@@ -1,0 +1,35 @@
+[package]
+name = "selium-kernel"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+futures-util = { workspace = true, features = ["alloc"] }
+parking_lot = { workspace = true }
+rkyv = { workspace = true }
+selium-abi = { workspace = true }
+sharded-slab = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time"
+] }
+tracing = { workspace = true, features = ["attributes"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+default = ["services"]
+service-session = []
+service-singleton = []
+service-time = []
+services = ["service-session", "service-singleton", "service-time"]
