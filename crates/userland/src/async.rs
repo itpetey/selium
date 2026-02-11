@@ -61,6 +61,7 @@ mod host_wakers {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn wake(id: GuestUint) {
         if let Ok(mut guard) = registry().lock()
             && let Some(waker) = guard.wakers.remove(&id)
@@ -217,6 +218,7 @@ pub fn register(cx: &mut Context<'_>) -> GuestUint {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(dead_code)]
 pub fn wake(task_id: GuestUint) {
     host_wakers::wake(task_id);
 }

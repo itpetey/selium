@@ -1,26 +1,8 @@
-//! Guest-side helpers for building Selium userland services.
+//! Guest-side helpers for Selium hostcalls.
 //!
-//! Selium guests communicate exclusively via channels and typed hostcalls.
-//!
-//! # Examples
-//! ```
-//! use futures::{SinkExt, StreamExt};
-//! use selium_userland::{entrypoint, io::DriverError};
-//!
-//! // Services can return results.
-//! #[entrypoint]
-//! pub async fn result_service() -> Result<(), DriverError> {
-//!     Ok(())
-//! }
-//!
-//! // You can also define services that do not have return values.
-//! #[entrypoint]
-//! pub async fn void_service() {
-//!     ()
-//! }
-//! ```
+//! This crate mirrors the current Selium hostcall surface:
+//! session, process, singleton, time, and shared-memory operations.
 
-// Appease #[schema] macro that can't find `selium_userland::` without it.
 extern crate self as selium_userland;
 
 macro_rules! driver_module {
@@ -51,40 +33,13 @@ macro_rules! driver_module {
             }
 
             #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), test))]
-            unsafe fn create(args_ptr: GuestInt, args_len: GuestUint) -> GuestUint {
-                crate::driver::test_driver::create(
-                    selium_abi::hostcall_name!($import),
-                    args_ptr,
-                    args_len,
-                )
-            }
-
-            #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            #[cfg(not(target_arch = "wasm32"))]
             unsafe fn create(_args_ptr: GuestInt, _args_len: GuestUint) -> GuestUint {
                 selium_abi::driver_encode_error(2)
             }
 
             #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), test))]
-            unsafe fn poll(
-                handle: GuestUint,
-                task_id: GuestUint,
-                result_ptr: GuestInt,
-                result_len: GuestUint,
-            ) -> GuestUint {
-                crate::driver::test_driver::poll(
-                    selium_abi::hostcall_name!($import),
-                    handle,
-                    task_id,
-                    result_ptr,
-                    result_len,
-                )
-            }
-
-            #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            #[cfg(not(target_arch = "wasm32"))]
             unsafe fn poll(
                 _handle: GuestUint,
                 _task_id: GuestUint,
@@ -95,22 +50,7 @@ macro_rules! driver_module {
             }
 
             #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), test))]
-            unsafe fn drop(
-                handle: GuestUint,
-                result_ptr: GuestInt,
-                result_len: GuestUint,
-            ) -> GuestUint {
-                crate::driver::test_driver::drop(
-                    selium_abi::hostcall_name!($import),
-                    handle,
-                    result_ptr,
-                    result_len,
-                )
-            }
-
-            #[allow(dead_code)]
-            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            #[cfg(not(target_arch = "wasm32"))]
             unsafe fn drop(
                 _handle: GuestUint,
                 _result_ptr: GuestInt,
@@ -148,28 +88,10 @@ macro_rules! driver_module {
 pub mod abi;
 mod r#async;
 pub mod context;
-mod driver;
-pub mod encoding;
-/// Generated Flatbuffers schema bindings.
-///
-/// The types in this module are generated from Selium `.fbs` schema files and are primarily used
-/// by higher-level helpers (for example, [`crate::encoding`]).
-///
-/// # Examples
-/// ```
-/// use selium_userland::encoding::{FlatMsg, FlatResult};
-///
-/// let bytes = FlatMsg::encode(&FlatResult::ok(1, Vec::new()));
-/// assert!(selium_userland::fbs::selium::result::flat_result_buffer_has_identifier(&bytes));
-/// ```
-#[allow(missing_docs)]
-#[allow(warnings)]
-#[rustfmt::skip]
-pub mod fbs;
-pub mod io;
-pub mod logging;
-pub mod net;
+pub mod driver;
 pub mod process;
+pub mod session;
+pub mod shm;
 pub mod singleton;
 pub mod time;
 
@@ -178,8 +100,8 @@ pub use rkyv;
 
 pub use r#async::{block_on, spawn, yield_now};
 pub use context::{Context, Dependency, DependencyDescriptor};
-/// Re-export of Selium's derive and attribute macros for guest crates.
-pub use selium_userland_macros::*;
+/// Re-export of supported Selium macros for guest crates.
+pub use selium_userland_macros::{dependency_id, entrypoint};
 
 /// Re-export of singleton dependency identifiers.
 pub use selium_abi::DependencyId;

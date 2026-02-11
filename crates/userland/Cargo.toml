@@ -14,21 +14,9 @@ categories.workspace = true
 ignored-paths = ["macros/tests/**/*.rs"]
 
 [dependencies]
-anyhow = { workspace = true }
-flatbuffers = { workspace = true }
 futures = { workspace = true, features = ["alloc", "std"] }
 rkyv = { workspace = true }
 selium-abi = { workspace = true }
-selium-userland-macros = { workspace = true }
+selium-userland-macros = { path = "macros" }
 thiserror = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, default-features = false, features = [
-  "alloc",
-  "registry",
-  "std",
-] }
-
-[build-dependencies]
-flatbuffers-build = { workspace = true }
-flatc-fork = { workspace = true }

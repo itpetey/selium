@@ -31,6 +31,5 @@ syn = { workspace = true, features = [
 
 [dev-dependencies]
 anyhow = { workspace = true }
-flatbuffers = { workspace = true }
 selium-userland = { path = "../../userland" }
 trybuild = { workspace = true }
