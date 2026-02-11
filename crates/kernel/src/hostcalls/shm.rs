@@ -3,7 +3,8 @@
 use std::{convert::TryFrom, future::ready, sync::Arc};
 
 use selium_abi::{
-    GuestResourceId, GuestUint, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRegion, ShmShare,
+    GuestResourceId, GuestUint, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead, ShmRegion,
+    ShmShare, ShmWrite,
 };
 
 use crate::{
@@ -19,6 +20,8 @@ type SharedMemoryOps<C> = (
     Arc<Operation<ShmShareDriver>>,
     Arc<Operation<ShmAttachDriver>>,
     Arc<Operation<ShmDetachDriver>>,
+    Arc<Operation<ShmReadDriver<C>>>,
+    Arc<Operation<ShmWriteDriver<C>>>,
 );
 
 /// Hostcall driver that allocates shared memory.
@@ -29,6 +32,10 @@ pub struct ShmShareDriver;
 pub struct ShmAttachDriver;
 /// Hostcall driver that detaches a local shared-memory resource.
 pub struct ShmDetachDriver;
+/// Hostcall driver that reads bytes from a local shared-memory resource.
+pub struct ShmReadDriver<Impl>(Impl);
+/// Hostcall driver that writes bytes to a local shared-memory resource.
+pub struct ShmWriteDriver<Impl>(Impl);
 
 impl<Impl> Contract for ShmAllocDriver<Impl>
 where
@@ -197,6 +204,100 @@ impl Contract for ShmDetachDriver {
     }
 }
 
+impl<Impl> Contract for ShmReadDriver<Impl>
+where
+    Impl: SharedMemoryCapability + Clone + Send + 'static,
+{
+    type Input = ShmRead;
+    type Output = Vec<u8>;
+
+    fn to_future<C>(
+        &self,
+        context: &mut C,
+        input: Self::Input,
+    ) -> impl std::future::Future<Output = GuestResult<Self::Output>> + Send + 'static
+    where
+        C: HostcallContext,
+    {
+        let inner = self.0.clone();
+
+        let result = (|| -> GuestResult<Vec<u8>> {
+            let slot =
+                usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
+            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let meta = context
+                .registry()
+                .registry()
+                .metadata(resource_id)
+                .ok_or(GuestError::NotFound)?;
+            if meta.kind != ResourceType::SharedMemory {
+                return Err(GuestError::InvalidArgument);
+            }
+
+            let region = context
+                .registry()
+                .registry()
+                .with(ResourceHandle::<ShmRegion>::new(resource_id), |region| {
+                    *region
+                })
+                .ok_or(GuestError::NotFound)?;
+
+            inner
+                .read(region, input.offset, input.len)
+                .map_err(Into::into)
+        })();
+
+        ready(result)
+    }
+}
+
+impl<Impl> Contract for ShmWriteDriver<Impl>
+where
+    Impl: SharedMemoryCapability + Clone + Send + 'static,
+{
+    type Input = ShmWrite;
+    type Output = ();
+
+    fn to_future<C>(
+        &self,
+        context: &mut C,
+        input: Self::Input,
+    ) -> impl std::future::Future<Output = GuestResult<Self::Output>> + Send + 'static
+    where
+        C: HostcallContext,
+    {
+        let inner = self.0.clone();
+
+        let result = (|| -> GuestResult<()> {
+            let slot =
+                usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
+            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let meta = context
+                .registry()
+                .registry()
+                .metadata(resource_id)
+                .ok_or(GuestError::NotFound)?;
+            if meta.kind != ResourceType::SharedMemory {
+                return Err(GuestError::InvalidArgument);
+            }
+
+            let region = context
+                .registry()
+                .registry()
+                .with(ResourceHandle::<ShmRegion>::new(resource_id), |region| {
+                    *region
+                })
+                .ok_or(GuestError::NotFound)?;
+
+            inner
+                .write(region, input.offset, &input.bytes)
+                .map_err(Into::into)
+        })();
+
+        ready(result)
+    }
+}
+
 /// Build hostcall operations for shared memory.
 pub fn operations<C>(capability: C) -> SharedMemoryOps<C>
 where
@@ -204,11 +305,19 @@ where
 {
     (
         Operation::from_hostcall(
-            ShmAllocDriver(capability),
+            ShmAllocDriver(capability.clone()),
             selium_abi::hostcall_contract!(SHM_ALLOC),
         ),
         Operation::from_hostcall(ShmShareDriver, selium_abi::hostcall_contract!(SHM_SHARE)),
         Operation::from_hostcall(ShmAttachDriver, selium_abi::hostcall_contract!(SHM_ATTACH)),
         Operation::from_hostcall(ShmDetachDriver, selium_abi::hostcall_contract!(SHM_DETACH)),
+        Operation::from_hostcall(
+            ShmReadDriver(capability.clone()),
+            selium_abi::hostcall_contract!(SHM_READ),
+        ),
+        Operation::from_hostcall(
+            ShmWriteDriver(capability),
+            selium_abi::hostcall_contract!(SHM_WRITE),
+        ),
     )
 }

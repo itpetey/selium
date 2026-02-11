@@ -59,3 +59,27 @@ pub struct ShmDetach {
     /// Instance-local resource table id.
     pub resource_id: GuestUint,
 }
+
+/// Request to read bytes from a shared memory resource.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ShmRead {
+    /// Instance-local resource table id.
+    pub resource_id: GuestUint,
+    /// Start offset relative to the region base.
+    pub offset: GuestUint,
+    /// Number of bytes to read.
+    pub len: GuestUint,
+}
+
+/// Request to write bytes into a shared memory resource.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ShmWrite {
+    /// Instance-local resource table id.
+    pub resource_id: GuestUint,
+    /// Start offset relative to the region base.
+    pub offset: GuestUint,
+    /// Bytes to write.
+    pub bytes: Vec<u8>,
+}

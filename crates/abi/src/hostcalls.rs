@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     Capability, GuestResourceId, ProcessStart, RkyvEncode, SessionCreate, SessionEntitlement,
-    SessionRemove, SessionResource, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmShare,
-    SingletonLookup, SingletonRegister, TimeNow, TimeSleep,
+    SessionRemove, SessionResource, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead,
+    ShmShare, ShmWrite, SingletonLookup, SingletonRegister, TimeNow, TimeSleep,
 };
 
 /// Type-erased metadata describing a hostcall.
@@ -211,6 +211,18 @@ declare_hostcalls! {
         name: "selium::shm::detach",
         capability: Capability::SharedMemory,
         input: ShmDetach,
+        output: ()
+    },
+    SHM_READ => {
+        name: "selium::shm::read",
+        capability: Capability::SharedMemory,
+        input: ShmRead,
+        output: Vec<u8>
+    },
+    SHM_WRITE => {
+        name: "selium::shm::write",
+        capability: Capability::SharedMemory,
+        input: ShmWrite,
         output: ()
     },
 }

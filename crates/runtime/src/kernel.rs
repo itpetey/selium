@@ -78,6 +78,8 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
             shm.1.as_linkable(),
             shm.2.as_linkable(),
             shm.3.as_linkable(),
+            shm.4.as_linkable(),
+            shm.5.as_linkable(),
         ]);
 
     let shutdown = Arc::new(Notify::new());

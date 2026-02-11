@@ -84,6 +84,18 @@
 - Reintroduce process logging path without old host-channel coupling.
 - Re-expand capability parser and runtime entitlement flow as required.
 
+## Shared Memory Model Update (2026-02-11)
+- We cannot rely on dynamically attaching Wasmtime shared memories after guest start.
+- Phase 2 now treats shared memory as host-managed runtime state with explicit hostcalls.
+- Current SHM hostcall surface:
+  - `selium::shm::alloc`
+  - `selium::shm::share`
+  - `selium::shm::attach`
+  - `selium::shm::detach`
+  - `selium::shm::read`
+  - `selium::shm::write`
+- `crates/userland` is legacy relative to the new ABI and still needs a dedicated catch-up migration.
+
 ## Tests and Scenarios to Restore
 - Request/reply integration with channel lifecycle/read/write flow.
 - Cross-process channel share/attach semantics.
