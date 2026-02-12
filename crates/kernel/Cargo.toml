@@ -30,6 +30,12 @@ uuid = { workspace = true, features = ["v4"] }
 [features]
 default = ["services"]
 service-session = []
+service-shared-memory = []
 service-singleton = []
 service-time = []
-services = ["service-session", "service-singleton", "service-time"]
+services = [
+  "service-session",
+  "service-shared-memory",
+  "service-singleton",
+  "service-time"
+]

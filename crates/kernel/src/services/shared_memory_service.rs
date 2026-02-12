@@ -1,11 +1,12 @@
-//! Runtime-backed shared memory allocator capability.
+//! Host-managed shared memory allocator capability.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use selium_abi::{GuestUint, ShmAlloc, ShmRegion};
-use selium_kernel::{guest_error::GuestError, spi::shared_memory::SharedMemoryCapability};
+
+use crate::{guest_error::GuestError, spi::shared_memory::SharedMemoryCapability};
 
 /// Default shared memory arena size for host allocations.
 const DEFAULT_ARENA_BYTES: u64 = 256 * 1024 * 1024;

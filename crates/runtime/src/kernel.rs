@@ -9,15 +9,14 @@ use selium_abi::Capability;
 use selium_kernel::{
     Kernel,
     hostcalls::{process, session, shm, singleton, time},
+    services::shared_memory_service::SharedMemoryDriver,
     services::singleton_service::SingletonRegistryService,
     services::time_service::SystemTimeService,
 };
 use tokio::sync::Notify;
 
 use crate::{
-    providers::{
-        module_repository_fs::FilesystemModuleRepository, shared_memory_arena::SharedMemoryDriver,
-    },
+    providers::module_repository_fs::FilesystemModuleRepository,
     wasmtime::runtime::{WasmtimeProcessDriver, WasmtimeRuntime},
     wasmtime::{
         guest_async::GuestAsync,
