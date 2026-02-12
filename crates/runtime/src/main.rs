@@ -152,3 +152,34 @@ async fn main() -> Result<()> {
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_default_options() {
+        let opts = ServerOptions::parse_from(["selium-runtime"]);
+        assert_eq!(opts.log_format, LogFormat::Text);
+        assert!(opts.command.is_none());
+        assert_eq!(opts.work_dir, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parses_generate_certs_command() {
+        let opts = ServerOptions::parse_from([
+            "selium-runtime",
+            "generate-certs",
+            "--output-dir",
+            "certs-out",
+            "--server-name",
+            "example.local",
+        ]);
+        let Some(ServerCommand::GenerateCerts(args)) = opts.command else {
+            panic!("expected generate-certs command");
+        };
+        assert_eq!(args.output_dir, PathBuf::from("certs-out"));
+        assert_eq!(args.server_name, "example.local");
+    }
+}

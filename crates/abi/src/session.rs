@@ -47,3 +47,35 @@ pub struct SessionRemove {
     /// Target session handle.
     pub target_id: GuestUint,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode_rkyv, encode_rkyv};
+
+    #[test]
+    fn session_create_round_trips_with_rkyv() {
+        let payload = SessionCreate {
+            session_id: 5,
+            pubkey: [7; 32],
+        };
+
+        let encoded = encode_rkyv(&payload).expect("encode");
+        let decoded = decode_rkyv::<SessionCreate>(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn session_resource_round_trips_with_rkyv() {
+        let payload = SessionResource {
+            session_id: 1,
+            target_id: 2,
+            capability: Capability::SharedMemory,
+            resource_id: 42,
+        };
+
+        let encoded = encode_rkyv(&payload).expect("encode");
+        let decoded = decode_rkyv::<SessionResource>(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+}

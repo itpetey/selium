@@ -46,3 +46,26 @@ fn monotonic_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_returns_monotonic_and_unix_values() {
+        let first = SystemTimeService.now().expect("now");
+        let second = SystemTimeService.now().expect("now");
+        assert!(first.unix_ms > 0);
+        assert!(second.monotonic_ms >= first.monotonic_ms);
+    }
+
+    #[tokio::test]
+    async fn sleep_waits_for_requested_duration() {
+        let started = Instant::now();
+        SystemTimeService
+            .sleep(TimeSleep { duration_ms: 5 })
+            .await
+            .expect("sleep");
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+}

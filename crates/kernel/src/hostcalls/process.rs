@@ -247,3 +247,192 @@ where
         ),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use selium_abi::{AbiSignature, Capability};
+
+    use crate::registry::{Registry, ResourceType};
+
+    struct TestContext {
+        registry: InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn context() -> TestContext {
+        let registry = Registry::new();
+        let instance = registry.instance().expect("instance");
+        TestContext { registry: instance }
+    }
+
+    #[derive(Clone)]
+    struct StartCapability {
+        fail: bool,
+        seen_process_id: Arc<Mutex<Option<ResourceId>>>,
+    }
+
+    impl ProcessLifecycleCapability for StartCapability {
+        type Process = ();
+        type Error = GuestError;
+
+        fn start(
+            &self,
+            _registry: &Arc<crate::registry::Registry>,
+            process_id: ResourceId,
+            _module_id: &str,
+            _name: &str,
+            _capabilities: Vec<Capability>,
+            _entrypoint: EntrypointInvocation,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            let fail = self.fail;
+            *self.seen_process_id.lock().expect("process id lock") = Some(process_id);
+            async move {
+                if fail {
+                    Err(GuestError::Subsystem("start failed".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        async fn stop(&self, _instance: &mut Self::Process) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StopCapability {
+        stopped: Arc<Mutex<bool>>,
+    }
+
+    impl ProcessLifecycleCapability for StopCapability {
+        type Process = String;
+        type Error = GuestError;
+
+        async fn start(
+            &self,
+            _registry: &Arc<crate::registry::Registry>,
+            _process_id: ResourceId,
+            _module_id: &str,
+            _name: &str,
+            _capabilities: Vec<Capability>,
+            _entrypoint: EntrypointInvocation,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn stop(&self, instance: &mut Self::Process) -> Result<(), Self::Error> {
+            *self.stopped.lock().expect("stop lock") = true;
+            instance.push_str(":stopped");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resolve_resources_maps_instance_slot_to_resource_id() {
+        let mut ctx = context();
+        let slot = ctx
+            .registry_mut()
+            .insert(5u32, None, ResourceType::Other)
+            .expect("insert");
+        let expected = ctx.registry().entry(slot).expect("resource id");
+
+        let invocation = EntrypointInvocation::new(
+            AbiSignature::new(vec![AbiParam::Scalar(AbiScalarType::I32)], Vec::new()),
+            vec![EntrypointArg::Resource(slot as GuestResourceId)],
+        )
+        .expect("invocation");
+
+        let resolved = invocation
+            .resolve_resources(ctx.registry())
+            .expect("resolve resources");
+        assert_eq!(
+            resolved.args,
+            vec![EntrypointArg::Resource(expected as GuestResourceId)]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_start_driver_discards_reservation_on_failure() {
+        let process_id_seen = Arc::new(Mutex::new(None));
+        let capability = StartCapability {
+            fail: true,
+            seen_process_id: Arc::clone(&process_id_seen),
+        };
+        let driver = ProcessStartDriver(capability);
+        let mut ctx = context();
+        let input = ProcessStart {
+            module_id: "m".to_string(),
+            name: "n".to_string(),
+            capabilities: vec![Capability::TimeRead],
+            entrypoint: EntrypointInvocation::new(
+                AbiSignature::new(Vec::new(), Vec::new()),
+                Vec::new(),
+            )
+            .expect("entrypoint"),
+        };
+
+        let err = driver
+            .to_future(&mut ctx, input)
+            .await
+            .expect_err("start should fail");
+        assert!(matches!(err, GuestError::Subsystem(_)));
+        let process_id = (*process_id_seen.lock().expect("process lock")).expect("process id");
+        assert!(ctx.registry().registry().metadata(process_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn process_stop_driver_rejects_non_process_handle() {
+        let driver = ProcessStopDriver(StopCapability {
+            stopped: Arc::new(Mutex::new(false)),
+        });
+        let mut ctx = context();
+        let other = ctx
+            .registry_mut()
+            .registry()
+            .add(1u32, None, ResourceType::Other)
+            .expect("add other");
+
+        let err = driver
+            .to_future(&mut ctx, other.into_id() as GuestResourceId)
+            .await
+            .expect_err("non-process should fail");
+        assert!(matches!(err, GuestError::InvalidArgument));
+    }
+
+    #[tokio::test]
+    async fn process_stop_driver_calls_capability_for_process() {
+        let stopped = Arc::new(Mutex::new(false));
+        let driver = ProcessStopDriver(StopCapability {
+            stopped: Arc::clone(&stopped),
+        });
+        let mut ctx = context();
+        let process = ctx
+            .registry_mut()
+            .registry()
+            .add("proc".to_string(), None, ResourceType::Process)
+            .expect("add process");
+
+        driver
+            .to_future(&mut ctx, process.into_id() as GuestResourceId)
+            .await
+            .expect("stop succeeds");
+        assert!(*stopped.lock().expect("stopped lock"));
+    }
+}

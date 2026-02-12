@@ -41,3 +41,27 @@ pub enum GuestError {
     #[error("This function would block")]
     WouldBlock,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_messages_are_human_readable() {
+        assert_eq!(GuestError::InvalidArgument.to_string(), "invalid argument");
+        assert_eq!(GuestError::NotFound.to_string(), "resource not found");
+        assert_eq!(
+            GuestError::PermissionDenied.to_string(),
+            "permission denied"
+        );
+    }
+
+    #[test]
+    fn kernel_and_registry_errors_convert_into_guest_error() {
+        let kernel = GuestError::from(KernelError::Driver("x".to_string()));
+        assert!(matches!(kernel, GuestError::Kernel(_)));
+
+        let registry = GuestError::from(RegistryError::InvalidReservation);
+        assert!(matches!(registry, GuestError::Registry(_)));
+    }
+}

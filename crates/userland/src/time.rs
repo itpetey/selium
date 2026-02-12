@@ -67,3 +67,23 @@ fn monotonic_ms() -> u64 {
 
 driver_module!(time_now, TIME_NOW, "selium::time::now");
 driver_module!(time_sleep, TIME_SLEEP, "selium::time::sleep");
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_returns_monotonic_snapshot() {
+        let first = crate::block_on(now()).expect("now");
+        let second = crate::block_on(now()).expect("now");
+        assert!(first.unix_ms > 0);
+        assert!(second.monotonic_ms >= first.monotonic_ms);
+    }
+
+    #[test]
+    fn sleep_waits_at_least_requested_duration() {
+        let started = std::time::Instant::now();
+        crate::block_on(sleep(Duration::from_millis(5))).expect("sleep");
+        assert!(started.elapsed() >= Duration::from_millis(5));
+    }
+}

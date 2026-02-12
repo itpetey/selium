@@ -46,3 +46,20 @@ impl GuestAsync {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_registers_guest_async_module() {
+        let mut config = wasmtime::Config::new();
+        config.async_support(true);
+        let engine = wasmtime::Engine::new(&config).expect("engine");
+        let mut linker = Linker::<InstanceRegistry>::new(&engine);
+        let notify = Arc::new(Notify::new());
+        let guest_async = GuestAsync::new(notify);
+
+        guest_async.link(&mut linker).expect("link guest async");
+    }
+}

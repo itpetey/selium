@@ -33,3 +33,26 @@ pub struct SingletonLookup {
     /// Dependency identifier.
     pub id: DependencyId,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode_rkyv, encode_rkyv};
+
+    #[test]
+    fn dependency_id_bytes_returns_inner_value() {
+        let id = DependencyId([1; 16]);
+        assert_eq!(id.bytes(), [1; 16]);
+    }
+
+    #[test]
+    fn singleton_register_round_trips_with_rkyv() {
+        let payload = SingletonRegister {
+            id: DependencyId([2; 16]),
+            resource: 44,
+        };
+        let encoded = encode_rkyv(&payload).expect("encode");
+        let decoded = decode_rkyv::<SingletonRegister>(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+}

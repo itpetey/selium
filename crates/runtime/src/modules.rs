@@ -582,3 +582,91 @@ async fn spawn_module(
 
     Ok(process_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_relative_path_accepts_safe_paths() {
+        let parsed = parse_relative_path("modules/echo.wasm").expect("parse");
+        assert_eq!(parsed, PathBuf::from("modules/echo.wasm"));
+    }
+
+    #[test]
+    fn parse_relative_path_rejects_absolute_and_parent_paths() {
+        assert!(parse_relative_path("/tmp/module.wasm").is_err());
+        assert!(parse_relative_path("../module.wasm").is_err());
+    }
+
+    #[test]
+    fn parse_capabilities_accepts_aliases_and_deduplicates() {
+        let caps = parse_capabilities("time_read, time-read, shared-memory").expect("caps");
+        assert_eq!(caps, vec![Capability::TimeRead, Capability::SharedMemory]);
+    }
+
+    #[test]
+    fn parse_params_and_args_detect_invalid_entries() {
+        assert!(parse_params("i32,unknown").is_err());
+        assert!(parse_args("i32:1,").is_err());
+    }
+
+    #[test]
+    fn resolve_arguments_infers_types_when_params_are_omitted() {
+        let args = vec![
+            Argument::Typed {
+                kind: ParamKind::I32,
+                value: "1".to_string(),
+            },
+            Argument::Typed {
+                kind: ParamKind::Utf8,
+                value: "hello".to_string(),
+            },
+        ];
+
+        let (params, values) = resolve_arguments(Vec::new(), args).expect("resolve");
+        assert_eq!(params, vec![ParamKind::I32, ParamKind::Utf8]);
+        assert_eq!(values, vec!["1".to_string(), "hello".to_string()]);
+    }
+
+    #[test]
+    fn resolve_arguments_rejects_untyped_values_without_params() {
+        let err = resolve_arguments(Vec::new(), vec![Argument::Untyped("x".to_string())])
+            .expect_err("expected failure");
+        assert!(err.to_string().contains("missing a type"));
+    }
+
+    #[test]
+    fn parse_entrypoint_arg_supports_resource_and_hex_buffer() {
+        let resource = parse_entrypoint_arg(&ParamKind::Resource, "9").expect("resource");
+        assert_eq!(resource, EntrypointArg::Resource(9));
+
+        let buffer = parse_entrypoint_arg(&ParamKind::Buffer, "hex:0x41_42").expect("buffer");
+        assert_eq!(buffer, EntrypointArg::Buffer(vec![0x41, 0x42]));
+    }
+
+    #[test]
+    fn parse_hex_rejects_odd_digit_count() {
+        let err = decode_hex("abc").expect_err("odd hex should fail");
+        assert!(err.to_string().contains("even number of digits"));
+    }
+
+    #[test]
+    fn parse_module_spec_applies_defaults() {
+        let work_dir = Path::new(".");
+        let spec =
+            parse_module_spec("path=mod.wasm;capabilities=time_read", work_dir).expect("spec");
+
+        assert_eq!(spec.module_label, "mod.wasm");
+        assert_eq!(spec.entrypoint, DEFAULT_ENTRYPOINT);
+        assert_eq!(spec.capabilities, vec![Capability::TimeRead]);
+        assert_eq!(spec.params, Vec::<AbiParam>::new());
+        assert_eq!(spec.args, Vec::<EntrypointArg>::new());
+    }
+
+    #[test]
+    fn parse_module_specs_requires_input() {
+        let specs = parse_module_specs(&[], Path::new("."));
+        assert!(specs.is_err());
+    }
+}

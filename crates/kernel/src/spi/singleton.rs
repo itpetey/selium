@@ -45,3 +45,42 @@ where
         self.as_ref().lookup(registry, id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Driver;
+
+    impl SingletonCapability for Driver {
+        type Error = GuestError;
+
+        fn register(
+            &self,
+            _registry: &Registry,
+            _id: DependencyId,
+            _resource: ResourceId,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn lookup(
+            &self,
+            _registry: &Registry,
+            _id: DependencyId,
+        ) -> Result<ResourceId, Self::Error> {
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn arc_wrapper_forwards_register_and_lookup() {
+        let registry = Registry::new();
+        let driver = Arc::new(Driver);
+        let id = DependencyId([1; 16]);
+
+        driver.register(&registry, id, 5).expect("register");
+        let value = driver.lookup(&registry, id).expect("lookup");
+        assert_eq!(value, 7);
+    }
+}

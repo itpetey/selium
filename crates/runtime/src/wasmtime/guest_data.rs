@@ -102,3 +102,20 @@ pub fn encode_ready_len(len: usize) -> Result<GuestUint, KernelError> {
     let guest_len = GuestUint::try_from(len).map_err(|_| KernelError::MemoryCapacity)?;
     driver_encode_ready(guest_len).ok_or(KernelError::MemoryCapacity)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_ready_len_accepts_small_lengths() {
+        let encoded = encode_ready_len(16).expect("encode");
+        assert!(encoded > 0);
+    }
+
+    #[test]
+    fn encode_ready_len_rejects_out_of_range_lengths() {
+        let err = encode_ready_len(usize::MAX).expect_err("too large");
+        assert!(matches!(err, KernelError::MemoryCapacity));
+    }
+}

@@ -27,3 +27,38 @@ impl From<ModuleRepositoryError> for i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Repo;
+
+    impl ModuleRepositoryReadCapability for Repo {
+        fn read(&self, _module_id: &str) -> Result<Vec<u8>, ModuleRepositoryError> {
+            Ok(vec![1, 2, 3])
+        }
+    }
+
+    #[test]
+    fn error_codes_match_contract() {
+        assert_eq!(
+            i32::from(ModuleRepositoryError::InvalidPath(
+                PathBuf::from("."),
+                "x".into()
+            )),
+            -300
+        );
+        assert_eq!(
+            i32::from(ModuleRepositoryError::Filesystem("x".into())),
+            -301
+        );
+    }
+
+    #[test]
+    fn repository_trait_can_be_used_via_trait_object() {
+        let repo: &dyn ModuleRepositoryReadCapability = &Repo;
+        let bytes = repo.read("module.wasm").expect("read");
+        assert_eq!(bytes, vec![1, 2, 3]);
+    }
+}

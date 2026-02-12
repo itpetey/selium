@@ -135,3 +135,21 @@ driver_module!(
     SESSION_RM_RESOURCE,
     "selium::session::rm_resource"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_returns_kernel_error_with_native_stub_driver() {
+        let err = crate::block_on(create(1, [0; 32])).expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+
+    #[test]
+    fn add_resource_returns_kernel_error_with_native_stub_driver() {
+        let err = crate::block_on(add_resource(1, 2, Capability::TimeRead, 3))
+            .expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+}

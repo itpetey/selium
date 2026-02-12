@@ -300,3 +300,88 @@ impl SessionLifecycleCapability for SessionLifecycleDriver {
         target.ensure_removable()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(values: &[ResourceId]) -> HashSet<ResourceId> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn bootstrap_grants_any_scope_for_all_entitlements() {
+        let session = Session::bootstrap(
+            vec![Capability::TimeRead, Capability::SharedMemory],
+            [0; 32],
+        );
+
+        assert!(session.authorise(Capability::TimeRead, 123));
+        assert!(session.authorise(Capability::SharedMemory, 456));
+        assert!(!session.authorise(Capability::ProcessLifecycle, 456));
+    }
+
+    #[test]
+    fn create_rejects_entitlements_outside_parent_scope() {
+        let parent = Session {
+            id: Uuid::new_v4(),
+            #[cfg(feature = "service-session")]
+            parent: Uuid::nil(),
+            #[cfg(not(feature = "service-session"))]
+            _parent: Uuid::nil(),
+            entitlements: HashMap::from([(
+                Capability::SharedMemory,
+                ResourceScope::Some(set(&[1, 2])),
+            )]),
+            _pubkey: [0; 32],
+        };
+
+        let child_entitlements =
+            HashMap::from([(Capability::SharedMemory, ResourceScope::Some(set(&[2, 3])))]);
+
+        let err = match parent.create(child_entitlements, [1; 32]) {
+            Ok(_) => panic!("scope escalation should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, SessionError::EntitlementScope));
+    }
+
+    #[test]
+    fn grant_and_revoke_resource_updates_scope() {
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            #[cfg(feature = "service-session")]
+            parent: Uuid::nil(),
+            #[cfg(not(feature = "service-session"))]
+            _parent: Uuid::nil(),
+            entitlements: HashMap::from([(Capability::TimeRead, ResourceScope::None)]),
+            _pubkey: [0; 32],
+        };
+
+        assert!(session.grant_resource(Capability::TimeRead, 7));
+        assert!(session.authorise(Capability::TimeRead, 7));
+
+        let removed = session
+            .revoke_resource(Capability::TimeRead, 7)
+            .expect("revoke should succeed");
+        assert!(removed);
+        assert!(!session.authorise(Capability::TimeRead, 7));
+    }
+
+    #[test]
+    fn revoke_resource_from_any_scope_fails() {
+        let mut session = Session::bootstrap(vec![Capability::TimeRead], [0; 32]);
+        let err = session
+            .revoke_resource(Capability::TimeRead, 1)
+            .expect_err("cannot revoke from Any scope");
+        assert!(matches!(err, SessionError::RevokeOnAny));
+    }
+
+    #[test]
+    fn error_code_mapping_is_stable() {
+        assert_eq!(i32::from(SessionError::InvalidSignature), -110);
+        assert_eq!(i32::from(SessionError::Unauthorised), -111);
+        assert_eq!(i32::from(SessionError::EntitlementScope), -112);
+        assert_eq!(i32::from(SessionError::RevokeOnAny), -113);
+    }
+}

@@ -40,3 +40,53 @@ impl ModuleRepositoryReadCapability for FilesystemModuleRepository {
         Ok(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("selium-module-repo-{id}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn reads_existing_module_bytes() {
+        let dir = temp_dir();
+        let module_path = dir.join("module.wasm");
+        fs::write(&module_path, [1u8, 2, 3]).expect("write module");
+
+        let repo = FilesystemModuleRepository::new(&dir);
+        let bytes = repo.read("module.wasm").expect("read module");
+        assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_path_escape_attempts() {
+        let dir = temp_dir();
+        let repo = FilesystemModuleRepository::new(&dir);
+
+        let err = repo
+            .read("../outside.wasm")
+            .expect_err("expected invalid path");
+        assert!(matches!(err, ModuleRepositoryError::InvalidPath(_, _)));
+    }
+
+    #[test]
+    fn surfaces_filesystem_errors_for_missing_file() {
+        let dir = temp_dir();
+        let repo = FilesystemModuleRepository::new(&dir);
+
+        let err = repo.read("missing.wasm").expect_err("missing file");
+        assert!(matches!(err, ModuleRepositoryError::Filesystem(_)));
+    }
+}

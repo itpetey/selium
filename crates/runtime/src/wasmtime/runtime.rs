@@ -778,3 +778,63 @@ fn take_u32(iter: &mut std::slice::Iter<Val>, msg: &str) -> Result<u32, wasmtime
     let raw = take_i32(iter, msg)?;
     Ok(u32::from_ne_bytes(raw.to_ne_bytes()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_params_detects_count_mismatches() {
+        let err = prepare_params(&[ValType::I32], &[]).expect_err("count mismatch");
+        assert!(err.contains("expects 1 params"));
+    }
+
+    #[test]
+    fn scalar_to_val_converts_integer_and_float_types() {
+        let i32_val = scalar_to_val(&AbiScalarValue::I32(7), &ValType::I32).expect("i32");
+        assert!(matches!(i32_val, Val::I32(7)));
+        let f64_val = scalar_to_val(&AbiScalarValue::F64(1.5), &ValType::F64).expect("f64");
+        assert!(matches!(f64_val, Val::F64(bits) if bits == 1.5f64.to_bits()));
+    }
+
+    #[test]
+    fn decode_scalar_handles_u64_split_values() {
+        let values = [Val::I32(0x89abcdefu32 as i32), Val::I32(0x01234567)];
+        let mut iter = values.iter();
+        let decoded = decode_scalar(&mut iter, AbiScalarType::U64).expect("decode u64");
+        assert_eq!(decoded, AbiScalarValue::U64(0x0123456789abcdef));
+    }
+
+    #[test]
+    fn flatten_signature_types_expands_buffers_and_wide_scalars() {
+        let types = flatten_signature_types(&[
+            AbiParam::Scalar(AbiScalarType::I32),
+            AbiParam::Buffer,
+            AbiParam::Scalar(AbiScalarType::U64),
+        ]);
+        let expected = [
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+            ValType::I32,
+        ];
+        assert_eq!(types.len(), expected.len());
+        for (actual, expected) in types.iter().zip(expected.iter()) {
+            assert!(valtype_eq(actual, expected));
+        }
+    }
+
+    #[test]
+    fn valtype_eq_matches_only_same_core_types() {
+        assert!(valtype_eq(&ValType::I32, &ValType::I32));
+        assert!(!valtype_eq(&ValType::I32, &ValType::I64));
+    }
+
+    #[test]
+    fn missing_capabilities_generate_stub_operations() {
+        let requested = HashSet::from([Capability::TimeRead]);
+        let stubs = stub_operations_for_missing(&requested);
+        assert!(!stubs.is_empty());
+    }
+}

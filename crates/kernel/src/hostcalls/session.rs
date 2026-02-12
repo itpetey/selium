@@ -388,3 +388,177 @@ where
         ),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        registry::{InstanceRegistry, Registry, ResourceType},
+        services::session_service::{Session, SessionLifecycleDriver},
+    };
+
+    struct TestContext {
+        registry: InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn context() -> TestContext {
+        let registry = Registry::new();
+        let instance = registry.instance().expect("instance");
+        TestContext { registry: instance }
+    }
+
+    fn insert_parent_session(ctx: &mut TestContext) -> usize {
+        let mut parent = Session::bootstrap(Vec::new(), [0; 32]);
+        SessionLifecycleDriver
+            .add_entitlement(&mut parent, Capability::SessionLifecycle)
+            .expect("add entitlement");
+        ctx.registry_mut()
+            .insert(parent, None, ResourceType::Session)
+            .expect("insert parent session")
+    }
+
+    #[tokio::test]
+    async fn session_create_returns_child_handle() {
+        let mut ctx = context();
+        let parent_slot = insert_parent_session(&mut ctx);
+        let driver = SessionCreateDriver(SessionLifecycleDriver);
+
+        let child = driver
+            .to_future(
+                &mut ctx,
+                SessionCreate {
+                    session_id: parent_slot as u32,
+                    pubkey: [1; 32],
+                },
+            )
+            .await
+            .expect("session created");
+        let child_slot = child as usize;
+
+        let authorised = ctx
+            .registry()
+            .with::<Session, _>(parent_slot, |session| {
+                session.authorise(Capability::SessionLifecycle, child_slot)
+            })
+            .expect("parent session exists");
+        assert!(authorised);
+    }
+
+    #[tokio::test]
+    async fn add_entitlement_requires_parent_authorisation() {
+        let mut ctx = context();
+        let parent_slot = ctx
+            .registry_mut()
+            .insert(
+                Session::bootstrap(Vec::new(), [0; 32]),
+                None,
+                ResourceType::Session,
+            )
+            .expect("insert parent");
+        let target_slot = ctx
+            .registry_mut()
+            .insert(
+                Session::bootstrap(Vec::new(), [1; 32]),
+                None,
+                ResourceType::Session,
+            )
+            .expect("insert target");
+        let driver = SessionAddEntitlementDriver(SessionLifecycleDriver);
+
+        let err = driver
+            .to_future(
+                &mut ctx,
+                SessionEntitlement {
+                    session_id: parent_slot as u32,
+                    target_id: target_slot as u32,
+                    capability: Capability::TimeRead,
+                },
+            )
+            .await
+            .expect_err("parent is not authorised");
+        assert!(matches!(err, GuestError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_resource_report_change_flags() {
+        let mut ctx = context();
+        let parent_slot = insert_parent_session(&mut ctx);
+        let target_slot = ctx
+            .registry_mut()
+            .insert(
+                Session::bootstrap(Vec::new(), [2; 32]),
+                None,
+                ResourceType::Session,
+            )
+            .expect("insert target");
+        let granted = ctx
+            .registry()
+            .grant_session_resource(parent_slot, Capability::SessionLifecycle, target_slot)
+            .expect("grant target scope");
+        assert!(granted);
+        let resource_id = ctx
+            .registry()
+            .registry()
+            .add(5u32, None, ResourceType::Other)
+            .expect("insert resource")
+            .into_id();
+
+        let add_entitlement = SessionAddEntitlementDriver(SessionLifecycleDriver);
+        add_entitlement
+            .to_future(
+                &mut ctx,
+                SessionEntitlement {
+                    session_id: parent_slot as u32,
+                    target_id: target_slot as u32,
+                    capability: Capability::TimeRead,
+                },
+            )
+            .await
+            .expect("add entitlement");
+
+        let add_resource = SessionAddResourceDriver(SessionLifecycleDriver);
+        let added = add_resource
+            .to_future(
+                &mut ctx,
+                SessionResource {
+                    session_id: parent_slot as u32,
+                    target_id: target_slot as u32,
+                    capability: Capability::TimeRead,
+                    resource_id: resource_id as u64,
+                },
+            )
+            .await
+            .expect("add resource");
+        assert_eq!(added, 1);
+
+        let remove_resource = SessionRemoveResourceDriver(SessionLifecycleDriver);
+        let removed = remove_resource
+            .to_future(
+                &mut ctx,
+                SessionResource {
+                    session_id: parent_slot as u32,
+                    target_id: target_slot as u32,
+                    capability: Capability::TimeRead,
+                    resource_id: resource_id as u64,
+                },
+            )
+            .await
+            .expect("remove resource");
+        assert_eq!(removed, 1);
+    }
+}

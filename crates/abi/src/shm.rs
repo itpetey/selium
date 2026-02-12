@@ -83,3 +83,38 @@ pub struct ShmWrite {
     /// Bytes to write.
     pub bytes: Vec<u8>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{decode_rkyv, encode_rkyv};
+
+    #[test]
+    fn descriptor_round_trips_with_rkyv() {
+        let payload = ShmDescriptor {
+            resource_id: 3,
+            shared_id: 9,
+            region: ShmRegion {
+                offset: 16,
+                len: 64,
+            },
+        };
+
+        let encoded = encode_rkyv(&payload).expect("encode");
+        let decoded = decode_rkyv::<ShmDescriptor>(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn write_payload_preserves_bytes() {
+        let payload = ShmWrite {
+            resource_id: 1,
+            offset: 4,
+            bytes: vec![10, 20, 30],
+        };
+
+        let encoded = encode_rkyv(&payload).expect("encode");
+        let decoded = decode_rkyv::<ShmWrite>(&encoded).expect("decode");
+        assert_eq!(decoded.bytes, vec![10, 20, 30]);
+    }
+}

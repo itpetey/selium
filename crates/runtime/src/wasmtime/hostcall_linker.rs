@@ -143,3 +143,41 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use selium_kernel::hostcalls::Operation;
+
+    struct NoopContract;
+
+    impl Contract for NoopContract {
+        type Input = ();
+        type Output = ();
+
+        #[allow(clippy::manual_async_fn)]
+        fn to_future<C>(
+            &self,
+            _context: &mut C,
+            _input: Self::Input,
+        ) -> impl std::future::Future<
+            Output = selium_kernel::guest_error::GuestResult<Self::Output>,
+        > + Send
+        + 'static
+        where
+            C: HostcallContext,
+        {
+            async { Ok(()) }
+        }
+    }
+
+    #[test]
+    fn linkable_operation_registers_create_poll_and_drop_functions() {
+        let engine = wasmtime::Engine::default();
+        let mut linker = Linker::<InstanceRegistry>::new(&engine);
+        let op = Operation::new(NoopContract, "selium::test::noop");
+        let linkable = op.as_linkable();
+
+        linkable.link(&mut linker).expect("link operation");
+    }
+}

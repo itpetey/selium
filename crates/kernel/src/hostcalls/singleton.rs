@@ -97,3 +97,101 @@ where
         ),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        registry::{InstanceRegistry, Registry, ResourceType},
+        services::singleton_service::SingletonRegistryService,
+    };
+
+    struct TestContext {
+        registry: InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn context() -> TestContext {
+        let registry = Registry::new();
+        let instance = registry.instance().expect("instance");
+        TestContext { registry: instance }
+    }
+
+    #[tokio::test]
+    async fn register_driver_accepts_shared_resource_handle() {
+        let mut ctx = context();
+        let resource_id = ctx
+            .registry()
+            .registry()
+            .add(12u32, None, ResourceType::Other)
+            .expect("resource")
+            .into_id();
+        let shared = ctx
+            .registry()
+            .registry()
+            .share_handle(resource_id)
+            .expect("share");
+        let driver = SingletonRegisterDriver(SingletonRegistryService);
+        let dep = selium_abi::DependencyId([3; 16]);
+
+        driver
+            .to_future(
+                &mut ctx,
+                SingletonRegister {
+                    id: dep,
+                    resource: shared,
+                },
+            )
+            .await
+            .expect("register singleton");
+
+        let mapped = ctx
+            .registry()
+            .registry()
+            .singleton(dep)
+            .expect("singleton stored");
+        assert_eq!(mapped, resource_id);
+    }
+
+    #[tokio::test]
+    async fn lookup_driver_returns_shareable_handle() {
+        let mut ctx = context();
+        let resource_id = ctx
+            .registry()
+            .registry()
+            .add(9u32, None, ResourceType::Other)
+            .expect("resource")
+            .into_id();
+        let dep = selium_abi::DependencyId([8; 16]);
+        ctx.registry()
+            .registry()
+            .register_singleton(dep, resource_id)
+            .expect("register singleton");
+        let driver = SingletonLookupDriver(SingletonRegistryService);
+
+        let shared = driver
+            .to_future(&mut ctx, SingletonLookup { id: dep })
+            .await
+            .expect("lookup");
+        let resolved = ctx
+            .registry()
+            .registry()
+            .resolve_shared(shared)
+            .expect("resolved shared handle");
+        assert_eq!(resolved, resource_id);
+    }
+}

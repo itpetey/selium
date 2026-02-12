@@ -110,3 +110,48 @@ fn dn(common_name: &str) -> DistinguishedName {
     dn.push(DnType::CommonName, common_name);
     dn
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("selium-certs-{id}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn build_path_uses_prefix_and_extension() {
+        let path = build_path(Path::new("/tmp"), "server", "crt");
+        assert_eq!(path, PathBuf::from("/tmp/server.crt"));
+    }
+
+    #[test]
+    fn generate_certificates_writes_all_expected_files() {
+        let dir = temp_dir();
+        generate_certificates(&dir, "Test CA", "localhost", "client.localhost")
+            .expect("generate certs");
+
+        for name in [
+            "ca.crt",
+            "ca.key",
+            "server.crt",
+            "server.key",
+            "client.crt",
+            "client.key",
+        ] {
+            let path = dir.join(name);
+            let contents = fs::read_to_string(&path).expect("read cert file");
+            assert!(!contents.is_empty(), "{name} should be non-empty");
+        }
+    }
+}

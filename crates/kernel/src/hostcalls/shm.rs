@@ -321,3 +321,215 @@ where
         ),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use crate::{
+        registry::{InstanceRegistry, Registry, ResourceType},
+        spi::shared_memory::SharedMemoryCapability,
+    };
+
+    struct TestContext {
+        registry: InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn context() -> TestContext {
+        let registry = Registry::new();
+        let instance = registry.instance().expect("instance");
+        TestContext { registry: instance }
+    }
+
+    type ReadRecord = (ShmRegion, GuestUint, GuestUint);
+    type WriteRecord = (ShmRegion, GuestUint, Vec<u8>);
+
+    #[derive(Clone, Default)]
+    struct MemoryCapability {
+        reads: Arc<Mutex<Vec<ReadRecord>>>,
+        writes: Arc<Mutex<Vec<WriteRecord>>>,
+    }
+
+    impl SharedMemoryCapability for MemoryCapability {
+        type Error = GuestError;
+
+        fn alloc(&self, request: ShmAlloc) -> Result<ShmRegion, Self::Error> {
+            Ok(ShmRegion {
+                offset: request.align,
+                len: request.size,
+            })
+        }
+
+        fn read(
+            &self,
+            region: ShmRegion,
+            offset: GuestUint,
+            len: GuestUint,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.reads
+                .lock()
+                .expect("reads lock")
+                .push((region, offset, len));
+            Ok(vec![1, 2, 3])
+        }
+
+        fn write(
+            &self,
+            region: ShmRegion,
+            offset: GuestUint,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.writes
+                .lock()
+                .expect("writes lock")
+                .push((region, offset, bytes.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn alloc_returns_descriptor_and_shared_handle() {
+        let mut ctx = context();
+        let capability = MemoryCapability::default();
+        let driver = ShmAllocDriver(capability);
+
+        let descriptor = driver
+            .to_future(&mut ctx, ShmAlloc { size: 64, align: 8 })
+            .await
+            .expect("alloc");
+        let resource_id = ctx
+            .registry()
+            .entry(descriptor.resource_id as usize)
+            .expect("local slot");
+        let resolved = ctx
+            .registry()
+            .registry()
+            .resolve_shared(descriptor.shared_id)
+            .expect("shared handle");
+        assert_eq!(resolved, resource_id);
+    }
+
+    #[tokio::test]
+    async fn share_rejects_non_shared_memory_resource() {
+        let mut ctx = context();
+        let slot = ctx
+            .registry_mut()
+            .insert(5u32, None, ResourceType::Other)
+            .expect("insert");
+        let driver = ShmShareDriver;
+
+        let err = driver
+            .to_future(
+                &mut ctx,
+                ShmShare {
+                    resource_id: slot as u32,
+                },
+            )
+            .await
+            .expect_err("non-shm should fail");
+        assert!(matches!(err, GuestError::InvalidArgument));
+    }
+
+    #[tokio::test]
+    async fn attach_and_detach_round_trip() {
+        let mut ctx = context();
+        let region = ShmRegion { offset: 2, len: 16 };
+        let resource_id = ctx
+            .registry()
+            .registry()
+            .add(region, None, ResourceType::SharedMemory)
+            .expect("add region")
+            .into_id();
+        let shared_id = ctx
+            .registry()
+            .registry()
+            .share_handle(resource_id)
+            .expect("share handle");
+
+        let attach_driver = ShmAttachDriver;
+        let descriptor = attach_driver
+            .to_future(&mut ctx, ShmAttach { shared_id })
+            .await
+            .expect("attach");
+        assert_eq!(descriptor.shared_id, shared_id);
+        assert_eq!(descriptor.region, region);
+
+        let detach_driver = ShmDetachDriver;
+        detach_driver
+            .to_future(
+                &mut ctx,
+                ShmDetach {
+                    resource_id: descriptor.resource_id,
+                },
+            )
+            .await
+            .expect("detach");
+        assert!(
+            ctx.registry()
+                .entry(descriptor.resource_id as usize)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_and_write_delegate_to_capability() {
+        let mut ctx = context();
+        let capability = MemoryCapability::default();
+        let read_driver = ShmReadDriver(capability.clone());
+        let write_driver = ShmWriteDriver(capability.clone());
+        let slot = ctx
+            .registry_mut()
+            .insert(
+                ShmRegion {
+                    offset: 10,
+                    len: 20,
+                },
+                None,
+                ResourceType::SharedMemory,
+            )
+            .expect("insert region");
+
+        let read = read_driver
+            .to_future(
+                &mut ctx,
+                ShmRead {
+                    resource_id: slot as u32,
+                    offset: 2,
+                    len: 3,
+                },
+            )
+            .await
+            .expect("read");
+        assert_eq!(read, vec![1, 2, 3]);
+
+        write_driver
+            .to_future(
+                &mut ctx,
+                ShmWrite {
+                    resource_id: slot as u32,
+                    offset: 4,
+                    bytes: vec![8, 9],
+                },
+            )
+            .await
+            .expect("write");
+
+        assert_eq!(capability.reads.lock().expect("reads lock").len(), 1);
+        assert_eq!(capability.writes.lock().expect("writes lock").len(), 1);
+    }
+}

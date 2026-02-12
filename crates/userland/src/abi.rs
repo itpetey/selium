@@ -55,3 +55,39 @@ pub unsafe fn utf8_from_parts<'a>(ptr: u32, len: u32) -> Result<&'a str, GuestDe
     let buf = unsafe { buffer_from_parts(ptr, len)? };
     str::from_utf8(buf).map_err(|_| GuestDecodeError::InvalidUtf8)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_pointer_or_length_returns_empty_slice() {
+        let bytes = unsafe { buffer_from_parts(0, 0) }.expect("decode");
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn utf8_from_parts_decodes_valid_input() {
+        let data = b"hello";
+        let addr = data.as_ptr() as usize;
+        if addr > u32::MAX as usize {
+            return;
+        }
+
+        let value = unsafe { utf8_from_parts(addr as u32, data.len() as u32) }.expect("utf8");
+        assert_eq!(value, "hello");
+    }
+
+    #[test]
+    fn utf8_from_parts_rejects_invalid_utf8() {
+        let data = [0xffu8, 0xfe];
+        let addr = data.as_ptr() as usize;
+        if addr > u32::MAX as usize {
+            return;
+        }
+
+        let err =
+            unsafe { utf8_from_parts(addr as u32, data.len() as u32) }.expect_err("invalid utf8");
+        assert!(matches!(err, GuestDecodeError::InvalidUtf8));
+    }
+}

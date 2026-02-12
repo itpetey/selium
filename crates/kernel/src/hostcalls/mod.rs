@@ -193,3 +193,124 @@ where
         Ok(guest_result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{pin::Pin, task::Waker};
+
+    use selium_abi::{Capability, hostcalls::Hostcall};
+
+    use crate::{
+        registry::{InstanceRegistry, Registry},
+        spi::wake_mailbox::WakeMailbox,
+    };
+
+    struct NoopMailbox;
+
+    impl WakeMailbox for NoopMailbox {
+        fn refresh_base(&self, _base: usize) {}
+
+        fn close(&self) {}
+
+        fn waker(&'static self, _task_id: usize) -> Waker {
+            Waker::noop().clone()
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn is_signalled(&self) -> bool {
+            false
+        }
+
+        fn wait_for_signal<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    struct TestContext {
+        registry: InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct IncrementContract;
+
+    impl Contract for IncrementContract {
+        type Input = u32;
+        type Output = u32;
+
+        #[allow(clippy::manual_async_fn)]
+        fn to_future<C>(
+            &self,
+            _context: &mut C,
+            input: Self::Input,
+        ) -> impl Future<Output = GuestResult<Self::Output>> + Send + 'static
+        where
+            C: HostcallContext,
+        {
+            async move { Ok(input + 1) }
+        }
+    }
+
+    fn context() -> TestContext {
+        let registry = Registry::new();
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .load_mailbox(Box::leak(Box::new(NoopMailbox)))
+            .expect("mailbox");
+        TestContext { registry: instance }
+    }
+
+    #[test]
+    fn from_hostcall_uses_canonical_module_name() {
+        const TEST_HOSTCALL: Hostcall<u32, u32> =
+            Hostcall::new("selium::test::inc", Capability::TimeRead);
+        let op = Operation::from_hostcall(IncrementContract, &TEST_HOSTCALL);
+        assert_eq!(op.module(), "selium::test::inc");
+    }
+
+    #[tokio::test]
+    async fn create_and_drop_state_round_trip() {
+        let mut ctx = context();
+        let op = Operation::new(IncrementContract, "selium::test");
+        let state_id = op.create_with_input(&mut ctx, 41).expect("create future");
+
+        let dropped = op
+            .drop_state(&mut ctx, state_id)
+            .expect("drop state")
+            .expect("drop result");
+        assert!(dropped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_state_returns_ready_payload() {
+        let mut ctx = context();
+        let op = Operation::new(IncrementContract, "selium::test");
+        let state_id = op.create_with_input(&mut ctx, 1).expect("create");
+
+        tokio::task::yield_now().await;
+
+        let result = op
+            .poll_state(&mut ctx, state_id, 1)
+            .expect("poll")
+            .expect("ready");
+        let decoded = selium_abi::decode_rkyv::<u32>(&result).expect("decode");
+        assert_eq!(decoded, 2);
+    }
+}

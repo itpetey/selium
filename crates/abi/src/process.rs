@@ -109,3 +109,81 @@ pub struct ProcessStart {
     /// Entrypoint invocation details.
     pub entrypoint: EntrypointInvocation,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invocation_new_accepts_matching_arguments() {
+        let signature = AbiSignature::new(
+            vec![
+                AbiParam::Scalar(AbiScalarType::I32),
+                AbiParam::Buffer,
+                AbiParam::Scalar(AbiScalarType::U64),
+            ],
+            Vec::new(),
+        );
+        let args = vec![
+            EntrypointArg::Scalar(AbiScalarValue::I32(7)),
+            EntrypointArg::Buffer(vec![1, 2, 3]),
+            EntrypointArg::Resource(99),
+        ];
+
+        let invocation = EntrypointInvocation::new(signature, args).expect("valid invocation");
+        assert_eq!(invocation.args.len(), 3);
+    }
+
+    #[test]
+    fn invocation_validate_rejects_argument_count_mismatch() {
+        let signature = AbiSignature::new(vec![AbiParam::Scalar(AbiScalarType::I32)], Vec::new());
+        let invocation = EntrypointInvocation {
+            signature,
+            args: Vec::new(),
+        };
+
+        let err = invocation.validate().expect_err("expected mismatch");
+        assert!(matches!(
+            err,
+            CallPlanError::ParameterCount {
+                expected: 1,
+                actual: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn invocation_validate_rejects_scalar_type_mismatch() {
+        let signature = AbiSignature::new(vec![AbiParam::Scalar(AbiScalarType::I32)], Vec::new());
+        let invocation = EntrypointInvocation {
+            signature,
+            args: vec![EntrypointArg::Scalar(AbiScalarValue::U32(1))],
+        };
+
+        let err = invocation.validate().expect_err("expected mismatch");
+        assert!(matches!(
+            err,
+            CallPlanError::ValueMismatch {
+                reason: "scalar type mismatch",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invocation_validate_accepts_resource_for_i32_and_u64() {
+        let signature = AbiSignature::new(
+            vec![
+                AbiParam::Scalar(AbiScalarType::I32),
+                AbiParam::Scalar(AbiScalarType::U64),
+            ],
+            Vec::new(),
+        );
+        let invocation = EntrypointInvocation {
+            signature,
+            args: vec![EntrypointArg::Resource(1), EntrypointArg::Resource(2)],
+        };
+
+        invocation.validate().expect("resources are accepted");
+    }
+}

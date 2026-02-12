@@ -88,3 +88,20 @@ driver_module!(shm_attach, SHM_ATTACH, "selium::shm::attach");
 driver_module!(shm_detach, SHM_DETACH, "selium::shm::detach");
 driver_module!(shm_read, SHM_READ, "selium::shm::read");
 driver_module!(shm_write, SHM_WRITE, "selium::shm::write");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_returns_kernel_error_with_native_stub_driver() {
+        let err = crate::block_on(alloc(64, 8)).expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+
+    #[test]
+    fn read_returns_kernel_error_with_native_stub_driver() {
+        let err = crate::block_on(read(1, 0, 4)).expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+}

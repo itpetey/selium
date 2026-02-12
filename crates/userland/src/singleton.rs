@@ -34,3 +34,21 @@ driver_module!(
     SINGLETON_LOOKUP,
     "selium::singleton::lookup"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_returns_kernel_error_with_native_stub_driver() {
+        let err =
+            crate::block_on(register(DependencyId([0; 16]), 1)).expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+
+    #[test]
+    fn lookup_returns_kernel_error_with_native_stub_driver() {
+        let err = crate::block_on(lookup(DependencyId([1; 16]))).expect_err("stub should fail");
+        assert!(matches!(err, DriverError::Kernel(2)));
+    }
+}

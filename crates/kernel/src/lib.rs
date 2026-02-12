@@ -70,3 +70,22 @@ impl KernelBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct CapabilityA(u32);
+
+    #[test]
+    fn kernel_builder_stores_and_recovers_capabilities_by_type() {
+        let mut builder = Kernel::build();
+        let cap = builder.add_capability(Arc::new(CapabilityA(7)));
+        assert_eq!(cap.0, 7);
+
+        let kernel = builder.build().expect("build kernel");
+        let recovered = kernel.get::<CapabilityA>().expect("capability present");
+        assert_eq!(recovered.0, 7);
+    }
+}

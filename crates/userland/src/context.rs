@@ -70,3 +70,59 @@ impl Context {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct DummyHandle(GuestResourceId);
+
+    impl crate::FromHandle for DummyHandle {
+        type Handles = GuestResourceId;
+
+        unsafe fn from_handle(handles: Self::Handles) -> Self {
+            Self(handles)
+        }
+    }
+
+    struct DummyDependency;
+
+    impl Dependency for DummyDependency {
+        type Handle = DummyHandle;
+        type Error = std::io::Error;
+
+        const DESCRIPTOR: DependencyDescriptor =
+            DependencyDescriptor::new("dummy", selium_abi::DependencyId([1; 16]));
+
+        fn from_handle(handle: Self::Handle) -> impl Future<Output = Result<Self, Self::Error>> {
+            let _ = handle.0;
+            async { Ok(Self) }
+        }
+    }
+
+    #[test]
+    fn descriptor_constructor_sets_fields() {
+        let descriptor = DependencyDescriptor::new("clock", selium_abi::DependencyId([2; 16]));
+        assert_eq!(descriptor.name, "clock");
+        assert_eq!(descriptor.id, selium_abi::DependencyId([2; 16]));
+    }
+
+    #[test]
+    fn singleton_lookup_surfaces_driver_errors() {
+        let ctx = Context::current();
+        match crate::block_on(ctx.singleton::<DummyDependency>()) {
+            Ok(_) => panic!("expected driver error"),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(-2)),
+        }
+    }
+
+    #[test]
+    fn require_panics_when_dependency_lookup_fails() {
+        let ctx = Context::current();
+        let panic = std::panic::catch_unwind(|| {
+            crate::block_on(ctx.require::<DummyDependency>());
+        });
+        assert!(panic.is_err());
+    }
+}

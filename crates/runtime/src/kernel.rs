@@ -103,3 +103,32 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
 
     Ok((builder.build()?, shutdown))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::wasmtime::runtime::WasmtimeProcessDriver;
+
+    fn temp_dir() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("selium-kernel-build-{id}"));
+        fs::create_dir_all(path.join("modules")).expect("create modules dir");
+        path
+    }
+
+    #[test]
+    fn build_registers_runtime_capabilities() {
+        let dir = temp_dir();
+        let (kernel, _shutdown) = build(&dir).expect("build kernel");
+        let process_driver = kernel.get::<WasmtimeProcessDriver>();
+        assert!(process_driver.is_some());
+    }
+}

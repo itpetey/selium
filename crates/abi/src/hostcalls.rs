@@ -226,3 +226,60 @@ declare_hostcalls! {
         output: ()
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_accessors_return_expected_metadata() {
+        let meta = SESSION_CREATE.meta();
+        assert_eq!(SESSION_CREATE.name(), "selium::session::create");
+        assert_eq!(SESSION_CREATE.capability(), Capability::SessionLifecycle);
+        assert_eq!(meta.name, SESSION_CREATE.name());
+        assert_eq!(meta.capability, SESSION_CREATE.capability());
+    }
+
+    #[test]
+    fn hostcall_catalogue_contains_unique_entries() {
+        let mut names: Vec<&str> = ALL.iter().map(|meta| meta.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL.len());
+    }
+
+    #[test]
+    fn by_capability_groups_hostcalls() {
+        let grouped = by_capability();
+        assert_eq!(
+            grouped
+                .get(&Capability::SessionLifecycle)
+                .expect("session lifecycle entries")
+                .len(),
+            6
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::SharedMemory)
+                .expect("shared memory entries")
+                .len(),
+            6
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::ProcessLifecycle)
+                .expect("process lifecycle entries")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn exported_hostcall_macros_expand_to_expected_values() {
+        let name = hostcall_name!(SESSION_CREATE);
+        let contract = hostcall_contract!(SESSION_CREATE);
+        assert_eq!(name, "selium::session::create");
+        assert_eq!(contract.name(), name);
+        assert_eq!(contract.capability(), Capability::SessionLifecycle);
+    }
+}
