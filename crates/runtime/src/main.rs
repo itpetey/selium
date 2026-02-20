@@ -16,6 +16,7 @@ mod certs;
 mod kernel;
 mod modules;
 mod providers;
+mod wamr;
 mod wasmtime;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -24,6 +25,14 @@ enum LogFormat {
     Text,
     /// JSON logs for ingestion into systems such as Loki or OTLP collectors.
     Json,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub(crate) enum RuntimeEngine {
+    /// Use the WAMR backend.
+    Wamr,
+    /// Use the Wasmtime backend.
+    Wasmtime,
 }
 
 #[derive(Parser, Debug)]
@@ -40,6 +49,9 @@ struct ServerOptions {
     /// Module specification to start (repeatable). Format: `path=...;capabilities=...;args=...`
     #[arg(long, value_name = "SPEC")]
     module: Option<Vec<String>>,
+    /// Wasm runtime backend used for guest execution.
+    #[arg(long, env = "SELIUM_RUNTIME_ENGINE", default_value = "wamr")]
+    engine: RuntimeEngine,
 }
 
 #[derive(Subcommand, Debug)]
@@ -141,7 +153,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (kernel, shutdown) = kernel::build(&args.work_dir).context("build runtime kernel")?;
+    let (kernel, shutdown) =
+        kernel::build(&args.work_dir, args.engine).context("build runtime kernel")?;
     let registry = Registry::new();
     run(
         kernel,
@@ -164,6 +177,7 @@ mod tests {
         assert_eq!(opts.log_format, LogFormat::Text);
         assert!(opts.command.is_none());
         assert_eq!(opts.work_dir, PathBuf::from("."));
+        assert_eq!(opts.engine, RuntimeEngine::Wamr);
     }
 
     #[test]

@@ -52,6 +52,7 @@ tracing-subscriber = { workspace = true, features = [
   "json",
   "std",
 ] }
+wamr-rust-sdk = { workspace = true }
 wasmtime = { workspace = true, features = [
   "async",
   "cranelift",

@@ -1,5 +1,6 @@
 //! Kernel service implementations.
 
+#[cfg(feature = "service-session")]
 pub mod session_service;
 #[cfg(feature = "service-shared-memory")]
 pub mod shared_memory_service;

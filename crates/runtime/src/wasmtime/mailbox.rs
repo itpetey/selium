@@ -54,16 +54,23 @@ unsafe impl Sync for GuestMailbox {}
 
 impl GuestMailbox {
     /// # Safety
-    /// * `memory` / `store` must reference a mailbox layout produced by the guest helper.
-    /// * The pointed-to memory must not be reclaimed while the mailbox lives.
-    /// * Only host code may mutate the mailbox slots; guests may read them.
-    unsafe fn new<T>(memory: &Memory, store: &mut Store<T>) -> Self {
-        let base = memory.data_ptr(store) as usize;
+    /// * `base` must point to the start of guest linear memory containing a mailbox layout.
+    /// * The pointed-to memory must remain valid for the mailbox lifetime.
+    unsafe fn from_base(base: usize) -> Self {
         Self {
             base: AtomicUsize::new(base),
             closed: AtomicBool::new(false),
             notify: Notify::new(),
         }
+    }
+
+    /// # Safety
+    /// * `memory` / `store` must reference a mailbox layout produced by the guest helper.
+    /// * The pointed-to memory must not be reclaimed while the mailbox lives.
+    /// * Only host code may mutate the mailbox slots; guests may read them.
+    unsafe fn new<T>(memory: &Memory, store: &mut Store<T>) -> Self {
+        let base = memory.data_ptr(store) as usize;
+        unsafe { Self::from_base(base) }
     }
 
     /// Refresh the cached guest memory base in case the instance grew its linear memory.
@@ -190,6 +197,12 @@ pub unsafe fn create_guest_mailbox<T>(
     store: &mut Store<T>,
 ) -> &'static GuestMailbox {
     Box::leak(Box::new(unsafe { GuestMailbox::new(memory, store) }))
+}
+
+/// # Safety
+/// Leaks a GuestMailbox to 'static; caller is responsible for process lifetime semantics.
+pub unsafe fn create_guest_mailbox_from_base(base: usize) -> &'static GuestMailbox {
+    Box::leak(Box::new(unsafe { GuestMailbox::from_base(base) }))
 }
 
 #[cfg(test)]

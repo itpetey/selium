@@ -16,7 +16,10 @@ use selium_kernel::{
 use tokio::sync::Notify;
 
 use crate::{
+    RuntimeEngine,
     providers::module_repository_fs::FilesystemModuleRepository,
+    wamr::hostcall_linker::{WamrHostcallOperation, WamrOperationExt},
+    wamr::runtime::{WamrProcessDriver, WamrRuntime},
     wasmtime::runtime::{WasmtimeProcessDriver, WasmtimeRuntime},
     wasmtime::{
         guest_async::GuestAsync,
@@ -27,10 +30,11 @@ use crate::{
 /// Where WASM modules are stored.
 const MODULES_SUBDIR: &str = "modules";
 
-pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
+pub fn build(work_dir: impl AsRef<Path>, engine: RuntimeEngine) -> Result<(Kernel, Arc<Notify>)> {
     let modules_dir: PathBuf = work_dir.as_ref().join(MODULES_SUBDIR);
     let mut builder = Kernel::build();
     let mut capability_ops: HashMap<Capability, Vec<Arc<dyn LinkableOperation>>> = HashMap::new();
+    let mut wamr_ops: HashMap<Capability, Vec<Arc<dyn WamrHostcallOperation>>> = HashMap::new();
 
     // Session lifecycle.
     let session_driver = builder
@@ -47,6 +51,17 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
             session.4.as_linkable(),
             session.5.as_linkable(),
         ]);
+    wamr_ops
+        .entry(Capability::SessionLifecycle)
+        .or_default()
+        .extend([
+            session.0.as_wamr_operation(),
+            session.1.as_wamr_operation(),
+            session.2.as_wamr_operation(),
+            session.3.as_wamr_operation(),
+            session.4.as_wamr_operation(),
+            session.5.as_wamr_operation(),
+        ]);
 
     // Singleton registry.
     let singleton = singleton::operations(SingletonRegistryService);
@@ -58,6 +73,14 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
         .entry(Capability::SingletonLookup)
         .or_default()
         .push(singleton.1.as_linkable());
+    wamr_ops
+        .entry(Capability::SingletonRegistry)
+        .or_default()
+        .push(singleton.0.as_wamr_operation());
+    wamr_ops
+        .entry(Capability::SingletonLookup)
+        .or_default()
+        .push(singleton.1.as_wamr_operation());
 
     // Time.
     let time = time::operations(SystemTimeService);
@@ -65,6 +88,10 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
         .entry(Capability::TimeRead)
         .or_default()
         .extend([time.0.as_linkable(), time.1.as_linkable()]);
+    wamr_ops
+        .entry(Capability::TimeRead)
+        .or_default()
+        .extend([time.0.as_wamr_operation(), time.1.as_wamr_operation()]);
 
     // Shared memory.
     let shm_driver = builder.add_capability(SharedMemoryDriver::new());
@@ -80,25 +107,53 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
             shm.4.as_linkable(),
             shm.5.as_linkable(),
         ]);
+    wamr_ops
+        .entry(Capability::SharedMemory)
+        .or_default()
+        .extend([
+            shm.0.as_wamr_operation(),
+            shm.1.as_wamr_operation(),
+            shm.2.as_wamr_operation(),
+            shm.3.as_wamr_operation(),
+            shm.4.as_wamr_operation(),
+            shm.5.as_wamr_operation(),
+        ]);
 
-    let shutdown = Arc::new(Notify::new());
-    let guest_async = builder.add_capability(Arc::new(GuestAsync::new(Arc::clone(&shutdown))));
-    let wasmtime_runtime = Arc::new(WasmtimeRuntime::new(
-        capability_ops.clone(),
-        Arc::clone(&guest_async),
-    )?);
     let module_repository: Arc<FilesystemModuleRepository> =
         builder.add_capability(Arc::new(FilesystemModuleRepository::new(&modules_dir)));
-    let wasmtime = builder.add_capability(WasmtimeProcessDriver::new(
-        wasmtime_runtime.clone(),
-        module_repository,
-    ));
+    let shutdown = Arc::new(Notify::new());
 
-    let process = process::lifecycle_ops(wasmtime);
-    wasmtime_runtime.extend_capability(
-        Capability::ProcessLifecycle,
-        vec![process.0.as_linkable(), process.1.as_linkable()],
-    )?;
+    match engine {
+        RuntimeEngine::Wamr => {
+            let wamr_runtime = Arc::new(WamrRuntime::new(wamr_ops)?);
+            let wamr = builder.add_capability(WamrProcessDriver::new(
+                Arc::clone(&wamr_runtime),
+                module_repository,
+            ));
+            let process = process::lifecycle_ops(wamr);
+            wamr_runtime.extend_capability(
+                Capability::ProcessLifecycle,
+                vec![process.0.as_wamr_operation(), process.1.as_wamr_operation()],
+            )?;
+        }
+        RuntimeEngine::Wasmtime => {
+            let guest_async =
+                builder.add_capability(Arc::new(GuestAsync::new(Arc::clone(&shutdown))));
+            let wasmtime_runtime = Arc::new(WasmtimeRuntime::new(
+                capability_ops.clone(),
+                Arc::clone(&guest_async),
+            )?);
+            let wasmtime = builder.add_capability(WasmtimeProcessDriver::new(
+                wasmtime_runtime.clone(),
+                module_repository,
+            ));
+            let process = process::lifecycle_ops(wasmtime);
+            wasmtime_runtime.extend_capability(
+                Capability::ProcessLifecycle,
+                vec![process.0.as_linkable(), process.1.as_linkable()],
+            )?;
+        }
+    }
 
     Ok((builder.build()?, shutdown))
 }
@@ -111,7 +166,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::wasmtime::runtime::WasmtimeProcessDriver;
+    use crate::{wamr::runtime::WamrProcessDriver, wasmtime::runtime::WasmtimeProcessDriver};
 
     fn temp_dir() -> PathBuf {
         let id = SystemTime::now()
@@ -126,8 +181,11 @@ mod tests {
     #[test]
     fn build_registers_runtime_capabilities() {
         let dir = temp_dir();
-        let (kernel, _shutdown) = build(&dir).expect("build kernel");
-        let process_driver = kernel.get::<WasmtimeProcessDriver>();
-        assert!(process_driver.is_some());
+        let (wamr_kernel, _shutdown) = build(&dir, RuntimeEngine::Wamr).expect("build kernel");
+        assert!(wamr_kernel.get::<WamrProcessDriver>().is_some());
+
+        let (wasmtime_kernel, _shutdown) =
+            build(&dir, RuntimeEngine::Wasmtime).expect("build kernel");
+        assert!(wasmtime_kernel.get::<WasmtimeProcessDriver>().is_some());
     }
 }

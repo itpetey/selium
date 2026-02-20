@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::wasmtime::runtime::{Error as WasmtimeError, WasmtimeProcessDriver};
+use crate::{wamr::runtime::WamrProcessDriver, wasmtime::runtime::WasmtimeProcessDriver};
 use anyhow::{Context, Result, anyhow, bail};
 use selium_abi::{
     AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, Capability, EntrypointArg,
@@ -114,12 +114,27 @@ pub async fn spawn_from_cli(
     specs: &[String],
 ) -> Result<Vec<ResourceId>> {
     let specs = parse_module_specs(specs, work_dir.as_ref())?;
-    let runtime = kernel.get::<WasmtimeProcessDriver>().ok_or_else(|| {
-        WasmtimeError::Kernel(KernelError::Driver(
-            "missing Wasmtime process driver in kernel".to_string(),
-        ))
-    })?;
+    if let Some(runtime) = kernel.get::<WamrProcessDriver>() {
+        return spawn_with_driver(runtime, registry, specs).await;
+    }
+    if let Some(runtime) = kernel.get::<WasmtimeProcessDriver>() {
+        return spawn_with_driver(runtime, registry, specs).await;
+    }
 
+    Err(anyhow!(KernelError::Driver(
+        "missing process driver in kernel".to_string()
+    )))
+}
+
+async fn spawn_with_driver<D>(
+    runtime: &D,
+    registry: &Arc<Registry>,
+    specs: Vec<ModuleSpec>,
+) -> Result<Vec<ResourceId>>
+where
+    D: ProcessLifecycleCapability,
+    D::Error: std::fmt::Display,
+{
     let mut processes = Vec::with_capacity(specs.len());
     for spec in specs {
         let process_id = spawn_module(runtime, registry, spec).await?;
@@ -534,11 +549,15 @@ fn hex_digit(byte: u8) -> Result<u8> {
     }
 }
 
-async fn spawn_module(
-    runtime: &WasmtimeProcessDriver,
+async fn spawn_module<D>(
+    runtime: &D,
     registry: &Arc<Registry>,
     spec: ModuleSpec,
-) -> Result<ResourceId> {
+) -> Result<ResourceId>
+where
+    D: ProcessLifecycleCapability,
+    D::Error: std::fmt::Display,
+{
     let process_id = registry
         .reserve(None, ResourceType::Process)
         .map_err(KernelError::from)
@@ -559,11 +578,9 @@ async fn spawn_module(
         EntrypointInvocation::new(AbiSignature::new(params, Vec::new()), args)
             .with_context(|| format!("build entrypoint invocation for {module_label}"))?;
 
-    let module_id = module_path.to_str().ok_or_else(|| {
-        WasmtimeError::Kernel(KernelError::Driver(format!(
-            "module path for {module_label} is not valid UTF-8"
-        )))
-    })?;
+    let module_id = module_path
+        .to_str()
+        .ok_or_else(|| anyhow!("module path for {module_label} is not valid UTF-8"))?;
 
     if let Err(err) = runtime
         .start(
@@ -577,7 +594,8 @@ async fn spawn_module(
         .await
     {
         registry.discard(process_id);
-        return Err(err).with_context(|| format!("start module {module_label}"));
+        return Err(anyhow!(err.to_string()))
+            .with_context(|| format!("start module {module_label}"));
     }
 
     Ok(process_id)

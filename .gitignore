@@ -2,3 +2,4 @@
 examples/**/target
 certs
 /modules
+*.profraw
