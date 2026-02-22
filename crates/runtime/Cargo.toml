@@ -52,10 +52,13 @@ tracing-subscriber = { workspace = true, features = [
   "json",
   "std",
 ] }
-wamr-rust-sdk = { workspace = true }
+wamr-rust-sdk = { workspace = true, features = ["shared-heap"] }
 wasmtime = { workspace = true, features = [
   "async",
   "cranelift",
   "runtime",
   "std"
 ] }
+
+[dev-dependencies]
+wat = { workspace = true }

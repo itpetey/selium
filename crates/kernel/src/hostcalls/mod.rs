@@ -10,6 +10,7 @@ use crate::{
     r#async::futures::FutureSharedState,
     guest_error::{GuestError, GuestResult},
     registry::InstanceRegistry,
+    spi::shared_memory::SharedMemoryBindingContext,
 };
 
 pub mod process;
@@ -28,6 +29,11 @@ pub trait HostcallContext {
 
     /// Return the current guest memory base pointer if available.
     fn mailbox_base(&mut self) -> Option<usize>;
+
+    /// Return runtime-specific shared-memory mapping bindings when available.
+    fn shared_memory_binding(&mut self) -> Option<&mut dyn SharedMemoryBindingContext> {
+        None
+    }
 }
 
 /// Contract implemented by hostcall drivers.

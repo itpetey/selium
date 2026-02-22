@@ -53,7 +53,8 @@ trybuild = { version = "1.0", default-features = false }
 uuid = { version = "1.20", default-features = false }
 wasmtime = { version = "41.0", default-features = false }
 webpki-roots = { version = "1.0", default-features = false }
-wamr-rust-sdk = { version = "1.0", default-features = false }
+wamr-rust-sdk = { version = "1.0", default-features = false, features = ["shared-heap"] }
+wat = { version = "1.0", default-features = false }
 
 [patch.crates-io]
 wamr-rust-sdk = { path = "vendor/wamr-rust-sdk" }

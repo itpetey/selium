@@ -25,6 +25,7 @@ use selium_kernel::{
     spi::{
         module_repository::{ModuleRepositoryError, ModuleRepositoryReadCapability},
         process::ProcessLifecycleCapability,
+        shared_memory::SharedMemoryBindingContext,
     },
 };
 use tokio::task::JoinHandle;
@@ -41,7 +42,8 @@ use wamr_rust_sdk::sys::{
 };
 
 use crate::{
-    wamr::hostcall_linker::WamrHostcallOperation, wasmtime::mailbox::create_guest_mailbox_from_base,
+    wamr::hostcall_linker::WamrHostcallOperation, wamr::shared_heap_manager::SharedHeapManager,
+    wasmtime::mailbox::create_guest_mailbox_from_base,
 };
 
 const STACK_SIZE: u32 = 64 * 1024;
@@ -94,11 +96,14 @@ struct NativeHostcallAttachment {
 struct HostcallInvocationContext {
     registry: *mut InstanceRegistry,
     capabilities: *const HashSet<Capability>,
+    shared_heaps: Option<Arc<SharedHeapManager>>,
 }
 
 struct WamrHostcallContext<'a> {
     registry: &'a mut InstanceRegistry,
     mailbox_base: Option<usize>,
+    module_inst: wasm_module_inst_t,
+    shared_heaps: Option<Arc<SharedHeapManager>>,
 }
 
 struct WamrHostcallTable {
@@ -159,10 +164,15 @@ impl NativeModuleRegistration {
 }
 
 impl HostcallInvocationContext {
-    fn new(registry: &mut InstanceRegistry, capabilities: &HashSet<Capability>) -> Self {
+    fn new(
+        registry: &mut InstanceRegistry,
+        capabilities: &HashSet<Capability>,
+        shared_heaps: Option<Arc<SharedHeapManager>>,
+    ) -> Self {
         Self {
             registry: registry as *mut InstanceRegistry,
             capabilities: capabilities as *const HashSet<Capability>,
+            shared_heaps,
         }
     }
 
@@ -198,6 +208,33 @@ impl HostcallContext for WamrHostcallContext<'_> {
 
     fn mailbox_base(&mut self) -> Option<usize> {
         self.mailbox_base
+    }
+
+    fn shared_memory_binding(&mut self) -> Option<&mut dyn SharedMemoryBindingContext> {
+        if self.shared_heaps.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl SharedMemoryBindingContext for WamrHostcallContext<'_> {
+    fn attach_mapping(
+        &mut self,
+        shared_id: selium_abi::GuestResourceId,
+    ) -> Result<GuestUint, GuestError> {
+        let manager = self.shared_heaps.as_ref().ok_or_else(|| {
+            GuestError::Subsystem("shared heap manager is unavailable".to_string())
+        })?;
+        manager.attach_for_instance(self.module_inst, shared_id)
+    }
+
+    fn detach_mapping(&mut self, shared_id: selium_abi::GuestResourceId) -> Result<(), GuestError> {
+        let manager = self.shared_heaps.as_ref().ok_or_else(|| {
+            GuestError::Subsystem("shared heap manager is unavailable".to_string())
+        })?;
+        manager.detach_for_instance(self.module_inst, shared_id)
     }
 }
 
@@ -419,12 +456,14 @@ impl From<Error> for GuestError {
 /// WAMR execution engine used by the runtime process lifecycle adapter.
 pub struct WamrRuntime {
     hostcalls: Arc<WamrHostcallTable>,
+    shared_heaps: Option<Arc<SharedHeapManager>>,
 }
 
 impl WamrRuntime {
     /// Create a new WAMR runtime and register Selium hostcall bindings.
     pub fn new(
         available_capabilities: HashMap<Capability, Vec<Arc<dyn WamrHostcallOperation>>>,
+        shared_heaps: Option<Arc<SharedHeapManager>>,
     ) -> Result<Self, Error> {
         if WAMR_INITIALISED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -446,7 +485,10 @@ impl WamrRuntime {
         let hostcalls = Arc::new(WamrHostcallTable::new(available_capabilities));
         register_hostcall_modules(Arc::clone(&hostcalls))?;
 
-        Ok(Self { hostcalls })
+        Ok(Self {
+            hostcalls,
+            shared_heaps,
+        })
     }
 
     /// Register additional hostcall operations for an already initialised capability.
@@ -546,8 +588,11 @@ impl WamrRuntime {
             }
 
             let exec_env = OwnedExecEnv::get(module_inst)?;
-            let mut invocation =
-                HostcallInvocationContext::new(&mut instance_registry, &requested_capabilities);
+            let mut invocation = HostcallInvocationContext::new(
+                &mut instance_registry,
+                &requested_capabilities,
+                self.shared_heaps.clone(),
+            );
             unsafe {
                 wasm_runtime_set_user_data(
                     exec_env.exec_env,
@@ -568,6 +613,9 @@ impl WamrRuntime {
         })();
 
         if !module_inst.is_null() {
+            if let Some(shared_heaps) = &self.shared_heaps {
+                shared_heaps.clear_instance(module_inst);
+            }
             unsafe {
                 wasm_runtime_deinstantiate(module_inst);
             }
@@ -811,9 +859,12 @@ fn dispatch_create(
     let invocation = hostcall_invocation(exec_env)?;
     let requested_capabilities = invocation.capabilities()?.clone();
     let mailbox_base = guest_memory_base(module_inst);
+    let shared_heaps = invocation.shared_heaps.clone();
     let mut context = WamrHostcallContext {
         registry: invocation.registry()?,
         mailbox_base,
+        module_inst,
+        shared_heaps,
     };
     let args = as_guest_slice(args_ptr, args_len)?;
     let operation = attachment
@@ -834,9 +885,12 @@ fn dispatch_poll(
     let invocation = hostcall_invocation(exec_env)?;
     let requested_capabilities = invocation.capabilities()?.clone();
     let mailbox_base = guest_memory_base(module_inst);
+    let shared_heaps = invocation.shared_heaps.clone();
     let mut context = WamrHostcallContext {
         registry: invocation.registry()?,
         mailbox_base,
+        module_inst,
+        shared_heaps,
     };
     let operation = attachment
         .table
@@ -858,9 +912,12 @@ fn dispatch_drop(
     let invocation = hostcall_invocation(exec_env)?;
     let requested_capabilities = invocation.capabilities()?.clone();
     let mailbox_base = guest_memory_base(module_inst);
+    let shared_heaps = invocation.shared_heaps.clone();
     let mut context = WamrHostcallContext {
         registry: invocation.registry()?,
         mailbox_base,
+        module_inst,
+        shared_heaps,
     };
     let operation = attachment
         .table

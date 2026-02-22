@@ -9,7 +9,6 @@ use selium_abi::Capability;
 use selium_kernel::{
     Kernel,
     hostcalls::{process, session, shm, singleton, time},
-    services::shared_memory_service::SharedMemoryDriver,
     services::singleton_service::SingletonRegistryService,
     services::time_service::SystemTimeService,
 };
@@ -20,6 +19,7 @@ use crate::{
     providers::module_repository_fs::FilesystemModuleRepository,
     wamr::hostcall_linker::{WamrHostcallOperation, WamrOperationExt},
     wamr::runtime::{WamrProcessDriver, WamrRuntime},
+    wamr::shared_heap_manager::{SharedHeapManager, WamrSharedMemoryService},
     wasmtime::runtime::{WasmtimeProcessDriver, WasmtimeRuntime},
     wasmtime::{
         guest_async::GuestAsync,
@@ -93,39 +93,29 @@ pub fn build(work_dir: impl AsRef<Path>, engine: RuntimeEngine) -> Result<(Kerne
         .or_default()
         .extend([time.0.as_wamr_operation(), time.1.as_wamr_operation()]);
 
-    // Shared memory.
-    let shm_driver = builder.add_capability(SharedMemoryDriver::new());
-    let shm = shm::operations(shm_driver);
-    capability_ops
-        .entry(Capability::SharedMemory)
-        .or_default()
-        .extend([
-            shm.0.as_linkable(),
-            shm.1.as_linkable(),
-            shm.2.as_linkable(),
-            shm.3.as_linkable(),
-            shm.4.as_linkable(),
-            shm.5.as_linkable(),
-        ]);
-    wamr_ops
-        .entry(Capability::SharedMemory)
-        .or_default()
-        .extend([
-            shm.0.as_wamr_operation(),
-            shm.1.as_wamr_operation(),
-            shm.2.as_wamr_operation(),
-            shm.3.as_wamr_operation(),
-            shm.4.as_wamr_operation(),
-            shm.5.as_wamr_operation(),
-        ]);
-
     let module_repository: Arc<FilesystemModuleRepository> =
         builder.add_capability(Arc::new(FilesystemModuleRepository::new(&modules_dir)));
     let shutdown = Arc::new(Notify::new());
 
     match engine {
         RuntimeEngine::Wamr => {
-            let wamr_runtime = Arc::new(WamrRuntime::new(wamr_ops)?);
+            let shared_heaps = SharedHeapManager::new();
+            let shm_driver =
+                builder.add_capability(WamrSharedMemoryService::new(Arc::clone(&shared_heaps)));
+            let shm = shm::operations(shm_driver);
+            wamr_ops
+                .entry(Capability::SharedMemory)
+                .or_default()
+                .extend([
+                    shm.0.as_wamr_operation(),
+                    shm.1.as_wamr_operation(),
+                    shm.2.as_wamr_operation(),
+                    shm.3.as_wamr_operation(),
+                    shm.4.as_wamr_operation(),
+                    shm.5.as_wamr_operation(),
+                ]);
+
+            let wamr_runtime = Arc::new(WamrRuntime::new(wamr_ops, Some(shared_heaps))?);
             let wamr = builder.add_capability(WamrProcessDriver::new(
                 Arc::clone(&wamr_runtime),
                 module_repository,

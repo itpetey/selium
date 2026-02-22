@@ -4,6 +4,31 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::{GuestResourceId, GuestUint};
 
+/// Byte width of a single ring header field.
+pub const SHM_RING_FIELD_BYTES: usize = core::mem::size_of::<GuestUint>();
+/// Magic marker stored in ring headers.
+pub const SHM_RING_MAGIC: GuestUint = 0x5348_4d52;
+/// Ring header version supported by this ABI.
+pub const SHM_RING_VERSION: GuestUint = 1;
+/// Offset of the magic field in the ring header.
+pub const SHM_RING_MAGIC_OFFSET: usize = 0;
+/// Offset of the version field in the ring header.
+pub const SHM_RING_VERSION_OFFSET: usize = SHM_RING_FIELD_BYTES;
+/// Offset of the capacity field in the ring header.
+pub const SHM_RING_CAPACITY_OFFSET: usize = SHM_RING_FIELD_BYTES * 2;
+/// Offset of the head cursor field in the ring header.
+pub const SHM_RING_HEAD_OFFSET: usize = SHM_RING_FIELD_BYTES * 3;
+/// Offset of the tail cursor field in the ring header.
+pub const SHM_RING_TAIL_OFFSET: usize = SHM_RING_FIELD_BYTES * 4;
+/// Offset of the sequence field in the ring header.
+pub const SHM_RING_SEQUENCE_OFFSET: usize = SHM_RING_FIELD_BYTES * 5;
+/// Offset of the flags field in the ring header.
+pub const SHM_RING_FLAGS_OFFSET: usize = SHM_RING_FIELD_BYTES * 6;
+/// Total size of the ring header in bytes.
+pub const SHM_RING_HEADER_BYTES: usize = SHM_RING_FIELD_BYTES * 7;
+/// Offset where ring payload bytes begin.
+pub const SHM_RING_PAYLOAD_OFFSET: usize = SHM_RING_HEADER_BYTES;
+
 /// Parameters for allocating a shared memory region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -32,6 +57,8 @@ pub struct ShmDescriptor {
     pub resource_id: GuestUint,
     /// Shared handle suitable for cross-instance transfer.
     pub shared_id: GuestResourceId,
+    /// Guest-visible base offset of the attached shared heap mapping.
+    pub mapping_offset: GuestUint,
     /// Region in the shared memory arena.
     pub region: ShmRegion,
 }
@@ -60,28 +87,52 @@ pub struct ShmDetach {
     pub resource_id: GuestUint,
 }
 
-/// Request to read bytes from a shared memory resource.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+/// Conditions that can satisfy a shared-memory wait operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ShmRead {
-    /// Instance-local resource table id.
-    pub resource_id: GuestUint,
-    /// Start offset relative to the region base.
-    pub offset: GuestUint,
-    /// Number of bytes to read.
-    pub len: GuestUint,
+pub enum ShmWaitCondition {
+    /// Wake when the ring contains at least one readable byte.
+    DataAvailable,
+    /// Wake when the ring contains at least one writable byte.
+    SpaceAvailable,
+    /// Wake when the ring sequence reaches or exceeds the requested value.
+    SequenceAtLeast(GuestUint),
 }
 
-/// Request to write bytes into a shared memory resource.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+/// Request to wait for ring readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ShmWrite {
+pub struct ShmWait {
     /// Instance-local resource table id.
     pub resource_id: GuestUint,
-    /// Start offset relative to the region base.
-    pub offset: GuestUint,
-    /// Bytes to write.
-    pub bytes: Vec<u8>,
+    /// Condition that must be met before the wait completes.
+    pub condition: ShmWaitCondition,
+}
+
+/// Request to notify waiters after mutating ring state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ShmNotify {
+    /// Instance-local resource table id.
+    pub resource_id: GuestUint,
+    /// New ring sequence value observed by the caller.
+    pub sequence: GuestUint,
+}
+
+/// Ring readiness snapshot returned by wait/notify hostcalls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ShmReady {
+    /// Current ring head cursor.
+    pub head: GuestUint,
+    /// Current ring tail cursor.
+    pub tail: GuestUint,
+    /// Current ring sequence.
+    pub sequence: GuestUint,
+    /// Number of readable payload bytes in the ring.
+    pub readable: GuestUint,
+    /// Number of writable payload bytes in the ring.
+    pub writable: GuestUint,
 }
 
 #[cfg(test)]
@@ -94,6 +145,7 @@ mod tests {
         let payload = ShmDescriptor {
             resource_id: 3,
             shared_id: 9,
+            mapping_offset: 32,
             region: ShmRegion {
                 offset: 16,
                 len: 64,
@@ -106,15 +158,27 @@ mod tests {
     }
 
     #[test]
-    fn write_payload_preserves_bytes() {
-        let payload = ShmWrite {
+    fn wait_payload_preserves_condition() {
+        let payload = ShmWait {
             resource_id: 1,
-            offset: 4,
-            bytes: vec![10, 20, 30],
+            condition: ShmWaitCondition::SequenceAtLeast(7),
         };
 
         let encoded = encode_rkyv(&payload).expect("encode");
-        let decoded = decode_rkyv::<ShmWrite>(&encoded).expect("decode");
-        assert_eq!(decoded.bytes, vec![10, 20, 30]);
+        let decoded = decode_rkyv::<ShmWait>(&encoded).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn ring_header_offsets_are_contiguous() {
+        assert_eq!(
+            SHM_RING_VERSION_OFFSET,
+            SHM_RING_MAGIC_OFFSET + SHM_RING_FIELD_BYTES
+        );
+        assert_eq!(
+            SHM_RING_CAPACITY_OFFSET,
+            SHM_RING_VERSION_OFFSET + SHM_RING_FIELD_BYTES
+        );
+        assert_eq!(SHM_RING_PAYLOAD_OFFSET, SHM_RING_HEADER_BYTES);
     }
 }

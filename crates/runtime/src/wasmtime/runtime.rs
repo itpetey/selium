@@ -837,4 +837,40 @@ mod tests {
         let stubs = stub_operations_for_missing(&requested);
         assert!(!stubs.is_empty());
     }
+
+    #[tokio::test]
+    async fn run_rejects_unregistered_shared_memory_capability() {
+        let guest_async = Arc::new(super::GuestAsync::new(Arc::new(tokio::sync::Notify::new())));
+        let runtime = WasmtimeRuntime::new(HashMap::new(), guest_async).expect("runtime");
+        let module_bytes = wat::parse_str(
+            r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "entry")))
+            "#,
+        )
+        .expect("parse wat");
+        let module = Module::from_binary(&runtime.engine, &module_bytes).expect("module");
+        let registry = Registry::new();
+        let invocation =
+            EntrypointInvocation::new(AbiSignature::new(Vec::new(), Vec::new()), Vec::new())
+                .expect("entrypoint");
+
+        let error = runtime
+            .run(
+                &registry,
+                1,
+                module,
+                "entry",
+                &[Capability::SharedMemory],
+                invocation,
+            )
+            .await
+            .expect_err("shared memory capability should be unavailable");
+
+        assert!(matches!(
+            error,
+            Error::CapabilityUnavailable(Capability::SharedMemory)
+        ));
+    }
 }
