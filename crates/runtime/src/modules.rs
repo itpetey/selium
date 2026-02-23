@@ -284,6 +284,9 @@ fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
             }
             "timeread" | "time_read" | "time-read" => Capability::TimeRead,
             "sharedmemory" | "shared_memory" | "shared-memory" => Capability::SharedMemory,
+            "queuelifecycle" | "queue_lifecycle" | "queue-lifecycle" => Capability::QueueLifecycle,
+            "queuewriter" | "queue_writer" | "queue-writer" => Capability::QueueWriter,
+            "queuereader" | "queue_reader" | "queue-reader" => Capability::QueueReader,
             _ => return Err(anyhow!("unknown capability `{item}`")),
         };
 

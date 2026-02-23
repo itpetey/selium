@@ -37,6 +37,10 @@ pub enum ResourceType {
     Session,
     /// Shared memory arena region metadata.
     SharedMemory,
+    /// Queue control-plane state.
+    Queue,
+    /// Queue endpoint state.
+    QueueEndpoint,
     /// Guest-visible future state resource.
     Future,
     /// Uncategorised resource.

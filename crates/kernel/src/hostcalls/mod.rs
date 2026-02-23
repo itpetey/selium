@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod process;
+pub mod queue;
 pub mod session;
 pub mod shm;
 pub mod singleton;

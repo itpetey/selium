@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub mod hostcalls;
 mod process;
+mod queue;
 mod session;
 mod shm;
 mod singleton;
@@ -23,6 +24,7 @@ mod time;
 // pub use external::*;
 pub use hostcalls::*;
 pub use process::*;
+pub use queue::*;
 pub use session::*;
 pub use shm::*;
 pub use singleton::*;
@@ -114,17 +116,23 @@ pub enum Capability {
     SingletonLookup = 3,
     TimeRead = 4,
     SharedMemory = 5,
+    QueueLifecycle = 6,
+    QueueWriter = 7,
+    QueueReader = 8,
 }
 
 impl Capability {
     /// All capabilities understood by the Selium kernel ABI.
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 9] = [
         Capability::SessionLifecycle,
         Capability::ProcessLifecycle,
         Capability::SingletonRegistry,
         Capability::SingletonLookup,
         Capability::TimeRead,
         Capability::SharedMemory,
+        Capability::QueueLifecycle,
+        Capability::QueueWriter,
+        Capability::QueueReader,
     ];
 }
 
@@ -272,6 +280,9 @@ impl TryFrom<u8> for Capability {
             3 => Ok(Capability::SingletonLookup),
             4 => Ok(Capability::TimeRead),
             5 => Ok(Capability::SharedMemory),
+            6 => Ok(Capability::QueueLifecycle),
+            7 => Ok(Capability::QueueWriter),
+            8 => Ok(Capability::QueueReader),
             _ => Err(CapabilityDecodeError),
         }
     }
@@ -292,6 +303,9 @@ impl Display for Capability {
             Capability::SingletonLookup => write!(f, "SingletonLookup"),
             Capability::TimeRead => write!(f, "TimeRead"),
             Capability::SharedMemory => write!(f, "SharedMemory"),
+            Capability::QueueLifecycle => write!(f, "QueueLifecycle"),
+            Capability::QueueWriter => write!(f, "QueueWriter"),
+            Capability::QueueReader => write!(f, "QueueReader"),
         }
     }
 }

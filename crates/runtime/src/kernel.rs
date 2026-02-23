@@ -8,7 +8,8 @@ use anyhow::Result;
 use selium_abi::Capability;
 use selium_kernel::{
     Kernel,
-    hostcalls::{process, session, shm, singleton, time},
+    hostcalls::{process, queue, session, shm, singleton, time},
+    services::queue_service::QueueService,
     services::shared_memory_service::SharedMemoryDriver,
     services::singleton_service::SingletonRegistryService,
     services::time_service::SystemTimeService,
@@ -80,6 +81,31 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
             shm.4.as_linkable(),
             shm.5.as_linkable(),
         ]);
+
+    // Queue control plane.
+    let queue = queue::operations(QueueService);
+    capability_ops
+        .entry(Capability::QueueLifecycle)
+        .or_default()
+        .extend([
+            queue.0.as_linkable(),
+            queue.1.as_linkable(),
+            queue.2.as_linkable(),
+            queue.3.as_linkable(),
+            queue.4.as_linkable(),
+        ]);
+    capability_ops
+        .entry(Capability::QueueWriter)
+        .or_default()
+        .extend([
+            queue.5.as_linkable(),
+            queue.6.as_linkable(),
+            queue.7.as_linkable(),
+        ]);
+    capability_ops
+        .entry(Capability::QueueReader)
+        .or_default()
+        .extend([queue.8.as_linkable(), queue.9.as_linkable()]);
 
     let shutdown = Arc::new(Notify::new());
     let guest_async = builder.add_capability(Arc::new(GuestAsync::new(Arc::clone(&shutdown))));

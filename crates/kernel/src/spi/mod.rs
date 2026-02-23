@@ -2,6 +2,7 @@
 
 pub mod module_repository;
 pub mod process;
+pub mod queue;
 pub mod session;
 pub mod shared_memory;
 pub mod singleton;

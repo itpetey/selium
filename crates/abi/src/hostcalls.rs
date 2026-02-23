@@ -9,9 +9,12 @@ use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
 use crate::{
-    Capability, GuestResourceId, ProcessStart, RkyvEncode, SessionCreate, SessionEntitlement,
-    SessionRemove, SessionResource, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead,
-    ShmShare, ShmWrite, SingletonLookup, SingletonRegister, TimeNow, TimeSleep,
+    Capability, GuestResourceId, ProcessStart, QueueAck, QueueAttach, QueueCancel, QueueClose,
+    QueueCommit, QueueCreate, QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult,
+    QueueShare, QueueStats, QueueStatsResult, QueueStatus, QueueWait, QueueWaitResult, RkyvEncode,
+    SessionCreate, SessionEntitlement, SessionRemove, SessionResource, ShmAlloc, ShmAttach,
+    ShmDescriptor, ShmDetach, ShmRead, ShmShare, ShmWrite, SingletonLookup, SingletonRegister,
+    TimeNow, TimeSleep,
 };
 
 /// Type-erased metadata describing a hostcall.
@@ -225,6 +228,66 @@ declare_hostcalls! {
         input: ShmWrite,
         output: ()
     },
+    QUEUE_CREATE => {
+        name: "selium::queue::create",
+        capability: Capability::QueueLifecycle,
+        input: QueueCreate,
+        output: QueueDescriptor
+    },
+    QUEUE_SHARE => {
+        name: "selium::queue::share",
+        capability: Capability::QueueLifecycle,
+        input: QueueShare,
+        output: GuestResourceId
+    },
+    QUEUE_ATTACH => {
+        name: "selium::queue::attach",
+        capability: Capability::QueueLifecycle,
+        input: QueueAttach,
+        output: QueueEndpoint
+    },
+    QUEUE_CLOSE => {
+        name: "selium::queue::close",
+        capability: Capability::QueueLifecycle,
+        input: QueueClose,
+        output: QueueStatus
+    },
+    QUEUE_STATS => {
+        name: "selium::queue::stats",
+        capability: Capability::QueueLifecycle,
+        input: QueueStats,
+        output: QueueStatsResult
+    },
+    QUEUE_RESERVE => {
+        name: "selium::queue::reserve",
+        capability: Capability::QueueWriter,
+        input: QueueReserve,
+        output: QueueReserveResult
+    },
+    QUEUE_COMMIT => {
+        name: "selium::queue::commit",
+        capability: Capability::QueueWriter,
+        input: QueueCommit,
+        output: QueueStatus
+    },
+    QUEUE_CANCEL => {
+        name: "selium::queue::cancel",
+        capability: Capability::QueueWriter,
+        input: QueueCancel,
+        output: QueueStatus
+    },
+    QUEUE_WAIT => {
+        name: "selium::queue::wait",
+        capability: Capability::QueueReader,
+        input: QueueWait,
+        output: QueueWaitResult
+    },
+    QUEUE_ACK => {
+        name: "selium::queue::ack",
+        capability: Capability::QueueReader,
+        input: QueueAck,
+        output: QueueStatus
+    },
 }
 
 #[cfg(test)]
@@ -269,6 +332,27 @@ mod tests {
             grouped
                 .get(&Capability::ProcessLifecycle)
                 .expect("process lifecycle entries")
+                .len(),
+            2
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::QueueLifecycle)
+                .expect("queue lifecycle entries")
+                .len(),
+            5
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::QueueWriter)
+                .expect("queue writer entries")
+                .len(),
+            3
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::QueueReader)
+                .expect("queue reader entries")
                 .len(),
             2
         );

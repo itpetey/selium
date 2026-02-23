@@ -82,6 +82,9 @@ async fn run(
         Capability::SingletonLookup,
         Capability::TimeRead,
         Capability::SharedMemory,
+        Capability::QueueLifecycle,
+        Capability::QueueWriter,
+        Capability::QueueReader,
     ];
     let _session = Session::bootstrap(entitlements, [0; 32]);
     // @todo Store session in Registry, then pass FuncParam::Resource(id) to host bridge

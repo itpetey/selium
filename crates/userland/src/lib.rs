@@ -90,6 +90,7 @@ mod r#async;
 pub mod context;
 pub mod driver;
 pub mod process;
+pub mod queue;
 pub mod session;
 pub mod shm;
 pub mod singleton;
