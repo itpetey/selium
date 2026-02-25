@@ -12,7 +12,7 @@ use tracing::{
     field::{self, Empty},
 };
 
-use selium_abi::{Capability, DependencyId, GuestResourceId};
+use selium_abi::{Capability, GuestResourceId};
 
 use crate::{
     KernelError,
@@ -97,8 +97,6 @@ struct RelationIndex {
     children_of: HashMap<ResourceId, Vec<ResourceId>>,
     instance_to_process: HashMap<ResourceId, ResourceId>,
     process_to_instance: HashMap<ResourceId, ResourceId>,
-    singletons: HashMap<DependencyId, ResourceId>,
-    singleton_ids: HashMap<ResourceId, DependencyId>,
 }
 
 /// Registry of guest resources.
@@ -306,20 +304,6 @@ impl RelationIndex {
         self.process_to_instance.get(&process_id).copied()
     }
 
-    fn register_singleton(&mut self, id: DependencyId, resource: ResourceId) -> bool {
-        if self.singletons.contains_key(&id) || self.singleton_ids.contains_key(&resource) {
-            return false;
-        }
-
-        self.singletons.insert(id, resource);
-        self.singleton_ids.insert(resource, id);
-        true
-    }
-
-    fn singleton(&self, id: DependencyId) -> Option<ResourceId> {
-        self.singletons.get(&id).copied()
-    }
-
     fn remove_resource(&mut self, id: ResourceId) {
         if let Some(owner) = self.owner_of.remove(&id) {
             Self::remove_from_list(self.owned_by.get_mut(&owner), id);
@@ -335,10 +319,6 @@ impl RelationIndex {
 
         if let Some(instance) = self.process_to_instance.remove(&id) {
             self.instance_to_process.remove(&instance);
-        }
-
-        if let Some(singleton_id) = self.singleton_ids.remove(&id) {
-            self.singletons.remove(&singleton_id);
         }
     }
 
@@ -615,26 +595,6 @@ impl Registry {
     /// Return the instance id associated with the provided process id.
     pub fn process_instance(&self, process_id: ResourceId) -> Option<ResourceId> {
         self.relations.lock().ok()?.process_instance(process_id)
-    }
-
-    /// Register a singleton dependency identifier against the supplied resource.
-    ///
-    /// Returns `false` if the identifier or resource is already registered.
-    pub fn register_singleton(
-        &self,
-        id: DependencyId,
-        resource: ResourceId,
-    ) -> Result<bool, RegistryError> {
-        let mut relations = self
-            .relations
-            .lock()
-            .map_err(|_| RegistryError::LockPoisoned)?;
-        Ok(relations.register_singleton(id, resource))
-    }
-
-    /// Resolve a singleton dependency identifier to its backing resource id.
-    pub fn singleton(&self, id: DependencyId) -> Option<ResourceId> {
-        self.relations.lock().ok()?.singleton(id)
     }
 
     fn record_resource_added<T: 'static>(&self, id: ResourceId) {

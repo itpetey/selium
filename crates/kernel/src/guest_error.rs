@@ -31,9 +31,6 @@ pub enum GuestError {
     /// Internal registry error.
     #[error("The kernel Registry encountered an error. Please report this to your administrator.")]
     Registry(#[from] RegistryError),
-    /// Stable identifier already exists.
-    #[error("Stable identifier already exists")]
-    StableIdExists,
     /// Subsystem-specific internal error.
     #[error("internal error: {0}")]
     Subsystem(String),

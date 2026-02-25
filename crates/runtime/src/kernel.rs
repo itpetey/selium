@@ -8,10 +8,9 @@ use anyhow::Result;
 use selium_abi::Capability;
 use selium_kernel::{
     Kernel,
-    hostcalls::{process, queue, session, shm, singleton, time},
+    hostcalls::{process, queue, session, shm, time},
     services::queue_service::QueueService,
     services::shared_memory_service::SharedMemoryDriver,
-    services::singleton_service::SingletonRegistryService,
     services::time_service::SystemTimeService,
 };
 use tokio::sync::Notify;
@@ -48,17 +47,6 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
             session.4.as_linkable(),
             session.5.as_linkable(),
         ]);
-
-    // Singleton registry.
-    let singleton = singleton::operations(SingletonRegistryService);
-    capability_ops
-        .entry(Capability::SingletonRegistry)
-        .or_default()
-        .push(singleton.0.as_linkable());
-    capability_ops
-        .entry(Capability::SingletonLookup)
-        .or_default()
-        .push(singleton.1.as_linkable());
 
     // Time.
     let time = time::operations(SystemTimeService);

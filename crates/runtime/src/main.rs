@@ -78,8 +78,6 @@ async fn run(
     let entitlements = vec![
         Capability::SessionLifecycle,
         Capability::ProcessLifecycle,
-        Capability::SingletonRegistry,
-        Capability::SingletonLookup,
         Capability::TimeRead,
         Capability::SharedMemory,
         Capability::QueueLifecycle,

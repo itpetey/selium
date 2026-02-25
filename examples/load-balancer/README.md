@@ -53,8 +53,8 @@ In a fresh terminal, run:
 ```bash
 cargo run -p selium-runtime -- \
     --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
-    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
-    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry'
+    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter' \
+    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter'
 ```
 
 ### 5. Start the load balancer
@@ -68,10 +68,10 @@ cargo run -p selium-remote-cli -- \
     start selium_example_load_balancer.wasm load_balancer \
     --attach \
     -a utf8:localhost -a u16:8080 \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,NetHttpAccept,NetHttpBind,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,NetHttpAccept,NetHttpBind
 ```
 
-`--attach` tells the CLI to subscribe to the example's log channel so we can see what it's doing. `-a` identifies an argument to pass; in our case the HTTP address to bind. Finally we grant the example module the capability to create an HTTP socket, accept connections, read/write channels, and lookup global singletons.
+`--attach` tells the CLI to subscribe to the example's log channel so we can see what it's doing. `-a` identifies an argument to pass; in our case the HTTP address to bind. Finally we grant the example module the capability to create an HTTP socket, accept connections, read/write channels, and access pre-launched infrastructure services.
 
 ### 6. Run the example connection handler
 
@@ -83,7 +83,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_load_balancer.wasm conn_handler \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,NetHttpRead,NetHttpWrite,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,NetHttpRead,NetHttpWrite
 ```
 
 ### 7. Test the load balancer

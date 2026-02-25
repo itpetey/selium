@@ -1,5 +1,6 @@
 //! Guest-facing helpers for shared-memory hostcalls.
 
+use rkyv::Archive;
 use selium_abi::{
     GuestResourceId, GuestUint, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead, ShmShare,
     ShmWrite,
@@ -7,12 +8,16 @@ use selium_abi::{
 
 use crate::driver::{DriverError, DriverFuture, RKYV_VEC_OVERHEAD, RkyvDecoder, encode_args};
 
+const SHM_DESCRIPTOR_CAPACITY: usize = core::mem::size_of::<<ShmDescriptor as Archive>::Archived>();
+const RESOURCE_ID_CAPACITY: usize = core::mem::size_of::<<GuestResourceId as Archive>::Archived>();
+const READ_RESULT_OVERHEAD: usize = RKYV_VEC_OVERHEAD + core::mem::size_of::<u64>();
+
 /// Allocate a shared-memory region.
 pub async fn alloc(size: GuestUint, align: GuestUint) -> Result<ShmDescriptor, DriverError> {
     let args = encode_args(&ShmAlloc { size, align })?;
     DriverFuture::<shm_alloc::Module, RkyvDecoder<ShmDescriptor>>::new(
         &args,
-        16,
+        SHM_DESCRIPTOR_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -23,7 +28,7 @@ pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverErro
     let args = encode_args(&ShmShare { resource_id })?;
     DriverFuture::<shm_share::Module, RkyvDecoder<GuestResourceId>>::new(
         &args,
-        8,
+        RESOURCE_ID_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -34,7 +39,7 @@ pub async fn attach(shared_id: GuestResourceId) -> Result<ShmDescriptor, DriverE
     let args = encode_args(&ShmAttach { shared_id })?;
     DriverFuture::<shm_attach::Module, RkyvDecoder<ShmDescriptor>>::new(
         &args,
-        16,
+        SHM_DESCRIPTOR_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -61,7 +66,7 @@ pub async fn read(
     let capacity = usize::try_from(len).map_err(|_| DriverError::InvalidArgument)?;
     DriverFuture::<shm_read::Module, RkyvDecoder<Vec<u8>>>::new(
         &args,
-        capacity + RKYV_VEC_OVERHEAD + 8,
+        capacity + READ_RESULT_OVERHEAD,
         RkyvDecoder::new(),
     )?
     .await
@@ -82,16 +87,17 @@ pub async fn write(
     Ok(())
 }
 
-driver_module!(shm_alloc, SHM_ALLOC, "selium::shm::alloc");
-driver_module!(shm_share, SHM_SHARE, "selium::shm::share");
-driver_module!(shm_attach, SHM_ATTACH, "selium::shm::attach");
-driver_module!(shm_detach, SHM_DETACH, "selium::shm::detach");
-driver_module!(shm_read, SHM_READ, "selium::shm::read");
-driver_module!(shm_write, SHM_WRITE, "selium::shm::write");
+driver_module!(shm_alloc, "selium::shm::alloc");
+driver_module!(shm_share, "selium::shm::share");
+driver_module!(shm_attach, "selium::shm::attach");
+driver_module!(shm_detach, "selium::shm::detach");
+driver_module!(shm_read, "selium::shm::read");
+driver_module!(shm_write, "selium::shm::write");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_abi::{ShmRegion, encode_rkyv};
 
     #[test]
     fn alloc_returns_kernel_error_with_native_stub_driver() {
@@ -103,5 +109,26 @@ mod tests {
     fn read_returns_kernel_error_with_native_stub_driver() {
         let err = crate::block_on(read(1, 0, 4)).expect_err("stub should fail");
         assert!(matches!(err, DriverError::Kernel(2)));
+    }
+
+    #[test]
+    fn descriptor_capacity_covers_archived_payload() {
+        let descriptor = ShmDescriptor {
+            resource_id: 3,
+            shared_id: 9,
+            region: ShmRegion {
+                offset: 16,
+                len: 64,
+            },
+        };
+        let encoded = encode_rkyv(&descriptor).expect("encode descriptor");
+        assert!(encoded.len() <= SHM_DESCRIPTOR_CAPACITY);
+    }
+
+    #[test]
+    fn read_overhead_covers_vec_archive_metadata() {
+        let payload = vec![1u8, 2, 3, 4, 5];
+        let encoded = encode_rkyv(&payload).expect("encode vec");
+        assert!(encoded.len() <= payload.len() + READ_RESULT_OVERHEAD);
     }
 }

@@ -13,8 +13,7 @@ use crate::{
     QueueCommit, QueueCreate, QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult,
     QueueShare, QueueStats, QueueStatsResult, QueueStatus, QueueWait, QueueWaitResult, RkyvEncode,
     SessionCreate, SessionEntitlement, SessionRemove, SessionResource, ShmAlloc, ShmAttach,
-    ShmDescriptor, ShmDetach, ShmRead, ShmShare, ShmWrite, SingletonLookup, SingletonRegister,
-    TimeNow, TimeSleep,
+    ShmDescriptor, ShmDetach, ShmRead, ShmShare, ShmWrite, TimeNow, TimeSleep,
 };
 
 /// Type-erased metadata describing a hostcall.
@@ -155,18 +154,6 @@ declare_hostcalls! {
         capability: Capability::SessionLifecycle,
         input: SessionResource,
         output: u32
-    },
-    SINGLETON_REGISTER => {
-        name: "selium::singleton::register",
-        capability: Capability::SingletonRegistry,
-        input: SingletonRegister,
-        output: ()
-    },
-    SINGLETON_LOOKUP => {
-        name: "selium::singleton::lookup",
-        capability: Capability::SingletonLookup,
-        input: SingletonLookup,
-        output: GuestResourceId
     },
     TIME_NOW => {
         name: "selium::time::now",

@@ -1,5 +1,6 @@
 //! Guest-facing helpers for queue control-plane hostcalls.
 
+use rkyv::Archive;
 use selium_abi::{
     GuestResourceId, GuestUint, QueueAck, QueueAttach, QueueClose, QueueCommit, QueueCreate,
     QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult, QueueRole, QueueShare,
@@ -8,12 +9,24 @@ use selium_abi::{
 
 use crate::driver::{DriverError, DriverFuture, RkyvDecoder, encode_args};
 
+const RESOURCE_ID_CAPACITY: usize = core::mem::size_of::<<GuestResourceId as Archive>::Archived>();
+const QUEUE_DESCRIPTOR_CAPACITY: usize =
+    core::mem::size_of::<<QueueDescriptor as Archive>::Archived>();
+const QUEUE_ENDPOINT_CAPACITY: usize = core::mem::size_of::<<QueueEndpoint as Archive>::Archived>();
+const QUEUE_STATUS_CAPACITY: usize = core::mem::size_of::<<QueueStatus as Archive>::Archived>();
+const QUEUE_STATS_RESULT_CAPACITY: usize =
+    core::mem::size_of::<<QueueStatsResult as Archive>::Archived>();
+const QUEUE_RESERVE_RESULT_CAPACITY: usize =
+    core::mem::size_of::<<QueueReserveResult as Archive>::Archived>();
+const QUEUE_WAIT_RESULT_CAPACITY: usize =
+    core::mem::size_of::<<QueueWaitResult as Archive>::Archived>();
+
 /// Create a queue and return local + shared handles.
 pub async fn create(input: QueueCreate) -> Result<QueueDescriptor, DriverError> {
     let args = encode_args(&input)?;
     DriverFuture::<queue_create::Module, RkyvDecoder<QueueDescriptor>>::new(
         &args,
-        16,
+        QUEUE_DESCRIPTOR_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -24,7 +37,7 @@ pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverErro
     let args = encode_args(&QueueShare { resource_id })?;
     DriverFuture::<queue_share::Module, RkyvDecoder<GuestResourceId>>::new(
         &args,
-        8,
+        RESOURCE_ID_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -38,7 +51,7 @@ pub async fn attach(
     let args = encode_args(&QueueAttach { shared_id, role })?;
     DriverFuture::<queue_attach::Module, RkyvDecoder<QueueEndpoint>>::new(
         &args,
-        8,
+        QUEUE_ENDPOINT_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -49,7 +62,7 @@ pub async fn close(resource_id: GuestUint) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&QueueClose { resource_id })?;
     DriverFuture::<queue_close::Module, RkyvDecoder<QueueStatus>>::new(
         &args,
-        8,
+        QUEUE_STATUS_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -60,7 +73,7 @@ pub async fn stats(queue_id: GuestUint) -> Result<QueueStatsResult, DriverError>
     let args = encode_args(&QueueStats { queue_id })?;
     DriverFuture::<queue_stats::Module, RkyvDecoder<QueueStatsResult>>::new(
         &args,
-        64,
+        QUEUE_STATS_RESULT_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -79,7 +92,7 @@ pub async fn reserve(
     })?;
     DriverFuture::<queue_reserve::Module, RkyvDecoder<QueueReserveResult>>::new(
         &args,
-        32,
+        QUEUE_RESERVE_RESULT_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -90,7 +103,7 @@ pub async fn commit(input: QueueCommit) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&input)?;
     DriverFuture::<queue_commit::Module, RkyvDecoder<QueueStatus>>::new(
         &args,
-        8,
+        QUEUE_STATUS_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -107,7 +120,7 @@ pub async fn cancel(
     })?;
     DriverFuture::<queue_cancel::Module, RkyvDecoder<QueueStatus>>::new(
         &args,
-        8,
+        QUEUE_STATUS_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -121,7 +134,7 @@ pub async fn wait(endpoint_id: GuestUint, timeout_ms: u32) -> Result<QueueWaitRe
     })?;
     DriverFuture::<queue_wait::Module, RkyvDecoder<QueueWaitResult>>::new(
         &args,
-        64,
+        QUEUE_WAIT_RESULT_CAPACITY,
         RkyvDecoder::new(),
     )?
     .await
@@ -130,34 +143,97 @@ pub async fn wait(endpoint_id: GuestUint, timeout_ms: u32) -> Result<QueueWaitRe
 /// Acknowledge one delivered frame sequence.
 pub async fn ack(endpoint_id: GuestUint, seq: u64) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&QueueAck { endpoint_id, seq })?;
-    DriverFuture::<queue_ack::Module, RkyvDecoder<QueueStatus>>::new(&args, 8, RkyvDecoder::new())?
-        .await
+    DriverFuture::<queue_ack::Module, RkyvDecoder<QueueStatus>>::new(
+        &args,
+        QUEUE_STATUS_CAPACITY,
+        RkyvDecoder::new(),
+    )?
+    .await
 }
 
-driver_module!(queue_create, QUEUE_CREATE, "selium::queue::create");
-driver_module!(queue_share, QUEUE_SHARE, "selium::queue::share");
-driver_module!(queue_attach, QUEUE_ATTACH, "selium::queue::attach");
-driver_module!(queue_close, QUEUE_CLOSE, "selium::queue::close");
-driver_module!(queue_stats, QUEUE_STATS, "selium::queue::stats");
-driver_module!(queue_reserve, QUEUE_RESERVE, "selium::queue::reserve");
-driver_module!(queue_commit, QUEUE_COMMIT, "selium::queue::commit");
-driver_module!(queue_cancel, QUEUE_CANCEL, "selium::queue::cancel");
-driver_module!(queue_wait, QUEUE_WAIT, "selium::queue::wait");
-driver_module!(queue_ack, QUEUE_ACK, "selium::queue::ack");
+driver_module!(queue_create, "selium::queue::create");
+driver_module!(queue_share, "selium::queue::share");
+driver_module!(queue_attach, "selium::queue::attach");
+driver_module!(queue_close, "selium::queue::close");
+driver_module!(queue_stats, "selium::queue::stats");
+driver_module!(queue_reserve, "selium::queue::reserve");
+driver_module!(queue_commit, "selium::queue::commit");
+driver_module!(queue_cancel, "selium::queue::cancel");
+driver_module!(queue_wait, "selium::queue::wait");
+driver_module!(queue_ack, "selium::queue::ack");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_abi::{
+        QueueDelivery, QueueFrameRef, QueueOverflow, QueueReservation, QueueStatsData,
+        QueueStatusCode, encode_rkyv,
+    };
 
     #[test]
     fn create_returns_kernel_error_with_native_stub_driver() {
         let err = crate::block_on(create(QueueCreate {
             capacity_frames: 8,
             max_frame_bytes: 256,
-            delivery: selium_abi::QueueDelivery::Lossless,
-            overflow: selium_abi::QueueOverflow::Block,
+            delivery: QueueDelivery::Lossless,
+            overflow: QueueOverflow::Block,
         }))
         .expect_err("stub should fail");
         assert!(matches!(err, DriverError::Kernel(2)));
+    }
+
+    #[test]
+    fn descriptor_capacity_covers_archived_payload() {
+        let descriptor = QueueDescriptor {
+            resource_id: 7,
+            shared_id: 11,
+        };
+        let encoded = encode_rkyv(&descriptor).expect("encode descriptor");
+        assert!(encoded.len() <= QUEUE_DESCRIPTOR_CAPACITY);
+    }
+
+    #[test]
+    fn reserve_result_capacity_covers_archived_payload() {
+        let result = QueueReserveResult {
+            code: QueueStatusCode::Ok,
+            reservation: Some(QueueReservation {
+                reservation_id: 99,
+                seq: 101,
+            }),
+        };
+        let encoded = encode_rkyv(&result).expect("encode reserve result");
+        assert!(encoded.len() <= QUEUE_RESERVE_RESULT_CAPACITY);
+    }
+
+    #[test]
+    fn wait_result_capacity_covers_archived_payload() {
+        let result = QueueWaitResult {
+            code: QueueStatusCode::Ok,
+            frame: Some(QueueFrameRef {
+                seq: 12,
+                writer_id: 2,
+                shm_shared_id: 33,
+                offset: 4,
+                len: 5,
+            }),
+        };
+        let encoded = encode_rkyv(&result).expect("encode wait result");
+        assert!(encoded.len() <= QUEUE_WAIT_RESULT_CAPACITY);
+    }
+
+    #[test]
+    fn stats_result_capacity_covers_archived_payload() {
+        let result = QueueStatsResult {
+            code: QueueStatusCode::Ok,
+            stats: Some(QueueStatsData {
+                depth_frames: 1,
+                reservations: 2,
+                readers: 3,
+                writers: 4,
+                closed: false,
+            }),
+        };
+        let encoded = encode_rkyv(&result).expect("encode stats result");
+        assert!(encoded.len() <= QUEUE_STATS_RESULT_CAPACITY);
     }
 }

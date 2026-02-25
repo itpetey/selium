@@ -30,16 +30,6 @@ enum ParamKind {
         high_ident: Ident,
         signed: bool,
     },
-    Context {
-        holder_ident: Ident,
-        by_ref: bool,
-    },
-}
-
-enum ContextMode {
-    Owned,
-    Ref,
-    MutRef,
 }
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -125,7 +115,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             parse_quote! { #low_ident: selium_userland::abi::GuestInt },
             parse_quote! { #high_ident: selium_userland::abi::GuestInt },
         ],
-        ParamKind::Context { .. } => Vec::new(),
     }));
 
     let decode_bindings: Vec<_> = params
@@ -208,28 +197,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
                 })
             }
-            ParamKind::Context {
-                holder_ident,
-                by_ref,
-            } => {
-                let ident = &param.ident;
-                let ty = &param.ty;
-                let mutability = if param.mutable {
-                    quote! { mut }
-                } else {
-                    quote! {}
-                };
-                if *by_ref {
-                    Some(quote! {
-                        let #holder_ident = selium_userland::Context::current();
-                        let #mutability #ident: #ty = &#holder_ident;
-                    })
-                } else {
-                    Some(quote! {
-                        let #mutability #ident: #ty = selium_userland::Context::current();
-                    })
-                }
-            }
             ParamKind::SplitInt {
                 low_ident,
                 high_ident,
@@ -286,7 +253,6 @@ fn classify_return(ret: &ReturnType) -> Result<RetKind, Error> {
 
 fn validate_params(f: &ItemFn) -> Result<Vec<ParamSpec>, Error> {
     let mut params = Vec::new();
-    let mut context_seen = None;
 
     for input in &f.sig.inputs {
         let (pat, ty) = match input {
@@ -311,27 +277,13 @@ fn validate_params(f: &ItemFn) -> Result<Vec<ParamSpec>, Error> {
 
         let ident = ident.clone();
         let ty = ty.clone();
-        let kind = if let Some(mode) = context_mode(&ty) {
-            if context_seen.is_some() {
-                return Err(Error::new_spanned(
-                    &ty,
-                    "#[entrypoint] supports at most one Context parameter",
-                ));
-            }
-            if matches!(mode, ContextMode::MutRef) {
-                return Err(Error::new_spanned(
-                    &ty,
-                    "#[entrypoint] Context parameters must be passed by value or shared reference",
-                ));
-            }
-            context_seen = Some(());
-            ParamKind::Context {
-                holder_ident: Ident::new(&format!("__selium_ctx_{}", ident), Span::call_site()),
-                by_ref: matches!(mode, ContextMode::Ref),
-            }
-        } else {
-            classify_param_kind(&ident, &ty)
-        };
+        if is_context_param(&ty) {
+            return Err(Error::new_spanned(
+                &ty,
+                "#[entrypoint] Context parameters are not supported in this ABI",
+            ));
+        }
+        let kind = classify_param_kind(&ident, &ty);
 
         params.push(ParamSpec {
             ident,
@@ -365,23 +317,16 @@ fn classify_param_kind(ident: &Ident, ty: &Type) -> ParamKind {
     }
 }
 
-fn context_mode(ty: &Type) -> Option<ContextMode> {
+fn is_context_param(ty: &Type) -> bool {
     match ty {
-        Type::Path(path) if is_context_path(&path.path) => Some(ContextMode::Owned),
+        Type::Path(path) => is_context_path(&path.path),
         Type::Reference(reference) => {
             let Type::Path(path) = reference.elem.as_ref() else {
-                return None;
+                return false;
             };
-            if !is_context_path(&path.path) {
-                return None;
-            }
-            if reference.mutability.is_some() {
-                Some(ContextMode::MutRef)
-            } else {
-                Some(ContextMode::Ref)
-            }
+            is_context_path(&path.path)
         }
-        _ => None,
+        _ => false,
     }
 }
 

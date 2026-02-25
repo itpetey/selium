@@ -53,8 +53,8 @@ In a fresh terminal, run:
 ```bash
 cargo run -p selium-runtime -- \
     --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
-    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
-    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry'
+    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter' \
+    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter'
 ```
 
 ### 5. Start the example modules
@@ -67,7 +67,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_waf.wasm edge_ingress_stub \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 ```bash
@@ -76,7 +76,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_waf.wasm validate_requests \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 ```bash
@@ -85,7 +85,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_waf.wasm result_router \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 ```bash
@@ -94,7 +94,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_waf.wasm alert_sink \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 ```bash
@@ -103,7 +103,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_waf.wasm audit_sink \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 You should see log output showing edge requests, verdicts, and core alert/audit fan-out.

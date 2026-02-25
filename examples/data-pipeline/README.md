@@ -50,7 +50,7 @@ cd selium-modules/remote-client
 cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_data_pipeline.wasm generator \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 In a second new terminal, run:
@@ -61,7 +61,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     --attach \
     start selium_example_data_pipeline.wasm even \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 > This terminal should start logging integers once the whole pipeline has been launched.
@@ -73,7 +73,7 @@ cd selium-modules/remote-client
 cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_data_pipeline.wasm double \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 ```bash
@@ -81,5 +81,5 @@ cd selium-modules/remote-client
 cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_data_pipeline.wasm add_five \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```

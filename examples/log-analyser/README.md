@@ -53,8 +53,8 @@ In a fresh terminal, run:
 ```bash
 cargo run -p selium-runtime -- \
     --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
-    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
-    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry'
+    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter' \
+    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter'
 ```
 
 ### 5. Start the example modules
@@ -67,7 +67,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_log_analyser.wasm test_warnings \
     --log-uri sel://example/app/logs \
-    --capabilities ChannelReader,SingletonLookup
+    --capabilities ChannelReader
 ```
 
 Or to simulate a flood of errors, run the "test_errors" entrypoint:
@@ -78,7 +78,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_log_analyser.wasm test_errors \
     --log-uri sel://example/app/logs \
-    --capabilities ChannelReader,SingletonLookup
+    --capabilities ChannelReader
 ```
 
 Then start the log analyser app. It looks for error and warning log floods on `sel://example/app/logs` over a 5 second window.
@@ -91,5 +91,5 @@ cargo run -p selium-remote-cli -- \
     -a utf8:sel://example/app/logs -a utf8:sel://example/logs/alerts -a u32:5 \
     --log-uri sel://example/logs/analyser \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```

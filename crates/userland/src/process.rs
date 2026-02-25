@@ -190,8 +190,8 @@ fn build_start_payload(builder: ProcessBuilder) -> Result<ProcessStart, ProcessE
     })
 }
 
-driver_module!(process_start, PROCESS_START, "selium::process::start");
-driver_module!(process_stop, PROCESS_STOP, "selium::process::stop");
+driver_module!(process_start, "selium::process::start");
+driver_module!(process_stop, "selium::process::stop");
 
 #[cfg(test)]
 mod tests {

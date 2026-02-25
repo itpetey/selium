@@ -32,12 +32,10 @@ default = ["services"]
 service-queue = []
 service-session = []
 service-shared-memory = []
-service-singleton = []
 service-time = []
 services = [
   "service-queue",
   "service-session",
   "service-shared-memory",
-  "service-singleton",
   "service-time"
 ]

@@ -65,8 +65,8 @@ fn monotonic_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-driver_module!(time_now, TIME_NOW, "selium::time::now");
-driver_module!(time_sleep, TIME_SLEEP, "selium::time::sleep");
+driver_module!(time_now, "selium::time::now");
+driver_module!(time_sleep, "selium::time::sleep");
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {

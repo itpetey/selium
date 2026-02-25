@@ -16,7 +16,6 @@ pub mod process;
 pub mod queue;
 pub mod session;
 pub mod shm;
-pub mod singleton;
 pub mod time;
 
 /// Engine-neutral context required by hostcall operations.

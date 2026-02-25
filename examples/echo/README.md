@@ -53,8 +53,8 @@ In a fresh terminal, run:
 ```bash
 cargo run -p selium-runtime -- \
     --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
-    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
-    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry'
+    --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter' \
+    --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter'
 ```
 
 The long `--module` definitions tell the runtime to compile and run the remote client, switchboard, and atlas dependencies with their respective required capabilities. The remote client definition also includes two arguments, indicating that it should bind to localhost:7000.
@@ -69,7 +69,7 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_echo.wasm echo_server \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```
 
 `--attach` tells the CLI to subscribe to the example's log channel so we can see what it's doing.
@@ -84,5 +84,5 @@ cargo run -p selium-remote-cli -- \
     --cert-dir ../../certs \
     start selium_example_echo.wasm echo_client \
     --attach \
-    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter,SingletonLookup
+    --capabilities ChannelLifecycle,ChannelReader,ChannelWriter
 ```

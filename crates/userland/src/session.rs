@@ -113,28 +113,12 @@ pub async fn rm_resource(
     Ok(changed != 0)
 }
 
-driver_module!(session_create, SESSION_CREATE, "selium::session::create");
-driver_module!(session_remove, SESSION_REMOVE, "selium::session::remove");
-driver_module!(
-    session_add_entitlement,
-    SESSION_ADD_ENTITLEMENT,
-    "selium::session::add_entitlement"
-);
-driver_module!(
-    session_rm_entitlement,
-    SESSION_RM_ENTITLEMENT,
-    "selium::session::rm_entitlement"
-);
-driver_module!(
-    session_add_resource,
-    SESSION_ADD_RESOURCE,
-    "selium::session::add_resource"
-);
-driver_module!(
-    session_rm_resource,
-    SESSION_RM_RESOURCE,
-    "selium::session::rm_resource"
-);
+driver_module!(session_create, "selium::session::create");
+driver_module!(session_remove, "selium::session::remove");
+driver_module!(session_add_entitlement, "selium::session::add_entitlement");
+driver_module!(session_rm_entitlement, "selium::session::rm_entitlement");
+driver_module!(session_add_resource, "selium::session::add_resource");
+driver_module!(session_rm_resource, "selium::session::rm_resource");
 
 #[cfg(test)]
 mod tests {

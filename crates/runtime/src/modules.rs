@@ -276,12 +276,6 @@ fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
             "processlifecycle" | "process_lifecycle" | "process-lifecycle" => {
                 Capability::ProcessLifecycle
             }
-            "singletonregistry" | "singleton_registry" | "singleton-registry" => {
-                Capability::SingletonRegistry
-            }
-            "singletonlookup" | "singleton_lookup" | "singleton-lookup" => {
-                Capability::SingletonLookup
-            }
             "timeread" | "time_read" | "time-read" => Capability::TimeRead,
             "sharedmemory" | "shared_memory" | "shared-memory" => Capability::SharedMemory,
             "queuelifecycle" | "queue_lifecycle" | "queue-lifecycle" => Capability::QueueLifecycle,
