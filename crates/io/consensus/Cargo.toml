@@ -1,0 +1,9 @@
+[package]
+name = "selium-io-consensus"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rkyv = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }

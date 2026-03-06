@@ -1,56 +1,69 @@
-# Selium
+# Selium Monorepo (Next)
 
-[![Crates.io][crates-badge]][crates-url]
-[![MPL2 licensed][mpl-badge]][mpl-url]
-[![Build Status][build-badge]][build-url]
-[![Audit Status][audit-badge]][audit-url]
+This repository is the temporary monorepo for Selium's next architecture:
 
-[crates-badge]: https://img.shields.io/crates/v/selium-kernel.svg
-[crates-url]: https://crates.io/crates/selium-kernel
-[mpl-badge]: https://img.shields.io/badge/licence-MPL2-blue.svg
-[mpl-url]: https://github.com/seliumlabs/selium/blob/main/LICENCE
-[build-badge]: https://github.com/seliumlabs/selium/actions/workflows/ci.yml/badge.svg
-[build-url]: https://github.com/seliumlabs/selium/actions/workflows/ci.yml
-[audit-badge]: https://github.com/seliumlabs/selium/actions/workflows/audit.yml/badge.svg
-[audit-url]: https://github.com/seliumlabs/selium/actions/workflows/audit.yml
+- Contract-first IDL and SDK generation
+- Distributed control plane running on Selium
+- Unified RPC/events/stream developer APIs
+- Strong capability isolation by default
+- Durable replay for selected channels
 
-Selium is a software framework and runtime for building scalable, connected applications. With Selium, you can compose entire application stacks with **strict capabilities**, **typed I/O**, and **zero infrastructure**.
+## Layout
 
-You get the ergonomics of an application platform, with the safety properties of a capability system:
+- `crates/{abi,kernel,runtime,guest}`: imported runtime/kernel/ABI guest baseline
+- `crates/cli`: CLI entrypoint
+- `crates/control-plane/*`: control-plane APIs, scheduler, runtime state machine, and daemon protocol
+- `crates/io/*`: generic host-managed I/O substrate (`consensus`, `tables`)
+  - `.../core`: communication primitives and transport abstractions
+  - `.../durability`: retention/replay/checkpoints
+- `crates/runtime-adapters/*`: adapter SPI and engine-specific adapters
+- `crates/sdk/rust`: SDK runtime surface
+- `examples/`: example contracts, state snapshots, and workflow walkthroughs
+- `modules/*`: first-party system modules
+  - `.../control-plane`: guest-side control-plane module + re-exported policy/runtime interfaces
+  - `.../io-demo`: guest-side I/O example module (`selium_guest::io`)
 
-- **Zero DevOps**: a batteries-included platform that is entirely composable in code.
-- **Ergonomic I/O everywhere**: first class composable messaging, even when interacting with network protocols.
-- **End-to-end type safety**: seamless type support across process and network boundaries.
-- **No ambient authority**: guests only receive the capabilities you grant them at runtime.
+## Current Status
 
-**Status:** alpha (APIs and project structure are still evolving).
+Core scaffolding plus first functional cut is in place:
 
----
+- IDL parser + contract registry + compatibility checks
+- Scheduler and control-plane reconcile + runtime daemon actuation hooks
+- Runtime adapter validation (`wasmtime` executable, `microvm` stubbed/non-executable)
+- Core-io I/O with in-memory or kernel (queue+SHM) transport
+- Guest-side I/O facade (`selium_guest::io`) on queue + shared memory
+- File-backed durable replay/checkpoints for channel persistence
+- Host-managed Raft primitives (`selium-io-consensus`) and table/view engine (`selium-io-tables`)
+- Control-plane runtime engine built atop committed Raft log entries with node registration/heartbeat
+- Rust SDK typed and byte-level publish/subscribe APIs
+- CLI daemon-backed workflow (`deploy`, `connect`, `scale`, `observe`, `replay`, `nodes`, `idl`)
+- CLI runtime lifecycle commands (`start`, `stop`, `list`) with node targeting
+- Agent reconciliation loop command (`agent`) for schedule→start/stop execution via daemon APIs
+- Runtime daemon QUIC API (typed binary envelopes) for lifecycle + control-plane mutate/query/status/replay + Raft RPC
 
-## What happened to the messaging platform?
+## Examples
 
-**The previous project can be found in the _legacy_ branch.**
+Use [`examples/README.md`](examples/README.md) for migrated and rewritten examples:
 
-A messaging platform was never our end-goal. We have taken all of our learning from building that platform and applied it to the network stack for Selium 1.0.
+- Echo workflow
+- Data pipeline workflow
+- Orchestrator workflow
+- Rust SDK typed + byte pub/sub examples
 
----
+`.selium/` is runtime-generated local state (gitignored), not a curated examples directory.
 
-## Getting started
+## Orientation
 
-The fastest way to orient yourself is by [checking out an example](examples/).
+If you're familiar with the previous architecture and need a map to the new codebase, start with [`docs/ORIENTATION.md`](docs/ORIENTATION.md).
 
-You can also find [Selium modules in their own repo](https://github.com/seliumlabs/selium-modules). These modules add significant extra functionality on top of the core platform.
+## Validation
 
----
+From repo root:
 
-## Contributing
-
-We'd love your help! Check out the issue log or join in a discussion to get started.
-
-See `AGENTS.md` for contribution rules, including: stable Rust only, `tracing` logging, and International English.
-
----
-
-## Licence
-
-MPL v2 (see `LICENCE`)
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
+- `cargo test -p selium --test goal1_cluster -- --ignored --nocapture` (Goal 1 two-node cluster harness)
+- `cargo test -p selium --test goal2_runtime_topology -- --ignored --nocapture` (Goal 2 runtime topology)
+- `cargo test -p selium --test goal3_cli_targeted_launch -- --ignored --nocapture` (Goal 3 node-targeted launch)
+- `cargo test -p selium --test goal4_guest_io -- --ignored --nocapture` (Goal 4 guest-side I/O smoke)

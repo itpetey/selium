@@ -1,93 +1,16 @@
-name: Publish project artifacts
+name: Publish Artifacts
 
 on:
-  push:
-    tags:
-      - v*
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  crates-io:
-    name: Publish to crates.io
+  publish:
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
-        with:
-          toolchain: stable
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: cargo login
-        run: echo ${{ secrets.CRATES_TOKEN }} | cargo login
-
-      - name: cargo publish
-        run: cargo publish --workspace --keep-going
-
-  artifacts:
-    name: Publish release artifacts
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: cargo build
-        run: cargo build --release -p selium-runtime --target ${{ matrix.target }}
-
-      - name: package artifact (nix)
-        if: runner.os != 'Windows'
+      - name: Placeholder
         run: |
-          set -euo pipefail
-          target_dir="target/${{ matrix.target }}/release"
-          bin="selium-runtime"
-          out="selium-runtime-${{ matrix.target }}"
-          mkdir -p dist
-          cp "${target_dir}/${bin}" "dist/${bin}"
-          tar -C dist -czf "${out}.tar.gz" "${bin}"
-
-      - name: package artifact (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $targetDir = "target\\${{ matrix.target }}\\release"
-          $bin = "selium-runtime.exe"
-          $out = "selium-runtime-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "$targetDir\\$bin" "dist\\$bin"
-          Push-Location dist
-          Compress-Archive -Path "$bin" -DestinationPath "..\\$out.zip"
-          Pop-Location
-
-      - name: upload release assets
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            selium-runtime-*.tar.gz
-            selium-runtime-*.zip
+          echo "Publishing is intentionally disabled during monorepo bootstrap."

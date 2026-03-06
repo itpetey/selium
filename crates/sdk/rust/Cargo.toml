@@ -1,0 +1,20 @@
+[package]
+name = "selium-sdk-rust"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+selium-control-plane-api = { workspace = true }
+selium-abi = { workspace = true }
+selium-io-core = { workspace = true }
+selium-io-durability = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+rkyv = { workspace = true }

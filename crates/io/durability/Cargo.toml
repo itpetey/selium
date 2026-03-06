@@ -1,0 +1,16 @@
+[package]
+name = "selium-io-durability"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rkyv = { workspace = true }
+selium-abi = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }

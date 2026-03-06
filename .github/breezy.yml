@@ -1,5 +1,5 @@
-name-template: v$VERSION
-tag-template: v$VERSION
+name-template: $DIRECTORY-$VERSION
+tag-template: $DIRECTORY-$VERSION
 categories:
   - title: 🚀 Features
     labels:
@@ -18,4 +18,6 @@ exclude-labels:
   - skip-log
 change-template: "* $TITLE @$AUTHOR (#$NUMBER)"
 template: |
+  ## Changes
+
   $CHANGES

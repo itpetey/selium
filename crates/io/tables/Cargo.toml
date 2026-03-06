@@ -1,0 +1,10 @@
+[package]
+name = "selium-io-tables"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rkyv = { workspace = true }
+selium-abi = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }

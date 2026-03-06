@@ -1,103 +1,22 @@
-# AGENTS.md
+# Repository Guidelines
 
-> **Guidelines for AI coding agents contributing to Selium**
+## Project Structure & Module Organization
+This repo is a Rust workspace monorepo. Core runtime crates live under `crates/{abi,kernel,runtime,guest}`; platform crates are under `crates/control-plane/*`, `crates/io/*`, `crates/io/core`, `crates/io/durability`, and `crates/runtime-adapters/*`; Rust SDK lives in `crates/sdk/rust`; system modules live under `modules/*` (control-plane reconcile logic); CLI is at `crates/cli`; examples (contracts/workflows/state snapshots) are in `examples/`.
 
-Selium is a channel‑native compute fabric. Guests are WASM services with typed ports; all I/O is via channels; no ambient authority; Flatbuffers only.
+## Build, Test, and Development Commands
+Run commands from repo root:
+- `cargo check --workspace --all-targets`
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --all-targets`
 
-This document defines what agents may change, how to do it, and what "done" means.
+For WASM modules, build any module crate with `--target wasm32-unknown-unknown`, e.g. `cargo build --release --target wasm32-unknown-unknown -p selium-module-control-plane`.
 
----
+## Coding Style & Naming Conventions
+Rust 2024 edition is used across the workspace; prefer default rustfmt output and keep clippy clean. Use standard Rust naming (`snake_case` for functions/modules, `CamelCase` for types). Workspace members follow `selium-<domain>-<component>` naming.
 
-## Prime directives (do not break these)
- - **Channels‑only I/O.** No sockets, no WASI/POSIX.
- - **Flatbuffers on wires.** Public wires and persisted artefacts use Flatbuffers; internal code uses idiomatic Rust types.
- - **No use of WASI toolchain.** Code and docs should never reference `wasm(32|64)-wasi-*`.
- - **Strict capabilities.** Guests may only do what their capability bundle allows. No ambient lookups.
- - **Stable Rust only.** Annotate public items with Rustdoc. Log via tracing.
- - **Small, reviewable patches (unless specifically required by a human developer).** Never push or commit; output patches and file diffs only.
+## Testing Guidelines
+Unit tests live with each crate. For cross-crate changes, ensure workspace checks/tests pass and document any runtime environment assumptions in your PR.
 
----
-
-## Coding standards
-
- - **Edition:** Rust 2024.
- - **Lint gate:** `cargo clippy -- -D warnings` must be clean.
- - **Fmt:** `cargo fmt` required.
- - **Tests:** `cargo test --all-targets` must pass.
- - **Logging:** `tracing` only.
- - **Async:** `tokio` (multi‑thread runtime).
- - **Error handling:** `anyhow` for binaries. `thiserror` for libraries.
- - **Error handling (strict):**
-   - Do not suppress `Result` values. Never write `let _ = some_result;` or otherwise drop errors. Propagate with `?` and map with `map_err`/`context` as appropriate.
-   - Do not use `unwrap`/`expect` in host code. Handle errors gracefully and return typed errors; panics in host paths create denial‑of‑service risk. Exception: permitted inside `#[test]` scopes. Explicit human permission required for any other exceptions.
- - **Unsafe:** avoid; if necessary, encapsulate and document reasoning.
- - **Human language:** all documentation, comments, binding names etc. should use International English.
- - **Order of code:** each Rust code file should be laid out in the following order:
-    1. Module/library doc comments
-    2. `use` statements
-    3. `type` definitions
-    4. `const` and `static` definitions
-    5. `trait` definitions
-    6. `struct` and `enum` definitions
-    7. `impl` blocks
-    8. Free functions
-    9. Tests (in a `#[cfg(test)] mod tests` block at the end of the file)
- - **Documentation:** all public items must have `///` Rustdoc comments
-
----
-
-## Flatbuffers policy
-
- - Public wires and cross‑process/persisted artefacts are Flatbuffers. No JSON for runtime wires.
- - Keep generated Rust modules checked in (build must not require network).
- - Schema ids: compute a 16‑byte BLAKE3 of the .fbs file content. The `#[schema]` macro must emit a const with this id for use in port metadata.
-
----
-
-## Security invariants
-
- - **Capabilities:** every I/O handle the guest uses must be backed by a capability entry minted by the authoriser; host validates on each call.
- - **No ambient authority:** forbid any API that opens Catalogue paths or channels by string unless explicitly authorised.
- - **Isolation:** one wasmtime store per instance; configure memory caps; pooling; fuel/epoch interruption to bound CPU.
-
----
-
-## Pre‑finish checklist (every patch)
- - `cargo fmt` (after every changeset)
- - `cargo clippy -- -D warnings` clean
- - `cargo test --all-targets` passes
- - No flexbuffers, no bincode, no ambient I/O
- - Public items have /// Rustdoc
- - Flatbuffers root/file ids intact (SDIC/SCAT/STOP/SBND/SCAP)
- - If schemas changed: generated code updated and checked in
- - If bindings/rules changed: tests updated or added
- - No suppressed `Result`s; no `unwrap`/`expect` in host code (tests are exempt)
-
----
-
-## What NOT to do
- - ❌ Push commits or rewrite git history
- - ❌ Introduce network, filesystem, or POSIX/WASI dependencies for guests
- - ❌ Add heavy dependencies casually
- - ❌ Bypass capability checks or create "debug backdoors"
- - ❌ Hide transforms/rules in opaque “network” layers; transforms must be explicit services
- - ❌ Use American English
- - ❌ Suppress `Result`s (e.g., `let _ = some_result;`). Propagate with `?` and map errors.
- - ❌ Use `unwrap`/`expect` in host code (except inside `#[test]` scopes). Convert to fallible flows and surface errors.
- - X Use `thiserror` in binary crates. Use `anyhow`.
- - X Use `anyhow` in library crates. Use `thiserror`.
-
----
-
-## Contact the humans
-
-When trade‑offs are non‑obvious, prefer a TODO with a short rationale:
-
-```rust
-// TODO(@maintainer): We could adopt the channel's schema on first write.
-// Leaving strict-equality for now to avoid accidental schema drift.
-```
-
----
-
-Thank you! Following these rules keeps Selium simple, safe, and pleasant to work in.
+## Commit & Pull Request Guidelines
+Recent commits use short, descriptive, imperative summaries (optionally with a scope). Keep commit messages concise and focused on one change set. For PRs, include a clear summary, rationale, and the exact `cargo` commands you ran; call out affected modules and any runtime requirements (e.g., wasm builds or `selium-runtime` setup).

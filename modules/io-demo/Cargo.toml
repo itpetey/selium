@@ -1,0 +1,9 @@
+[package]
+name = "selium-module-io-demo"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+selium-guest = { workspace = true }

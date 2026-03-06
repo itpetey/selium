@@ -1,0 +1,34 @@
+[package]
+name = "selium-guest-macros"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.cargo-shear]
+ignored-paths = ["tests/**/*.rs"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true, features = ["proc-macro"] }
+proc-macro-crate = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true, features = [
+  "clone-impls",
+  "full",
+  "parsing",
+  "printing",
+  "proc-macro"
+] }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+selium-guest = { path = "../../guest" }
+trybuild = { workspace = true }

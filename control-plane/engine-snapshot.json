@@ -1,0 +1,29 @@
+{
+  "control_plane": {
+    "registry": {
+      "packages": {}
+    },
+    "deployments": {},
+    "pipelines": {},
+    "nodes": {
+      "local-node": {
+        "name": "local-node",
+        "capacity_slots": 64,
+        "supported_isolation": [
+          "Standard",
+          "Hardened",
+          "Microvm"
+        ],
+        "daemon_addr": "127.0.0.1:7100",
+        "daemon_server_name": "localhost",
+        "last_heartbeat_ms": 0
+      }
+    }
+  },
+  "tables": {
+    "tables": {},
+    "views": {},
+    "view_state": {}
+  },
+  "last_applied": 0
+}

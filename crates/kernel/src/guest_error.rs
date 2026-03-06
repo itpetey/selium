@@ -1,0 +1,64 @@
+//! Guest-facing error types shared across hostcall contracts.
+
+use thiserror::Error;
+
+use crate::{KernelError, registry::RegistryError};
+
+/// Result type used for guest-visible operations.
+pub type GuestResult<T, E = GuestError> = Result<T, E>;
+
+/// Errors surfaced to guest callers through hostcall contracts.
+#[derive(Error, Debug)]
+pub enum GuestError {
+    /// Invalid argument received from guest input.
+    #[error("invalid argument")]
+    InvalidArgument,
+    /// Guest-provided UTF-8 payload is invalid.
+    #[error("Invalid UTF-8 in guest input")]
+    InvalidUtf8,
+    /// Guest memory slice is invalid.
+    #[error("Invalid guest memory slice")]
+    MemorySlice,
+    /// Requested resource was not found.
+    #[error("resource not found")]
+    NotFound,
+    /// Caller does not have sufficient permissions.
+    #[error("permission denied")]
+    PermissionDenied,
+    /// Internal kernel error.
+    #[error("The kernel encountered an error. Please report this to your administrator.")]
+    Kernel(#[from] KernelError),
+    /// Internal registry error.
+    #[error("The kernel Registry encountered an error. Please report this to your administrator.")]
+    Registry(#[from] RegistryError),
+    /// Subsystem-specific internal error.
+    #[error("internal error: {0}")]
+    Subsystem(String),
+    /// Requested operation would block.
+    #[error("This function would block")]
+    WouldBlock,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_messages_are_human_readable() {
+        assert_eq!(GuestError::InvalidArgument.to_string(), "invalid argument");
+        assert_eq!(GuestError::NotFound.to_string(), "resource not found");
+        assert_eq!(
+            GuestError::PermissionDenied.to_string(),
+            "permission denied"
+        );
+    }
+
+    #[test]
+    fn kernel_and_registry_errors_convert_into_guest_error() {
+        let kernel = GuestError::from(KernelError::Driver("x".to_string()));
+        assert!(matches!(kernel, GuestError::Kernel(_)));
+
+        let registry = GuestError::from(RegistryError::InvalidReservation);
+        assert!(matches!(registry, GuestError::Registry(_)));
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "selium-module-control-plane"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+rkyv = { workspace = true }
+selium-control-plane-api = { workspace = true }
+selium-control-plane-runtime = { workspace = true }
+selium-control-plane-scheduler = { workspace = true }
+selium-guest = { workspace = true }
+
+[dev-dependencies]
+selium-control-plane-api = { workspace = true }

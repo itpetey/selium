@@ -1,19 +1,16 @@
-name: Draft the release
+name: Draft Release
 
 on:
-  push:
-    branches:
-      - main
-      - hotfix
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  release:
+  draft:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: read
     steps:
       - uses: actions/checkout@v6
-      - uses: itpetey/breezy@bb65a07f3ed4778279c6908d32cc72dbef642b34 # v0.4.0
-        with:
-          language: rust
+      - name: Placeholder
+        run: |
+          echo "Release automation will be wired after control-plane + SDK stabilization."
