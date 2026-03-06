@@ -1682,6 +1682,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-example-network-http-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-network-quic-stream"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "selium-guest",
+]
+
+[[package]]
 name = "selium-example-pipeline-transform"
 version = "0.1.0"
 dependencies = [

@@ -1,11 +1,3 @@
-mod certs;
-mod config;
-mod daemon;
-mod kernel;
-mod modules;
-mod providers;
-mod wasmtime;
-
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +11,14 @@ use crate::config::{
     EgressProfileConfig, IngressBindingConfig, LogFormat, RuntimeNetworkConfig,
     RuntimeStorageConfig, ServerCommand, StorageBlobConfig, StorageLogConfig, load_server_options,
 };
+
+mod certs;
+mod config;
+mod daemon;
+mod kernel;
+mod modules;
+mod providers;
+mod wasmtime;
 
 fn initialise_tracing(format: LogFormat) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()

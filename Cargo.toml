@@ -25,6 +25,8 @@ members = [
   "examples/control-plane-topology/apps/processor",
   "examples/control-plane-topology/apps/sink",
   "examples/event-broadcast",
+  "examples/network-http-rpc",
+  "examples/network-quic-stream",
   "examples/pipeline-transform",
   "examples/process-supervisor",
   "examples/rpc-echo-service",

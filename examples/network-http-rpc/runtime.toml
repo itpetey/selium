@@ -1,0 +1,16 @@
+[network]
+
+[[network.egress-profiles]]
+name = "example-http-loopback"
+protocol = "http"
+interactions = ["rpc"]
+allowed-authorities = ["127.0.0.1:7443"]
+ca-cert = "certs/ca.crt"
+
+[[network.ingress-bindings]]
+name = "example-http-loopback"
+protocol = "http"
+interactions = ["rpc"]
+listen = "127.0.0.1:7443"
+cert = "certs/server.crt"
+key = "certs/server.key"

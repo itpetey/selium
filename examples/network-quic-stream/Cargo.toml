@@ -1,0 +1,13 @@
+[package]
+name = "selium-example-network-quic-stream"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "network_quic_stream"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+selium-guest.workspace = true
