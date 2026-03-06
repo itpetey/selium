@@ -1,3 +1,6 @@
+//! Scatter-gather quote processing with two workers and one aggregator.
+//! Requests are partitioned across workers and gathered back into a single validated result set.
+
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -159,6 +162,8 @@ fn writer_id_for(worker: &str) -> u32 {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Workers and the coordinator all attach from the shared queue id rather than holding
+    // onto a writer or reader instance across task boundaries.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,
@@ -169,6 +174,7 @@ fn spawn_checked<F>(name: &'static str, future: F)
 where
     F: Future<Output = Result<()>> + 'static,
 {
+    // If one worker exits unexpectedly, the gather loop would otherwise hang waiting for results.
     spawn(async move {
         if let Err(err) = future.await {
             panic!("{name} failed: {err:#}");

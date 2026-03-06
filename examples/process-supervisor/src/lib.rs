@@ -1,3 +1,6 @@
+//! Parent/child orchestration with `ProcessBuilder`.
+//! The supervisor starts two child entrypoints, receives a status signal from each, and stops them again.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -97,6 +100,7 @@ pub async fn worker(worker_id: i32, status_channel_shared_id: u64) -> Result<()>
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Child processes only receive the shared resource id, so they rebuild the descriptor on entry.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,

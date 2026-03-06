@@ -1,3 +1,6 @@
+//! Checkpoint handoff and resume using typed Selium entrypoint arguments.
+//! This models guest-managed recovery state, not runtime-provided persistence.
+
 use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -146,6 +149,7 @@ fn expected_total(last_seq: u32, running_total: u32) -> u32 {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Queue ids are the stable values worth keeping in checkpoints or passing between tasks.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,
@@ -156,6 +160,7 @@ fn spawn_checked<F>(name: &'static str, future: F)
 where
     F: Future<Output = Result<()>> + 'static,
 {
+    // The producer is part of the startup proof, so its failure should surface immediately.
     spawn(async move {
         if let Err(err) = future.await {
             panic!("{name} failed: {err:#}");

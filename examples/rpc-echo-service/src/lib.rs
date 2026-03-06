@@ -1,3 +1,6 @@
+//! Minimal request/reply RPC inside one Selium guest module.
+//! Startup proves the request path and response path both work before the module idles.
+
 use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -102,6 +105,7 @@ async fn run_server(requests_shared_id: u64, responses_shared_id: u64) -> Result
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Examples pass shared queue ids around and rebuild the descriptor at the attachment site.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,
@@ -112,6 +116,8 @@ fn spawn_checked<F>(name: &'static str, future: F)
 where
     F: Future<Output = Result<()>> + 'static,
 {
+    // Background tasks panic the whole module on failure so startup never reports success
+    // while one half of the example flow has already died.
     spawn(async move {
         if let Err(err) = future.await {
             panic!("{name} failed: {err:#}");

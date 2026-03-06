@@ -1,3 +1,6 @@
+//! Sink app used by the control-plane topology example.
+//! It mirrors the other apps with a local contract-level self-check before idling under control-plane management.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -54,6 +57,7 @@ pub async fn start() -> Result<()> {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // The sink receives the same kind of queue handle as any other guest task or process.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,

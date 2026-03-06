@@ -1,3 +1,6 @@
+//! Processor app used by the control-plane topology example.
+//! Today it validates its own contract types locally while the control plane models the deployment graph.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -55,6 +58,7 @@ pub async fn start() -> Result<()> {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Keeping descriptor construction local makes each app independent of who created the queue.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,

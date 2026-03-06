@@ -1,3 +1,6 @@
+//! Two-stage pipeline processing inside one Selium guest module.
+//! The example turns raw orders into reservation work and then into projection updates.
+
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -163,6 +166,7 @@ fn expected_projection_keys() -> BTreeSet<String> {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // Each stage receives only the queue id it needs and reconstructs the full descriptor locally.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,
@@ -173,6 +177,7 @@ fn spawn_checked<F>(name: &'static str, future: F)
 where
     F: Future<Output = Result<()>> + 'static,
 {
+    // Any stage failure is treated as a startup failure because partial pipelines are misleading.
     spawn(async move {
         if let Err(err) = future.await {
             panic!("{name} failed: {err:#}");

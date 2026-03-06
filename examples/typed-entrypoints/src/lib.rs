@@ -1,3 +1,6 @@
+//! Multiple typed Selium entrypoints funneled into one guest implementation.
+//! The module proves that different entrypoint signatures arrive as normal typed Rust values.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -73,6 +76,8 @@ async fn run_invocation(service: &str, retries: i32, mode: &str) -> Result<()> {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // The launch record is echoed through a queue so the example crosses both the ABI boundary
+    // and the message boundary before declaring success.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,

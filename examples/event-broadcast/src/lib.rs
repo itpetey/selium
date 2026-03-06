@@ -1,3 +1,6 @@
+//! Minimal event broadcast with two subscribers and explicit delivery acknowledgements.
+//! Startup only succeeds once every subscriber has confirmed every published event.
+
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -133,6 +136,8 @@ fn writer_id_for(consumer: &str) -> u32 {
 }
 
 fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
+    // The shared queue id is the durable handle that lets separately spawned tasks attach
+    // to the same channel topology.
     io::ChannelDescriptor {
         queue_shared_id: shared_id,
         max_frame_bytes: FRAME_BYTES,
@@ -143,6 +148,7 @@ fn spawn_checked<F>(name: &'static str, future: F)
 where
     F: Future<Output = Result<()>> + 'static,
 {
+    // Subscriber failures should fail the module instead of silently reducing fan-out.
     spawn(async move {
         if let Err(err) = future.await {
             panic!("{name} failed: {err:#}");
