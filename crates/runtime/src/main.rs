@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     rc::Rc,
@@ -8,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
+};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, Incoming};
 use rustls::{RootCertStore, pki_types::PrivateKeyDer};
@@ -25,6 +29,7 @@ use selium_module_control_plane::{
     api::{IsolationProfile, NodeSpec},
     runtime::Mutation,
 };
+use serde::Deserialize;
 use tokio::{
     signal,
     sync::{Mutex, Notify},
@@ -40,7 +45,8 @@ mod modules;
 mod providers;
 mod wasmtime;
 
-#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 enum LogFormat {
     /// Human-friendly text logs suitable for local development.
     Text,
@@ -51,6 +57,9 @@ enum LogFormat {
 #[derive(Parser, Debug)]
 #[command(version, about = "Selium host runtime")]
 struct ServerOptions {
+    /// Optional TOML config file that provides defaults for omitted flags.
+    #[arg(short = 'c', long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
     /// Log output format (text or JSON) for tracing events.
     #[arg(long, env = "SELIUM_LOG_FORMAT", default_value = "text")]
     log_format: LogFormat,
@@ -133,6 +142,44 @@ struct DaemonArgs {
     /// Heartbeat interval for node liveness updates (milliseconds).
     #[arg(long, default_value_t = 1000)]
     cp_heartbeat_interval_ms: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct RuntimeConfig {
+    log_format: Option<LogFormat>,
+    work_dir: Option<PathBuf>,
+    module: Option<Vec<String>>,
+    generate_certs: Option<GenerateCertsConfig>,
+    daemon: Option<DaemonConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct GenerateCertsConfig {
+    output_dir: Option<PathBuf>,
+    ca_common_name: Option<String>,
+    server_name: Option<String>,
+    client_name: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct DaemonConfig {
+    listen: Option<String>,
+    cp_node_id: Option<String>,
+    cp_peers: Option<Vec<String>>,
+    cp_bootstrap_leader: Option<bool>,
+    cp_state_dir: Option<PathBuf>,
+    quic_cert: Option<PathBuf>,
+    quic_key: Option<PathBuf>,
+    quic_peer_cert: Option<PathBuf>,
+    quic_peer_key: Option<PathBuf>,
+    quic_ca: Option<PathBuf>,
+    cp_public_addr: Option<String>,
+    cp_server_name: Option<String>,
+    cp_capacity_slots: Option<u32>,
+    cp_heartbeat_interval_ms: Option<u64>,
 }
 
 struct DaemonState {
@@ -663,9 +710,196 @@ fn initialise_tracing(format: LogFormat) -> Result<()> {
     Ok(())
 }
 
+fn load_server_options() -> Result<ServerOptions> {
+    load_server_options_from(std::env::args_os())
+}
+
+fn load_server_options_from<I, T>(args: I) -> Result<ServerOptions>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let matches = ServerOptions::command().get_matches_from(args);
+    let mut options = ServerOptions::from_arg_matches(&matches)
+        .map_err(|err| anyhow!("parse runtime arguments: {err}"))?;
+
+    if let Some(path) = options.config.clone() {
+        let config: RuntimeConfig = load_toml_config(&path)?;
+        merge_runtime_config(&mut options, &matches, config);
+    }
+
+    Ok(options)
+}
+
+fn merge_runtime_config(
+    options: &mut ServerOptions,
+    matches: &clap::ArgMatches,
+    config: RuntimeConfig,
+) {
+    let RuntimeConfig {
+        log_format,
+        work_dir,
+        module,
+        generate_certs,
+        daemon,
+    } = config;
+
+    if should_apply_config(matches.value_source("log_format")) {
+        if let Some(log_format) = log_format {
+            options.log_format = log_format;
+        }
+    }
+
+    if should_apply_config(matches.value_source("work_dir")) {
+        if let Some(work_dir) = work_dir {
+            options.work_dir = work_dir;
+        }
+    }
+
+    if should_apply_config(matches.value_source("module")) {
+        if let Some(module) = module {
+            options.module = Some(module);
+        }
+    }
+
+    match (&mut options.command, generate_certs, daemon) {
+        (Some(ServerCommand::GenerateCerts(args)), Some(cfg), _) => {
+            merge_generate_certs_config(args, matches.subcommand_matches("generate-certs"), cfg);
+        }
+        (Some(ServerCommand::Daemon(args)), _, Some(cfg)) => {
+            merge_daemon_config(args, matches.subcommand_matches("daemon"), cfg);
+        }
+        _ => {}
+    }
+}
+
+fn merge_generate_certs_config(
+    args: &mut GenerateCertsArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: GenerateCertsConfig,
+) {
+    let value_source = |name| matches.and_then(|m| m.value_source(name));
+
+    if should_apply_config(value_source("output_dir")) {
+        if let Some(output_dir) = config.output_dir {
+            args.output_dir = output_dir;
+        }
+    }
+    if should_apply_config(value_source("ca_common_name")) {
+        if let Some(ca_common_name) = config.ca_common_name {
+            args.ca_common_name = ca_common_name;
+        }
+    }
+    if should_apply_config(value_source("server_name")) {
+        if let Some(server_name) = config.server_name {
+            args.server_name = server_name;
+        }
+    }
+    if should_apply_config(value_source("client_name")) {
+        if let Some(client_name) = config.client_name {
+            args.client_name = client_name;
+        }
+    }
+}
+
+fn merge_daemon_config(
+    args: &mut DaemonArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: DaemonConfig,
+) {
+    let value_source = |name| matches.and_then(|m| m.value_source(name));
+
+    if should_apply_config(value_source("listen")) {
+        if let Some(listen) = config.listen {
+            args.listen = listen;
+        }
+    }
+    if should_apply_config(value_source("cp_node_id")) {
+        if let Some(cp_node_id) = config.cp_node_id {
+            args.cp_node_id = cp_node_id;
+        }
+    }
+    if should_apply_config(value_source("cp_peers")) {
+        if let Some(cp_peers) = config.cp_peers {
+            args.cp_peers = cp_peers;
+        }
+    }
+    if should_apply_config(value_source("cp_bootstrap_leader")) {
+        if let Some(cp_bootstrap_leader) = config.cp_bootstrap_leader {
+            args.cp_bootstrap_leader = cp_bootstrap_leader;
+        }
+    }
+    if should_apply_config(value_source("cp_state_dir")) {
+        if let Some(cp_state_dir) = config.cp_state_dir {
+            args.cp_state_dir = cp_state_dir;
+        }
+    }
+    if should_apply_config(value_source("quic_cert")) {
+        if let Some(quic_cert) = config.quic_cert {
+            args.quic_cert = quic_cert;
+        }
+    }
+    if should_apply_config(value_source("quic_key")) {
+        if let Some(quic_key) = config.quic_key {
+            args.quic_key = quic_key;
+        }
+    }
+    if should_apply_config(value_source("quic_peer_cert")) {
+        if let Some(quic_peer_cert) = config.quic_peer_cert {
+            args.quic_peer_cert = Some(quic_peer_cert);
+        }
+    }
+    if should_apply_config(value_source("quic_peer_key")) {
+        if let Some(quic_peer_key) = config.quic_peer_key {
+            args.quic_peer_key = Some(quic_peer_key);
+        }
+    }
+    if should_apply_config(value_source("quic_ca")) {
+        if let Some(quic_ca) = config.quic_ca {
+            args.quic_ca = quic_ca;
+        }
+    }
+    if should_apply_config(value_source("cp_public_addr")) {
+        if let Some(cp_public_addr) = config.cp_public_addr {
+            args.cp_public_addr = Some(cp_public_addr);
+        }
+    }
+    if should_apply_config(value_source("cp_server_name")) {
+        if let Some(cp_server_name) = config.cp_server_name {
+            args.cp_server_name = cp_server_name;
+        }
+    }
+    if should_apply_config(value_source("cp_capacity_slots")) {
+        if let Some(cp_capacity_slots) = config.cp_capacity_slots {
+            args.cp_capacity_slots = cp_capacity_slots;
+        }
+    }
+    if should_apply_config(value_source("cp_heartbeat_interval_ms")) {
+        if let Some(cp_heartbeat_interval_ms) = config.cp_heartbeat_interval_ms {
+            args.cp_heartbeat_interval_ms = cp_heartbeat_interval_ms;
+        }
+    }
+}
+
+fn should_apply_config(source: Option<ValueSource>) -> bool {
+    !matches!(
+        source,
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    )
+}
+
+fn load_toml_config<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read config file {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("parse TOML config {}", path.display()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = ServerOptions::parse();
+    let args = load_server_options()?;
     initialise_tracing(args.log_format)?;
 
     if let Some(ServerCommand::GenerateCerts(cert_args)) = &args.command {
@@ -698,11 +932,23 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_test_config(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "selium-runtime-config-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::write(&path, contents).expect("write config");
+        path
+    }
 
     #[test]
     fn parses_default_options() {
-        let opts = ServerOptions::parse_from(["selium-runtime"]);
+        let opts = load_server_options_from(["selium-runtime"]).expect("parse opts");
         assert_eq!(opts.log_format, LogFormat::Text);
         assert!(opts.command.is_none());
         assert_eq!(opts.work_dir, PathBuf::from("."));
@@ -710,14 +956,15 @@ mod tests {
 
     #[test]
     fn parses_generate_certs_command() {
-        let opts = ServerOptions::parse_from([
+        let opts = load_server_options_from([
             "selium-runtime",
             "generate-certs",
             "--output-dir",
             "certs-out",
             "--server-name",
             "example.local",
-        ]);
+        ])
+        .expect("parse opts");
         let Some(ServerCommand::GenerateCerts(args)) = opts.command else {
             panic!("expected generate-certs command");
         };
@@ -728,10 +975,66 @@ mod tests {
     #[test]
     fn parses_daemon_command() {
         let opts =
-            ServerOptions::parse_from(["selium-runtime", "daemon", "--listen", "127.0.0.1:7999"]);
+            load_server_options_from(["selium-runtime", "daemon", "--listen", "127.0.0.1:7999"])
+                .expect("parse opts");
         let Some(ServerCommand::Daemon(args)) = opts.command else {
             panic!("expected daemon command");
         };
         assert_eq!(args.listen, "127.0.0.1:7999");
+    }
+
+    #[test]
+    fn applies_runtime_config_when_flag_missing() {
+        let config = write_test_config(
+            r#"
+log-format = "json"
+work-dir = "runtime-data"
+
+[daemon]
+listen = "127.0.0.1:7999"
+cp-node-id = "cfg-node"
+"#,
+        );
+
+        let opts = load_server_options_from([
+            "selium-runtime",
+            "--config",
+            config.to_str().expect("config path"),
+            "daemon",
+        ])
+        .expect("parse opts");
+
+        assert_eq!(opts.log_format, LogFormat::Json);
+        assert_eq!(opts.work_dir, PathBuf::from("runtime-data"));
+        let Some(ServerCommand::Daemon(args)) = opts.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.listen, "127.0.0.1:7999");
+        assert_eq!(args.cp_node_id, "cfg-node");
+    }
+
+    #[test]
+    fn command_line_runtime_args_override_config() {
+        let config = write_test_config(
+            r#"
+[daemon]
+listen = "127.0.0.1:7999"
+"#,
+        );
+
+        let opts = load_server_options_from([
+            "selium-runtime",
+            "--config",
+            config.to_str().expect("config path"),
+            "daemon",
+            "--listen",
+            "127.0.0.1:8001",
+        ])
+        .expect("parse opts");
+
+        let Some(ServerCommand::Daemon(args)) = opts.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.listen, "127.0.0.1:8001");
     }
 }
