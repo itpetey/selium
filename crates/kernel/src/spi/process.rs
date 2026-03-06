@@ -24,6 +24,10 @@ pub trait ProcessLifecycleCapability {
         module_id: &str,
         name: &str,
         capabilities: Vec<Capability>,
+        network_egress_profiles: Vec<String>,
+        network_ingress_bindings: Vec<String>,
+        storage_logs: Vec<String>,
+        storage_blobs: Vec<String>,
         entrypoint: EntrypointInvocation,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -48,6 +52,10 @@ where
         module_id: &str,
         name: &str,
         capabilities: Vec<Capability>,
+        network_egress_profiles: Vec<String>,
+        network_ingress_bindings: Vec<String>,
+        storage_logs: Vec<String>,
+        storage_blobs: Vec<String>,
         entrypoint: EntrypointInvocation,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.as_ref().start(
@@ -56,6 +64,10 @@ where
             module_id,
             name,
             capabilities,
+            network_egress_profiles,
+            network_ingress_bindings,
+            storage_logs,
+            storage_blobs,
             entrypoint,
         )
     }
@@ -91,6 +103,10 @@ mod tests {
             _module_id: &str,
             _name: &str,
             _capabilities: Vec<Capability>,
+            _network_egress_profiles: Vec<String>,
+            _network_ingress_bindings: Vec<String>,
+            _storage_logs: Vec<String>,
+            _storage_blobs: Vec<String>,
             _entrypoint: EntrypointInvocation,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             *self.started.lock().expect("started lock") = true;
@@ -128,6 +144,10 @@ mod tests {
                 "m",
                 "n",
                 vec![Capability::TimeRead],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 invocation,
             )
             .await

@@ -9,11 +9,22 @@ use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
 use crate::{
-    Capability, GuestResourceId, ProcessStart, QueueAck, QueueAttach, QueueCancel, QueueClose,
-    QueueCommit, QueueCreate, QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult,
-    QueueShare, QueueStats, QueueStatsResult, QueueStatus, QueueWait, QueueWaitResult, RkyvEncode,
+    Capability, GuestResourceId, NetworkAccept, NetworkAcceptResult, NetworkClose, NetworkConnect,
+    NetworkListen, NetworkListenerDescriptor, NetworkRpcAccept, NetworkRpcAcceptResult,
+    NetworkRpcAwait, NetworkRpcBodyRead, NetworkRpcBodyReadResult, NetworkRpcBodyWrite,
+    NetworkRpcInvoke, NetworkRpcInvokeResult, NetworkRpcRespond, NetworkRpcRespondResult,
+    NetworkRpcResponseResult, NetworkSessionDescriptor, NetworkStatus, NetworkStreamAccept,
+    NetworkStreamOpen, NetworkStreamRecv, NetworkStreamRecvResult, NetworkStreamResult,
+    NetworkStreamSend, ProcessStart, QueueAck, QueueAttach, QueueCancel, QueueClose, QueueCommit,
+    QueueCreate, QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult, QueueShare,
+    QueueStats, QueueStatsResult, QueueStatus, QueueWait, QueueWaitResult, RkyvEncode,
     SessionCreate, SessionEntitlement, SessionRemove, SessionResource, ShmAlloc, ShmAttach,
-    ShmDescriptor, ShmDetach, ShmRead, ShmShare, ShmWrite, TimeNow, TimeSleep,
+    ShmDescriptor, ShmDetach, ShmRead, ShmShare, ShmWrite, StorageBlobGet, StorageBlobGetResult,
+    StorageBlobPut, StorageBlobPutResult, StorageBlobStoreDescriptor, StorageCheckpointResult,
+    StorageClose, StorageLogAppend, StorageLogAppendResult, StorageLogBounds,
+    StorageLogBoundsResult, StorageLogCheckpoint, StorageLogCheckpointGet, StorageLogDescriptor,
+    StorageLogReplay, StorageLogReplayResult, StorageManifestGet, StorageManifestGetResult,
+    StorageManifestSet, StorageOpenBlobStore, StorageOpenLog, StorageStatus, TimeNow, TimeSleep,
 };
 
 /// Type-erased metadata describing a hostcall.
@@ -275,6 +286,174 @@ declare_hostcalls! {
         input: QueueAck,
         output: QueueStatus
     },
+    NETWORK_LISTEN => {
+        name: "selium::network::listen",
+        capability: Capability::NetworkLifecycle,
+        input: NetworkListen,
+        output: NetworkListenerDescriptor
+    },
+    NETWORK_CLOSE => {
+        name: "selium::network::close",
+        capability: Capability::NetworkLifecycle,
+        input: NetworkClose,
+        output: NetworkStatus
+    },
+    NETWORK_CONNECT => {
+        name: "selium::network::connect",
+        capability: Capability::NetworkConnect,
+        input: NetworkConnect,
+        output: NetworkSessionDescriptor
+    },
+    NETWORK_ACCEPT => {
+        name: "selium::network::accept",
+        capability: Capability::NetworkAccept,
+        input: NetworkAccept,
+        output: NetworkAcceptResult
+    },
+    NETWORK_STREAM_OPEN => {
+        name: "selium::network::stream_open",
+        capability: Capability::NetworkStreamWrite,
+        input: NetworkStreamOpen,
+        output: NetworkStreamResult
+    },
+    NETWORK_STREAM_ACCEPT => {
+        name: "selium::network::stream_accept",
+        capability: Capability::NetworkAccept,
+        input: NetworkStreamAccept,
+        output: NetworkStreamResult
+    },
+    NETWORK_STREAM_SEND => {
+        name: "selium::network::stream_send",
+        capability: Capability::NetworkStreamWrite,
+        input: NetworkStreamSend,
+        output: NetworkStatus
+    },
+    NETWORK_STREAM_RECV => {
+        name: "selium::network::stream_recv",
+        capability: Capability::NetworkStreamRead,
+        input: NetworkStreamRecv,
+        output: NetworkStreamRecvResult
+    },
+    NETWORK_RPC_INVOKE => {
+        name: "selium::network::rpc_invoke",
+        capability: Capability::NetworkRpcClient,
+        input: NetworkRpcInvoke,
+        output: NetworkRpcInvokeResult
+    },
+    NETWORK_RPC_AWAIT => {
+        name: "selium::network::rpc_await",
+        capability: Capability::NetworkRpcClient,
+        input: NetworkRpcAwait,
+        output: NetworkRpcResponseResult
+    },
+    NETWORK_RPC_REQUEST_BODY_WRITE => {
+        name: "selium::network::rpc_request_body_write",
+        capability: Capability::NetworkRpcClient,
+        input: NetworkRpcBodyWrite,
+        output: NetworkStatus
+    },
+    NETWORK_RPC_RESPONSE_BODY_READ => {
+        name: "selium::network::rpc_response_body_read",
+        capability: Capability::NetworkRpcClient,
+        input: NetworkRpcBodyRead,
+        output: NetworkRpcBodyReadResult
+    },
+    NETWORK_RPC_ACCEPT => {
+        name: "selium::network::rpc_accept",
+        capability: Capability::NetworkRpcServer,
+        input: NetworkRpcAccept,
+        output: NetworkRpcAcceptResult
+    },
+    NETWORK_RPC_RESPOND => {
+        name: "selium::network::rpc_respond",
+        capability: Capability::NetworkRpcServer,
+        input: NetworkRpcRespond,
+        output: NetworkRpcRespondResult
+    },
+    NETWORK_RPC_REQUEST_BODY_READ => {
+        name: "selium::network::rpc_request_body_read",
+        capability: Capability::NetworkRpcServer,
+        input: NetworkRpcBodyRead,
+        output: NetworkRpcBodyReadResult
+    },
+    NETWORK_RPC_RESPONSE_BODY_WRITE => {
+        name: "selium::network::rpc_response_body_write",
+        capability: Capability::NetworkRpcServer,
+        input: NetworkRpcBodyWrite,
+        output: NetworkStatus
+    },
+    STORAGE_OPEN_LOG => {
+        name: "selium::storage::open_log",
+        capability: Capability::StorageLifecycle,
+        input: StorageOpenLog,
+        output: StorageLogDescriptor
+    },
+    STORAGE_OPEN_BLOB_STORE => {
+        name: "selium::storage::open_blob_store",
+        capability: Capability::StorageLifecycle,
+        input: StorageOpenBlobStore,
+        output: StorageBlobStoreDescriptor
+    },
+    STORAGE_CLOSE => {
+        name: "selium::storage::close",
+        capability: Capability::StorageLifecycle,
+        input: StorageClose,
+        output: StorageStatus
+    },
+    STORAGE_LOG_APPEND => {
+        name: "selium::storage::log_append",
+        capability: Capability::StorageLogWrite,
+        input: StorageLogAppend,
+        output: StorageLogAppendResult
+    },
+    STORAGE_LOG_CHECKPOINT => {
+        name: "selium::storage::log_checkpoint",
+        capability: Capability::StorageLogWrite,
+        input: StorageLogCheckpoint,
+        output: StorageStatus
+    },
+    STORAGE_LOG_REPLAY => {
+        name: "selium::storage::log_replay",
+        capability: Capability::StorageLogRead,
+        input: StorageLogReplay,
+        output: StorageLogReplayResult
+    },
+    STORAGE_LOG_CHECKPOINT_GET => {
+        name: "selium::storage::log_checkpoint_get",
+        capability: Capability::StorageLogRead,
+        input: StorageLogCheckpointGet,
+        output: StorageCheckpointResult
+    },
+    STORAGE_LOG_BOUNDS => {
+        name: "selium::storage::log_bounds",
+        capability: Capability::StorageLogRead,
+        input: StorageLogBounds,
+        output: StorageLogBoundsResult
+    },
+    STORAGE_BLOB_PUT => {
+        name: "selium::storage::blob_put",
+        capability: Capability::StorageBlobWrite,
+        input: StorageBlobPut,
+        output: StorageBlobPutResult
+    },
+    STORAGE_MANIFEST_SET => {
+        name: "selium::storage::manifest_set",
+        capability: Capability::StorageBlobWrite,
+        input: StorageManifestSet,
+        output: StorageStatus
+    },
+    STORAGE_BLOB_GET => {
+        name: "selium::storage::blob_get",
+        capability: Capability::StorageBlobRead,
+        input: StorageBlobGet,
+        output: StorageBlobGetResult
+    },
+    STORAGE_MANIFEST_GET => {
+        name: "selium::storage::manifest_get",
+        capability: Capability::StorageBlobRead,
+        input: StorageManifestGet,
+        output: StorageManifestGetResult
+    },
 }
 
 #[cfg(test)]
@@ -314,6 +493,13 @@ mod tests {
                 .expect("shared memory entries")
                 .len(),
             6
+        );
+        assert_eq!(
+            grouped
+                .get(&Capability::StorageLifecycle)
+                .expect("storage lifecycle entries")
+                .len(),
+            3
         );
         assert_eq!(
             grouped

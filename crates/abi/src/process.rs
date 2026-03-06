@@ -106,6 +106,14 @@ pub struct ProcessStart {
     pub name: String,
     /// Capabilities granted to the process.
     pub capabilities: Vec<crate::Capability>,
+    /// Runtime-managed outbound egress profiles granted to the process.
+    pub network_egress_profiles: Vec<String>,
+    /// Runtime-managed inbound bindings granted to the process.
+    pub network_ingress_bindings: Vec<String>,
+    /// Runtime-managed durable logs granted to the process.
+    pub storage_logs: Vec<String>,
+    /// Runtime-managed blob stores granted to the process.
+    pub storage_blobs: Vec<String>,
     /// Entrypoint invocation details.
     pub entrypoint: EntrypointInvocation,
 }

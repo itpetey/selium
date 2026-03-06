@@ -35,7 +35,7 @@ use super::{
 
 const PREALLOC_PAGES: u64 = 256;
 
-/// Wasmtime execution engine used by the runtime process lifecycle adapter.
+/// Wasmtime execution engine used by the runtime process lifecycle adaptor.
 pub struct WasmtimeRuntime {
     pub(crate) engine: Engine,
     available_caps: RwLock<HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>>,
@@ -43,7 +43,7 @@ pub struct WasmtimeRuntime {
 }
 
 #[derive(Debug)]
-/// Runtime error surfaced by the Wasmtime process adapter.
+/// Runtime error surfaced by the Wasmtime process adaptor.
 pub enum Error {
     CapabilityUnavailable(Capability),
     Kernel(KernelError),
@@ -134,6 +134,10 @@ impl WasmtimeRuntime {
         module: Module,
         name: &str,
         capabilities: &[Capability],
+        network_egress_profiles: &[String],
+        network_ingress_bindings: &[String],
+        storage_logs: &[String],
+        storage_blobs: &[String],
         entrypoint: EntrypointInvocation,
     ) -> Result<(), Error> {
         let mut linker = Linker::new(&self.engine);
@@ -175,6 +179,20 @@ impl WasmtimeRuntime {
         store
             .data_mut()
             .insert_extension(identity)
+            .map_err(KernelError::from)?;
+        store
+            .data_mut()
+            .insert_extension(selium_kernel::spi::network::NetworkProcessPolicy::new(
+                network_egress_profiles.iter().cloned(),
+                network_ingress_bindings.iter().cloned(),
+            ))
+            .map_err(KernelError::from)?;
+        store
+            .data_mut()
+            .insert_extension(selium_kernel::spi::storage::StorageProcessPolicy::new(
+                storage_logs.iter().cloned(),
+                storage_blobs.iter().cloned(),
+            ))
             .map_err(KernelError::from)?;
         // Limit linear memory growth to keep the mailbox pointers stable across the
         // instance lifetime. We preallocate and then lock the limit to the current
@@ -275,14 +293,14 @@ impl WasmtimeRuntime {
 }
 
 #[derive(Clone)]
-/// Process lifecycle adapter backed by [`WasmtimeRuntime`].
+/// Process lifecycle adaptor backed by [`WasmtimeRuntime`].
 pub struct WasmtimeProcessDriver {
     runtime: Arc<WasmtimeRuntime>,
     repository: Arc<dyn ModuleRepositoryReadCapability + Send + Sync>,
 }
 
 impl WasmtimeProcessDriver {
-    /// Create a new Wasmtime-backed process lifecycle adapter.
+    /// Create a new Wasmtime-backed process lifecycle adaptor.
     pub fn new(
         runtime: Arc<WasmtimeRuntime>,
         repository: Arc<dyn ModuleRepositoryReadCapability + Send + Sync>,
@@ -305,6 +323,10 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
         module_id: &str,
         name: &str,
         capabilities: Vec<Capability>,
+        network_egress_profiles: Vec<String>,
+        network_ingress_bindings: Vec<String>,
+        storage_logs: Vec<String>,
+        storage_blobs: Vec<String>,
         entrypoint: EntrypointInvocation,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let inner = self.clone();
@@ -320,6 +342,10 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                     module,
                     name,
                     &capabilities,
+                    &network_egress_profiles,
+                    &network_ingress_bindings,
+                    &storage_logs,
+                    &storage_blobs,
                     entrypoint,
                 )
                 .await

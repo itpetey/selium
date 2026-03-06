@@ -14,10 +14,12 @@ members = [
   "crates/io/durability",
   "crates/io/tables",
   "crates/kernel",
-  "crates/runtime",
-  "crates/runtime-adapters/microvm-adapter",
-  "crates/runtime-adapters/spi",
-  "crates/runtime-adapters/wasmtime-adapter",
+  "crates/runtime/adaptors/microvm-adaptor",
+  "crates/runtime/adaptors/spi",
+  "crates/runtime/adaptors/wasmtime-adaptor",
+  "crates/runtime/network",
+  "crates/runtime/service",
+  "crates/runtime/storage",
   "crates/sdk/rust",
   "examples/control-plane-topology/apps/ingress",
   "examples/control-plane-topology/apps/processor",
@@ -46,10 +48,15 @@ categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
 anyhow = { version = "1.0", default-features = false }
+bytes = { version = "1.10", default-features = false }
 blake3 = { version = "1.8", default-features = false }
 clap = { version = "4.5", default-features = false }
 futures = { version = "0.3", default-features = false }
 futures-util = { version = "0.3", default-features = false }
+http = { version = "1.3", default-features = false }
+http-body-util = { version = "0.1", default-features = false }
+hyper = { version = "1.7", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
 libc = { version = "0.2", default-features = false }
 loom = { version = "0.7", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
@@ -92,9 +99,11 @@ selium-io-core = { path = "crates/io/core", version = "0.1.0-alpha.0" }
 selium-io-durability = { path = "crates/io/durability", version = "0.1.0-alpha.0" }
 selium-io-tables = { path = "crates/io/tables", version = "0.1.0-alpha.0" }
 selium-module-control-plane = { path = "modules/control-plane", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-microvm = { path = "crates/runtime-adapters/microvm-adapter", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-spi = { path = "crates/runtime-adapters/spi", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-wasmtime = { path = "crates/runtime-adapters/wasmtime-adapter", version = "0.1.0-alpha.0" }
+selium-runtime-adaptor-microvm = { path = "crates/runtime/adaptors/microvm-adaptor", version = "0.1.0-alpha.0" }
+selium-runtime-adaptor-spi = { path = "crates/runtime/adaptors/spi", version = "0.1.0-alpha.0" }
+selium-runtime-adaptor-wasmtime = { path = "crates/runtime/adaptors/wasmtime-adaptor", version = "0.1.0-alpha.0" }
+selium-runtime-network = { path = "crates/runtime/network", version = "0.1.0-alpha.0" }
+selium-runtime-storage = { path = "crates/runtime/storage", version = "0.1.0-alpha.0" }
 selium-sdk-rust = { path = "crates/sdk/rust", version = "0.1.0-alpha.0" }
 
 [workspace.lints.rust]

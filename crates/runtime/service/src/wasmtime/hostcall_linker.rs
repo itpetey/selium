@@ -1,4 +1,4 @@
-//! Wasmtime adapter that links kernel hostcall operations.
+//! Wasmtime adaptor that links kernel hostcall operations.
 
 use std::sync::Arc;
 

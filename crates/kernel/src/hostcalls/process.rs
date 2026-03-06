@@ -152,20 +152,51 @@ where
             module_id,
             name,
             capabilities,
+            network_egress_profiles,
+            network_ingress_bindings,
+            storage_logs,
+            storage_blobs,
             entrypoint,
         } = input;
 
         let preparation =
-            (|| -> GuestResult<(String, String, Vec<selium_abi::Capability>, EntrypointInvocation)> {
+            (|| -> GuestResult<(
+                String,
+                String,
+                Vec<selium_abi::Capability>,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+                Vec<String>,
+                EntrypointInvocation,
+            )> {
                 entrypoint
                     .validate()
                     .map_err(|err| GuestError::from(KernelError::Driver(err.to_string())))?;
                 let entrypoint = entrypoint.resolve_resources(context.registry())?;
-                Ok((module_id, name, capabilities, entrypoint))
+                Ok((
+                    module_id,
+                    name,
+                    capabilities,
+                    network_egress_profiles,
+                    network_ingress_bindings,
+                    storage_logs,
+                    storage_blobs,
+                    entrypoint,
+                ))
             })();
 
         async move {
-            let (module_id, name, capabilities, entrypoint) = preparation?;
+            let (
+                module_id,
+                name,
+                capabilities,
+                network_egress_profiles,
+                network_ingress_bindings,
+                storage_logs,
+                storage_blobs,
+                entrypoint,
+            ) = preparation?;
             debug!(%module_id, %name, capabilities = ?capabilities, "process_start requested");
             let process_id = registry
                 .reserve(None, ResourceType::Process)
@@ -178,6 +209,10 @@ where
                     &module_id,
                     &name,
                     capabilities,
+                    network_egress_profiles,
+                    network_ingress_bindings,
+                    storage_logs,
+                    storage_blobs,
                     entrypoint,
                 )
                 .await
@@ -298,6 +333,10 @@ mod tests {
             _module_id: &str,
             _name: &str,
             _capabilities: Vec<Capability>,
+            _network_egress_profiles: Vec<String>,
+            _network_ingress_bindings: Vec<String>,
+            _storage_logs: Vec<String>,
+            _storage_blobs: Vec<String>,
             _entrypoint: EntrypointInvocation,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             let fail = self.fail;
@@ -332,6 +371,10 @@ mod tests {
             _module_id: &str,
             _name: &str,
             _capabilities: Vec<Capability>,
+            _network_egress_profiles: Vec<String>,
+            _network_ingress_bindings: Vec<String>,
+            _storage_logs: Vec<String>,
+            _storage_blobs: Vec<String>,
             _entrypoint: EntrypointInvocation,
         ) -> Result<(), Self::Error> {
             Ok(())
@@ -381,6 +424,10 @@ mod tests {
             module_id: "m".to_string(),
             name: "n".to_string(),
             capabilities: vec![Capability::TimeRead],
+            network_egress_profiles: Vec::new(),
+            network_ingress_bindings: Vec::new(),
+            storage_logs: Vec::new(),
+            storage_blobs: Vec::new(),
             entrypoint: EntrypointInvocation::new(
                 AbiSignature::new(Vec::new(), Vec::new()),
                 Vec::new(),

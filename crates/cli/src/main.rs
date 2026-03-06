@@ -34,7 +34,7 @@ use tokio::{signal, time::sleep};
 
 use crate::{
     config::{
-        AdapterArg, AgentArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs, IdlArgs,
+        AdaptorArg, AgentArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs, IdlArgs,
         IdlCommand, IdlCompileArgs, IdlPublishArgs, IsolationArg, ListArgs, NodesArgs, ObserveArgs,
         ReplayArgs, ScaleArgs, StartArgs, StopArgs, load_cli,
     },
@@ -242,7 +242,7 @@ async fn cmd_start(
             .ok_or_else(|| anyhow!("provide --module-spec or --module"))?;
         build_module_spec(
             &module,
-            args.adapter,
+            args.adaptor,
             args.isolation,
             if args.capabilities.is_empty() {
                 default_capabilities()
@@ -557,7 +557,7 @@ async fn execute_daemon_actions(
 }
 
 fn deployment_module_spec(deployment: &DeploymentSpec) -> String {
-    let (adapter, profile) = match deployment.isolation {
+    let (adaptor, profile) = match deployment.isolation {
         IsolationProfile::Standard => ("wasmtime", "standard"),
         IsolationProfile::Hardened => ("wasmtime", "hardened"),
         IsolationProfile::Microvm => ("microvm", "microvm"),
@@ -566,8 +566,8 @@ fn deployment_module_spec(deployment: &DeploymentSpec) -> String {
     build_module_spec(
         &deployment.module,
         match deployment.isolation {
-            IsolationProfile::Microvm => AdapterArg::Microvm,
-            _ => AdapterArg::Wasmtime,
+            IsolationProfile::Microvm => AdaptorArg::Microvm,
+            _ => AdaptorArg::Wasmtime,
         },
         match deployment.isolation {
             IsolationProfile::Standard => IsolationArg::Standard,
@@ -577,20 +577,20 @@ fn deployment_module_spec(deployment: &DeploymentSpec) -> String {
         default_capabilities(),
     )
     .replace(
-        "adapter=wasmtime;profile=standard",
-        &format!("adapter={adapter};profile={profile}"),
+        "adaptor=wasmtime;profile=standard",
+        &format!("adaptor={adaptor};profile={profile}"),
     )
 }
 
 fn build_module_spec(
     module: &str,
-    adapter: AdapterArg,
+    adaptor: AdaptorArg,
     isolation: IsolationArg,
     capabilities: Vec<String>,
 ) -> String {
-    let adapter = match adapter {
-        AdapterArg::Wasmtime => "wasmtime",
-        AdapterArg::Microvm => "microvm",
+    let adaptor = match adaptor {
+        AdaptorArg::Wasmtime => "wasmtime",
+        AdaptorArg::Microvm => "microvm",
     };
     let profile = match isolation {
         IsolationArg::Standard => "standard",
@@ -599,10 +599,10 @@ fn build_module_spec(
     };
 
     format!(
-        "path={};capabilities={};adapter={};profile={}",
+        "path={};capabilities={};adaptor={};profile={}",
         module,
         capabilities.join(","),
-        adapter,
+        adaptor,
         profile
     )
 }
@@ -666,12 +666,12 @@ mod tests {
     fn module_spec_contains_expected_capabilities() {
         let spec = build_module_spec(
             "echo.wasm",
-            AdapterArg::Wasmtime,
+            AdaptorArg::Wasmtime,
             IsolationArg::Standard,
             default_capabilities(),
         );
         assert!(spec.contains("path=echo.wasm"));
-        assert!(spec.contains("adapter=wasmtime"));
+        assert!(spec.contains("adaptor=wasmtime"));
         assert!(spec.contains("queue_writer"));
     }
 }

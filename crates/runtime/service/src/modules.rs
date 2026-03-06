@@ -14,16 +14,18 @@ use selium_kernel::{
     registry::{Registry, ResourceHandle, ResourceId, ResourceType},
     spi::process::ProcessLifecycleCapability,
 };
-use selium_runtime_adapter_microvm::MicroVmAdapter;
-use selium_runtime_adapter_spi::{
-    AdapterKind, ExecutionProfile, ModuleSpec as AdapterModuleSpec, RuntimeAdapter,
+use selium_runtime_adaptor_microvm::MicroVmAdaptor;
+use selium_runtime_adaptor_spi::{
+    AdaptorKind, ExecutionProfile, ModuleSpec as AdaptorModuleSpec, RuntimeAdaptor,
 };
-use selium_runtime_adapter_wasmtime::WasmtimeAdapter;
+use selium_runtime_adaptor_wasmtime::WasmtimeAdaptor;
+use selium_runtime_network::NetworkService;
+use selium_runtime_storage::StorageService;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 const DEFAULT_ENTRYPOINT: &str = "start";
-const DEFAULT_ADAPTER: AdapterKind = AdapterKind::Wasmtime;
+const DEFAULT_ADAPTOR: AdaptorKind = AdaptorKind::Wasmtime;
 const DEFAULT_PROFILE: ExecutionProfile = ExecutionProfile::Standard;
 
 #[derive(Default)]
@@ -38,7 +40,11 @@ struct ModuleSpec {
     module_path: PathBuf,
     entrypoint: String,
     capabilities: Vec<Capability>,
-    adapter: AdapterKind,
+    network_egress_profiles: Vec<String>,
+    network_ingress_bindings: Vec<String>,
+    storage_logs: Vec<String>,
+    storage_blobs: Vec<String>,
+    adaptor: AdaptorKind,
     profile: ExecutionProfile,
     params: Vec<AbiParam>,
     args: Vec<EntrypointArg>,
@@ -49,7 +55,11 @@ struct ModuleSpecBuilder {
     path: Option<String>,
     entrypoint: Option<String>,
     capabilities: Option<Vec<Capability>>,
-    adapter: Option<AdapterKind>,
+    network_egress_profiles: Option<Vec<String>>,
+    network_ingress_bindings: Option<Vec<String>>,
+    storage_logs: Option<Vec<String>>,
+    storage_blobs: Option<Vec<String>>,
+    adaptor: Option<AdaptorKind>,
     profile: Option<ExecutionProfile>,
     params: Option<Vec<ParamKind>>,
     args: Option<Vec<Argument>>,
@@ -83,7 +93,11 @@ impl ModuleSpecBuilder {
         self.path.is_none()
             && self.entrypoint.is_none()
             && self.capabilities.is_none()
-            && self.adapter.is_none()
+            && self.network_egress_profiles.is_none()
+            && self.network_ingress_bindings.is_none()
+            && self.storage_logs.is_none()
+            && self.storage_blobs.is_none()
+            && self.adaptor.is_none()
             && self.profile.is_none()
             && self.params.is_none()
             && self.args.is_none()
@@ -114,7 +128,7 @@ impl ParamKind {
 /// Read module specifications from CLI strings and start each module.
 ///
 /// Input format per module: a `;`-delimited list of `key=value` entries. Required keys are
-/// `path` and `capabilities`. Optional keys are `entrypoint` (defaults to `start`), `adapter`
+/// `path` and `capabilities`. Optional keys are `entrypoint` (defaults to `start`), `adaptor`
 /// (`wasmtime`/`microvm`), `profile` (`standard`/`hardened`/`microvm`), `params`, and `args`.
 /// The `args` value is a comma-separated list of values that may be prefixed with `TYPE:` to
 /// infer parameter kinds. When `params` is omitted, every arg must be typed. The `path` must
@@ -130,6 +144,7 @@ pub async fn spawn_from_cli(
     specs: &[String],
 ) -> Result<Vec<ResourceId>> {
     let specs = parse_module_specs(specs, work_dir.as_ref())?;
+    validate_runtime_grants(kernel, &specs).await?;
     let runtime = kernel.get::<WasmtimeProcessDriver>().ok_or_else(|| {
         WasmtimeError::Kernel(KernelError::Driver(
             "missing Wasmtime process driver in kernel".to_string(),
@@ -143,6 +158,35 @@ pub async fn spawn_from_cli(
     }
 
     Ok(processes)
+}
+
+async fn validate_runtime_grants(kernel: &Kernel, specs: &[ModuleSpec]) -> Result<()> {
+    let network = kernel
+        .get::<NetworkService>()
+        .ok_or_else(|| anyhow!("missing NetworkService in kernel"))?;
+    let storage = kernel
+        .get::<StorageService>()
+        .ok_or_else(|| anyhow!("missing StorageService in kernel"))?;
+
+    for spec in specs {
+        network
+            .validate_process_grants(
+                &spec.network_egress_profiles,
+                &spec.network_ingress_bindings,
+            )
+            .await
+            .with_context(|| {
+                format!("validate network grants for module `{}`", spec.module_label)
+            })?;
+        storage
+            .validate_process_grants(&spec.storage_logs, &spec.storage_blobs)
+            .await
+            .with_context(|| {
+                format!("validate storage grants for module `{}`", spec.module_label)
+            })?;
+    }
+
+    Ok(())
 }
 
 pub async fn stop_process(
@@ -221,11 +265,39 @@ fn parse_module_spec(raw: &str, work_dir: &Path) -> Result<ModuleSpec> {
                 }
                 builder.capabilities = Some(parse_capabilities(value)?);
             }
-            "adapter" => {
-                if builder.adapter.is_some() {
-                    return Err(anyhow!("entry {line_no}: duplicate adapter"));
+            "network_egress_profiles" | "network-egress-profiles" => {
+                if builder.network_egress_profiles.is_some() {
+                    return Err(anyhow!(
+                        "entry {line_no}: duplicate network egress profiles"
+                    ));
                 }
-                builder.adapter = Some(parse_adapter_kind(value)?);
+                builder.network_egress_profiles = Some(parse_string_list(value)?);
+            }
+            "network_ingress_bindings" | "network-ingress-bindings" => {
+                if builder.network_ingress_bindings.is_some() {
+                    return Err(anyhow!(
+                        "entry {line_no}: duplicate network ingress bindings"
+                    ));
+                }
+                builder.network_ingress_bindings = Some(parse_string_list(value)?);
+            }
+            "storage_logs" | "storage-logs" => {
+                if builder.storage_logs.is_some() {
+                    return Err(anyhow!("entry {line_no}: duplicate storage logs"));
+                }
+                builder.storage_logs = Some(parse_string_list(value)?);
+            }
+            "storage_blobs" | "storage-blobs" => {
+                if builder.storage_blobs.is_some() {
+                    return Err(anyhow!("entry {line_no}: duplicate storage blobs"));
+                }
+                builder.storage_blobs = Some(parse_string_list(value)?);
+            }
+            "adaptor" => {
+                if builder.adaptor.is_some() {
+                    return Err(anyhow!("entry {line_no}: duplicate adaptor"));
+                }
+                builder.adaptor = Some(parse_adaptor_kind(value)?);
             }
             "profile" => {
                 if builder.profile.is_some() {
@@ -264,7 +336,11 @@ fn build_module_spec(builder: ModuleSpecBuilder, _work_dir: &Path) -> Result<Mod
         .entrypoint
         .unwrap_or_else(|| DEFAULT_ENTRYPOINT.to_string());
     let capabilities = builder.capabilities.unwrap_or_default();
-    let adapter = builder.adapter.unwrap_or(DEFAULT_ADAPTER);
+    let network_egress_profiles = builder.network_egress_profiles.unwrap_or_default();
+    let network_ingress_bindings = builder.network_ingress_bindings.unwrap_or_default();
+    let storage_logs = builder.storage_logs.unwrap_or_default();
+    let storage_blobs = builder.storage_blobs.unwrap_or_default();
+    let adaptor = builder.adaptor.unwrap_or(DEFAULT_ADAPTOR);
     let profile = builder.profile.unwrap_or(DEFAULT_PROFILE);
     let args = builder.args.unwrap_or_default();
     let params = builder.params.unwrap_or_default();
@@ -291,7 +367,11 @@ fn build_module_spec(builder: ModuleSpecBuilder, _work_dir: &Path) -> Result<Mod
         module_path,
         entrypoint,
         capabilities,
-        adapter,
+        network_egress_profiles,
+        network_ingress_bindings,
+        storage_logs,
+        storage_blobs,
+        adaptor,
         profile,
         params,
         args,
@@ -356,6 +436,38 @@ fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
             "queuelifecycle" | "queue_lifecycle" | "queue-lifecycle" => Capability::QueueLifecycle,
             "queuewriter" | "queue_writer" | "queue-writer" => Capability::QueueWriter,
             "queuereader" | "queue_reader" | "queue-reader" => Capability::QueueReader,
+            "networklifecycle" | "network_lifecycle" | "network-lifecycle" => {
+                Capability::NetworkLifecycle
+            }
+            "networkconnect" | "network_connect" | "network-connect" => Capability::NetworkConnect,
+            "networkaccept" | "network_accept" | "network-accept" => Capability::NetworkAccept,
+            "networkstreamread" | "network_stream_read" | "network-stream-read" => {
+                Capability::NetworkStreamRead
+            }
+            "networkstreamwrite" | "network_stream_write" | "network-stream-write" => {
+                Capability::NetworkStreamWrite
+            }
+            "networkrpcclient" | "network_rpc_client" | "network-rpc-client" => {
+                Capability::NetworkRpcClient
+            }
+            "networkrpcserver" | "network_rpc_server" | "network-rpc-server" => {
+                Capability::NetworkRpcServer
+            }
+            "storagelifecycle" | "storage_lifecycle" | "storage-lifecycle" => {
+                Capability::StorageLifecycle
+            }
+            "storagelogread" | "storage_log_read" | "storage-log-read" => {
+                Capability::StorageLogRead
+            }
+            "storagelogwrite" | "storage_log_write" | "storage-log-write" => {
+                Capability::StorageLogWrite
+            }
+            "storageblobread" | "storage_blob_read" | "storage-blob-read" => {
+                Capability::StorageBlobRead
+            }
+            "storageblobwrite" | "storage_blob_write" | "storage-blob-write" => {
+                Capability::StorageBlobWrite
+            }
             _ => return Err(anyhow!("unknown capability `{item}`")),
         };
 
@@ -367,9 +479,22 @@ fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
     Ok(caps)
 }
 
-fn parse_adapter_kind(raw: &str) -> Result<AdapterKind> {
-    raw.parse::<AdapterKind>()
-        .map_err(|_| anyhow!("unknown adapter `{raw}`"))
+fn parse_string_list(raw: &str) -> Result<Vec<String>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn parse_adaptor_kind(raw: &str) -> Result<AdaptorKind> {
+    raw.parse::<AdaptorKind>()
+        .map_err(|_| anyhow!("unknown adaptor `{raw}`"))
 }
 
 fn parse_execution_profile(raw: &str) -> Result<ExecutionProfile> {
@@ -635,7 +760,11 @@ async fn spawn_module(
         module_path,
         entrypoint,
         capabilities,
-        adapter,
+        network_egress_profiles,
+        network_ingress_bindings,
+        storage_logs,
+        storage_blobs,
+        adaptor,
         profile,
         params,
         args,
@@ -643,13 +772,13 @@ async fn spawn_module(
 
     info!(
         module = module_label,
-        adapter = %adapter,
+        adaptor = %adaptor,
         profile = ?profile,
         "spawning module"
     );
 
-    if adapter != AdapterKind::Wasmtime {
-        bail!("adapter `{adapter}` is configured but not executable in this runtime build");
+    if adaptor != AdaptorKind::Wasmtime {
+        bail!("adaptor `{adaptor}` is configured but not executable in this runtime build");
     }
 
     let entrypoint_invocation =
@@ -669,6 +798,10 @@ async fn spawn_module(
             module_id,
             &entrypoint,
             capabilities,
+            network_egress_profiles,
+            network_ingress_bindings,
+            storage_logs,
+            storage_blobs,
             entrypoint_invocation,
         )
         .await
@@ -681,43 +814,44 @@ async fn spawn_module(
 }
 
 fn validate_module_spec(spec: &ModuleSpec) -> Result<()> {
-    let adapter = adapter_for_kind(spec.adapter);
+    let adaptor = adaptor_for_kind(spec.adaptor);
     let module_id = spec
         .module_path
         .to_str()
         .ok_or_else(|| anyhow!("module path for `{}` is not valid UTF-8", spec.module_label))?;
 
-    let adapter_spec = AdapterModuleSpec {
+    let adaptor_spec = AdaptorModuleSpec {
         module_id: module_id.to_string(),
         entrypoint: spec.entrypoint.clone(),
         capabilities: spec.capabilities.clone(),
         profile: spec.profile,
     };
-    adapter.validate(&adapter_spec).map_err(|err| {
+    adaptor.validate(&adaptor_spec).map_err(|err| {
         anyhow!(
-            "module `{}` failed adapter validation: {err}",
+            "module `{}` failed adaptor validation: {err}",
             spec.module_label
         )
     })?;
-    if !adapter.executable() {
+    if !adaptor.executable() {
         bail!(
-            "adapter `{}` is configured but marked non-executable on this node",
-            adapter.kind()
+            "adaptor `{}` is configured but marked non-executable on this node",
+            adaptor.kind()
         );
     }
     Ok(())
 }
 
-fn adapter_for_kind(kind: AdapterKind) -> Box<dyn RuntimeAdapter> {
+fn adaptor_for_kind(kind: AdaptorKind) -> Box<dyn RuntimeAdaptor> {
     match kind {
-        AdapterKind::Wasmtime => Box::new(WasmtimeAdapter),
-        AdapterKind::Microvm => Box::new(MicroVmAdapter),
+        AdaptorKind::Wasmtime => Box::new(WasmtimeAdaptor),
+        AdaptorKind::Microvm => Box::new(MicroVmAdaptor),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_runtime_network::NetworkService;
 
     #[test]
     fn parse_relative_path_accepts_safe_paths() {
@@ -792,7 +926,7 @@ mod tests {
         assert_eq!(spec.module_label, "mod.wasm");
         assert_eq!(spec.module_path, PathBuf::from("mod.wasm"));
         assert_eq!(spec.entrypoint, DEFAULT_ENTRYPOINT);
-        assert_eq!(spec.adapter, AdapterKind::Wasmtime);
+        assert_eq!(spec.adaptor, AdaptorKind::Wasmtime);
         assert_eq!(spec.profile, ExecutionProfile::Standard);
         assert_eq!(spec.capabilities, vec![Capability::TimeRead]);
         assert_eq!(spec.params, Vec::<AbiParam>::new());
@@ -808,10 +942,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_module_spec_rejects_non_executable_adapter() {
+    fn parse_module_spec_rejects_non_executable_adaptor() {
         let work_dir = Path::new(".");
         let err = parse_module_spec(
-            "path=image.oci;capabilities=time_read;adapter=microvm;profile=microvm",
+            "path=image.oci;capabilities=time_read;adaptor=microvm;profile=microvm",
             work_dir,
         )
         .expect_err("microvm should not be executable");
@@ -822,5 +956,44 @@ mod tests {
     fn parse_module_specs_requires_input() {
         let specs = parse_module_specs(&[], Path::new("."));
         assert!(specs.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_runtime_grants_rejects_unknown_profile() {
+        let mut builder = Kernel::build();
+        let network = builder.add_capability(NetworkService::new());
+        let storage = builder.add_capability(StorageService::new());
+        network
+            .register_egress_profile(selium_runtime_network::NetworkEgressProfile {
+                name: "known".to_string(),
+                protocol: selium_abi::NetworkProtocol::Http,
+                interactions: vec![selium_abi::InteractionKind::Rpc],
+                allowed_authorities: vec!["api.example.com:443".to_string()],
+                ca_cert_path: PathBuf::from("certs/ca.crt"),
+                client_cert_path: None,
+                client_key_path: None,
+            })
+            .await;
+        storage
+            .register_log(selium_runtime_storage::StorageLogDefinition {
+                name: "known-log".to_string(),
+                path: PathBuf::from("state/known-log.rkyv"),
+                retention: selium_io_durability::RetentionPolicy::default(),
+            })
+            .await;
+        let kernel = builder.build().expect("build kernel");
+
+        let spec = parse_module_spec(
+            "path=demo.wasm;capabilities=time_read;network-egress-profiles=missing",
+            Path::new("."),
+        )
+        .expect("spec");
+
+        let err = validate_runtime_grants(&kernel, &[spec])
+            .await
+            .expect_err("expected validation failure");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("demo.wasm"));
+        assert!(rendered.contains("not registered"));
     }
 }

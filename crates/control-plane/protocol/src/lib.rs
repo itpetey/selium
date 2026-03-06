@@ -8,8 +8,8 @@ use rkyv::{
     api::high::{HighDeserializer, HighValidator},
 };
 use selium_abi::{DataValue, RkyvEncode, decode_rkyv, encode_rkyv};
+use selium_control_plane_runtime::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
-use selium_module_control_plane::runtime::{Mutation, Query};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u16 = 1;

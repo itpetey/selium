@@ -15,18 +15,22 @@ use std::{
 use thiserror::Error;
 
 pub mod hostcalls;
+mod network;
 mod process;
 mod queue;
 mod session;
 mod shm;
+mod storage;
 mod time;
 
 // pub use external::*;
 pub use hostcalls::*;
+pub use network::*;
 pub use process::*;
 pub use queue::*;
 pub use session::*;
 pub use shm::*;
+pub use storage::*;
 pub use time::*;
 
 /// Guest pointer-sized signed integer.
@@ -234,11 +238,23 @@ pub enum Capability {
     QueueLifecycle = 4,
     QueueWriter = 5,
     QueueReader = 6,
+    NetworkLifecycle = 7,
+    NetworkConnect = 8,
+    NetworkAccept = 9,
+    NetworkStreamRead = 10,
+    NetworkStreamWrite = 11,
+    NetworkRpcClient = 12,
+    NetworkRpcServer = 13,
+    StorageLifecycle = 14,
+    StorageLogRead = 15,
+    StorageLogWrite = 16,
+    StorageBlobRead = 17,
+    StorageBlobWrite = 18,
 }
 
 impl Capability {
     /// All capabilities understood by the Selium kernel ABI.
-    pub const ALL: [Capability; 7] = [
+    pub const ALL: [Capability; 19] = [
         Capability::SessionLifecycle,
         Capability::ProcessLifecycle,
         Capability::TimeRead,
@@ -246,6 +262,18 @@ impl Capability {
         Capability::QueueLifecycle,
         Capability::QueueWriter,
         Capability::QueueReader,
+        Capability::NetworkLifecycle,
+        Capability::NetworkConnect,
+        Capability::NetworkAccept,
+        Capability::NetworkStreamRead,
+        Capability::NetworkStreamWrite,
+        Capability::NetworkRpcClient,
+        Capability::NetworkRpcServer,
+        Capability::StorageLifecycle,
+        Capability::StorageLogRead,
+        Capability::StorageLogWrite,
+        Capability::StorageBlobRead,
+        Capability::StorageBlobWrite,
     ];
 }
 
@@ -394,6 +422,18 @@ impl TryFrom<u8> for Capability {
             4 => Ok(Capability::QueueLifecycle),
             5 => Ok(Capability::QueueWriter),
             6 => Ok(Capability::QueueReader),
+            7 => Ok(Capability::NetworkLifecycle),
+            8 => Ok(Capability::NetworkConnect),
+            9 => Ok(Capability::NetworkAccept),
+            10 => Ok(Capability::NetworkStreamRead),
+            11 => Ok(Capability::NetworkStreamWrite),
+            12 => Ok(Capability::NetworkRpcClient),
+            13 => Ok(Capability::NetworkRpcServer),
+            14 => Ok(Capability::StorageLifecycle),
+            15 => Ok(Capability::StorageLogRead),
+            16 => Ok(Capability::StorageLogWrite),
+            17 => Ok(Capability::StorageBlobRead),
+            18 => Ok(Capability::StorageBlobWrite),
             _ => Err(CapabilityDecodeError),
         }
     }
@@ -415,6 +455,18 @@ impl Display for Capability {
             Capability::QueueLifecycle => write!(f, "QueueLifecycle"),
             Capability::QueueWriter => write!(f, "QueueWriter"),
             Capability::QueueReader => write!(f, "QueueReader"),
+            Capability::NetworkLifecycle => write!(f, "NetworkLifecycle"),
+            Capability::NetworkConnect => write!(f, "NetworkConnect"),
+            Capability::NetworkAccept => write!(f, "NetworkAccept"),
+            Capability::NetworkStreamRead => write!(f, "NetworkStreamRead"),
+            Capability::NetworkStreamWrite => write!(f, "NetworkStreamWrite"),
+            Capability::NetworkRpcClient => write!(f, "NetworkRpcClient"),
+            Capability::NetworkRpcServer => write!(f, "NetworkRpcServer"),
+            Capability::StorageLifecycle => write!(f, "StorageLifecycle"),
+            Capability::StorageLogRead => write!(f, "StorageLogRead"),
+            Capability::StorageLogWrite => write!(f, "StorageLogWrite"),
+            Capability::StorageBlobRead => write!(f, "StorageBlobRead"),
+            Capability::StorageBlobWrite => write!(f, "StorageBlobWrite"),
         }
     }
 }

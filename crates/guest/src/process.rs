@@ -40,6 +40,10 @@ pub struct ProcessBuilder {
     module_id: String,
     entrypoint: String,
     capabilities: Vec<Capability>,
+    network_egress_profiles: Vec<String>,
+    network_ingress_bindings: Vec<String>,
+    storage_logs: Vec<String>,
+    storage_blobs: Vec<String>,
     signature: AbiSignature,
     args: Vec<EntrypointArg>,
 }
@@ -55,6 +59,10 @@ impl ProcessBuilder {
             module_id: module_id.into(),
             entrypoint: entrypoint.into(),
             capabilities: Vec::new(),
+            network_egress_profiles: Vec::new(),
+            network_ingress_bindings: Vec::new(),
+            storage_logs: Vec::new(),
+            storage_blobs: Vec::new(),
             signature: AbiSignature::new(Vec::new(), Vec::new()),
             args: Vec::new(),
         }
@@ -64,6 +72,42 @@ impl ProcessBuilder {
     pub fn capability(mut self, capability: Capability) -> Self {
         if !self.capabilities.contains(&capability) {
             self.capabilities.push(capability);
+        }
+        self
+    }
+
+    /// Grant access to one runtime-managed outbound egress profile.
+    pub fn network_egress_profile(mut self, profile: impl Into<String>) -> Self {
+        let profile = profile.into();
+        if !self.network_egress_profiles.contains(&profile) {
+            self.network_egress_profiles.push(profile);
+        }
+        self
+    }
+
+    /// Grant access to one runtime-managed inbound binding.
+    pub fn network_ingress_binding(mut self, binding: impl Into<String>) -> Self {
+        let binding = binding.into();
+        if !self.network_ingress_bindings.contains(&binding) {
+            self.network_ingress_bindings.push(binding);
+        }
+        self
+    }
+
+    /// Grant access to one runtime-managed durable log.
+    pub fn storage_log(mut self, log: impl Into<String>) -> Self {
+        let log = log.into();
+        if !self.storage_logs.contains(&log) {
+            self.storage_logs.push(log);
+        }
+        self
+    }
+
+    /// Grant access to one runtime-managed blob store.
+    pub fn storage_blob(mut self, blob: impl Into<String>) -> Self {
+        let blob = blob.into();
+        if !self.storage_blobs.contains(&blob) {
+            self.storage_blobs.push(blob);
         }
         self
     }
@@ -175,6 +219,10 @@ fn build_start_payload(builder: ProcessBuilder) -> Result<ProcessStart, ProcessE
         module_id,
         entrypoint,
         capabilities,
+        network_egress_profiles,
+        network_ingress_bindings,
+        storage_logs,
+        storage_blobs,
         signature,
         args,
     } = builder;
@@ -186,6 +234,10 @@ fn build_start_payload(builder: ProcessBuilder) -> Result<ProcessStart, ProcessE
         module_id,
         name: entrypoint,
         capabilities,
+        network_egress_profiles,
+        network_ingress_bindings,
+        storage_logs,
+        storage_blobs,
         entrypoint: invocation,
     })
 }
@@ -216,6 +268,10 @@ mod tests {
         assert_eq!(start.module_id, "module");
         assert_eq!(start.name, "proc");
         assert_eq!(start.capabilities, vec![Capability::TimeRead]);
+        assert!(start.network_egress_profiles.is_empty());
+        assert!(start.network_ingress_bindings.is_empty());
+        assert!(start.storage_logs.is_empty());
+        assert!(start.storage_blobs.is_empty());
         assert_eq!(start.entrypoint.signature.params(), signature.params());
         assert_eq!(start.entrypoint.signature.results(), signature.results());
         assert_eq!(
@@ -247,5 +303,27 @@ mod tests {
         let bytes = encode_start_args(builder).expect("encode");
         let start = decode_rkyv::<ProcessStart>(&bytes).expect("decode");
         assert_eq!(start.entrypoint.args, [EntrypointArg::Resource(7)]);
+    }
+
+    #[test]
+    fn encode_start_args_includes_network_grants() {
+        let builder = ProcessBuilder::new("module", "proc")
+            .network_egress_profile("egress.default")
+            .network_ingress_binding("ingress.public");
+        let bytes = encode_start_args(builder).expect("encode");
+        let start = decode_rkyv::<ProcessStart>(&bytes).expect("decode");
+        assert_eq!(start.network_egress_profiles, ["egress.default"]);
+        assert_eq!(start.network_ingress_bindings, ["ingress.public"]);
+    }
+
+    #[test]
+    fn encode_start_args_includes_storage_grants() {
+        let builder = ProcessBuilder::new("module", "proc")
+            .storage_log("control-plane.log")
+            .storage_blob("control-plane.snapshots");
+        let bytes = encode_start_args(builder).expect("encode");
+        let start = decode_rkyv::<ProcessStart>(&bytes).expect("decode");
+        assert_eq!(start.storage_logs, ["control-plane.log"]);
+        assert_eq!(start.storage_blobs, ["control-plane.snapshots"]);
     }
 }

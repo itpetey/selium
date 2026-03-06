@@ -1,7 +1,7 @@
 //! Guest-side helpers for Selium hostcalls.
 //!
 //! This crate mirrors the current Selium hostcall surface:
-//! session, process, time, shared-memory, and queue operations.
+//! session, process, time, shared-memory, queue, and network operations.
 
 extern crate self as selium_guest;
 
@@ -88,11 +88,14 @@ macro_rules! driver_module {
 pub mod abi;
 mod r#async;
 pub mod driver;
+pub mod durability;
 pub mod io;
+pub mod network;
 pub mod process;
 pub mod queue;
 pub mod session;
 pub mod shm;
+pub mod storage;
 pub mod time;
 
 /// Re-export of the `rkyv` crate used for internal Selium serialisation.

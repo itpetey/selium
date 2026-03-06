@@ -12,10 +12,12 @@ use crate::{
     registry::InstanceRegistry,
 };
 
+pub mod network;
 pub mod process;
 pub mod queue;
 pub mod session;
 pub mod shm;
+pub mod storage;
 pub mod time;
 
 /// Engine-neutral context required by hostcall operations.

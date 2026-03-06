@@ -41,6 +41,24 @@ pub enum ResourceType {
     Queue,
     /// Queue endpoint state.
     QueueEndpoint,
+    /// Network listener state.
+    NetworkListener,
+    /// Protocol session state.
+    NetworkSession,
+    /// Protocol stream state.
+    NetworkStream,
+    /// Inbound RPC exchange state.
+    NetworkRpcExchange,
+    /// Outbound RPC client exchange state.
+    NetworkRpcClientExchange,
+    /// RPC body reader state.
+    NetworkRpcBodyReader,
+    /// RPC body writer state.
+    NetworkRpcBodyWriter,
+    /// Durable log resource.
+    StorageLog,
+    /// Blob store resource.
+    StorageBlobStore,
     /// Guest-visible future state resource.
     Future,
     /// Uncategorised resource.

@@ -117,8 +117,8 @@ pub(crate) struct StartArgs {
     pub(crate) module_spec: Option<String>,
     #[arg(long)]
     pub(crate) module: Option<String>,
-    #[arg(long, value_enum, default_value_t = AdapterArg::Wasmtime)]
-    pub(crate) adapter: AdapterArg,
+    #[arg(long = "adaptor", value_enum, default_value_t = AdaptorArg::Wasmtime)]
+    pub(crate) adaptor: AdaptorArg,
     #[arg(long, value_enum, default_value_t = IsolationArg::Standard)]
     pub(crate) isolation: IsolationArg,
     #[arg(long = "capability")]
@@ -187,7 +187,7 @@ pub(crate) enum IsolationArg {
 
 #[derive(Debug, Clone, Copy, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum AdapterArg {
+pub(crate) enum AdaptorArg {
     Wasmtime,
     Microvm,
 }
@@ -308,8 +308,8 @@ struct RawStartArgs {
     module_spec: Option<String>,
     #[arg(long)]
     module: Option<String>,
-    #[arg(long, value_enum)]
-    adapter: Option<AdapterArg>,
+    #[arg(long = "adaptor", value_enum)]
+    adaptor: Option<AdaptorArg>,
     #[arg(long, value_enum)]
     isolation: Option<IsolationArg>,
     #[arg(long = "capability")]
@@ -549,7 +549,7 @@ impl RawStartArgs {
             instance_id: required_arg("start.instance-id", self.instance_id)?,
             module_spec: self.module_spec,
             module: self.module,
-            adapter: self.adapter.unwrap_or(AdapterArg::Wasmtime),
+            adaptor: self.adaptor.unwrap_or(AdaptorArg::Wasmtime),
             isolation: self.isolation.unwrap_or(IsolationArg::Standard),
             capabilities: self.capabilities,
         })
@@ -841,7 +841,7 @@ fn merge_start_config(
         config.module_spec,
     );
     merge_option(&mut args.module, value_source("module"), config.module);
-    merge_option(&mut args.adapter, value_source("adapter"), config.adapter);
+    merge_option(&mut args.adaptor, value_source("adaptor"), config.adaptor);
     merge_option(
         &mut args.isolation,
         value_source("isolation"),

@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
+use selium_abi::{InteractionKind, NetworkProtocol};
 use serde::Deserialize;
 
 #[derive(Copy, Clone, Debug, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -33,8 +34,14 @@ pub(crate) struct ServerOptions {
     /// Base directory where certificates and WASM modules are stored.
     #[arg(short, long, env = "SELIUM_WORK_DIR", default_value_os = ".")]
     pub(crate) work_dir: PathBuf,
+    /// Runtime-managed network definitions loaded from config.
+    #[arg(skip = RuntimeNetworkConfig::default())]
+    pub(crate) network: RuntimeNetworkConfig,
+    /// Runtime-managed storage definitions loaded from config.
+    #[arg(skip = RuntimeStorageConfig::default())]
+    pub(crate) storage: RuntimeStorageConfig,
     /// Module specification to start (repeatable). Format:
-    /// `path=...;capabilities=...;adapter=wasmtime;profile=standard;args=...`
+    /// `path=...;capabilities=...;adaptor=wasmtime;profile=standard;args=...`
     #[arg(long, value_name = "SPEC")]
     pub(crate) module: Option<Vec<String>>,
 }
@@ -80,6 +87,9 @@ pub(crate) struct DaemonArgs {
     /// Directory used for control-plane raft state, snapshots, and durable events.
     #[arg(long, default_value = ".selium/control-plane")]
     pub(crate) cp_state_dir: PathBuf,
+    /// Loopback address used by the host to proxy public control-plane RPCs into the guest module.
+    #[arg(long)]
+    pub(crate) cp_internal_addr: Option<String>,
     /// Path to server cert PEM used for daemon QUIC endpoint.
     #[arg(long, default_value = "certs/server.crt")]
     pub(crate) quic_cert: PathBuf,
@@ -114,9 +124,95 @@ pub(crate) struct DaemonArgs {
 struct RuntimeConfig {
     log_format: Option<LogFormat>,
     work_dir: Option<PathBuf>,
+    network: Option<RuntimeNetworkConfig>,
+    storage: Option<RuntimeStorageConfig>,
     module: Option<Vec<String>>,
     generate_certs: Option<GenerateCertsConfig>,
     daemon: Option<DaemonConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", default)]
+pub(crate) struct RuntimeNetworkConfig {
+    pub(crate) egress_profiles: Vec<EgressProfileConfig>,
+    pub(crate) ingress_bindings: Vec<IngressBindingConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", default)]
+pub(crate) struct RuntimeStorageConfig {
+    pub(crate) logs: Vec<StorageLogConfig>,
+    pub(crate) blobs: Vec<StorageBlobConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct EgressProfileConfig {
+    pub(crate) name: String,
+    pub(crate) protocol: NetworkProtocolArg,
+    pub(crate) interactions: Vec<InteractionKindArg>,
+    pub(crate) allowed_authorities: Vec<String>,
+    pub(crate) ca_cert: PathBuf,
+    pub(crate) client_cert: Option<PathBuf>,
+    pub(crate) client_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct IngressBindingConfig {
+    pub(crate) name: String,
+    pub(crate) protocol: NetworkProtocolArg,
+    pub(crate) interactions: Vec<InteractionKindArg>,
+    pub(crate) listen: String,
+    pub(crate) cert: PathBuf,
+    pub(crate) key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct StorageLogConfig {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) max_entries: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct StorageBlobConfig {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NetworkProtocolArg {
+    Quic,
+    Http,
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InteractionKindArg {
+    Stream,
+    Rpc,
+}
+
+impl From<NetworkProtocolArg> for NetworkProtocol {
+    fn from(value: NetworkProtocolArg) -> Self {
+        match value {
+            NetworkProtocolArg::Quic => Self::Quic,
+            NetworkProtocolArg::Http => Self::Http,
+        }
+    }
+}
+
+impl From<InteractionKindArg> for InteractionKind {
+    fn from(value: InteractionKindArg) -> Self {
+        match value {
+            InteractionKindArg::Stream => Self::Stream,
+            InteractionKindArg::Rpc => Self::Rpc,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,6 +232,7 @@ struct DaemonConfig {
     cp_peers: Option<Vec<String>>,
     cp_bootstrap_leader: Option<bool>,
     cp_state_dir: Option<PathBuf>,
+    cp_internal_addr: Option<String>,
     quic_cert: Option<PathBuf>,
     quic_key: Option<PathBuf>,
     quic_peer_cert: Option<PathBuf>,
@@ -176,6 +273,8 @@ fn merge_runtime_config(
     let RuntimeConfig {
         log_format,
         work_dir,
+        network,
+        storage,
         module,
         generate_certs,
         daemon,
@@ -191,6 +290,8 @@ fn merge_runtime_config(
         matches.value_source("work_dir"),
         work_dir,
     );
+    merge_value(&mut options.network, None, network);
+    merge_value(&mut options.storage, None, storage);
     merge_optional(&mut options.module, matches.value_source("module"), module);
 
     match (&mut options.command, generate_certs, daemon) {
@@ -259,6 +360,11 @@ fn merge_daemon_config(
         &mut args.cp_state_dir,
         value_source("cp_state_dir"),
         config.cp_state_dir,
+    );
+    merge_optional(
+        &mut args.cp_internal_addr,
+        value_source("cp_internal_addr"),
+        config.cp_internal_addr,
     );
     merge_value(
         &mut args.quic_cert,
@@ -413,6 +519,14 @@ mod tests {
 log-format = "json"
 work-dir = "runtime-data"
 
+[network]
+[[network.egress-profiles]]
+name = "public-http"
+protocol = "http"
+interactions = ["rpc"]
+allowed-authorities = ["api.example.com:443"]
+ca-cert = "certs/ca.crt"
+
 [daemon]
 listen = "127.0.0.1:7999"
 cp-node-id = "cfg-node"
@@ -429,6 +543,12 @@ cp-node-id = "cfg-node"
 
         assert_eq!(opts.log_format, LogFormat::Json);
         assert_eq!(opts.work_dir, PathBuf::from("runtime-data"));
+        assert_eq!(opts.network.egress_profiles.len(), 1);
+        assert_eq!(opts.network.egress_profiles[0].name, "public-http");
+        assert_eq!(
+            opts.network.egress_profiles[0].protocol,
+            NetworkProtocolArg::Http
+        );
         let Some(ServerCommand::Daemon(args)) = opts.command else {
             panic!("expected daemon command");
         };

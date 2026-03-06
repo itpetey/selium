@@ -1,5 +1,5 @@
 [package]
-name = "selium-runtime-adapter-wasmtime"
+name = "selium-runtime-adaptor-wasmtime"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -11,5 +11,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-selium-runtime-adapter-spi = { workspace = true }
-
+selium-runtime-adaptor-spi = { workspace = true }
