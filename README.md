@@ -18,7 +18,7 @@ This repository is the temporary monorepo for Selium's next architecture:
   - `.../durability`: retention/replay/checkpoints
 - `crates/runtime-adapters/*`: adapter SPI and engine-specific adapters
 - `crates/sdk/rust`: SDK runtime surface
-- `examples/`: example contracts, state snapshots, and workflow walkthroughs
+- `examples/`: end-user guest module projects that can be built and deployed onto a Selium runtime
 - `modules/*`: first-party system modules
   - `.../control-plane`: guest-side control-plane module + re-exported policy/runtime interfaces
   - `.../io-demo`: guest-side I/O example module (`selium_guest::io`)
@@ -43,12 +43,16 @@ Core scaffolding plus first functional cut is in place:
 
 ## Examples
 
-Use [`examples/README.md`](examples/README.md) for migrated and rewritten examples:
+Use [`examples/README.md`](examples/README.md) for the current example projects:
 
-- Echo workflow
-- Data pipeline workflow
-- Orchestrator workflow
-- Rust SDK typed + byte pub/sub examples
+- RPC echo service
+- Event broadcast
+- Pipeline transform
+- Scatter gather
+- Stateful counter resume
+- Process supervisor
+- Typed entrypoints
+- Control-plane topology
 
 `.selium/` is runtime-generated local state (gitignored), not a curated examples directory.
 

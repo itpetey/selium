@@ -1,0 +1,15 @@
+[package]
+name = "selium-example-process-supervisor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "process_supervisor"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+rkyv = { workspace = true, features = ["std", "bytecheck"] }
+selium-abi.workspace = true
+selium-guest.workspace = true

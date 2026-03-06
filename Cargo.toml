@@ -2,25 +2,35 @@
 resolver = "2"
 members = [
   "crates/abi",
-  "crates/kernel",
-  "crates/runtime",
-  "crates/guest",
-  "crates/guest/macros",
+  "crates/cli",
   "crates/control-plane/api",
   "crates/control-plane/protocol",
-  "crates/control-plane/scheduler",
   "crates/control-plane/runtime",
+  "crates/control-plane/scheduler",
+  "crates/guest",
+  "crates/guest/macros",
   "crates/io/consensus",
-  "crates/io/tables",
-  "crates/runtime-adapters/spi",
-  "crates/runtime-adapters/wasmtime-adapter",
-  "crates/runtime-adapters/microvm-adapter",
   "crates/io/core",
   "crates/io/durability",
+  "crates/io/tables",
+  "crates/kernel",
+  "crates/runtime",
+  "crates/runtime-adapters/microvm-adapter",
+  "crates/runtime-adapters/spi",
+  "crates/runtime-adapters/wasmtime-adapter",
   "crates/sdk/rust",
+  "examples/control-plane-topology/apps/ingress",
+  "examples/control-plane-topology/apps/processor",
+  "examples/control-plane-topology/apps/sink",
+  "examples/event-broadcast",
+  "examples/pipeline-transform",
+  "examples/process-supervisor",
+  "examples/rpc-echo-service",
+  "examples/scatter-gather",
+  "examples/stateful-counter",
+  "examples/typed-entrypoints",
   "modules/control-plane",
   "modules/io-demo",
-  "crates/cli",
 ]
 
 [workspace.package]
@@ -28,11 +38,11 @@ version = "0.1.0-alpha.0"
 edition = "2024"
 description = "Selium next-generation monorepo"
 readme = "README.md"
-license = "MPL-2.0"
-repository = "https://github.com/seliumlabs/selium"
 homepage = "https://selium.com"
-keywords = ["selium", "runtime", "wasm", "control-plane"]
-categories = ["virtualization", "wasm", "development-tools"]
+repository = "https://github.com/seliumlabs/selium"
+license = "MPL-2.0"
+keywords = ["control-plane", "runtime", "selium", "wasm"]
+categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
 anyhow = { version = "1.0", default-features = false }
@@ -68,22 +78,22 @@ wasmtime = { version = "41.0", default-features = false }
 webpki-roots = { version = "1.0", default-features = false }
 
 selium-abi = { path = "crates/abi", version = "0.1.0-alpha.0" }
-selium-kernel = { path = "crates/kernel", version = "0.1.0-alpha.0" }
 selium-guest = { path = "crates/guest", version = "0.1.0-alpha.0" }
+selium-kernel = { path = "crates/kernel", version = "0.1.0-alpha.0" }
 
 selium-control-plane-api = { path = "crates/control-plane/api", version = "0.1.0-alpha.0" }
 selium-control-plane-protocol = { path = "crates/control-plane/protocol", version = "0.1.0-alpha.0" }
-selium-control-plane-scheduler = { path = "crates/control-plane/scheduler", version = "0.1.0-alpha.0" }
 selium-control-plane-runtime = { path = "crates/control-plane/runtime", version = "0.1.0-alpha.0" }
+selium-control-plane-scheduler = { path = "crates/control-plane/scheduler", version = "0.1.0-alpha.0" }
 selium-io-consensus = { path = "crates/io/consensus", version = "0.1.0-alpha.0" }
-selium-io-tables = { path = "crates/io/tables", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-spi = { path = "crates/runtime-adapters/spi", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-wasmtime = { path = "crates/runtime-adapters/wasmtime-adapter", version = "0.1.0-alpha.0" }
-selium-runtime-adapter-microvm = { path = "crates/runtime-adapters/microvm-adapter", version = "0.1.0-alpha.0" }
 selium-io-core = { path = "crates/io/core", version = "0.1.0-alpha.0" }
 selium-io-durability = { path = "crates/io/durability", version = "0.1.0-alpha.0" }
-selium-sdk-rust = { path = "crates/sdk/rust", version = "0.1.0-alpha.0" }
+selium-io-tables = { path = "crates/io/tables", version = "0.1.0-alpha.0" }
 selium-module-control-plane = { path = "modules/control-plane", version = "0.1.0-alpha.0" }
+selium-runtime-adapter-microvm = { path = "crates/runtime-adapters/microvm-adapter", version = "0.1.0-alpha.0" }
+selium-runtime-adapter-spi = { path = "crates/runtime-adapters/spi", version = "0.1.0-alpha.0" }
+selium-runtime-adapter-wasmtime = { path = "crates/runtime-adapters/wasmtime-adapter", version = "0.1.0-alpha.0" }
+selium-sdk-rust = { path = "crates/sdk/rust", version = "0.1.0-alpha.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

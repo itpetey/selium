@@ -1506,6 +1506,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-example-cp-topology-ingress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-cp-topology-processor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-cp-topology-sink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-event-broadcast"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-pipeline-transform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-process-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-rpc-echo-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-scatter-gather"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-stateful-counter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-example-typed-entrypoints"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
 name = "selium-guest"
 version = "0.1.0-alpha.0"
 dependencies = [

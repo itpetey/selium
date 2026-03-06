@@ -1,0 +1,26 @@
+package inventory.broadcast.v1;
+
+schema InventoryAdjusted {
+  event_id: u32;
+  sku: string;
+  delta: i32;
+}
+
+schema DeliveryAck {
+  consumer: string;
+  event_id: u32;
+}
+
+event inventory.adjusted(InventoryAdjusted) {
+  partitions: 8;
+  retention: "6h";
+  delivery: at_least_once;
+  replay: enabled;
+}
+
+event inventory.delivery_acks(DeliveryAck) {
+  partitions: 8;
+  retention: "1h";
+  delivery: at_least_once;
+  replay: enabled;
+}

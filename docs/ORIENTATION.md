@@ -70,7 +70,7 @@ This guide is for engineers who knew the previous Selium architecture (domain si
 
 ### Modules/examples/tests
 - `modules/` first-party modules.
-- `examples/modules/*` user-authored wasm example modules.
+- `examples/*` end-user guest module projects and deployment walkthroughs.
 - `crates/cli/tests/goal*.rs` end-to-end prototype goals.
 
 ## 4. The Core Signal Paths

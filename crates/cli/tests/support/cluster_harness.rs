@@ -13,10 +13,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::time::sleep;
 
-const USER_ECHO_MANIFEST: &str = "examples/modules/user-echo/Cargo.toml";
-const USER_ECHO_ARTIFACT: &str = "user_echo.wasm";
-const USER_IO_MANIFEST: &str = "examples/modules/user-io/Cargo.toml";
-const USER_IO_ARTIFACT: &str = "user_io.wasm";
+const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
+const USER_ECHO_ARTIFACT: &str = "rpc_echo_service.wasm";
+const USER_IO_MANIFEST: &str = "examples/event-broadcast/Cargo.toml";
+const USER_IO_ARTIFACT: &str = "event_broadcast.wasm";
 const DEFAULT_SERVER_NAME: &str = "localhost";
 const CLI_CONNECT_TIMEOUT_RETRIES: usize = 5;
 const CLI_CONNECT_TIMEOUT_BACKOFF: Duration = Duration::from_millis(400);
@@ -110,11 +110,11 @@ impl ClusterHarness {
     }
 
     pub fn user_module_relative_path(&self) -> &'static str {
-        "modules/user_echo.wasm"
+        "modules/rpc_echo_service.wasm"
     }
 
     pub fn user_io_module_relative_path(&self) -> &'static str {
-        "modules/user_io.wasm"
+        "modules/event_broadcast.wasm"
     }
 
     pub fn runtime_pids(&self) -> Vec<u32> {
@@ -354,7 +354,7 @@ impl ClusterHarness {
         fs::create_dir_all(&logs_dir)
             .with_context(|| format!("create logs dir {}", logs_dir.display()))?;
 
-        let staged_user_echo = modules_dir.join("user_echo.wasm");
+        let staged_user_echo = modules_dir.join("rpc_echo_service.wasm");
         fs::copy(&self.user_echo_source, &staged_user_echo).with_context(|| {
             format!(
                 "copy module {} -> {}",
@@ -362,7 +362,7 @@ impl ClusterHarness {
                 staged_user_echo.display()
             )
         })?;
-        let staged_user_io = modules_dir.join("user_io.wasm");
+        let staged_user_io = modules_dir.join("event_broadcast.wasm");
         fs::copy(&self.user_io_source, &staged_user_io).with_context(|| {
             format!(
                 "copy module {} -> {}",
