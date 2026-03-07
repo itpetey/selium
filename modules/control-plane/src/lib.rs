@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{DataValue, StorageReplayStart, decode_rkyv, encode_rkyv};
-use selium_control_plane_api::{ControlPlaneState, DeploymentSpec, IsolationProfile, NodeSpec};
+use selium_control_plane_api::{ControlPlaneState, IsolationProfile, NodeSpec};
 use selium_control_plane_protocol::{
     AppendEntriesApiRequest, ListResponse, Method, MutateApiRequest, MutateApiResponse,
     QueryApiRequest, QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest,
@@ -27,6 +27,8 @@ use selium_io_consensus::{
     RequestVote, RequestVoteResponse, TickAction,
 };
 
+mod module_spec;
+
 pub mod api {
     pub use selium_control_plane_api::*;
 }
@@ -38,6 +40,8 @@ pub mod runtime {
 pub mod scheduler {
     pub use selium_control_plane_scheduler::*;
 }
+
+pub use module_spec::{build_module_spec, default_capabilities, deployment_module_spec};
 
 /// Well-known module identifier used by the host when wiring system workloads.
 pub const MODULE_ID: &str = "system/control-plane.wasm";
@@ -446,35 +450,38 @@ async fn handle_mutate(state: SharedState, request: MutateApiRequest) -> Result<
     };
     let payload = ControlPlaneEngine::encode_mutation(&envelope).map_err(anyhow_from_runtime)?;
 
-    let (entry_index, append_requests, leader_hint) = {
+    let proposal = {
         let mut borrowed = state.borrow_mut();
-        let entry = match borrowed.raft.propose(payload) {
-            Ok(entry) => entry,
-            Err(ConsensusError::NotLeader) => {
-                let leader_hint = borrowed.raft.leader_hint();
-                drop(borrowed);
-                if let Some(leader_id) = leader_hint.as_deref()
-                    && let Some(forwarded) =
-                        forward_mutation_to_leader(Rc::clone(&state), leader_id, request.clone())
-                            .await?
-                {
-                    return Ok(forwarded);
+        match borrowed.raft.propose(payload) {
+            Ok(entry) => {
+                let requests = borrowed.raft.build_append_entries_requests();
+                if requests.is_empty() {
+                    borrowed.raft.force_commit_to(entry.index);
                 }
-
-                return Ok(MutateApiResponse {
-                    committed: false,
-                    index: None,
-                    leader_hint,
-                    result: None,
-                    error: Some("not leader".to_string()),
-                });
+                Ok((entry.index, requests, borrowed.raft.leader_hint()))
             }
-        };
-        let requests = borrowed.raft.build_append_entries_requests();
-        if requests.is_empty() {
-            borrowed.raft.force_commit_to(entry.index);
+            Err(ConsensusError::NotLeader) => Err(borrowed.raft.leader_hint()),
         }
-        (entry.index, requests, borrowed.raft.leader_hint())
+    };
+
+    let (entry_index, append_requests, leader_hint) = match proposal {
+        Ok(proposal) => proposal,
+        Err(leader_hint) => {
+            if let Some(leader_id) = leader_hint.as_deref()
+                && let Some(forwarded) =
+                    forward_mutation_to_leader(Rc::clone(&state), leader_id, request.clone())
+                        .await?
+            {
+                return Ok(forwarded);
+            }
+            return Ok(MutateApiResponse {
+                committed: false,
+                index: None,
+                leader_hint,
+                result: None,
+                error: Some("not leader".to_string()),
+            });
+        }
     };
 
     for (peer_id, append) in append_requests {
@@ -487,7 +494,7 @@ async fn handle_mutate(state: SharedState, request: MutateApiRequest) -> Result<
     }
 
     let applied = apply_committed(Rc::clone(&state)).await?;
-    persist_state(&state.borrow()).await?;
+    persist_state_shared(Rc::clone(&state)).await?;
 
     if let Some(result) = applied.get(&entry_index) {
         return Ok(MutateApiResponse {
@@ -513,17 +520,29 @@ async fn forward_mutation_to_leader(
     leader_id: &str,
     request: MutateApiRequest,
 ) -> Result<Option<MutateApiResponse>> {
-    let Some(authority) = authority_for_node(&state.borrow(), leader_id)? else {
+    let authority = {
+        let borrowed = state.borrow();
+        authority_for_node(&borrowed, leader_id)?
+    };
+    let Some(authority) = authority else {
         return Ok(None);
     };
     send_daemon_rpc(&state, &authority, Method::ControlMutate, &request).await
 }
 
 async fn handle_query(state: SharedState, request: QueryApiRequest) -> Result<QueryApiResponse> {
-    if !request.allow_stale && !state.borrow().raft.is_leader() {
-        let leader_hint = state.borrow().raft.leader_hint();
-        if let Some(leader_id) = leader_hint.as_deref()
-            && let Some(authority) = authority_for_node(&state.borrow(), leader_id)?
+    let (is_leader, leader_hint) = {
+        let borrowed = state.borrow();
+        (borrowed.raft.is_leader(), borrowed.raft.leader_hint())
+    };
+    if !request.allow_stale && !is_leader {
+        let authority = if let Some(leader_id) = leader_hint.as_deref() {
+            let borrowed = state.borrow();
+            authority_for_node(&borrowed, leader_id)?
+        } else {
+            None
+        };
+        if let Some(authority) = authority
             && let Some(forwarded) =
                 send_daemon_rpc(&state, &authority, Method::ControlQuery, &request).await?
         {
@@ -550,8 +569,20 @@ async fn handle_query(state: SharedState, request: QueryApiRequest) -> Result<Qu
 }
 
 async fn handle_status(state: SharedState) -> Result<StatusApiResponse> {
-    let borrowed = state.borrow();
-    let status = borrowed.raft.status();
+    let (status, peers, table_count, event_log) = {
+        let borrowed = state.borrow();
+        (
+            borrowed.raft.status(),
+            borrowed
+                .config
+                .peers
+                .iter()
+                .map(|peer| peer.node_id.clone())
+                .collect::<Vec<_>>(),
+            borrowed.engine.snapshot().tables.tables().len(),
+            borrowed.event_log,
+        )
+    };
     Ok(StatusApiResponse {
         node_id: status.node_id,
         role: format!("{:?}", status.role),
@@ -559,21 +590,15 @@ async fn handle_status(state: SharedState) -> Result<StatusApiResponse> {
         leader_id: status.leader_id,
         commit_index: status.commit_index,
         last_applied: status.last_applied,
-        peers: borrowed
-            .config
-            .peers
-            .iter()
-            .map(|peer| peer.node_id.clone())
-            .collect(),
-        table_count: borrowed.engine.snapshot().tables.tables().len(),
-        durable_events: borrowed.event_log.bounds().await?.latest_sequence,
+        peers,
+        table_count,
+        durable_events: event_log.bounds().await?.latest_sequence,
     })
 }
 
 async fn handle_replay(state: SharedState, limit: usize) -> Result<ReplayApiResponse> {
-    let (records, _) = state
-        .borrow()
-        .event_log
+    let event_log = state.borrow().event_log;
+    let (records, _) = event_log
         .replay(StorageReplayStart::Latest, limit as u32)
         .await?;
     let events = records
@@ -602,7 +627,7 @@ async fn handle_request_vote(
         .borrow_mut()
         .raft
         .handle_request_vote(request.request, now);
-    persist_state(&state.borrow()).await?;
+    persist_state_shared(Rc::clone(&state)).await?;
     Ok(response)
 }
 
@@ -616,7 +641,7 @@ async fn handle_append_entries(
         .raft
         .handle_append_entries(request.request, now);
     let _ = apply_committed(Rc::clone(&state)).await?;
-    persist_state(&state.borrow()).await?;
+    persist_state_shared(Rc::clone(&state)).await?;
     Ok(response)
 }
 
@@ -676,7 +701,7 @@ async fn tick_once(state: SharedState) -> Result<()> {
     }
 
     let _ = apply_committed(Rc::clone(&state)).await?;
-    persist_state(&state.borrow()).await?;
+    persist_state_shared(Rc::clone(&state)).await?;
     Ok(())
 }
 
@@ -826,9 +851,8 @@ async fn apply_committed(state: SharedState) -> Result<BTreeMap<u64, MutationRes
             .borrow_mut()
             .dedupe
             .insert(envelope.idempotency_key.clone(), response.clone());
-        state
-            .borrow()
-            .event_log
+        let event_log = state.borrow().event_log;
+        event_log
             .append(
                 time::now().await?.unix_ms,
                 BTreeMap::from([("source".to_string(), "control-plane".to_string())]),
@@ -869,6 +893,37 @@ async fn persist_state(state: &ControlPlaneRuntimeState) -> Result<()> {
         .context("write engine snapshot blob")?;
     state
         .snapshots
+        .set_manifest(ENGINE_MANIFEST, engine_blob)
+        .await
+        .context("publish engine snapshot manifest")?;
+
+    Ok(())
+}
+
+async fn persist_state_shared(state: SharedState) -> Result<()> {
+    let (snapshots, raft, engine_snapshot) = {
+        let borrowed = state.borrow();
+        (
+            borrowed.snapshots,
+            borrowed.raft.clone(),
+            borrowed.engine.snapshot(),
+        )
+    };
+
+    let raft_blob = snapshots
+        .put(encode_rkyv(&PersistedRaft { raft })?)
+        .await
+        .context("write raft snapshot blob")?;
+    snapshots
+        .set_manifest(RAFT_MANIFEST, raft_blob)
+        .await
+        .context("publish raft snapshot manifest")?;
+
+    let engine_blob = snapshots
+        .put(encode_rkyv(&engine_snapshot)?)
+        .await
+        .context("write engine snapshot blob")?;
+    snapshots
         .set_manifest(ENGINE_MANIFEST, engine_blob)
         .await
         .context("publish engine snapshot manifest")?;
@@ -1034,34 +1089,6 @@ async fn read_framed_stream(stream: &network::StreamChannel) -> Result<Vec<u8>> 
         ));
     }
     Ok(buffer[4..].to_vec())
-}
-
-fn deployment_module_spec(deployment: &DeploymentSpec) -> String {
-    let (adaptor, profile) = match deployment.isolation {
-        IsolationProfile::Standard => ("wasmtime", "standard"),
-        IsolationProfile::Hardened => ("wasmtime", "hardened"),
-        IsolationProfile::Microvm => ("microvm", "microvm"),
-    };
-
-    format!(
-        "path={};capabilities={};adaptor={};profile={}",
-        deployment.module,
-        default_capabilities().join(","),
-        adaptor,
-        profile
-    )
-}
-
-fn default_capabilities() -> Vec<String> {
-    vec![
-        "session_lifecycle".to_string(),
-        "process_lifecycle".to_string(),
-        "time_read".to_string(),
-        "shared_memory".to_string(),
-        "queue_lifecycle".to_string(),
-        "queue_writer".to_string(),
-        "queue_reader".to_string(),
-    ]
 }
 
 fn anyhow_from_runtime(err: RuntimeError) -> anyhow::Error {

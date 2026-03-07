@@ -1181,8 +1181,10 @@ impl ProtocolRpcClientExchange for QuicClientExchange {
     }
 }
 
+type HttpResponseTask = Arc<Mutex<Option<JoinHandle<Result<Response<Incoming>, NetworkError>>>>>;
+
 struct HttpClientExchange {
-    response_task: Arc<Mutex<Option<JoinHandle<Result<Response<Incoming>, NetworkError>>>>>,
+    response_task: HttpResponseTask,
 }
 
 impl ProtocolRpcClientExchange for HttpClientExchange {

@@ -9,6 +9,19 @@ use crate::{
     registry::{Registry, ResourceId},
 };
 
+#[derive(Debug)]
+pub struct ProcessStartRequest<'a> {
+    pub process_id: ResourceId,
+    pub module_id: &'a str,
+    pub name: &'a str,
+    pub capabilities: Vec<Capability>,
+    pub network_egress_profiles: Vec<String>,
+    pub network_ingress_bindings: Vec<String>,
+    pub storage_logs: Vec<String>,
+    pub storage_blobs: Vec<String>,
+    pub entrypoint: EntrypointInvocation,
+}
+
 /// Capability responsible for starting and stopping guest instances.
 pub trait ProcessLifecycleCapability {
     /// Runtime-specific process state type.
@@ -20,15 +33,7 @@ pub trait ProcessLifecycleCapability {
     fn start(
         &self,
         registry: &Arc<Registry>,
-        process_id: ResourceId,
-        module_id: &str,
-        name: &str,
-        capabilities: Vec<Capability>,
-        network_egress_profiles: Vec<String>,
-        network_ingress_bindings: Vec<String>,
-        storage_logs: Vec<String>,
-        storage_blobs: Vec<String>,
-        entrypoint: EntrypointInvocation,
+        request: ProcessStartRequest<'_>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Stop a running process.
@@ -48,28 +53,9 @@ where
     fn start(
         &self,
         registry: &Arc<Registry>,
-        process_id: ResourceId,
-        module_id: &str,
-        name: &str,
-        capabilities: Vec<Capability>,
-        network_egress_profiles: Vec<String>,
-        network_ingress_bindings: Vec<String>,
-        storage_logs: Vec<String>,
-        storage_blobs: Vec<String>,
-        entrypoint: EntrypointInvocation,
+        request: ProcessStartRequest<'_>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.as_ref().start(
-            registry,
-            process_id,
-            module_id,
-            name,
-            capabilities,
-            network_egress_profiles,
-            network_ingress_bindings,
-            storage_logs,
-            storage_blobs,
-            entrypoint,
-        )
+        self.as_ref().start(registry, request)
     }
 
     fn stop(
@@ -99,15 +85,7 @@ mod tests {
         fn start(
             &self,
             _registry: &Arc<Registry>,
-            _process_id: ResourceId,
-            _module_id: &str,
-            _name: &str,
-            _capabilities: Vec<Capability>,
-            _network_egress_profiles: Vec<String>,
-            _network_ingress_bindings: Vec<String>,
-            _storage_logs: Vec<String>,
-            _storage_blobs: Vec<String>,
-            _entrypoint: EntrypointInvocation,
+            _request: ProcessStartRequest<'_>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             *self.started.lock().expect("started lock") = true;
             async { Ok(()) }
@@ -140,15 +118,17 @@ mod tests {
         driver
             .start(
                 &registry,
-                process_id,
-                "m",
-                "n",
-                vec![Capability::TimeRead],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                invocation,
+                ProcessStartRequest {
+                    process_id,
+                    module_id: "m",
+                    name: "n",
+                    capabilities: vec![Capability::TimeRead],
+                    network_egress_profiles: Vec::new(),
+                    network_ingress_bindings: Vec::new(),
+                    storage_logs: Vec::new(),
+                    storage_blobs: Vec::new(),
+                    entrypoint: invocation,
+                },
             )
             .await
             .expect("start");

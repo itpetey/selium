@@ -8,8 +8,8 @@ use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
-async fn goal2_one_runtime_daemon_per_node_is_running() -> Result<()> {
-    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("goal2-runtime-topology"))?;
+async fn one_runtime_daemon_per_node_is_running() -> Result<()> {
+    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("runtime-topology"))?;
     harness.prepare()?;
     harness.wait_for_consensus_ready().await?;
 

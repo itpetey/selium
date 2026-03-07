@@ -47,6 +47,19 @@ struct DaemonState {
     control_plane_process_id: usize,
 }
 
+struct ControlPlaneTlsPaths<'a> {
+    cert_path: &'a Path,
+    key_path: &'a Path,
+    ca_path: &'a Path,
+    peer_cert_path: &'a Path,
+    peer_key_path: &'a Path,
+}
+
+struct ControlPlaneAddresses<'a> {
+    public_addr: &'a str,
+    internal_addr: &'a str,
+}
+
 struct LocalControlPlaneClient {
     endpoint: Endpoint,
     addr: SocketAddr,
@@ -219,20 +232,20 @@ pub(crate) async fn run_daemon(
         Some(addr) => normalise_authority_endpoint(addr),
         None => default_internal_addr(&args.listen)?,
     };
-    let (control_plane_process_id, control_plane) = bootstrap_control_plane(
-        &kernel,
-        &registry,
-        &work_dir,
-        &args,
-        &cert_path,
-        &key_path,
-        &ca_path,
-        &peer_cert_path,
-        &peer_key_path,
-        &public_addr,
-        &internal_addr,
-    )
-    .await?;
+    let tls_paths = ControlPlaneTlsPaths {
+        cert_path: &cert_path,
+        key_path: &key_path,
+        ca_path: &ca_path,
+        peer_cert_path: &peer_cert_path,
+        peer_key_path: &peer_key_path,
+    };
+    let addresses = ControlPlaneAddresses {
+        public_addr: &public_addr,
+        internal_addr: &internal_addr,
+    };
+    let (control_plane_process_id, control_plane) =
+        bootstrap_control_plane(&kernel, &registry, &work_dir, &args, &tls_paths, &addresses)
+            .await?;
 
     let state = Rc::new(DaemonState {
         kernel,
@@ -293,33 +306,16 @@ async fn bootstrap_control_plane(
     registry: &Arc<Registry>,
     work_dir: &Path,
     args: &DaemonArgs,
-    cert_path: &Path,
-    key_path: &Path,
-    ca_path: &Path,
-    peer_cert_path: &Path,
-    peer_key_path: &Path,
-    public_addr: &str,
-    internal_addr: &str,
+    tls_paths: &ControlPlaneTlsPaths<'_>,
+    addresses: &ControlPlaneAddresses<'_>,
 ) -> Result<(usize, Arc<LocalControlPlaneClient>)> {
     let peers = parse_peer_targets(&args.cp_peers)?;
-    register_control_plane_runtime_resources(
-        kernel,
-        work_dir,
-        args,
-        cert_path,
-        key_path,
-        ca_path,
-        peer_cert_path,
-        peer_key_path,
-        public_addr,
-        internal_addr,
-        &peers,
-    )
-    .await?;
+    register_control_plane_runtime_resources(kernel, work_dir, args, tls_paths, addresses, &peers)
+        .await?;
 
     let module_config = ControlPlaneModuleConfig {
         node_id: args.cp_node_id.clone(),
-        public_daemon_addr: public_addr.to_string(),
+        public_daemon_addr: addresses.public_addr.to_string(),
         public_daemon_server_name: args.cp_server_name.clone(),
         capacity_slots: args.cp_capacity_slots,
         heartbeat_interval_ms: args.cp_heartbeat_interval_ms,
@@ -329,11 +325,11 @@ async fn bootstrap_control_plane(
 
     let process_id = spawn_control_plane_module(kernel, registry, work_dir, &module_config).await?;
     let client = Arc::new(LocalControlPlaneClient::new(
-        parse_socket_addr(internal_addr)?,
+        parse_socket_addr(addresses.internal_addr)?,
         args.cp_server_name.clone(),
-        ca_path,
-        peer_cert_path,
-        peer_key_path,
+        tls_paths.ca_path,
+        tls_paths.peer_cert_path,
+        tls_paths.peer_key_path,
     )?);
     client.wait_until_ready().await?;
     Ok((process_id, client))
@@ -343,13 +339,8 @@ async fn register_control_plane_runtime_resources(
     kernel: &Kernel,
     work_dir: &Path,
     args: &DaemonArgs,
-    cert_path: &Path,
-    key_path: &Path,
-    ca_path: &Path,
-    peer_cert_path: &Path,
-    peer_key_path: &Path,
-    public_addr: &str,
-    internal_addr: &str,
+    tls_paths: &ControlPlaneTlsPaths<'_>,
+    addresses: &ControlPlaneAddresses<'_>,
     peers: &[PeerTarget],
 ) -> Result<()> {
     let network = kernel
@@ -360,7 +351,7 @@ async fn register_control_plane_runtime_resources(
         .ok_or_else(|| anyhow!("missing StorageService in kernel"))?;
 
     let mut allowed_authorities = BTreeSet::new();
-    allowed_authorities.insert(public_addr.to_string());
+    allowed_authorities.insert(addresses.public_addr.to_string());
     for peer in peers {
         allowed_authorities.insert(peer.daemon_addr.clone());
     }
@@ -371,9 +362,9 @@ async fn register_control_plane_runtime_resources(
             protocol: NetworkProtocol::Quic,
             interactions: vec![InteractionKind::Stream],
             allowed_authorities: allowed_authorities.into_iter().collect(),
-            ca_cert_path: ca_path.to_path_buf(),
-            client_cert_path: Some(peer_cert_path.to_path_buf()),
-            client_key_path: Some(peer_key_path.to_path_buf()),
+            ca_cert_path: tls_paths.ca_path.to_path_buf(),
+            client_cert_path: Some(tls_paths.peer_cert_path.to_path_buf()),
+            client_key_path: Some(tls_paths.peer_key_path.to_path_buf()),
         })
         .await;
     network
@@ -381,9 +372,9 @@ async fn register_control_plane_runtime_resources(
             name: INTERNAL_BINDING_NAME.to_string(),
             protocol: NetworkProtocol::Quic,
             interactions: vec![InteractionKind::Stream],
-            listen_addr: internal_addr.to_string(),
-            cert_path: cert_path.to_path_buf(),
-            key_path: key_path.to_path_buf(),
+            listen_addr: addresses.internal_addr.to_string(),
+            cert_path: tls_paths.cert_path.to_path_buf(),
+            key_path: tls_paths.key_path.to_path_buf(),
         })
         .await;
 

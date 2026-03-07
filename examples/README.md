@@ -5,8 +5,8 @@ These examples are meant to be copied, built, and deployed by end users. Each pr
 ## Projects
 
 - `rpc-echo-service/`: request/reply RPC over Selium guest channels, plus `contracts/messaging.echo.v1.selium`.
-- `network-quic-stream/`: QUIC stream echo over the guest network layer with runtime-managed TLS.
-- `network-http-rpc/`: HTTPS request/response echo over the guest network RPC surface.
+- `network-quic-stream/`: QUIC stream echo over the guest network layer with runtime-managed TLS, plus `contracts/network.quic.echo.v1.selium`.
+- `network-http-rpc/`: HTTPS request/response upload over the guest network RPC surface, plus `contracts/network.http.upload.v1.selium`.
 - `event-broadcast/`: event fan-out to multiple subscribers, plus `contracts/inventory.broadcast.v1.selium`.
 - `pipeline-transform/`: staged pipeline processing, plus `contracts/commerce.pipeline.v1.selium`.
 - `scatter-gather/`: parallel request distribution, plus `contracts/pricing.scatter.v1.selium`.
@@ -61,6 +61,10 @@ cargo run -p selium -- \
 ```
 
 Examples that share one contract across multiple crates, such as `control-plane-topology/`, need one `idl compile` invocation per output `bindings.rs`.
+
+For the network examples, the generated bindings now include protocol-aware guest helpers as well as typed schema structs:
+- `network-http-rpc/` generates an HTTP RPC `upload` client/server module.
+- `network-quic-stream/` generates a QUIC stream `quic_echo` helper module.
 
 ## Current Boundary
 

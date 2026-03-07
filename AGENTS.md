@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repo is a Rust workspace monorepo. Core runtime crates live under `crates/{abi,kernel,runtime,guest}`; platform crates are under `crates/control-plane/*`, `crates/io/*`, `crates/io/core`, `crates/io/durability`, and `crates/runtime-adapters/*`; Rust SDK lives in `crates/sdk/rust`; system modules live under `modules/*` (control-plane reconcile logic); CLI is at `crates/cli`; examples (contracts/workflows/state snapshots) are in `examples/`.
+This repo is a Rust workspace monorepo. Core runtime crates live under `crates/{abi,kernel,runtime,guest}`; platform crates are under `crates/control-plane/*`, `crates/io/*`, `crates/io/core`, `crates/io/durability`, and `crates/runtime/adaptors/*`; Rust SDK lives in `crates/sdk/rust`; system modules live under `modules/*` (control-plane reconcile logic); CLI is at `crates/cli`; examples (contracts/workflows/state snapshots) are in `examples/`.
 
 ## Build, Test, and Development Commands
 Run commands from repo root:

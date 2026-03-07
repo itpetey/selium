@@ -8,8 +8,8 @@ use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
-async fn goal4_guest_side_io_module_starts_and_stops_cleanly() -> Result<()> {
-    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("goal4-guest-io"))?;
+async fn guest_side_io_module_starts_and_stops_cleanly() -> Result<()> {
+    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("guest-io"))?;
     harness.prepare()?;
     harness.wait_for_consensus_ready().await?;
 

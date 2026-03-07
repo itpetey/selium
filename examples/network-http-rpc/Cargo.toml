@@ -10,5 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
+rkyv.workspace = true
 selium-abi.workspace = true
 selium-guest.workspace = true

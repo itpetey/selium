@@ -16,7 +16,7 @@ This repository is the temporary monorepo for Selium's next architecture:
 - `crates/io/*`: generic host-managed I/O substrate (`consensus`, `tables`)
   - `.../core`: communication primitives and transport abstractions
   - `.../durability`: retention/replay/checkpoints
-- `crates/runtime-adapters/*`: adapter SPI and engine-specific adapters
+- `crates/runtime/adaptors/*`: adapter SPI and engine-specific adapters
 - `crates/sdk/rust`: SDK runtime surface
 - `examples/`: end-user guest module projects that can be built and deployed onto a Selium runtime
 - `modules/*`: first-party system modules

@@ -6,8 +6,8 @@ use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
-async fn goal3_cli_can_launch_user_module_on_either_node() -> Result<()> {
-    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("goal3-cli-targeted-launch"))?;
+async fn cli_can_launch_user_module_on_either_node() -> Result<()> {
+    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("cli-targeted-launch"))?;
     harness.prepare()?;
     harness.wait_for_consensus_ready().await?;
 

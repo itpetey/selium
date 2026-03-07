@@ -19,7 +19,7 @@ use selium_kernel::{
     registry::{InstanceRegistry, ProcessIdentity, Registry, ResourceId},
     spi::{
         module_repository::{ModuleRepositoryError, ModuleRepositoryReadCapability},
-        process::ProcessLifecycleCapability,
+        process::{ProcessLifecycleCapability, ProcessStartRequest},
     },
 };
 use tokio::task::JoinHandle;
@@ -40,6 +40,19 @@ pub struct WasmtimeRuntime {
     pub(crate) engine: Engine,
     available_caps: RwLock<HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>>,
     guest_async: Arc<GuestAsync>,
+}
+
+pub struct WasmtimeRunRequest<'a> {
+    pub registry: &'a Arc<Registry>,
+    pub process_id: ResourceId,
+    pub module: Module,
+    pub name: &'a str,
+    pub capabilities: &'a [Capability],
+    pub network_egress_profiles: &'a [String],
+    pub network_ingress_bindings: &'a [String],
+    pub storage_logs: &'a [String],
+    pub storage_blobs: &'a [String],
+    pub entrypoint: EntrypointInvocation,
 }
 
 #[derive(Debug)]
@@ -127,19 +140,19 @@ impl WasmtimeRuntime {
         Ok(())
     }
 
-    pub async fn run(
-        &self,
-        registry: &Arc<Registry>,
-        process_id: ResourceId,
-        module: Module,
-        name: &str,
-        capabilities: &[Capability],
-        network_egress_profiles: &[String],
-        network_ingress_bindings: &[String],
-        storage_logs: &[String],
-        storage_blobs: &[String],
-        entrypoint: EntrypointInvocation,
-    ) -> Result<(), Error> {
+    pub async fn run(&self, request: WasmtimeRunRequest<'_>) -> Result<(), Error> {
+        let WasmtimeRunRequest {
+            registry,
+            process_id,
+            module,
+            name,
+            capabilities,
+            network_egress_profiles,
+            network_ingress_bindings,
+            storage_logs,
+            storage_blobs,
+            entrypoint,
+        } = request;
         let mut linker = Linker::new(&self.engine);
         let operations_to_link = {
             let map = self
@@ -319,35 +332,38 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
     fn start(
         &self,
         registry: &Arc<Registry>,
-        process_id: ResourceId,
-        module_id: &str,
-        name: &str,
-        capabilities: Vec<Capability>,
-        network_egress_profiles: Vec<String>,
-        network_ingress_bindings: Vec<String>,
-        storage_logs: Vec<String>,
-        storage_blobs: Vec<String>,
-        entrypoint: EntrypointInvocation,
+        request: ProcessStartRequest<'_>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let inner = self.clone();
 
         async move {
+            let ProcessStartRequest {
+                process_id,
+                module_id,
+                name,
+                capabilities,
+                network_egress_profiles,
+                network_ingress_bindings,
+                storage_logs,
+                storage_blobs,
+                entrypoint,
+            } = request;
             let bytes = inner.repository.read(module_id)?;
             let module = Module::from_binary(&inner.runtime.engine, &bytes)?;
             inner
                 .runtime
-                .run(
+                .run(WasmtimeRunRequest {
                     registry,
                     process_id,
                     module,
                     name,
-                    &capabilities,
-                    &network_egress_profiles,
-                    &network_ingress_bindings,
-                    &storage_logs,
-                    &storage_blobs,
+                    capabilities: &capabilities,
+                    network_egress_profiles: &network_egress_profiles,
+                    network_ingress_bindings: &network_ingress_bindings,
+                    storage_logs: &storage_logs,
+                    storage_blobs: &storage_blobs,
                     entrypoint,
-                )
+                })
                 .await
         }
     }

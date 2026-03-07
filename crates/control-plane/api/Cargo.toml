@@ -12,5 +12,5 @@ categories.workspace = true
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
-rkyv = { workspace = true }
+rkyv = { workspace = true, features = ["std", "bytecheck"] }
 thiserror = { workspace = true, features = ["std"] }

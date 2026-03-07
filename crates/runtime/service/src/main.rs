@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     let registry = Registry::new();
 
     if let Some(ServerCommand::Daemon(daemon_args)) = args.command {
-        return daemon::run_daemon(kernel, registry, shutdown, args.work_dir, daemon_args).await;
+        return daemon::run_daemon(kernel, registry, shutdown, args.work_dir, *daemon_args).await;
     }
 
     daemon::run(

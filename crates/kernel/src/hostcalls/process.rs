@@ -11,8 +11,19 @@ use crate::{
     KernelError,
     guest_error::{GuestError, GuestResult},
     registry::{InstanceRegistry, ResourceHandle, ResourceId, ResourceType},
-    spi::process::ProcessLifecycleCapability,
+    spi::process::{ProcessLifecycleCapability, ProcessStartRequest},
 };
+
+struct PreparedProcessStart {
+    module_id: String,
+    name: String,
+    capabilities: Vec<selium_abi::Capability>,
+    network_egress_profiles: Vec<String>,
+    network_ingress_bindings: Vec<String>,
+    storage_logs: Vec<String>,
+    storage_blobs: Vec<String>,
+    entrypoint: EntrypointInvocation,
+}
 
 /// Helpers for working with entrypoint invocations inside the kernel.
 pub trait EntrypointInvocationExt {
@@ -159,35 +170,12 @@ where
             entrypoint,
         } = input;
 
-        let preparation =
-            (|| -> GuestResult<(
-                String,
-                String,
-                Vec<selium_abi::Capability>,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                EntrypointInvocation,
-            )> {
-                entrypoint
-                    .validate()
-                    .map_err(|err| GuestError::from(KernelError::Driver(err.to_string())))?;
-                let entrypoint = entrypoint.resolve_resources(context.registry())?;
-                Ok((
-                    module_id,
-                    name,
-                    capabilities,
-                    network_egress_profiles,
-                    network_ingress_bindings,
-                    storage_logs,
-                    storage_blobs,
-                    entrypoint,
-                ))
-            })();
-
-        async move {
-            let (
+        let preparation = (|| -> GuestResult<PreparedProcessStart> {
+            entrypoint
+                .validate()
+                .map_err(|err| GuestError::from(KernelError::Driver(err.to_string())))?;
+            let entrypoint = entrypoint.resolve_resources(context.registry())?;
+            Ok(PreparedProcessStart {
                 module_id,
                 name,
                 capabilities,
@@ -196,7 +184,20 @@ where
                 storage_logs,
                 storage_blobs,
                 entrypoint,
-            ) = preparation?;
+            })
+        })();
+
+        async move {
+            let PreparedProcessStart {
+                module_id,
+                name,
+                capabilities,
+                network_egress_profiles,
+                network_ingress_bindings,
+                storage_logs,
+                storage_blobs,
+                entrypoint,
+            } = preparation?;
             debug!(%module_id, %name, capabilities = ?capabilities, "process_start requested");
             let process_id = registry
                 .reserve(None, ResourceType::Process)
@@ -205,15 +206,17 @@ where
             match inner
                 .start(
                     &registry,
-                    process_id,
-                    &module_id,
-                    &name,
-                    capabilities,
-                    network_egress_profiles,
-                    network_ingress_bindings,
-                    storage_logs,
-                    storage_blobs,
-                    entrypoint,
+                    ProcessStartRequest {
+                        process_id,
+                        module_id: &module_id,
+                        name: &name,
+                        capabilities,
+                        network_egress_profiles,
+                        network_ingress_bindings,
+                        storage_logs,
+                        storage_blobs,
+                        entrypoint,
+                    },
                 )
                 .await
             {
@@ -329,18 +332,10 @@ mod tests {
         fn start(
             &self,
             _registry: &Arc<crate::registry::Registry>,
-            process_id: ResourceId,
-            _module_id: &str,
-            _name: &str,
-            _capabilities: Vec<Capability>,
-            _network_egress_profiles: Vec<String>,
-            _network_ingress_bindings: Vec<String>,
-            _storage_logs: Vec<String>,
-            _storage_blobs: Vec<String>,
-            _entrypoint: EntrypointInvocation,
+            request: ProcessStartRequest<'_>,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             let fail = self.fail;
-            *self.seen_process_id.lock().expect("process id lock") = Some(process_id);
+            *self.seen_process_id.lock().expect("process id lock") = Some(request.process_id);
             async move {
                 if fail {
                     Err(GuestError::Subsystem("start failed".to_string()))
@@ -367,15 +362,7 @@ mod tests {
         async fn start(
             &self,
             _registry: &Arc<crate::registry::Registry>,
-            _process_id: ResourceId,
-            _module_id: &str,
-            _name: &str,
-            _capabilities: Vec<Capability>,
-            _network_egress_profiles: Vec<String>,
-            _network_ingress_bindings: Vec<String>,
-            _storage_logs: Vec<String>,
-            _storage_blobs: Vec<String>,
-            _entrypoint: EntrypointInvocation,
+            _request: ProcessStartRequest<'_>,
         ) -> Result<(), Self::Error> {
             Ok(())
         }

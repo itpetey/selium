@@ -19,6 +19,32 @@ mkdir -p "$SELIUM_WORK_DIR/modules/examples"
 ./target/debug/selium-runtime generate-certs --output-dir "$SELIUM_WORK_DIR/certs"
 ```
 
+## Contracts
+
+The example contract is in `contracts/network.http.upload.v1.selium`. It demonstrates a streamed request body for an upload-style RPC:
+
+```selium
+service upload(UploadRequest) -> UploadReceipt {
+  protocol: http;
+  method: POST;
+  path: "/upload/{file_name}";
+  request-header: content_type = "content-type";
+  request-body: stream<bytes>;
+  response-body: buffered<UploadReceipt>;
+}
+```
+
+The generated `src/bindings.rs` file includes an `upload` module with typed client/server helpers over `selium_guest::network`, so the example no longer assembles HTTP method/path/header metadata by hand.
+
+Regenerate the checked-in bindings after editing the contract:
+
+```bash
+cargo run -p selium -- \
+  idl compile \
+  --input examples/network-http-rpc/contracts/network.http.upload.v1.selium \
+  --output examples/network-http-rpc/src/bindings.rs
+```
+
 ## Usage
 
 Build the guest module and copy it into the runtime module repository:

@@ -22,11 +22,13 @@ use selium_control_plane_protocol::{
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
     api::{
-        ContractRef, ControlPlaneState, DeploymentSpec, IsolationProfile, PipelineEdge,
-        PipelineEndpoint, PipelineSpec, collect_contracts_for_app, ensure_pipeline_consistency,
+        ContractRef, ControlPlaneState, DeploymentSpec, PipelineEdge, PipelineEndpoint,
+        PipelineSpec, collect_contracts_for_app, ensure_pipeline_consistency,
         generate_rust_bindings, parse_contract_ref, parse_idl,
     },
-    apply, reconcile,
+    apply, build_module_spec as build_runtime_module_spec,
+    default_capabilities as default_runtime_capabilities,
+    deployment_module_spec as build_deployment_module_spec, reconcile,
     runtime::{Mutation, Query},
     scheduler::build_plan,
 };
@@ -245,7 +247,7 @@ async fn cmd_start(
             args.adaptor,
             args.isolation,
             if args.capabilities.is_empty() {
-                default_capabilities()
+                default_runtime_capabilities()
             } else {
                 args.capabilities
             },
@@ -529,7 +531,7 @@ async fn execute_daemon_actions(
                     .deployments
                     .get(deployment)
                     .ok_or_else(|| anyhow!("missing deployment `{deployment}`"))?;
-                let module_spec = deployment_module_spec(spec);
+                let module_spec = build_deployment_module_spec(spec);
                 let _ = node_client
                     .request::<_, StartResponse>(
                         Method::StartInstance,
@@ -556,32 +558,6 @@ async fn execute_daemon_actions(
     Ok(())
 }
 
-fn deployment_module_spec(deployment: &DeploymentSpec) -> String {
-    let (adaptor, profile) = match deployment.isolation {
-        IsolationProfile::Standard => ("wasmtime", "standard"),
-        IsolationProfile::Hardened => ("wasmtime", "hardened"),
-        IsolationProfile::Microvm => ("microvm", "microvm"),
-    };
-
-    build_module_spec(
-        &deployment.module,
-        match deployment.isolation {
-            IsolationProfile::Microvm => AdaptorArg::Microvm,
-            _ => AdaptorArg::Wasmtime,
-        },
-        match deployment.isolation {
-            IsolationProfile::Standard => IsolationArg::Standard,
-            IsolationProfile::Hardened => IsolationArg::Hardened,
-            IsolationProfile::Microvm => IsolationArg::Microvm,
-        },
-        default_capabilities(),
-    )
-    .replace(
-        "adaptor=wasmtime;profile=standard",
-        &format!("adaptor={adaptor};profile={profile}"),
-    )
-}
-
 fn build_module_spec(
     module: &str,
     adaptor: AdaptorArg,
@@ -598,25 +574,7 @@ fn build_module_spec(
         IsolationArg::Microvm => "microvm",
     };
 
-    format!(
-        "path={};capabilities={};adaptor={};profile={}",
-        module,
-        capabilities.join(","),
-        adaptor,
-        profile
-    )
-}
-
-fn default_capabilities() -> Vec<String> {
-    vec![
-        "session_lifecycle".to_string(),
-        "process_lifecycle".to_string(),
-        "time_read".to_string(),
-        "shared_memory".to_string(),
-        "queue_lifecycle".to_string(),
-        "queue_writer".to_string(),
-        "queue_reader".to_string(),
-    ]
+    build_runtime_module_spec(module, adaptor, profile, capabilities)
 }
 
 fn load_agent_state(path: &Path) -> Result<AgentState> {
@@ -668,7 +626,7 @@ mod tests {
             "echo.wasm",
             AdaptorArg::Wasmtime,
             IsolationArg::Standard,
-            default_capabilities(),
+            default_runtime_capabilities(),
         );
         assert!(spec.contains("path=echo.wasm"));
         assert!(spec.contains("adaptor=wasmtime"));

@@ -1686,6 +1686,7 @@ name = "selium-example-network-http-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rkyv",
  "selium-abi",
  "selium-guest",
 ]
@@ -1695,6 +1696,8 @@ name = "selium-example-network-quic-stream"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rkyv",
+ "selium-abi",
  "selium-guest",
 ]
 

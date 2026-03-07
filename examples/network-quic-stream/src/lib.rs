@@ -5,6 +5,11 @@ use std::{future::Future, time::Duration};
 use anyhow::{Context, Result, ensure};
 use selium_guest::{network, spawn, time};
 
+#[allow(dead_code)]
+mod bindings;
+
+use bindings::{EchoChunk, quic_echo};
+
 const BINDING_NAME: &str = "example-quic-loopback";
 const PROFILE_NAME: &str = "example-quic-loopback";
 const AUTHORITY: &str = "127.0.0.1:7400@localhost";
@@ -28,16 +33,16 @@ pub async fn start() -> Result<()> {
         .context("connect QUIC loopback session")?;
     let stream = wait_for_open_stream(&session).await?;
 
-    let payload = b"hello over quic".to_vec();
-    stream
-        .send(payload.clone(), true, IO_TIMEOUT_MS)
+    let payload = EchoChunk {
+        payload: b"hello over quic".to_vec(),
+    };
+    quic_echo::send(&stream, &payload, IO_TIMEOUT_MS)
         .await
         .context("send QUIC request")?;
-    let response = read_all(&stream).await?;
-    ensure!(
-        response == format!("quic echo: {}", String::from_utf8_lossy(&payload)).into_bytes(),
-        "unexpected QUIC response body"
-    );
+    let response = quic_echo::recv(&stream, CHUNK_BYTES, IO_TIMEOUT_MS)
+        .await
+        .context("decode QUIC response")?;
+    ensure!(response == payload, "unexpected QUIC response body");
 
     stream.close().await.context("close QUIC client stream")?;
     session.close().await.context("close QUIC client session")?;
@@ -59,16 +64,16 @@ async fn run_server(listener: network::Listener) -> Result<()> {
 
 async fn handle_session(session: network::Session) -> Result<()> {
     loop {
-        let stream = match network::stream::accept(&session, ACCEPT_TIMEOUT_MS).await {
+        let stream = match quic_echo::accept(&session, ACCEPT_TIMEOUT_MS).await {
             Ok(Some(stream)) => stream,
             Ok(None) => continue,
             Err(_) => return Ok(()),
         };
 
-        let request = read_all(&stream).await?;
-        let reply = format!("quic echo: {}", String::from_utf8_lossy(&request)).into_bytes();
-        stream
-            .send(reply, true, IO_TIMEOUT_MS)
+        let request = quic_echo::recv(&stream, CHUNK_BYTES, IO_TIMEOUT_MS)
+            .await
+            .context("decode QUIC request")?;
+        quic_echo::send(&stream, &request, IO_TIMEOUT_MS)
             .await
             .context("send QUIC response")?;
         stream.close().await.context("close QUIC server stream")?;
@@ -86,23 +91,6 @@ async fn wait_for_open_stream(session: &network::Session) -> Result<network::Str
         time::sleep(Duration::from_millis(25))
             .await
             .context("wait for QUIC stream availability")?;
-    }
-}
-
-async fn read_all(stream: &network::StreamChannel) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    loop {
-        let Some(chunk) = stream
-            .recv(CHUNK_BYTES, IO_TIMEOUT_MS)
-            .await
-            .context("receive QUIC bytes")?
-        else {
-            continue;
-        };
-        payload.extend_from_slice(&chunk.bytes);
-        if chunk.finish {
-            return Ok(payload);
-        }
     }
 }
 

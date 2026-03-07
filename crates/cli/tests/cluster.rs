@@ -6,8 +6,8 @@ use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
-async fn goal1_two_node_cluster_starts_user_module_on_both_nodes() -> Result<()> {
-    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("goal1-cluster"))?;
+async fn two_node_cluster_starts_user_module_on_both_nodes() -> Result<()> {
+    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("cluster"))?;
     harness.prepare()?;
     harness.wait_for_consensus_ready().await?;
 

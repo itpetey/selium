@@ -19,6 +19,29 @@ mkdir -p "$SELIUM_WORK_DIR/modules/examples"
 ./target/debug/selium-runtime generate-certs --output-dir "$SELIUM_WORK_DIR/certs"
 ```
 
+## Contracts
+
+The example contract is in `contracts/network.quic.echo.v1.selium`. It defines the typed stream payload used on the QUIC channel:
+
+```selium
+schema EchoChunk {
+  payload: bytes;
+}
+
+stream quic.echo(EchoChunk);
+```
+
+The generated `src/bindings.rs` file includes a `quic_echo` module with typed send/receive helpers over `selium_guest::network::stream`.
+
+Regenerate the checked-in bindings after editing the contract:
+
+```bash
+cargo run -p selium -- \
+  idl compile \
+  --input examples/network-quic-stream/contracts/network.quic.echo.v1.selium \
+  --output examples/network-quic-stream/src/bindings.rs
+```
+
 ## Usage
 
 Build the guest module and copy it into the runtime module repository:

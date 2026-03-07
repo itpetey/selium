@@ -12,7 +12,7 @@ use selium_abi::{
 use selium_kernel::{
     Kernel, KernelError,
     registry::{Registry, ResourceHandle, ResourceId, ResourceType},
-    spi::process::ProcessLifecycleCapability,
+    spi::process::{ProcessLifecycleCapability, ProcessStartRequest},
 };
 use selium_runtime_adaptor_microvm::MicroVmAdaptor;
 use selium_runtime_adaptor_spi::{
@@ -403,13 +403,12 @@ fn normalize_module_id(path: PathBuf) -> PathBuf {
     use std::ffi::OsStr;
 
     let mut components = path.components();
-    let stripped = match components.next() {
+    match components.next() {
         Some(Component::Normal(first)) if first == OsStr::new("modules") => {
             components.as_path().to_path_buf()
         }
         _ => path,
-    };
-    stripped
+    }
 }
 
 fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
@@ -794,15 +793,17 @@ async fn spawn_module(
     if let Err(err) = runtime
         .start(
             registry,
-            process_id,
-            module_id,
-            &entrypoint,
-            capabilities,
-            network_egress_profiles,
-            network_ingress_bindings,
-            storage_logs,
-            storage_blobs,
-            entrypoint_invocation,
+            ProcessStartRequest {
+                process_id,
+                module_id,
+                name: &entrypoint,
+                capabilities,
+                network_egress_profiles,
+                network_ingress_bindings,
+                storage_logs,
+                storage_blobs,
+                entrypoint: entrypoint_invocation,
+            },
         )
         .await
     {

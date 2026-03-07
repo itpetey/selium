@@ -65,7 +65,7 @@ pub async fn start() -> Result<()> {
             .context("missing worker status frame")?;
         let status = decode_rkyv::<WorkerStatus>(&frame.payload).context("decode worker status")?;
         ensure!(status.phase == "started", "unexpected worker phase");
-        if !started.iter().any(|id| *id == status.worker_id) {
+        if !started.contains(&status.worker_id) {
             started.push(status.worker_id);
         }
     }

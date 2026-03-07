@@ -51,7 +51,7 @@ pub(crate) enum ServerCommand {
     /// Generate a local CA plus server and client certificate pairs.
     GenerateCerts(GenerateCertsArgs),
     /// Run long-lived runtime daemon with lifecycle API.
-    Daemon(DaemonArgs),
+    Daemon(Box<DaemonArgs>),
 }
 
 #[derive(Args, Debug)]
