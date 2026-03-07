@@ -53,9 +53,7 @@ mod tests {
 
     #[test]
     fn link_registers_guest_async_module() {
-        let mut config = wasmtime::Config::new();
-        config.async_support(true);
-        let engine = wasmtime::Engine::new(&config).expect("engine");
+        let engine = wasmtime::Engine::default();
         let mut linker = Linker::<InstanceRegistry>::new(&engine);
         let notify = Arc::new(Notify::new());
         let guest_async = GuestAsync::new(notify);
