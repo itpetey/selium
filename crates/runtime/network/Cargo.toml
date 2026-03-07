@@ -20,7 +20,6 @@ hyper-util = { workspace = true, features = ["http1", "server", "tokio"] }
 quinn = { workspace = true, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
 rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
-rustls-pki-types = { workspace = true, features = ["std"] }
 selium-abi = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
 selium-kernel = { workspace = true, features = ["services"] }

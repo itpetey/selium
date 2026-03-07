@@ -25,13 +25,8 @@ pkg-fmt = "zip"
 
 [dependencies]
 anyhow = { workspace = true }
-bytes = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive", "env", "help", "std"] }
 futures-util = { workspace = true, features = ["alloc"] }
-http = { workspace = true, features = ["std"] }
-http-body-util = { workspace = true }
-hyper = { workspace = true, features = ["client", "http1", "server"] }
-hyper-util = { workspace = true, features = ["http1", "server", "tokio"] }
 libc = { workspace = true }
 path-security = { workspace = true }
 quinn = { workspace = true, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
@@ -39,13 +34,10 @@ rcgen = { workspace = true, features = ["crypto", "pem", "ring"] }
 rkyv = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
-rustls-pki-types = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 selium-abi = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
 selium-io-durability = { workspace = true }
-selium-io-consensus = { workspace = true }
-selium-io-tables = { workspace = true }
 selium-module-control-plane = { workspace = true }
 selium-kernel = { workspace = true, features = ["services"] }
 selium-runtime-adaptor-spi = { workspace = true }
@@ -53,7 +45,6 @@ selium-runtime-adaptor-wasmtime = { workspace = true }
 selium-runtime-adaptor-microvm = { workspace = true }
 selium-runtime-network = { workspace = true }
 selium-runtime-storage = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true, features = [
   "net",
   "io-std",
@@ -64,7 +55,6 @@ tokio = { workspace = true, features = [
   "sync",
   "time"
 ] }
-tokio-rustls = { workspace = true, features = ["ring"] }
 toml = { workspace = true, features = ["parse", "serde", "std"] }
 tracing = { workspace = true, features = ["attributes"] }
 tracing-subscriber = { workspace = true, features = [

@@ -14,7 +14,6 @@ rustls-pemfile = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 selium-abi = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
-selium-io-durability = { workspace = true }
 selium-module-control-plane = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { workspace = true, features = ["parse", "serde", "std"] }

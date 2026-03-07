@@ -11,7 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-selium-control-plane-api = { workspace = true }
 selium-abi = { workspace = true }
 selium-io-core = { workspace = true }
 selium-io-durability = { workspace = true }
