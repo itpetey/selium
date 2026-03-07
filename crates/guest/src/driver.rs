@@ -220,61 +220,58 @@ where
             None => return Poll::Ready(Err(DriverError::InvalidArgument)),
         };
 
-        let task_id = r#async::register(cx);
-        let capacity = match guest_len(self.result.len()) {
-            Ok(len) => len,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        let ptr = match GuestPtr::new(self.result.as_mut_ptr()) {
-            Ok(ptr) => ptr,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        let rc = unsafe { M::poll(handle, task_id, ptr.raw(), capacity) };
+        loop {
+            let task_id = r#async::register(cx);
+            let capacity = match guest_len(self.result.len()) {
+                Ok(len) => len,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            let ptr = match GuestPtr::new(self.result.as_mut_ptr()) {
+                Ok(ptr) => ptr,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            let rc = unsafe { M::poll(handle, task_id, ptr.raw(), capacity) };
 
-        match driver_decode_result(rc) {
-            DriverPollResult::Pending => Poll::Pending,
-            DriverPollResult::Error(code) => {
-                self.handle = None;
-                if code == DRIVER_ERROR_MESSAGE_CODE {
-                    let msg = decode_driver_error(&self.result);
-                    Poll::Ready(Err(DriverError::Driver(msg)))
-                } else {
-                    Poll::Ready(Err(DriverError::Kernel(code)))
-                }
-            }
-            DriverPollResult::Ready(value) => {
-                if value > capacity {
+            match driver_decode_result(rc) {
+                DriverPollResult::Pending => return Poll::Pending,
+                DriverPollResult::Error(code) => {
                     self.handle = None;
-                    return Poll::Ready(Err(DriverError::Kernel(value)));
-                }
-
-                let used = match host_len(value) {
-                    Ok(len) => len,
-                    Err(err) => {
-                        self.handle = None;
-                        return Poll::Ready(Err(err));
+                    if code == DRIVER_ERROR_MESSAGE_CODE {
+                        let msg = decode_driver_error(&self.result);
+                        return Poll::Ready(Err(DriverError::Driver(msg)));
+                    } else {
+                        return Poll::Ready(Err(DriverError::Kernel(code)));
                     }
-                };
-                if used > self.result.len() {
+                }
+                DriverPollResult::Ready(value) => {
+                    let used = match host_len(value) {
+                        Ok(len) => len,
+                        Err(err) => {
+                            self.handle = None;
+                            return Poll::Ready(Err(err));
+                        }
+                    };
+                    if used > self.result.len() {
+                        self.result.resize(used, 0);
+                        continue;
+                    }
+
                     self.handle = None;
-                    return Poll::Ready(Err(DriverError::InvalidArgument));
+                    let ptr = self.result.as_ptr();
+                    let output = {
+                        let bytes = unsafe { slice::from_raw_parts(ptr, used) };
+                        let decoded = self.decoder.decode(bytes);
+                        if let Err(DriverError::Driver(ref msg)) = decoded {
+                            tracing::warn!(
+                                "driver decode failed (module={}, used={}): {msg}",
+                                std::any::type_name::<M>(),
+                                used
+                            );
+                        }
+                        decoded
+                    };
+                    return Poll::Ready(output);
                 }
-
-                self.handle = None;
-                let ptr = self.result.as_ptr();
-                let output = {
-                    let bytes = unsafe { slice::from_raw_parts(ptr, used) };
-                    let decoded = self.decoder.decode(bytes);
-                    if let Err(DriverError::Driver(ref msg)) = decoded {
-                        tracing::warn!(
-                            "driver decode failed (module={}, used={}): {msg}",
-                            std::any::type_name::<M>(),
-                            used
-                        );
-                    }
-                    decoded
-                };
-                Poll::Ready(output)
             }
         }
     }
@@ -616,5 +613,54 @@ mod tests {
         assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
         let out = run_ready(fut).expect("future output");
         assert_eq!(out, "done");
+    }
+
+    struct ResizingReadyModule;
+
+    impl DriverModule for ResizingReadyModule {
+        unsafe fn create(_args_ptr: DriverInt, _args_len: DriverUint) -> DriverUint {
+            4
+        }
+
+        unsafe fn poll(
+            _handle: DriverUint,
+            _task_id: DriverUint,
+            result_ptr: DriverInt,
+            result_len: DriverUint,
+        ) -> DriverUint {
+            let payload = b"this payload needs a larger buffer";
+            if usize::try_from(result_len).expect("length fits") < payload.len() {
+                return driver_encode_ready(
+                    DriverUint::try_from(payload.len()).expect("payload length fits"),
+                )
+                .expect("payload length fits");
+            }
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    test_ptr_mut(result_ptr),
+                    payload.len(),
+                );
+            }
+            driver_encode_ready(DriverUint::try_from(payload.len()).expect("payload length fits"))
+                .expect("payload length fits")
+        }
+
+        unsafe fn drop(
+            _handle: DriverUint,
+            _result_ptr: DriverInt,
+            _result_len: DriverUint,
+        ) -> DriverUint {
+            0
+        }
+    }
+
+    #[test]
+    fn driver_future_grows_buffer_for_large_ready_payloads() {
+        let fut = DriverFuture::<ResizingReadyModule, StrDecoder>::new(&[], 4, StrDecoder)
+            .expect("create future");
+        let out = run_ready(fut).expect("future output");
+        assert_eq!(out, "this payload needs a larger buffer");
     }
 }

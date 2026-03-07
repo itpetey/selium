@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
+use selium_abi::DRIVER_RESULT_PENDING;
 use selium_kernel::{
     KernelError,
-    hostcalls::{Contract, HostcallContext, Operation as KernelOperation},
+    hostcalls::{Contract, HostcallContext, Operation as KernelOperation, PollState},
     registry::InstanceRegistry,
 };
 use wasmtime::{Caller, Linker};
@@ -94,12 +95,34 @@ where
                       task_id: GuestUint,
                       result_ptr: GuestInt,
                       result_capacity: GuestUint| {
-                    let guest_result = {
+                    let poll_state = {
                         let mut context = WasmtimeContext::new(&mut caller);
                         poll_op.poll_state(&mut context, state_id, task_id)?
                     };
-                    write_poll_result(&mut caller, result_ptr, result_capacity, guest_result)
-                        .map_err(Into::into)
+                    match poll_state {
+                        PollState::Pending => Ok(DRIVER_RESULT_PENDING),
+                        PollState::Missing(result) => {
+                            let write = write_poll_result(
+                                &mut caller,
+                                result_ptr,
+                                result_capacity,
+                                &result,
+                            )?;
+                            Ok(write.encoded)
+                        }
+                        PollState::Complete(state) => {
+                            let write = state.with_result(|result| {
+                                let result = result.expect("completed future must store a result");
+                                write_poll_result(&mut caller, result_ptr, result_capacity, result)
+                            })?;
+                            if write.complete {
+                                let state_id =
+                                    usize::try_from(state_id).map_err(KernelError::IntConvert)?;
+                                let _ = caller.data_mut().remove_future(state_id);
+                            }
+                            Ok(write.encoded)
+                        }
+                    }
                 },
             )
             .map_err(|err| KernelError::Engine(err.to_string()))?;
@@ -117,7 +140,8 @@ where
                         let mut context = WasmtimeContext::new(&mut caller);
                         drop_op.drop_state(&mut context, state_id)?
                     };
-                    write_poll_result(&mut caller, result_ptr, result_capacity, guest_result)
+                    write_poll_result(&mut caller, result_ptr, result_capacity, &guest_result)
+                        .map(|write| write.encoded)
                         .map_err(Into::into)
                 },
             )

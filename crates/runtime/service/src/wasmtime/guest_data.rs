@@ -11,28 +11,43 @@ use selium_kernel::{
     registry::InstanceRegistry,
 };
 
+pub struct WritePollResult {
+    pub encoded: GuestUint,
+    pub complete: bool,
+}
+
 fn encode_for_guest(
-    error: GuestError,
+    error: &GuestError,
     caller: &mut Caller<'_, InstanceRegistry>,
     ptr: GuestInt,
     len: GuestUint,
-) -> Result<GuestUint, KernelError> {
+) -> Result<WritePollResult, KernelError> {
     if matches!(error, GuestError::WouldBlock) {
-        return Ok(DRIVER_RESULT_PENDING);
+        return Ok(WritePollResult {
+            encoded: DRIVER_RESULT_PENDING,
+            complete: false,
+        });
     }
 
     let bytes = encode_driver_error_message(&error.to_string())
         .map_err(|err| KernelError::Driver(err.to_string()))?;
-    write_encoded(caller, ptr, len, &bytes)?;
-    Ok(driver_encode_error(DRIVER_ERROR_MESSAGE_CODE))
+    let write = write_encoded(caller, ptr, len, &bytes)?;
+    Ok(if write.complete {
+        WritePollResult {
+            encoded: driver_encode_error(DRIVER_ERROR_MESSAGE_CODE),
+            complete: true,
+        }
+    } else {
+        write
+    })
 }
 
 pub fn write_poll_result(
     caller: &mut Caller<'_, InstanceRegistry>,
     ptr: GuestInt,
     len: GuestUint,
-    result: GuestResult<Vec<u8>>,
-) -> Result<GuestUint, KernelError> {
+    result: &GuestResult<Vec<u8>>,
+) -> Result<WritePollResult, KernelError> {
     match result {
         Ok(bytes) => write_encoded(caller, ptr, len, &bytes),
         Err(err) => encode_for_guest(err, caller, ptr, len),
@@ -80,14 +95,17 @@ fn write_encoded(
     ptr: GuestInt,
     len: GuestUint,
     bytes: &[u8],
-) -> Result<GuestUint, KernelError> {
+) -> Result<WritePollResult, KernelError> {
     let memory = caller
         .get_export("memory")
         .and_then(|export| export.into_memory())
         .ok_or(KernelError::MemoryMissing)?;
     let capacity = usize::try_from(len).map_err(KernelError::IntConvert)?;
     if capacity < bytes.len() {
-        return Err(KernelError::MemoryCapacity);
+        return Ok(WritePollResult {
+            encoded: encode_ready_len(bytes.len())?,
+            complete: false,
+        });
     }
 
     let offset = usize::try_from(ptr).map_err(KernelError::IntConvert)?;
@@ -95,7 +113,10 @@ fn write_encoded(
         .write(caller, offset, bytes)
         .map_err(|err| KernelError::MemoryAccess(err.to_string()))?;
 
-    encode_ready_len(bytes.len())
+    Ok(WritePollResult {
+        encoded: encode_ready_len(bytes.len())?,
+        complete: true,
+    })
 }
 
 pub fn encode_ready_len(len: usize) -> Result<GuestUint, KernelError> {

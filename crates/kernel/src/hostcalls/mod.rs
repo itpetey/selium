@@ -12,6 +12,12 @@ use crate::{
     registry::InstanceRegistry,
 };
 
+pub enum PollState {
+    Pending,
+    Complete(Arc<FutureSharedState<GuestResult<Vec<u8>>>>),
+    Missing(GuestResult<Vec<u8>>),
+}
+
 pub mod network;
 pub mod process;
 pub mod queue;
@@ -126,7 +132,7 @@ where
         context: &mut C,
         state_id: GuestUint,
         task_id: GuestUint,
-    ) -> Result<GuestResult<Vec<u8>>, KernelError>
+    ) -> Result<PollState, KernelError>
     where
         C: HostcallContext,
     {
@@ -148,21 +154,17 @@ where
                     })?;
                     state.register_waker(waker);
 
-                    match state.take_result() {
-                        None => Err(GuestError::WouldBlock),
-                        Some(output) => {
-                            registry.remove_future(state_id);
-                            output
-                        }
+                    if state.with_result(|result| result.is_some()) {
+                        PollState::Complete(state)
+                    } else {
+                        PollState::Pending
                     }
                 }
-                None => Err(GuestError::NotFound),
+                None => PollState::Missing(Err(GuestError::NotFound)),
             }
         };
 
-        if let Err(error) = &guest_result
-            && !matches!(error, GuestError::WouldBlock)
-        {
+        if let PollState::Missing(Err(error)) = &guest_result {
             debug!("Future failed with error: {error}");
         }
 
@@ -308,11 +310,19 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let result = op
-            .poll_state(&mut ctx, state_id, 1)
-            .expect("poll")
-            .expect("ready");
-        let decoded = selium_abi::decode_rkyv::<u32>(&result).expect("decode");
-        assert_eq!(decoded, 2);
+        let result = op.poll_state(&mut ctx, state_id, 1).expect("poll");
+        match result {
+            PollState::Complete(state) => {
+                let decoded = state.with_result(|result| {
+                    let result = result.expect("ready result");
+                    let payload = result.as_ref().expect("successful result");
+                    selium_abi::decode_rkyv::<u32>(payload).expect("decode")
+                });
+                assert_eq!(decoded, 2);
+                assert!(ctx.registry.future_state(state_id as usize).is_some());
+            }
+            PollState::Pending => panic!("future should be ready"),
+            PollState::Missing(other) => panic!("unexpected result: {other:?}"),
+        }
     }
 }

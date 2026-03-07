@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_control_plane_protocol::{
-    Empty, ListResponse, Method, MutateApiRequest, MutateApiResponse, QueryApiRequest,
+    ListRequest, ListResponse, Method, MutateApiRequest, MutateApiResponse, QueryApiRequest,
     QueryApiResponse, ReplayApiRequest, ReplayApiResponse, StartRequest, StartResponse,
     StopRequest, StopResponse,
 };
@@ -67,8 +67,8 @@ async fn run() -> Result<()> {
                 Command::Observe(args) => cmd_observe(daemon, args).await,
                 Command::Replay(args) => cmd_replay(daemon, args).await,
                 Command::Nodes(args) => cmd_nodes(daemon, args).await,
-                Command::Start(args) => cmd_start(daemon, &cli.daemon, args).await,
-                Command::Stop(args) => cmd_stop(daemon, &cli.daemon, args).await,
+                Command::Start(args) => cmd_start(daemon, args).await,
+                Command::Stop(args) => cmd_stop(daemon, args).await,
                 Command::List(args) => cmd_list(daemon, &cli.daemon, args).await,
                 Command::Agent(args) => cmd_agent(daemon, &cli.daemon, args).await,
                 Command::Idl(IdlArgs {
@@ -230,12 +230,7 @@ async fn cmd_nodes(daemon: Arc<DaemonQuicClient>, args: NodesArgs) -> Result<()>
     Ok(())
 }
 
-async fn cmd_start(
-    daemon: Arc<DaemonQuicClient>,
-    conn_args: &DaemonConnectionArgs,
-    args: StartArgs,
-) -> Result<()> {
-    let node_client = node_client(&daemon, conn_args, &args.node).await?;
+async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()> {
     let module_spec = if let Some(spec) = args.module_spec {
         spec
     } else {
@@ -254,10 +249,11 @@ async fn cmd_start(
         )
     };
 
-    let response: StartResponse = node_client
+    let response: StartResponse = daemon
         .request(
             Method::StartInstance,
             &StartRequest {
+                node_id: args.node,
                 instance_id: args.instance_id,
                 module_spec,
             },
@@ -271,16 +267,12 @@ async fn cmd_start(
     Ok(())
 }
 
-async fn cmd_stop(
-    daemon: Arc<DaemonQuicClient>,
-    conn_args: &DaemonConnectionArgs,
-    args: StopArgs,
-) -> Result<()> {
-    let node_client = node_client(&daemon, conn_args, &args.node).await?;
-    let response: StopResponse = node_client
+async fn cmd_stop(daemon: Arc<DaemonQuicClient>, args: StopArgs) -> Result<()> {
+    let response: StopResponse = daemon
         .request(
             Method::StopInstance,
             &StopRequest {
+                node_id: args.node,
                 instance_id: args.instance_id,
             },
         )
@@ -304,9 +296,8 @@ async fn cmd_list(
     args: ListArgs,
 ) -> Result<()> {
     if let Some(node) = args.node {
-        let node_client = node_client(&daemon, conn_args, &node).await?;
-        let list: ListResponse = node_client
-            .request(Method::ListInstances, &Empty {})
+        let list: ListResponse = daemon
+            .request(Method::ListInstances, &ListRequest { node_id: node })
             .await?;
         print_instance_map(&list.instances);
         return Ok(());
@@ -322,7 +313,12 @@ async fn cmd_list(
             &conn_args.client_key,
         )?;
         let list: ListResponse = client
-            .request(Method::ListInstances, &Empty {})
+            .request(
+                Method::ListInstances,
+                &ListRequest {
+                    node_id: node.name.clone(),
+                },
+            )
             .await
             .unwrap_or(ListResponse {
                 instances: BTreeMap::new(),
@@ -536,6 +532,7 @@ async fn execute_daemon_actions(
                     .request::<_, StartResponse>(
                         Method::StartInstance,
                         &StartRequest {
+                            node_id: node.to_string(),
                             instance_id: instance_id.clone(),
                             module_spec,
                         },
@@ -547,6 +544,7 @@ async fn execute_daemon_actions(
                     .request::<_, StopResponse>(
                         Method::StopInstance,
                         &StopRequest {
+                            node_id: node.to_string(),
                             instance_id: instance_id.clone(),
                         },
                     )

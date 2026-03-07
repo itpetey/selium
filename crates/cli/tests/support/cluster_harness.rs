@@ -17,6 +17,9 @@ const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
 const USER_ECHO_ARTIFACT: &str = "rpc_echo_service.wasm";
 const USER_IO_MANIFEST: &str = "examples/event-broadcast/Cargo.toml";
 const USER_IO_ARTIFACT: &str = "event_broadcast.wasm";
+const CONTROL_PLANE_MANIFEST: &str = "modules/control-plane/Cargo.toml";
+const CONTROL_PLANE_ARTIFACT: &str = "selium_module_control_plane.wasm";
+const STAGED_CONTROL_PLANE_ARTIFACT: &str = "control-plane.wasm";
 const DEFAULT_SERVER_NAME: &str = "localhost";
 const CLI_CONNECT_TIMEOUT_RETRIES: usize = 5;
 const CLI_CONNECT_TIMEOUT_BACKOFF: Duration = Duration::from_millis(400);
@@ -32,7 +35,7 @@ impl ClusterHarnessConfig {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            consensus_timeout: Duration::from_secs(30),
+            consensus_timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(500),
         }
     }
@@ -44,6 +47,7 @@ pub struct ClusterHarness {
     cert_dir: PathBuf,
     runtime_bin: PathBuf,
     cli_bin: PathBuf,
+    control_plane_source: PathBuf,
     user_echo_source: PathBuf,
     user_io_source: PathBuf,
     config: ClusterHarnessConfig,
@@ -78,6 +82,9 @@ impl ClusterHarness {
         Ok(Self {
             runtime_bin: root.join("target/debug/selium-runtime"),
             cli_bin: root.join("target/debug/selium"),
+            control_plane_source: root
+                .join("target/wasm32-unknown-unknown/debug")
+                .join(CONTROL_PLANE_ARTIFACT),
             user_echo_source: root
                 .join("target/wasm32-unknown-unknown/debug")
                 .join(USER_ECHO_ARTIFACT),
@@ -94,6 +101,7 @@ impl ClusterHarness {
 
     pub fn prepare(&mut self) -> Result<()> {
         self.prepare_binaries()?;
+        self.build_example_wasm(CONTROL_PLANE_MANIFEST, &self.control_plane_source)?;
         self.build_example_wasm(USER_ECHO_MANIFEST, &self.user_echo_source)?;
         self.build_example_wasm(USER_IO_MANIFEST, &self.user_io_source)?;
         self.generate_certs()?;
@@ -330,14 +338,24 @@ impl ClusterHarness {
     }
 
     fn spawn_nodes(&mut self) -> Result<()> {
-        let ports = allocate_ports(2)?;
+        let ports = allocate_ports(4)?;
+        let addr_a = format!("127.0.0.1:{}", ports[0]);
+        let internal_addr_a = format!("127.0.0.1:{}", ports[1]);
+        let addr_b = format!("127.0.0.1:{}", ports[2]);
+        let internal_addr_b = format!("127.0.0.1:{}", ports[3]);
         let node_a = NodeStart {
             id: "node-a",
             port: ports[0],
+            internal_addr: internal_addr_a,
+            bootstrap_leader: true,
+            peers: vec![format!("node-b={addr_b}@{DEFAULT_SERVER_NAME}")],
         };
         let node_b = NodeStart {
             id: "node-b",
-            port: ports[1],
+            port: ports[2],
+            internal_addr: internal_addr_b,
+            bootstrap_leader: false,
+            peers: vec![format!("node-a={addr_a}@{DEFAULT_SERVER_NAME}")],
         };
 
         self.nodes.push(self.spawn_node(node_a)?);
@@ -348,12 +366,23 @@ impl ClusterHarness {
     fn spawn_node(&self, start: NodeStart<'_>) -> Result<NodeProcess> {
         let work_dir = self.base_dir.join(start.id);
         let modules_dir = work_dir.join("modules");
+        let system_modules_dir = modules_dir.join("system");
         let logs_dir = self.base_dir.join("logs");
         fs::create_dir_all(&modules_dir)
             .with_context(|| format!("create module dir {}", modules_dir.display()))?;
+        fs::create_dir_all(&system_modules_dir)
+            .with_context(|| format!("create module dir {}", system_modules_dir.display()))?;
         fs::create_dir_all(&logs_dir)
             .with_context(|| format!("create logs dir {}", logs_dir.display()))?;
 
+        let staged_control_plane = system_modules_dir.join(STAGED_CONTROL_PLANE_ARTIFACT);
+        fs::copy(&self.control_plane_source, &staged_control_plane).with_context(|| {
+            format!(
+                "copy module {} -> {}",
+                self.control_plane_source.display(),
+                staged_control_plane.display()
+            )
+        })?;
         let staged_user_echo = modules_dir.join("rpc_echo_service.wasm");
         fs::copy(&self.user_echo_source, &staged_user_echo).with_context(|| {
             format!(
@@ -393,6 +422,8 @@ impl ClusterHarness {
             .arg(start.id)
             .arg("--cp-public-addr")
             .arg(&addr)
+            .arg("--cp-internal-addr")
+            .arg(&start.internal_addr)
             .arg("--cp-state-dir")
             .arg("control-plane")
             .arg("--quic-ca")
@@ -412,6 +443,12 @@ impl ClusterHarness {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .current_dir(&self.root);
+        if start.bootstrap_leader {
+            cmd.arg("--cp-bootstrap-leader");
+        }
+        for peer in &start.peers {
+            cmd.arg("--cp-peer").arg(peer);
+        }
 
         let child = cmd
             .spawn()
@@ -456,6 +493,9 @@ impl Drop for ClusterHarness {
 struct NodeStart<'a> {
     id: &'a str,
     port: u16,
+    internal_addr: String,
+    bootstrap_leader: bool,
+    peers: Vec<String>,
 }
 
 fn repo_root() -> Result<PathBuf> {

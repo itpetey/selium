@@ -64,6 +64,12 @@ impl<Output> FutureSharedState<Output> {
         inner.result.take()
     }
 
+    /// Inspect the completion result without consuming it.
+    pub fn with_result<R>(self: &Arc<Self>, f: impl FnOnce(Option<&Output>) -> R) -> R {
+        let inner = self.inner.lock();
+        f(inner.result.as_ref())
+    }
+
     /// Mark the future as dropped by the guest; subsequent completions are ignored.
     pub fn abandon(self: &Arc<Self>) {
         let mut inner = self.inner.lock();
@@ -105,6 +111,23 @@ mod tests {
         state.resolve(Ok(Vec::new()));
 
         assert!(flag.load(Ordering::SeqCst));
+        assert!(state.take_result().is_some());
+    }
+
+    #[test]
+    fn with_result_inspects_without_consuming() {
+        let state = FutureSharedState::<GuestResult<Vec<u8>>>::new();
+        state.resolve(Ok(vec![1, 2, 3]));
+
+        let len = state.with_result(|result| {
+            result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(Vec::len)
+                .unwrap_or_default()
+        });
+
+        assert_eq!(len, 3);
         assert!(state.take_result().is_some());
     }
 }

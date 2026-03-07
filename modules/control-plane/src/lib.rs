@@ -809,6 +809,7 @@ async fn execute_daemon_actions(
                     &authority,
                     Method::StartInstance,
                     &StartRequest {
+                        node_id: node.to_string(),
                         instance_id: instance_id.clone(),
                         module_spec,
                     },
@@ -822,6 +823,7 @@ async fn execute_daemon_actions(
                     &authority,
                     Method::StopInstance,
                     &StopRequest {
+                        node_id: node.to_string(),
                         instance_id: instance_id.clone(),
                     },
                 )

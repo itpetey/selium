@@ -147,6 +147,7 @@ pub struct AppendEntriesApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct StartRequest {
+    pub node_id: String,
     pub instance_id: String,
     pub module_spec: String,
 }
@@ -163,7 +164,14 @@ pub struct StartResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct StopRequest {
+    pub node_id: String,
     pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ListRequest {
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]

@@ -23,8 +23,13 @@ use selium_control_plane_protocol::{
     write_framed,
 };
 use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 
 use crate::config::DaemonConnectionArgs;
+
+const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct DaemonQuicClient {
     endpoint: Endpoint,
@@ -88,16 +93,24 @@ impl DaemonQuicClient {
             + rkyv::bytecheck::CheckBytes<HighValidator<'a, rkyv::rancor::Error>>,
     {
         let connection = self.connection().await?;
-        let (mut send, mut recv) = connection.open_bi().await.context("open QUIC stream")?;
+        let request_timeout = request_timeout(method);
+        let (mut send, mut recv) = timeout(request_timeout, connection.open_bi())
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("open QUIC stream")??;
         let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let frame = encode_request(method, request_id, payload).context("encode request")?;
 
-        write_framed(&mut send, &frame)
+        timeout(request_timeout, write_framed(&mut send, &frame))
             .await
-            .context("write request")?;
+            .map_err(|_| anyhow!("timed out"))
+            .context("write request")??;
         let _ = send.finish();
 
-        let frame = read_framed(&mut recv).await.context("read response")?;
+        let frame = timeout(request_timeout, read_framed(&mut recv))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("read response")??;
         let envelope = decode_envelope(&frame).context("decode response envelope")?;
         if envelope.method != method || envelope.request_id != request_id {
             return Err(anyhow!("daemon response mismatch"));
@@ -132,10 +145,20 @@ impl DaemonQuicClient {
             .endpoint
             .connect(self.addr, &self.server_name)
             .context("connect daemon")?;
-        let connection = connecting.await.context("await daemon connect")?;
+        let connection = timeout(DAEMON_CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("await daemon connect")??;
         let mut guard = self.connection.lock().await;
         *guard = Some(connection.clone());
         Ok(connection)
+    }
+}
+
+fn request_timeout(method: Method) -> Duration {
+    match method {
+        Method::StartInstance => DAEMON_START_TIMEOUT,
+        _ => DAEMON_REQUEST_TIMEOUT,
     }
 }
 

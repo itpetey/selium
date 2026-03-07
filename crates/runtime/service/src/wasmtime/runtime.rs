@@ -274,13 +274,15 @@ impl WasmtimeRuntime {
             .map_err(|err| Error::Kernel(KernelError::Driver(err)))?;
         let signature_clone = signature.clone();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let entrypoint_name = name.to_string();
         let handle = tokio::spawn(async move {
             // Wait for registration before invoking entrypoint. This prevents races between
             // guests registering resources and the process_id being set on the registry.
             if start_rx.await.is_err() {
                 return Err(wasmtime::Error::msg("process start cancelled"));
             }
-            invoke_entrypoint(
+            debug!(process_id, entrypoint = %entrypoint_name, "invoking guest entrypoint");
+            let result = invoke_entrypoint(
                 func,
                 store,
                 memory,
@@ -288,7 +290,21 @@ impl WasmtimeRuntime {
                 result_template,
                 signature_clone,
             )
-            .await
+            .await;
+            match &result {
+                Ok(values) => debug!(
+                    process_id,
+                    entrypoint = %entrypoint_name,
+                    result_count = values.len(),
+                    "guest entrypoint completed"
+                ),
+                Err(err) => warn!(
+                    process_id,
+                    entrypoint = %entrypoint_name,
+                    "guest entrypoint failed: {err:#}"
+                ),
+            }
+            result
         });
 
         registry
@@ -495,14 +511,27 @@ impl StubOperation {
         debug!(%module, ?capability, "polling stub capability binding");
 
         let state_id = usize::try_from(state_id).map_err(KernelError::IntConvert)?;
-        let result = match caller.data_mut().remove_future(state_id) {
-            Some(state) => state
-                .take_result()
-                .unwrap_or(Err(GuestError::PermissionDenied)),
-            None => Err(GuestError::NotFound),
+        let Some(state) = caller.data().future_state(state_id) else {
+            return Ok(write_poll_result(
+                &mut caller,
+                result_ptr,
+                result_capacity,
+                &Err(GuestError::NotFound),
+            )?
+            .encoded);
         };
 
-        write_poll_result(&mut caller, result_ptr, result_capacity, result)
+        let write = state.with_result(|result| match result {
+            Some(result) => write_poll_result(&mut caller, result_ptr, result_capacity, result),
+            None => Ok(super::guest_data::WritePollResult {
+                encoded: selium_abi::DRIVER_RESULT_PENDING,
+                complete: false,
+            }),
+        })?;
+        if write.complete {
+            let _ = caller.data_mut().remove_future(state_id);
+        }
+        Ok(write.encoded)
     }
 
     fn drop_stub_future(
@@ -523,7 +552,8 @@ impl StubOperation {
             Err(GuestError::NotFound)
         };
 
-        write_poll_result(&mut caller, result_ptr, result_capacity, result)
+        write_poll_result(&mut caller, result_ptr, result_capacity, &result)
+            .map(|write| write.encoded)
     }
 }
 

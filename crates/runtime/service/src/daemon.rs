@@ -17,9 +17,10 @@ use rustls::{RootCertStore, pki_types::PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
 use selium_abi::{Capability, InteractionKind, NetworkProtocol, encode_rkyv};
 use selium_control_plane_protocol::{
-    Empty, ListResponse, Method, StartRequest, StartResponse, StatusApiResponse, StopRequest,
-    StopResponse, decode_envelope, decode_error, decode_payload, encode_error_response,
-    encode_request, encode_response, is_error, is_request, read_framed, write_framed,
+    Empty, ListRequest, ListResponse, Method, StartRequest, StartResponse, StatusApiResponse,
+    StopRequest, StopResponse, decode_envelope, decode_error, decode_payload,
+    encode_error_response, encode_request, encode_response, is_error, is_request, read_framed,
+    write_framed,
 };
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{Kernel, registry::Registry, services::session_service::Session};
@@ -32,13 +33,18 @@ use selium_runtime_storage::{StorageBlobStoreDefinition, StorageLogDefinition, S
 use tokio::{
     signal,
     sync::{Mutex, Notify},
-    time::{Duration, sleep},
+    task::LocalSet,
+    time::{Duration, sleep, timeout},
 };
 use tracing::info;
 
 use crate::{config::DaemonArgs, modules};
 
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const QUIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct DaemonState {
+    node_id: String,
     kernel: Kernel,
     registry: Arc<Registry>,
     work_dir: PathBuf,
@@ -87,12 +93,19 @@ impl LocalControlPlaneClient {
 
     async fn request_raw(&self, frame: &[u8]) -> Result<Vec<u8>> {
         let connection = self.connection().await?;
-        let (mut send, mut recv) = connection.open_bi().await.context("open proxy stream")?;
-        write_framed(&mut send, frame)
+        let (mut send, mut recv) = timeout(QUIC_REQUEST_TIMEOUT, connection.open_bi())
             .await
-            .context("write proxy request")?;
+            .map_err(|_| anyhow!("timed out"))
+            .context("open proxy stream")??;
+        timeout(QUIC_REQUEST_TIMEOUT, write_framed(&mut send, frame))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("write proxy request")??;
         let _ = send.finish();
-        read_framed(&mut recv).await.context("read proxy response")
+        timeout(QUIC_REQUEST_TIMEOUT, read_framed(&mut recv))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("read proxy response")?
     }
 
     async fn wait_until_ready(&self) -> Result<()> {
@@ -150,9 +163,10 @@ impl LocalControlPlaneClient {
             .endpoint
             .connect(self.addr, &self.server_name)
             .context("connect guest control-plane")?;
-        let connection = connecting
+        let connection = timeout(QUIC_CONNECT_TIMEOUT, connecting)
             .await
-            .context("await guest control-plane connect")?;
+            .map_err(|_| anyhow!("timed out"))
+            .context("await guest control-plane connect")??;
         let mut guard = self.connection.lock().await;
         *guard = Some(connection.clone());
         Ok(connection)
@@ -248,6 +262,7 @@ pub(crate) async fn run_daemon(
             .await?;
 
     let state = Rc::new(DaemonState {
+        node_id: args.cp_node_id.clone(),
         kernel,
         registry,
         work_dir,
@@ -257,23 +272,32 @@ pub(crate) async fn run_daemon(
     });
 
     let endpoint = build_server_endpoint(&args.listen, &cert_path, &key_path, &ca_path)?;
+    let local = LocalSet::new();
+    let state_for_loop = Rc::clone(&state);
 
-    loop {
-        tokio::select! {
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else {
-                    break;
-                };
-                if let Err(err) = handle_incoming(Rc::clone(&state), incoming).await {
-                    tracing::warn!("daemon QUIC connection error: {err:#}");
+    local
+        .run_until(async move {
+            loop {
+                tokio::select! {
+                    incoming = endpoint.accept() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        let state = Rc::clone(&state_for_loop);
+                        tokio::task::spawn_local(async move {
+                            if let Err(err) = handle_incoming(state, incoming).await {
+                                tracing::warn!("daemon QUIC connection error: {err:#}");
+                            }
+                        });
+                    }
+                    _ = signal::ctrl_c() => {
+                        info!("daemon shutting down after Ctrl-C");
+                        break;
+                    }
                 }
             }
-            _ = signal::ctrl_c() => {
-                info!("daemon shutting down after Ctrl-C");
-                break;
-            }
-        }
-    }
+        })
+        .await;
 
     let to_stop = {
         let processes = state.processes.lock().await;
@@ -331,7 +355,17 @@ async fn bootstrap_control_plane(
         tls_paths.peer_cert_path,
         tls_paths.peer_key_path,
     )?);
+    info!(
+        internal_addr = %addresses.internal_addr,
+        process_id,
+        "waiting for control-plane guest readiness"
+    );
     client.wait_until_ready().await?;
+    info!(
+        internal_addr = %addresses.internal_addr,
+        process_id,
+        "control-plane guest reported ready"
+    );
     Ok((process_id, client))
 }
 
@@ -575,6 +609,15 @@ async fn handle_stream_request(
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
+            if payload.node_id != state.node_id {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    404,
+                    format!("node `{}` not served by this daemon", payload.node_id),
+                    false,
+                );
+            }
             if payload.instance_id.trim().is_empty() {
                 return encode_error_response(
                     envelope.method,
@@ -657,6 +700,15 @@ async fn handle_stream_request(
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
+            if payload.node_id != state.node_id {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    404,
+                    format!("node `{}` not served by this daemon", payload.node_id),
+                    false,
+                );
+            }
 
             let process_id = state.processes.lock().await.remove(&payload.instance_id);
             let Some(process_id) = process_id else {
@@ -688,6 +740,19 @@ async fn handle_stream_request(
             )
         }
         Method::ListInstances => {
+            let payload: ListRequest = match decode_payload(&envelope) {
+                Ok(payload) => payload,
+                Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
+            };
+            if payload.node_id != state.node_id {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    404,
+                    format!("node `{}` not served by this daemon", payload.node_id),
+                    false,
+                );
+            }
             let processes = state.processes.lock().await;
             let entries = processes
                 .iter()

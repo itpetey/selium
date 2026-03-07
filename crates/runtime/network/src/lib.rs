@@ -1597,14 +1597,18 @@ async fn connect_quic(
     profile: &NetworkEgressProfile,
     authority: &str,
 ) -> Result<QuicSession, NetworkError> {
+    const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
     let bind = "127.0.0.1:0".parse::<SocketAddr>().map_err(network_other)?;
     let mut endpoint = Endpoint::client(bind).map_err(network_other)?;
     endpoint.set_default_client_config(build_quic_client_config(profile).map_err(network_other)?);
     let addr = parse_authority_addr(authority).map_err(network_other)?;
-    let connection = endpoint
+    let connecting = endpoint
         .connect(addr, &derive_server_name(authority))
-        .map_err(network_other)?
+        .map_err(network_other)?;
+    let connection = timeout(QUIC_CONNECT_TIMEOUT, connecting)
         .await
+        .map_err(|_| NetworkError::Timeout)?
         .map_err(network_other)?;
     Ok(QuicSession {
         connection,
