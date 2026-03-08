@@ -12,5 +12,9 @@ categories.workspace = true
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+prettyplease = "0.2"
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
 rkyv = { workspace = true, features = ["std", "bytecheck"] }
+syn = { workspace = true, features = ["full", "parsing"] }
 thiserror = { workspace = true, features = ["std"] }

@@ -1597,7 +1597,11 @@ name = "selium-control-plane-api"
 version = "0.1.0-alpha.0"
 dependencies = [
  "anyhow",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
  "rkyv",
+ "syn",
  "thiserror 2.0.18",
 ]
 
