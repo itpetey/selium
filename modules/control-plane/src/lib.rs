@@ -134,26 +134,6 @@ struct ControlPlaneRuntimeState {
 
 type SharedState = Rc<RefCell<ControlPlaneRuntimeState>>;
 
-pub fn bootstrap_report() -> BootstrapReport {
-    BootstrapReport {
-        module_id: MODULE_ID,
-        entrypoint: ENTRYPOINT,
-        managed_capabilities: &[
-            "time.read",
-            "network.lifecycle",
-            "network.connect",
-            "network.accept",
-            "network.stream.read",
-            "network.stream.write",
-            "storage.lifecycle",
-            "storage.log.read",
-            "storage.log.write",
-            "storage.blob.read",
-            "storage.blob.write",
-        ],
-    }
-}
-
 pub fn reconcile(
     node_name: &str,
     desired: &SchedulePlan,
@@ -216,7 +196,6 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
 
 #[selium_guest::entrypoint]
 pub async fn start(config: ControlPlaneModuleConfig) -> Result<()> {
-    let _report = bootstrap_report();
     let state = Rc::new(RefCell::new(recover_state(config).await?));
     let listener = network::listen(INTERNAL_BINDING_NAME)
         .await
@@ -1101,14 +1080,6 @@ fn anyhow_from_runtime(err: RuntimeError) -> anyhow::Error {
 mod tests {
     use super::*;
     use selium_control_plane_api::DeploymentSpec;
-
-    #[test]
-    fn report_contains_expected_entrypoint() {
-        let report = bootstrap_report();
-        assert_eq!(report.module_id, MODULE_ID);
-        assert_eq!(report.entrypoint, ENTRYPOINT);
-        assert!(!report.managed_capabilities.is_empty());
-    }
 
     #[test]
     fn reconcile_generates_start_and_stop_actions() {
