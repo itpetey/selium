@@ -1187,7 +1187,9 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                 let Some(frame) = waited.frame else {
                     continue;
                 };
-                let payload = read_managed_event_frame(&state, frame.shm_shared_id).await?;
+                let payload =
+                    read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                        .await?;
                 let delivered = match spec.mode {
                     EventRouteMode::Local => {
                         deliver_event_frame(
@@ -1198,16 +1200,28 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                         )
                         .await?
                     }
-                    EventRouteMode::Remote => {
-                        deliver_event_frame_remote(
-                            &state,
-                            &spec.target_node,
-                            &spec.target_instance_id,
-                            &spec.target_endpoint.name,
-                            &payload,
-                        )
-                        .await?
-                    }
+                    EventRouteMode::Remote => match deliver_event_frame_remote(
+                        &state,
+                        &spec.target_node,
+                        &spec.target_instance_id,
+                        &spec.target_endpoint.name,
+                        &payload,
+                    )
+                    .await
+                    {
+                        Ok(delivered) => delivered,
+                        Err(err) => {
+                            tracing::warn!(
+                                source = %spec.source_endpoint.key(),
+                                target = %spec.target_endpoint.key(),
+                                target_node = %spec.target_node,
+                                error = %err,
+                                "remote managed event delivery attempt failed; retrying"
+                            );
+                            sleep(MANAGED_EVENT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    },
                 };
                 if delivered {
                     if spec.mode == EventRouteMode::Remote {
@@ -1235,7 +1249,12 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
     }
 }
 
-async fn read_managed_event_frame(state: &DaemonState, shm_shared_id: u64) -> Result<Vec<u8>> {
+async fn read_managed_event_frame(
+    state: &DaemonState,
+    shm_shared_id: u64,
+    offset: u32,
+    len: u32,
+) -> Result<Vec<u8>> {
     let shm_id = state
         .registry
         .resolve_shared(shm_shared_id)
@@ -1251,7 +1270,7 @@ async fn read_managed_event_frame(state: &DaemonState, shm_shared_id: u64) -> Re
         .kernel
         .get::<SharedMemoryDriver>()
         .ok_or_else(|| anyhow!("shared memory driver unavailable"))?;
-    Ok(driver.read(region, 0, region.len)?)
+    Ok(driver.read(region, offset, len)?)
 }
 
 async fn deliver_event_frame(
@@ -1408,9 +1427,13 @@ fn endpoint_key(instance_id: &str, endpoint_name: &str) -> (String, String) {
 async fn query_control_plane_state(
     control_plane: &LocalControlPlaneClient,
 ) -> Result<ControlPlaneState> {
-    let response = control_plane.query(Query::ControlPlaneState, false).await?;
+    let response = control_plane.query(Query::ControlPlaneState, true).await?;
     let Some(DataValue::Bytes(bytes)) = response.result else {
-        bail!("control-plane state query did not return bytes")
+        let detail = response
+            .error
+            .or(response.leader_hint)
+            .unwrap_or_else(|| "no result payload".to_string());
+        bail!("control-plane state query did not return bytes: {detail}")
     };
     decode_rkyv(&bytes).context("decode control-plane state")
 }
@@ -1617,9 +1640,10 @@ mod tests {
                     .await
                     .expect("wait target frame");
                 let frame = waited.frame.expect("frame available");
-                let payload = read_managed_event_frame(&state, frame.shm_shared_id)
-                    .await
-                    .expect("read target frame");
+                let payload =
+                    read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                        .await
+                        .expect("read target frame");
                 assert_eq!(payload, b"frame-local");
             })
             .await;
@@ -1666,9 +1690,100 @@ mod tests {
             .await
             .expect("wait target frame");
         let frame = waited.frame.expect("frame available");
-        let payload = read_managed_event_frame(&state, frame.shm_shared_id)
+        let payload =
+            read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                .await
+                .expect("read target frame");
+        assert_eq!(payload, b"frame-remote");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_managed_event_frame_respects_committed_length() {
+        let state = sample_state("remote-node");
+        let queue = QueueService
+            .create(QueueCreate {
+                capacity_frames: 8,
+                max_frame_bytes: 512,
+                delivery: QueueDelivery::Lossless,
+                overflow: QueueOverflow::Block,
+            })
+            .expect("create queue");
+        let writer = QueueService
+            .attach(
+                &queue,
+                QueueAttach {
+                    shared_id: 0,
+                    role: QueueRole::Writer { writer_id: 1 },
+                },
+            )
+            .expect("attach writer");
+        let reader = QueueService
+            .attach(
+                &queue,
+                QueueAttach {
+                    shared_id: 0,
+                    role: QueueRole::Reader,
+                },
+            )
+            .expect("attach reader");
+        let driver = state
+            .kernel
+            .get::<SharedMemoryDriver>()
+            .expect("shared memory driver");
+        let region = driver
+            .alloc(ShmAlloc {
+                size: 512,
+                align: 8,
+            })
+            .expect("allocate shared memory");
+        driver
+            .write(region, 0, b"frame-remote")
+            .expect("write payload");
+        driver
+            .write(region, 12, &[0; 4])
+            .expect("write trailing padding");
+        let shm = state
+            .registry
+            .add(region, None, ResourceType::SharedMemory)
+            .expect("register shared memory");
+        let shm_shared_id = state
+            .registry
+            .share_handle(shm.into_id())
+            .expect("share shared memory");
+        let reserved = QueueService
+            .reserve(
+                &writer,
+                QueueReserve {
+                    endpoint_id: 0,
+                    len: 12,
+                    timeout_ms: 1_000,
+                },
+            )
             .await
-            .expect("read target frame");
+            .expect("reserve queue slot");
+        let reservation = reserved.reservation.expect("queue reservation");
+        QueueService
+            .commit(
+                &writer,
+                QueueCommit {
+                    endpoint_id: 0,
+                    reservation_id: reservation.reservation_id,
+                    shm_shared_id,
+                    offset: 0,
+                    len: 12,
+                },
+            )
+            .expect("commit queue slot");
+
+        let waited = QueueService
+            .wait(&reader, 2_000)
+            .await
+            .expect("wait for frame");
+        let frame = waited.frame.expect("frame available");
+        let payload =
+            read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                .await
+                .expect("read committed payload");
         assert_eq!(payload, b"frame-remote");
     }
 

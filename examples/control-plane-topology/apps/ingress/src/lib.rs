@@ -12,9 +12,7 @@ mod bindings;
 
 use bindings::Frame;
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
-const SEND_INTERVAL: Duration = Duration::from_millis(250);
 
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
@@ -23,22 +21,25 @@ pub async fn start(bindings: DataValue) -> Result<()> {
         .await
         .context("attach ingress managed-event writer")?;
 
-    let mut seq = 1_u32;
+    let frame = Frame {
+        source: "ingress".to_string(),
+        seq: 1,
+    };
+    writer
+        .send(
+            &encode_rkyv(&frame).context("encode ingress frame")?,
+            SEND_TIMEOUT_MS,
+        )
+        .await
+        .context("send ingress frame 1")?;
+
+    idle_forever().await
+}
+
+async fn idle_forever() -> Result<()> {
     loop {
-        let frame = Frame {
-            source: "ingress".to_string(),
-            seq,
-        };
-        writer
-            .send(
-                &encode_rkyv(&frame).context("encode ingress frame")?,
-                SEND_TIMEOUT_MS,
-            )
+        time::sleep(Duration::from_secs(60))
             .await
-            .with_context(|| format!("send ingress frame {seq}"))?;
-        seq = seq.saturating_add(1);
-        time::sleep(SEND_INTERVAL)
-            .await
-            .context("sleep between ingress frames")?;
+            .context("sleep while idle")?;
     }
 }

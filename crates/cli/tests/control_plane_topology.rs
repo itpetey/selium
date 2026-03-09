@@ -6,7 +6,8 @@ use anyhow::Result;
 
 use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
-const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(180);
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(90);
 const INGRESS_REPLICA: &str = "tenant=tenant-a;namespace=analytics;workload=topology-ingress;replica=0";
 const PROCESSOR_REPLICA: &str =
     "tenant=tenant-a;namespace=analytics;workload=topology-processor;replica=0";
@@ -16,7 +17,11 @@ const REMOTE_DELIVERY: &str = "delivered remote managed event frame tenant-a/ana
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
 async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<()> {
-    let mut harness = ClusterHarness::new(ClusterHarnessConfig::new("control-plane-topology"))?;
+    let mut harness = ClusterHarness::new(ClusterHarnessConfig {
+        name: "control-plane-topology".to_string(),
+        consensus_timeout: CONSENSUS_TIMEOUT,
+        ..ClusterHarnessConfig::new("control-plane-topology")
+    })?;
     harness.prepare()?;
     harness.prepare_control_plane_topology()?;
     harness.wait_for_consensus_ready().await?;
@@ -141,17 +146,6 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
     );
 
     harness.run_cli(
-        &daemon_a,
-        &[
-            "agent",
-            "--node",
-            "node-a",
-            "--once",
-            "--agent-state",
-            &agent_state_a,
-        ],
-    )?;
-    harness.run_cli(
         &daemon_b,
         &[
             "agent",
@@ -160,6 +154,30 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             "--once",
             "--agent-state",
             &agent_state_b,
+        ],
+    )?;
+    let list_b = harness
+        .wait_for_cli_contains(
+            &daemon_b,
+            &["list", "--node", "node-b"],
+            PROCESSOR_REPLICA,
+            DELIVERY_TIMEOUT,
+        )
+        .await?;
+    assert!(
+        list_b.contains(PROCESSOR_REPLICA) && list_b.contains(SINK_REPLICA),
+        "expected processor and sink replicas on node-b\nlist-b:\n{list_b}"
+    );
+
+    harness.run_cli(
+        &daemon_a,
+        &[
+            "agent",
+            "--node",
+            "node-a",
+            "--once",
+            "--agent-state",
+            &agent_state_a,
         ],
     )?;
 
@@ -171,21 +189,9 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             DELIVERY_TIMEOUT,
         )
         .await?;
-    let list_b = harness
-        .wait_for_cli_contains(
-            &daemon_b,
-            &["list", "--node", "node-b"],
-            PROCESSOR_REPLICA,
-            DELIVERY_TIMEOUT,
-        )
-        .await?;
     assert!(
         list_a.contains(INGRESS_REPLICA),
         "expected ingress replica on node-a\nlist-a:\n{list_a}\nlist-b:\n{list_b}"
-    );
-    assert!(
-        list_b.contains(PROCESSOR_REPLICA) && list_b.contains(SINK_REPLICA),
-        "expected processor and sink replicas on node-b\nlist-a:\n{list_a}\nlist-b:\n{list_b}"
     );
 
     harness

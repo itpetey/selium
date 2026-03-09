@@ -462,8 +462,9 @@ impl ClusterHarness {
     fn stage_module_for_all_nodes(&self, source: &Path, staged_name: &str) -> Result<()> {
         for node in &self.nodes {
             let target = node.work_dir.join("modules").join(staged_name);
-            fs::copy(source, &target)
-                .with_context(|| format!("copy module {} -> {}", source.display(), target.display()))?;
+            fs::copy(source, &target).with_context(|| {
+                format!("copy module {} -> {}", source.display(), target.display())
+            })?;
         }
         Ok(())
     }
