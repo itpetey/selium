@@ -8,11 +8,14 @@ use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 
 const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(180);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(90);
-const INGRESS_REPLICA: &str = "tenant=tenant-a;namespace=analytics;workload=topology-ingress;replica=0";
+const INGRESS_REPLICA: &str =
+    "tenant=tenant-a;namespace=analytics;workload=topology-ingress;replica=0";
 const PROCESSOR_REPLICA: &str =
     "tenant=tenant-a;namespace=analytics;workload=topology-processor;replica=0";
 const SINK_REPLICA: &str = "tenant=tenant-a;namespace=analytics;workload=topology-sink;replica=0";
 const REMOTE_DELIVERY: &str = "delivered remote managed event frame tenant-a/analytics/topology-ingress#ingest.frames -> tenant-a/analytics/topology-processor#ingest.frames";
+const PROCESSOR_TO_SINK_EDGE: &str = "tenant-a/analytics/topology-processor#process.enriched";
+const SINK_EDGE: &str = "tenant-a/analytics/topology-sink#process.enriched";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local runtime binaries plus wasm32 build target"]
@@ -36,7 +39,12 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
 
     let publish_out = harness.run_cli(
         &daemon_a,
-        &["idl", "publish", "--input", harness.topology_contract_path()],
+        &[
+            "idl",
+            "publish",
+            "--input",
+            harness.topology_contract_path(),
+        ],
     )?;
     assert!(
         publish_out.contains("published IDL"),
@@ -136,7 +144,12 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
     )?;
 
     let (_, observe) = harness
-        .wait_for_any_cli_contains(&control_daemons, &["observe"], "analytics-demo", DELIVERY_TIMEOUT)
+        .wait_for_any_cli_contains(
+            &control_daemons,
+            &["observe"],
+            "analytics-demo",
+            DELIVERY_TIMEOUT,
+        )
         .await?;
     assert!(
         observe.contains("topology-ingress")
@@ -144,6 +157,17 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             && observe.contains("topology-sink"),
         "unexpected observe output:\n{observe}"
     );
+
+    harness
+        .wait_for_control_plane_state(&daemon_b, true, DELIVERY_TIMEOUT, |state| {
+            state.pipelines.values().any(|pipeline| {
+                pipeline.edges.iter().any(|edge| {
+                    edge.from.endpoint.key() == PROCESSOR_TO_SINK_EDGE
+                        && edge.to.endpoint.key() == SINK_EDGE
+                })
+            })
+        })
+        .await?;
 
     harness.run_cli(
         &daemon_b,

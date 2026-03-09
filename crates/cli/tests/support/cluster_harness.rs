@@ -6,12 +6,24 @@ use std::{
     net::UdpSocket,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::time::sleep;
+use quinn::Endpoint;
+use quinn::crypto::rustls::QuicClientConfig;
+use rustls::{RootCertStore, pki_types::PrivateKeyDer};
+use rustls_pemfile::{certs, private_key};
+use selium_abi::{DataValue, decode_rkyv};
+use selium_control_plane_api::ControlPlaneState;
+use selium_control_plane_protocol::{
+    Method, QueryApiRequest, QueryApiResponse, decode_envelope, decode_error, decode_payload,
+    encode_request, is_error, read_framed, write_framed,
+};
+use selium_control_plane_runtime::Query;
+use tokio::time::{sleep, timeout};
 
 const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
 const USER_ECHO_ARTIFACT: &str = "rpc_echo_service.wasm";
@@ -30,6 +42,7 @@ const STAGED_CONTROL_PLANE_ARTIFACT: &str = "control-plane.wasm";
 const DEFAULT_SERVER_NAME: &str = "localhost";
 const CLI_CONNECT_TIMEOUT_RETRIES: usize = 5;
 const CLI_CONNECT_TIMEOUT_BACKOFF: Duration = Duration::from_millis(400);
+const DIRECT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct ClusterHarnessConfig {
@@ -223,6 +236,37 @@ impl ClusterHarness {
         bail!("timed out waiting for log text `{needle}` on {node_id}. last logs:\n{last_logs}")
     }
 
+    pub async fn wait_for_control_plane_state<F>(
+        &mut self,
+        daemon_addr: &str,
+        allow_stale: bool,
+        timeout_window: Duration,
+        predicate: F,
+    ) -> Result<ControlPlaneState>
+    where
+        F: Fn(&ControlPlaneState) -> bool,
+    {
+        let deadline = Instant::now() + timeout_window;
+        let mut last_state = None;
+        while Instant::now() < deadline {
+            self.ensure_nodes_alive()?;
+            let state = self
+                .query_control_plane_state(daemon_addr, allow_stale)
+                .await?;
+            if predicate(&state) {
+                return Ok(state);
+            }
+            last_state = Some(format!("{state:#?}"));
+            sleep(self.config.poll_interval).await;
+        }
+
+        bail!(
+            "timed out waiting for control-plane state on {} to satisfy predicate. last state:\n{}",
+            daemon_addr,
+            last_state.unwrap_or_else(|| "<none>".to_string())
+        )
+    }
+
     pub async fn wait_for_consensus_ready(&mut self) -> Result<()> {
         if self.nodes.len() != 2 {
             bail!("expected exactly two nodes, found {}", self.nodes.len());
@@ -353,6 +397,91 @@ impl ClusterHarness {
             needle,
             last_output
         )
+    }
+
+    async fn query_control_plane_state(
+        &self,
+        daemon_addr: &str,
+        allow_stale: bool,
+    ) -> Result<ControlPlaneState> {
+        let response = self
+            .query_control_plane_value(daemon_addr, Query::ControlPlaneState, allow_stale)
+            .await?;
+        let DataValue::Bytes(bytes) = response else {
+            bail!("control-plane state query returned non-bytes payload: {response:?}");
+        };
+        decode_rkyv(&bytes).context("decode control-plane state")
+    }
+
+    async fn query_control_plane_value(
+        &self,
+        daemon_addr: &str,
+        query: Query,
+        allow_stale: bool,
+    ) -> Result<DataValue> {
+        let addr = daemon_addr.parse().context("parse daemon addr")?;
+        let endpoint = self.build_query_endpoint()?;
+        let connecting = endpoint
+            .connect(addr, DEFAULT_SERVER_NAME)
+            .context("connect daemon")?;
+        let connection = timeout(DIRECT_QUERY_TIMEOUT, connecting)
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("await daemon connect")??;
+        let (mut send, mut recv) = timeout(DIRECT_QUERY_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("open QUIC stream")??;
+        let frame = encode_request(
+            Method::ControlQuery,
+            1,
+            &QueryApiRequest { query, allow_stale },
+        )
+        .context("encode control query")?;
+        timeout(DIRECT_QUERY_TIMEOUT, write_framed(&mut send, &frame))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("write control query")??;
+        let _ = send.finish();
+        let frame = timeout(DIRECT_QUERY_TIMEOUT, read_framed(&mut recv))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("read control query response")??;
+        connection.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+
+        let envelope = decode_envelope(&frame).context("decode response envelope")?;
+        if is_error(&envelope) {
+            let error = decode_error(&envelope).context("decode daemon error")?;
+            bail!("daemon error {}: {}", error.code, error.message);
+        }
+        let response: QueryApiResponse =
+            decode_payload(&envelope).context("decode query payload")?;
+        let Some(result) = response.result else {
+            bail!(
+                "query returned no result: {}",
+                response
+                    .error
+                    .or(response.leader_hint)
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        };
+        Ok(result)
+    }
+
+    fn build_query_endpoint(&self) -> Result<Endpoint> {
+        let bind = "127.0.0.1:0".parse().expect("client bind");
+        let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
+        let roots = load_root_store(&self.cert_dir.join("ca.crt"))?;
+        let cert_chain = load_cert_chain(&self.cert_dir.join("client.crt"))?;
+        let key = load_private_key(&self.cert_dir.join("client.key"))?;
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cert_chain, key)
+            .context("build QUIC TLS client config")?;
+        let quic_crypto = QuicClientConfig::try_from(tls).context("build QUIC crypto config")?;
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
+        Ok(endpoint)
     }
 
     fn fetch_live_nodes(&self, daemon_addr: &str) -> Result<BTreeSet<String>> {
@@ -653,6 +782,40 @@ fn repo_root() -> Result<PathBuf> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("resolve repo root from {}", manifest_dir.display()))
+}
+
+fn load_root_store(path: &Path) -> Result<RootCertStore> {
+    let pem = fs::read(path).with_context(|| format!("read CA cert {}", path.display()))?;
+    let mut reader = std::io::Cursor::new(pem);
+    let mut store = RootCertStore::empty();
+    for cert in certs(&mut reader) {
+        let cert = cert.context("parse CA cert")?;
+        store
+            .add(cert)
+            .map_err(|err| anyhow!("add CA cert to root store: {err}"))?;
+    }
+    Ok(store)
+}
+
+fn load_cert_chain(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let pem = fs::read(path).with_context(|| format!("read cert {}", path.display()))?;
+    let mut reader = std::io::Cursor::new(pem);
+    let mut chain = Vec::new();
+    for cert in certs(&mut reader) {
+        chain.push(cert.context("parse cert")?);
+    }
+    if chain.is_empty() {
+        bail!("no certs found in {}", path.display());
+    }
+    Ok(chain)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let pem = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
+    let mut reader = std::io::Cursor::new(pem);
+    private_key(&mut reader)
+        .context("parse private key")?
+        .ok_or_else(|| anyhow!("no private key in {}", path.display()))
 }
 
 fn allocate_ports(count: usize) -> Result<Vec<u16>> {
