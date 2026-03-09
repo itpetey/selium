@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use selium_abi::{
-    GuestResourceId, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueRole,
-    QueueStatusCode,
+    DataValue, GuestResourceId, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueRole,
+    QueueStatusCode, decode_rkyv,
 };
 use thiserror::Error;
 
@@ -36,6 +36,8 @@ pub enum IoError {
     PayloadTooLarge { actual: usize, max: u32 },
     #[error("queue operation `{0}` returned missing payload")]
     MissingPayload(&'static str),
+    #[error("invalid managed event bindings: {0}")]
+    InvalidManagedBindings(String),
 }
 
 pub struct ChannelWriter {
@@ -89,6 +91,23 @@ pub async fn attach_reader(channel: &ChannelDescriptor) -> Result<ChannelReader,
         endpoint_id: endpoint.resource_id,
         attached_shm: BTreeMap::new(),
     })
+}
+
+pub async fn managed_event_writer(
+    bindings: &[u8],
+    endpoint: &str,
+    writer_id: u32,
+) -> Result<ChannelWriter, IoError> {
+    let channel = managed_event_channel(bindings, "writers", endpoint)?;
+    attach_writer(&channel, writer_id).await
+}
+
+pub async fn managed_event_reader(
+    bindings: &[u8],
+    endpoint: &str,
+) -> Result<ChannelReader, IoError> {
+    let channel = managed_event_channel(bindings, "readers", endpoint)?;
+    attach_reader(&channel).await
 }
 
 impl ChannelWriter {
@@ -181,6 +200,36 @@ fn ensure_queue_ok(operation: &'static str, status: QueueStatusCode) -> Result<(
     } else {
         Err(IoError::QueueStatus { operation, status })
     }
+}
+
+fn managed_event_channel(
+    bindings: &[u8],
+    section: &str,
+    endpoint: &str,
+) -> Result<ChannelDescriptor, IoError> {
+    let value = decode_rkyv::<DataValue>(bindings)
+        .map_err(|err| IoError::InvalidManagedBindings(err.to_string()))?;
+    let binding = value
+        .get(section)
+        .and_then(|section| section.get(endpoint))
+        .ok_or_else(|| {
+            IoError::InvalidManagedBindings(format!("missing binding for `{endpoint}`"))
+        })?;
+
+    let queue_shared_id = binding
+        .get("queue_shared_id")
+        .and_then(DataValue::as_u64)
+        .ok_or_else(|| IoError::InvalidManagedBindings("missing queue_shared_id".to_string()))?;
+    let max_frame_bytes = binding
+        .get("max_frame_bytes")
+        .and_then(DataValue::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| IoError::InvalidManagedBindings("missing max_frame_bytes".to_string()))?;
+
+    Ok(ChannelDescriptor {
+        queue_shared_id,
+        max_frame_bytes,
+    })
 }
 
 #[cfg(test)]

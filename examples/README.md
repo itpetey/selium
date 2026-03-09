@@ -68,4 +68,4 @@ For the network examples, the generated bindings now include protocol-aware gues
 
 ## Current Boundary
 
-These examples are contract-first in the sense that they ship `.selium` packages and generated Rust bindings, and they show the `idl publish` flow. The runtime does not yet route messages across deployments from control-plane pipeline edges, so the messaging behavior in these examples still happens through guest-local channels inside a single deployed module.
+These examples are contract-first in the sense that they ship `.selium` packages and generated Rust bindings, and they show the `idl publish` flow. For control-plane-managed workloads, the user-facing discovery model is `tenant/namespace/workload` for workloads and `tenant/namespace/workload#endpoint` for contract-defined event endpoints. That naming is application-facing and transport-agnostic: the runtime may keep delivery on-node or bridge it across nodes, but guest code still binds by workload and endpoint identity rather than queue, channel, protocol, or replica details. Direct process listing plus `start`/`stop --replica-key` remain operational surfaces for administrators.

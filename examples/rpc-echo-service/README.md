@@ -43,7 +43,7 @@ cargo run -p selium -- \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start \
   --node "$SELIUM_NODE" \
-  --instance-id rpc-echo-demo \
+  --replica-key rpc-echo-demo \
   --module modules/rpc_echo_service.wasm
 
 cargo run -p selium -- \
@@ -58,7 +58,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id rpc-echo-demo
+  stop --node "$SELIUM_NODE" --replica-key rpc-echo-demo
 ```
 
 Successful startup means the module completed an RPC round-trip before idling. If the server fails to answer or the payload is corrupted, startup fails and the instance never settles into the idle loop.

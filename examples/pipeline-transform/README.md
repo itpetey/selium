@@ -43,7 +43,7 @@ cargo run -p selium -- \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start \
   --node "$SELIUM_NODE" \
-  --instance-id pipeline-transform-demo \
+  --replica-key pipeline-transform-demo \
   --module modules/pipeline_transform.wasm
 
 cargo run -p selium -- \
@@ -58,7 +58,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id pipeline-transform-demo
+  stop --node "$SELIUM_NODE" --replica-key pipeline-transform-demo
 ```
 
 The module only enters its idle loop after both downstream stages processed the full order set and the coordinator verified the final projections.

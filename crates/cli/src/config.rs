@@ -52,7 +52,11 @@ pub(crate) enum Command {
 #[derive(Debug, Args)]
 pub(crate) struct DeployArgs {
     #[arg(long)]
-    pub(crate) app: String,
+    pub(crate) tenant: String,
+    #[arg(long)]
+    pub(crate) namespace: String,
+    #[arg(long, alias = "app")]
+    pub(crate) workload: String,
     #[arg(long)]
     pub(crate) module: String,
     #[arg(long, default_value_t = 1)]
@@ -68,11 +72,15 @@ pub(crate) struct ConnectArgs {
     #[arg(long)]
     pub(crate) pipeline: String,
     #[arg(long)]
+    pub(crate) tenant: String,
+    #[arg(long)]
     pub(crate) namespace: String,
+    #[arg(long, alias = "from-app")]
+    pub(crate) from_workload: String,
+    #[arg(long, alias = "to-app")]
+    pub(crate) to_workload: String,
     #[arg(long)]
-    pub(crate) from_app: String,
-    #[arg(long)]
-    pub(crate) to_app: String,
+    pub(crate) endpoint: String,
     #[arg(long)]
     pub(crate) contract: String,
 }
@@ -80,7 +88,11 @@ pub(crate) struct ConnectArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ScaleArgs {
     #[arg(long)]
-    pub(crate) app: String,
+    pub(crate) tenant: String,
+    #[arg(long)]
+    pub(crate) namespace: String,
+    #[arg(long, alias = "app")]
+    pub(crate) workload: String,
     #[arg(long)]
     pub(crate) replicas: u32,
 }
@@ -96,7 +108,11 @@ pub(crate) struct ReplayArgs {
     #[arg(long, default_value_t = 50)]
     pub(crate) limit: usize,
     #[arg(long)]
-    pub(crate) app: Option<String>,
+    pub(crate) tenant: Option<String>,
+    #[arg(long)]
+    pub(crate) namespace: Option<String>,
+    #[arg(long, alias = "app")]
+    pub(crate) workload: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -111,8 +127,8 @@ pub(crate) struct NodesArgs {
 pub(crate) struct StartArgs {
     #[arg(long)]
     pub(crate) node: String,
-    #[arg(long)]
-    pub(crate) instance_id: String,
+    #[arg(long = "replica-key")]
+    pub(crate) replica_key: String,
     #[arg(long)]
     pub(crate) module_spec: Option<String>,
     #[arg(long)]
@@ -129,8 +145,8 @@ pub(crate) struct StartArgs {
 pub(crate) struct StopArgs {
     #[arg(long)]
     pub(crate) node: String,
-    #[arg(long)]
-    pub(crate) instance_id: String,
+    #[arg(long = "replica-key")]
+    pub(crate) replica_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -237,7 +253,12 @@ enum RawCommand {
 #[serde(rename_all = "kebab-case", default)]
 struct RawDeployArgs {
     #[arg(long)]
-    app: Option<String>,
+    tenant: Option<String>,
+    #[arg(long)]
+    namespace: Option<String>,
+    #[arg(long, alias = "app")]
+    #[serde(alias = "app")]
+    workload: Option<String>,
     #[arg(long)]
     module: Option<String>,
     #[arg(long)]
@@ -254,11 +275,17 @@ struct RawConnectArgs {
     #[arg(long)]
     pipeline: Option<String>,
     #[arg(long)]
+    tenant: Option<String>,
+    #[arg(long)]
     namespace: Option<String>,
+    #[arg(long, alias = "from-app")]
+    #[serde(alias = "from-app")]
+    from_workload: Option<String>,
+    #[arg(long, alias = "to-app")]
+    #[serde(alias = "to-app")]
+    to_workload: Option<String>,
     #[arg(long)]
-    from_app: Option<String>,
-    #[arg(long)]
-    to_app: Option<String>,
+    endpoint: Option<String>,
     #[arg(long)]
     contract: Option<String>,
 }
@@ -267,7 +294,12 @@ struct RawConnectArgs {
 #[serde(rename_all = "kebab-case", default)]
 struct RawScaleArgs {
     #[arg(long)]
-    app: Option<String>,
+    tenant: Option<String>,
+    #[arg(long)]
+    namespace: Option<String>,
+    #[arg(long, alias = "app")]
+    #[serde(alias = "app")]
+    workload: Option<String>,
     #[arg(long)]
     replicas: Option<u32>,
 }
@@ -285,7 +317,12 @@ struct RawReplayArgs {
     #[arg(long)]
     limit: Option<usize>,
     #[arg(long)]
-    app: Option<String>,
+    tenant: Option<String>,
+    #[arg(long)]
+    namespace: Option<String>,
+    #[arg(long, alias = "app")]
+    #[serde(alias = "app")]
+    workload: Option<String>,
 }
 
 #[derive(Debug, Args, Default, Deserialize)]
@@ -298,12 +335,12 @@ struct RawNodesArgs {
 }
 
 #[derive(Debug, Args, Default, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 struct RawStartArgs {
     #[arg(long)]
     node: Option<String>,
-    #[arg(long)]
-    instance_id: Option<String>,
+    #[arg(long = "replica-key")]
+    replica_key: Option<String>,
     #[arg(long)]
     module_spec: Option<String>,
     #[arg(long)]
@@ -317,12 +354,12 @@ struct RawStartArgs {
 }
 
 #[derive(Debug, Args, Default, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 struct RawStopArgs {
     #[arg(long)]
     node: Option<String>,
-    #[arg(long)]
-    instance_id: Option<String>,
+    #[arg(long = "replica-key")]
+    replica_key: Option<String>,
 }
 
 #[derive(Debug, Args, Default, Deserialize)]
@@ -416,15 +453,24 @@ impl From<IsolationArg> for IsolationProfile {
 }
 
 pub(crate) fn load_cli() -> Result<Cli> {
-    load_cli_from(std::env::args_os())
+    let matches = RawCli::command().get_matches_from(std::env::args_os());
+    resolve_cli_from_matches(matches)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn load_cli_from<I, T>(args: I) -> Result<Cli>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let matches = RawCli::command().get_matches_from(args);
+    let matches = RawCli::command()
+        .try_get_matches_from(args)
+        .map_err(|err| anyhow!("parse CLI arguments: {err}"))?;
+
+    resolve_cli_from_matches(matches)
+}
+
+fn resolve_cli_from_matches(matches: clap::ArgMatches) -> Result<Cli> {
     let mut raw =
         RawCli::from_arg_matches(&matches).map_err(|err| anyhow!("parse CLI arguments: {err}"))?;
 
@@ -488,7 +534,9 @@ impl RawCommand {
 impl RawDeployArgs {
     fn resolve(self) -> Result<DeployArgs> {
         Ok(DeployArgs {
-            app: required_arg("deploy.app", self.app)?,
+            tenant: required_arg("deploy.tenant", self.tenant)?,
+            namespace: required_arg("deploy.namespace", self.namespace)?,
+            workload: required_arg("deploy.workload", self.workload)?,
             module: required_arg("deploy.module", self.module)?,
             replicas: self.replicas.unwrap_or(1),
             isolation: self.isolation.unwrap_or(IsolationArg::Standard),
@@ -501,9 +549,11 @@ impl RawConnectArgs {
     fn resolve(self) -> Result<ConnectArgs> {
         Ok(ConnectArgs {
             pipeline: required_arg("connect.pipeline", self.pipeline)?,
+            tenant: required_arg("connect.tenant", self.tenant)?,
             namespace: required_arg("connect.namespace", self.namespace)?,
-            from_app: required_arg("connect.from-app", self.from_app)?,
-            to_app: required_arg("connect.to-app", self.to_app)?,
+            from_workload: required_arg("connect.from-workload", self.from_workload)?,
+            to_workload: required_arg("connect.to-workload", self.to_workload)?,
+            endpoint: required_arg("connect.endpoint", self.endpoint)?,
             contract: required_arg("connect.contract", self.contract)?,
         })
     }
@@ -512,7 +562,9 @@ impl RawConnectArgs {
 impl RawScaleArgs {
     fn resolve(self) -> Result<ScaleArgs> {
         Ok(ScaleArgs {
-            app: required_arg("scale.app", self.app)?,
+            tenant: required_arg("scale.tenant", self.tenant)?,
+            namespace: required_arg("scale.namespace", self.namespace)?,
+            workload: required_arg("scale.workload", self.workload)?,
             replicas: required_arg("scale.replicas", self.replicas)?,
         })
     }
@@ -528,7 +580,9 @@ impl RawReplayArgs {
     fn resolve(self) -> ReplayArgs {
         ReplayArgs {
             limit: self.limit.unwrap_or(50),
-            app: self.app,
+            tenant: self.tenant,
+            namespace: self.namespace,
+            workload: self.workload,
         }
     }
 }
@@ -546,7 +600,7 @@ impl RawStartArgs {
     fn resolve(self) -> Result<StartArgs> {
         Ok(StartArgs {
             node: required_arg("start.node", self.node)?,
-            instance_id: required_arg("start.instance-id", self.instance_id)?,
+            replica_key: required_arg("start.replica-key", self.replica_key)?,
             module_spec: self.module_spec,
             module: self.module,
             adaptor: self.adaptor.unwrap_or(AdaptorArg::Wasmtime),
@@ -560,7 +614,7 @@ impl RawStopArgs {
     fn resolve(self) -> Result<StopArgs> {
         Ok(StopArgs {
             node: required_arg("stop.node", self.node)?,
-            instance_id: required_arg("stop.instance-id", self.instance_id)?,
+            replica_key: required_arg("stop.replica-key", self.replica_key)?,
         })
     }
 }
@@ -725,7 +779,17 @@ fn merge_deploy_config(
     config: RawDeployArgs,
 ) {
     let value_source = |name| matches.and_then(|m| m.value_source(name));
-    merge_option(&mut args.app, value_source("app"), config.app);
+    merge_option(&mut args.tenant, value_source("tenant"), config.tenant);
+    merge_option(
+        &mut args.namespace,
+        value_source("namespace"),
+        config.namespace,
+    );
+    merge_option(
+        &mut args.workload,
+        value_source("workload"),
+        config.workload,
+    );
     merge_option(&mut args.module, value_source("module"), config.module);
     merge_option(
         &mut args.replicas,
@@ -755,17 +819,27 @@ fn merge_connect_config(
         value_source("pipeline"),
         config.pipeline,
     );
+    merge_option(&mut args.tenant, value_source("tenant"), config.tenant);
     merge_option(
         &mut args.namespace,
         value_source("namespace"),
         config.namespace,
     );
     merge_option(
-        &mut args.from_app,
-        value_source("from_app"),
-        config.from_app,
+        &mut args.from_workload,
+        value_source("from_workload"),
+        config.from_workload,
     );
-    merge_option(&mut args.to_app, value_source("to_app"), config.to_app);
+    merge_option(
+        &mut args.to_workload,
+        value_source("to_workload"),
+        config.to_workload,
+    );
+    merge_option(
+        &mut args.endpoint,
+        value_source("endpoint"),
+        config.endpoint,
+    );
     merge_option(
         &mut args.contract,
         value_source("contract"),
@@ -779,7 +853,17 @@ fn merge_scale_config(
     config: RawScaleArgs,
 ) {
     let value_source = |name| matches.and_then(|m| m.value_source(name));
-    merge_option(&mut args.app, value_source("app"), config.app);
+    merge_option(&mut args.tenant, value_source("tenant"), config.tenant);
+    merge_option(
+        &mut args.namespace,
+        value_source("namespace"),
+        config.namespace,
+    );
+    merge_option(
+        &mut args.workload,
+        value_source("workload"),
+        config.workload,
+    );
     merge_option(
         &mut args.replicas,
         value_source("replicas"),
@@ -806,7 +890,17 @@ fn merge_replay_config(
 ) {
     let value_source = |name| matches.and_then(|m| m.value_source(name));
     merge_option(&mut args.limit, value_source("limit"), config.limit);
-    merge_option(&mut args.app, value_source("app"), config.app);
+    merge_option(&mut args.tenant, value_source("tenant"), config.tenant);
+    merge_option(
+        &mut args.namespace,
+        value_source("namespace"),
+        config.namespace,
+    );
+    merge_option(
+        &mut args.workload,
+        value_source("workload"),
+        config.workload,
+    );
 }
 
 fn merge_nodes_config(
@@ -831,9 +925,9 @@ fn merge_start_config(
     let value_source = |name| matches.and_then(|m| m.value_source(name));
     merge_option(&mut args.node, value_source("node"), config.node);
     merge_option(
-        &mut args.instance_id,
-        value_source("instance_id"),
-        config.instance_id,
+        &mut args.replica_key,
+        value_source("replica_key"),
+        config.replica_key,
     );
     merge_option(
         &mut args.module_spec,
@@ -862,9 +956,9 @@ fn merge_stop_config(
     let value_source = |name| matches.and_then(|m| m.value_source(name));
     merge_option(&mut args.node, value_source("node"), config.node);
     merge_option(
-        &mut args.instance_id,
-        value_source("instance_id"),
-        config.instance_id,
+        &mut args.replica_key,
+        value_source("replica_key"),
+        config.replica_key,
     );
 }
 
@@ -993,11 +1087,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+
     fn write_test_config(contents: &str) -> PathBuf {
+        let id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "selium-cli-config-{}.toml",
+            "selium-cli-config-{}-{id}.toml",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1015,7 +1113,9 @@ mod tests {
 daemon-addr = "127.0.0.1:7999"
 
 [deploy]
-app = "from-config"
+tenant = "tenant-a"
+namespace = "payments"
+workload = "from-config"
 module = "module.wasm"
 replicas = 3
 "#,
@@ -1033,7 +1133,9 @@ replicas = 3
         let Command::Deploy(args) = cli.command else {
             panic!("expected deploy command");
         };
-        assert_eq!(args.app, "from-config");
+        assert_eq!(args.tenant, "tenant-a");
+        assert_eq!(args.namespace, "payments");
+        assert_eq!(args.workload, "from-config");
         assert_eq!(args.module, "module.wasm");
         assert_eq!(args.replicas, 3);
     }
@@ -1043,7 +1145,9 @@ replicas = 3
         let config = write_test_config(
             r#"
 [deploy]
-app = "from-config"
+tenant = "tenant-a"
+namespace = "payments"
+workload = "from-config"
 module = "module.wasm"
 replicas = 3
 "#,
@@ -1054,7 +1158,11 @@ replicas = 3
             "--config",
             config.to_str().expect("config path"),
             "deploy",
-            "--app",
+            "--tenant",
+            "tenant-b",
+            "--namespace",
+            "search",
+            "--workload",
             "from-cli",
         ])
         .expect("parse cli");
@@ -1062,8 +1170,49 @@ replicas = 3
         let Command::Deploy(args) = cli.command else {
             panic!("expected deploy command");
         };
-        assert_eq!(args.app, "from-cli");
+        assert_eq!(args.tenant, "tenant-b");
+        assert_eq!(args.namespace, "search");
+        assert_eq!(args.workload, "from-cli");
         assert_eq!(args.module, "module.wasm");
         assert_eq!(args.replicas, 3);
+    }
+
+    #[test]
+    fn start_command_rejects_legacy_instance_id_flag() {
+        let err = load_cli_from([
+            "selium",
+            "start",
+            "--node",
+            "node-a",
+            "--instance-id",
+            "legacy-id",
+            "--module",
+            "module.wasm",
+        ])
+        .expect_err("legacy flag should be rejected");
+
+        assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn start_config_rejects_legacy_instance_id_key() {
+        let config = write_test_config(
+            r#"
+[start]
+node = "node-a"
+instance-id = "legacy-id"
+module = "module.wasm"
+"#,
+        );
+
+        let err = load_cli_from([
+            "selium",
+            "--config",
+            config.to_str().expect("config path"),
+            "start",
+        ])
+        .expect_err("legacy config key should be rejected");
+
+        assert!(format!("{err:#}").contains("unknown field `instance-id`"));
     }
 }

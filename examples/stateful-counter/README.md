@@ -41,7 +41,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  start --node "$SELIUM_NODE" --instance-id stateful-counter-cold \
+  start --node "$SELIUM_NODE" --replica-key stateful-counter-cold \
   --module modules/stateful_counter.wasm
 
 cargo run -p selium -- \
@@ -49,7 +49,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  start --node "$SELIUM_NODE" --instance-id stateful-counter-resume \
+  start --node "$SELIUM_NODE" --replica-key stateful-counter-resume \
   --module-spec "path=modules/stateful_counter.wasm;entrypoint=resume;capabilities=$SELIUM_CAPS;params=u32,u32;args=u32:2,u32:15;adapter=wasmtime;profile=standard"
 
 cargo run -p selium -- \
@@ -57,14 +57,14 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id stateful-counter-cold
+  stop --node "$SELIUM_NODE" --replica-key stateful-counter-cold
 
 cargo run -p selium -- \
   --daemon-addr "$SELIUM_DAEMON" \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id stateful-counter-resume
+  stop --node "$SELIUM_NODE" --replica-key stateful-counter-resume
 ```
 
 ## Notes

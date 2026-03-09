@@ -43,7 +43,7 @@ cargo run -p selium -- \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start \
   --node "$SELIUM_NODE" \
-  --instance-id event-broadcast-demo \
+  --replica-key event-broadcast-demo \
   --module modules/event_broadcast.wasm
 
 cargo run -p selium -- \
@@ -58,7 +58,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id event-broadcast-demo
+  stop --node "$SELIUM_NODE" --replica-key event-broadcast-demo
 ```
 
 On successful startup, both subscribers consumed the full event set and the coordinator verified every acknowledgement before entering the idle loop.

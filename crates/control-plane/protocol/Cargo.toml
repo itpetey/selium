@@ -14,6 +14,7 @@ categories.workspace = true
 anyhow = { workspace = true, features = ["std"] }
 rkyv = { workspace = true }
 selium-abi = { workspace = true }
+selium-control-plane-api = { workspace = true }
 selium-control-plane-runtime = { workspace = true }
 selium-io-consensus = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }

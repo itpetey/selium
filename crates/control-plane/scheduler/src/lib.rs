@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_control_plane_api::{
-    ControlPlaneState, IsolationProfile, collect_contracts_for_app, ensure_pipeline_consistency,
+    ContractRef, ControlPlaneState, EventEndpointRef, IsolationProfile, WorkloadRef,
+    collect_contracts_for_workload, ensure_pipeline_consistency,
 };
 use thiserror::Error;
 
@@ -22,6 +23,19 @@ pub struct ScheduledInstance {
 pub struct SchedulePlan {
     pub instances: Vec<ScheduledInstance>,
     pub node_slots: BTreeMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ScheduledEventRouteIntent {
+    pub route_id: String,
+    pub source_instance_id: String,
+    pub source_node: String,
+    pub source_endpoint: EventEndpointRef,
+    pub target_instance_id: String,
+    pub target_node: String,
+    pub target_endpoint: EventEndpointRef,
+    pub contract: ContractRef,
 }
 
 #[derive(Debug, Error)]
@@ -46,11 +60,12 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
     ensure_pipeline_consistency(state)
         .map_err(|err| ScheduleError::InconsistentPipeline(err.to_string()))?;
 
-    if state.nodes.is_empty() {
+    let schedulable_nodes = schedulable_node_names(state);
+    if schedulable_nodes.is_empty() {
         return Err(ScheduleError::NoNodes);
     }
 
-    let mut node_order = state.nodes.keys().cloned().collect::<Vec<_>>();
+    let mut node_order = schedulable_nodes.iter().cloned().collect::<Vec<_>>();
     node_order.sort_unstable();
 
     let mut used_slots: BTreeMap<String, u32> =
@@ -58,9 +73,11 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
     let mut instances = Vec::new();
 
     for deployment in state.deployments.values() {
-        let eligible = eligible_nodes(state, deployment.isolation.clone());
+        let eligible = eligible_nodes(state, deployment.isolation.clone(), &schedulable_nodes);
         if eligible.is_empty() {
-            return Err(ScheduleError::NoEligibleNodes(deployment.app.clone()));
+            return Err(ScheduleError::NoEligibleNodes(
+                deployment.workload.to_string(),
+            ));
         }
 
         let mut remaining = deployment.replicas;
@@ -77,8 +94,8 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
             if used < capacity {
                 let ordinal = deployment.replicas - remaining;
                 instances.push(ScheduledInstance {
-                    deployment: deployment.app.clone(),
-                    instance_id: format!("{}-{}", deployment.app, ordinal),
+                    deployment: deployment.workload.key(),
+                    instance_id: internal_instance_id(&deployment.workload, ordinal),
                     node: node.clone(),
                     isolation: deployment.isolation.clone(),
                 });
@@ -101,7 +118,7 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
                     })
                     .sum();
                 return Err(ScheduleError::InsufficientCapacity {
-                    deployment: deployment.app.clone(),
+                    deployment: deployment.workload.to_string(),
                     required: deployment.replicas,
                     available,
                 });
@@ -115,12 +132,26 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
     })
 }
 
+fn schedulable_node_names(state: &ControlPlaneState) -> BTreeSet<String> {
+    let live = state
+        .nodes
+        .values()
+        .filter(|node| node.last_heartbeat_ms > 0)
+        .map(|node| node.name.clone())
+        .collect::<BTreeSet<_>>();
+    if live.is_empty() {
+        state.nodes.keys().cloned().collect()
+    } else {
+        live
+    }
+}
+
 pub fn deployment_contract_usage(state: &ControlPlaneState) -> BTreeMap<String, BTreeSet<String>> {
     state
         .deployments
-        .keys()
+        .values()
         .map(|deployment| {
-            let contracts = collect_contracts_for_app(state, deployment)
+            let contracts = collect_contracts_for_workload(state, &deployment.workload)
                 .into_iter()
                 .map(|contract| {
                     format!(
@@ -129,16 +160,112 @@ pub fn deployment_contract_usage(state: &ControlPlaneState) -> BTreeMap<String, 
                     )
                 })
                 .collect::<BTreeSet<_>>();
-            (deployment.clone(), contracts)
+            (deployment.workload.key(), contracts)
         })
         .collect()
 }
 
-fn eligible_nodes(state: &ControlPlaneState, isolation: IsolationProfile) -> Vec<String> {
+pub fn build_event_route_intents(
+    state: &ControlPlaneState,
+    plan: &SchedulePlan,
+) -> Vec<ScheduledEventRouteIntent> {
+    let mut instances_by_workload: BTreeMap<&str, Vec<&ScheduledInstance>> = BTreeMap::new();
+    for instance in &plan.instances {
+        instances_by_workload
+            .entry(instance.deployment.as_str())
+            .or_default()
+            .push(instance);
+    }
+
+    let mut intents = Vec::new();
+    for pipeline in state.pipelines.values() {
+        for edge in &pipeline.edges {
+            let Some(source_instances) =
+                instances_by_workload.get(edge.from.endpoint.workload.key().as_str())
+            else {
+                continue;
+            };
+            let Some(target_instances) =
+                instances_by_workload.get(edge.to.endpoint.workload.key().as_str())
+            else {
+                continue;
+            };
+            for instance in source_instances {
+                let Some(target) = select_target_instance(instance.node.as_str(), target_instances)
+                else {
+                    continue;
+                };
+                intents.push(ScheduledEventRouteIntent {
+                    route_id: event_route_id(
+                        &instance.instance_id,
+                        &target.instance_id,
+                        &edge.from.endpoint,
+                        &edge.to.endpoint,
+                    ),
+                    source_instance_id: instance.instance_id.clone(),
+                    source_node: instance.node.clone(),
+                    source_endpoint: edge.from.endpoint.clone(),
+                    target_instance_id: target.instance_id.clone(),
+                    target_node: target.node.clone(),
+                    target_endpoint: edge.to.endpoint.clone(),
+                    contract: edge.to.contract.clone(),
+                });
+            }
+        }
+    }
+    intents.sort_by(|lhs, rhs| lhs.route_id.cmp(&rhs.route_id));
+    intents
+}
+
+fn internal_instance_id(workload: &WorkloadRef, ordinal: u32) -> String {
+    format!(
+        "tenant={};namespace={};workload={};replica={ordinal}",
+        workload.tenant, workload.namespace, workload.name
+    )
+}
+
+fn event_route_id(
+    source_instance_id: &str,
+    target_instance_id: &str,
+    source_endpoint: &EventEndpointRef,
+    target_endpoint: &EventEndpointRef,
+) -> String {
+    format!(
+        "{source_instance_id}->{target_instance_id}::{source}->{target}",
+        source = source_endpoint.key(),
+        target = target_endpoint.key()
+    )
+}
+
+fn select_target_instance<'a>(
+    source_node: &str,
+    targets: &'a [&'a ScheduledInstance],
+) -> Option<&'a ScheduledInstance> {
+    targets
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.node == source_node)
+        .min_by(|lhs, rhs| lhs.instance_id.cmp(&rhs.instance_id))
+        .or_else(|| {
+            targets.iter().copied().min_by(|lhs, rhs| {
+                lhs.node
+                    .cmp(&rhs.node)
+                    .then(lhs.instance_id.cmp(&rhs.instance_id))
+            })
+        })
+}
+
+fn eligible_nodes(
+    state: &ControlPlaneState,
+    isolation: IsolationProfile,
+    schedulable_nodes: &BTreeSet<String>,
+) -> Vec<String> {
     let mut nodes = state
         .nodes
         .values()
-        .filter(|node| node.supported_isolation.contains(&isolation))
+        .filter(|node| {
+            schedulable_nodes.contains(&node.name) && node.supported_isolation.contains(&isolation)
+        })
         .map(|node| node.name.clone())
         .collect::<Vec<_>>();
     nodes.sort_unstable();
@@ -148,7 +275,8 @@ fn eligible_nodes(state: &ControlPlaneState, isolation: IsolationProfile) -> Vec
 #[cfg(test)]
 mod tests {
     use selium_control_plane_api::{
-        ContractRef, DeploymentSpec, PipelineEdge, PipelineEndpoint, PipelineSpec, parse_idl,
+        ContractRef, DeploymentSpec, NodeSpec, PipelineEdge, PipelineEndpoint, PipelineSpec,
+        parse_idl,
     };
 
     use super::*;
@@ -170,29 +298,53 @@ mod tests {
 
         state
             .upsert_deployment(DeploymentSpec {
-                app: "ingest".to_string(),
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "ingest".to_string(),
+                },
                 module: "ingest.wasm".to_string(),
                 replicas: 2,
-                contracts: vec![],
+                contracts: vec![ContractRef {
+                    namespace: "media.pipeline".to_string(),
+                    name: "camera.frames".to_string(),
+                    version: "v1".to_string(),
+                }],
                 isolation: IsolationProfile::Standard,
             })
             .expect("deployment");
         state
             .upsert_deployment(DeploymentSpec {
-                app: "detector".to_string(),
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "detector".to_string(),
+                },
                 module: "detector.wasm".to_string(),
                 replicas: 1,
-                contracts: vec![],
+                contracts: vec![ContractRef {
+                    namespace: "media.pipeline".to_string(),
+                    name: "camera.frames".to_string(),
+                    version: "v1".to_string(),
+                }],
                 isolation: IsolationProfile::Standard,
             })
             .expect("deployment");
 
         state.upsert_pipeline(PipelineSpec {
             name: "pipeline".to_string(),
+            tenant: "tenant-a".to_string(),
             namespace: "media".to_string(),
             edges: vec![PipelineEdge {
                 from: PipelineEndpoint {
-                    app: "ingest".to_string(),
+                    endpoint: selium_control_plane_api::EventEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        name: "camera.frames".to_string(),
+                    },
                     contract: ContractRef {
                         namespace: "media.pipeline".to_string(),
                         name: "camera.frames".to_string(),
@@ -200,7 +352,14 @@ mod tests {
                     },
                 },
                 to: PipelineEndpoint {
-                    app: "detector".to_string(),
+                    endpoint: selium_control_plane_api::EventEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "detector".to_string(),
+                        },
+                        name: "camera.frames".to_string(),
+                    },
                     contract: ContractRef {
                         namespace: "media.pipeline".to_string(),
                         name: "camera.frames".to_string(),
@@ -229,7 +388,37 @@ mod tests {
     fn usage_contains_contract_refs() {
         let state = sample_state();
         let usage = deployment_contract_usage(&state);
-        let ingest = usage.get("ingest").expect("ingest usage");
+        let ingest = usage.get("tenant-a/media/ingest").expect("ingest usage");
         assert!(ingest.contains("media.pipeline/camera.frames@v1"));
+    }
+
+    #[test]
+    fn builds_route_intents_per_source_instance() {
+        let state = sample_state();
+        let plan = build_plan(&state).expect("plan");
+
+        let intents = build_event_route_intents(&state, &plan);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(
+            intents[0].source_endpoint.key(),
+            "tenant-a/media/ingest#camera.frames"
+        );
+        assert_eq!(
+            intents[0].target_endpoint.key(),
+            "tenant-a/media/detector#camera.frames"
+        );
+        assert_eq!(intents[0].source_node, "local-node");
+        assert_eq!(intents[0].target_node, "local-node");
+        assert_eq!(
+            intents[0].target_instance_id,
+            "tenant=tenant-a;namespace=media;workload=detector;replica=0"
+        );
+        assert!(
+            intents[0]
+                .route_id
+                .starts_with(
+                    "tenant=tenant-a;namespace=media;workload=ingest;replica=0->tenant=tenant-a;namespace=media;workload=detector;replica=0::"
+                )
+        );
     }
 }

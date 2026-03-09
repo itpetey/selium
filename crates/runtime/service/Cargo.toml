@@ -36,7 +36,9 @@ rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 selium-abi = { workspace = true }
+selium-control-plane-api = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
+selium-control-plane-runtime = { workspace = true }
 selium-io-durability = { workspace = true }
 selium-module-control-plane = { workspace = true }
 selium-kernel = { workspace = true, features = ["services"] }

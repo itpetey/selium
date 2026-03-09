@@ -154,29 +154,53 @@ fn pipeline_consistency_checks_registry_and_deployments() {
 
     state
         .upsert_deployment(DeploymentSpec {
-            app: "ingest".to_string(),
+            workload: WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "ingest".to_string(),
+            },
             module: "ingest.wasm".to_string(),
             replicas: 1,
-            contracts: Vec::new(),
+            contracts: vec![ContractRef {
+                namespace: "media.pipeline".to_string(),
+                name: "camera.frames".to_string(),
+                version: "v1".to_string(),
+            }],
             isolation: IsolationProfile::Standard,
         })
         .expect("deployment");
     state
         .upsert_deployment(DeploymentSpec {
-            app: "detector".to_string(),
+            workload: WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "detector".to_string(),
+            },
             module: "detector.wasm".to_string(),
             replicas: 1,
-            contracts: Vec::new(),
+            contracts: vec![ContractRef {
+                namespace: "media.pipeline".to_string(),
+                name: "camera.frames".to_string(),
+                version: "v1".to_string(),
+            }],
             isolation: IsolationProfile::Standard,
         })
         .expect("deployment");
 
     state.upsert_pipeline(PipelineSpec {
         name: "p".to_string(),
+        tenant: "tenant-a".to_string(),
         namespace: "media".to_string(),
         edges: vec![PipelineEdge {
             from: PipelineEndpoint {
-                app: "ingest".to_string(),
+                endpoint: EventEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "ingest".to_string(),
+                    },
+                    name: "camera.frames".to_string(),
+                },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
                     name: "camera.frames".to_string(),
@@ -184,7 +208,14 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 },
             },
             to: PipelineEndpoint {
-                app: "detector".to_string(),
+                endpoint: EventEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "detector".to_string(),
+                    },
+                    name: "camera.frames".to_string(),
+                },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
                     name: "camera.frames".to_string(),
@@ -195,4 +226,87 @@ fn pipeline_consistency_checks_registry_and_deployments() {
     });
 
     ensure_pipeline_consistency(&state).expect("consistent");
+}
+
+#[test]
+fn pipeline_consistency_rejects_cross_tenant_endpoint() {
+    let mut state = ControlPlaneState::new_local_default();
+    let package = parse_idl(SAMPLE).expect("parse sample");
+    state.registry.register_package(package).expect("register");
+
+    state
+        .upsert_deployment(DeploymentSpec {
+            workload: WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "ingest".to_string(),
+            },
+            module: "ingest.wasm".to_string(),
+            replicas: 1,
+            contracts: vec![ContractRef {
+                namespace: "media.pipeline".to_string(),
+                name: "camera.frames".to_string(),
+                version: "v1".to_string(),
+            }],
+            isolation: IsolationProfile::Standard,
+        })
+        .expect("deployment");
+    state
+        .upsert_deployment(DeploymentSpec {
+            workload: WorkloadRef {
+                tenant: "tenant-b".to_string(),
+                namespace: "media".to_string(),
+                name: "detector".to_string(),
+            },
+            module: "detector.wasm".to_string(),
+            replicas: 1,
+            contracts: vec![ContractRef {
+                namespace: "media.pipeline".to_string(),
+                name: "camera.frames".to_string(),
+                version: "v1".to_string(),
+            }],
+            isolation: IsolationProfile::Standard,
+        })
+        .expect("deployment");
+
+    state.upsert_pipeline(PipelineSpec {
+        name: "p".to_string(),
+        tenant: "tenant-a".to_string(),
+        namespace: "media".to_string(),
+        edges: vec![PipelineEdge {
+            from: PipelineEndpoint {
+                endpoint: EventEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "ingest".to_string(),
+                    },
+                    name: "camera.frames".to_string(),
+                },
+                contract: ContractRef {
+                    namespace: "media.pipeline".to_string(),
+                    name: "camera.frames".to_string(),
+                    version: "v1".to_string(),
+                },
+            },
+            to: PipelineEndpoint {
+                endpoint: EventEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-b".to_string(),
+                        namespace: "media".to_string(),
+                        name: "detector".to_string(),
+                    },
+                    name: "camera.frames".to_string(),
+                },
+                contract: ContractRef {
+                    namespace: "media.pipeline".to_string(),
+                    name: "camera.frames".to_string(),
+                    version: "v1".to_string(),
+                },
+            },
+        }],
+    });
+
+    let err = ensure_pipeline_consistency(&state).expect_err("must fail");
+    assert!(err.to_string().contains("must stay within pipeline tenant"));
 }

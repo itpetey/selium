@@ -43,7 +43,7 @@ cargo run -p selium -- \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start \
   --node "$SELIUM_NODE" \
-  --instance-id scatter-gather-demo \
+  --replica-key scatter-gather-demo \
   --module modules/scatter_gather.wasm
 
 cargo run -p selium -- \
@@ -58,7 +58,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id scatter-gather-demo
+  stop --node "$SELIUM_NODE" --replica-key scatter-gather-demo
 ```
 
 A successful start means the coordinator received every worker response with the expected totals. Any missing or malformed response fails startup.

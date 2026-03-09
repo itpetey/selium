@@ -21,7 +21,7 @@ async fn guest_side_io_module_starts_and_stops_cleanly() -> Result<()> {
             "start",
             "--node",
             "node-a",
-            "--instance-id",
+            "--replica-key",
             "io-a",
             "--module",
             harness.user_io_module_relative_path(),
@@ -42,7 +42,7 @@ async fn guest_side_io_module_starts_and_stops_cleanly() -> Result<()> {
 
     let stop_out = harness.run_cli(
         &daemon_a,
-        &["stop", "--node", "node-a", "--instance-id", "io-a"],
+        &["stop", "--node", "node-a", "--replica-key", "io-a"],
     )?;
     assert!(
         stop_out.contains("stop status=ok"),

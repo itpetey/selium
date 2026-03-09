@@ -10,17 +10,22 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{DataValue, StorageReplayStart, decode_rkyv, encode_rkyv};
-use selium_control_plane_api::{ControlPlaneState, IsolationProfile, NodeSpec};
+use selium_control_plane_api::{ControlPlaneState, EventEndpointRef, IsolationProfile, NodeSpec};
 use selium_control_plane_protocol::{
-    AppendEntriesApiRequest, ListResponse, Method, MutateApiRequest, MutateApiResponse,
-    QueryApiRequest, QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest,
-    StatusApiResponse, StopRequest, decode_envelope, decode_payload, encode_error_response,
-    encode_response, is_error, is_request,
+    ActivateEventRouteRequest, ActivateEventRouteResponse, AppendEntriesApiRequest,
+    DeactivateEventRouteRequest, DeactivateEventRouteResponse, ListResponse, ManagedEventBinding,
+    ManagedEventBindingRole, Method, MutateApiRequest, MutateApiResponse, QueryApiRequest,
+    QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest, StatusApiResponse,
+    StopRequest, decode_envelope, decode_payload, encode_error_response, encode_response, is_error,
+    is_request,
 };
 use selium_control_plane_runtime::{
     ControlPlaneEngine, EngineSnapshot, Mutation, MutationEnvelope, MutationResponse, RuntimeError,
 };
-use selium_control_plane_scheduler::{SchedulePlan, ScheduledInstance, build_plan};
+use selium_control_plane_scheduler::{
+    SchedulePlan, ScheduledEventRouteIntent, ScheduledInstance, build_event_route_intents,
+    build_plan,
+};
 use selium_guest::{network, spawn, storage, time};
 use selium_io_consensus::{
     AppendEntries, AppendEntriesResponse, ConsensusConfig, ConsensusError, LogEntry, RaftNode,
@@ -73,6 +78,7 @@ pub struct BootstrapReport {
 #[rkyv(bytecheck())]
 pub struct AgentState {
     pub running_instances: BTreeMap<String, String>,
+    pub active_routes: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -81,9 +87,21 @@ pub enum ReconcileAction {
     Start {
         instance_id: String,
         deployment: String,
+        managed_event_bindings: Vec<ManagedEventBinding>,
     },
     Stop {
         instance_id: String,
+    },
+    EnsureEventRoute {
+        route_id: String,
+        source_instance_id: String,
+        source_endpoint: EventEndpointRef,
+        target_instance_id: String,
+        target_node: String,
+        target_endpoint: EventEndpointRef,
+    },
+    RemoveEventRoute {
+        route_id: String,
     },
 }
 
@@ -136,6 +154,7 @@ type SharedState = Rc<RefCell<ControlPlaneRuntimeState>>;
 
 pub fn reconcile(
     node_name: &str,
+    state: &ControlPlaneState,
     desired: &SchedulePlan,
     current: &AgentState,
 ) -> Vec<ReconcileAction> {
@@ -151,6 +170,7 @@ pub fn reconcile(
         .collect::<BTreeSet<_>>();
 
     let mut actions = Vec::new();
+    let all_routes = build_event_route_intents(state, desired);
 
     for instance in desired_on_node {
         if !current
@@ -160,6 +180,10 @@ pub fn reconcile(
             actions.push(ReconcileAction::Start {
                 instance_id: instance.instance_id.clone(),
                 deployment: instance.deployment.clone(),
+                managed_event_bindings: managed_event_bindings_for_instance(
+                    &instance.instance_id,
+                    &all_routes,
+                ),
             });
         }
     }
@@ -168,6 +192,36 @@ pub fn reconcile(
         if !desired_ids.contains(instance_id) {
             actions.push(ReconcileAction::Stop {
                 instance_id: instance_id.clone(),
+            });
+        }
+    }
+
+    let desired_routes = all_routes
+        .into_iter()
+        .filter(|route| route.source_node == node_name)
+        .collect::<Vec<_>>();
+    let desired_route_ids = desired_routes
+        .iter()
+        .map(|route| route.route_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    for route in desired_routes {
+        if !current.active_routes.contains(&route.route_id) {
+            actions.push(ReconcileAction::EnsureEventRoute {
+                route_id: route.route_id,
+                source_instance_id: route.source_instance_id,
+                source_endpoint: route.source_endpoint,
+                target_instance_id: route.target_instance_id,
+                target_node: route.target_node,
+                target_endpoint: route.target_endpoint,
+            });
+        }
+    }
+
+    for route_id in &current.active_routes {
+        if !desired_route_ids.contains(route_id) {
+            actions.push(ReconcileAction::RemoveEventRoute {
+                route_id: route_id.clone(),
             });
         }
     }
@@ -182,6 +236,7 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
             ReconcileAction::Start {
                 instance_id,
                 deployment,
+                managed_event_bindings: _,
             } => {
                 current
                     .running_instances
@@ -190,8 +245,40 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
             ReconcileAction::Stop { instance_id } => {
                 current.running_instances.remove(instance_id);
             }
+            ReconcileAction::EnsureEventRoute { route_id, .. } => {
+                current.active_routes.insert(route_id.clone());
+            }
+            ReconcileAction::RemoveEventRoute { route_id } => {
+                current.active_routes.remove(route_id);
+            }
         }
     }
+}
+
+fn managed_event_bindings_for_instance(
+    instance_id: &str,
+    routes: &[ScheduledEventRouteIntent],
+) -> Vec<ManagedEventBinding> {
+    let mut bindings = BTreeMap::<(u8, String), ManagedEventBinding>::new();
+    for route in routes {
+        if route.source_instance_id == instance_id {
+            bindings
+                .entry((0, route.source_endpoint.name.clone()))
+                .or_insert_with(|| ManagedEventBinding {
+                    endpoint_name: route.source_endpoint.name.clone(),
+                    role: ManagedEventBindingRole::Source,
+                });
+        }
+        if route.target_instance_id == instance_id {
+            bindings
+                .entry((1, route.target_endpoint.name.clone()))
+                .or_insert_with(|| ManagedEventBinding {
+                    endpoint_name: route.target_endpoint.name.clone(),
+                    role: ManagedEventBindingRole::Target,
+                });
+        }
+    }
+    bindings.into_values().collect()
 }
 
 #[selium_guest::entrypoint]
@@ -745,6 +832,7 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
         .await?
         .unwrap_or(ListResponse {
             instances: BTreeMap::new(),
+            active_routes: Vec::new(),
         });
         let current = AgentState {
             running_instances: list
@@ -752,8 +840,9 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
                 .into_iter()
                 .map(|(instance_id, process_id)| (instance_id, process_id.to_string()))
                 .collect(),
+            active_routes: list.active_routes.into_iter().collect(),
         };
-        let actions = reconcile(node, &desired, &current);
+        let actions = reconcile(node, &snapshot, &desired, &current);
         execute_daemon_actions(&state, &snapshot, &actions, node).await?;
     }
 
@@ -777,6 +866,7 @@ async fn execute_daemon_actions(
             ReconcileAction::Start {
                 instance_id,
                 deployment,
+                managed_event_bindings,
             } => {
                 let spec = cp_state
                     .deployments
@@ -791,6 +881,7 @@ async fn execute_daemon_actions(
                         node_id: node.to_string(),
                         instance_id: instance_id.clone(),
                         module_spec,
+                        managed_event_bindings: managed_event_bindings.clone(),
                     },
                 )
                 .await?
@@ -808,6 +899,44 @@ async fn execute_daemon_actions(
                 )
                 .await?
                 .ok_or_else(|| anyhow!("missing stop response"))?;
+            }
+            ReconcileAction::EnsureEventRoute {
+                route_id,
+                source_instance_id,
+                source_endpoint,
+                target_instance_id,
+                target_node,
+                target_endpoint,
+            } => {
+                let _: ActivateEventRouteResponse = send_daemon_rpc(
+                    state,
+                    &authority,
+                    Method::ActivateEventRoute,
+                    &ActivateEventRouteRequest {
+                        node_id: node.to_string(),
+                        route_id: route_id.clone(),
+                        source_instance_id: source_instance_id.clone(),
+                        source_endpoint: source_endpoint.clone(),
+                        target_instance_id: target_instance_id.clone(),
+                        target_node: target_node.clone(),
+                        target_endpoint: target_endpoint.clone(),
+                    },
+                )
+                .await?
+                .ok_or_else(|| anyhow!("missing activate route response"))?;
+            }
+            ReconcileAction::RemoveEventRoute { route_id } => {
+                let _: DeactivateEventRouteResponse = send_daemon_rpc(
+                    state,
+                    &authority,
+                    Method::DeactivateEventRoute,
+                    &DeactivateEventRouteRequest {
+                        node_id: node.to_string(),
+                        route_id: route_id.clone(),
+                    },
+                )
+                .await?
+                .ok_or_else(|| anyhow!("missing deactivate route response"))?;
             }
         }
     }
@@ -1079,14 +1208,34 @@ fn anyhow_from_runtime(err: RuntimeError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_control_plane_api::DeploymentSpec;
+    use selium_control_plane_api::{
+        ContractRef, DeploymentSpec, EventEndpointRef, PipelineEdge, PipelineEndpoint,
+        PipelineSpec, WorkloadRef, parse_idl,
+    };
+
+    const SAMPLE_IDL: &str = r#"
+package media.pipeline.v1;
+
+schema Frame {
+  camera_id: string;
+}
+
+event camera.frames(Frame) {
+  partitions: 1;
+  delivery: at_least_once;
+}
+"#;
 
     #[test]
     fn reconcile_generates_start_and_stop_actions() {
         let mut state = ControlPlaneState::new_local_default();
         state
             .upsert_deployment(DeploymentSpec {
-                app: "echo".to_string(),
+                workload: selium_control_plane_api::WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "default".to_string(),
+                    name: "echo".to_string(),
+                },
                 module: "echo.wasm".to_string(),
                 replicas: 2,
                 contracts: Vec::new(),
@@ -1097,14 +1246,91 @@ mod tests {
         let desired = build_plan(&state).expect("schedule");
         let mut current = AgentState {
             running_instances: BTreeMap::from([("old-0".to_string(), "old".to_string())]),
+            active_routes: BTreeSet::new(),
         };
 
-        let actions = reconcile("local-node", &desired, &current);
+        let actions = reconcile("local-node", &state, &desired, &current);
         assert_eq!(actions.len(), 3);
 
         apply(&mut current, &actions);
         assert_eq!(current.running_instances.len(), 2);
-        assert!(current.running_instances.contains_key("echo-0"));
-        assert!(current.running_instances.contains_key("echo-1"));
+        assert!(current.active_routes.is_empty());
+        assert!(
+            current
+                .running_instances
+                .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=0")
+        );
+        assert!(
+            current
+                .running_instances
+                .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=1")
+        );
+    }
+
+    #[test]
+    fn reconcile_generates_event_route_actions() {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(parse_idl(SAMPLE_IDL).expect("parse idl"))
+            .expect("register package");
+
+        let ingest = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        let detector = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "detector".to_string(),
+        };
+        let contract = ContractRef {
+            namespace: "media.pipeline".to_string(),
+            name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        };
+        for workload in [ingest.clone(), detector.clone()] {
+            state
+                .upsert_deployment(DeploymentSpec {
+                    workload,
+                    module: "module.wasm".to_string(),
+                    replicas: 1,
+                    contracts: vec![contract.clone()],
+                    isolation: IsolationProfile::Standard,
+                })
+                .expect("deployment");
+        }
+        state.upsert_pipeline(PipelineSpec {
+            name: "camera".to_string(),
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            edges: vec![PipelineEdge {
+                from: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: ingest,
+                        name: "camera.frames".to_string(),
+                    },
+                    contract: contract.clone(),
+                },
+                to: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: detector,
+                        name: "camera.frames".to_string(),
+                    },
+                    contract,
+                },
+            }],
+        });
+
+        let desired = build_plan(&state).expect("schedule");
+        let current = AgentState::default();
+        let actions = reconcile("local-node", &state, &desired, &current);
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, ReconcileAction::EnsureEventRoute { .. }))
+        );
     }
 }

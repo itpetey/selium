@@ -8,6 +8,7 @@ use rkyv::{
     api::high::{HighDeserializer, HighValidator},
 };
 use selium_abi::{DataValue, RkyvEncode, decode_rkyv, encode_rkyv};
+use selium_control_plane_api::EventEndpointRef;
 use selium_control_plane_runtime::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,6 +31,9 @@ pub enum Method {
     StartInstance = 100,
     StopInstance = 101,
     ListInstances = 102,
+    ActivateEventRoute = 103,
+    DeactivateEventRoute = 104,
+    DeliverEventFrame = 105,
 }
 
 impl Method {
@@ -44,6 +48,9 @@ impl Method {
             100 => Some(Self::StartInstance),
             101 => Some(Self::StopInstance),
             102 => Some(Self::ListInstances),
+            103 => Some(Self::ActivateEventRoute),
+            104 => Some(Self::DeactivateEventRoute),
+            105 => Some(Self::DeliverEventFrame),
             _ => None,
         }
     }
@@ -146,10 +153,25 @@ pub struct AppendEntriesApiRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
+pub enum ManagedEventBindingRole {
+    Source,
+    Target,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ManagedEventBinding {
+    pub endpoint_name: String,
+    pub role: ManagedEventBindingRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
 pub struct StartRequest {
     pub node_id: String,
     pub instance_id: String,
     pub module_spec: String,
+    pub managed_event_bindings: Vec<ManagedEventBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -186,6 +208,67 @@ pub struct StopResponse {
 #[rkyv(bytecheck())]
 pub struct ListResponse {
     pub instances: BTreeMap<String, usize>,
+    pub active_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum EventRouteMode {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ActivateEventRouteRequest {
+    pub node_id: String,
+    pub route_id: String,
+    pub source_instance_id: String,
+    pub source_endpoint: EventEndpointRef,
+    pub target_instance_id: String,
+    pub target_node: String,
+    pub target_endpoint: EventEndpointRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ActivateEventRouteResponse {
+    pub status: String,
+    pub route_id: String,
+    pub mode: EventRouteMode,
+    pub target_node: String,
+    pub target_instance_id: String,
+    pub already_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeactivateEventRouteRequest {
+    pub node_id: String,
+    pub route_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeactivateEventRouteResponse {
+    pub status: String,
+    pub route_id: String,
+    pub existed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeliverEventFrameRequest {
+    pub target_instance_id: String,
+    pub target_endpoint_name: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeliverEventFrameResponse {
+    pub status: String,
+    pub delivered: bool,
 }
 
 pub fn encode_request<T: RkyvEncode>(

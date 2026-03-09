@@ -20,7 +20,7 @@ async fn cli_can_launch_user_module_on_either_node() -> Result<()> {
             "start",
             "--node",
             "node-a",
-            "--instance-id",
+            "--replica-key",
             "user-a",
             "--module",
             harness.user_module_relative_path(),
@@ -33,7 +33,7 @@ async fn cli_can_launch_user_module_on_either_node() -> Result<()> {
             "start",
             "--node",
             "node-b",
-            "--instance-id",
+            "--replica-key",
             "user-b",
             "--module",
             harness.user_module_relative_path(),
@@ -48,11 +48,11 @@ async fn cli_can_launch_user_module_on_either_node() -> Result<()> {
 
     harness.run_cli(
         &daemon_a,
-        &["stop", "--node", "node-a", "--instance-id", "user-a"],
+        &["stop", "--node", "node-a", "--replica-key", "user-a"],
     )?;
     harness.run_cli(
         &daemon_b,
-        &["stop", "--node", "node-b", "--instance-id", "user-b"],
+        &["stop", "--node", "node-b", "--replica-key", "user-b"],
     )?;
 
     Ok(())

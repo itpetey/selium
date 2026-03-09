@@ -11,4 +11,7 @@ pub use codegen::generate_rust_bindings;
 pub use idl::parse_idl;
 pub use model::*;
 pub use refs::parse_contract_ref;
-pub use state::{collect_contracts_for_app, ensure_pipeline_consistency};
+pub use state::{
+    build_discovery_state, collect_contracts_for_app, collect_contracts_for_workload,
+    ensure_pipeline_consistency,
+};

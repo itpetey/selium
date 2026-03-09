@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ApiError, ContractRef, ControlPlaneState, DeploymentSpec, IsolationProfile, NodeSpec,
-    PipelineSpec,
+    ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec,
+    DiscoverableEventEndpoint, DiscoverableWorkload, DiscoveryState, EventEndpointRef,
+    IsolationProfile, NodeSpec, PipelineEndpoint, PipelineSpec, WorkloadRef,
 };
 
 impl ControlPlaneState {
@@ -34,11 +35,7 @@ impl ControlPlaneState {
         &mut self,
         deployment: DeploymentSpec,
     ) -> std::result::Result<(), ApiError> {
-        if deployment.app.trim().is_empty() {
-            return Err(ApiError::InvalidDeployment(
-                "app name must not be empty".to_string(),
-            ));
-        }
+        deployment.workload.validate("deployment")?;
         if deployment.module.trim().is_empty() {
             return Err(ApiError::InvalidDeployment(
                 "module must not be empty".to_string(),
@@ -50,21 +47,28 @@ impl ControlPlaneState {
             ));
         }
 
-        self.deployments.insert(deployment.app.clone(), deployment);
+        self.deployments
+            .insert(deployment.workload.key(), deployment);
         Ok(())
     }
 
-    pub fn set_scale(&mut self, app: &str, replicas: u32) -> std::result::Result<(), ApiError> {
+    pub fn set_scale(
+        &mut self,
+        workload: &WorkloadRef,
+        replicas: u32,
+    ) -> std::result::Result<(), ApiError> {
+        workload.validate("scale target")?;
+        let key = workload.key();
         let deployment = self
             .deployments
-            .get_mut(app)
-            .ok_or_else(|| ApiError::UnknownDeployment(app.to_string()))?;
+            .get_mut(&key)
+            .ok_or_else(|| ApiError::UnknownDeployment(key.clone()))?;
         deployment.replicas = replicas.max(1);
         Ok(())
     }
 
     pub fn upsert_pipeline(&mut self, pipeline: PipelineSpec) {
-        self.pipelines.insert(pipeline.name.clone(), pipeline);
+        self.pipelines.insert(pipeline.key(), pipeline);
     }
 
     pub fn upsert_node(&mut self, node: NodeSpec) -> std::result::Result<(), ApiError> {
@@ -86,18 +90,33 @@ impl ControlPlaneState {
 
 pub fn ensure_pipeline_consistency(state: &ControlPlaneState) -> std::result::Result<(), ApiError> {
     for pipeline in state.pipelines.values() {
+        if pipeline.name.trim().is_empty() {
+            return Err(ApiError::InvalidPipeline(
+                "pipeline name must not be empty".to_string(),
+            ));
+        }
+        if pipeline.tenant.trim().is_empty() {
+            return Err(ApiError::InvalidPipeline(
+                "pipeline tenant must not be empty".to_string(),
+            ));
+        }
+        if pipeline.namespace.trim().is_empty() {
+            return Err(ApiError::InvalidPipeline(
+                "pipeline namespace must not be empty".to_string(),
+            ));
+        }
+
         for edge in &pipeline.edges {
-            if !state.deployments.contains_key(&edge.from.app) {
-                return Err(ApiError::UnknownDeployment(edge.from.app.clone()));
+            validate_pipeline_endpoint(state, pipeline, &edge.from, "source")?;
+            validate_pipeline_endpoint(state, pipeline, &edge.to, "target")?;
+
+            let from_key = edge.from.endpoint.workload.key();
+            if !state.deployments.contains_key(&from_key) {
+                return Err(ApiError::UnknownDeployment(from_key));
             }
-            if !state.deployments.contains_key(&edge.to.app) {
-                return Err(ApiError::UnknownDeployment(edge.to.app.clone()));
-            }
-            if !state.registry.has_contract(&edge.from.contract) {
-                return Err(ApiError::InvalidContract);
-            }
-            if !state.registry.has_contract(&edge.to.contract) {
-                return Err(ApiError::InvalidContract);
+            let to_key = edge.to.endpoint.workload.key();
+            if !state.deployments.contains_key(&to_key) {
+                return Err(ApiError::UnknownDeployment(to_key));
             }
         }
     }
@@ -105,17 +124,263 @@ pub fn ensure_pipeline_consistency(state: &ControlPlaneState) -> std::result::Re
     Ok(())
 }
 
-pub fn collect_contracts_for_app(state: &ControlPlaneState, app: &str) -> BTreeSet<ContractRef> {
+pub fn build_discovery_state(
+    state: &ControlPlaneState,
+) -> std::result::Result<DiscoveryState, ApiError> {
+    ensure_pipeline_consistency(state)?;
+
+    let mut workloads = Vec::new();
+    let mut endpoints = Vec::new();
+
+    for deployment in state.deployments.values() {
+        let mut workload_endpoints = deployment_event_endpoints(state, deployment)?;
+        workload_endpoints.sort_by(|lhs, rhs| lhs.endpoint.cmp(&rhs.endpoint));
+
+        workloads.push(DiscoverableWorkload {
+            workload: deployment.workload.clone(),
+            endpoints: workload_endpoints
+                .iter()
+                .map(|record| record.endpoint.clone())
+                .collect(),
+        });
+        endpoints.extend(workload_endpoints);
+    }
+
+    workloads.sort_by(|lhs, rhs| lhs.workload.cmp(&rhs.workload));
+    endpoints.sort_by(|lhs, rhs| lhs.endpoint.cmp(&rhs.endpoint));
+
+    Ok(DiscoveryState {
+        workloads,
+        endpoints,
+    })
+}
+
+pub fn collect_contracts_for_workload(
+    state: &ControlPlaneState,
+    workload: &WorkloadRef,
+) -> BTreeSet<ContractRef> {
     let mut out = BTreeSet::new();
     for pipeline in state.pipelines.values() {
         for edge in &pipeline.edges {
-            if edge.from.app == app {
+            if edge.from.endpoint.workload == *workload {
                 out.insert(edge.from.contract.clone());
             }
-            if edge.to.app == app {
+            if edge.to.endpoint.workload == *workload {
                 out.insert(edge.to.contract.clone());
             }
         }
     }
     out
+}
+
+pub fn collect_contracts_for_app(state: &ControlPlaneState, app: &str) -> BTreeSet<ContractRef> {
+    let mut out = BTreeSet::new();
+    for deployment in state.deployments.values() {
+        if deployment.workload.name == app {
+            out.extend(collect_contracts_for_workload(state, &deployment.workload));
+        }
+    }
+    out
+}
+
+fn validate_pipeline_endpoint(
+    state: &ControlPlaneState,
+    pipeline: &PipelineSpec,
+    endpoint: &PipelineEndpoint,
+    role: &str,
+) -> std::result::Result<(), ApiError> {
+    endpoint
+        .endpoint
+        .validate(&format!("{role} pipeline endpoint"))?;
+
+    if endpoint.endpoint.workload.tenant != pipeline.tenant {
+        return Err(ApiError::InvalidPipeline(format!(
+            "{role} endpoint `{}` must stay within pipeline tenant `{}`",
+            endpoint.endpoint, pipeline.tenant
+        )));
+    }
+
+    if endpoint.endpoint.workload.namespace != pipeline.namespace {
+        return Err(ApiError::InvalidPipeline(format!(
+            "{role} endpoint `{}` must stay within pipeline namespace `{}`",
+            endpoint.endpoint, pipeline.namespace
+        )));
+    }
+
+    let resolved = state
+        .registry
+        .resolve(&endpoint.contract)
+        .ok_or(ApiError::InvalidContract)?;
+    if resolved.kind != ContractKind::Event {
+        return Err(ApiError::InvalidPipeline(format!(
+            "{role} endpoint `{}` must reference an event contract",
+            endpoint.endpoint
+        )));
+    }
+    if endpoint.endpoint.name != endpoint.contract.name {
+        return Err(ApiError::InvalidPipeline(format!(
+            "{role} endpoint `{}` must match contract-defined event `{}`",
+            endpoint.endpoint, endpoint.contract.name
+        )));
+    }
+
+    let deployment_key = endpoint.endpoint.workload.key();
+    let deployment = state
+        .deployments
+        .get(&deployment_key)
+        .ok_or_else(|| ApiError::UnknownDeployment(deployment_key.clone()))?;
+    if !deployment.contracts.contains(&endpoint.contract) {
+        return Err(ApiError::InvalidPipeline(format!(
+            "{role} endpoint `{}` must be declared by workload `{}`",
+            endpoint.endpoint, endpoint.endpoint.workload
+        )));
+    }
+
+    Ok(())
+}
+
+fn deployment_event_endpoints(
+    state: &ControlPlaneState,
+    deployment: &DeploymentSpec,
+) -> std::result::Result<Vec<DiscoverableEventEndpoint>, ApiError> {
+    let mut endpoints = BTreeMap::new();
+
+    for contract in &deployment.contracts {
+        let resolved = state
+            .registry
+            .resolve(contract)
+            .ok_or(ApiError::InvalidContract)?;
+        if resolved.kind != ContractKind::Event {
+            continue;
+        }
+
+        let endpoint = EventEndpointRef {
+            workload: deployment.workload.clone(),
+            name: contract.name.clone(),
+        };
+        endpoints.insert(
+            endpoint.key(),
+            DiscoverableEventEndpoint {
+                endpoint,
+                contract: contract.clone(),
+            },
+        );
+    }
+
+    Ok(endpoints.into_values().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ContractRef, PipelineEdge, parse_idl};
+
+    fn event_contract() -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn sample_state() -> ControlPlaneState {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(
+                parse_idl(
+                    "package media.pipeline.v1;\n\
+                     schema Frame { camera_id: string; }\n\
+                     event camera.frames(Frame) { replay: enabled; }",
+                )
+                .expect("parse"),
+            )
+            .expect("register");
+        state
+    }
+
+    #[test]
+    fn discovery_state_keeps_tenant_qualified_namespace_collisions_separate() {
+        let mut state = sample_state();
+        let contract = event_contract();
+
+        for (tenant, namespace) in [("tenant-a", "media"), ("tenant-b", "media")] {
+            state
+                .upsert_deployment(DeploymentSpec {
+                    workload: WorkloadRef {
+                        tenant: tenant.to_string(),
+                        namespace: namespace.to_string(),
+                        name: "ingest".to_string(),
+                    },
+                    module: format!("{tenant}-ingest.wasm"),
+                    replicas: 1,
+                    contracts: vec![contract.clone()],
+                    isolation: IsolationProfile::Standard,
+                })
+                .expect("deployment");
+        }
+
+        let discovery = build_discovery_state(&state).expect("discovery");
+        let workload_keys = discovery
+            .workloads
+            .iter()
+            .map(|record| record.workload.key())
+            .collect::<Vec<_>>();
+        let endpoint_keys = discovery
+            .endpoints
+            .iter()
+            .map(|record| record.endpoint.key())
+            .collect::<Vec<_>>();
+
+        assert_eq!(workload_keys.len(), 2);
+        assert!(workload_keys.contains(&"tenant-a/media/ingest".to_string()));
+        assert!(workload_keys.contains(&"tenant-b/media/ingest".to_string()));
+        assert!(endpoint_keys.contains(&"tenant-a/media/ingest#camera.frames".to_string()));
+        assert!(endpoint_keys.contains(&"tenant-b/media/ingest#camera.frames".to_string()));
+    }
+
+    #[test]
+    fn pipeline_endpoint_must_be_declared_by_workload_contracts() {
+        let mut state = sample_state();
+        let contract = event_contract();
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: workload.clone(),
+                module: "ingest.wasm".to_string(),
+                replicas: 1,
+                contracts: Vec::new(),
+                isolation: IsolationProfile::Standard,
+            })
+            .expect("deployment");
+
+        state.upsert_pipeline(PipelineSpec {
+            name: "pipeline".to_string(),
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            edges: vec![PipelineEdge {
+                from: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: workload.clone(),
+                        name: contract.name.clone(),
+                    },
+                    contract: contract.clone(),
+                },
+                to: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload,
+                        name: contract.name.clone(),
+                    },
+                    contract,
+                },
+            }],
+        });
+
+        let err = ensure_pipeline_consistency(&state).expect_err("undeclared contract rejected");
+        assert!(err.to_string().contains("must be declared by workload"));
+    }
 }

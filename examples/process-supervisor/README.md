@@ -39,7 +39,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  start --node "$SELIUM_NODE" --instance-id process-supervisor-demo \
+  start --node "$SELIUM_NODE" --replica-key process-supervisor-demo \
   --module modules/process_supervisor.wasm
 
 cargo run -p selium -- \
@@ -54,7 +54,7 @@ cargo run -p selium -- \
   --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
-  stop --node "$SELIUM_NODE" --instance-id process-supervisor-demo
+  stop --node "$SELIUM_NODE" --replica-key process-supervisor-demo
 ```
 
 The parent process launches child entrypoint `worker` from the same Wasm module file. That is why the module artifact name matters in this example.

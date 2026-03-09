@@ -22,9 +22,9 @@ use selium_control_plane_protocol::{
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
     api::{
-        ContractRef, ControlPlaneState, DeploymentSpec, PipelineEdge, PipelineEndpoint,
-        PipelineSpec, collect_contracts_for_app, ensure_pipeline_consistency,
-        generate_rust_bindings, parse_contract_ref, parse_idl,
+        ContractRef, ControlPlaneState, DeploymentSpec, EventEndpointRef, PipelineEdge,
+        PipelineEndpoint, PipelineSpec, WorkloadRef, collect_contracts_for_workload,
+        ensure_pipeline_consistency, generate_rust_bindings, parse_contract_ref, parse_idl,
     },
     apply, build_module_spec as build_runtime_module_spec,
     default_capabilities as default_runtime_capabilities,
@@ -83,6 +83,7 @@ async fn run() -> Result<()> {
 }
 
 async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<()> {
+    let workload = workload_ref(args.tenant, args.namespace, args.workload);
     let contracts = args
         .contracts
         .iter()
@@ -93,7 +94,7 @@ async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<(
         &daemon,
         Mutation::UpsertDeployment {
             spec: DeploymentSpec {
-                app: args.app,
+                workload: workload.clone(),
                 module: args.module,
                 replicas: args.replicas,
                 contracts,
@@ -103,40 +104,55 @@ async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<(
     )
     .await?;
 
-    println!("deployment upserted");
+    println!("deployment upserted {}", workload);
     Ok(())
 }
 
 async fn cmd_connect(daemon: Arc<DaemonQuicClient>, args: ConnectArgs) -> Result<()> {
     let mut state = cp_query_state(&daemon, false).await?;
     let contract = parse_contract_ref(&args.contract)?;
+    let pipeline_key = qualified_pipeline_key(&args.tenant, &args.namespace, &args.pipeline);
+    let from_workload = workload_ref(
+        args.tenant.clone(),
+        args.namespace.clone(),
+        args.from_workload,
+    );
+    let to_workload = workload_ref(
+        args.tenant.clone(),
+        args.namespace.clone(),
+        args.to_workload,
+    );
 
     let edge = PipelineEdge {
         from: PipelineEndpoint {
-            app: args.from_app,
+            endpoint: EventEndpointRef {
+                workload: from_workload,
+                name: args.endpoint.clone(),
+            },
             contract: contract.clone(),
         },
         to: PipelineEndpoint {
-            app: args.to_app,
+            endpoint: EventEndpointRef {
+                workload: to_workload,
+                name: args.endpoint.clone(),
+            },
             contract,
         },
     };
 
     let pipeline_spec = {
-        let pipeline = state
-            .pipelines
-            .entry(args.pipeline.clone())
-            .or_insert(PipelineSpec {
-                name: args.pipeline,
-                namespace: args.namespace,
-                edges: Vec::new(),
-            });
+        let pipeline = state.pipelines.entry(pipeline_key).or_insert(PipelineSpec {
+            name: args.pipeline,
+            tenant: args.tenant,
+            namespace: args.namespace,
+            edges: Vec::new(),
+        });
         pipeline.edges.push(edge);
         pipeline.clone()
     };
 
     ensure_pipeline_consistency(&state)
-        .with_context(|| "pipeline references unknown deployment or contract")?;
+        .with_context(|| "pipeline references unknown workload or event contract")?;
 
     cp_mutate(
         &daemon,
@@ -146,20 +162,21 @@ async fn cmd_connect(daemon: Arc<DaemonQuicClient>, args: ConnectArgs) -> Result
     )
     .await?;
 
-    println!("pipeline edge added");
+    println!("pipeline event edge added");
     Ok(())
 }
 
 async fn cmd_scale(daemon: Arc<DaemonQuicClient>, args: ScaleArgs) -> Result<()> {
+    let workload = workload_ref(args.tenant, args.namespace, args.workload);
     cp_mutate(
         &daemon,
         Mutation::SetScale {
-            app: args.app.clone(),
+            workload: workload.clone(),
             replicas: args.replicas,
         },
     )
     .await?;
-    println!("scaled {} to {} replicas", args.app, args.replicas.max(1));
+    println!("scaled {} to {} replicas", workload, args.replicas.max(1));
     Ok(())
 }
 
@@ -179,13 +196,13 @@ async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<(
         .await?;
 
     println!("replay events: {}", replay.events.len());
-    if let Some(app) = args.app {
+    if let Some(workload) = replay_workload_ref(args)? {
         let state = cp_query_state(&daemon, true).await?;
-        let contracts = collect_contracts_for_app(&state, &app)
+        let contracts = collect_contracts_for_workload(&state, &workload)
             .into_iter()
             .map(format_contract)
             .collect::<Vec<_>>();
-        println!("app contracts: {}", contracts.join(", "));
+        println!("workload contracts: {}", contracts.join(", "));
     }
     println!("{:#?}", replay.events);
     Ok(())
@@ -254,14 +271,15 @@ async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()>
             Method::StartInstance,
             &StartRequest {
                 node_id: args.node,
-                instance_id: args.instance_id,
+                instance_id: args.replica_key,
                 module_spec,
+                managed_event_bindings: Vec::new(),
             },
         )
         .await?;
 
     println!(
-        "start status={} instance={} process_id={} already_running={}",
+        "start status={} replica_key={} process_id={} already_running={}",
         response.status, response.instance_id, response.process_id, response.already_running
     );
     Ok(())
@@ -273,13 +291,13 @@ async fn cmd_stop(daemon: Arc<DaemonQuicClient>, args: StopArgs) -> Result<()> {
             Method::StopInstance,
             &StopRequest {
                 node_id: args.node,
-                instance_id: args.instance_id,
+                instance_id: args.replica_key,
             },
         )
         .await?;
 
     println!(
-        "stop status={} instance={} process_id={}",
+        "stop status={} replica_key={} process_id={}",
         response.status,
         response.instance_id,
         response
@@ -322,6 +340,7 @@ async fn cmd_list(
             .await
             .unwrap_or(ListResponse {
                 instances: BTreeMap::new(),
+                active_routes: Vec::new(),
             });
         println!("node={}", node.name);
         print_instance_map(&list.instances);
@@ -342,11 +361,11 @@ async fn cmd_agent(
     let mut agent_state = load_agent_state(&agent_state_path)?;
 
     loop {
-        let state = cp_query_state(&daemon, false).await?;
+        let state = cp_query_state(&daemon, true).await?;
         ensure_pipeline_consistency(&state)?;
         let plan = build_plan(&state)?;
 
-        let actions = reconcile(&args.node, &plan, &agent_state);
+        let actions = reconcile(&args.node, &state, &plan, &agent_state);
         execute_daemon_actions(&daemon, conn_args, &state, &actions, &args.node).await?;
         apply(&mut agent_state, &actions);
         save_agent_state(&agent_state_path, &agent_state)?;
@@ -516,12 +535,12 @@ async fn execute_daemon_actions(
     node: &str,
 ) -> Result<()> {
     let node_client = node_client(daemon, conn_args, node).await?;
-
     for action in actions {
         match action {
             ReconcileAction::Start {
                 instance_id,
                 deployment,
+                managed_event_bindings,
             } => {
                 let spec = state
                     .deployments
@@ -535,6 +554,7 @@ async fn execute_daemon_actions(
                             node_id: node.to_string(),
                             instance_id: instance_id.clone(),
                             module_spec,
+                            managed_event_bindings: managed_event_bindings.clone(),
                         },
                     )
                     .await?;
@@ -546,6 +566,40 @@ async fn execute_daemon_actions(
                         &StopRequest {
                             node_id: node.to_string(),
                             instance_id: instance_id.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            ReconcileAction::EnsureEventRoute {
+                route_id,
+                source_instance_id,
+                source_endpoint,
+                target_instance_id,
+                target_node,
+                target_endpoint,
+            } => {
+                let _ = node_client
+                    .request::<_, selium_control_plane_protocol::ActivateEventRouteResponse>(
+                        Method::ActivateEventRoute,
+                        &selium_control_plane_protocol::ActivateEventRouteRequest {
+                            node_id: node.to_string(),
+                            route_id: route_id.clone(),
+                            source_instance_id: source_instance_id.clone(),
+                            source_endpoint: source_endpoint.clone(),
+                            target_instance_id: target_instance_id.clone(),
+                            target_node: target_node.clone(),
+                            target_endpoint: target_endpoint.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            ReconcileAction::RemoveEventRoute { route_id } => {
+                let _ = node_client
+                    .request::<_, selium_control_plane_protocol::DeactivateEventRouteResponse>(
+                        Method::DeactivateEventRoute,
+                        &selium_control_plane_protocol::DeactivateEventRouteRequest {
+                            node_id: node.to_string(),
+                            route_id: route_id.clone(),
                         },
                     )
                     .await?;
@@ -573,6 +627,30 @@ fn build_module_spec(
     };
 
     build_runtime_module_spec(module, adaptor, profile, capabilities)
+}
+
+fn workload_ref(tenant: String, namespace: String, workload: String) -> WorkloadRef {
+    WorkloadRef {
+        tenant,
+        namespace,
+        name: workload,
+    }
+}
+
+fn replay_workload_ref(args: ReplayArgs) -> Result<Option<WorkloadRef>> {
+    match (args.tenant, args.namespace, args.workload) {
+        (Some(tenant), Some(namespace), Some(workload)) => {
+            Ok(Some(workload_ref(tenant, namespace, workload)))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(anyhow!(
+            "provide --tenant, --namespace, and --workload together when filtering replay output"
+        )),
+    }
+}
+
+fn qualified_pipeline_key(tenant: &str, namespace: &str, pipeline: &str) -> String {
+    format!("{tenant}/{namespace}/{pipeline}")
 }
 
 fn load_agent_state(path: &Path) -> Result<AgentState> {
