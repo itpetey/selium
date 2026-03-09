@@ -18,19 +18,17 @@ use rustls_pemfile::{certs, private_key};
 use selium_abi::{
     Capability, DataValue, InteractionKind, NetworkProtocol, QueueAck, QueueAttach, QueueCommit,
     QueueCreate, QueueDelivery, QueueOverflow, QueueReserve, QueueRole, QueueStatusCode, ShmAlloc,
-    decode_rkyv, encode_rkyv,
+    encode_rkyv,
 };
-use selium_control_plane_api::{ControlPlaneState, EventEndpointRef};
+use selium_control_plane_api::EventEndpointRef;
 use selium_control_plane_protocol::{
     ActivateEventRouteRequest, ActivateEventRouteResponse, DeactivateEventRouteRequest,
     DeactivateEventRouteResponse, DeliverEventFrameRequest, DeliverEventFrameResponse, Empty,
     EventRouteMode, ListRequest, ListResponse, ManagedEventBinding, ManagedEventBindingRole,
-    Method, QueryApiRequest, QueryApiResponse, StartRequest, StartResponse, StatusApiResponse,
-    StopRequest, StopResponse, decode_envelope, decode_error, decode_payload,
-    encode_error_response, encode_request, encode_response, is_error, is_request, read_framed,
-    write_framed,
+    Method, StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
+    decode_envelope, decode_error, decode_payload, encode_error_response, encode_request,
+    encode_response, is_error, is_request, read_framed, write_framed,
 };
-use selium_control_plane_runtime::Query;
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
     Kernel,
@@ -97,6 +95,8 @@ struct ActiveEventRouteSpec {
     target_endpoint: EventEndpointRef,
     mode: EventRouteMode,
     target_node: String,
+    target_daemon_addr: String,
+    target_daemon_server_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -193,30 +193,6 @@ impl LocalControlPlaneClient {
         }
 
         Err(anyhow!("timed out waiting for guest control-plane module"))
-    }
-
-    async fn query(&self, query: Query, allow_stale: bool) -> Result<QueryApiResponse> {
-        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
-        let frame = encode_request(
-            Method::ControlQuery,
-            request_id,
-            &QueryApiRequest { query, allow_stale },
-        )
-        .context("encode control query")?;
-        let response = self.request_raw(&frame).await?;
-        let envelope = decode_envelope(&response).context("decode query response")?;
-        if envelope.method != Method::ControlQuery || envelope.request_id != request_id {
-            bail!("control-plane query returned mismatched envelope");
-        }
-        if is_error(&envelope) {
-            let err = decode_error(&envelope).context("decode query error")?;
-            bail!(
-                "control-plane query failed with {}: {}",
-                err.code,
-                err.message
-            );
-        }
-        decode_payload(&envelope).context("decode query payload")
     }
 
     async fn reset_connection(&self) {
@@ -982,17 +958,21 @@ async fn activate_event_route(
         );
     }
 
+    let mode = if payload.target_node == state.node_id {
+        EventRouteMode::Local
+    } else {
+        EventRouteMode::Remote
+    };
+
     let spec = ActiveEventRouteSpec {
         source_instance_id: payload.source_instance_id.clone(),
         source_endpoint: payload.source_endpoint.clone(),
         target_instance_id: payload.target_instance_id.clone(),
         target_endpoint: payload.target_endpoint.clone(),
-        mode: if payload.target_node == state.node_id {
-            EventRouteMode::Local
-        } else {
-            EventRouteMode::Remote
-        },
+        mode,
         target_node: payload.target_node.clone(),
+        target_daemon_addr: payload.target_daemon_addr.clone(),
+        target_daemon_server_name: payload.target_daemon_server_name.clone(),
     };
 
     let mut routes = state.active_routes.lock().await;
@@ -1201,8 +1181,9 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                         .await?
                     }
                     EventRouteMode::Remote => match deliver_event_frame_remote(
-                        &state,
-                        &spec.target_node,
+                        state.tls_paths.clone(),
+                        &spec.target_daemon_addr,
+                        &spec.target_daemon_server_name,
                         &spec.target_instance_id,
                         &spec.target_endpoint.name,
                         &payload,
@@ -1360,27 +1341,23 @@ async fn enqueue_managed_event_frame(
 }
 
 async fn deliver_event_frame_remote(
-    state: &DaemonState,
-    target_node: &str,
+    tls_paths: ManagedEventTlsPaths,
+    target_daemon_addr: &str,
+    target_daemon_server_name: &str,
     target_instance_id: &str,
     target_endpoint_name: &str,
     payload: &[u8],
 ) -> Result<bool> {
-    let control_plane = query_control_plane_state(&state.control_plane).await?;
-    let node = control_plane
-        .nodes
-        .get(target_node)
-        .ok_or_else(|| anyhow!("missing daemon details for node `{target_node}`"))?;
     let endpoint = build_client_endpoint(
-        &state.tls_paths.ca_cert,
-        &state.tls_paths.client_cert,
-        &state.tls_paths.client_key,
+        &tls_paths.ca_cert,
+        &tls_paths.client_cert,
+        &tls_paths.client_key,
     )?;
     let connection = timeout(
         QUIC_CONNECT_TIMEOUT,
         endpoint.connect(
-            node.daemon_addr.parse::<SocketAddr>()?,
-            &node.daemon_server_name,
+            target_daemon_addr.parse::<SocketAddr>()?,
+            target_daemon_server_name,
         )?,
     )
     .await
@@ -1422,20 +1399,6 @@ async fn deliver_event_frame_remote(
 
 fn endpoint_key(instance_id: &str, endpoint_name: &str) -> (String, String) {
     (instance_id.to_string(), endpoint_name.to_string())
-}
-
-async fn query_control_plane_state(
-    control_plane: &LocalControlPlaneClient,
-) -> Result<ControlPlaneState> {
-    let response = control_plane.query(Query::ControlPlaneState, true).await?;
-    let Some(DataValue::Bytes(bytes)) = response.result else {
-        let detail = response
-            .error
-            .or(response.leader_hint)
-            .unwrap_or_else(|| "no result payload".to_string());
-        bail!("control-plane state query did not return bytes: {detail}")
-    };
-    decode_rkyv(&bytes).context("decode control-plane state")
 }
 
 fn rpc_decode_error(method: Method, request_id: u64, error: anyhow::Error) -> Result<Vec<u8>> {
@@ -1600,6 +1563,8 @@ mod tests {
                         source_endpoint: sample_endpoint("ingress", "camera.frames"),
                         target_instance_id: "target-1".to_string(),
                         target_node: "local-node".to_string(),
+                        target_daemon_addr: "127.0.0.1:7100".to_string(),
+                        target_daemon_server_name: "localhost".to_string(),
                         target_endpoint: sample_endpoint("detector", "camera.frames"),
                     },
                 )

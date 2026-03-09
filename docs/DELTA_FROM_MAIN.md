@@ -200,11 +200,8 @@ are not the supported application-facing discovery or bind identifiers.
 Current verification covers public discovery filtering, denied event-endpoint
 binds, operational running-process discovery behaviour, local route forwarding,
 remote daemon frame delivery, and a dedicated ignored multi-node CLI
-integration intended to prove payload delivery across a full
-`deploy` → `connect` → `agent --once` workflow. On the current workspace tree,
-that ignored topology integration remains blocked by the `node-b`
-processor/sink startup path, so it should not yet be treated as verified
-end-to-end proof.
+integration that proves payload delivery across a full `deploy` → `connect` →
+`agent --once` workflow on the current workspace tree.
 
 ## `todo!()` / `unimplemented!()` Inventory
 

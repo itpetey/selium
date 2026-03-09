@@ -921,6 +921,11 @@ async fn execute_daemon_actions(
                 target_node,
                 target_endpoint,
             } => {
+                let target_spec = cp_state
+                    .nodes
+                    .get(target_node)
+                    .ok_or_else(|| anyhow!("unknown target node `{target_node}`"))?
+                    .clone();
                 let _: ActivateEventRouteResponse = send_daemon_rpc(
                     state,
                     &authority,
@@ -932,6 +937,8 @@ async fn execute_daemon_actions(
                         source_endpoint: source_endpoint.clone(),
                         target_instance_id: target_instance_id.clone(),
                         target_node: target_node.clone(),
+                        target_daemon_addr: target_spec.daemon_addr,
+                        target_daemon_server_name: target_spec.daemon_server_name,
                         target_endpoint: target_endpoint.clone(),
                     },
                 )

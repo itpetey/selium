@@ -227,6 +227,8 @@ pub struct ActivateEventRouteRequest {
     pub source_endpoint: EventEndpointRef,
     pub target_instance_id: String,
     pub target_node: String,
+    pub target_daemon_addr: String,
+    pub target_daemon_server_name: String,
     pub target_endpoint: EventEndpointRef,
 }
 
