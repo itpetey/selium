@@ -17,6 +17,13 @@ const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
 const USER_ECHO_ARTIFACT: &str = "rpc_echo_service.wasm";
 const USER_IO_MANIFEST: &str = "examples/event-broadcast/Cargo.toml";
 const USER_IO_ARTIFACT: &str = "event_broadcast.wasm";
+const TOPOLOGY_INGRESS_MANIFEST: &str = "examples/control-plane-topology/apps/ingress/Cargo.toml";
+const TOPOLOGY_INGRESS_ARTIFACT: &str = "cp_topology_ingress.wasm";
+const TOPOLOGY_PROCESSOR_MANIFEST: &str =
+    "examples/control-plane-topology/apps/processor/Cargo.toml";
+const TOPOLOGY_PROCESSOR_ARTIFACT: &str = "cp_topology_processor.wasm";
+const TOPOLOGY_SINK_MANIFEST: &str = "examples/control-plane-topology/apps/sink/Cargo.toml";
+const TOPOLOGY_SINK_ARTIFACT: &str = "cp_topology_sink.wasm";
 const CONTROL_PLANE_MANIFEST: &str = "modules/control-plane/Cargo.toml";
 const CONTROL_PLANE_ARTIFACT: &str = "selium_module_control_plane.wasm";
 const STAGED_CONTROL_PLANE_ARTIFACT: &str = "control-plane.wasm";
@@ -50,6 +57,9 @@ pub struct ClusterHarness {
     control_plane_source: PathBuf,
     user_echo_source: PathBuf,
     user_io_source: PathBuf,
+    topology_ingress_source: PathBuf,
+    topology_processor_source: PathBuf,
+    topology_sink_source: PathBuf,
     config: ClusterHarnessConfig,
     nodes: Vec<NodeProcess>,
 }
@@ -91,6 +101,15 @@ impl ClusterHarness {
             user_io_source: root
                 .join("target/wasm32-unknown-unknown/debug")
                 .join(USER_IO_ARTIFACT),
+            topology_ingress_source: root
+                .join("target/wasm32-unknown-unknown/debug")
+                .join(TOPOLOGY_INGRESS_ARTIFACT),
+            topology_processor_source: root
+                .join("target/wasm32-unknown-unknown/debug")
+                .join(TOPOLOGY_PROCESSOR_ARTIFACT),
+            topology_sink_source: root
+                .join("target/wasm32-unknown-unknown/debug")
+                .join(TOPOLOGY_SINK_ARTIFACT),
             root,
             base_dir,
             cert_dir,
@@ -109,6 +128,19 @@ impl ClusterHarness {
         Ok(())
     }
 
+    pub fn prepare_control_plane_topology(&self) -> Result<()> {
+        self.build_example_wasm(TOPOLOGY_INGRESS_MANIFEST, &self.topology_ingress_source)?;
+        self.build_example_wasm(TOPOLOGY_PROCESSOR_MANIFEST, &self.topology_processor_source)?;
+        self.build_example_wasm(TOPOLOGY_SINK_MANIFEST, &self.topology_sink_source)?;
+        self.stage_module_for_all_nodes(&self.topology_ingress_source, TOPOLOGY_INGRESS_ARTIFACT)?;
+        self.stage_module_for_all_nodes(
+            &self.topology_processor_source,
+            TOPOLOGY_PROCESSOR_ARTIFACT,
+        )?;
+        self.stage_module_for_all_nodes(&self.topology_sink_source, TOPOLOGY_SINK_ARTIFACT)?;
+        Ok(())
+    }
+
     pub fn daemon_addr_for(&self, node_id: &str) -> Result<String> {
         self.nodes
             .iter()
@@ -123,6 +155,31 @@ impl ClusterHarness {
 
     pub fn user_io_module_relative_path(&self) -> &'static str {
         "modules/event_broadcast.wasm"
+    }
+
+    pub fn topology_contract_path(&self) -> &'static str {
+        "examples/control-plane-topology/contracts/analytics.topology.v1.selium"
+    }
+
+    pub fn topology_ingress_module_relative_path(&self) -> &'static str {
+        "modules/cp_topology_ingress.wasm"
+    }
+
+    pub fn topology_processor_module_relative_path(&self) -> &'static str {
+        "modules/cp_topology_processor.wasm"
+    }
+
+    pub fn topology_sink_module_relative_path(&self) -> &'static str {
+        "modules/cp_topology_sink.wasm"
+    }
+
+    pub fn agent_state_path(&self, node_id: &str) -> Result<PathBuf> {
+        if !self.nodes.iter().any(|node| node.id == node_id) {
+            bail!("unknown node id `{node_id}`");
+        }
+        let dir = self.base_dir.join("agent-state");
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(dir.join(format!("{node_id}.rkyv")))
     }
 
     pub fn runtime_pids(&self) -> Vec<u32> {
@@ -144,6 +201,26 @@ impl ClusterHarness {
         let stderr = fs::read_to_string(&node.stderr_log)
             .with_context(|| format!("read {}", node.stderr_log.display()))?;
         Ok(format!("{stdout}\n{stderr}"))
+    }
+
+    pub async fn wait_for_node_log_contains(
+        &mut self,
+        node_id: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_logs = String::new();
+        while Instant::now() < deadline {
+            self.ensure_nodes_alive()?;
+            last_logs = self.node_logs(node_id)?;
+            if last_logs.contains(needle) {
+                return Ok(last_logs);
+            }
+            sleep(self.config.poll_interval).await;
+        }
+
+        bail!("timed out waiting for log text `{needle}` on {node_id}. last logs:\n{last_logs}")
     }
 
     pub async fn wait_for_consensus_ready(&mut self) -> Result<()> {
@@ -220,6 +297,62 @@ impl ClusterHarness {
         }
 
         unreachable!("retry loop should always return or bail")
+    }
+
+    pub async fn wait_for_cli_contains(
+        &mut self,
+        daemon_addr: &str,
+        args: &[&str],
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_output = String::new();
+        while Instant::now() < deadline {
+            self.ensure_nodes_alive()?;
+            last_output = self.run_cli(daemon_addr, args)?;
+            if last_output.contains(needle) {
+                return Ok(last_output);
+            }
+            sleep(self.config.poll_interval).await;
+        }
+
+        bail!(
+            "timed out waiting for CLI output {:?} on {} to contain `{}`. last output:\n{}",
+            args,
+            daemon_addr,
+            needle,
+            last_output
+        )
+    }
+
+    pub async fn wait_for_any_cli_contains(
+        &mut self,
+        daemon_addrs: &[&str],
+        args: &[&str],
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<(String, String)> {
+        let deadline = Instant::now() + timeout;
+        let mut last_output = String::new();
+        while Instant::now() < deadline {
+            self.ensure_nodes_alive()?;
+            for daemon_addr in daemon_addrs {
+                let output = self.run_cli(daemon_addr, args)?;
+                if output.contains(needle) {
+                    return Ok(((*daemon_addr).to_string(), output));
+                }
+                last_output = output;
+            }
+            sleep(self.config.poll_interval).await;
+        }
+
+        bail!(
+            "timed out waiting for CLI output {:?} to contain `{}` on any daemon. last output:\n{}",
+            args,
+            needle,
+            last_output
+        )
     }
 
     fn fetch_live_nodes(&self, daemon_addr: &str) -> Result<BTreeSet<String>> {
@@ -326,6 +459,15 @@ impl ClusterHarness {
         Ok(())
     }
 
+    fn stage_module_for_all_nodes(&self, source: &Path, staged_name: &str) -> Result<()> {
+        for node in &self.nodes {
+            let target = node.work_dir.join("modules").join(staged_name);
+            fs::copy(source, &target)
+                .with_context(|| format!("copy module {} -> {}", source.display(), target.display()))?;
+        }
+        Ok(())
+    }
+
     fn generate_certs(&self) -> Result<()> {
         let output = Command::new(&self.runtime_bin)
             .arg("generate-certs")
@@ -347,6 +489,7 @@ impl ClusterHarness {
             id: "node-a",
             port: ports[0],
             internal_addr: internal_addr_a,
+            capacity_slots: 1,
             bootstrap_leader: true,
             peers: vec![format!("node-b={addr_b}@{DEFAULT_SERVER_NAME}")],
         };
@@ -354,6 +497,7 @@ impl ClusterHarness {
             id: "node-b",
             port: ports[2],
             internal_addr: internal_addr_b,
+            capacity_slots: 2,
             bootstrap_leader: false,
             peers: vec![format!("node-a={addr_a}@{DEFAULT_SERVER_NAME}")],
         };
@@ -438,6 +582,8 @@ impl ClusterHarness {
             .arg(self.cert_dir.join("client.key"))
             .arg("--cp-heartbeat-interval-ms")
             .arg("500")
+            .arg("--cp-capacity-slots")
+            .arg(start.capacity_slots.to_string())
             .arg("--cp-server-name")
             .arg(DEFAULT_SERVER_NAME)
             .stdout(Stdio::from(stdout))
@@ -494,6 +640,7 @@ struct NodeStart<'a> {
     id: &'a str,
     port: u16,
     internal_addr: String,
+    capacity_slots: u32,
     bootstrap_leader: bool,
     peers: Vec<String>,
 }

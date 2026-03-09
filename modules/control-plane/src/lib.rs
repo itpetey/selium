@@ -226,8 +226,21 @@ pub fn reconcile(
         }
     }
 
-    actions.sort_by(|lhs, rhs| format!("{lhs:?}").cmp(&format!("{rhs:?}")));
+    actions.sort_by(|lhs, rhs| {
+        action_order(lhs)
+            .cmp(&action_order(rhs))
+            .then_with(|| format!("{lhs:?}").cmp(&format!("{rhs:?}")))
+    });
     actions
+}
+
+fn action_order(action: &ReconcileAction) -> u8 {
+    match action {
+        ReconcileAction::RemoveEventRoute { .. } => 0,
+        ReconcileAction::Stop { .. } => 1,
+        ReconcileAction::Start { .. } => 2,
+        ReconcileAction::EnsureEventRoute { .. } => 3,
+    }
 }
 
 pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
@@ -1331,6 +1344,79 @@ event camera.frames(Frame) {
             actions
                 .iter()
                 .any(|action| matches!(action, ReconcileAction::EnsureEventRoute { .. }))
+        );
+    }
+
+    #[test]
+    fn reconcile_orders_starts_before_event_routes() {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(parse_idl(SAMPLE_IDL).expect("parse idl"))
+            .expect("register package");
+
+        let ingest = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        let detector = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "detector".to_string(),
+        };
+        let contract = ContractRef {
+            namespace: "media.pipeline".to_string(),
+            name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        };
+        for workload in [ingest.clone(), detector.clone()] {
+            state
+                .upsert_deployment(DeploymentSpec {
+                    workload,
+                    module: "module.wasm".to_string(),
+                    replicas: 1,
+                    contracts: vec![contract.clone()],
+                    isolation: IsolationProfile::Standard,
+                })
+                .expect("deployment");
+        }
+        state.upsert_pipeline(PipelineSpec {
+            name: "camera".to_string(),
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            edges: vec![PipelineEdge {
+                from: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: ingest,
+                        name: "camera.frames".to_string(),
+                    },
+                    contract: contract.clone(),
+                },
+                to: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: detector,
+                        name: "camera.frames".to_string(),
+                    },
+                    contract,
+                },
+            }],
+        });
+
+        let desired = build_plan(&state).expect("schedule");
+        let actions = reconcile("local-node", &state, &desired, &AgentState::default());
+        let start_idx = actions
+            .iter()
+            .position(|action| matches!(action, ReconcileAction::Start { .. }))
+            .expect("start action");
+        let ensure_idx = actions
+            .iter()
+            .position(|action| matches!(action, ReconcileAction::EnsureEventRoute { .. }))
+            .expect("ensure action");
+
+        assert!(
+            start_idx < ensure_idx,
+            "expected start before ensure actions, got {actions:?}"
         );
     }
 }

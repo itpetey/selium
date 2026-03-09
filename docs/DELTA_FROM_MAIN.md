@@ -199,9 +199,8 @@ are not the supported application-facing discovery or bind identifiers.
 
 Current verification covers public discovery filtering, denied event-endpoint
 binds, operational running-process discovery behaviour, local route forwarding,
-and remote daemon frame delivery. The remaining explicit verification boundary
-is that the repository does not yet contain one dedicated multi-node ignored
-integration test that proves payload delivery across a full
+remote daemon frame delivery, and a dedicated ignored multi-node CLI
+integration that proves payload delivery across a full
 `deploy` → `connect` → `agent --once` workflow end-to-end.
 
 ## `todo!()` / `unimplemented!()` Inventory
@@ -245,6 +244,7 @@ Search performed: `rg -n "\\b(todo!|unimplemented!)\\s*\\(" .`
   - one-runtime-per-node topology
   - targeted CLI launch
   - guest-side I/O smoke
+  - control-plane topology deploy/connect/agent-once remote delivery
 
 ## Priority Follow-Ups
 
@@ -253,8 +253,5 @@ Search performed: `rg -n "\\b(todo!|unimplemented!)\\s*\\(" .`
 2. Decide which removed first-party examples need direct replacements:
    load-balancer, HTTPS load-balancer, WAF, and log analysis are the clearest
    user-visible gaps.
-3. Add a dedicated multi-node ignored integration that proves the full
-   `deploy` → `connect` → `agent --once` flow delivers payloads end-to-end,
-   now that cross-deployment routing is implemented.
-4. Implement real session authentication in `Session::authenticate` instead of
+3. Implement real session authentication in `Session::authenticate` instead of
    leaving `todo!()`.

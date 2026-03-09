@@ -1210,6 +1210,13 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                     }
                 };
                 if delivered {
+                    if spec.mode == EventRouteMode::Remote {
+                        info!(
+                            "delivered remote managed event frame {} -> {}",
+                            spec.source_endpoint.key(),
+                            spec.target_endpoint.key()
+                        );
+                    }
                     QueueService
                         .ack(
                             &reader,
