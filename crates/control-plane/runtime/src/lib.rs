@@ -7,7 +7,7 @@ use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_control_plane_api::{
     ApiError, ControlPlaneState, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryOperation,
     DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, NodeSpec,
-    OperationalProcessRecord, OperationalProcessSelector, PipelineSpec, ResolvedEventEndpoint,
+    OperationalProcessRecord, OperationalProcessSelector, PipelineSpec, ResolvedEndpoint,
     ResolvedWorkload, WorkloadRef, build_discovery_state, ensure_pipeline_consistency, parse_idl,
 };
 use selium_control_plane_scheduler::{build_plan, deployment_contract_usage};
@@ -413,7 +413,7 @@ fn resolve_discovery(
                 endpoints,
             }))
         }
-        DiscoveryTarget::EventEndpoint(endpoint) => {
+        DiscoveryTarget::Endpoint(endpoint) => {
             if !request.scope.allows_endpoint(request.operation, &endpoint) {
                 return Err(ApiError::Unauthorised {
                     operation: request.operation.as_str().to_string(),
@@ -428,7 +428,7 @@ fn resolve_discovery(
                 .find(|record| record.endpoint == endpoint)
                 .ok_or_else(|| ApiError::UnknownEndpoint(endpoint.key()))?;
 
-            Ok(DiscoveryResolution::EventEndpoint(ResolvedEventEndpoint {
+            Ok(DiscoveryResolution::Endpoint(ResolvedEndpoint {
                 contract: endpoint_record.contract,
                 endpoint,
             }))
@@ -561,14 +561,42 @@ fn serialize_table_result(result: TableApplyResult) -> DataValue {
 mod tests {
     use super::*;
     use selium_control_plane_api::{
-        ContractRef, DiscoveryPattern, EventEndpointRef, IsolationProfile, parse_idl,
+        ContractKind, ContractRef, DiscoveryPattern, IsolationProfile, PublicEndpointRef, parse_idl,
     };
     use selium_io_consensus::{ConsensusConfig, RaftNode};
 
     fn event_contract() -> ContractRef {
         ContractRef {
             namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Event,
             name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn service_contract() -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Service,
+            name: "camera.detect".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn stream_contract() -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Stream,
+            name: "camera.raw".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn shared_name_contract(kind: ContractKind) -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind,
+            name: "camera.shared".to_string(),
             version: "v1".to_string(),
         }
     }
@@ -606,6 +634,74 @@ mod tests {
                 })
                 .expect("deployment");
         }
+
+        ControlPlaneEngine::new(state)
+    }
+
+    fn multi_kind_discovery_engine() -> ControlPlaneEngine {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(
+                parse_idl(
+                    "package media.pipeline.v1;\n\
+                     schema Frame { camera_id: string; }\n\
+                     event camera.frames(Frame) { replay: enabled; }\n\
+                     service camera.detect(Frame) -> Frame;\n\
+                     stream camera.raw(Frame);",
+                )
+                .expect("parse"),
+            )
+            .expect("register");
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "router".to_string(),
+                },
+                module: "tenant-a-media-router.wasm".to_string(),
+                replicas: 2,
+                contracts: vec![event_contract(), service_contract(), stream_contract()],
+                isolation: IsolationProfile::Standard,
+            })
+            .expect("deployment");
+
+        ControlPlaneEngine::new(state)
+    }
+
+    fn same_name_multi_kind_discovery_engine() -> ControlPlaneEngine {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(
+                parse_idl(
+                    "package media.pipeline.v1;\n\
+                     schema Frame { camera_id: string; }\n\
+                     event camera.shared(Frame) { replay: enabled; }\n\
+                     service camera.shared(Frame) -> Frame;\n\
+                     stream camera.shared(Frame);",
+                )
+                .expect("parse"),
+            )
+            .expect("register");
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "router".to_string(),
+                },
+                module: "tenant-a-media-router.wasm".to_string(),
+                replicas: 2,
+                contracts: vec![
+                    shared_name_contract(ContractKind::Event),
+                    shared_name_contract(ContractKind::Service),
+                    shared_name_contract(ContractKind::Stream),
+                ],
+                isolation: IsolationProfile::Standard,
+            })
+            .expect("deployment");
 
         ControlPlaneEngine::new(state)
     }
@@ -727,7 +823,7 @@ mod tests {
         );
         assert_eq!(
             discovery.endpoints[0].endpoint.key(),
-            "tenant-a/media/ingest#camera.frames"
+            "tenant-a/media/ingest#event:camera.frames"
         );
     }
 
@@ -738,12 +834,13 @@ mod tests {
             .query(Query::ResolveDiscovery {
                 request: DiscoveryRequest {
                     operation: DiscoveryOperation::Bind,
-                    target: DiscoveryTarget::EventEndpoint(EventEndpointRef {
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
                         workload: WorkloadRef {
                             tenant: "tenant-a".to_string(),
                             namespace: "media".to_string(),
                             name: "ingest".to_string(),
                         },
+                        kind: ContractKind::Event,
                         name: "camera.frames".to_string(),
                     }),
                     scope: DiscoveryCapabilityScope {
@@ -797,13 +894,14 @@ mod tests {
                     namespace: "media".to_string(),
                     name: "ingest".to_string(),
                 },
-                endpoints: vec![selium_control_plane_api::DiscoverableEventEndpoint {
-                    endpoint: EventEndpointRef {
+                endpoints: vec![selium_control_plane_api::DiscoverableEndpoint {
+                    endpoint: PublicEndpointRef {
                         workload: WorkloadRef {
                             tenant: "tenant-a".to_string(),
                             namespace: "media".to_string(),
                             name: "ingest".to_string(),
                         },
+                        kind: ContractKind::Event,
                         name: "camera.frames".to_string(),
                     },
                     contract: event_contract(),
@@ -819,12 +917,13 @@ mod tests {
             .query(Query::ResolveDiscovery {
                 request: DiscoveryRequest {
                     operation: DiscoveryOperation::Bind,
-                    target: DiscoveryTarget::EventEndpoint(EventEndpointRef {
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
                         workload: WorkloadRef {
                             tenant: "tenant-a".to_string(),
                             namespace: "media".to_string(),
                             name: "ingest".to_string(),
                         },
+                        kind: ContractKind::Event,
                         name: "camera.frames".to_string(),
                     }),
                     scope: DiscoveryCapabilityScope {
@@ -845,18 +944,207 @@ mod tests {
 
         assert_eq!(
             resolution,
-            DiscoveryResolution::EventEndpoint(ResolvedEventEndpoint {
-                endpoint: EventEndpointRef {
+            DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                endpoint: PublicEndpointRef {
                     workload: WorkloadRef {
                         tenant: "tenant-a".to_string(),
                         namespace: "media".to_string(),
                         name: "ingest".to_string(),
                     },
+                    kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                 },
                 contract: event_contract(),
             })
         );
+    }
+
+    #[test]
+    fn discovery_state_lists_event_service_and_stream_endpoints() {
+        let engine = multi_kind_discovery_engine();
+        let query = engine
+            .query(Query::DiscoveryState {
+                scope: DiscoveryCapabilityScope {
+                    operations: vec![DiscoveryOperation::Discover],
+                    workloads: vec![DiscoveryPattern::Exact("tenant-a/media/router".to_string())],
+                    endpoints: Vec::new(),
+                    allow_operational_processes: false,
+                },
+            })
+            .expect("discovery state");
+        let DataValue::Bytes(bytes) = &query.result else {
+            panic!("expected bytes result");
+        };
+        let discovery: DiscoveryState = decode_rkyv(bytes).expect("decode discovery");
+        let endpoint_keys = discovery
+            .endpoints
+            .iter()
+            .map(|record| record.endpoint.key())
+            .collect::<Vec<_>>();
+
+        assert_eq!(discovery.workloads.len(), 1);
+        assert_eq!(
+            endpoint_keys,
+            vec![
+                "tenant-a/media/router#event:camera.frames".to_string(),
+                "tenant-a/media/router#service:camera.detect".to_string(),
+                "tenant-a/media/router#stream:camera.raw".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_service_endpoint_bind_omits_replica_identity() {
+        let engine = multi_kind_discovery_engine();
+        let query = engine
+            .query(Query::ResolveDiscovery {
+                request: DiscoveryRequest {
+                    operation: DiscoveryOperation::Bind,
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "router".to_string(),
+                        },
+                        kind: ContractKind::Service,
+                        name: "camera.detect".to_string(),
+                    }),
+                    scope: DiscoveryCapabilityScope {
+                        operations: vec![DiscoveryOperation::Bind],
+                        workloads: vec![DiscoveryPattern::Exact(
+                            "tenant-a/media/router".to_string(),
+                        )],
+                        endpoints: Vec::new(),
+                        allow_operational_processes: false,
+                    },
+                },
+            })
+            .expect("resolve service endpoint bind");
+        let DataValue::Bytes(bytes) = &query.result else {
+            panic!("expected bytes result");
+        };
+        let resolution: DiscoveryResolution = decode_rkyv(bytes).expect("decode resolution");
+
+        assert_eq!(
+            resolution,
+            DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                endpoint: PublicEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "router".to_string(),
+                    },
+                    kind: ContractKind::Service,
+                    name: "camera.detect".to_string(),
+                },
+                contract: service_contract(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_stream_endpoint_bind_omits_replica_identity() {
+        let engine = multi_kind_discovery_engine();
+        let query = engine
+            .query(Query::ResolveDiscovery {
+                request: DiscoveryRequest {
+                    operation: DiscoveryOperation::Bind,
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "router".to_string(),
+                        },
+                        kind: ContractKind::Stream,
+                        name: "camera.raw".to_string(),
+                    }),
+                    scope: DiscoveryCapabilityScope {
+                        operations: vec![DiscoveryOperation::Bind],
+                        workloads: vec![DiscoveryPattern::Exact(
+                            "tenant-a/media/router".to_string(),
+                        )],
+                        endpoints: Vec::new(),
+                        allow_operational_processes: false,
+                    },
+                },
+            })
+            .expect("resolve stream endpoint bind");
+        let DataValue::Bytes(bytes) = &query.result else {
+            panic!("expected bytes result");
+        };
+        let resolution: DiscoveryResolution = decode_rkyv(bytes).expect("decode resolution");
+
+        assert_eq!(
+            resolution,
+            DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                endpoint: PublicEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "router".to_string(),
+                    },
+                    kind: ContractKind::Stream,
+                    name: "camera.raw".to_string(),
+                },
+                contract: stream_contract(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_same_name_cross_kind_endpoints_uses_explicit_contract_kind() {
+        let engine = same_name_multi_kind_discovery_engine();
+
+        for kind in [
+            ContractKind::Event,
+            ContractKind::Service,
+            ContractKind::Stream,
+        ] {
+            let query = engine
+                .query(Query::ResolveDiscovery {
+                    request: DiscoveryRequest {
+                        operation: DiscoveryOperation::Bind,
+                        target: DiscoveryTarget::Endpoint(PublicEndpointRef {
+                            workload: WorkloadRef {
+                                tenant: "tenant-a".to_string(),
+                                namespace: "media".to_string(),
+                                name: "router".to_string(),
+                            },
+                            kind,
+                            name: "camera.shared".to_string(),
+                        }),
+                        scope: DiscoveryCapabilityScope {
+                            operations: vec![DiscoveryOperation::Bind],
+                            workloads: vec![DiscoveryPattern::Exact(
+                                "tenant-a/media/router".to_string(),
+                            )],
+                            endpoints: Vec::new(),
+                            allow_operational_processes: false,
+                        },
+                    },
+                })
+                .expect("resolve endpoint bind");
+            let DataValue::Bytes(bytes) = &query.result else {
+                panic!("expected bytes result");
+            };
+            let resolution: DiscoveryResolution = decode_rkyv(bytes).expect("decode resolution");
+
+            assert_eq!(
+                resolution,
+                DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                    endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "router".to_string(),
+                        },
+                        kind,
+                        name: "camera.shared".to_string(),
+                    },
+                    contract: shared_name_contract(kind),
+                })
+            );
+        }
     }
 
     #[test]
@@ -894,12 +1182,13 @@ mod tests {
             .query(Query::ResolveDiscovery {
                 request: DiscoveryRequest {
                     operation: DiscoveryOperation::Bind,
-                    target: DiscoveryTarget::EventEndpoint(EventEndpointRef {
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
                         workload: WorkloadRef {
                             tenant: "tenant-a".to_string(),
                             namespace: "media".to_string(),
                             name: "ingest".to_string(),
                         },
+                        kind: ContractKind::Event,
                         name: "camera.missing".to_string(),
                     }),
                     scope: DiscoveryCapabilityScope {
@@ -914,10 +1203,10 @@ mod tests {
             })
             .expect_err("unknown endpoint should be rejected");
 
-        assert!(err.to_string().contains("unknown event endpoint"));
+        assert!(err.to_string().contains("unknown endpoint"));
         assert!(
             err.to_string()
-                .contains("tenant-a/media/ingest#camera.missing")
+                .contains("tenant-a/media/ingest#event:camera.missing")
         );
     }
 

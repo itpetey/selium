@@ -10,20 +10,24 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{DataValue, StorageReplayStart, decode_rkyv, encode_rkyv};
-use selium_control_plane_api::{ControlPlaneState, EventEndpointRef, IsolationProfile, NodeSpec};
+use selium_control_plane_api::{
+    ContractKind, ControlPlaneState, IsolationProfile, NodeSpec, PublicEndpointRef,
+};
 use selium_control_plane_protocol::{
-    ActivateEventRouteRequest, ActivateEventRouteResponse, AppendEntriesApiRequest,
-    DeactivateEventRouteRequest, DeactivateEventRouteResponse, ListResponse, ManagedEventBinding,
-    ManagedEventBindingRole, Method, MutateApiRequest, MutateApiResponse, QueryApiRequest,
-    QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest, StatusApiResponse,
-    StopRequest, decode_envelope, decode_payload, encode_error_response, encode_response, is_error,
-    is_request,
+    ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, AppendEntriesApiRequest,
+    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, EndpointBridgeSemantics,
+    EventBridgeSemantics, EventDeliveryMode, ListResponse, ManagedEndpointBinding,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, MutateApiRequest, MutateApiResponse,
+    QueryApiRequest, QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest,
+    ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StatusApiResponse, StopRequest,
+    StreamBridgeSemantics, StreamLifecycleMode, decode_envelope, decode_payload,
+    encode_error_response, encode_response, is_error, is_request,
 };
 use selium_control_plane_runtime::{
     ControlPlaneEngine, EngineSnapshot, Mutation, MutationEnvelope, MutationResponse, RuntimeError,
 };
 use selium_control_plane_scheduler::{
-    SchedulePlan, ScheduledEventRouteIntent, ScheduledInstance, build_event_route_intents,
+    SchedulePlan, ScheduledEndpointBridgeIntent, ScheduledInstance, build_endpoint_bridge_intents,
     build_plan,
 };
 use selium_guest::{network, spawn, storage, time};
@@ -78,7 +82,7 @@ pub struct BootstrapReport {
 #[rkyv(bytecheck())]
 pub struct AgentState {
     pub running_instances: BTreeMap<String, String>,
-    pub active_routes: BTreeSet<String>,
+    pub active_bridges: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -87,21 +91,21 @@ pub enum ReconcileAction {
     Start {
         instance_id: String,
         deployment: String,
-        managed_event_bindings: Vec<ManagedEventBinding>,
+        managed_endpoint_bindings: Vec<ManagedEndpointBinding>,
     },
     Stop {
         instance_id: String,
     },
-    EnsureEventRoute {
-        route_id: String,
+    EnsureEndpointBridge {
+        bridge_id: String,
         source_instance_id: String,
-        source_endpoint: EventEndpointRef,
+        source_endpoint: PublicEndpointRef,
         target_instance_id: String,
         target_node: String,
-        target_endpoint: EventEndpointRef,
+        target_endpoint: PublicEndpointRef,
     },
-    RemoveEventRoute {
-        route_id: String,
+    RemoveEndpointBridge {
+        bridge_id: String,
     },
 }
 
@@ -170,7 +174,7 @@ pub fn reconcile(
         .collect::<BTreeSet<_>>();
 
     let mut actions = Vec::new();
-    let all_routes = build_event_route_intents(state, desired);
+    let all_bridges = build_endpoint_bridge_intents(state, desired);
 
     for instance in desired_on_node {
         if !current
@@ -180,9 +184,9 @@ pub fn reconcile(
             actions.push(ReconcileAction::Start {
                 instance_id: instance.instance_id.clone(),
                 deployment: instance.deployment.clone(),
-                managed_event_bindings: managed_event_bindings_for_instance(
+                managed_endpoint_bindings: managed_endpoint_bindings_for_instance(
                     &instance.instance_id,
-                    &all_routes,
+                    &all_bridges,
                 ),
             });
         }
@@ -196,32 +200,32 @@ pub fn reconcile(
         }
     }
 
-    let desired_routes = all_routes
+    let desired_bridges = all_bridges
         .into_iter()
-        .filter(|route| route.source_node == node_name)
+        .filter(|bridge| bridge.source_node == node_name)
         .collect::<Vec<_>>();
-    let desired_route_ids = desired_routes
+    let desired_bridge_ids = desired_bridges
         .iter()
-        .map(|route| route.route_id.clone())
+        .map(|bridge| bridge.bridge_id.clone())
         .collect::<BTreeSet<_>>();
 
-    for route in desired_routes {
-        if !current.active_routes.contains(&route.route_id) {
-            actions.push(ReconcileAction::EnsureEventRoute {
-                route_id: route.route_id,
-                source_instance_id: route.source_instance_id,
-                source_endpoint: route.source_endpoint,
-                target_instance_id: route.target_instance_id,
-                target_node: route.target_node,
-                target_endpoint: route.target_endpoint,
+    for bridge in desired_bridges {
+        if !current.active_bridges.contains(&bridge.bridge_id) {
+            actions.push(ReconcileAction::EnsureEndpointBridge {
+                bridge_id: bridge.bridge_id,
+                source_instance_id: bridge.source_instance_id,
+                source_endpoint: bridge.source_endpoint,
+                target_instance_id: bridge.target_instance_id,
+                target_node: bridge.target_node,
+                target_endpoint: bridge.target_endpoint,
             });
         }
     }
 
-    for route_id in &current.active_routes {
-        if !desired_route_ids.contains(route_id) {
-            actions.push(ReconcileAction::RemoveEventRoute {
-                route_id: route_id.clone(),
+    for bridge_id in &current.active_bridges {
+        if !desired_bridge_ids.contains(bridge_id) {
+            actions.push(ReconcileAction::RemoveEndpointBridge {
+                bridge_id: bridge_id.clone(),
             });
         }
     }
@@ -236,10 +240,10 @@ pub fn reconcile(
 
 fn action_order(action: &ReconcileAction) -> u8 {
     match action {
-        ReconcileAction::RemoveEventRoute { .. } => 0,
+        ReconcileAction::RemoveEndpointBridge { .. } => 0,
         ReconcileAction::Stop { .. } => 1,
         ReconcileAction::Start { .. } => 2,
-        ReconcileAction::EnsureEventRoute { .. } => 3,
+        ReconcileAction::EnsureEndpointBridge { .. } => 3,
     }
 }
 
@@ -249,7 +253,7 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
             ReconcileAction::Start {
                 instance_id,
                 deployment,
-                managed_event_bindings: _,
+                managed_endpoint_bindings: _,
             } => {
                 current
                     .running_instances
@@ -258,40 +262,74 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
             ReconcileAction::Stop { instance_id } => {
                 current.running_instances.remove(instance_id);
             }
-            ReconcileAction::EnsureEventRoute { route_id, .. } => {
-                current.active_routes.insert(route_id.clone());
+            ReconcileAction::EnsureEndpointBridge { bridge_id, .. } => {
+                current.active_bridges.insert(bridge_id.clone());
             }
-            ReconcileAction::RemoveEventRoute { route_id } => {
-                current.active_routes.remove(route_id);
+            ReconcileAction::RemoveEndpointBridge { bridge_id } => {
+                current.active_bridges.remove(bridge_id);
             }
         }
     }
 }
 
-fn managed_event_bindings_for_instance(
+fn managed_endpoint_bindings_for_instance(
     instance_id: &str,
-    routes: &[ScheduledEventRouteIntent],
-) -> Vec<ManagedEventBinding> {
-    let mut bindings = BTreeMap::<(u8, String), ManagedEventBinding>::new();
-    for route in routes {
-        if route.source_instance_id == instance_id {
+    bridges: &[ScheduledEndpointBridgeIntent],
+) -> Vec<ManagedEndpointBinding> {
+    let mut bindings = BTreeMap::<(u8, ContractKind, String), ManagedEndpointBinding>::new();
+    for bridge in bridges {
+        if bridge.source_instance_id == instance_id {
             bindings
-                .entry((0, route.source_endpoint.name.clone()))
-                .or_insert_with(|| ManagedEventBinding {
-                    endpoint_name: route.source_endpoint.name.clone(),
-                    role: ManagedEventBindingRole::Source,
+                .entry((
+                    0,
+                    bridge.source_endpoint.kind,
+                    bridge.source_endpoint.name.clone(),
+                ))
+                .or_insert_with(|| ManagedEndpointBinding {
+                    endpoint_name: bridge.source_endpoint.name.clone(),
+                    endpoint_kind: bridge.source_endpoint.kind,
+                    role: ManagedEndpointRole::Egress,
+                    binding_type: binding_type_for_kind(bridge.source_endpoint.kind),
                 });
         }
-        if route.target_instance_id == instance_id {
+        if bridge.target_instance_id == instance_id {
             bindings
-                .entry((1, route.target_endpoint.name.clone()))
-                .or_insert_with(|| ManagedEventBinding {
-                    endpoint_name: route.target_endpoint.name.clone(),
-                    role: ManagedEventBindingRole::Target,
+                .entry((
+                    1,
+                    bridge.target_endpoint.kind,
+                    bridge.target_endpoint.name.clone(),
+                ))
+                .or_insert_with(|| ManagedEndpointBinding {
+                    endpoint_name: bridge.target_endpoint.name.clone(),
+                    endpoint_kind: bridge.target_endpoint.kind,
+                    role: ManagedEndpointRole::Ingress,
+                    binding_type: binding_type_for_kind(bridge.target_endpoint.kind),
                 });
         }
     }
     bindings.into_values().collect()
+}
+
+fn binding_type_for_kind(kind: ContractKind) -> ManagedEndpointBindingType {
+    match kind {
+        ContractKind::Event => ManagedEndpointBindingType::OneWay,
+        ContractKind::Service => ManagedEndpointBindingType::RequestResponse,
+        ContractKind::Stream => ManagedEndpointBindingType::Session,
+    }
+}
+
+fn endpoint_bridge_semantics(kind: ContractKind) -> EndpointBridgeSemantics {
+    match kind {
+        ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
+            delivery: EventDeliveryMode::Frame,
+        }),
+        ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
+            correlation: ServiceCorrelationMode::RequestId,
+        }),
+        ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
+            lifecycle: StreamLifecycleMode::SessionFrames,
+        }),
+    }
 }
 
 #[selium_guest::entrypoint]
@@ -845,7 +883,7 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
         .await?
         .unwrap_or(ListResponse {
             instances: BTreeMap::new(),
-            active_routes: Vec::new(),
+            active_bridges: Vec::new(),
         });
         let current = AgentState {
             running_instances: list
@@ -853,7 +891,7 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
                 .into_iter()
                 .map(|(instance_id, process_id)| (instance_id, process_id.to_string()))
                 .collect(),
-            active_routes: list.active_routes.into_iter().collect(),
+            active_bridges: list.active_bridges.into_iter().collect(),
         };
         let actions = reconcile(node, &snapshot, &desired, &current);
         execute_daemon_actions(&state, &snapshot, &actions, node).await?;
@@ -879,7 +917,7 @@ async fn execute_daemon_actions(
             ReconcileAction::Start {
                 instance_id,
                 deployment,
-                managed_event_bindings,
+                managed_endpoint_bindings,
             } => {
                 let spec = cp_state
                     .deployments
@@ -894,7 +932,7 @@ async fn execute_daemon_actions(
                         node_id: node.to_string(),
                         instance_id: instance_id.clone(),
                         module_spec,
-                        managed_event_bindings: managed_event_bindings.clone(),
+                        managed_endpoint_bindings: managed_endpoint_bindings.clone(),
                     },
                 )
                 .await?
@@ -913,8 +951,8 @@ async fn execute_daemon_actions(
                 .await?
                 .ok_or_else(|| anyhow!("missing stop response"))?;
             }
-            ReconcileAction::EnsureEventRoute {
-                route_id,
+            ReconcileAction::EnsureEndpointBridge {
+                bridge_id,
                 source_instance_id,
                 source_endpoint,
                 target_instance_id,
@@ -926,13 +964,13 @@ async fn execute_daemon_actions(
                     .get(target_node)
                     .ok_or_else(|| anyhow!("unknown target node `{target_node}`"))?
                     .clone();
-                let _: ActivateEventRouteResponse = send_daemon_rpc(
+                let _: ActivateEndpointBridgeResponse = send_daemon_rpc(
                     state,
                     &authority,
-                    Method::ActivateEventRoute,
-                    &ActivateEventRouteRequest {
+                    Method::ActivateEndpointBridge,
+                    &ActivateEndpointBridgeRequest {
                         node_id: node.to_string(),
-                        route_id: route_id.clone(),
+                        bridge_id: bridge_id.clone(),
                         source_instance_id: source_instance_id.clone(),
                         source_endpoint: source_endpoint.clone(),
                         target_instance_id: target_instance_id.clone(),
@@ -940,19 +978,20 @@ async fn execute_daemon_actions(
                         target_daemon_addr: target_spec.daemon_addr,
                         target_daemon_server_name: target_spec.daemon_server_name,
                         target_endpoint: target_endpoint.clone(),
+                        semantics: endpoint_bridge_semantics(source_endpoint.kind),
                     },
                 )
                 .await?
                 .ok_or_else(|| anyhow!("missing activate route response"))?;
             }
-            ReconcileAction::RemoveEventRoute { route_id } => {
-                let _: DeactivateEventRouteResponse = send_daemon_rpc(
+            ReconcileAction::RemoveEndpointBridge { bridge_id } => {
+                let _: DeactivateEndpointBridgeResponse = send_daemon_rpc(
                     state,
                     &authority,
-                    Method::DeactivateEventRoute,
-                    &DeactivateEventRouteRequest {
+                    Method::DeactivateEndpointBridge,
+                    &DeactivateEndpointBridgeRequest {
                         node_id: node.to_string(),
-                        route_id: route_id.clone(),
+                        bridge_id: bridge_id.clone(),
                     },
                 )
                 .await?
@@ -1266,7 +1305,7 @@ event camera.frames(Frame) {
         let desired = build_plan(&state).expect("schedule");
         let mut current = AgentState {
             running_instances: BTreeMap::from([("old-0".to_string(), "old".to_string())]),
-            active_routes: BTreeSet::new(),
+            active_bridges: BTreeSet::new(),
         };
 
         let actions = reconcile("local-node", &state, &desired, &current);
@@ -1274,7 +1313,7 @@ event camera.frames(Frame) {
 
         apply(&mut current, &actions);
         assert_eq!(current.running_instances.len(), 2);
-        assert!(current.active_routes.is_empty());
+        assert!(current.active_bridges.is_empty());
         assert!(
             current
                 .running_instances
@@ -1288,7 +1327,7 @@ event camera.frames(Frame) {
     }
 
     #[test]
-    fn reconcile_generates_event_route_actions() {
+    fn reconcile_generates_endpoint_bridge_actions() {
         let mut state = ControlPlaneState::new_local_default();
         state
             .registry
@@ -1307,6 +1346,7 @@ event camera.frames(Frame) {
         };
         let contract = ContractRef {
             namespace: "media.pipeline".to_string(),
+            kind: selium_control_plane_api::ContractKind::Event,
             name: "camera.frames".to_string(),
             version: "v1".to_string(),
         };
@@ -1350,12 +1390,12 @@ event camera.frames(Frame) {
         assert!(
             actions
                 .iter()
-                .any(|action| matches!(action, ReconcileAction::EnsureEventRoute { .. }))
+                .any(|action| matches!(action, ReconcileAction::EnsureEndpointBridge { .. }))
         );
     }
 
     #[test]
-    fn reconcile_orders_starts_before_event_routes() {
+    fn reconcile_orders_starts_before_endpoint_bridges() {
         let mut state = ControlPlaneState::new_local_default();
         state
             .registry
@@ -1374,6 +1414,7 @@ event camera.frames(Frame) {
         };
         let contract = ContractRef {
             namespace: "media.pipeline".to_string(),
+            kind: selium_control_plane_api::ContractKind::Event,
             name: "camera.frames".to_string(),
             version: "v1".to_string(),
         };
@@ -1418,12 +1459,128 @@ event camera.frames(Frame) {
             .expect("start action");
         let ensure_idx = actions
             .iter()
-            .position(|action| matches!(action, ReconcileAction::EnsureEventRoute { .. }))
+            .position(|action| matches!(action, ReconcileAction::EnsureEndpointBridge { .. }))
             .expect("ensure action");
 
         assert!(
             start_idx < ensure_idx,
             "expected start before ensure actions, got {actions:?}"
         );
+    }
+
+    #[test]
+    fn managed_endpoint_bindings_keep_same_name_cross_kind_entries_distinct() {
+        let bindings = managed_endpoint_bindings_for_instance(
+            "instance-a",
+            &[
+                ScheduledEndpointBridgeIntent {
+                    bridge_id: "bridge-event".to_string(),
+                    source_instance_id: "instance-a".to_string(),
+                    source_node: "local-node".to_string(),
+                    source_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        kind: ContractKind::Event,
+                        name: "shared".to_string(),
+                    },
+                    target_instance_id: "instance-b".to_string(),
+                    target_node: "local-node".to_string(),
+                    target_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "detector".to_string(),
+                        },
+                        kind: ContractKind::Event,
+                        name: "shared".to_string(),
+                    },
+                    contract: ContractRef {
+                        namespace: "media.pipeline".to_string(),
+                        kind: ContractKind::Event,
+                        name: "shared".to_string(),
+                        version: "v1".to_string(),
+                    },
+                },
+                ScheduledEndpointBridgeIntent {
+                    bridge_id: "bridge-service".to_string(),
+                    source_instance_id: "instance-a".to_string(),
+                    source_node: "local-node".to_string(),
+                    source_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        kind: ContractKind::Service,
+                        name: "shared".to_string(),
+                    },
+                    target_instance_id: "instance-c".to_string(),
+                    target_node: "remote-node".to_string(),
+                    target_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "uploader".to_string(),
+                        },
+                        kind: ContractKind::Service,
+                        name: "shared".to_string(),
+                    },
+                    contract: ContractRef {
+                        namespace: "media.pipeline".to_string(),
+                        kind: ContractKind::Service,
+                        name: "shared".to_string(),
+                        version: "v1".to_string(),
+                    },
+                },
+                ScheduledEndpointBridgeIntent {
+                    bridge_id: "bridge-stream".to_string(),
+                    source_instance_id: "instance-a".to_string(),
+                    source_node: "local-node".to_string(),
+                    source_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        kind: ContractKind::Stream,
+                        name: "shared".to_string(),
+                    },
+                    target_instance_id: "instance-d".to_string(),
+                    target_node: "local-node".to_string(),
+                    target_endpoint: PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "streamer".to_string(),
+                        },
+                        kind: ContractKind::Stream,
+                        name: "shared".to_string(),
+                    },
+                    contract: ContractRef {
+                        namespace: "media.pipeline".to_string(),
+                        kind: ContractKind::Stream,
+                        name: "shared".to_string(),
+                        version: "v1".to_string(),
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(bindings.len(), 3);
+        assert!(bindings.iter().any(|binding| {
+            binding.endpoint_kind == ContractKind::Event
+                && binding.binding_type == ManagedEndpointBindingType::OneWay
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.endpoint_kind == ContractKind::Service
+                && binding.binding_type == ManagedEndpointBindingType::RequestResponse
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.endpoint_kind == ContractKind::Stream
+                && binding.binding_type == ManagedEndpointBindingType::Session
+        }));
     }
 }

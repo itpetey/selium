@@ -144,6 +144,10 @@ fn contract_ref_parser_rejects_invalid_shape() {
     assert!(parse_contract_ref("bad").is_err());
     let contract = parse_contract_ref("media.pipeline/camera.frames@v1").expect("parse");
     assert_eq!(contract.namespace, "media.pipeline");
+    assert_eq!(contract.kind, ContractKind::Event);
+
+    let service = parse_contract_ref("media.pipeline/service:camera.frames@v1").expect("parse");
+    assert_eq!(service.kind, ContractKind::Service);
 }
 
 #[test]
@@ -163,6 +167,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
             replicas: 1,
             contracts: vec![ContractRef {
                 namespace: "media.pipeline".to_string(),
+                kind: ContractKind::Event,
                 name: "camera.frames".to_string(),
                 version: "v1".to_string(),
             }],
@@ -180,6 +185,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
             replicas: 1,
             contracts: vec![ContractRef {
                 namespace: "media.pipeline".to_string(),
+                kind: ContractKind::Event,
                 name: "camera.frames".to_string(),
                 version: "v1".to_string(),
             }],
@@ -203,6 +209,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 },
@@ -218,6 +225,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 },
@@ -245,6 +253,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
             replicas: 1,
             contracts: vec![ContractRef {
                 namespace: "media.pipeline".to_string(),
+                kind: ContractKind::Event,
                 name: "camera.frames".to_string(),
                 version: "v1".to_string(),
             }],
@@ -262,6 +271,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
             replicas: 1,
             contracts: vec![ContractRef {
                 namespace: "media.pipeline".to_string(),
+                kind: ContractKind::Event,
                 name: "camera.frames".to_string(),
                 version: "v1".to_string(),
             }],
@@ -285,6 +295,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
                 },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 },
@@ -300,6 +311,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
                 },
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 },

@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec,
-    DiscoverableEventEndpoint, DiscoverableWorkload, DiscoveryState, EventEndpointRef,
-    IsolationProfile, NodeSpec, PipelineEndpoint, PipelineSpec, WorkloadRef,
+    ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
+    DiscoverableWorkload, DiscoveryState, IsolationProfile, NodeSpec, PipelineEndpoint,
+    PipelineSpec, PublicEndpointRef, WorkloadRef,
 };
 
 impl ControlPlaneState {
@@ -133,7 +133,7 @@ pub fn build_discovery_state(
     let mut endpoints = Vec::new();
 
     for deployment in state.deployments.values() {
-        let mut workload_endpoints = deployment_event_endpoints(state, deployment)?;
+        let mut workload_endpoints = deployment_public_endpoints(state, deployment)?;
         workload_endpoints.sort_by(|lhs, rhs| lhs.endpoint.cmp(&rhs.endpoint));
 
         workloads.push(DiscoverableWorkload {
@@ -239,28 +239,26 @@ fn validate_pipeline_endpoint(
     Ok(())
 }
 
-fn deployment_event_endpoints(
+fn deployment_public_endpoints(
     state: &ControlPlaneState,
     deployment: &DeploymentSpec,
-) -> std::result::Result<Vec<DiscoverableEventEndpoint>, ApiError> {
+) -> std::result::Result<Vec<DiscoverableEndpoint>, ApiError> {
     let mut endpoints = BTreeMap::new();
 
     for contract in &deployment.contracts {
-        let resolved = state
+        state
             .registry
             .resolve(contract)
             .ok_or(ApiError::InvalidContract)?;
-        if resolved.kind != ContractKind::Event {
-            continue;
-        }
 
-        let endpoint = EventEndpointRef {
+        let endpoint = PublicEndpointRef {
             workload: deployment.workload.clone(),
+            kind: contract.kind,
             name: contract.name.clone(),
         };
         endpoints.insert(
             endpoint.key(),
-            DiscoverableEventEndpoint {
+            DiscoverableEndpoint {
                 endpoint,
                 contract: contract.clone(),
             },
@@ -273,12 +271,40 @@ fn deployment_event_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContractRef, PipelineEdge, parse_idl};
+    use crate::{ContractRef, EventEndpointRef, PipelineEdge, parse_idl};
 
     fn event_contract() -> ContractRef {
         ContractRef {
             namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Event,
             name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn service_contract() -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Service,
+            name: "camera.detect".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn stream_contract() -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind: ContractKind::Stream,
+            name: "camera.raw".to_string(),
+            version: "v1".to_string(),
+        }
+    }
+
+    fn shared_name_contract(kind: ContractKind) -> ContractRef {
+        ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind,
+            name: "camera.shared".to_string(),
             version: "v1".to_string(),
         }
     }
@@ -292,6 +318,24 @@ mod tests {
                     "package media.pipeline.v1;\n\
                      schema Frame { camera_id: string; }\n\
                      event camera.frames(Frame) { replay: enabled; }",
+                )
+                .expect("parse"),
+            )
+            .expect("register");
+        state
+    }
+
+    fn mixed_state() -> ControlPlaneState {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(
+                parse_idl(
+                    "package media.pipeline.v1;\n\
+                     schema Frame { camera_id: string; }\n\
+                     event camera.frames(Frame) { replay: enabled; }\n\
+                     service camera.detect(Frame) -> Frame;\n\
+                     stream camera.raw(Frame);",
                 )
                 .expect("parse"),
             )
@@ -335,8 +379,146 @@ mod tests {
         assert_eq!(workload_keys.len(), 2);
         assert!(workload_keys.contains(&"tenant-a/media/ingest".to_string()));
         assert!(workload_keys.contains(&"tenant-b/media/ingest".to_string()));
-        assert!(endpoint_keys.contains(&"tenant-a/media/ingest#camera.frames".to_string()));
-        assert!(endpoint_keys.contains(&"tenant-b/media/ingest#camera.frames".to_string()));
+        assert!(endpoint_keys.contains(&"tenant-a/media/ingest#event:camera.frames".to_string()));
+        assert!(endpoint_keys.contains(&"tenant-b/media/ingest#event:camera.frames".to_string()));
+    }
+
+    #[test]
+    fn discovery_state_includes_event_service_and_stream_endpoints() {
+        let mut state = mixed_state();
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: workload.clone(),
+                module: "ingest.wasm".to_string(),
+                replicas: 1,
+                contracts: vec![event_contract(), service_contract(), stream_contract()],
+                isolation: IsolationProfile::Standard,
+            })
+            .expect("deployment");
+
+        let discovery = build_discovery_state(&state).expect("discovery");
+        let workload_endpoint_keys = discovery.workloads[0]
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.key())
+            .collect::<Vec<_>>();
+        let endpoint_keys = discovery
+            .endpoints
+            .iter()
+            .map(|record| record.endpoint.key())
+            .collect::<Vec<_>>();
+
+        assert_eq!(discovery.workloads.len(), 1);
+        assert_eq!(discovery.workloads[0].workload, workload);
+        assert_eq!(
+            workload_endpoint_keys,
+            vec![
+                "tenant-a/media/ingest#event:camera.frames".to_string(),
+                "tenant-a/media/ingest#service:camera.detect".to_string(),
+                "tenant-a/media/ingest#stream:camera.raw".to_string(),
+            ]
+        );
+        assert_eq!(endpoint_keys, workload_endpoint_keys);
+    }
+
+    #[test]
+    fn public_endpoint_identity_includes_kind_for_same_name_collisions() {
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        let event = PublicEndpointRef {
+            workload: workload.clone(),
+            kind: ContractKind::Event,
+            name: "camera.shared".to_string(),
+        };
+        let service = PublicEndpointRef {
+            workload: workload.clone(),
+            kind: ContractKind::Service,
+            name: "camera.shared".to_string(),
+        };
+        let stream = PublicEndpointRef {
+            workload,
+            kind: ContractKind::Stream,
+            name: "camera.shared".to_string(),
+        };
+
+        assert_eq!(event.key(), "tenant-a/media/ingest#event:camera.shared");
+        assert_eq!(service.key(), "tenant-a/media/ingest#service:camera.shared");
+        assert_eq!(stream.key(), "tenant-a/media/ingest#stream:camera.shared");
+        assert_ne!(event, service);
+        assert_ne!(service, stream);
+        assert_ne!(event, stream);
+    }
+
+    #[test]
+    fn discovery_state_preserves_same_name_cross_kind_contracts() {
+        let mut state = ControlPlaneState::new_local_default();
+        state
+            .registry
+            .register_package(
+                parse_idl(
+                    "package media.pipeline.v1;\n\
+                     schema Frame { camera_id: string; }\n\
+                     event camera.shared(Frame) { replay: enabled; }\n\
+                     service camera.shared(Frame) -> Frame;\n\
+                     stream camera.shared(Frame);",
+                )
+                .expect("parse"),
+            )
+            .expect("register");
+
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "router".to_string(),
+                },
+                module: "router.wasm".to_string(),
+                replicas: 1,
+                contracts: vec![
+                    shared_name_contract(ContractKind::Event),
+                    shared_name_contract(ContractKind::Service),
+                    shared_name_contract(ContractKind::Stream),
+                ],
+                isolation: IsolationProfile::Standard,
+            })
+            .expect("deployment");
+
+        let discovery = build_discovery_state(&state).expect("discovery");
+
+        assert_eq!(
+            discovery
+                .endpoints
+                .iter()
+                .map(|record| record.endpoint.key())
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant-a/media/router#event:camera.shared".to_string(),
+                "tenant-a/media/router#service:camera.shared".to_string(),
+                "tenant-a/media/router#stream:camera.shared".to_string(),
+            ]
+        );
+        assert_eq!(
+            discovery
+                .endpoints
+                .iter()
+                .map(|record| record.contract.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ContractKind::Event,
+                ContractKind::Service,
+                ContractKind::Stream,
+            ]
+        );
     }
 
     #[test]

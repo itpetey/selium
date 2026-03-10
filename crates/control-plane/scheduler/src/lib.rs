@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_control_plane_api::{
-    ContractRef, ControlPlaneState, EventEndpointRef, IsolationProfile, WorkloadRef,
-    collect_contracts_for_workload, ensure_pipeline_consistency,
+    ContractRef, ControlPlaneState, EventEndpointRef, IsolationProfile, PublicEndpointRef,
+    WorkloadRef, collect_contracts_for_workload, ensure_pipeline_consistency,
 };
 use thiserror::Error;
 
@@ -27,14 +27,14 @@ pub struct SchedulePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ScheduledEventRouteIntent {
-    pub route_id: String,
+pub struct ScheduledEndpointBridgeIntent {
+    pub bridge_id: String,
     pub source_instance_id: String,
     pub source_node: String,
-    pub source_endpoint: EventEndpointRef,
+    pub source_endpoint: PublicEndpointRef,
     pub target_instance_id: String,
     pub target_node: String,
-    pub target_endpoint: EventEndpointRef,
+    pub target_endpoint: PublicEndpointRef,
     pub contract: ContractRef,
 }
 
@@ -155,8 +155,11 @@ pub fn deployment_contract_usage(state: &ControlPlaneState) -> BTreeMap<String, 
                 .into_iter()
                 .map(|contract| {
                     format!(
-                        "{}/{}@{}",
-                        contract.namespace, contract.name, contract.version
+                        "{}/{}:{}@{}",
+                        contract.namespace,
+                        contract.kind.as_str(),
+                        contract.name,
+                        contract.version
                     )
                 })
                 .collect::<BTreeSet<_>>();
@@ -165,10 +168,10 @@ pub fn deployment_contract_usage(state: &ControlPlaneState) -> BTreeMap<String, 
         .collect()
 }
 
-pub fn build_event_route_intents(
+pub fn build_endpoint_bridge_intents(
     state: &ControlPlaneState,
     plan: &SchedulePlan,
-) -> Vec<ScheduledEventRouteIntent> {
+) -> Vec<ScheduledEndpointBridgeIntent> {
     let mut instances_by_workload: BTreeMap<&str, Vec<&ScheduledInstance>> = BTreeMap::new();
     for instance in &plan.instances {
         instances_by_workload
@@ -195,25 +198,25 @@ pub fn build_event_route_intents(
                 else {
                     continue;
                 };
-                intents.push(ScheduledEventRouteIntent {
-                    route_id: event_route_id(
+                intents.push(ScheduledEndpointBridgeIntent {
+                    bridge_id: endpoint_bridge_id(
                         &instance.instance_id,
                         &target.instance_id,
-                        &edge.from.endpoint,
-                        &edge.to.endpoint,
+                        &public_endpoint_ref(&edge.from.endpoint, &edge.from.contract),
+                        &public_endpoint_ref(&edge.to.endpoint, &edge.to.contract),
                     ),
                     source_instance_id: instance.instance_id.clone(),
                     source_node: instance.node.clone(),
-                    source_endpoint: edge.from.endpoint.clone(),
+                    source_endpoint: public_endpoint_ref(&edge.from.endpoint, &edge.from.contract),
                     target_instance_id: target.instance_id.clone(),
                     target_node: target.node.clone(),
-                    target_endpoint: edge.to.endpoint.clone(),
+                    target_endpoint: public_endpoint_ref(&edge.to.endpoint, &edge.to.contract),
                     contract: edge.to.contract.clone(),
                 });
             }
         }
     }
-    intents.sort_by(|lhs, rhs| lhs.route_id.cmp(&rhs.route_id));
+    intents.sort_by(|lhs, rhs| lhs.bridge_id.cmp(&rhs.bridge_id));
     intents
 }
 
@@ -224,17 +227,25 @@ fn internal_instance_id(workload: &WorkloadRef, ordinal: u32) -> String {
     )
 }
 
-fn event_route_id(
+fn endpoint_bridge_id(
     source_instance_id: &str,
     target_instance_id: &str,
-    source_endpoint: &EventEndpointRef,
-    target_endpoint: &EventEndpointRef,
+    source_endpoint: &PublicEndpointRef,
+    target_endpoint: &PublicEndpointRef,
 ) -> String {
     format!(
         "{source_instance_id}->{target_instance_id}::{source}->{target}",
         source = source_endpoint.key(),
         target = target_endpoint.key()
     )
+}
+
+fn public_endpoint_ref(endpoint: &EventEndpointRef, contract: &ContractRef) -> PublicEndpointRef {
+    PublicEndpointRef {
+        workload: endpoint.workload.clone(),
+        kind: contract.kind,
+        name: endpoint.name.clone(),
+    }
 }
 
 fn select_target_instance<'a>(
@@ -275,8 +286,7 @@ fn eligible_nodes(
 #[cfg(test)]
 mod tests {
     use selium_control_plane_api::{
-        ContractRef, DeploymentSpec, NodeSpec, PipelineEdge, PipelineEndpoint, PipelineSpec,
-        parse_idl,
+        ContractRef, DeploymentSpec, PipelineEdge, PipelineEndpoint, PipelineSpec, parse_idl,
     };
 
     use super::*;
@@ -307,6 +317,7 @@ mod tests {
                 replicas: 2,
                 contracts: vec![ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: selium_control_plane_api::ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 }],
@@ -324,6 +335,7 @@ mod tests {
                 replicas: 1,
                 contracts: vec![ContractRef {
                     namespace: "media.pipeline".to_string(),
+                    kind: selium_control_plane_api::ContractKind::Event,
                     name: "camera.frames".to_string(),
                     version: "v1".to_string(),
                 }],
@@ -347,6 +359,7 @@ mod tests {
                     },
                     contract: ContractRef {
                         namespace: "media.pipeline".to_string(),
+                        kind: selium_control_plane_api::ContractKind::Event,
                         name: "camera.frames".to_string(),
                         version: "v1".to_string(),
                     },
@@ -362,6 +375,7 @@ mod tests {
                     },
                     contract: ContractRef {
                         namespace: "media.pipeline".to_string(),
+                        kind: selium_control_plane_api::ContractKind::Event,
                         name: "camera.frames".to_string(),
                         version: "v1".to_string(),
                     },
@@ -389,23 +403,23 @@ mod tests {
         let state = sample_state();
         let usage = deployment_contract_usage(&state);
         let ingest = usage.get("tenant-a/media/ingest").expect("ingest usage");
-        assert!(ingest.contains("media.pipeline/camera.frames@v1"));
+        assert!(ingest.contains("media.pipeline/event:camera.frames@v1"));
     }
 
     #[test]
-    fn builds_route_intents_per_source_instance() {
+    fn builds_endpoint_bridge_intents_per_source_instance() {
         let state = sample_state();
         let plan = build_plan(&state).expect("plan");
 
-        let intents = build_event_route_intents(&state, &plan);
+        let intents = build_endpoint_bridge_intents(&state, &plan);
         assert_eq!(intents.len(), 2);
         assert_eq!(
             intents[0].source_endpoint.key(),
-            "tenant-a/media/ingest#camera.frames"
+            "tenant-a/media/ingest#event:camera.frames"
         );
         assert_eq!(
             intents[0].target_endpoint.key(),
-            "tenant-a/media/detector#camera.frames"
+            "tenant-a/media/detector#event:camera.frames"
         );
         assert_eq!(intents[0].source_node, "local-node");
         assert_eq!(intents[0].target_node, "local-node");
@@ -415,7 +429,7 @@ mod tests {
         );
         assert!(
             intents[0]
-                .route_id
+                .bridge_id
                 .starts_with(
                     "tenant=tenant-a;namespace=media;workload=ingest;replica=0->tenant=tenant-a;namespace=media;workload=detector;replica=0::"
                 )

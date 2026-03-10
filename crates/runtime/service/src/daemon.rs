@@ -18,16 +18,18 @@ use rustls_pemfile::{certs, private_key};
 use selium_abi::{
     Capability, DataValue, InteractionKind, NetworkProtocol, QueueAck, QueueAttach, QueueCommit,
     QueueCreate, QueueDelivery, QueueOverflow, QueueReserve, QueueRole, QueueStatusCode, ShmAlloc,
-    encode_rkyv,
+    decode_rkyv, encode_rkyv,
 };
-use selium_control_plane_api::EventEndpointRef;
+use selium_control_plane_api::{ContractKind, PublicEndpointRef};
 use selium_control_plane_protocol::{
-    ActivateEventRouteRequest, ActivateEventRouteResponse, DeactivateEventRouteRequest,
-    DeactivateEventRouteResponse, DeliverEventFrameRequest, DeliverEventFrameResponse, Empty,
-    EventRouteMode, ListRequest, ListResponse, ManagedEventBinding, ManagedEventBindingRole,
-    Method, StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
-    decode_envelope, decode_error, decode_payload, encode_error_response, encode_request,
-    encode_response, is_error, is_request, read_framed, write_framed,
+    ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, BridgeMessage,
+    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, DeliverBridgeMessageRequest,
+    DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics,
+    EventBridgeMessage, ListRequest, ListResponse, ManagedEndpointBinding,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, ServiceBridgeMessage,
+    ServiceMessagePhase, StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
+    StreamBridgeMessage, decode_envelope, decode_error, decode_payload, encode_error_response,
+    encode_request, encode_response, is_error, is_request, read_framed, write_framed,
 };
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
@@ -67,9 +69,11 @@ struct DaemonState {
     registry: Arc<Registry>,
     work_dir: PathBuf,
     processes: Mutex<BTreeMap<String, usize>>,
-    source_bindings: Mutex<BTreeMap<(String, String), ManagedEventEndpointQueue>>,
-    target_bindings: Mutex<BTreeMap<(String, String), ManagedEventEndpointQueue>>,
-    active_routes: Mutex<BTreeMap<String, ActiveEventRoute>>,
+    source_bindings: Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
+    target_bindings: Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
+    service_response_bindings:
+        Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
+    active_bridges: Mutex<BTreeMap<String, ActiveEndpointBridge>>,
     control_plane: Arc<LocalControlPlaneClient>,
     control_plane_process_id: usize,
     tls_paths: ManagedEventTlsPaths,
@@ -82,18 +86,83 @@ struct ManagedEventEndpointQueue {
 }
 
 #[derive(Debug)]
-struct ActiveEventRoute {
-    spec: ActiveEventRouteSpec,
+struct ActiveEndpointBridge {
+    spec: ActiveEndpointBridgeSpec,
     bridge_task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveEventRouteSpec {
+enum ActiveEndpointBridgeSpec {
+    Event(ActiveEventEndpointBridgeSpec),
+    Service(ActiveServiceEndpointBridgeSpec),
+    Stream(ActiveStreamEndpointBridgeSpec),
+}
+
+impl ActiveEndpointBridgeSpec {
+    fn source_instance_id(&self) -> &str {
+        match self {
+            Self::Event(spec) => &spec.source_instance_id,
+            Self::Service(spec) => &spec.source_instance_id,
+            Self::Stream(spec) => &spec.source_instance_id,
+        }
+    }
+
+    fn mode(&self) -> EndpointBridgeMode {
+        match self {
+            Self::Event(spec) => spec.mode,
+            Self::Service(spec) => spec.mode,
+            Self::Stream(spec) => spec.mode,
+        }
+    }
+
+    fn target_node(&self) -> &str {
+        match self {
+            Self::Event(spec) => &spec.target_node,
+            Self::Service(spec) => &spec.target_node,
+            Self::Stream(spec) => &spec.target_node,
+        }
+    }
+
+    fn target_instance_id(&self) -> &str {
+        match self {
+            Self::Event(spec) => &spec.target_instance_id,
+            Self::Service(spec) => &spec.target_instance_id,
+            Self::Stream(spec) => &spec.target_instance_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveEventEndpointBridgeSpec {
     source_instance_id: String,
-    source_endpoint: EventEndpointRef,
+    source_endpoint: PublicEndpointRef,
     target_instance_id: String,
-    target_endpoint: EventEndpointRef,
-    mode: EventRouteMode,
+    target_endpoint: PublicEndpointRef,
+    mode: EndpointBridgeMode,
+    target_node: String,
+    target_daemon_addr: String,
+    target_daemon_server_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveServiceEndpointBridgeSpec {
+    source_instance_id: String,
+    source_endpoint: PublicEndpointRef,
+    target_instance_id: String,
+    target_endpoint: PublicEndpointRef,
+    mode: EndpointBridgeMode,
+    target_node: String,
+    target_daemon_addr: String,
+    target_daemon_server_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveStreamEndpointBridgeSpec {
+    source_instance_id: String,
+    source_endpoint: PublicEndpointRef,
+    target_instance_id: String,
+    target_endpoint: PublicEndpointRef,
+    mode: EndpointBridgeMode,
     target_node: String,
     target_daemon_addr: String,
     target_daemon_server_name: String,
@@ -104,6 +173,12 @@ struct ManagedEventTlsPaths {
     ca_cert: PathBuf,
     client_cert: PathBuf,
     client_key: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BridgeMessageDelivery {
+    delivered: bool,
+    message: Option<BridgeMessage>,
 }
 
 struct ControlPlaneTlsPaths<'a> {
@@ -322,7 +397,8 @@ pub(crate) async fn run_daemon(
         processes: Mutex::new(BTreeMap::new()),
         source_bindings: Mutex::new(BTreeMap::new()),
         target_bindings: Mutex::new(BTreeMap::new()),
-        active_routes: Mutex::new(BTreeMap::new()),
+        service_response_bindings: Mutex::new(BTreeMap::new()),
+        active_bridges: Mutex::new(BTreeMap::new()),
         control_plane,
         control_plane_process_id,
         tls_paths: ManagedEventTlsPaths {
@@ -705,19 +781,19 @@ async fn handle_stream_request(
                 }
             }
 
-            let managed_event_bindings = match ensure_managed_event_bindings(
+            let managed_endpoint_bindings = match ensure_managed_endpoint_bindings(
                 &state,
                 &payload.instance_id,
-                &payload.managed_event_bindings,
+                &payload.managed_endpoint_bindings,
             )
             .await
             {
                 Ok(bindings) => bindings,
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
             };
-            let module_spec = match append_managed_event_bindings_arg(
+            let module_spec = match append_managed_endpoint_bindings_arg(
                 &payload.module_spec,
-                managed_event_bindings.as_deref(),
+                managed_endpoint_bindings.as_deref(),
             ) {
                 Ok(spec) => spec,
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
@@ -801,9 +877,9 @@ async fn handle_stream_request(
                 );
             };
 
-            state.active_routes.lock().await.retain(|_, route| {
-                let remove = route.spec.source_instance_id == payload.instance_id
-                    || route.spec.target_instance_id == payload.instance_id;
+            state.active_bridges.lock().await.retain(|_, route| {
+                let remove = route.spec.source_instance_id() == payload.instance_id
+                    || route.spec.target_instance_id() == payload.instance_id;
                 if remove {
                     route.bridge_task.abort();
                 }
@@ -813,12 +889,12 @@ async fn handle_stream_request(
                 .source_bindings
                 .lock()
                 .await
-                .retain(|(instance_id, _), _| instance_id != &payload.instance_id);
+                .retain(|(instance_id, _, _), _| instance_id != &payload.instance_id);
             state
                 .target_bindings
                 .lock()
                 .await
-                .retain(|(instance_id, _), _| instance_id != &payload.instance_id);
+                .retain(|(instance_id, _, _), _| instance_id != &payload.instance_id);
 
             if let Err(err) =
                 modules::stop_process(&state.kernel, &state.registry, process_id).await
@@ -855,18 +931,18 @@ async fn handle_stream_request(
                 .iter()
                 .map(|(instance, process)| (instance.clone(), *process))
                 .collect::<BTreeMap<_, _>>();
-            let active_routes = state.active_routes.lock().await.keys().cloned().collect();
+            let active_bridges = state.active_bridges.lock().await.keys().cloned().collect();
             encode_response(
                 envelope.method,
                 envelope.request_id,
                 &ListResponse {
                     instances: entries,
-                    active_routes,
+                    active_bridges,
                 },
             )
         }
-        Method::ActivateEventRoute => {
-            let payload: ActivateEventRouteRequest = match decode_payload(&envelope) {
+        Method::ActivateEndpointBridge => {
+            let payload: ActivateEndpointBridgeRequest = match decode_payload(&envelope) {
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
@@ -879,13 +955,13 @@ async fn handle_stream_request(
                     false,
                 );
             }
-            match activate_event_route(&state, &payload).await {
+            match activate_endpoint_bridge(&state, &payload).await {
                 Ok(response) => encode_response(envelope.method, envelope.request_id, &response),
                 Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
             }
         }
-        Method::DeactivateEventRoute => {
-            let payload: DeactivateEventRouteRequest = match decode_payload(&envelope) {
+        Method::DeactivateEndpointBridge => {
+            let payload: DeactivateEndpointBridgeRequest = match decode_payload(&envelope) {
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
@@ -898,47 +974,51 @@ async fn handle_stream_request(
                     false,
                 );
             }
-            match deactivate_event_route(&state, &payload).await {
+            match deactivate_endpoint_bridge(&state, &payload).await {
                 Ok(response) => encode_response(envelope.method, envelope.request_id, &response),
                 Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
             }
         }
-        Method::DeliverEventFrame => {
-            let payload: DeliverEventFrameRequest = match decode_payload(&envelope) {
+        Method::DeliverBridgeMessage => {
+            let payload: DeliverBridgeMessageRequest = match decode_payload(&envelope) {
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
-            match deliver_event_frame(
+            let message = payload.message;
+            let delivered = match deliver_bridge_message_local(
                 &state,
                 &payload.target_instance_id,
-                &payload.target_endpoint_name,
-                &payload.payload,
+                &payload.target_endpoint,
+                &message,
             )
             .await
             {
-                Ok(delivered) => encode_response(
-                    envelope.method,
-                    envelope.request_id,
-                    &DeliverEventFrameResponse {
-                        status: if delivered {
-                            "ok".to_string()
-                        } else {
-                            "not_found".to_string()
-                        },
-                        delivered,
-                    },
-                ),
-                Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
-            }
+                Ok(delivered) => delivered,
+                Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
+            };
+            let status = if delivered.delivered {
+                "ok".to_string()
+            } else {
+                "not_found".to_string()
+            };
+            encode_response(
+                envelope.method,
+                envelope.request_id,
+                &DeliverBridgeMessageResponse {
+                    status,
+                    delivered: delivered.delivered,
+                    message: delivered.message,
+                },
+            )
         }
     }
 }
 
-async fn activate_event_route(
+async fn activate_endpoint_bridge(
     state: &Rc<DaemonState>,
-    payload: &ActivateEventRouteRequest,
-) -> Result<ActivateEventRouteResponse> {
-    let source_key = endpoint_key(&payload.source_instance_id, &payload.source_endpoint.name);
+    payload: &ActivateEndpointBridgeRequest,
+) -> Result<ActivateEndpointBridgeResponse> {
+    let source_key = endpoint_key(&payload.source_instance_id, &payload.source_endpoint);
     if !state.source_bindings.lock().await.contains_key(&source_key) {
         bail!(
             "source endpoint `{}` is not registered for instance `{}`",
@@ -959,135 +1039,254 @@ async fn activate_event_route(
     }
 
     let mode = if payload.target_node == state.node_id {
-        EventRouteMode::Local
+        EndpointBridgeMode::Local
     } else {
-        EventRouteMode::Remote
+        EndpointBridgeMode::Remote
     };
 
-    let spec = ActiveEventRouteSpec {
-        source_instance_id: payload.source_instance_id.clone(),
-        source_endpoint: payload.source_endpoint.clone(),
-        target_instance_id: payload.target_instance_id.clone(),
-        target_endpoint: payload.target_endpoint.clone(),
-        mode,
-        target_node: payload.target_node.clone(),
-        target_daemon_addr: payload.target_daemon_addr.clone(),
-        target_daemon_server_name: payload.target_daemon_server_name.clone(),
-    };
+    let spec = build_active_endpoint_bridge_spec(payload, mode)?;
 
-    let mut routes = state.active_routes.lock().await;
-    if let Some(existing) = routes.get(&payload.route_id) {
+    let mut bridges = state.active_bridges.lock().await;
+    if let Some(existing) = bridges.get(&payload.bridge_id) {
         if existing.spec == spec {
-            return Ok(ActivateEventRouteResponse {
+            return Ok(ActivateEndpointBridgeResponse {
                 status: "ok".to_string(),
-                route_id: payload.route_id.clone(),
-                mode: spec.mode,
-                target_node: spec.target_node.clone(),
-                target_instance_id: spec.target_instance_id.clone(),
+                bridge_id: payload.bridge_id.clone(),
+                mode: spec.mode(),
+                target_node: spec.target_node().to_string(),
+                target_instance_id: spec.target_instance_id().to_string(),
                 already_active: true,
             });
         }
     }
-    if let Some(existing) = routes.remove(&payload.route_id) {
+    if let Some(existing) = bridges.remove(&payload.bridge_id) {
         existing.bridge_task.abort();
     }
 
     let state_for_task = Rc::clone(state);
-    let route_id = payload.route_id.clone();
+    let bridge_id = payload.bridge_id.clone();
     let spec_for_task = spec.clone();
     let bridge_task = spawn_local(async move {
-        if let Err(err) = forward_event_route(state_for_task, spec_for_task).await {
-            info!(route_id, error = %err, "managed event route bridge stopped");
+        if let Err(err) = forward_endpoint_bridge(state_for_task, spec_for_task).await {
+            info!(bridge_id, error = %err, "managed endpoint bridge stopped");
         }
     });
-    routes.insert(
-        payload.route_id.clone(),
-        ActiveEventRoute {
+    bridges.insert(
+        payload.bridge_id.clone(),
+        ActiveEndpointBridge {
             spec: spec.clone(),
             bridge_task,
         },
     );
 
-    Ok(ActivateEventRouteResponse {
+    Ok(ActivateEndpointBridgeResponse {
         status: "ok".to_string(),
-        route_id: payload.route_id.clone(),
-        mode: spec.mode,
-        target_node: spec.target_node,
-        target_instance_id: spec.target_instance_id,
+        bridge_id: payload.bridge_id.clone(),
+        mode: spec.mode(),
+        target_node: spec.target_node().to_string(),
+        target_instance_id: spec.target_instance_id().to_string(),
         already_active: false,
     })
 }
 
-async fn deactivate_event_route(
+async fn deactivate_endpoint_bridge(
     state: &DaemonState,
-    payload: &DeactivateEventRouteRequest,
-) -> Result<DeactivateEventRouteResponse> {
-    let existed = state.active_routes.lock().await.remove(&payload.route_id);
+    payload: &DeactivateEndpointBridgeRequest,
+) -> Result<DeactivateEndpointBridgeResponse> {
+    let existed = state.active_bridges.lock().await.remove(&payload.bridge_id);
     if let Some(route) = existed.as_ref() {
         route.bridge_task.abort();
     }
-    Ok(DeactivateEventRouteResponse {
+    Ok(DeactivateEndpointBridgeResponse {
         status: if existed.is_some() {
             "ok".to_string()
         } else {
             "not_found".to_string()
         },
-        route_id: payload.route_id.clone(),
+        bridge_id: payload.bridge_id.clone(),
         existed: existed.is_some(),
     })
 }
 
-async fn ensure_managed_event_bindings(
+fn build_active_endpoint_bridge_spec(
+    payload: &ActivateEndpointBridgeRequest,
+    mode: EndpointBridgeMode,
+) -> Result<ActiveEndpointBridgeSpec> {
+    match &payload.semantics {
+        EndpointBridgeSemantics::Event(_) => {
+            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Event)?;
+            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Event)?;
+            Ok(ActiveEndpointBridgeSpec::Event(
+                ActiveEventEndpointBridgeSpec {
+                    source_instance_id: payload.source_instance_id.clone(),
+                    source_endpoint: payload.source_endpoint.clone(),
+                    target_instance_id: payload.target_instance_id.clone(),
+                    target_endpoint: payload.target_endpoint.clone(),
+                    mode,
+                    target_node: payload.target_node.clone(),
+                    target_daemon_addr: payload.target_daemon_addr.clone(),
+                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                },
+            ))
+        }
+        EndpointBridgeSemantics::Service(_) => {
+            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Service)?;
+            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Service)?;
+            Ok(ActiveEndpointBridgeSpec::Service(
+                ActiveServiceEndpointBridgeSpec {
+                    source_instance_id: payload.source_instance_id.clone(),
+                    source_endpoint: payload.source_endpoint.clone(),
+                    target_instance_id: payload.target_instance_id.clone(),
+                    target_endpoint: payload.target_endpoint.clone(),
+                    mode,
+                    target_node: payload.target_node.clone(),
+                    target_daemon_addr: payload.target_daemon_addr.clone(),
+                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                },
+            ))
+        }
+        EndpointBridgeSemantics::Stream(_) => {
+            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Stream)?;
+            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Stream)?;
+            Ok(ActiveEndpointBridgeSpec::Stream(
+                ActiveStreamEndpointBridgeSpec {
+                    source_instance_id: payload.source_instance_id.clone(),
+                    source_endpoint: payload.source_endpoint.clone(),
+                    target_instance_id: payload.target_instance_id.clone(),
+                    target_endpoint: payload.target_endpoint.clone(),
+                    mode,
+                    target_node: payload.target_node.clone(),
+                    target_daemon_addr: payload.target_daemon_addr.clone(),
+                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                },
+            ))
+        }
+    }
+}
+
+fn ensure_endpoint_kind(
+    label: &str,
+    endpoint: &PublicEndpointRef,
+    expected: ContractKind,
+) -> Result<()> {
+    if endpoint.kind != expected {
+        bail!(
+            "{label} endpoint `{}` expected `{}` kind semantics, got `{}`",
+            endpoint.name,
+            expected.as_str(),
+            endpoint.kind.as_str()
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_managed_endpoint_bindings(
     state: &DaemonState,
     instance_id: &str,
-    bindings: &[ManagedEventBinding],
+    bindings: &[ManagedEndpointBinding],
 ) -> Result<Option<Vec<u8>>> {
     if bindings.is_empty() {
         return Ok(None);
     }
 
-    let mut writers = BTreeMap::new();
-    let mut readers = BTreeMap::new();
+    let mut writers = BTreeMap::<String, BTreeMap<String, DataValue>>::new();
+    let mut readers = BTreeMap::<String, BTreeMap<String, DataValue>>::new();
     for binding in bindings {
-        let queue = ensure_managed_endpoint_queue(state, instance_id, binding).await?;
-        let descriptor = DataValue::Map(BTreeMap::from([
-            (
-                "queue_shared_id".to_string(),
-                DataValue::U64(queue.queue_shared_id),
-            ),
-            (
-                "max_frame_bytes".to_string(),
-                DataValue::U64(MANAGED_EVENT_MAX_FRAME_BYTES as u64),
-            ),
-        ]));
-        match binding.role {
-            ManagedEventBindingRole::Source => {
-                writers.insert(binding.endpoint_name.clone(), descriptor);
+        let primary_queue = ensure_managed_endpoint_queue(state, instance_id, binding).await?;
+        let primary_descriptor = queue_descriptor(binding, primary_queue.queue_shared_id);
+        match (binding.role.clone(), binding.binding_type.clone()) {
+            (ManagedEndpointRole::Egress, ManagedEndpointBindingType::OneWay)
+            | (ManagedEndpointRole::Egress, ManagedEndpointBindingType::Session) => {
+                insert_managed_endpoint_descriptor(&mut writers, binding, primary_descriptor);
             }
-            ManagedEventBindingRole::Target => {
-                readers.insert(binding.endpoint_name.clone(), descriptor);
+            (ManagedEndpointRole::Ingress, ManagedEndpointBindingType::OneWay)
+            | (ManagedEndpointRole::Ingress, ManagedEndpointBindingType::Session) => {
+                insert_managed_endpoint_descriptor(&mut readers, binding, primary_descriptor);
+            }
+            (ManagedEndpointRole::Egress, ManagedEndpointBindingType::RequestResponse) => {
+                let response_queue =
+                    ensure_service_response_queue(state, instance_id, binding).await?;
+                insert_managed_endpoint_descriptor(&mut writers, binding, primary_descriptor);
+                insert_managed_endpoint_descriptor(
+                    &mut readers,
+                    binding,
+                    queue_descriptor(binding, response_queue.queue_shared_id),
+                );
+            }
+            (ManagedEndpointRole::Ingress, ManagedEndpointBindingType::RequestResponse) => {
+                let response_queue =
+                    ensure_service_response_queue(state, instance_id, binding).await?;
+                insert_managed_endpoint_descriptor(&mut readers, binding, primary_descriptor);
+                insert_managed_endpoint_descriptor(
+                    &mut writers,
+                    binding,
+                    queue_descriptor(binding, response_queue.queue_shared_id),
+                );
             }
         }
     }
 
     Ok(Some(
         encode_rkyv(&DataValue::Map(BTreeMap::from([
-            ("writers".to_string(), DataValue::Map(writers)),
-            ("readers".to_string(), DataValue::Map(readers)),
+            (
+                "writers".to_string(),
+                DataValue::Map(encode_managed_endpoint_section(writers)),
+            ),
+            (
+                "readers".to_string(),
+                DataValue::Map(encode_managed_endpoint_section(readers)),
+            ),
         ])))
-        .context("encode managed event bindings")?,
+        .context("encode managed endpoint bindings")?,
     ))
+}
+
+fn insert_managed_endpoint_descriptor(
+    section: &mut BTreeMap<String, BTreeMap<String, DataValue>>,
+    binding: &ManagedEndpointBinding,
+    descriptor: DataValue,
+) {
+    section
+        .entry(binding.endpoint_kind.as_str().to_string())
+        .or_default()
+        .insert(binding.endpoint_name.clone(), descriptor);
+}
+
+fn queue_descriptor(binding: &ManagedEndpointBinding, queue_shared_id: u64) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "queue_shared_id".to_string(),
+            DataValue::U64(queue_shared_id),
+        ),
+        (
+            "max_frame_bytes".to_string(),
+            DataValue::U64(MANAGED_EVENT_MAX_FRAME_BYTES as u64),
+        ),
+        (
+            "endpoint_kind".to_string(),
+            DataValue::String(binding.endpoint_kind.as_str().to_string()),
+        ),
+    ]))
+}
+
+fn encode_managed_endpoint_section(
+    section: BTreeMap<String, BTreeMap<String, DataValue>>,
+) -> BTreeMap<String, DataValue> {
+    section
+        .into_iter()
+        .map(|(kind, endpoints)| (kind, DataValue::Map(endpoints)))
+        .collect()
 }
 
 async fn ensure_managed_endpoint_queue(
     state: &DaemonState,
     instance_id: &str,
-    binding: &ManagedEventBinding,
+    binding: &ManagedEndpointBinding,
 ) -> Result<ManagedEventEndpointQueue> {
-    let key = endpoint_key(instance_id, &binding.endpoint_name);
+    let key = endpoint_binding_key(instance_id, binding.endpoint_kind, &binding.endpoint_name);
     let bindings = match binding.role {
-        ManagedEventBindingRole::Source => &state.source_bindings,
-        ManagedEventBindingRole::Target => &state.target_bindings,
+        ManagedEndpointRole::Egress => &state.source_bindings,
+        ManagedEndpointRole::Ingress => &state.target_bindings,
     };
 
     if let Some(existing) = bindings.lock().await.get(&key).cloned() {
@@ -1118,7 +1317,54 @@ async fn ensure_managed_endpoint_queue(
     Ok(registered)
 }
 
-fn append_managed_event_bindings_arg(module_spec: &str, bindings: Option<&[u8]>) -> Result<String> {
+async fn ensure_service_response_queue(
+    state: &DaemonState,
+    instance_id: &str,
+    binding: &ManagedEndpointBinding,
+) -> Result<ManagedEventEndpointQueue> {
+    let key = endpoint_binding_key(instance_id, binding.endpoint_kind, &binding.endpoint_name);
+    if let Some(existing) = state
+        .service_response_bindings
+        .lock()
+        .await
+        .get(&key)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+
+    let queue = QueueService
+        .create(QueueCreate {
+            capacity_frames: MANAGED_EVENT_QUEUE_DEPTH,
+            max_frame_bytes: MANAGED_EVENT_MAX_FRAME_BYTES,
+            delivery: QueueDelivery::Lossless,
+            overflow: QueueOverflow::Block,
+        })
+        .context("create managed service response queue")?;
+    let handle = state
+        .registry
+        .add(queue.clone(), None, ResourceType::Queue)
+        .context("register managed service response queue")?;
+    let queue_shared_id = state
+        .registry
+        .share_handle(handle.into_id())
+        .context("share managed service response queue")?;
+    let registered = ManagedEventEndpointQueue {
+        queue,
+        queue_shared_id,
+    };
+    state
+        .service_response_bindings
+        .lock()
+        .await
+        .insert(key, registered.clone());
+    Ok(registered)
+}
+
+fn append_managed_endpoint_bindings_arg(
+    module_spec: &str,
+    bindings: Option<&[u8]>,
+) -> Result<String> {
     match bindings {
         Some(bytes) => Ok(format!(
             "{module_spec};params=buffer;args=buffer:hex:{}",
@@ -1128,13 +1374,273 @@ fn append_managed_event_bindings_arg(module_spec: &str, bindings: Option<&[u8]>)
     }
 }
 
-async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec) -> Result<()> {
+async fn forward_endpoint_bridge(
+    state: Rc<DaemonState>,
+    spec: ActiveEndpointBridgeSpec,
+) -> Result<()> {
+    match spec {
+        ActiveEndpointBridgeSpec::Event(spec) => forward_event_endpoint_bridge(state, spec).await,
+        ActiveEndpointBridgeSpec::Service(spec) => {
+            forward_service_endpoint_bridge(state, spec).await
+        }
+        ActiveEndpointBridgeSpec::Stream(spec) => forward_stream_endpoint_bridge(state, spec).await,
+    }
+}
+
+async fn forward_stream_endpoint_bridge(
+    state: Rc<DaemonState>,
+    spec: ActiveStreamEndpointBridgeSpec,
+) -> Result<()> {
     let source_queue = {
         let bindings = state.source_bindings.lock().await;
         bindings
             .get(&endpoint_key(
                 &spec.source_instance_id,
-                &spec.source_endpoint.name,
+                &spec.source_endpoint,
+            ))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing source binding for `{}` on `{}`",
+                    spec.source_endpoint.name,
+                    spec.source_instance_id
+                )
+            })?
+    };
+
+    let reader = QueueService
+        .attach(
+            &source_queue.queue,
+            QueueAttach {
+                shared_id: 0,
+                role: QueueRole::Reader,
+            },
+        )
+        .context("attach managed stream route reader")?;
+
+    loop {
+        let waited = QueueService
+            .wait(&reader, MANAGED_EVENT_RETRY_DELAY.as_millis() as u32)
+            .await
+            .context("wait for managed stream frame")?;
+        match waited.code {
+            QueueStatusCode::Timeout => continue,
+            QueueStatusCode::Ok => {
+                let Some(frame) = waited.frame else {
+                    continue;
+                };
+                let message =
+                    read_managed_stream_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                        .await?;
+                let delivered = match spec.mode {
+                    EndpointBridgeMode::Local => {
+                        deliver_bridge_message_local(
+                            &state,
+                            &spec.target_instance_id,
+                            &spec.target_endpoint,
+                            &BridgeMessage::Stream(message.clone()),
+                        )
+                        .await?
+                        .delivered
+                    }
+                    EndpointBridgeMode::Remote => match deliver_bridge_message_remote(
+                        state.tls_paths.clone(),
+                        &spec.target_daemon_addr,
+                        &spec.target_daemon_server_name,
+                        &spec.target_instance_id,
+                        &spec.target_endpoint,
+                        BridgeMessage::Stream(message.clone()),
+                    )
+                    .await
+                    {
+                        Ok(delivery) => delivery.delivered,
+                        Err(err) => {
+                            tracing::warn!(
+                                source = %spec.source_endpoint.key(),
+                                target = %spec.target_endpoint.key(),
+                                target_node = %spec.target_node,
+                                session_id = %message.session_id,
+                                lifecycle = ?message.lifecycle,
+                                error = %err,
+                                "remote managed stream delivery attempt failed; retrying"
+                            );
+                            sleep(MANAGED_EVENT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    },
+                };
+                if delivered {
+                    if spec.mode == EndpointBridgeMode::Remote {
+                        info!(
+                            "delivered remote managed stream frame {} -> {}",
+                            spec.source_endpoint.key(),
+                            spec.target_endpoint.key()
+                        );
+                    }
+                    QueueService
+                        .ack(
+                            &reader,
+                            QueueAck {
+                                endpoint_id: 0,
+                                seq: frame.seq,
+                            },
+                        )
+                        .context("ack managed stream frame")?;
+                } else {
+                    sleep(MANAGED_EVENT_RETRY_DELAY).await;
+                }
+            }
+            other => bail!("managed stream queue wait failed with {other:?}"),
+        }
+    }
+}
+
+async fn forward_service_endpoint_bridge(
+    state: Rc<DaemonState>,
+    spec: ActiveServiceEndpointBridgeSpec,
+) -> Result<()> {
+    let source_queue = {
+        let bindings = state.source_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(
+                &spec.source_instance_id,
+                &spec.source_endpoint,
+            ))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing source binding for `{}` on `{}`",
+                    spec.source_endpoint.name,
+                    spec.source_instance_id
+                )
+            })?
+    };
+
+    let reader = QueueService
+        .attach(
+            &source_queue.queue,
+            QueueAttach {
+                shared_id: 0,
+                role: QueueRole::Reader,
+            },
+        )
+        .context("attach managed service route reader")?;
+
+    loop {
+        let waited = QueueService
+            .wait(&reader, MANAGED_EVENT_RETRY_DELAY.as_millis() as u32)
+            .await
+            .context("wait for managed service frame")?;
+        match waited.code {
+            QueueStatusCode::Timeout => continue,
+            QueueStatusCode::Ok => {
+                let Some(frame) = waited.frame else {
+                    continue;
+                };
+                let message = read_managed_service_frame(
+                    &state,
+                    frame.shm_shared_id,
+                    frame.offset,
+                    frame.len,
+                )
+                .await?;
+                if message.phase != ServiceMessagePhase::Request {
+                    bail!(
+                        "managed service bridge expected request phase for `{}`",
+                        spec.source_endpoint.key()
+                    );
+                }
+
+                let delivered = match spec.mode {
+                    EndpointBridgeMode::Local => {
+                        deliver_bridge_message_local(
+                            &state,
+                            &spec.target_instance_id,
+                            &spec.target_endpoint,
+                            &BridgeMessage::Service(message.clone()),
+                        )
+                        .await?
+                    }
+                    EndpointBridgeMode::Remote => match deliver_bridge_message_remote(
+                        state.tls_paths.clone(),
+                        &spec.target_daemon_addr,
+                        &spec.target_daemon_server_name,
+                        &spec.target_instance_id,
+                        &spec.target_endpoint,
+                        BridgeMessage::Service(message.clone()),
+                    )
+                    .await
+                    {
+                        Ok(delivery) => delivery,
+                        Err(err) => {
+                            tracing::warn!(
+                                source = %spec.source_endpoint.key(),
+                                target = %spec.target_endpoint.key(),
+                                target_node = %spec.target_node,
+                                exchange_id = %message.exchange_id,
+                                error = %err,
+                                "remote managed service delivery attempt failed; retrying"
+                            );
+                            sleep(MANAGED_EVENT_RETRY_DELAY).await;
+                            continue;
+                        }
+                    },
+                };
+
+                if !delivered.delivered {
+                    sleep(MANAGED_EVENT_RETRY_DELAY).await;
+                    continue;
+                }
+
+                let response = match delivered.message {
+                    Some(BridgeMessage::Service(response)) => response,
+                    Some(other) => bail!("service bridge received unexpected response {other:?}"),
+                    None => bail!(
+                        "service bridge missing correlated response for exchange `{}`",
+                        message.exchange_id
+                    ),
+                };
+
+                let response_delivery = deliver_bridge_message_local(
+                    &state,
+                    &spec.source_instance_id,
+                    &spec.source_endpoint,
+                    &BridgeMessage::Service(response),
+                )
+                .await?;
+                if !response_delivery.delivered {
+                    bail!(
+                        "source response binding missing for `{}` on `{}`",
+                        spec.source_endpoint.name,
+                        spec.source_instance_id
+                    );
+                }
+
+                QueueService
+                    .ack(
+                        &reader,
+                        QueueAck {
+                            endpoint_id: 0,
+                            seq: frame.seq,
+                        },
+                    )
+                    .context("ack managed service frame")?;
+            }
+            other => bail!("managed service queue wait failed with {other:?}"),
+        }
+    }
+}
+
+async fn forward_event_endpoint_bridge(
+    state: Rc<DaemonState>,
+    spec: ActiveEventEndpointBridgeSpec,
+) -> Result<()> {
+    let source_queue = {
+        let bindings = state.source_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(
+                &spec.source_instance_id,
+                &spec.source_endpoint,
             ))
             .cloned()
             .ok_or_else(|| {
@@ -1170,27 +1676,29 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                 let payload =
                     read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
                         .await?;
+                let message = BridgeMessage::Event(EventBridgeMessage { payload });
                 let delivered = match spec.mode {
-                    EventRouteMode::Local => {
-                        deliver_event_frame(
+                    EndpointBridgeMode::Local => {
+                        deliver_bridge_message_local(
                             &state,
                             &spec.target_instance_id,
-                            &spec.target_endpoint.name,
-                            &payload,
+                            &spec.target_endpoint,
+                            &message,
                         )
                         .await?
+                        .delivered
                     }
-                    EventRouteMode::Remote => match deliver_event_frame_remote(
+                    EndpointBridgeMode::Remote => match deliver_bridge_message_remote(
                         state.tls_paths.clone(),
                         &spec.target_daemon_addr,
                         &spec.target_daemon_server_name,
                         &spec.target_instance_id,
-                        &spec.target_endpoint.name,
-                        &payload,
+                        &spec.target_endpoint,
+                        message.clone(),
                     )
                     .await
                     {
-                        Ok(delivered) => delivered,
+                        Ok(delivery) => delivery.delivered,
                         Err(err) => {
                             tracing::warn!(
                                 source = %spec.source_endpoint.key(),
@@ -1205,7 +1713,7 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
                     },
                 };
                 if delivered {
-                    if spec.mode == EventRouteMode::Remote {
+                    if spec.mode == EndpointBridgeMode::Remote {
                         info!(
                             "delivered remote managed event frame {} -> {}",
                             spec.source_endpoint.key(),
@@ -1227,6 +1735,184 @@ async fn forward_event_route(state: Rc<DaemonState>, spec: ActiveEventRouteSpec)
             }
             other => bail!("managed event queue wait failed with {other:?}"),
         }
+    }
+}
+
+async fn deliver_bridge_message_local(
+    state: &DaemonState,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: &BridgeMessage,
+) -> Result<BridgeMessageDelivery> {
+    match message {
+        BridgeMessage::Event(frame) => Ok(BridgeMessageDelivery {
+            delivered: deliver_event_frame(
+                state,
+                target_instance_id,
+                target_endpoint,
+                &frame.payload,
+            )
+            .await?,
+            message: None,
+        }),
+        BridgeMessage::Service(frame) => {
+            deliver_service_frame(state, target_instance_id, target_endpoint, frame).await
+        }
+        BridgeMessage::Stream(frame) => Ok(BridgeMessageDelivery {
+            delivered: deliver_stream_frame(state, target_instance_id, target_endpoint, frame)
+                .await?,
+            message: None,
+        }),
+    }
+}
+
+async fn read_managed_stream_frame(
+    state: &DaemonState,
+    shm_shared_id: u64,
+    offset: u32,
+    len: u32,
+) -> Result<StreamBridgeMessage> {
+    let payload = read_managed_event_frame(state, shm_shared_id, offset, len).await?;
+    decode_rkyv(&payload).context("decode managed stream frame")
+}
+
+async fn read_managed_service_frame(
+    state: &DaemonState,
+    shm_shared_id: u64,
+    offset: u32,
+    len: u32,
+) -> Result<ServiceBridgeMessage> {
+    let payload = read_managed_event_frame(state, shm_shared_id, offset, len).await?;
+    decode_rkyv(&payload).context("decode managed service frame")
+}
+
+async fn deliver_service_frame(
+    state: &DaemonState,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: &ServiceBridgeMessage,
+) -> Result<BridgeMessageDelivery> {
+    match message.phase {
+        ServiceMessagePhase::Request => {
+            deliver_service_request(state, target_instance_id, target_endpoint, message).await
+        }
+        ServiceMessagePhase::Response => Ok(BridgeMessageDelivery {
+            delivered: deliver_service_response(
+                state,
+                target_instance_id,
+                target_endpoint,
+                message,
+            )
+            .await?,
+            message: None,
+        }),
+    }
+}
+
+async fn deliver_service_request(
+    state: &DaemonState,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: &ServiceBridgeMessage,
+) -> Result<BridgeMessageDelivery> {
+    let request_binding = {
+        let bindings = state.target_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(target_instance_id, target_endpoint))
+            .cloned()
+    };
+    let response_binding = {
+        let bindings = state.service_response_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(target_instance_id, target_endpoint))
+            .cloned()
+    };
+    let (Some(request_binding), Some(response_binding)) = (request_binding, response_binding)
+    else {
+        return Ok(BridgeMessageDelivery {
+            delivered: false,
+            message: None,
+        });
+    };
+
+    enqueue_managed_service_frame(state, &request_binding.queue, message).await?;
+    let response =
+        await_service_response(state, &response_binding.queue, &message.exchange_id).await?;
+    Ok(BridgeMessageDelivery {
+        delivered: true,
+        message: Some(BridgeMessage::Service(response)),
+    })
+}
+
+async fn deliver_service_response(
+    state: &DaemonState,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: &ServiceBridgeMessage,
+) -> Result<bool> {
+    let binding = {
+        let bindings = state.service_response_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(target_instance_id, target_endpoint))
+            .cloned()
+    };
+    let Some(binding) = binding else {
+        return Ok(false);
+    };
+    enqueue_managed_service_frame(state, &binding.queue, message).await?;
+    Ok(true)
+}
+
+async fn await_service_response(
+    state: &DaemonState,
+    queue: &selium_kernel::services::queue_service::QueueState,
+    exchange_id: &str,
+) -> Result<ServiceBridgeMessage> {
+    let reader = QueueService
+        .attach(
+            queue,
+            QueueAttach {
+                shared_id: 0,
+                role: QueueRole::Reader,
+            },
+        )
+        .context("attach managed service response reader")?;
+    let waited = QueueService
+        .wait(&reader, QUIC_REQUEST_TIMEOUT.as_millis() as u32)
+        .await
+        .context("wait for managed service response")?;
+    match waited.code {
+        QueueStatusCode::Ok => {
+            let frame = waited
+                .frame
+                .ok_or_else(|| anyhow!("missing managed service response frame"))?;
+            let response =
+                read_managed_service_frame(state, frame.shm_shared_id, frame.offset, frame.len)
+                    .await?;
+            if response.phase != ServiceMessagePhase::Response {
+                bail!("managed service response queue yielded non-response phase");
+            }
+            if response.exchange_id != exchange_id {
+                bail!(
+                    "managed service response exchange mismatch: expected `{exchange_id}`, got `{}`",
+                    response.exchange_id
+                );
+            }
+            QueueService
+                .ack(
+                    &reader,
+                    QueueAck {
+                        endpoint_id: 0,
+                        seq: frame.seq,
+                    },
+                )
+                .context("ack managed service response")?;
+            Ok(response)
+        }
+        QueueStatusCode::Timeout => {
+            bail!("timed out waiting for service response for exchange `{exchange_id}`")
+        }
+        other => bail!("managed service response wait failed with {other:?}"),
     }
 }
 
@@ -1257,19 +1943,38 @@ async fn read_managed_event_frame(
 async fn deliver_event_frame(
     state: &DaemonState,
     target_instance_id: &str,
-    target_endpoint_name: &str,
+    target_endpoint: &PublicEndpointRef,
     payload: &[u8],
 ) -> Result<bool> {
     let binding = {
         let bindings = state.target_bindings.lock().await;
         bindings
-            .get(&endpoint_key(target_instance_id, target_endpoint_name))
+            .get(&endpoint_key(target_instance_id, target_endpoint))
             .cloned()
     };
     let Some(binding) = binding else {
         return Ok(false);
     };
     enqueue_managed_event_frame(state, &binding.queue, payload).await?;
+    Ok(true)
+}
+
+async fn deliver_stream_frame(
+    state: &DaemonState,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: &StreamBridgeMessage,
+) -> Result<bool> {
+    let binding = {
+        let bindings = state.target_bindings.lock().await;
+        bindings
+            .get(&endpoint_key(target_instance_id, target_endpoint))
+            .cloned()
+    };
+    let Some(binding) = binding else {
+        return Ok(false);
+    };
+    enqueue_managed_stream_frame(state, &binding.queue, message).await?;
     Ok(true)
 }
 
@@ -1340,14 +2045,32 @@ async fn enqueue_managed_event_frame(
     Ok(())
 }
 
-async fn deliver_event_frame_remote(
+async fn enqueue_managed_service_frame(
+    state: &DaemonState,
+    queue: &selium_kernel::services::queue_service::QueueState,
+    message: &ServiceBridgeMessage,
+) -> Result<()> {
+    let payload = encode_rkyv(message).context("encode managed service frame")?;
+    enqueue_managed_event_frame(state, queue, &payload).await
+}
+
+async fn enqueue_managed_stream_frame(
+    state: &DaemonState,
+    queue: &selium_kernel::services::queue_service::QueueState,
+    message: &StreamBridgeMessage,
+) -> Result<()> {
+    let payload = encode_rkyv(message).context("encode managed stream frame")?;
+    enqueue_managed_event_frame(state, queue, &payload).await
+}
+
+async fn deliver_bridge_message_remote(
     tls_paths: ManagedEventTlsPaths,
     target_daemon_addr: &str,
     target_daemon_server_name: &str,
     target_instance_id: &str,
-    target_endpoint_name: &str,
-    payload: &[u8],
-) -> Result<bool> {
+    target_endpoint: &PublicEndpointRef,
+    message: BridgeMessage,
+) -> Result<BridgeMessageDelivery> {
     let endpoint = build_client_endpoint(
         &tls_paths.ca_cert,
         &tls_paths.client_cert,
@@ -1365,12 +2088,12 @@ async fn deliver_event_frame_remote(
     .context("connect remote daemon")??;
     let request_id = 1;
     let frame = encode_request(
-        Method::DeliverEventFrame,
+        Method::DeliverBridgeMessage,
         request_id,
-        &DeliverEventFrameRequest {
+        &DeliverBridgeMessageRequest {
             target_instance_id: target_instance_id.to_string(),
-            target_endpoint_name: target_endpoint_name.to_string(),
-            payload: payload.to_vec(),
+            target_endpoint: target_endpoint.clone(),
+            message,
         },
     )
     .context("encode remote frame delivery")?;
@@ -1392,13 +2115,28 @@ async fn deliver_event_frame_remote(
         let err = decode_error(&envelope).context("decode remote route error")?;
         bail!("remote daemon returned {}: {}", err.code, err.message);
     }
-    let delivered: DeliverEventFrameResponse =
+    let delivered: DeliverBridgeMessageResponse =
         decode_payload(&envelope).context("decode remote route delivery")?;
-    Ok(delivered.delivered)
+    Ok(BridgeMessageDelivery {
+        delivered: delivered.delivered,
+        message: delivered.message,
+    })
 }
 
-fn endpoint_key(instance_id: &str, endpoint_name: &str) -> (String, String) {
-    (instance_id.to_string(), endpoint_name.to_string())
+fn endpoint_binding_key(
+    instance_id: &str,
+    endpoint_kind: ContractKind,
+    endpoint_name: &str,
+) -> (String, ContractKind, String) {
+    (
+        instance_id.to_string(),
+        endpoint_kind,
+        endpoint_name.to_string(),
+    )
+}
+
+fn endpoint_key(instance_id: &str, endpoint: &PublicEndpointRef) -> (String, ContractKind, String) {
+    endpoint_binding_key(instance_id, endpoint.kind, &endpoint.name)
 }
 
 fn rpc_decode_error(method: Method, request_id: u64, error: anyhow::Error) -> Result<Vec<u8>> {
@@ -1521,10 +2259,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use selium_abi::decode_rkyv;
     use selium_control_plane_api::WorkloadRef;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activate_event_route_forwards_local_frames() {
+    async fn activate_endpoint_bridge_forwards_local_event_frames() {
         LocalSet::new()
             .run_until(async {
                 let state = sample_state("local-node");
@@ -1533,32 +2272,38 @@ mod tests {
                     .lock()
                     .await
                     .insert("source-1".to_string(), 7);
-                ensure_managed_event_bindings(
+                ensure_managed_endpoint_bindings(
                     &state,
                     "source-1",
-                    &[ManagedEventBinding {
+                    &[ManagedEndpointBinding {
                         endpoint_name: "camera.frames".to_string(),
-                        role: ManagedEventBindingRole::Source,
+                        endpoint_kind: ContractKind::Event,
+                        role: ManagedEndpointRole::Egress,
+                        binding_type:
+                            selium_control_plane_protocol::ManagedEndpointBindingType::OneWay,
                     }],
                 )
                 .await
                 .expect("register source binding");
-                ensure_managed_event_bindings(
+                ensure_managed_endpoint_bindings(
                     &state,
                     "target-1",
-                    &[ManagedEventBinding {
+                    &[ManagedEndpointBinding {
                         endpoint_name: "camera.frames".to_string(),
-                        role: ManagedEventBindingRole::Target,
+                        endpoint_kind: ContractKind::Event,
+                        role: ManagedEndpointRole::Ingress,
+                        binding_type:
+                            selium_control_plane_protocol::ManagedEndpointBindingType::OneWay,
                     }],
                 )
                 .await
                 .expect("register target binding");
 
-                let response = activate_event_route(
+                let response = activate_endpoint_bridge(
                     &state,
-                    &ActivateEventRouteRequest {
+                    &ActivateEndpointBridgeRequest {
                         node_id: "local-node".to_string(),
-                        route_id: "route-1".to_string(),
+                        bridge_id: "bridge-1".to_string(),
                         source_instance_id: "source-1".to_string(),
                         source_endpoint: sample_endpoint("ingress", "camera.frames"),
                         target_instance_id: "target-1".to_string(),
@@ -1566,24 +2311,35 @@ mod tests {
                         target_daemon_addr: "127.0.0.1:7100".to_string(),
                         target_daemon_server_name: "localhost".to_string(),
                         target_endpoint: sample_endpoint("detector", "camera.frames"),
+                        semantics: selium_control_plane_protocol::EndpointBridgeSemantics::Event(
+                            selium_control_plane_protocol::EventBridgeSemantics {
+                                delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+                            },
+                        ),
                     },
                 )
                 .await
                 .expect("activate route");
-                assert_eq!(response.mode, EventRouteMode::Local);
+                assert_eq!(response.mode, EndpointBridgeMode::Local);
 
                 let source = state
                     .source_bindings
                     .lock()
                     .await
-                    .get(&endpoint_key("source-1", "camera.frames"))
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint("ingress", "camera.frames"),
+                    ))
                     .cloned()
                     .expect("source binding present");
                 let target = state
                     .target_bindings
                     .lock()
                     .await
-                    .get(&endpoint_key("target-1", "camera.frames"))
+                    .get(&endpoint_key(
+                        "target-1",
+                        &sample_endpoint("detector", "camera.frames"),
+                    ))
                     .cloned()
                     .expect("target binding present");
 
@@ -1615,30 +2371,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn deliver_event_frame_rpc_writes_target_queue() {
+    async fn deliver_bridge_message_event_writes_target_queue() {
         let state = sample_state("remote-node");
-        ensure_managed_event_bindings(
+        ensure_managed_endpoint_bindings(
             &state,
             "target-1",
-            &[ManagedEventBinding {
+            &[ManagedEndpointBinding {
                 endpoint_name: "camera.frames".to_string(),
-                role: ManagedEventBindingRole::Target,
+                endpoint_kind: ContractKind::Event,
+                role: ManagedEndpointRole::Ingress,
+                binding_type: selium_control_plane_protocol::ManagedEndpointBindingType::OneWay,
             }],
         )
         .await
         .expect("register target binding");
 
-        assert!(
-            deliver_event_frame(&state, "target-1", "camera.frames", b"frame-remote")
-                .await
-                .expect("deliver frame")
-        );
+        let delivered = deliver_bridge_message_local(
+            &state,
+            "target-1",
+            &sample_endpoint("detector", "camera.frames"),
+            &BridgeMessage::Event(EventBridgeMessage {
+                payload: b"frame-remote".to_vec(),
+            }),
+        )
+        .await
+        .expect("deliver bridge message");
+        assert!(matches!(
+            delivered,
+            BridgeMessageDelivery {
+                delivered: true,
+                message: None,
+            }
+        ));
 
         let target = state
             .target_bindings
             .lock()
             .await
-            .get(&endpoint_key("target-1", "camera.frames"))
+            .get(&endpoint_key(
+                "target-1",
+                &sample_endpoint("detector", "camera.frames"),
+            ))
             .cloned()
             .expect("target binding present");
         let reader = QueueService
@@ -1660,6 +2433,549 @@ mod tests {
                 .await
                 .expect("read target frame");
         assert_eq!(payload, b"frame-remote");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_endpoint_bridge_forwards_local_service_request_response() {
+        LocalSet::new()
+            .run_until(async {
+                let state = sample_state("local-node");
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .insert("source-1".to_string(), 7);
+                ensure_managed_endpoint_bindings(
+                    &state,
+                    "source-1",
+                    &[ManagedEndpointBinding {
+                        endpoint_name: "shared".to_string(),
+                        endpoint_kind: ContractKind::Service,
+                        role: ManagedEndpointRole::Egress,
+                        binding_type: ManagedEndpointBindingType::RequestResponse,
+                    }],
+                )
+                .await
+                .expect("register source binding");
+                ensure_managed_endpoint_bindings(
+                    &state,
+                    "target-1",
+                    &[ManagedEndpointBinding {
+                        endpoint_name: "shared".to_string(),
+                        endpoint_kind: ContractKind::Service,
+                        role: ManagedEndpointRole::Ingress,
+                        binding_type: ManagedEndpointBindingType::RequestResponse,
+                    }],
+                )
+                .await
+                .expect("register target binding");
+
+                let response = activate_endpoint_bridge(
+                    &state,
+                    &ActivateEndpointBridgeRequest {
+                        node_id: "local-node".to_string(),
+                        bridge_id: "bridge-service".to_string(),
+                        source_instance_id: "source-1".to_string(),
+                        source_endpoint: sample_endpoint_kind(ContractKind::Service, "ingest", "shared"),
+                        target_instance_id: "target-1".to_string(),
+                        target_node: "local-node".to_string(),
+                        target_daemon_addr: "127.0.0.1:7100".to_string(),
+                        target_daemon_server_name: "localhost".to_string(),
+                        target_endpoint: sample_endpoint_kind(ContractKind::Service, "detector", "shared"),
+                        semantics: EndpointBridgeSemantics::Service(
+                            selium_control_plane_protocol::ServiceBridgeSemantics {
+                                correlation:
+                                    selium_control_plane_protocol::ServiceCorrelationMode::RequestId,
+                            },
+                        ),
+                    },
+                )
+                .await
+                .expect("activate service route");
+                assert_eq!(response.mode, EndpointBridgeMode::Local);
+
+                let source_request = state
+                    .source_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint_kind(ContractKind::Service, "ingest", "shared"),
+                    ))
+                    .cloned()
+                    .expect("source request binding present");
+                let source_response = state
+                    .service_response_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint_kind(ContractKind::Service, "ingest", "shared"),
+                    ))
+                    .cloned()
+                    .expect("source response binding present");
+                let target_request = state
+                    .target_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "target-1",
+                        &sample_endpoint_kind(ContractKind::Service, "detector", "shared"),
+                    ))
+                    .cloned()
+                    .expect("target request binding present");
+                let target_response = state
+                    .service_response_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "target-1",
+                        &sample_endpoint_kind(ContractKind::Service, "detector", "shared"),
+                    ))
+                    .cloned()
+                    .expect("target response binding present");
+
+                let service_state = Rc::clone(&state);
+                spawn_local(async move {
+                    let reader = QueueService
+                        .attach(
+                            &target_request.queue,
+                            QueueAttach {
+                                shared_id: 0,
+                                role: QueueRole::Reader,
+                            },
+                        )
+                        .expect("attach target request reader");
+                    let waited = QueueService
+                        .wait(&reader, 2_000)
+                        .await
+                        .expect("wait target request");
+                    let frame = waited.frame.expect("target request frame");
+                    let request = read_managed_service_frame(
+                        &service_state,
+                        frame.shm_shared_id,
+                        frame.offset,
+                        frame.len,
+                    )
+                    .await
+                    .expect("decode service request");
+                    assert_eq!(request.exchange_id, "req-42");
+                    assert_eq!(request.phase, ServiceMessagePhase::Request);
+                    assert_eq!(request.payload, b"detect".to_vec());
+                    QueueService
+                        .ack(
+                            &reader,
+                            QueueAck {
+                                endpoint_id: 0,
+                                seq: frame.seq,
+                            },
+                        )
+                        .expect("ack target request");
+
+                    enqueue_managed_service_frame(
+                        &service_state,
+                        &target_response.queue,
+                        &ServiceBridgeMessage {
+                            exchange_id: request.exchange_id,
+                            phase: ServiceMessagePhase::Response,
+                            sequence: request.sequence + 1,
+                            complete: true,
+                            payload: b"ok".to_vec(),
+                        },
+                    )
+                    .await
+                    .expect("enqueue target response");
+                });
+
+                enqueue_managed_service_frame(
+                    &state,
+                    &source_request.queue,
+                    &ServiceBridgeMessage {
+                        exchange_id: "req-42".to_string(),
+                        phase: ServiceMessagePhase::Request,
+                        sequence: 0,
+                        complete: true,
+                        payload: b"detect".to_vec(),
+                    },
+                )
+                .await
+                .expect("enqueue source request");
+
+                let reader = QueueService
+                    .attach(
+                        &source_response.queue,
+                        QueueAttach {
+                            shared_id: 0,
+                            role: QueueRole::Reader,
+                        },
+                    )
+                    .expect("attach source response reader");
+                let waited = QueueService
+                    .wait(&reader, 2_000)
+                    .await
+                    .expect("wait source response");
+                let frame = waited.frame.expect("source response frame");
+                let response = read_managed_service_frame(
+                    &state,
+                    frame.shm_shared_id,
+                    frame.offset,
+                    frame.len,
+                )
+                .await
+                .expect("decode source response");
+                assert_eq!(response.exchange_id, "req-42");
+                assert_eq!(response.phase, ServiceMessagePhase::Response);
+                assert_eq!(response.payload, b"ok".to_vec());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_endpoint_bridge_forwards_local_stream_lifecycle_frames() {
+        LocalSet::new()
+            .run_until(async {
+                let state = sample_state("local-node");
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .insert("source-1".to_string(), 7);
+                ensure_managed_endpoint_bindings(
+                    &state,
+                    "source-1",
+                    &[ManagedEndpointBinding {
+                        endpoint_name: "shared".to_string(),
+                        endpoint_kind: ContractKind::Stream,
+                        role: ManagedEndpointRole::Egress,
+                        binding_type: ManagedEndpointBindingType::Session,
+                    }],
+                )
+                .await
+                .expect("register source binding");
+                ensure_managed_endpoint_bindings(
+                    &state,
+                    "target-1",
+                    &[ManagedEndpointBinding {
+                        endpoint_name: "shared".to_string(),
+                        endpoint_kind: ContractKind::Stream,
+                        role: ManagedEndpointRole::Ingress,
+                        binding_type: ManagedEndpointBindingType::Session,
+                    }],
+                )
+                .await
+                .expect("register target binding");
+
+                let response = activate_endpoint_bridge(
+                    &state,
+                    &ActivateEndpointBridgeRequest {
+                        node_id: "local-node".to_string(),
+                        bridge_id: "bridge-stream".to_string(),
+                        source_instance_id: "source-1".to_string(),
+                        source_endpoint: sample_endpoint_kind(ContractKind::Stream, "ingest", "shared"),
+                        target_instance_id: "target-1".to_string(),
+                        target_node: "local-node".to_string(),
+                        target_daemon_addr: "127.0.0.1:7100".to_string(),
+                        target_daemon_server_name: "localhost".to_string(),
+                        target_endpoint: sample_endpoint_kind(ContractKind::Stream, "detector", "shared"),
+                        semantics: EndpointBridgeSemantics::Stream(
+                            selium_control_plane_protocol::StreamBridgeSemantics {
+                                lifecycle: selium_control_plane_protocol::StreamLifecycleMode::SessionFrames,
+                            },
+                        ),
+                    },
+                )
+                .await
+                .expect("activate stream route");
+                assert_eq!(response.mode, EndpointBridgeMode::Local);
+
+                let source = state
+                    .source_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint_kind(ContractKind::Stream, "ingest", "shared"),
+                    ))
+                    .cloned()
+                    .expect("source binding present");
+                let target = state
+                    .target_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "target-1",
+                        &sample_endpoint_kind(ContractKind::Stream, "detector", "shared"),
+                    ))
+                    .cloned()
+                    .expect("target binding present");
+
+                for message in [
+                    StreamBridgeMessage {
+                        session_id: "session-7".to_string(),
+                        lifecycle: selium_control_plane_protocol::StreamLifecycle::Open,
+                        sequence: 0,
+                        payload: b"hello".to_vec(),
+                    },
+                    StreamBridgeMessage {
+                        session_id: "session-7".to_string(),
+                        lifecycle: selium_control_plane_protocol::StreamLifecycle::Data,
+                        sequence: 1,
+                        payload: b"chunk".to_vec(),
+                    },
+                    StreamBridgeMessage {
+                        session_id: "session-7".to_string(),
+                        lifecycle: selium_control_plane_protocol::StreamLifecycle::Close,
+                        sequence: 2,
+                        payload: Vec::new(),
+                    },
+                ] {
+                    enqueue_managed_stream_frame(&state, &source.queue, &message)
+                        .await
+                        .expect("enqueue source stream frame");
+                }
+
+                let reader = QueueService
+                    .attach(
+                        &target.queue,
+                        QueueAttach {
+                            shared_id: 0,
+                            role: QueueRole::Reader,
+                        },
+                    )
+                    .expect("attach target reader");
+
+                for (expected_lifecycle, expected_sequence, expected_payload) in [
+                    (selium_control_plane_protocol::StreamLifecycle::Open, 0, b"hello".as_slice()),
+                    (selium_control_plane_protocol::StreamLifecycle::Data, 1, b"chunk".as_slice()),
+                    (selium_control_plane_protocol::StreamLifecycle::Close, 2, b"".as_slice()),
+                ] {
+                    let waited = QueueService
+                        .wait(&reader, 2_000)
+                        .await
+                        .expect("wait target stream frame");
+                    let frame = waited.frame.expect("stream frame available");
+                    let message = read_managed_stream_frame(
+                        &state,
+                        frame.shm_shared_id,
+                        frame.offset,
+                        frame.len,
+                    )
+                    .await
+                    .expect("read target stream frame");
+                    assert_eq!(message.session_id, "session-7");
+                    assert_eq!(message.lifecycle, expected_lifecycle);
+                    assert_eq!(message.sequence, expected_sequence);
+                    assert_eq!(message.payload, expected_payload);
+                    QueueService
+                        .ack(
+                            &reader,
+                            QueueAck {
+                                endpoint_id: 0,
+                                seq: frame.seq,
+                            },
+                        )
+                        .expect("ack target stream frame");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deliver_bridge_message_stream_writes_target_queue() {
+        let state = sample_state("remote-node");
+        ensure_managed_endpoint_bindings(
+            &state,
+            "target-1",
+            &[ManagedEndpointBinding {
+                endpoint_name: "shared".to_string(),
+                endpoint_kind: ContractKind::Stream,
+                role: ManagedEndpointRole::Ingress,
+                binding_type: ManagedEndpointBindingType::Session,
+            }],
+        )
+        .await
+        .expect("register target binding");
+
+        let delivered = deliver_bridge_message_local(
+            &state,
+            "target-1",
+            &sample_endpoint_kind(ContractKind::Stream, "detector", "shared"),
+            &BridgeMessage::Stream(StreamBridgeMessage {
+                session_id: "session-9".to_string(),
+                lifecycle: selium_control_plane_protocol::StreamLifecycle::Abort,
+                sequence: 3,
+                payload: b"cancel".to_vec(),
+            }),
+        )
+        .await
+        .expect("deliver bridge stream message");
+        assert!(matches!(
+            delivered,
+            BridgeMessageDelivery {
+                delivered: true,
+                message: None,
+            }
+        ));
+
+        let target = state
+            .target_bindings
+            .lock()
+            .await
+            .get(&endpoint_key(
+                "target-1",
+                &sample_endpoint_kind(ContractKind::Stream, "detector", "shared"),
+            ))
+            .cloned()
+            .expect("target binding present");
+        let reader = QueueService
+            .attach(
+                &target.queue,
+                QueueAttach {
+                    shared_id: 0,
+                    role: QueueRole::Reader,
+                },
+            )
+            .expect("attach target reader");
+        let waited = QueueService
+            .wait(&reader, 2_000)
+            .await
+            .expect("wait target stream frame");
+        let frame = waited.frame.expect("stream frame available");
+        let message =
+            read_managed_stream_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                .await
+                .expect("read target stream frame");
+        assert_eq!(message.session_id, "session-9");
+        assert_eq!(
+            message.lifecycle,
+            selium_control_plane_protocol::StreamLifecycle::Abort
+        );
+        assert_eq!(message.sequence, 3);
+        assert_eq!(message.payload, b"cancel");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_endpoint_binding_payload_partitions_same_name_bindings_by_kind() {
+        let state = sample_state("remote-node");
+        let bindings = ensure_managed_endpoint_bindings(
+            &state,
+            "target-1",
+            &[
+                ManagedEndpointBinding {
+                    endpoint_name: "shared".to_string(),
+                    endpoint_kind: ContractKind::Event,
+                    role: ManagedEndpointRole::Ingress,
+                    binding_type: selium_control_plane_protocol::ManagedEndpointBindingType::OneWay,
+                },
+                ManagedEndpointBinding {
+                    endpoint_name: "shared".to_string(),
+                    endpoint_kind: ContractKind::Service,
+                    role: ManagedEndpointRole::Ingress,
+                    binding_type:
+                        selium_control_plane_protocol::ManagedEndpointBindingType::RequestResponse,
+                },
+                ManagedEndpointBinding {
+                    endpoint_name: "shared".to_string(),
+                    endpoint_kind: ContractKind::Stream,
+                    role: ManagedEndpointRole::Ingress,
+                    binding_type: ManagedEndpointBindingType::Session,
+                },
+            ],
+        )
+        .await
+        .expect("register bindings")
+        .expect("bindings payload");
+
+        let decoded = decode_rkyv::<DataValue>(&bindings).expect("decode bindings payload");
+        let event = decoded
+            .get("readers")
+            .and_then(|section| section.get("event"))
+            .and_then(|section| section.get("shared"))
+            .expect("event binding present");
+        let service_reader = decoded
+            .get("readers")
+            .and_then(|section| section.get("service"))
+            .and_then(|section| section.get("shared"))
+            .expect("service reader binding present");
+        let service_writer = decoded
+            .get("writers")
+            .and_then(|section| section.get("service"))
+            .and_then(|section| section.get("shared"))
+            .expect("service writer binding present");
+        let stream = decoded
+            .get("readers")
+            .and_then(|section| section.get("stream"))
+            .and_then(|section| section.get("shared"))
+            .expect("stream binding present");
+
+        assert_ne!(
+            event
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("event queue id"),
+            service_reader
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("service reader queue id")
+        );
+        assert_ne!(
+            service_reader
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("service reader queue id"),
+            service_writer
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("service writer queue id")
+        );
+        assert_ne!(
+            event
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("event queue id"),
+            stream
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("stream queue id")
+        );
+        assert_ne!(
+            service_reader
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("service reader queue id"),
+            stream
+                .get("queue_shared_id")
+                .and_then(DataValue::as_u64)
+                .expect("stream queue id")
+        );
+        assert_eq!(
+            event
+                .get("endpoint_kind")
+                .and_then(DataValue::as_str)
+                .expect("event kind"),
+            "event"
+        );
+        assert_eq!(
+            service_reader
+                .get("endpoint_kind")
+                .and_then(DataValue::as_str)
+                .expect("service kind"),
+            "service"
+        );
+        assert_eq!(
+            service_writer
+                .get("endpoint_kind")
+                .and_then(DataValue::as_str)
+                .expect("service writer kind"),
+            "service"
+        );
+        assert_eq!(
+            stream
+                .get("endpoint_kind")
+                .and_then(DataValue::as_str)
+                .expect("stream kind"),
+            "stream"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1753,8 +3069,8 @@ mod tests {
     }
 
     #[test]
-    fn append_managed_event_bindings_arg_uses_typed_buffer_argument() {
-        let spec = append_managed_event_bindings_arg("path=demo.wasm", Some(&[0x41, 0x42]))
+    fn append_managed_endpoint_bindings_arg_uses_typed_buffer_argument() {
+        let spec = append_managed_endpoint_bindings_arg("path=demo.wasm", Some(&[0x41, 0x42]))
             .expect("append bindings arg");
         assert_eq!(spec, "path=demo.wasm;params=buffer;args=buffer:hex:4142");
     }
@@ -1778,7 +3094,8 @@ mod tests {
             processes: Mutex::new(BTreeMap::new()),
             source_bindings: Mutex::new(BTreeMap::new()),
             target_bindings: Mutex::new(BTreeMap::new()),
-            active_routes: Mutex::new(BTreeMap::new()),
+            service_response_bindings: Mutex::new(BTreeMap::new()),
+            active_bridges: Mutex::new(BTreeMap::new()),
             control_plane: Arc::new(LocalControlPlaneClient {
                 endpoint,
                 addr: "127.0.0.1:1".parse().expect("dummy addr"),
@@ -1795,13 +3112,22 @@ mod tests {
         })
     }
 
-    fn sample_endpoint(workload: &str, endpoint: &str) -> EventEndpointRef {
-        EventEndpointRef {
+    fn sample_endpoint(workload: &str, endpoint: &str) -> PublicEndpointRef {
+        sample_endpoint_kind(ContractKind::Event, workload, endpoint)
+    }
+
+    fn sample_endpoint_kind(
+        kind: ContractKind,
+        workload: &str,
+        endpoint: &str,
+    ) -> PublicEndpointRef {
+        PublicEndpointRef {
             workload: WorkloadRef {
                 tenant: "tenant-a".to_string(),
                 namespace: "media".to_string(),
                 name: workload.to_string(),
             },
+            kind,
             name: endpoint.to_string(),
         }
     }

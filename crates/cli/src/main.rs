@@ -15,15 +15,17 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_control_plane_protocol::{
-    ListRequest, ListResponse, Method, MutateApiRequest, MutateApiResponse, QueryApiRequest,
-    QueryApiResponse, ReplayApiRequest, ReplayApiResponse, StartRequest, StartResponse,
-    StopRequest, StopResponse,
+    EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest, ListResponse,
+    Method, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
+    ReplayApiRequest, ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode,
+    StartRequest, StartResponse, StopRequest, StopResponse, StreamBridgeSemantics,
+    StreamLifecycleMode,
 };
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
     api::{
-        ContractRef, ControlPlaneState, DeploymentSpec, EventEndpointRef, PipelineEdge,
-        PipelineEndpoint, PipelineSpec, WorkloadRef, collect_contracts_for_workload,
+        ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, EventEndpointRef,
+        PipelineEdge, PipelineEndpoint, PipelineSpec, WorkloadRef, collect_contracts_for_workload,
         ensure_pipeline_consistency, generate_rust_bindings, parse_contract_ref, parse_idl,
     },
     apply, build_module_spec as build_runtime_module_spec,
@@ -273,7 +275,7 @@ async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()>
                 node_id: args.node,
                 instance_id: args.replica_key,
                 module_spec,
-                managed_event_bindings: Vec::new(),
+                managed_endpoint_bindings: Vec::new(),
             },
         )
         .await?;
@@ -340,7 +342,7 @@ async fn cmd_list(
             .await
             .unwrap_or(ListResponse {
                 instances: BTreeMap::new(),
-                active_routes: Vec::new(),
+                active_bridges: Vec::new(),
             });
         println!("node={}", node.name);
         print_instance_map(&list.instances);
@@ -428,6 +430,20 @@ fn cmd_idl_compile(args: IdlCompileArgs) -> Result<()> {
 fn print_instance_map(instances: &BTreeMap<String, usize>) {
     for (instance, pid) in instances {
         println!("{instance} {pid}");
+    }
+}
+
+fn endpoint_bridge_semantics(kind: ContractKind) -> EndpointBridgeSemantics {
+    match kind {
+        ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
+            delivery: EventDeliveryMode::Frame,
+        }),
+        ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
+            correlation: ServiceCorrelationMode::RequestId,
+        }),
+        ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
+            lifecycle: StreamLifecycleMode::SessionFrames,
+        }),
     }
 }
 
@@ -540,7 +556,7 @@ async fn execute_daemon_actions(
             ReconcileAction::Start {
                 instance_id,
                 deployment,
-                managed_event_bindings,
+                managed_endpoint_bindings,
             } => {
                 let spec = state
                     .deployments
@@ -554,7 +570,7 @@ async fn execute_daemon_actions(
                             node_id: node.to_string(),
                             instance_id: instance_id.clone(),
                             module_spec,
-                            managed_event_bindings: managed_event_bindings.clone(),
+                            managed_endpoint_bindings: managed_endpoint_bindings.clone(),
                         },
                     )
                     .await?;
@@ -570,8 +586,8 @@ async fn execute_daemon_actions(
                     )
                     .await?;
             }
-            ReconcileAction::EnsureEventRoute {
-                route_id,
+            ReconcileAction::EnsureEndpointBridge {
+                bridge_id,
                 source_instance_id,
                 source_endpoint,
                 target_instance_id,
@@ -583,11 +599,11 @@ async fn execute_daemon_actions(
                     .get(target_node)
                     .ok_or_else(|| anyhow!("unknown target node `{target_node}`"))?;
                 let _ = node_client
-                    .request::<_, selium_control_plane_protocol::ActivateEventRouteResponse>(
-                        Method::ActivateEventRoute,
-                        &selium_control_plane_protocol::ActivateEventRouteRequest {
+                    .request::<_, selium_control_plane_protocol::ActivateEndpointBridgeResponse>(
+                        Method::ActivateEndpointBridge,
+                        &selium_control_plane_protocol::ActivateEndpointBridgeRequest {
                             node_id: node.to_string(),
-                            route_id: route_id.clone(),
+                            bridge_id: bridge_id.clone(),
                             source_instance_id: source_instance_id.clone(),
                             source_endpoint: source_endpoint.clone(),
                             target_instance_id: target_instance_id.clone(),
@@ -595,17 +611,18 @@ async fn execute_daemon_actions(
                             target_daemon_addr: target_spec.daemon_addr.clone(),
                             target_daemon_server_name: target_spec.daemon_server_name.clone(),
                             target_endpoint: target_endpoint.clone(),
+                            semantics: endpoint_bridge_semantics(source_endpoint.kind),
                         },
                     )
                     .await?;
             }
-            ReconcileAction::RemoveEventRoute { route_id } => {
+            ReconcileAction::RemoveEndpointBridge { bridge_id } => {
                 let _ = node_client
-                    .request::<_, selium_control_plane_protocol::DeactivateEventRouteResponse>(
-                        Method::DeactivateEventRoute,
-                        &selium_control_plane_protocol::DeactivateEventRouteRequest {
+                    .request::<_, selium_control_plane_protocol::DeactivateEndpointBridgeResponse>(
+                        Method::DeactivateEndpointBridge,
+                        &selium_control_plane_protocol::DeactivateEndpointBridgeRequest {
                             node_id: node.to_string(),
-                            route_id: route_id.clone(),
+                            bridge_id: bridge_id.clone(),
                         },
                     )
                     .await?;
@@ -685,8 +702,11 @@ fn save_agent_state(path: &Path, state: &AgentState) -> Result<()> {
 
 fn format_contract(contract: ContractRef) -> String {
     format!(
-        "{}/{}@{}",
-        contract.namespace, contract.name, contract.version
+        "{}/{}:{}@{}",
+        contract.namespace,
+        contract.kind.as_str(),
+        contract.name,
+        contract.version
     )
 }
 

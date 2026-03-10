@@ -49,40 +49,32 @@ impl ContractRegistry {
             .get(&contract.namespace)?
             .get(&contract.version)?;
 
-        if let Some(event) = package
-            .events
-            .iter()
-            .find(|event| event.name == contract.name)
-        {
-            return Some(ResolvedContract {
-                kind: ContractKind::Event,
-                schema: Some(event.payload_schema.clone()),
-            });
+        match contract.kind {
+            ContractKind::Event => package
+                .events
+                .iter()
+                .find(|event| event.name == contract.name)
+                .map(|event| ResolvedContract {
+                    kind: ContractKind::Event,
+                    schema: Some(event.payload_schema.clone()),
+                }),
+            ContractKind::Service => package
+                .services
+                .iter()
+                .find(|service| service.name == contract.name)
+                .map(|service| ResolvedContract {
+                    kind: ContractKind::Service,
+                    schema: Some(service.request_schema.clone()),
+                }),
+            ContractKind::Stream => package
+                .streams
+                .iter()
+                .find(|stream| stream.name == contract.name)
+                .map(|stream| ResolvedContract {
+                    kind: ContractKind::Stream,
+                    schema: Some(stream.payload_schema.clone()),
+                }),
         }
-
-        if let Some(service) = package
-            .services
-            .iter()
-            .find(|service| service.name == contract.name)
-        {
-            return Some(ResolvedContract {
-                kind: ContractKind::Service,
-                schema: Some(service.request_schema.clone()),
-            });
-        }
-
-        if let Some(stream) = package
-            .streams
-            .iter()
-            .find(|stream| stream.name == contract.name)
-        {
-            return Some(ResolvedContract {
-                kind: ContractKind::Stream,
-                schema: Some(stream.payload_schema.clone()),
-            });
-        }
-
-        None
     }
 
     pub fn has_contract(&self, contract: &ContractRef) -> bool {

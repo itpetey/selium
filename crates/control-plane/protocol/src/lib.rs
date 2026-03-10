@@ -8,7 +8,7 @@ use rkyv::{
     api::high::{HighDeserializer, HighValidator},
 };
 use selium_abi::{DataValue, RkyvEncode, decode_rkyv, encode_rkyv};
-use selium_control_plane_api::EventEndpointRef;
+use selium_control_plane_api::{ContractKind, PublicEndpointRef};
 use selium_control_plane_runtime::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,9 +31,9 @@ pub enum Method {
     StartInstance = 100,
     StopInstance = 101,
     ListInstances = 102,
-    ActivateEventRoute = 103,
-    DeactivateEventRoute = 104,
-    DeliverEventFrame = 105,
+    ActivateEndpointBridge = 103,
+    DeactivateEndpointBridge = 104,
+    DeliverBridgeMessage = 105,
 }
 
 impl Method {
@@ -48,9 +48,9 @@ impl Method {
             100 => Some(Self::StartInstance),
             101 => Some(Self::StopInstance),
             102 => Some(Self::ListInstances),
-            103 => Some(Self::ActivateEventRoute),
-            104 => Some(Self::DeactivateEventRoute),
-            105 => Some(Self::DeliverEventFrame),
+            103 => Some(Self::ActivateEndpointBridge),
+            104 => Some(Self::DeactivateEndpointBridge),
+            105 => Some(Self::DeliverBridgeMessage),
             _ => None,
         }
     }
@@ -153,16 +153,26 @@ pub struct AppendEntriesApiRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub enum ManagedEventBindingRole {
-    Source,
-    Target,
+pub enum ManagedEndpointRole {
+    Ingress,
+    Egress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ManagedEventBinding {
+pub enum ManagedEndpointBindingType {
+    OneWay,
+    RequestResponse,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ManagedEndpointBinding {
     pub endpoint_name: String,
-    pub role: ManagedEventBindingRole,
+    pub endpoint_kind: ContractKind,
+    pub role: ManagedEndpointRole,
+    pub binding_type: ManagedEndpointBindingType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -171,7 +181,7 @@ pub struct StartRequest {
     pub node_id: String,
     pub instance_id: String,
     pub module_spec: String,
-    pub managed_event_bindings: Vec<ManagedEventBinding>,
+    pub managed_endpoint_bindings: Vec<ManagedEndpointBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -208,36 +218,81 @@ pub struct StopResponse {
 #[rkyv(bytecheck())]
 pub struct ListResponse {
     pub instances: BTreeMap<String, usize>,
-    pub active_routes: Vec<String>,
+    pub active_bridges: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub enum EventRouteMode {
+pub enum EndpointBridgeMode {
     Local,
     Remote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ActivateEventRouteRequest {
-    pub node_id: String,
-    pub route_id: String,
-    pub source_instance_id: String,
-    pub source_endpoint: EventEndpointRef,
-    pub target_instance_id: String,
-    pub target_node: String,
-    pub target_daemon_addr: String,
-    pub target_daemon_server_name: String,
-    pub target_endpoint: EventEndpointRef,
+pub enum EventDeliveryMode {
+    Frame,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ActivateEventRouteResponse {
+pub struct EventBridgeSemantics {
+    pub delivery: EventDeliveryMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ServiceCorrelationMode {
+    RequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ServiceBridgeSemantics {
+    pub correlation: ServiceCorrelationMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum StreamLifecycleMode {
+    SessionFrames,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct StreamBridgeSemantics {
+    pub lifecycle: StreamLifecycleMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum EndpointBridgeSemantics {
+    Event(EventBridgeSemantics),
+    Service(ServiceBridgeSemantics),
+    Stream(StreamBridgeSemantics),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ActivateEndpointBridgeRequest {
+    pub node_id: String,
+    pub bridge_id: String,
+    pub source_instance_id: String,
+    pub source_endpoint: PublicEndpointRef,
+    pub target_instance_id: String,
+    pub target_node: String,
+    pub target_daemon_addr: String,
+    pub target_daemon_server_name: String,
+    pub target_endpoint: PublicEndpointRef,
+    pub semantics: EndpointBridgeSemantics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ActivateEndpointBridgeResponse {
     pub status: String,
-    pub route_id: String,
-    pub mode: EventRouteMode,
+    pub bridge_id: String,
+    pub mode: EndpointBridgeMode,
     pub target_node: String,
     pub target_instance_id: String,
     pub already_active: bool,
@@ -245,32 +300,82 @@ pub struct ActivateEventRouteResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DeactivateEventRouteRequest {
+pub struct DeactivateEndpointBridgeRequest {
     pub node_id: String,
-    pub route_id: String,
+    pub bridge_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DeactivateEventRouteResponse {
+pub struct DeactivateEndpointBridgeResponse {
     pub status: String,
-    pub route_id: String,
+    pub bridge_id: String,
     pub existed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DeliverEventFrameRequest {
-    pub target_instance_id: String,
-    pub target_endpoint_name: String,
+pub struct EventBridgeMessage {
     pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DeliverEventFrameResponse {
+pub enum ServiceMessagePhase {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ServiceBridgeMessage {
+    pub exchange_id: String,
+    pub phase: ServiceMessagePhase,
+    pub sequence: u64,
+    pub complete: bool,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum StreamLifecycle {
+    Open,
+    Data,
+    Close,
+    Abort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct StreamBridgeMessage {
+    pub session_id: String,
+    pub lifecycle: StreamLifecycle,
+    pub sequence: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum BridgeMessage {
+    Event(EventBridgeMessage),
+    Service(ServiceBridgeMessage),
+    Stream(StreamBridgeMessage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeliverBridgeMessageRequest {
+    pub target_instance_id: String,
+    pub target_endpoint: PublicEndpointRef,
+    pub message: BridgeMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DeliverBridgeMessageResponse {
     pub status: String,
     pub delivered: bool,
+    pub message: Option<BridgeMessage>,
 }
 
 pub fn encode_request<T: RkyvEncode>(
@@ -423,4 +528,150 @@ where
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_endpoint(kind: ContractKind, name: &str) -> PublicEndpointRef {
+        PublicEndpointRef {
+            workload: selium_control_plane_api::WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "camera".to_string(),
+            },
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn managed_endpoint_bindings_preserve_kind_role_and_type() {
+        let binding = ManagedEndpointBinding {
+            endpoint_name: "camera.frames".to_string(),
+            endpoint_kind: ContractKind::Event,
+            role: ManagedEndpointRole::Egress,
+            binding_type: ManagedEndpointBindingType::OneWay,
+        };
+        let bytes = encode_request(
+            Method::StartInstance,
+            7,
+            &StartRequest {
+                node_id: "node-a".to_string(),
+                instance_id: "inst-1".to_string(),
+                module_spec: "path=demo.wasm".to_string(),
+                managed_endpoint_bindings: vec![binding.clone()],
+            },
+        )
+        .expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: StartRequest = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded.managed_endpoint_bindings, vec![binding]);
+    }
+
+    #[test]
+    fn endpoint_bridge_activation_round_trips_event_semantics() {
+        let request = ActivateEndpointBridgeRequest {
+            node_id: "node-a".to_string(),
+            bridge_id: "bridge-1".to_string(),
+            source_instance_id: "source-1".to_string(),
+            source_endpoint: sample_endpoint(ContractKind::Event, "camera.frames"),
+            target_instance_id: "target-1".to_string(),
+            target_node: "node-b".to_string(),
+            target_daemon_addr: "127.0.0.1:7100".to_string(),
+            target_daemon_server_name: "node-b.local".to_string(),
+            target_endpoint: sample_endpoint(ContractKind::Event, "camera.frames"),
+            semantics: EndpointBridgeSemantics::Event(EventBridgeSemantics {
+                delivery: EventDeliveryMode::Frame,
+            }),
+        };
+        let bytes = encode_request(Method::ActivateEndpointBridge, 11, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: ActivateEndpointBridgeRequest =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn endpoint_bridge_activation_round_trips_stream_session_semantics() {
+        let request = ActivateEndpointBridgeRequest {
+            node_id: "node-a".to_string(),
+            bridge_id: "bridge-stream".to_string(),
+            source_instance_id: "source-1".to_string(),
+            source_endpoint: sample_endpoint(ContractKind::Stream, "camera.raw"),
+            target_instance_id: "target-1".to_string(),
+            target_node: "node-b".to_string(),
+            target_daemon_addr: "127.0.0.1:7100".to_string(),
+            target_daemon_server_name: "node-b.local".to_string(),
+            target_endpoint: sample_endpoint(ContractKind::Stream, "camera.raw"),
+            semantics: EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
+                lifecycle: StreamLifecycleMode::SessionFrames,
+            }),
+        };
+        let bytes = encode_request(Method::ActivateEndpointBridge, 12, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: ActivateEndpointBridgeRequest =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn deliver_bridge_message_round_trips_service_request_response_semantics() {
+        let request = DeliverBridgeMessageRequest {
+            target_instance_id: "target-1".to_string(),
+            target_endpoint: sample_endpoint(ContractKind::Service, "camera.detect"),
+            message: BridgeMessage::Service(ServiceBridgeMessage {
+                exchange_id: "req-42".to_string(),
+                phase: ServiceMessagePhase::Response,
+                sequence: 3,
+                complete: true,
+                payload: b"ok".to_vec(),
+            }),
+        };
+        let bytes = encode_request(Method::DeliverBridgeMessage, 19, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: DeliverBridgeMessageRequest =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn deliver_bridge_message_response_round_trips_service_reply() {
+        let response = DeliverBridgeMessageResponse {
+            status: "ok".to_string(),
+            delivered: true,
+            message: Some(BridgeMessage::Service(ServiceBridgeMessage {
+                exchange_id: "req-42".to_string(),
+                phase: ServiceMessagePhase::Response,
+                sequence: 4,
+                complete: true,
+                payload: b"done".to_vec(),
+            })),
+        };
+        let bytes = encode_response(Method::DeliverBridgeMessage, 29, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: DeliverBridgeMessageResponse =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn deliver_bridge_message_round_trips_stream_session_lifecycle_semantics() {
+        let request = DeliverBridgeMessageRequest {
+            target_instance_id: "target-1".to_string(),
+            target_endpoint: sample_endpoint(ContractKind::Stream, "camera.raw"),
+            message: BridgeMessage::Stream(StreamBridgeMessage {
+                session_id: "session-7".to_string(),
+                lifecycle: StreamLifecycle::Close,
+                sequence: 9,
+                payload: Vec::new(),
+            }),
+        };
+        let bytes = encode_request(Method::DeliverBridgeMessage, 23, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: DeliverBridgeMessageRequest =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+    }
 }

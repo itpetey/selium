@@ -36,7 +36,7 @@ pub enum IoError {
     PayloadTooLarge { actual: usize, max: u32 },
     #[error("queue operation `{0}` returned missing payload")]
     MissingPayload(&'static str),
-    #[error("invalid managed event bindings: {0}")]
+    #[error("invalid managed endpoint bindings: {0}")]
     InvalidManagedBindings(String),
 }
 
@@ -98,7 +98,7 @@ pub async fn managed_event_writer(
     endpoint: &str,
     writer_id: u32,
 ) -> Result<ChannelWriter, IoError> {
-    let channel = managed_event_channel(bindings, "writers", endpoint)?;
+    let channel = managed_endpoint_channel(bindings, "writers", "event", endpoint)?;
     attach_writer(&channel, writer_id).await
 }
 
@@ -106,7 +106,7 @@ pub async fn managed_event_reader(
     bindings: &[u8],
     endpoint: &str,
 ) -> Result<ChannelReader, IoError> {
-    let channel = managed_event_channel(bindings, "readers", endpoint)?;
+    let channel = managed_endpoint_channel(bindings, "readers", "event", endpoint)?;
     attach_reader(&channel).await
 }
 
@@ -202,18 +202,22 @@ fn ensure_queue_ok(operation: &'static str, status: QueueStatusCode) -> Result<(
     }
 }
 
-fn managed_event_channel(
+fn managed_endpoint_channel(
     bindings: &[u8],
     section: &str,
+    endpoint_kind: &str,
     endpoint: &str,
 ) -> Result<ChannelDescriptor, IoError> {
     let value = decode_rkyv::<DataValue>(bindings)
         .map_err(|err| IoError::InvalidManagedBindings(err.to_string()))?;
     let binding = value
         .get(section)
-        .and_then(|section| section.get(endpoint))
+        .and_then(|section| section.get(endpoint_kind))
+        .and_then(|kind_bindings| kind_bindings.get(endpoint))
         .ok_or_else(|| {
-            IoError::InvalidManagedBindings(format!("missing binding for `{endpoint}`"))
+            IoError::InvalidManagedBindings(format!(
+                "missing binding for `{endpoint_kind}:{endpoint}`"
+            ))
         })?;
 
     let queue_shared_id = binding
@@ -235,6 +239,7 @@ fn managed_event_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_abi::encode_rkyv;
 
     #[test]
     fn create_channel_returns_kernel_error_with_native_stub_driver() {
@@ -256,5 +261,118 @@ mod tests {
 
         let err = crate::block_on(writer.send(&[1, 2, 3], 0)).expect_err("too large");
         assert!(matches!(err, IoError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn managed_event_channel_reads_from_event_kind_partition() {
+        let bindings = managed_bindings_fixture();
+
+        let channel = managed_endpoint_channel(&bindings, "writers", "event", "shared")
+            .expect("event binding present");
+
+        assert_eq!(
+            channel,
+            ChannelDescriptor {
+                queue_shared_id: 11,
+                max_frame_bytes: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_event_channel_keeps_same_name_cross_kind_bindings_distinct() {
+        let bindings = managed_bindings_fixture();
+
+        let event = managed_endpoint_channel(&bindings, "writers", "event", "shared")
+            .expect("event binding present");
+        let service = managed_endpoint_channel(&bindings, "writers", "service", "shared")
+            .expect("service binding present");
+        let stream = managed_endpoint_channel(&bindings, "writers", "stream", "shared")
+            .expect("stream binding present");
+
+        assert_ne!(event.queue_shared_id, service.queue_shared_id);
+        assert_ne!(event.queue_shared_id, stream.queue_shared_id);
+        assert_ne!(service.queue_shared_id, stream.queue_shared_id);
+        assert_eq!(event.max_frame_bytes, 256);
+        assert_eq!(service.max_frame_bytes, 1024);
+        assert_eq!(stream.max_frame_bytes, 512);
+    }
+
+    #[test]
+    fn managed_endpoint_channel_reports_missing_binding_for_unknown_endpoint() {
+        let bindings = managed_bindings_fixture();
+
+        let err = managed_endpoint_channel(&bindings, "readers", "stream", "missing")
+            .expect_err("stream binding should be absent");
+
+        assert!(matches!(
+            err,
+            IoError::InvalidManagedBindings(message)
+                if message.contains("stream:missing")
+        ));
+    }
+
+    fn managed_bindings_fixture() -> Vec<u8> {
+        encode_rkyv(&DataValue::Map(BTreeMap::from([
+            (
+                "writers".to_string(),
+                DataValue::Map(BTreeMap::from([
+                    (
+                        "event".to_string(),
+                        DataValue::Map(BTreeMap::from([(
+                            "shared".to_string(),
+                            descriptor_value(11, 256),
+                        )])),
+                    ),
+                    (
+                        "service".to_string(),
+                        DataValue::Map(BTreeMap::from([(
+                            "shared".to_string(),
+                            descriptor_value(22, 1024),
+                        )])),
+                    ),
+                    (
+                        "stream".to_string(),
+                        DataValue::Map(BTreeMap::from([(
+                            "shared".to_string(),
+                            descriptor_value(44, 512),
+                        )])),
+                    ),
+                ])),
+            ),
+            (
+                "readers".to_string(),
+                DataValue::Map(BTreeMap::from([
+                    (
+                        "event".to_string(),
+                        DataValue::Map(BTreeMap::from([(
+                            "shared".to_string(),
+                            descriptor_value(33, 256),
+                        )])),
+                    ),
+                    (
+                        "stream".to_string(),
+                        DataValue::Map(BTreeMap::from([(
+                            "shared".to_string(),
+                            descriptor_value(55, 512),
+                        )])),
+                    ),
+                ])),
+            ),
+        ])))
+        .expect("encode fixture")
+    }
+
+    fn descriptor_value(queue_shared_id: u64, max_frame_bytes: u64) -> DataValue {
+        DataValue::Map(BTreeMap::from([
+            (
+                "queue_shared_id".to_string(),
+                DataValue::U64(queue_shared_id),
+            ),
+            (
+                "max_frame_bytes".to_string(),
+                DataValue::U64(max_frame_bytes),
+            ),
+        ]))
     }
 }

@@ -7,6 +7,7 @@ use thiserror::Error;
 #[rkyv(bytecheck())]
 pub struct ContractRef {
     pub namespace: String,
+    pub kind: ContractKind,
     pub name: String,
     pub version: String,
 }
@@ -79,12 +80,57 @@ impl fmt::Display for EventEndpointRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum ContractKind {
     Event,
     Service,
     Stream,
+}
+
+impl ContractKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Service => "service",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+/// User-facing public endpoint identity for discovery across contract kinds.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct PublicEndpointRef {
+    pub workload: WorkloadRef,
+    pub kind: ContractKind,
+    pub name: String,
+}
+
+impl PublicEndpointRef {
+    pub fn key(&self) -> String {
+        format!(
+            "{}#{}:{}",
+            self.workload.key(),
+            self.kind.as_str(),
+            self.name
+        )
+    }
+
+    pub fn validate(&self, subject: &str) -> std::result::Result<(), ApiError> {
+        self.workload.validate(subject)?;
+        validate_identity_segment(
+            &self.name,
+            &format!("{subject} endpoint"),
+            ApiError::InvalidEndpoint,
+        )
+    }
+}
+
+impl fmt::Display for PublicEndpointRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.key())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -314,7 +360,7 @@ impl DiscoveryCapabilityScope {
     pub fn allows_endpoint(
         &self,
         operation: DiscoveryOperation,
-        endpoint: &EventEndpointRef,
+        endpoint: &PublicEndpointRef,
     ) -> bool {
         self.allows_operation(operation)
             && if self.endpoints.is_empty() {
@@ -343,13 +389,13 @@ impl DiscoveryCapabilityScope {
 #[rkyv(bytecheck())]
 pub struct DiscoverableWorkload {
     pub workload: WorkloadRef,
-    pub endpoints: Vec<EventEndpointRef>,
+    pub endpoints: Vec<PublicEndpointRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DiscoverableEventEndpoint {
-    pub endpoint: EventEndpointRef,
+pub struct DiscoverableEndpoint {
+    pub endpoint: PublicEndpointRef,
     pub contract: ContractRef,
 }
 
@@ -357,20 +403,20 @@ pub struct DiscoverableEventEndpoint {
 #[rkyv(bytecheck())]
 pub struct DiscoveryState {
     pub workloads: Vec<DiscoverableWorkload>,
-    pub endpoints: Vec<DiscoverableEventEndpoint>,
+    pub endpoints: Vec<DiscoverableEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct ResolvedWorkload {
     pub workload: WorkloadRef,
-    pub endpoints: Vec<DiscoverableEventEndpoint>,
+    pub endpoints: Vec<DiscoverableEndpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct ResolvedEventEndpoint {
-    pub endpoint: EventEndpointRef,
+pub struct ResolvedEndpoint {
+    pub endpoint: PublicEndpointRef,
     pub contract: ContractRef,
 }
 
@@ -393,7 +439,7 @@ pub enum OperationalProcessSelector {
 #[rkyv(bytecheck())]
 pub enum DiscoveryTarget {
     Workload(WorkloadRef),
-    EventEndpoint(EventEndpointRef),
+    Endpoint(PublicEndpointRef),
     RunningProcess(OperationalProcessSelector),
 }
 
@@ -409,7 +455,7 @@ pub struct DiscoveryRequest {
 #[rkyv(bytecheck())]
 pub enum DiscoveryResolution {
     Workload(ResolvedWorkload),
-    EventEndpoint(ResolvedEventEndpoint),
+    Endpoint(ResolvedEndpoint),
     RunningProcess(OperationalProcessRecord),
 }
 
@@ -449,7 +495,7 @@ pub enum ApiError {
     InvalidPipeline(String),
     #[error("invalid node `{0}`")]
     InvalidNode(String),
-    #[error("unknown event endpoint `{0}`")]
+    #[error("unknown endpoint `{0}`")]
     UnknownEndpoint(String),
     #[error("unauthorised to {operation} `{subject}`")]
     Unauthorised { operation: String, subject: String },
