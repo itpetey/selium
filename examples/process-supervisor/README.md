@@ -23,10 +23,7 @@ cargo run -p selium -- \
 
 ```bash
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   idl publish --input contracts/orchestration.supervisor.v1.selium
 
 mkdir -p "$SELIUM_WORK_DIR/modules"
@@ -35,27 +32,18 @@ cp ../../target/wasm32-unknown-unknown/debug/process_supervisor.wasm \
   "$SELIUM_WORK_DIR/modules/"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   start --node "$SELIUM_NODE" --replica-key process-supervisor-demo \
   --event-reader supervisor.worker_status \
   --event-writer supervisor.worker_status \
   --module modules/process_supervisor.wasm
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   list --node "$SELIUM_NODE"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key process-supervisor-demo
 ```
 

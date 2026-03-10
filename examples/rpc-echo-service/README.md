@@ -23,10 +23,7 @@ cargo run -p selium -- \
 
 ```bash
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   idl publish --input contracts/messaging.echo.v1.selium
 
 mkdir -p "$SELIUM_WORK_DIR/modules"
@@ -37,10 +34,7 @@ cp ../../target/wasm32-unknown-unknown/debug/rpc_echo_service.wasm \
   "$SELIUM_WORK_DIR/modules/"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   start \
   --node "$SELIUM_NODE" \
   --replica-key rpc-echo-demo \
@@ -51,17 +45,11 @@ cargo run -p selium -- \
   --module modules/rpc_echo_service.wasm
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   list --node "$SELIUM_NODE"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key rpc-echo-demo
 ```
 

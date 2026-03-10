@@ -38,18 +38,30 @@ mkdir -p .selium-local/modules .selium-local/certs
   --quic-peer-key certs/client.key
 ```
 
-With an existing runtime, set these shell variables once and reuse them for any example:
+With an existing runtime, set these shell variables once and generate a CLI config file for the daemon-backed examples:
 
 ```bash
 export SELIUM_DAEMON=127.0.0.1:7100
 export SELIUM_NODE=local-node
 export SELIUM_WORK_DIR=$PWD/.selium-local
 export SELIUM_CERT_DIR=$SELIUM_WORK_DIR/certs
+export SELIUM_CLI_CONFIG=$SELIUM_WORK_DIR/cli.toml
+
+cat > "$SELIUM_CLI_CONFIG" <<EOF
+[daemon]
+daemon-addr = "$SELIUM_DAEMON"
+daemon-server-name = "localhost"
+ca-cert = "$SELIUM_CERT_DIR/ca.crt"
+client-cert = "$SELIUM_CERT_DIR/client.crt"
+client-key = "$SELIUM_CERT_DIR/client.key"
+EOF
 ```
+
+If your daemon certificate uses a different server name, update `daemon-server-name` in that TOML file to match it.
 
 Each example README includes a `## Setup`, `## Contracts`, and `## Usage` section with the exact commands for that project.
 
-Most single-module examples bind their contract-defined endpoints directly on `start` with `--event-reader` and `--event-writer`. `typed-entrypoints/` shows the same daemon-backed path with `start --module-spec`, `control-plane-topology/` shows the full `idl publish`, `deploy`, `connect`, and `agent --once` control-plane workflow, and the network examples use `selium-runtime --config ... --module ...` directly with their checked-in `runtime.toml` files.
+Most single-module examples bind their contract-defined endpoints directly on `start` with `--event-reader` and `--event-writer`. `typed-entrypoints/` shows the same daemon-backed path with `start --module-spec`, `control-plane-topology/` shows the full `idl publish`, `deploy`, `connect`, and `agent --once` control-plane workflow, and the network examples use `selium-runtime --config ... --module ...` directly with their checked-in `runtime.toml` files. The daemon-backed READMEs use `--config "$SELIUM_CLI_CONFIG"` so the TLS and daemon connection tuple only has to be declared once.
 
 ## Contracts
 

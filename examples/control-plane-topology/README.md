@@ -33,10 +33,7 @@ cargo run -p selium -- \
 
 ```bash
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   idl publish --input contracts/analytics.topology.v1.selium
 
 mkdir -p "$SELIUM_WORK_DIR/modules"
@@ -48,65 +45,44 @@ cp ../../target/wasm32-unknown-unknown/debug/cp_topology_processor.wasm "$SELIUM
 cp ../../target/wasm32-unknown-unknown/debug/cp_topology_sink.wasm "$SELIUM_WORK_DIR/modules/"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   deploy --tenant tenant-a --namespace analytics --workload topology-ingress \
   --module modules/cp_topology_ingress.wasm \
   --contract analytics.topology/ingest.frames@v1
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   deploy --tenant tenant-a --namespace analytics --workload topology-processor \
   --module modules/cp_topology_processor.wasm \
   --contract analytics.topology/ingest.frames@v1 \
   --contract analytics.topology/process.enriched@v1
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   deploy --tenant tenant-a --namespace analytics --workload topology-sink \
   --module modules/cp_topology_sink.wasm \
   --contract analytics.topology/process.enriched@v1
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   connect --pipeline analytics-demo --tenant tenant-a --namespace analytics \
   --from-workload topology-ingress --to-workload topology-processor \
   --endpoint ingest.frames \
   --contract analytics.topology/ingest.frames@v1
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   connect --pipeline analytics-demo --tenant tenant-a --namespace analytics \
   --from-workload topology-processor --to-workload topology-sink \
   --endpoint process.enriched \
   --contract analytics.topology/process.enriched@v1
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   agent --node "$SELIUM_NODE" --once
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   list --node "$SELIUM_NODE"
 
 # Use the operational replica identifiers reported by `selium list --node ...`.
@@ -118,22 +94,13 @@ cargo run -p selium -- \
 # the user-facing workload or endpoint binding names.
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key 'tenant=tenant-a;namespace=analytics;workload=topology-ingress;replica=0'
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key 'tenant=tenant-a;namespace=analytics;workload=topology-processor;replica=0'
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key 'tenant=tenant-a;namespace=analytics;workload=topology-sink;replica=0'
 ```
 

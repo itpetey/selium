@@ -25,10 +25,7 @@ cargo run -p selium -- \
 export SELIUM_CAPS="session_lifecycle,process_lifecycle,time_read,shared_memory,queue_lifecycle,queue_writer,queue_reader"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   idl publish --input contracts/stateful.counter.v1.selium
 
 mkdir -p "$SELIUM_WORK_DIR/modules"
@@ -37,10 +34,7 @@ cp ../../target/wasm32-unknown-unknown/debug/stateful_counter.wasm \
   "$SELIUM_WORK_DIR/modules/"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   start --node "$SELIUM_NODE" --replica-key stateful-counter-cold \
   --event-reader counter.deltas \
   --event-writer counter.deltas \
@@ -49,10 +43,7 @@ cargo run -p selium -- \
   --module modules/stateful_counter.wasm
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   start --node "$SELIUM_NODE" --replica-key stateful-counter-resume \
   --event-reader counter.deltas \
   --event-writer counter.deltas \
@@ -61,17 +52,11 @@ cargo run -p selium -- \
   --module-spec "path=modules/stateful_counter.wasm;entrypoint=resume;capabilities=$SELIUM_CAPS;params=u32,u32;args=u32:2,u32:15;adapter=wasmtime;profile=standard"
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key stateful-counter-cold
 
 cargo run -p selium -- \
-  --daemon-addr "$SELIUM_DAEMON" \
-  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
-  --client-cert "$SELIUM_CERT_DIR/client.crt" \
-  --client-key "$SELIUM_CERT_DIR/client.key" \
+  --config "$SELIUM_CLI_CONFIG" \
   stop --node "$SELIUM_NODE" --replica-key stateful-counter-resume
 ```
 
