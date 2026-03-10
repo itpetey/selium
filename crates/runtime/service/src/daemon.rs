@@ -1365,12 +1365,50 @@ fn append_managed_endpoint_bindings_arg(
     module_spec: &str,
     bindings: Option<&[u8]>,
 ) -> Result<String> {
-    match bindings {
-        Some(bytes) => Ok(format!(
-            "{module_spec};params=buffer;args=buffer:hex:{}",
-            encode_hex(bytes)
-        )),
-        None => Ok(module_spec.to_string()),
+    let Some(bytes) = bindings else {
+        return Ok(module_spec.to_string());
+    };
+
+    let binding_arg = format!("buffer:hex:{}", encode_hex(bytes));
+    let mut entries: Vec<String> = module_spec
+        .replace(';', "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut params_found = false;
+    let mut args_found = false;
+
+    for entry in &mut entries {
+        if let Some(existing) = entry.strip_prefix("params=") {
+            *entry = format!("params={}", prepend_module_spec_value("buffer", existing));
+            params_found = true;
+        } else if let Some(existing) = entry.strip_prefix("param=") {
+            *entry = format!("param={}", prepend_module_spec_value("buffer", existing));
+            params_found = true;
+        } else if let Some(existing) = entry.strip_prefix("args=") {
+            *entry = format!("args={}", prepend_module_spec_value(&binding_arg, existing));
+            args_found = true;
+        }
+    }
+
+    if !args_found {
+        entries.push(format!("args={binding_arg}"));
+    }
+    if !params_found && !args_found {
+        entries.push("params=buffer".to_string());
+    }
+
+    Ok(entries.join(";"))
+}
+
+fn prepend_module_spec_value(prefix: &str, existing: &str) -> String {
+    let existing = existing.trim();
+    if existing.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix},{existing}")
     }
 }
 
@@ -3072,7 +3110,33 @@ mod tests {
     fn append_managed_endpoint_bindings_arg_uses_typed_buffer_argument() {
         let spec = append_managed_endpoint_bindings_arg("path=demo.wasm", Some(&[0x41, 0x42]))
             .expect("append bindings arg");
-        assert_eq!(spec, "path=demo.wasm;params=buffer;args=buffer:hex:4142");
+        assert_eq!(spec, "path=demo.wasm;args=buffer:hex:4142;params=buffer");
+    }
+
+    #[test]
+    fn append_managed_endpoint_bindings_arg_prepends_existing_params_and_args() {
+        let spec = append_managed_endpoint_bindings_arg(
+            "path=demo.wasm;params=utf8,i32;args=billing,3",
+            Some(&[0x41, 0x42]),
+        )
+        .expect("append bindings arg");
+        assert_eq!(
+            spec,
+            "path=demo.wasm;params=buffer,utf8,i32;args=buffer:hex:4142,billing,3"
+        );
+    }
+
+    #[test]
+    fn append_managed_endpoint_bindings_arg_keeps_typed_arg_inference_when_params_are_omitted() {
+        let spec = append_managed_endpoint_bindings_arg(
+            "path=demo.wasm;args=utf8:search,i32:5",
+            Some(&[0x41, 0x42]),
+        )
+        .expect("append bindings arg");
+        assert_eq!(
+            spec,
+            "path=demo.wasm;args=buffer:hex:4142,utf8:search,i32:5"
+        );
     }
 
     fn sample_state(node_id: &str) -> Rc<DaemonState> {
