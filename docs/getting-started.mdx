@@ -1,14 +1,14 @@
 ---
 title: "Getting started"
-description: "Install the CLI, scaffold a service, and deploy to Selium."
+description: "Run a local daemon, publish a contract, and launch a real Selium workload."
 ---
 
-This guide gets you from zero to a running Selium service on your machine. You will:
+This guide gets you from zero to a running Selium workload on your machine. You will:
 
-1. Install the Selium runtime and CLI.
-2. Build a tiny WASM service.
-3. Start a local runtime (with the remote client enabled).
-4. Launch your service and attach to its logs.
+1. Build the current Selium runtime and CLI from this repo.
+2. Create a local work directory and certificate bundle.
+3. Start the runtime daemon.
+4. Publish a contract and launch a real example module.
 
 ## Prerequisites
 
@@ -18,124 +18,148 @@ You will need stable Rust (see [rustup.rs](https://rustup.rs)), plus the WebAsse
 rustup target add wasm32-unknown-unknown
 ```
 
-## 1. Install the runtime and CLI
+## 1. Build the local tools
 
-We recommend using the install script to install `selium-runtime` (server) and `selium` (CLI):
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://selium.com/install.sh | sh
-```
-
-### From source
-
-You can also build from source:
+From the repository root:
 
 ```bash
-git clone https://github.com/seliumlabs/selium
-cd selium
-
-cargo build -p selium-runtime --release
-
-git clone https://github.com/seliumlabs/selium-modules
-
-cd selium-modules/remote-client
-cargo build -p selium-remote-client-server --target wasm32-unknown-unknown --release
-
-cd ../switchboard
-cargo build -p selium-switchboard-server --target wasm32-unknown-unknown --release
-
-cd ../atlas
-cargo build -p selium-atlas-server --target wasm32-unknown-unknown --release
+cargo build -p selium-runtime -p selium
 ```
 
-You'll also need to create a work directory and generate some TLS certificates:
+That gives you two local binaries:
+
+- `./target/debug/selium-runtime` for the daemon
+- `cargo run -p selium -- ...` (or `./target/debug/selium`) for CLI workflows
+
+## 2. Create a work directory and certificates
+
+Selium keeps local certificates and guest modules under a single work directory:
 
 ```bash
-mkdir -p selium-work/{certs,modules}
-selium-runtime generate-certs --output-dir selium-work/certs
+mkdir -p .selium-local/modules .selium-local/certs
+./target/debug/selium-runtime generate-certs --output-dir .selium-local/certs
 ```
 
-The certificates are used to secure the local QUIC server, which the CLI uses to talk to the runtime.
+The generated bundle gives the daemon a local server identity and gives the CLI a client certificate it can use for mTLS.
 
-The work directory holds two groups of important files:
+## 3. Start the daemon
 
-- `selium-work/certs` for TLS certificates
-- `selium-work/modules` for WASM modules (your apps and system modules)
+In a dedicated terminal, start the current runtime daemon:
 
-## 2. Create a service
-
-`src/lib.rs`:
-
-```rust
-use selium_userland::entrypoint;
-use tracing::info;
-
-#[entrypoint]
-fn hello() {
-    info!("hello from selium");
-}
-```
-
-`Cargo.toml`:
-
-```toml
-[package]
-name = "hello"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-selium-userland = "1.0.0-alpha.5"
-tracing = "0.1"
-```
-
-Build to WASM and copy into the work dir:
 
 ```bash
-cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/hello.wasm selium-work/modules/
+./target/debug/selium-runtime \
+  --work-dir .selium-local \
+  daemon \
+  --listen 127.0.0.1:7100 \
+  --cp-node-id local-node \
+  --cp-public-addr 127.0.0.1:7100 \
+  --cp-state-dir control-plane \
+  --quic-ca certs/ca.crt \
+  --quic-cert certs/server.crt \
+  --quic-key certs/server.key \
+  --quic-peer-cert certs/client.crt \
+  --quic-peer-key certs/client.key
 ```
 
-## 3. Start the runtime in the background
+This starts the QUIC control endpoint, boots the embedded control-plane guest, and keeps a local node named `local-node` available for CLI operations.
 
-The below command will start a new Selium runtime instance, preloading the Remote Client, Switchboard, and Atlas modules.
-These modules add extra functionality on top of the core platform. Generally you'll need the Remote Client for CLI
-access, but the Switchboard and Atlas can be omitted for a leaner runtime. See the
-[echo-no-deps](https://github.com/seliumlabs/selium/tree/main/examples/echo-no-deps) example for details.
-
-For this guide, we'll assume you're using all three.
+In a second terminal, export the connection details once:
 
 ```bash
-selium-runtime --work-dir selium-work \
-  --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
-  --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
-  --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' &
+export SELIUM_DAEMON=127.0.0.1:7100
+export SELIUM_NODE=local-node
+export SELIUM_WORK_DIR=$PWD/.selium-local
+export SELIUM_CERT_DIR=$SELIUM_WORK_DIR/certs
 ```
 
-## 4. Start your service with the CLI
+## 4. Run the `rpc-echo-service` example
 
-Start your example application with required capabilities. These are required for creating a channel to publish logs to
-(`ChannelLifecycle`), and writing to that channel (`ChannelWriter`).
+This repository already includes current examples built around the present mental model. We'll use `examples/rpc-echo-service`, which exercises contract publication plus managed public event bindings.
+
+Change into the example directory:
 
 ```bash
-selium --cert-dir selium-work/certs \
-  start hello.wasm start \
-  --capabilities ChannelLifecycle,ChannelWriter \
-  --attach
+cd examples/rpc-echo-service
 ```
 
-The CLI will print out the process's system ID, which you can use to stop it later:
+### Publish the contract package
 
-> Started process (id=...)
+The example checks in generated Rust bindings already, so the first required control-plane step is publishing the contract definition the runtime will use for its public endpoint names:
 
 ```bash
-selium --cert-dir selium-work/certs stop <id>
+cargo run -p selium -- \
+  --daemon-addr "$SELIUM_DAEMON" \
+  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
+  --client-cert "$SELIUM_CERT_DIR/client.crt" \
+  --client-key "$SELIUM_CERT_DIR/client.key" \
+  idl publish --input contracts/messaging.echo.v1.selium
 ```
+
+### Build the guest module and copy it into the work dir
+
+```bash
+cargo build --manifest-path Cargo.toml --target wasm32-unknown-unknown
+cp ../../target/wasm32-unknown-unknown/debug/rpc_echo_service.wasm \
+  "$SELIUM_WORK_DIR/modules/"
+```
+
+### Launch the workload
+
+This example uses direct operational launch: `selium start` plus managed endpoint bindings.
+
+```bash
+cargo run -p selium -- \
+  --daemon-addr "$SELIUM_DAEMON" \
+  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
+  --client-cert "$SELIUM_CERT_DIR/client.crt" \
+  --client-key "$SELIUM_CERT_DIR/client.key" \
+  start \
+  --node "$SELIUM_NODE" \
+  --replica-key rpc-echo-demo \
+  --event-reader echo.requested \
+  --event-writer echo.requested \
+  --event-reader echo.responded \
+  --event-writer echo.responded \
+  --module modules/rpc_echo_service.wasm
+```
+
+If the command succeeds, the daemon started the module, attached the contract-defined public endpoints, and the guest completed one typed round trip before idling.
+
+## 5. Inspect and stop it
+
+List the running replicas on the node:
+
+```bash
+cargo run -p selium -- \
+  --daemon-addr "$SELIUM_DAEMON" \
+  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
+  --client-cert "$SELIUM_CERT_DIR/client.crt" \
+  --client-key "$SELIUM_CERT_DIR/client.key" \
+  list --node "$SELIUM_NODE"
+```
+
+Then stop the replica you just started:
+
+```bash
+cargo run -p selium -- \
+  --daemon-addr "$SELIUM_DAEMON" \
+  --ca-cert "$SELIUM_CERT_DIR/ca.crt" \
+  --client-cert "$SELIUM_CERT_DIR/client.crt" \
+  --client-key "$SELIUM_CERT_DIR/client.key" \
+  stop --node "$SELIUM_NODE" --replica-key rpc-echo-demo
+```
+
+## What just happened
+
+- `selium-runtime daemon` started the local runtime and control plane.
+- `selium idl publish` registered the example's contract package.
+- `selium start` launched one operational replica and injected the managed bindings for `echo.requested` and `echo.responded`.
+- The guest used `selium_guest::io` against those bindings rather than manually building local queue topology.
 
 ## Next steps
 
-- Read **Applications** next to understand entrypoints, arguments, and capability grants.
-- If you want typed messaging and discovery, add **Switchboard** and **Atlas** to your mental model early.
+- Read [CLI](./cli) when you want the full command surface in one place.
+- Read [Guest API](./applications) to understand entrypoints, managed bindings, `ProcessBuilder`, and capability grants.
+- Read [Examples](./examples) to choose the next workflow to learn.
+- When you want the full desired-state workflow, pair [Control Plane](./control-plane) with `examples/control-plane-topology`: that is the reference `idl publish` + `deploy` + `connect` + `agent --once` flow.

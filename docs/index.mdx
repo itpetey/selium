@@ -3,82 +3,65 @@ title: "Overview"
 description: "Understand what Selium is and how it works."
 ---
 
-Selium is a software-defined hypervisor for WebAssembly. Like other hypervisors, Selium creates secure and isolated environments for running applications. However unlike the others, Selium is built specifically for the needs and preferences of software developers:
-- Our API is library-based and highly composable
-- "Virtual machines" in Selium behave like processes and don't ship with (or use) an operating system
-- Selium processes feature robust isolation with opt-in capability-based security
-- Our I/O is built around an ergonomic and strong-typed messaging layer, while still integrating trivially with external network protocols
+Selium is a developer-first platform for running WebAssembly workloads as isolated processes under a single runtime daemon. The current platform is organized around four surfaces:
 
-_Quick note: Selium is in alpha, so expect a bit of churn as we perfect our architecture._
+- `selium-runtime` runs the local daemon, owns the work directory, terminates mTLS, and boots the control plane.
+- `selium` is the operational and control-plane CLI: `start`, `stop`, `list`, `deploy`, `connect`, `scale`, `observe`, `replay`, `nodes`, `agent`, and `idl`.
+- `selium_guest` is the guest-side API for entrypoints, process orchestration, managed I/O, network, storage, queue, shared-memory, session, and time hostcalls.
+- `selium-sdk-rust` is the host/client-side SDK for typed publishing, subscription, and replay outside a guest module.
 
-## Example App
+Selium still has the same core promise: strong isolation, explicit authority, and composable APIs. What changed is the mental model. The current workflow is contract-first and daemon-first.
 
-```rust
-/// Selium uses Flatbuffers to enforce strong typing across process boundaries.
-/// This is the request payload to be transmitted on the wire.
-#[schema(
-    path = "schemas/echo.fbs",
-    ty = "examples.echo.EchoMsg",
-    binding = "crate::fbs::examples::echo::EchoMsg"
-)]
-pub struct EchoMsg {
-    /// Your message to echo
-    pub msg: String,
-}
+## The current mental model
 
-/// `entrypoint`s are like "main functions" for your application, except you can have
-/// lots of them in the same crate.
-#[entrypoint]
-async fn echo_client(ctx: Context) -> Result<()> {
-    // Singletons give users access to global context, like Switchboard and Atlas handles.
-    // You can define your own too!
-    let switchboard = ctx.require::<Switchboard>().await;
-    let atlas = ctx.require::<Atlas>().await;
+1. **Define contracts** for the public events, services, and streams your workload exposes.
+2. **Build guest modules** that expose one or more `#[selium_guest::entrypoint]` functions.
+3. **Run a daemon** with a work directory, certificates, and a node identity.
+4. **Choose an execution path**:
+   - use `selium start` / `list` / `stop` for direct operational launches
+   - use `idl publish`, `deploy`, `connect`, `scale`, and `agent` for desired-state control-plane workflows
 
-    // Create a client to query the server on its URI: "/moo/cow"
-    let mut client = Client::create(&switchboard).await?;
-    SubscriberAtlasExt::connect(&client, &atlas, &switchboard, "sel://moo/cow").await?;
+That split is intentional. Direct `start` is great for local iteration and one-off workloads. The control plane is how you name workloads, wire public endpoints, scale replicas, and reconcile onto nodes.
 
-    // Send the request, expecting the server to return an `EchoMsg` response
-    let response: EchoMsg = client
-        .request(EchoMsg::new("Hello, world!".to_string()))
-        .await
-        .context("send request")?;
-    
-    // Logs are integrated with messaging, so you can subscribe to logs from other
-    // processes as well as the CLI.
-    info!(reply = response.msg, "received echo");
+## What Selium applications look like now
 
-    Ok(())
-}
+Applications are plain WASM modules with entrypoints. Selium passes typed arguments across the ABI boundary, and public endpoint launches also prepend a bindings payload that guests use directly for managed event readers and writers. Service and stream workloads use generated helpers over `selium_guest::network`.
 
-#[entrypoint]
-async fn echo_server(ctx: Context) -> Result<()> {
-    let switchboard = ctx.require::<Switchboard>().await;
-    let atlas = ctx.require::<Atlas>().await;
+In practice, most applications use a small set of building blocks:
 
-    let server: Server<EchoMsg, EchoMsg> = Server::create(&switchboard).await?;
-    
-    // Tell Atlas that we're listening on /moo/cow so that the client can discover us
-    atlas.insert(Uri::parse("sel://moo/cow").unwrap(), server.endpoint_id() as u64).await?;
-    
-    // Handle requests from clients
-    server
-        .try_for_each(async |req| {
-            let (msg, responder) = req.into_parts();
-            info!(msg = msg.msg, "received request");
-            // Replies are automatically routed to their respective clients
-            responder.send(msg).await
-        })
-        .await?;
+- `selium_guest::io` for managed public event bindings
+- `selium_guest::process::ProcessBuilder` to start other Selium processes
+- `selium_guest::network` for daemon-managed ingress and egress plus generated service/stream sessions
+- `selium_guest::storage`, `queue`, `shm`, `session`, and `time` for stateful and systems-level flows
 
-    Ok(())
-}
-```
+## Two workflows you should keep separate
+
+### Direct runtime operations
+
+Use these when you want a fast inner loop:
+
+- build a module to `wasm32-unknown-unknown`
+- copy it into the runtime work directory
+- run `selium start --node ... --replica-key ... --module ...`
+- inspect with `selium list`
+- stop it with `selium stop`
+
+### Control-plane managed workloads
+
+Use these when you want stable identities and wiring between workloads:
+
+- publish contracts with `selium idl publish`
+- declare workloads with `selium deploy`
+- connect public event endpoints with `selium connect`
+- reconcile desired state with `selium agent --once` or the long-running agent loop
+- inspect state with `selium observe`, `selium replay`, and `selium nodes`
 
 ## What to read next
 
-- Start with **Getting started** to get a local runtime running and launch your first service.
-- Then read **Applications** to understand entrypoints, arguments, and capabilities.
-- Keep **Runtime** nearby when you want to tweak flags or module specs.
-- When you are ready to think about throughput and isolation, go deeper on **Channels**.
+- Start with [Getting started](./getting-started) to run a local daemon and launch a real example.
+- Use [Examples](./examples) to pick a workflow before you go deeper.
+- Read [CLI](./cli) for the direct `start` / `stop` loop and the higher-level `deploy` / `connect` / `agent` flow.
+- Read [Guest API](./applications) for entrypoints, managed bindings, capabilities, and `ProcessBuilder`.
+- Keep [Runtime](./runtime) and [Control Plane](./control-plane) nearby when you need daemon config, workload identities, or reconciliation details.
+
+_Selium is still evolving quickly, but the daemon + CLI + contracts + workloads model is the one to learn against today._

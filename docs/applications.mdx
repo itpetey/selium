@@ -1,150 +1,116 @@
 ---
-title: "Applications"
-description: "Creating and running applications in Selium"
+title: "Guest API"
+description: "Programming guest modules with selium_guest in the current Selium model."
 ---
 
-In Selium, an "application" refers to any WebAssembly (WASM) module that contains one or more entrypoints.
+In Selium, an application is a WebAssembly module with one or more `#[selium_guest::entrypoint]` functions. The runtime starts those entrypoints as isolated processes and gives them only the capabilities, bindings, and managed resources you asked for.
 
-Unlike virtual machines or containers, Selium applications do not have a guest operating system. Instead, your module runs as a standalone process, leveraging our `userland` library to perform network and filesystem I/O, and other system operations.
+There is no guest operating system inside the module. Instead, guest code uses `selium_guest` to talk to the host for I/O, process lifecycle, networking, storage, time, queue, and shared-memory operations.
 
-## `./modules` directory
+## Module IDs and the work directory
 
-The runtime needs a predictable place to find code and credentials. That is what the work directory is for:
+Selium resolves guest modules relative to the runtime work directory. In practice, most local setups keep compiled WASM files under `modules/`:
 
-- `--work-dir` (or `SELIUM_WORK_DIR`) is the base directory
-- `certs/` holds TLS certificates
-- `modules/` holds WASM binaries
+- `./target/.../my_module.wasm` is your build artifact
+- `<work-dir>/modules/my_module.wasm` is where the runtime expects to find it
 
-When you install or launch a process (via `selium` or `ProcessBuilder`), Selium resolves the module path relative to `work_dir/modules`. For example, `hello.wasm` maps to `selium-work/modules/hello.wasm`. Modules launched at runtime (`selium-runtime --module <spec...>`) are also resolved in this way.
+For CLI and runtime module specs, `my_module.wasm` and `modules/my_module.wasm` both map to the same module ID. The runtime normalizes the `modules/` prefix away before execution.
 
 ## Entrypoints
 
-Entrypoints are the public functions that the runtime is able to call. Generally they will serve as your _main_ function, used to bootstrap your application.
+Entrypoints are the guest functions the runtime is allowed to invoke. They are your public process surface.
 
-In Rust, you annotate these functions with `#[entrypoint]`:
-
-```rust
-use selium_userland::entrypoint;
-
-#[entrypoint]
-async fn start() {
-    // Your service logic here.
-}
-```
-
-Here's a few things to keep in mind for your entrypoints:
-- Entrypoints can be `async` or sync
-- Entrypoints _can_ accept arguments!
-- Return types must be `()` or `Result<(), E>`
-- You may accept at most one `Context` parameter (by value or `&Context`)
-- The CLI defaults to the entrypoint `start` if you leave the argument blank
-
-## Arguments
-
-Entrypoints are capable of accepting input parameters. In practice, you will pass them in one of three places:
-
-- `selium-runtime --module ...;params=...;args=...`
-- `selium start ... --param ... --arg ...`
-- `ProcessBuilder` from another guest
-
-Arguments can be simple scalars (integers) or byte buffers:
-
-- Scalars: `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`
-- Buffers: `utf8` (string), `buffer`/`hex` (raw bytes)
-- Resources: `resource` (a handle like `SharedChannel`)
-
-## Capabilities
-
-Capabilities are Selium's permission system. Any time your guest wants the host to do something (e.g. create/share a channel, open a socket, spawn a process, read time, etc.), the call is only allowed if the process was launched with the corresponding capability.
-
-Some common capability groups:
-
-- `ChannelLifecycle`: create, share, detach, drain, delete
-- `ChannelReader`: subscribe to channels
-- `ChannelWriter`: publish to channels
-- `ProcessLifecycle`: spawn or stop other processes
-- `NetQuic*` and `NetHttp*`: bind, accept, connect, read, write
-- `NetTlsServerConfig` / `NetTlsClientConfig`: create TLS configs for QUIC or HTTPS
-- `SingletonRegistry` / `SingletonLookup`: publish or resolve global singletons
-- `TimeRead`: read time helpers
-
-We strongly recommend that you only grant the specific capabilities that you require for any given process.
-
-## Singletons
-
-Singletons are used to ergonomically discover and load shared data, like channel handles. This is how system modules make themselves discoverable. For example, Switchboard and Atlas processes both register shared channel handles under a well-known ID that other guests resolve on demand.
-
-### Resolving (reading) a singleton
-
-Resolving a singleton is trivial using the `selium-userland` library `Context`:
+In Rust, you annotate them with `#[selium_guest::entrypoint]`:
 
 ```rust
-use selium_userland::Context;
+use anyhow::Result;
+use selium_abi::DataValue;
 
-let ctx = Context::current();
-let switchboard = ctx.require::<Switchboard>().await;
-```
-
-Under the hood this performs a singleton lookup and then builds a typed wrapper from the returned handle. To resolve singletons, the process needs the `SingletonLookup` capability.
-
-You can also retrieve the current `Context` using dependency injection:
-
-```rust
-#[entrypoint]
-async fn my_service(ctx: selium_userland::Context) -> Result<()> { ... }
-```
-
-### Registering a singleton
-
-User applications can also make use of singletons for exposing globally-unique data, like channel handles: a process creates some shared resource, shares it into the host registry, and then registers that shared handle under a stable ID. Registration requires the `SingletonRegistry` capability, and the resource itself must already be shareable (for example a channel you have exported via `Channel::share`).
-
-```rust
-use selium_userland::{
-    DependencyId,
-    io::{Channel, DriverError},
-    singleton,
-};
-
-// Pick a stable 16-byte identifier and keep it forever.
-// Duplicate identifiers will be rejected.
-const MY_SINGLETON: DependencyId = DependencyId([0; 16]);
-
-async fn register_my_singleton() -> Result<(), DriverError> {
-    let channel = Channel::create(64 * 1024).await?;
-    let shared = channel.share().await?;
-
-    // Register the shared handle in the host singleton registry.
-    singleton::register(MY_SINGLETON, shared.raw()).await?;
+#[selium_guest::entrypoint]
+pub async fn launch(bindings: DataValue, service: &str, retries: i32) -> Result<()> {
+    // Your process logic here.
     Ok(())
 }
 ```
 
-On the resolution side (i.e. the process looking up your singleton), you can provide an ergonomic wrapper for users to resolve via the `Dependency` trait. Here's how Switchboard does it:
+The important part is not just that entrypoints exist, but that Selium can pass typed ABI arguments into them. That is how the same module can expose multiple operational entrypoints such as `start`, `launch`, `reconfigure`, or worker-style child entrypoints started from another guest.
+
+## Arguments
+
+Selium supports scalar, buffer, and resource arguments. In practice you supply them in one of two places:
+
+- a runtime module spec such as `path=...;params=utf8,i32;args=utf8:billing,i32:3`
+- `selium_guest::process::ProcessBuilder` from another guest
+
+The current scalar and buffer kinds are:
+
+- Scalars: `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`
+- Buffers: `utf8` (string), `buffer`/`hex` (raw bytes)
+- Resources: `resource` (a numeric guest resource handle / resource id)
+
+When `params` is omitted from a module spec, each argument must carry its own type prefix.
+
+## Managed bindings
+
+Selium's current discovery model is built around managed bindings rather than guest-created global registries. When a process is launched with public endpoint bindings, Selium prepends that bindings payload to the entrypoint arguments.
+
+That is why many current examples begin like this:
 
 ```rust
-use selium_userland::{Dependency, DependencyDescriptor, dependency_id};
-
-impl Dependency for Switchboard {
-    type Handle = SharedChannel;
-    type Error = SwitchboardError;
-
-    const DESCRIPTOR: DependencyDescriptor = DependencyDescriptor {
-        name: "selium::Switchboard",
-        id: dependency_id!("selium.switchboard.singleton"),
-    };
-
-    async fn from_handle(handle: Self::Handle) -> Result<Self, Self::Error> {
-        Switchboard::attach(handle).await
-    }
+#[selium_guest::entrypoint]
+pub async fn start(bindings: DataValue) -> Result<()> {
+    let bindings = selium_abi::encode_rkyv(&bindings)?;
+    let mut writer = selium_guest::io::managed_event_writer(&bindings, "echo.requested", 1).await?;
+    Ok(())
 }
 ```
 
-## Logging
+Use these helpers when you want the runtime or control plane to wire public event endpoints for you.
 
-Your apps should use the `tracing` crate from the Tokio development team to perform logging. We've built specific logging integration around `tracing`: the `#[entrypoint]` macro initialises a bridge automatically that forwards typed log records over a dedicated channel.
+For public services and streams, the generated bindings layer uses `selium_guest::network` sessions and the RPC/stream helpers instead. That is the pattern used by the current network examples and the surface to learn against for service and stream workloads.
 
-For modules loaded into the Runtime on start (via `selium-runtime --module` arg), the runtime will automatically subscribe to and emit these logs to stdout/err.
+## ProcessBuilder
 
-You can also subscribe to application logs from the CLI when launching a process by using the `--attach` flag.
+Guests can start other Selium processes directly using `selium_guest::process::ProcessBuilder`. This is how supervisor-style modules start worker entrypoints, pass typed arguments, and grant only the capabilities or runtime-managed resources the child needs.
 
-If you're running the Selium Atlas module, you can publish logs to a URI using `--log-uri` (or `&log_uri=` in a module spec). Users can then discover and subscribe to the application's log channel for alerting, orchestration, etc.
+`ProcessBuilder` lets you set:
+
+- the target module ID and entrypoint name
+- the ABI signature and typed arguments
+- granted capabilities
+- network egress profiles and ingress bindings
+- storage log and blob grants
+
+Use it for parent/child orchestration inside the runtime. Use the `selium` CLI when you want operational control from outside the runtime.
+
+## Capabilities
+
+Capabilities are Selium's permission system. Any hostcall that touches process lifecycle, time, network, storage, shared memory, or queue I/O must be backed by an explicit grant.
+
+Some common capability names in the current ABI are:
+
+- `session_lifecycle`, `process_lifecycle`, `time_read`
+- `shared_memory`, `queue_lifecycle`, `queue_writer`, `queue_reader`
+- `network_lifecycle`, `network_connect`, `network_accept`, `network_stream_read`, `network_stream_write`, `network_rpc_client`, `network_rpc_server`
+- `storage_lifecycle`, `storage_log_read`, `storage_log_write`, `storage_blob_read`, `storage_blob_write`
+
+Grant as little authority as possible. For direct CLI launches, `selium start --module ...` can build a module spec for you; for lower-level launches, use an explicit module spec or `ProcessBuilder` and enumerate what the process needs.
+
+## Guest API surface
+
+The guest crate is intentionally split by host domain:
+
+- `selium_guest::io` for managed public event bindings
+- `selium_guest::process` for guest-started child processes
+- `selium_guest::network` for managed ingress/egress sessions, streams, and RPC
+- `selium_guest::storage` for runtime-managed durable logs and blob stores
+- `selium_guest::queue` and `selium_guest::shm` for lower-level data-plane control
+- `selium_guest::session` and `selium_guest::time` for lifecycle and timing primitives
+
+Most user code should start with `io`, `process`, and the contract-generated bindings from `selium idl compile`, then reach for the lower-level modules only when you need more control.
+
+## Choosing a launch path
+
+- Use `selium start` / `list` / `stop` when you want a fast operational inner loop.
+- Use `idl publish`, `deploy`, `connect`, `scale`, and `agent` when you want stable workload identities and desired-state reconciliation.
+- Use `ProcessBuilder` when one guest needs to orchestrate another guest from inside the runtime.

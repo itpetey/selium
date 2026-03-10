@@ -1,0 +1,67 @@
+---
+title: "CLI"
+description: "Use the selium CLI for direct launches, control-plane mutations, and diagnostics."
+---
+
+`selium` is the operator-facing CLI for Selium. Most commands talk to a running `selium-runtime` daemon, while `idl compile` is local and generates bindings directly from a `.selium` package.
+
+## Shared connection flags
+
+Daemon-backed commands share the same connection tuple:
+
+- `--daemon-addr`
+- `--daemon-server-name`
+- `--ca-cert`
+- `--client-cert`
+- `--client-key`
+
+You can pass those inline, or load them from a CLI config file with `-c/--config`. `idl compile` does not require a daemon connection.
+
+## Direct operational commands
+
+Use these when you want a tight local loop against a known node:
+
+- `start` launches one replica on `--node` with a required `--replica-key`
+- `list` shows running replicas, optionally filtered to one node
+- `stop` stops one running replica by `--node` and `--replica-key`
+
+`start` accepts either:
+
+- `--module modules/my_workload.wasm` for the common path, or
+- `--module-spec 'path=...;entrypoint=...;capabilities=...;args=...'` when you need the full launch surface
+
+It can also inject managed public event bindings with repeated `--event-reader` and `--event-writer` flags.
+
+## Control-plane commands
+
+Use these when you want stable names and desired-state workflows:
+
+- `idl compile` generates Rust bindings from a `.selium` package
+- `idl publish` registers that package with the control plane
+- `deploy` declares a workload, module, replica count, isolation, and one or more `--contract` bindings
+- `connect` creates a pipeline edge between two workloads for one contract-defined event endpoint
+- `scale` updates the replica count for an existing workload
+- `agent` reconciles desired state onto a node, once or on an interval
+
+The read-side commands are:
+
+- `nodes` for node inventory and liveness
+- `observe` for the current control-plane view
+- `replay` for recent control-plane events, optionally filtered by tenant, namespace, or workload
+
+## Know which identity you are holding
+
+Selium exposes two naming layers on purpose:
+
+- **user-facing workload identity**: `tenant/namespace/workload`
+- **operational running replica identity**: the `--replica-key` you use with `start` / `stop`
+
+Control-plane commands work with workload and endpoint identities. Operational commands work with node-local running replicas.
+
+## A good default split
+
+- Start with `idl publish` when the workload is contract-defined.
+- Use `start` for direct local launches and example iteration.
+- Use `deploy` + `connect` + `agent --once` when you want a real multi-workload topology.
+
+If you want a concrete walkthrough, read [Getting started](./getting-started) for the direct path, then [Control Plane](./control-plane) and [Examples](./examples) for the reconciled path.

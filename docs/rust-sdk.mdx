@@ -1,0 +1,49 @@
+---
+title: "Rust SDK"
+description: "Use selium-sdk-rust for host-side publish, subscribe, and replay workflows."
+---
+
+`selium-sdk-rust` is the host/client-side Rust facade for Selium's communication primitives. Use it when your code is **not** running as a guest module but still needs to publish, subscribe, or replay Selium data.
+
+## Start with a Context
+
+The SDK centers on `Context`:
+
+- `Context::new()` for the default in-memory setup
+- `Context::builder()` when you want to inject a specific `CoreIo`
+- `set_runtime_encoding(...)` when the runtime needs to enforce a particular encoding policy
+
+The default runtime encoding is `rkyv`, which matches the current contract and guest tooling story.
+
+## Create or reuse channels
+
+The SDK exposes channel lifecycle directly:
+
+- `create_channel(name, ChannelKind, RetentionPolicy)`
+- `ensure_channel(name, ChannelKind, RetentionPolicy)`
+
+The current channel kinds are `Event`, `Rpc`, and `Stream`. Retention is configured with `RetentionPolicy { max_entries }`.
+
+## Typed and byte-oriented publish/subscribe
+
+You can work at two levels:
+
+- `publisher<T>` and `subscriber<T>` for typed `rkyv` payloads
+- `byte_publisher` and `byte_subscriber` for raw byte frames
+
+Typed publishers automatically encode payloads as `application/rkyv`. Subscribers decode them back into Rust types on receipt.
+
+## Replay and backfill
+
+Replay is part of the public SDK surface.
+
+- `subscriber(..., ReplayStart::Earliest | Latest | Sequence | Timestamp | Checkpoint)` lets you join a stream at the right point
+- `replay_bytes(channel, start, limit)` gives host-side tools a simple backfill path
+
+That makes the SDK useful for tests, ingest tools, sidecars, diagnostics, and adapters that need to bootstrap from history before switching to live traffic.
+
+## When to use the SDK vs the guest crate
+
+- Use `selium-sdk-rust` for host-side or external Rust processes.
+- Use [Guest API](./applications) when the code is running inside a Selium WASM guest.
+- Use [Data Plane](./channels) when you want the broader mental model for events, services, streams, retention, and replay.

@@ -1,0 +1,61 @@
+---
+title: "Control Plane"
+description: "Contracts, workloads, pipelines, and reconciliation in the current Selium model."
+---
+
+The control plane is Selium's desired-state layer. It gives workloads stable names, tracks published contract packages, records how workloads should connect, and turns that intent into running processes and endpoint bridges.
+
+## The identities that matter
+
+The current public model is built around a few core types:
+
+- `WorkloadRef`: `tenant/namespace/workload`
+- `ContractRef`: `namespace/name@version` plus a contract kind
+- `PublicEndpointRef`: a workload plus a contract kind and endpoint name
+- `PipelineSpec`: named edges between workload endpoints
+- `NodeSpec`: node identity, daemon address, advertised TLS name, and capacity
+
+For event pipelines, `selium connect` creates a named pipeline edge: you provide `--pipeline` plus `--tenant`, `--namespace`, `--from-workload`, `--to-workload`, `--endpoint`, and `--contract`.
+
+## Contracts come first
+
+A `.selium` package can define schemas plus event, service, and stream interfaces. The normal flow is:
+
+1. `selium idl compile` to generate Rust bindings
+2. `selium idl publish` to register the package with the daemon's control plane
+3. `selium deploy` to attach one or more contract interfaces to a workload
+
+That is the baseline for both managed event routing and generated network helpers.
+
+## Desired state objects
+
+The control plane persists a few user-facing objects:
+
+- **deployments**: workload identity, module, replica count, isolation, and contracts
+- **pipelines**: edges that connect one workload endpoint to another
+- **nodes**: live daemon endpoints that can host reconciled workloads
+- **registry**: the published contract packages available for deployment and binding
+
+Those objects together form the `ControlPlaneState` snapshot the daemon and agent reconcile against.
+
+## Reconciliation
+
+Publishing and deploying do not start workloads by themselves. Reconciliation is the step that turns desired state into running state.
+
+- `selium agent --once` applies the current desired state once
+- `selium agent` without `--once` keeps reconciling on an interval
+
+During reconciliation, Selium decides which instances should run on which node and whether it needs endpoint bridges between nodes. That is how workload wiring stays stable even when placement changes.
+
+## Control plane vs direct operations
+
+Keep these separate:
+
+- use the control plane for stable workload names and contract-defined topology
+- use `selium start` / `list` / `stop` for direct operator control of running replicas
+
+Both surfaces matter. They just answer different questions.
+
+## Best example to learn from
+
+[Examples](./examples) includes several direct-launch workflows, but `control-plane-topology` is the clearest reference for the full contract-first path: publish a package, deploy workloads, connect endpoints, run `agent --once`, then inspect the result.

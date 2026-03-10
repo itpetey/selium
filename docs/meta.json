@@ -3,12 +3,13 @@
   "pages": [
     "index",
     "getting-started",
+    "examples",
+    "cli",
+    "runtime",
     "applications",
     "channels",
     "networking",
-    "runtime",
-    "remote-client",
-    "switchboard",
-    "atlas"
+    "rust-sdk",
+    "control-plane"
   ]
 }

@@ -1,59 +1,61 @@
 ---
 title: "Networking"
-description: "Connecting to and exposing network services."
+description: "Protocol-aware guest networking with runtime-managed ingress and egress."
 ---
 
-Networking in Selium is capability-driven. Guests access the host network stack through `selium_userland::net`, but only when you grant the relevant `Net*` capabilities. The goal is to make network I/O feel straightforward without granting hidden authority.
+Selium's current networking surface is runtime-managed and protocol-aware. Guests do not bind raw sockets directly. Instead, the runtime defines named ingress bindings and egress profiles, and guest code receives access to those named resources.
 
-Supported protocols:
+## What exists today
 
-- `NetProtocol::Quic` (QUIC over UDP with TLS 1.3)
-- `NetProtocol::Http` (HTTP/1.1 over TCP)
-- `NetProtocol::Https` (HTTP/1.1 over TLS 1.3)
-- _many more in development_
+- Protocols: `NetworkProtocol::{Quic, Http}`
+- Interaction kinds: `InteractionKind::{Stream, Rpc}`
 
-TLS configuration is explicit. You register configs with `TlsServerConfig::register` and `TlsClientConfig::register` (gated by `NetTlsServerConfig` and `NetTlsClientConfig` capabilities):
+In practice that means two main patterns today:
 
-```rust
-const TLS_CERT_PEM: &[u8] = include_bytes!("../server-cert.pem");
-const TLS_KEY_PEM: &[u8] = include_bytes!("../server-key.pem");
+- QUIC stream sessions for long-lived bidirectional traffic
+- HTTP-over-TLS request/response RPC
 
-let tls_bundle = TlsServerBundle {
-    cert_chain_pem: TLS_CERT_PEM.to_vec(),
-    private_key_pem: TLS_KEY_PEM.to_vec(),
-    client_ca_pem: None,
-    alpn: Some(vec!["http/1.1".to_string()]), // http/2 requires more boilerplate r/n
-    require_client_auth: false,
-};
-let tls_config = TlsServerConfig::register(tls_bundle).await?;
-let listener = HttpsListener::bind_with_tls(domain, port, &tls_config).await?;
-```
+The public examples are [network-quic-stream](https://github.com/itpetey/selium/tree/main/examples/network-quic-stream) and [network-http-rpc](https://github.com/itpetey/selium/tree/main/examples/network-http-rpc).
 
-Selium is still early here. Expect improvements and higher-level helpers over time.
+## Runtime-owned configuration
 
-## HTTP payloads
+The daemon config owns the network surface:
 
-HTTP connections surface complete request/response payloads as raw bytes. When you read or write frames, you are responsible for parsing or formatting HTTP messages yourself. (Chunked transfer encoding is not supported yet.)
+- **egress profiles** declare the protocol, allowed interaction kinds, allowed authorities, and client TLS material
+- **ingress bindings** declare the protocol, allowed interaction kinds, listen address, and server certificate/key
 
-Again, Selium is very early here, so you can expect this to improve dramatically over time.
+Guests and child processes only see those resources by name. Access is granted through a runtime module spec or through `selium_guest::process::ProcessBuilder`.
 
-## Channels
+## Guest API
 
-Network connections are not channels, but they intentionally feel similar, behaving like `Stream`/`Sink` pairs. If you want to integrate them into your channel-based architecture, you can bridge them explicitly:
+The core guest entrypoints are straightforward:
 
-For example (from the [load-balancer example](https://github.com/seliumlabs/selium/tree/main/examples/load-balancer)):
+- `selium_guest::network::listen(binding_name)` to accept inbound sessions
+- `selium_guest::network::quic::connect(profile, authority)` for outbound QUIC
+- `selium_guest::network::http::connect(profile, authority)` for outbound HTTP-over-TLS
 
-```rust
-let lb: Fanout<Connection> = Fanout::create(&switchboard).await?;
+Once connected, the guest works with `Listener`, `Session`, `StreamChannel`, and RPC exchange helpers:
 
-let listener = HttpListener::bind(domain, port).await?;
-listener
-    .incoming()
-    .and_then(|mut conn| async move {
-        conn.prepare_for_transfer().await?; // must be called first
-        Ok(conn)
-    })
-    .map_err(SwitchboardError::Driver)
-    .forward(lb)
-    .await?;
-```
+- `Listener::accept(...)` accepts a session
+- `network::stream::open(...)` or generated stream helpers create outbound stream channels
+- generated RPC helpers accept requests, read buffered or streaming bodies, and send typed responses
+
+Authorities are passed in `host:port@server-name` form, as shown in the network examples.
+
+## Contracts and generated helpers
+
+Service and stream contracts are where the current user-facing ergonomics live.
+
+- `selium idl compile` generates typed helpers for client/server or stream usage
+- generated service helpers sit on top of `selium_guest::network` RPC sessions
+- generated stream helpers sit on top of `selium_guest::network` stream channels
+
+That is why the current networking docs should be read together with [Control Plane](./control-plane) and [Guest API](./applications), not as a separate legacy subsystem.
+
+## Keep the responsibility split clear
+
+- Use `selium_guest::io` for managed **event** bindings
+- Use `selium_guest::network` for **service** and **stream** workloads
+- Use [Runtime](./runtime) when you need to define the binding/profile names the guest code will consume
+
+Selium is still early here, but the direction is already clear: runtime-defined network resources, guest access by name, and typed helpers generated from contracts rather than hand-rolled protocol plumbing.
