@@ -1,11 +1,15 @@
 //! Minimal request/reply RPC inside one Selium guest module.
 //! Startup proves the request path and response path both work before the module idles.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use selium_abi::DataValue;
-use selium_guest::{io, spawn, time};
+use selium_guest::{io, shutdown, spawn};
 
 #[allow(dead_code)]
 mod bindings;
@@ -15,11 +19,13 @@ use bindings::{EchoRequest, EchoResponse};
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
+type ServiceTask = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
     // The client and server still show the request path and reply path explicitly, but now
     // they bind to contract-defined public endpoints instead of guest-created queues.
-    spawn_checked("rpc server", run_server(bindings.clone()));
+    let server = spawn_service("rpc server", run_server(bindings.clone()));
 
     let mut request_writer = io::managed_event_writer(&bindings, bindings::EVENT_ECHO_REQUESTED, 1)
         .await
@@ -53,7 +59,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
         "echo response body mismatch"
     );
 
-    idle_forever().await
+    await_services_or_shutdown([server]).await
 }
 
 async fn run_server(bindings: DataValue) -> Result<()> {
@@ -87,23 +93,97 @@ async fn run_server(bindings: DataValue) -> Result<()> {
     }
 }
 
-fn spawn_checked<F>(name: &'static str, future: F)
+fn spawn_service<F>(name: &'static str, future: F) -> ServiceTask
 where
     F: Future<Output = Result<()>> + 'static,
 {
-    // Background tasks panic the whole module on failure so startup never reports success
-    // while one half of the example flow has already died.
-    spawn(async move {
-        if let Err(err) = future.await {
-            panic!("{name} failed: {err:#}");
-        }
-    });
+    Box::pin(spawn(async move {
+        future.await.with_context(|| format!("{name} failed"))
+    }))
 }
 
-async fn idle_forever() -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(60))
+async fn await_services_or_shutdown<const N: usize>(mut services: [ServiceTask; N]) -> Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown());
+    poll_fn(|cx| {
+        for service in &mut services {
+            if let Poll::Ready(result) = service.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+        }
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, future::pending, rc::Rc};
+
+    use anyhow::anyhow;
+    use selium_guest::{
+        __reset_shutdown_for_tests, __signal_shutdown_for_tests, block_on, spawn, yield_now,
+    };
+
+    use super::{await_services_or_shutdown, spawn_service};
+
+    #[test]
+    fn await_services_or_shutdown_returns_ok_after_shutdown_signal() {
+        __reset_shutdown_for_tests();
+        let completed = Rc::new(Cell::new(false));
+        let completed_ref = Rc::clone(&completed);
+        let waiter = spawn(async move {
+            let result = await_services_or_shutdown([spawn_service(
+                "rpc server",
+                pending::<anyhow::Result<()>>(),
+            )])
+            .await;
+            completed_ref.set(true);
+            result
+        });
+
+        let result = block_on(async {
+            yield_now().await;
+            assert!(
+                !completed.get(),
+                "service wait should still be pending before shutdown"
+            );
+            __signal_shutdown_for_tests();
+            waiter.await
+        });
+
+        assert!(
+            result.is_ok(),
+            "shutdown should resolve cleanly: {result:#?}"
+        );
+        assert!(
+            completed.get(),
+            "service wait should complete after shutdown"
+        );
+        __reset_shutdown_for_tests();
+    }
+
+    #[test]
+    fn await_services_or_shutdown_surfaces_service_failure() {
+        __reset_shutdown_for_tests();
+
+        let err = block_on(async {
+            await_services_or_shutdown([spawn_service("rpc server", async {
+                Err(anyhow!("boom"))
+            })])
             .await
-            .context("sleep while idle")?;
+        })
+        .expect_err("service failure should propagate");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("rpc server failed"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("boom"), "unexpected error: {message}");
+
+        __reset_shutdown_for_tests();
     }
 }

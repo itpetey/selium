@@ -3,10 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::wasmtime::runtime::{Error as WasmtimeError, WasmtimeProcessDriver};
+use crate::wasmtime::runtime::{Error as WasmtimeError, WasmtimeProcess, WasmtimeProcessDriver};
 use anyhow::{Context, Result, anyhow, bail};
 use selium_abi::{
-    AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, AbiValue, Capability, EntrypointArg,
+    AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, Capability, EntrypointArg,
     EntrypointInvocation,
 };
 use selium_kernel::{
@@ -21,7 +21,6 @@ use selium_runtime_adaptor_spi::{
 use selium_runtime_adaptor_wasmtime::WasmtimeAdaptor;
 use selium_runtime_network::NetworkService;
 use selium_runtime_storage::StorageService;
-use tokio::task::JoinHandle;
 use tracing::info;
 
 const DEFAULT_ENTRYPOINT: &str = "start";
@@ -201,9 +200,7 @@ pub async fn stop_process(
     })?;
 
     let mut process = registry
-        .remove(ResourceHandle::<
-            JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>,
-        >::new(process_id))
+        .remove(ResourceHandle::<WasmtimeProcess>::new(process_id))
         .ok_or_else(|| anyhow!("process resource `{process_id}` not found"))?;
 
     runtime

@@ -1,9 +1,14 @@
 //! QUIC stream loopback example for the Selium guest network API.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
-use selium_guest::{network, spawn, time};
+use selium_guest::{network, shutdown, spawn, time};
 
 #[allow(dead_code)]
 mod bindings;
@@ -17,12 +22,14 @@ const ACCEPT_TIMEOUT_MS: u32 = 100;
 const IO_TIMEOUT_MS: u32 = 5_000;
 const CHUNK_BYTES: u32 = 4_096;
 
+type ServiceTask = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
 #[selium_guest::entrypoint]
 pub async fn start() -> Result<()> {
     let listener = network::listen(BINDING_NAME)
         .await
         .context("listen on QUIC loopback binding")?;
-    spawn_checked("quic stream server", run_server(listener));
+    let server = spawn_service("quic stream server", run_server(listener));
 
     time::sleep(Duration::from_millis(100))
         .await
@@ -46,7 +53,7 @@ pub async fn start() -> Result<()> {
 
     stream.close().await.context("close QUIC client stream")?;
     session.close().await.context("close QUIC client session")?;
-    idle_forever().await
+    await_services_or_shutdown([server]).await
 }
 
 async fn run_server(listener: network::Listener) -> Result<()> {
@@ -105,10 +112,27 @@ where
     });
 }
 
-async fn idle_forever() -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(60))
-            .await
-            .context("sleep while QUIC example is idle")?;
-    }
+fn spawn_service<F>(name: &'static str, future: F) -> ServiceTask
+where
+    F: Future<Output = Result<()>> + 'static,
+{
+    Box::pin(spawn(async move {
+        future.await.with_context(|| format!("{name} failed"))
+    }))
+}
+
+async fn await_services_or_shutdown<const N: usize>(mut services: [ServiceTask; N]) -> Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown());
+    poll_fn(|cx| {
+        for service in &mut services {
+            if let Poll::Ready(result) = service.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+        }
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
 }

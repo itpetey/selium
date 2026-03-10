@@ -1,11 +1,16 @@
 //! Minimal event broadcast with two subscribers and explicit delivery acknowledgements.
 //! Startup only succeeds once every subscriber has confirmed every published event.
 
-use std::{collections::BTreeSet, future::Future, time::Duration};
+use std::{
+    collections::BTreeSet,
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use selium_abi::DataValue;
-use selium_guest::{io, spawn, time};
+use selium_guest::{io, shutdown, spawn};
 
 #[allow(dead_code)]
 mod bindings;
@@ -16,15 +21,17 @@ const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 const EVENT_COUNT: u32 = 3;
 
+type ServiceTask = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
     // Both flows now bind to contract-defined managed event endpoints instead of guest-created
     // queues, while keeping the same fan-out plus acknowledgement startup proof.
-    spawn_checked(
+    let audit = spawn_service(
         "audit subscriber",
         run_subscriber("audit", bindings.clone()),
     );
-    spawn_checked(
+    let notifications = spawn_service(
         "notifications subscriber",
         run_subscriber("notifications", bindings.clone()),
     );
@@ -63,7 +70,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
     }
 
     ensure!(seen == expected, "broadcast ack set mismatch");
-    idle_forever().await
+    await_services_or_shutdown([audit, notifications]).await
 }
 
 async fn run_subscriber(consumer: &'static str, bindings: DataValue) -> Result<()> {
@@ -117,22 +124,27 @@ fn writer_id_for(consumer: &str) -> u32 {
     }
 }
 
-fn spawn_checked<F>(name: &'static str, future: F)
+fn spawn_service<F>(name: &'static str, future: F) -> ServiceTask
 where
     F: Future<Output = Result<()>> + 'static,
 {
-    // Subscriber failures should fail the module instead of silently reducing fan-out.
-    spawn(async move {
-        if let Err(err) = future.await {
-            panic!("{name} failed: {err:#}");
-        }
-    });
+    Box::pin(spawn(async move {
+        future.await.with_context(|| format!("{name} failed"))
+    }))
 }
 
-async fn idle_forever() -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(60))
-            .await
-            .context("sleep while idle")?;
-    }
+async fn await_services_or_shutdown<const N: usize>(mut services: [ServiceTask; N]) -> Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown());
+    poll_fn(|cx| {
+        for service in &mut services {
+            if let Poll::Ready(result) = service.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+        }
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
 }

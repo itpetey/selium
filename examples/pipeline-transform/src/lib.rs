@@ -1,11 +1,16 @@
 //! Two-stage pipeline processing inside one Selium guest module.
 //! The example turns raw orders into reservation work and then into projection updates.
 
-use std::{collections::BTreeSet, future::Future, time::Duration};
+use std::{
+    collections::BTreeSet,
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
-use selium_guest::{io, spawn, time};
+use selium_guest::{io, shutdown, spawn};
 
 #[allow(dead_code)]
 mod bindings;
@@ -15,14 +20,16 @@ use bindings::{ProjectionApplied, RawOrder, ReservationRequest};
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
+type ServiceTask = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
     // The three pipeline stages still hand work off explicitly, but now through the managed
     // contract endpoints that the control plane binds for this workload.
     let bindings = encode_rkyv(&bindings).context("encode managed event bindings")?;
 
-    spawn_checked("normalize stage", run_normalizer(bindings.clone()));
-    spawn_checked("projection stage", run_projection(bindings.clone()));
+    let normalizer = spawn_service("normalize stage", run_normalizer(bindings.clone()));
+    let projection = spawn_service("projection stage", run_projection(bindings.clone()));
 
     let mut ingress_writer =
         io::managed_event_writer(&bindings, bindings::EVENT_INGRESS_ORDERS, 21)
@@ -57,7 +64,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
     }
 
     ensure!(seen == expected, "projection output mismatch");
-    idle_forever().await
+    await_services_or_shutdown([normalizer, projection]).await
 }
 
 async fn run_normalizer(bindings: Vec<u8>) -> Result<()> {
@@ -153,22 +160,27 @@ fn expected_projection_keys() -> BTreeSet<String> {
     ])
 }
 
-fn spawn_checked<F>(name: &'static str, future: F)
+fn spawn_service<F>(name: &'static str, future: F) -> ServiceTask
 where
     F: Future<Output = Result<()>> + 'static,
 {
-    // Any stage failure is treated as a startup failure because partial pipelines are misleading.
-    spawn(async move {
-        if let Err(err) = future.await {
-            panic!("{name} failed: {err:#}");
-        }
-    });
+    Box::pin(spawn(async move {
+        future.await.with_context(|| format!("{name} failed"))
+    }))
 }
 
-async fn idle_forever() -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(60))
-            .await
-            .context("sleep while idle")?;
-    }
+async fn await_services_or_shutdown<const N: usize>(mut services: [ServiceTask; N]) -> Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown());
+    poll_fn(|cx| {
+        for service in &mut services {
+            if let Poll::Ready(result) = service.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+        }
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
 }

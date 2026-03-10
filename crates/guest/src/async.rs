@@ -76,11 +76,19 @@ mod host {
     #[link(wasm_import_module = "selium::async")]
     unsafe extern "C" {
         fn yield_now();
+        #[link_name = "wait_for_shutdown"]
+        fn raw_wait_for_shutdown();
     }
 
     pub unsafe fn park() {
         unsafe {
             yield_now();
+        }
+    }
+
+    pub unsafe fn wait_for_shutdown() {
+        unsafe {
+            raw_wait_for_shutdown();
         }
     }
 }
@@ -93,6 +101,48 @@ mod host {
 thread_local! {
     static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static SHUTDOWN: RefCell<ShutdownCompatState> = const { RefCell::new(ShutdownCompatState::new()) };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ShutdownCompatState {
+    signalled: bool,
+    wakers: Vec<Waker>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ShutdownCompatState {
+    const fn new() -> Self {
+        Self {
+            signalled: false,
+            wakers: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, waker: &Waker) {
+        if self.wakers.iter().any(|existing| existing.will_wake(waker)) {
+            return;
+        }
+        self.wakers.push(waker.clone());
+    }
+
+    #[cfg(test)]
+    fn signal(&mut self) {
+        self.signalled = true;
+        for waker in self.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
+    #[cfg(test)]
+    fn reset(&mut self) {
+        self.signalled = false;
+        self.wakers.clear();
+    }
 }
 
 struct LocalWake {
@@ -128,6 +178,9 @@ struct BackgroundTask {
 struct YieldNow {
     yielded: bool,
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ShutdownFuture;
 
 impl BackgroundTask {
     fn new<F>(future: F) -> Self
@@ -198,6 +251,23 @@ impl Future for YieldNow {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Future for ShutdownFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        SHUTDOWN.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.signalled {
+                Poll::Ready(())
+            } else {
+                state.register(cx.waker());
+                Poll::Pending
+            }
+        })
+    }
+}
+
 #[inline(always)]
 #[cfg(target_arch = "wasm32")]
 unsafe fn cell(offset: usize) -> *mut GuestAtomicUint {
@@ -252,6 +322,39 @@ where
 /// Yield execution to the guest scheduler once.
 pub async fn yield_now() {
     YieldNow { yielded: false }.await;
+}
+
+/// Resolve when the runtime begins shutting this guest down.
+pub async fn shutdown() {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        host::wait_for_shutdown();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ShutdownFuture.await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn __reset_shutdown_for_tests() {
+    SHUTDOWN.with(|state| {
+        let mut state = state.borrow_mut();
+        state.signalled = false;
+        state.wakers.clear();
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn __signal_shutdown_for_tests() {
+    SHUTDOWN.with(|state| {
+        let mut state = state.borrow_mut();
+        state.signalled = true;
+        for waker in state.wakers.drain(..) {
+            waker.wake();
+        }
+    });
 }
 
 /// Block on a future using Selium's guest-side executor.
@@ -388,7 +491,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use futures::StreamExt;
@@ -437,5 +540,46 @@ mod tests {
         block_on(fut);
 
         assert_eq!(counter.load(Ordering::Relaxed), total);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reset_shutdown() {
+        SHUTDOWN.with(|state| state.borrow_mut().reset());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn signal_shutdown() {
+        SHUTDOWN.with(|state| state.borrow_mut().signal());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shutdown_resolves_when_signalled() {
+        reset_shutdown();
+        let resolved = Arc::new(AtomicBool::new(false));
+        let resolved_ref = Arc::clone(&resolved);
+        let waiter = spawn(async move {
+            shutdown().await;
+            resolved_ref.store(true, Ordering::SeqCst);
+        });
+
+        block_on(async {
+            yield_now().await;
+            assert!(!resolved.load(Ordering::SeqCst));
+            signal_shutdown();
+            waiter.await;
+        });
+
+        assert!(resolved.load(Ordering::SeqCst));
+        reset_shutdown();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shutdown_returns_immediately_after_signal() {
+        reset_shutdown();
+        signal_shutdown();
+        block_on(shutdown());
+        reset_shutdown();
     }
 }

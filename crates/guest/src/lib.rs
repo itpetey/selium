@@ -101,6 +101,9 @@ pub mod time;
 /// Re-export of the `rkyv` crate used for internal Selium serialisation.
 pub use rkyv;
 
-pub use r#async::{block_on, spawn, yield_now};
+pub use r#async::{block_on, shutdown, spawn, yield_now};
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use r#async::{__reset_shutdown_for_tests, __signal_shutdown_for_tests};
 /// Re-export of supported Selium macros for guest crates.
 pub use selium_guest_macros::entrypoint;

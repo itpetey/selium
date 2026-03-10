@@ -5,6 +5,7 @@ use std::{
     fmt::{Display, Formatter},
     future::Future,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use selium_abi::{
@@ -53,6 +54,20 @@ pub struct WasmtimeRunRequest<'a> {
     pub storage_logs: &'a [String],
     pub storage_blobs: &'a [String],
     pub entrypoint: EntrypointInvocation,
+}
+
+pub struct WasmtimeProcess {
+    handle: JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>,
+    mailbox: &'static dyn selium_kernel::spi::wake_mailbox::WakeMailbox,
+}
+
+impl WasmtimeProcess {
+    fn new(
+        handle: JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>,
+        mailbox: &'static dyn selium_kernel::spi::wake_mailbox::WakeMailbox,
+    ) -> Self {
+        Self { handle, mailbox }
+    }
 }
 
 #[derive(Debug)]
@@ -308,7 +323,7 @@ impl WasmtimeRuntime {
         });
 
         registry
-            .initialise(process_id, handle)
+            .initialise(process_id, WasmtimeProcess::new(handle, mb))
             .map_err(|err| Error::Kernel(KernelError::from(err)))?;
 
         // Trigger entrypoint exec
@@ -341,7 +356,7 @@ impl WasmtimeProcessDriver {
 }
 
 impl ProcessLifecycleCapability for WasmtimeProcessDriver {
-    type Process = JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>;
+    type Process = WasmtimeProcess;
     type Error = Error;
 
     fn start(
@@ -384,9 +399,23 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
     }
 
     async fn stop(&self, instance: &mut Self::Process) -> Result<(), Self::Error> {
-        instance.abort();
+        stop_process(instance).await?;
         Ok(())
     }
+}
+
+async fn stop_process(process: &mut WasmtimeProcess) -> Result<(), Error> {
+    process.mailbox.close();
+
+    if tokio::time::timeout(Duration::from_secs(1), &mut process.handle)
+        .await
+        .is_err()
+    {
+        process.handle.abort();
+        let _ = (&mut process.handle).await;
+    }
+
+    Ok(())
 }
 
 impl From<Error> for GuestError {
@@ -853,6 +882,49 @@ fn take_u32(iter: &mut std::slice::Iter<Val>, msg: &str) -> Result<u32, wasmtime
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::atomic::{AtomicBool, Ordering}, task::Waker};
+    use selium_kernel::spi::wake_mailbox::WakeMailbox;
+
+    struct TestMailbox {
+        closed: AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl TestMailbox {
+        fn new() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl selium_kernel::spi::wake_mailbox::WakeMailbox for TestMailbox {
+        fn refresh_base(&self, _base: usize) {}
+
+        fn close(&self) {
+            self.closed.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+
+        fn waker(&'static self, _task_id: usize) -> Waker {
+            Waker::noop().clone()
+        }
+
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+
+        fn is_signalled(&self) -> bool {
+            false
+        }
+
+        fn wait_for_signal<'a>(&'a self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                self.notify.notified().await;
+            })
+        }
+    }
 
     #[test]
     fn prepare_params_detects_count_mismatches() {
@@ -907,5 +979,22 @@ mod tests {
         let requested = HashSet::from([Capability::TimeRead]);
         let stubs = stub_operations_for_missing(&requested);
         assert!(!stubs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_process_closes_mailbox_and_waits_for_guest_exit() {
+        let mailbox: &'static TestMailbox = Box::leak(Box::new(TestMailbox::new()));
+        let wait_mailbox = mailbox;
+        let handle = tokio::spawn(async move {
+            wait_mailbox.wait_for_signal().await;
+            assert!(wait_mailbox.is_closed());
+            Ok(Vec::new())
+        });
+        let mut process = WasmtimeProcess::new(handle, mailbox);
+
+        stop_process(&mut process).await.expect("stop process");
+
+        assert!(mailbox.is_closed());
+        assert!(process.handle.is_finished());
     }
 }

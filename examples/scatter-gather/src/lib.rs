@@ -1,11 +1,16 @@
 //! Scatter-gather quote processing with two workers and one aggregator.
 //! Requests are partitioned across workers and gathered back into a single validated result set.
 
-use std::{collections::BTreeMap, future::Future, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
-use selium_guest::{io, spawn, time};
+use selium_guest::{io, shutdown, spawn};
 
 #[allow(dead_code)]
 mod bindings;
@@ -15,6 +20,8 @@ use bindings::{QuoteRequest, QuoteResponse};
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
+type ServiceTask = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
     let bindings =
@@ -22,7 +29,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
 
     // Scatter-gather still exposes one ingress per worker and one shared result stream, but
     // each hop now binds to a public contract endpoint instead of a guest-created queue.
-    spawn_checked(
+    let worker_a = spawn_service(
         "worker A",
         run_worker(
             bindings.clone(),
@@ -31,7 +38,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
             bindings::EVENT_PRICING_QUOTE_WORKER_A_REQUESTS,
         ),
     );
-    spawn_checked(
+    let worker_b = spawn_service(
         "worker B",
         run_worker(
             bindings.clone(),
@@ -111,7 +118,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
         totals == BTreeMap::from([(1, 250), (2, 525), (3, 125), (4, 700)]),
         "aggregated result mismatch"
     );
-    idle_forever().await
+    await_services_or_shutdown([worker_a, worker_b]).await
 }
 
 async fn run_worker(
@@ -165,22 +172,27 @@ fn writer_id_for(worker: &str) -> u32 {
     }
 }
 
-fn spawn_checked<F>(name: &'static str, future: F)
+fn spawn_service<F>(name: &'static str, future: F) -> ServiceTask
 where
     F: Future<Output = Result<()>> + 'static,
 {
-    // If one worker exits unexpectedly, the gather loop would otherwise hang waiting for results.
-    spawn(async move {
-        if let Err(err) = future.await {
-            panic!("{name} failed: {err:#}");
-        }
-    });
+    Box::pin(spawn(async move {
+        future.await.with_context(|| format!("{name} failed"))
+    }))
 }
 
-async fn idle_forever() -> Result<()> {
-    loop {
-        time::sleep(Duration::from_secs(60))
-            .await
-            .context("sleep while idle")?;
-    }
+async fn await_services_or_shutdown<const N: usize>(mut services: [ServiceTask; N]) -> Result<()> {
+    let mut shutdown = std::pin::pin!(shutdown());
+    poll_fn(|cx| {
+        for service in &mut services {
+            if let Poll::Ready(result) = service.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+        }
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    })
+    .await
 }
