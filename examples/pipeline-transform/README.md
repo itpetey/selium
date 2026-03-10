@@ -1,6 +1,6 @@
 # Pipeline Transform
 
-This example models a two-stage workflow. The ingress task submits raw orders, the normalizer stage converts them into reservation requests, and the projection stage emits a final materialized result.
+This example models a two-stage workflow. The ingress task submits raw orders, the normalizer stage converts them into reservation requests, and the projection stage emits a final materialized result across managed event bindings.
 
 The contract for the example lives at `contracts/commerce.pipeline.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -44,6 +44,12 @@ cargo run -p selium -- \
   start \
   --node "$SELIUM_NODE" \
   --replica-key pipeline-transform-demo \
+  --event-reader ingress.orders \
+  --event-writer ingress.orders \
+  --event-reader inventory.reservations \
+  --event-writer inventory.reservations \
+  --event-reader projections.applied \
+  --event-writer projections.applied \
   --module modules/pipeline_transform.wasm
 
 cargo run -p selium -- \
@@ -61,4 +67,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key pipeline-transform-demo
 ```
 
-The module only enters its idle loop after both downstream stages processed the full order set and the coordinator verified the final projections.
+The module only enters its idle loop after both downstream stages processed the full order set through the managed event bindings and the coordinator verified the final projections.

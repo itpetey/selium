@@ -1,6 +1,6 @@
 # RPC Echo Service
 
-This example shows a minimal request/reply service inside a single Selium guest module. The module starts a server task, sends one typed request through a request channel, validates the typed response, and then stays resident as a long-running service.
+This example shows a minimal request/reply service inside a single Selium guest module. The module starts a server task, binds to the contract-defined `echo.requested` and `echo.responded` endpoints, validates one typed round-trip, and then stays resident as a long-running service.
 
 The contract for the example lives at `contracts/messaging.echo.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -44,6 +44,10 @@ cargo run -p selium -- \
   start \
   --node "$SELIUM_NODE" \
   --replica-key rpc-echo-demo \
+  --event-reader echo.requested \
+  --event-writer echo.requested \
+  --event-reader echo.responded \
+  --event-writer echo.responded \
   --module modules/rpc_echo_service.wasm
 
 cargo run -p selium -- \
@@ -61,4 +65,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key rpc-echo-demo
 ```
 
-Successful startup means the module completed an RPC round-trip before idling. If the server fails to answer or the payload is corrupted, startup fails and the instance never settles into the idle loop.
+Successful startup means the module completed an RPC round-trip over the managed public endpoints before idling. If the server fails to answer or the payload is corrupted, startup fails and the instance never settles into the idle loop.

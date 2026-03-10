@@ -1,19 +1,19 @@
 # Examples
 
-These examples are meant to be copied, built, and deployed by end users. Each project is a single guest module crate that validates its own messaging flow during startup and then stays alive until you stop it with `selium stop`.
+These examples are meant to be copied, built, and deployed by end users. Each project is a single guest module crate that validates its own discovery-managed messaging flow during startup and then stays alive until you stop it with `selium stop`.
 
 ## Projects
 
-- `rpc-echo-service/`: request/reply RPC over Selium guest channels, plus `contracts/messaging.echo.v1.selium`.
+- `rpc-echo-service/`: request/reply RPC over the contract-defined `echo.requested` and `echo.responded` endpoints, plus `contracts/messaging.echo.v1.selium`.
 - `network-quic-stream/`: QUIC stream echo over the guest network layer with runtime-managed TLS, plus `contracts/network.quic.echo.v1.selium`.
 - `network-http-rpc/`: HTTPS request/response upload over the guest network RPC surface, plus `contracts/network.http.upload.v1.selium`.
-- `event-broadcast/`: event fan-out to multiple subscribers, plus `contracts/inventory.broadcast.v1.selium`.
-- `pipeline-transform/`: staged pipeline processing, plus `contracts/commerce.pipeline.v1.selium`.
-- `scatter-gather/`: parallel request distribution, plus `contracts/pricing.scatter.v1.selium`.
-- `stateful-counter/`: checkpoint handoff and resume via typed entrypoint arguments, plus `contracts/stateful.counter.v1.selium`.
-- `process-supervisor/`: parent/child process orchestration with `ProcessBuilder`, plus `contracts/orchestration.supervisor.v1.selium`.
-- `typed-entrypoints/`: custom entrypoints launched via `--module-spec`, plus `contracts/operations.launch.v1.selium`.
-- `control-plane-topology/`: contract publication, `deploy`, `connect`, and `agent --once` for a three-app topology, plus `contracts/analytics.topology.v1.selium`.
+- `event-broadcast/`: event fan-out over managed inventory and ack endpoints, plus `contracts/inventory.broadcast.v1.selium`.
+- `pipeline-transform/`: staged pipeline processing over managed ingress, reservation, and projection endpoints, plus `contracts/commerce.pipeline.v1.selium`.
+- `scatter-gather/`: parallel request distribution over per-worker request endpoints and a shared results endpoint, plus `contracts/pricing.scatter.v1.selium`.
+- `stateful-counter/`: checkpoint handoff and resume via managed counter endpoints plus typed entrypoint arguments, plus `contracts/stateful.counter.v1.selium`.
+- `process-supervisor/`: parent/child process orchestration with `ProcessBuilder` and forwarded managed worker-status bindings, plus `contracts/orchestration.supervisor.v1.selium`.
+- `typed-entrypoints/`: custom entrypoints launched via `--module-spec` with a managed `launch.recorded` event binding, plus `contracts/operations.launch.v1.selium`.
+- `control-plane-topology/`: the reference publish/deploy/connect/`agent --once` workflow for wiring contract-defined public endpoints across three workloads, plus `contracts/analytics.topology.v1.selium`.
 
 ## Setup
 
@@ -48,6 +48,8 @@ export SELIUM_CERT_DIR=/path/to/runtime/certs
 ```
 
 Each example README includes a `## Setup`, `## Contracts`, and `## Usage` section with the exact commands for that project.
+
+Most single-crate examples bind their contract-defined endpoints directly on `start` with `--event-reader` and `--event-writer`. `control-plane-topology/` shows the same discovery-first model driven through the full `idl publish`, `deploy`, `connect`, and `agent --once` control-plane workflow.
 
 ## Contracts
 

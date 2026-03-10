@@ -4,7 +4,7 @@
 use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -12,30 +12,21 @@ mod bindings;
 
 use bindings::{EchoRequest, EchoResponse};
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    // The client and server share two explicit channels so the RPC request path and
-    // reply path are visible in the example instead of being hidden behind a helper.
-    let requests = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create request channel")?;
-    let responses = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create response channel")?;
+pub async fn start(bindings: DataValue) -> Result<()> {
+    let bindings = encode_rkyv(&bindings).context("encode rpc managed-event bindings")?;
 
-    spawn_checked(
-        "rpc server",
-        run_server(requests.queue_shared_id, responses.queue_shared_id),
-    );
+    // The client and server still show the request path and reply path explicitly, but now
+    // they bind to contract-defined public endpoints instead of guest-created queues.
+    spawn_checked("rpc server", run_server(bindings.clone()));
 
-    let mut request_writer = io::attach_writer(&descriptor(requests.queue_shared_id), 1)
+    let mut request_writer = io::managed_event_writer(&bindings, bindings::EVENT_ECHO_REQUESTED, 1)
         .await
         .context("attach request writer")?;
-    let mut response_reader = io::attach_reader(&descriptor(responses.queue_shared_id))
+    let mut response_reader = io::managed_event_reader(&bindings, bindings::EVENT_ECHO_RESPONDED)
         .await
         .context("attach response reader")?;
 
@@ -70,13 +61,14 @@ pub async fn start() -> Result<()> {
     idle_forever().await
 }
 
-async fn run_server(requests_shared_id: u64, responses_shared_id: u64) -> Result<()> {
-    let mut request_reader = io::attach_reader(&descriptor(requests_shared_id))
+async fn run_server(bindings: Vec<u8>) -> Result<()> {
+    let mut request_reader = io::managed_event_reader(&bindings, bindings::EVENT_ECHO_REQUESTED)
         .await
         .context("attach request reader")?;
-    let mut response_writer = io::attach_writer(&descriptor(responses_shared_id), 41)
-        .await
-        .context("attach response writer")?;
+    let mut response_writer =
+        io::managed_event_writer(&bindings, bindings::EVENT_ECHO_RESPONDED, 41)
+            .await
+            .context("attach response writer")?;
 
     loop {
         let Some(frame) = request_reader
@@ -101,14 +93,6 @@ async fn run_server(requests_shared_id: u64, responses_shared_id: u64) -> Result
             )
             .await
             .context("send response")?;
-    }
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // Examples pass shared queue ids around and rebuild the descriptor at the attachment site.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
     }
 }
 

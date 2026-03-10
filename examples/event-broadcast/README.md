@@ -1,6 +1,6 @@
 # Event Broadcast
 
-This example demonstrates fan-out delivery. A publisher emits typed inventory events onto one channel, two subscriber tasks attach as independent readers, and each subscriber acknowledges every event on a separate ack channel.
+This example demonstrates fan-out delivery. A publisher emits typed inventory events onto one managed event endpoint, two subscriber tasks attach as independent readers, and each subscriber acknowledges every event on a separate managed ack endpoint.
 
 The contract for the example lives at `contracts/inventory.broadcast.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -44,6 +44,10 @@ cargo run -p selium -- \
   start \
   --node "$SELIUM_NODE" \
   --replica-key event-broadcast-demo \
+  --event-reader inventory.adjusted \
+  --event-writer inventory.adjusted \
+  --event-reader inventory.delivery_acks \
+  --event-writer inventory.delivery_acks \
   --module modules/event_broadcast.wasm
 
 cargo run -p selium -- \
@@ -61,4 +65,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key event-broadcast-demo
 ```
 
-On successful startup, both subscribers consumed the full event set and the coordinator verified every acknowledgement before entering the idle loop.
+On successful startup, both subscribers consumed the full event set from the managed event binding and the coordinator verified every acknowledgement before entering the idle loop.

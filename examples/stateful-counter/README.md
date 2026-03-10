@@ -1,6 +1,6 @@
 # Stateful Counter
 
-This example shows the current Selium pattern for restartable guest logic: explicit checkpoint handoff plus a resume entrypoint. The module replays a deterministic workset, skips deltas up to the provided checkpoint, verifies the resulting total, and then idles.
+This example shows the current Selium pattern for restartable guest logic with managed event bindings: explicit checkpoint handoff plus a resume entrypoint. The module replays a deterministic workset, skips deltas up to the provided checkpoint, verifies the resulting total, and then idles.
 
 The contract lives at `contracts/stateful.counter.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -42,6 +42,10 @@ cargo run -p selium -- \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start --node "$SELIUM_NODE" --replica-key stateful-counter-cold \
+  --event-reader counter.deltas \
+  --event-writer counter.deltas \
+  --event-reader counter.checkpoints \
+  --event-writer counter.checkpoints \
   --module modules/stateful_counter.wasm
 
 cargo run -p selium -- \
@@ -50,6 +54,10 @@ cargo run -p selium -- \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start --node "$SELIUM_NODE" --replica-key stateful-counter-resume \
+  --event-reader counter.deltas \
+  --event-writer counter.deltas \
+  --event-reader counter.checkpoints \
+  --event-writer counter.checkpoints \
   --module-spec "path=modules/stateful_counter.wasm;entrypoint=resume;capabilities=$SELIUM_CAPS;params=u32,u32;args=u32:2,u32:15;adapter=wasmtime;profile=standard"
 
 cargo run -p selium -- \
@@ -69,4 +77,4 @@ cargo run -p selium -- \
 
 ## Notes
 
-This is intentionally a checkpoint handoff example, not a true durable replay example. Selium does not yet expose guest-level persistent user-event replay across restarts, so the resume flow is driven by explicit typed entrypoint arguments.
+This is intentionally a checkpoint handoff example, not a true durable replay example. Selium does not yet expose guest-level persistent user-event replay across restarts, so the resume flow is still driven by explicit typed entrypoint arguments after the managed bindings buffer is injected ahead of them.

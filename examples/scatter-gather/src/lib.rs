@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -12,52 +12,53 @@ mod bindings;
 
 use bindings::{QuoteRequest, QuoteResponse};
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    // Scatter-gather is modeled as one request queue per worker and one shared results
-    // queue for aggregation, which keeps the fan-out and fan-in steps separate.
-    let worker_a_requests = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create worker A request channel")?;
-    let worker_b_requests = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create worker B request channel")?;
-    let results = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create results channel")?;
+pub async fn start(bindings: DataValue) -> Result<()> {
+    let bindings =
+        encode_rkyv(&bindings).context("encode scatter/gather managed-event bindings")?;
 
+    // Scatter-gather still exposes one ingress per worker and one shared result stream, but
+    // each hop now binds to a public contract endpoint instead of a guest-created queue.
     spawn_checked(
         "worker A",
         run_worker(
+            bindings.clone(),
             "worker-a",
             125,
-            worker_a_requests.queue_shared_id,
-            results.queue_shared_id,
+            bindings::EVENT_PRICING_QUOTE_WORKER_A_REQUESTS,
         ),
     );
     spawn_checked(
         "worker B",
         run_worker(
+            bindings.clone(),
             "worker-b",
             175,
-            worker_b_requests.queue_shared_id,
-            results.queue_shared_id,
+            bindings::EVENT_PRICING_QUOTE_WORKER_B_REQUESTS,
         ),
     );
 
-    let mut worker_a_writer = io::attach_writer(&descriptor(worker_a_requests.queue_shared_id), 31)
-        .await
-        .context("attach worker A writer")?;
-    let mut worker_b_writer = io::attach_writer(&descriptor(worker_b_requests.queue_shared_id), 32)
-        .await
-        .context("attach worker B writer")?;
-    let mut result_reader = io::attach_reader(&descriptor(results.queue_shared_id))
-        .await
-        .context("attach result reader")?;
+    let mut worker_a_writer = io::managed_event_writer(
+        &bindings,
+        bindings::EVENT_PRICING_QUOTE_WORKER_A_REQUESTS,
+        31,
+    )
+    .await
+    .context("attach worker A writer")?;
+    let mut worker_b_writer = io::managed_event_writer(
+        &bindings,
+        bindings::EVENT_PRICING_QUOTE_WORKER_B_REQUESTS,
+        32,
+    )
+    .await
+    .context("attach worker B writer")?;
+    let mut result_reader =
+        io::managed_event_reader(&bindings, bindings::EVENT_PRICING_QUOTE_RESULTS)
+            .await
+            .context("attach result reader")?;
 
     let requests = vec![
         QuoteRequest {
@@ -114,20 +115,23 @@ pub async fn start() -> Result<()> {
 }
 
 async fn run_worker(
+    bindings: Vec<u8>,
     worker: &'static str,
     unit_price_cents: u32,
-    requests_shared_id: u64,
-    results_shared_id: u64,
+    requests_endpoint: &'static str,
 ) -> Result<()> {
-    // Each worker only sees its own request queue but publishes into the shared results
-    // queue, which is the core shape of a scatter-gather workflow.
-    let mut request_reader = io::attach_reader(&descriptor(requests_shared_id))
+    // Each worker only sees its own request endpoint but publishes into the shared results
+    // endpoint, which keeps the scatter/gather shape visible without local channel setup.
+    let mut request_reader = io::managed_event_reader(&bindings, requests_endpoint)
         .await
         .context("attach worker request reader")?;
-    let mut result_writer =
-        io::attach_writer(&descriptor(results_shared_id), writer_id_for(worker))
-            .await
-            .context("attach result writer")?;
+    let mut result_writer = io::managed_event_writer(
+        &bindings,
+        bindings::EVENT_PRICING_QUOTE_RESULTS,
+        writer_id_for(worker),
+    )
+    .await
+    .context("attach result writer")?;
 
     loop {
         let Some(frame) = request_reader
@@ -158,15 +162,6 @@ fn writer_id_for(worker: &str) -> u32 {
     match worker {
         "worker-a" => 41,
         _ => 42,
-    }
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // Workers and the coordinator all attach from the shared queue id rather than holding
-    // onto a writer or reader instance across task boundaries.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
     }
 }
 

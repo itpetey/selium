@@ -1,6 +1,6 @@
 # Process Supervisor
 
-This example shows a parent guest process spawning and supervising child guest processes with `selium_guest::process::ProcessBuilder`. The parent starts two workers, waits for both workers to report readiness, stops them, and then idles.
+This example shows a parent guest process spawning and supervising child guest processes with `selium_guest::process::ProcessBuilder`. The parent binds the contract-defined `supervisor.worker_status` endpoint, starts two workers, waits for both workers to report readiness on that managed binding, stops them, and then idles.
 
 The contract lives at `contracts/orchestration.supervisor.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -40,6 +40,8 @@ cargo run -p selium -- \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start --node "$SELIUM_NODE" --replica-key process-supervisor-demo \
+  --event-reader supervisor.worker_status \
+  --event-writer supervisor.worker_status \
   --module modules/process_supervisor.wasm
 
 cargo run -p selium -- \
@@ -57,4 +59,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key process-supervisor-demo
 ```
 
-The parent process launches child entrypoint `worker` from the same Wasm module file. That is why the module artifact name matters in this example.
+The parent process launches child entrypoint `worker` from the same Wasm module file and forwards the managed bindings buffer to each child. That is why the module artifact name matters in this example: the workers publish onto the same discovery-managed `supervisor.worker_status` endpoint.

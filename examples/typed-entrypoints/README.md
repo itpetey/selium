@@ -1,6 +1,6 @@
 # Typed Entrypoints
 
-This example demonstrates custom entrypoints and typed CLI arguments passed through `--module-spec`. The module records the invocation payload to a guest channel, validates that it decoded correctly, and then idles.
+This example demonstrates custom entrypoints and typed CLI arguments passed through `--module-spec`. Each invocation also binds the contract-defined `launch.recorded` endpoint, records the decoded payload through that managed event binding, validates it, and then idles.
 
 The contract lives at `contracts/operations.launch.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -42,6 +42,8 @@ cargo run -p selium -- \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start --node "$SELIUM_NODE" --replica-key typed-entrypoints-launch \
+  --event-reader launch.recorded \
+  --event-writer launch.recorded \
   --module-spec "path=modules/typed_entrypoints.wasm;entrypoint=launch;capabilities=$SELIUM_CAPS;params=utf8,i32,utf8;args=utf8:billing,i32:3,utf8:blue-green;adapter=wasmtime;profile=standard"
 
 cargo run -p selium -- \
@@ -50,6 +52,8 @@ cargo run -p selium -- \
   --client-cert "$SELIUM_CERT_DIR/client.crt" \
   --client-key "$SELIUM_CERT_DIR/client.key" \
   start --node "$SELIUM_NODE" --replica-key typed-entrypoints-reconfigure \
+  --event-reader launch.recorded \
+  --event-writer launch.recorded \
   --module-spec "path=modules/typed_entrypoints.wasm;entrypoint=reconfigure;capabilities=$SELIUM_CAPS;args=utf8:search,i32:5;adapter=wasmtime;profile=standard"
 
 cargo run -p selium -- \
@@ -67,4 +71,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key typed-entrypoints-reconfigure
 ```
 
-The first invocation uses explicit `params=...`; the second relies on typed argument prefixes so the runtime can infer parameter kinds.
+The first invocation uses explicit `params=...`; the second relies on typed argument prefixes so the runtime can infer parameter kinds. In both cases the runtime prepends the managed bindings buffer ahead of the typed entrypoint arguments, so the guest still receives the normal Rust parameters for `launch` and `reconfigure`.

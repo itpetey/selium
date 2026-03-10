@@ -139,6 +139,10 @@ pub(crate) struct StartArgs {
     pub(crate) isolation: IsolationArg,
     #[arg(long = "capability")]
     pub(crate) capabilities: Vec<String>,
+    #[arg(long = "event-reader")]
+    pub(crate) event_readers: Vec<String>,
+    #[arg(long = "event-writer")]
+    pub(crate) event_writers: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -351,6 +355,10 @@ struct RawStartArgs {
     isolation: Option<IsolationArg>,
     #[arg(long = "capability")]
     capabilities: Vec<String>,
+    #[arg(long = "event-reader")]
+    event_readers: Vec<String>,
+    #[arg(long = "event-writer")]
+    event_writers: Vec<String>,
 }
 
 #[derive(Debug, Args, Default, Deserialize)]
@@ -606,6 +614,8 @@ impl RawStartArgs {
             adaptor: self.adaptor.unwrap_or(AdaptorArg::Wasmtime),
             isolation: self.isolation.unwrap_or(IsolationArg::Standard),
             capabilities: self.capabilities,
+            event_readers: self.event_readers,
+            event_writers: self.event_writers,
         })
     }
 }

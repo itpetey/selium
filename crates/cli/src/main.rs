@@ -16,10 +16,10 @@ use anyhow::{Context, Result, anyhow};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_control_plane_protocol::{
     EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest, ListResponse,
-    Method, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
-    ReplayApiRequest, ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode,
-    StartRequest, StartResponse, StopRequest, StopResponse, StreamBridgeSemantics,
-    StreamLifecycleMode,
+    ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
+    MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse, ReplayApiRequest,
+    ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StartResponse,
+    StopRequest, StopResponse, StreamBridgeSemantics, StreamLifecycleMode,
 };
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
@@ -250,6 +250,26 @@ async fn cmd_nodes(daemon: Arc<DaemonQuicClient>, args: NodesArgs) -> Result<()>
 }
 
 async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()> {
+    let managed_endpoint_bindings = args
+        .event_writers
+        .iter()
+        .map(|endpoint| ManagedEndpointBinding {
+            endpoint_name: endpoint.clone(),
+            endpoint_kind: ContractKind::Event,
+            role: ManagedEndpointRole::Egress,
+            binding_type: ManagedEndpointBindingType::OneWay,
+        })
+        .chain(
+            args.event_readers
+                .iter()
+                .map(|endpoint| ManagedEndpointBinding {
+                    endpoint_name: endpoint.clone(),
+                    endpoint_kind: ContractKind::Event,
+                    role: ManagedEndpointRole::Ingress,
+                    binding_type: ManagedEndpointBindingType::OneWay,
+                }),
+        )
+        .collect::<Vec<_>>();
     let module_spec = if let Some(spec) = args.module_spec {
         spec
     } else {
@@ -275,7 +295,7 @@ async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()>
                 node_id: args.node,
                 instance_id: args.replica_key,
                 module_spec,
-                managed_endpoint_bindings: Vec::new(),
+                managed_endpoint_bindings,
             },
         )
         .await?;

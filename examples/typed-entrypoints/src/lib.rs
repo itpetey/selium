@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{io, time};
 
 #[allow(dead_code)]
@@ -12,35 +12,37 @@ mod bindings;
 
 use bindings::LaunchRecord;
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    run_invocation("default-service", 1, "default-start").await
+pub async fn start(bindings: DataValue) -> Result<()> {
+    run_invocation(&bindings, "default-service", 1, "default-start").await
 }
 
 #[selium_guest::entrypoint]
-pub async fn launch(service: &str, retries: i32, mode: &str) -> Result<()> {
-    run_invocation(service, retries, mode).await
+pub async fn launch(bindings: DataValue, service: &str, retries: i32, mode: &str) -> Result<()> {
+    run_invocation(&bindings, service, retries, mode).await
 }
 
 #[selium_guest::entrypoint]
-pub async fn reconfigure(service: &str, retries: i32) -> Result<()> {
-    run_invocation(service, retries, "reconfigure").await
+pub async fn reconfigure(bindings: DataValue, service: &str, retries: i32) -> Result<()> {
+    run_invocation(&bindings, service, retries, "reconfigure").await
 }
 
-async fn run_invocation(service: &str, retries: i32, mode: &str) -> Result<()> {
+async fn run_invocation(
+    bindings: &DataValue,
+    service: &str,
+    retries: i32,
+    mode: &str,
+) -> Result<()> {
     // All entrypoints funnel through one helper so the example can show that Selium passes
     // typed arguments into different entrypoints without changing the guest-side logic.
-    let channel = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create launch channel")?;
-    let mut writer = io::attach_writer(&descriptor(channel.queue_shared_id), 9)
+    let bindings = encode_rkyv(bindings).context("encode launch managed-event bindings")?;
+    let mut writer = io::managed_event_writer(&bindings, bindings::EVENT_LAUNCH_RECORDED, 9)
         .await
         .context("attach launch writer")?;
-    let mut reader = io::attach_reader(&descriptor(channel.queue_shared_id))
+    let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_LAUNCH_RECORDED)
         .await
         .context("attach launch reader")?;
 
@@ -73,15 +75,6 @@ async fn run_invocation(service: &str, retries: i32, mode: &str) -> Result<()> {
     );
 
     idle_forever().await
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // The launch record is echoed through a queue so the example crosses both the ABI boundary
-    // and the message boundary before declaring success.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
-    }
 }
 
 async fn idle_forever() -> Result<()> {

@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use selium_abi::{AbiParam, AbiScalarType, AbiSignature, decode_rkyv, encode_rkyv};
+use selium_abi::{AbiParam, AbiScalarType, AbiSignature, DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{
     io,
     process::{Capability, ProcessBuilder},
@@ -16,25 +16,20 @@ mod bindings;
 
 use bindings::WorkerStatus;
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 const MODULE_ID: &str = "process_supervisor.wasm";
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    let status_channel = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create status channel")?;
-    let mut status_reader = io::attach_reader(&descriptor(status_channel.queue_shared_id))
-        .await
-        .context("attach status reader")?;
+pub async fn start(bindings: DataValue) -> Result<()> {
+    let bindings = encode_rkyv(&bindings).context("encode worker managed-event bindings")?;
+    let mut status_reader =
+        io::managed_event_reader(&bindings, bindings::EVENT_SUPERVISOR_WORKER_STATUS)
+            .await
+            .context("attach status reader")?;
 
     let signature = AbiSignature::new(
-        vec![
-            AbiParam::Scalar(AbiScalarType::I32),
-            AbiParam::Scalar(AbiScalarType::U64),
-        ],
+        vec![AbiParam::Scalar(AbiScalarType::I32), AbiParam::Buffer],
         Vec::new(),
     );
 
@@ -46,10 +41,9 @@ pub async fn start() -> Result<()> {
             .signature(signature.clone())
             .capability(Capability::TimeRead)
             .capability(Capability::SharedMemory)
-            .capability(Capability::QueueLifecycle)
             .capability(Capability::QueueWriter)
             .arg_i32(worker_id)
-            .arg_resource(status_channel.queue_shared_id)
+            .arg_buffer(bindings.clone())
             .start()
             .await
             .with_context(|| format!("start worker {worker_id}"))?;
@@ -78,12 +72,17 @@ pub async fn start() -> Result<()> {
 }
 
 #[selium_guest::entrypoint]
-pub async fn worker(worker_id: i32, status_channel_shared_id: u64) -> Result<()> {
-    // Child processes receive the shared queue id as a resource handle, then attach to it
-    // just like the parent would. That is the handoff mechanism between related processes.
-    let mut writer = io::attach_writer(&descriptor(status_channel_shared_id), worker_id as u32)
-        .await
-        .context("attach worker status writer")?;
+pub async fn worker(worker_id: i32, bindings: DataValue) -> Result<()> {
+    // Child processes receive the parent's managed bindings buffer so they can publish onto the
+    // same discovery-managed endpoint without constructing local queue topology themselves.
+    let bindings = encode_rkyv(&bindings).context("encode forwarded worker bindings")?;
+    let mut writer = io::managed_event_writer(
+        &bindings,
+        bindings::EVENT_SUPERVISOR_WORKER_STATUS,
+        worker_id as u32,
+    )
+    .await
+    .context("attach worker status writer")?;
     let payload = WorkerStatus {
         worker_id: worker_id as u32,
         phase: "started".to_string(),
@@ -97,14 +96,6 @@ pub async fn worker(worker_id: i32, status_channel_shared_id: u64) -> Result<()>
         .context("send worker status")?;
 
     idle_forever().await
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // Child processes only receive the shared resource id, so they rebuild the descriptor on entry.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
-    }
 }
 
 async fn idle_forever() -> Result<()> {

@@ -1,6 +1,6 @@
 # Scatter Gather
 
-This example demonstrates parallel request distribution. The coordinator sends quote requests to two worker tasks, both workers reply on a shared results channel, and the coordinator validates the aggregated totals before idling.
+This example demonstrates parallel request distribution. The coordinator sends quote requests onto the contract-defined `pricing.quote_worker_a_requests` and `pricing.quote_worker_b_requests` endpoints, both workers reply on the shared `pricing.quote_results` endpoint, and the coordinator validates the aggregated totals before idling.
 
 The contract for the example lives at `contracts/pricing.scatter.v1.selium`, and the crate uses generated types from `src/bindings.rs`.
 
@@ -44,6 +44,12 @@ cargo run -p selium -- \
   start \
   --node "$SELIUM_NODE" \
   --replica-key scatter-gather-demo \
+  --event-reader pricing.quote_worker_a_requests \
+  --event-writer pricing.quote_worker_a_requests \
+  --event-reader pricing.quote_worker_b_requests \
+  --event-writer pricing.quote_worker_b_requests \
+  --event-reader pricing.quote_results \
+  --event-writer pricing.quote_results \
   --module modules/scatter_gather.wasm
 
 cargo run -p selium -- \
@@ -61,4 +67,4 @@ cargo run -p selium -- \
   stop --node "$SELIUM_NODE" --replica-key scatter-gather-demo
 ```
 
-A successful start means the coordinator received every worker response with the expected totals. Any missing or malformed response fails startup.
+A successful start means the coordinator received every worker response with the expected totals across the managed endpoint bindings. Any missing or malformed response fails startup.

@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -12,39 +12,26 @@ mod bindings;
 
 use bindings::{ProjectionApplied, RawOrder, ReservationRequest};
 
-const FRAME_BYTES: u32 = 768;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    // The pipeline is modeled as three queues: raw ingress, normalized work, and final
-    // projections. Keeping the stages explicit makes the message handoff visible.
-    let ingress = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create ingress channel")?;
-    let normalized = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create normalized channel")?;
-    let projections = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create projection channel")?;
+pub async fn start(bindings: DataValue) -> Result<()> {
+    // The three pipeline stages still hand work off explicitly, but now through the managed
+    // contract endpoints that the control plane binds for this workload.
+    let bindings = encode_rkyv(&bindings).context("encode managed event bindings")?;
 
-    spawn_checked(
-        "normalize stage",
-        run_normalizer(ingress.queue_shared_id, normalized.queue_shared_id),
-    );
-    spawn_checked(
-        "projection stage",
-        run_projection(normalized.queue_shared_id, projections.queue_shared_id),
-    );
+    spawn_checked("normalize stage", run_normalizer(bindings.clone()));
+    spawn_checked("projection stage", run_projection(bindings.clone()));
 
-    let mut ingress_writer = io::attach_writer(&descriptor(ingress.queue_shared_id), 21)
-        .await
-        .context("attach ingress writer")?;
-    let mut projection_reader = io::attach_reader(&descriptor(projections.queue_shared_id))
-        .await
-        .context("attach projection reader")?;
+    let mut ingress_writer =
+        io::managed_event_writer(&bindings, bindings::EVENT_INGRESS_ORDERS, 21)
+            .await
+            .context("attach ingress writer")?;
+    let mut projection_reader =
+        io::managed_event_reader(&bindings, bindings::EVENT_PROJECTIONS_APPLIED)
+            .await
+            .context("attach projection reader")?;
 
     for order in demo_orders() {
         ingress_writer
@@ -73,13 +60,14 @@ pub async fn start() -> Result<()> {
     idle_forever().await
 }
 
-async fn run_normalizer(ingress_shared_id: u64, normalized_shared_id: u64) -> Result<()> {
-    let mut reader = io::attach_reader(&descriptor(ingress_shared_id))
+async fn run_normalizer(bindings: Vec<u8>) -> Result<()> {
+    let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_INGRESS_ORDERS)
         .await
         .context("attach ingress reader")?;
-    let mut writer = io::attach_writer(&descriptor(normalized_shared_id), 22)
-        .await
-        .context("attach normalized writer")?;
+    let mut writer =
+        io::managed_event_writer(&bindings, bindings::EVENT_INVENTORY_RESERVATIONS, 22)
+            .await
+            .context("attach normalized writer")?;
 
     loop {
         let Some(frame) = reader
@@ -108,11 +96,11 @@ async fn run_normalizer(ingress_shared_id: u64, normalized_shared_id: u64) -> Re
     }
 }
 
-async fn run_projection(normalized_shared_id: u64, projection_shared_id: u64) -> Result<()> {
-    let mut reader = io::attach_reader(&descriptor(normalized_shared_id))
+async fn run_projection(bindings: Vec<u8>) -> Result<()> {
+    let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_INVENTORY_RESERVATIONS)
         .await
         .context("attach normalized reader")?;
-    let mut writer = io::attach_writer(&descriptor(projection_shared_id), 23)
+    let mut writer = io::managed_event_writer(&bindings, bindings::EVENT_PROJECTIONS_APPLIED, 23)
         .await
         .context("attach projection writer")?;
 
@@ -163,14 +151,6 @@ fn expected_projection_keys() -> BTreeSet<String> {
         "projection/inventory/widget-a:2".to_string(),
         "projection/inventory/widget-b:5".to_string(),
     ])
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // Each stage receives only the queue id it needs and reconstructs the full descriptor locally.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
-    }
 }
 
 fn spawn_checked<F>(name: &'static str, future: F)

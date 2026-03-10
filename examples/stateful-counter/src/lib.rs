@@ -4,7 +4,7 @@
 use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -12,47 +12,55 @@ mod bindings;
 
 use bindings::{CounterCheckpoint, CounterDelta};
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
-pub async fn start() -> Result<()> {
-    run_counter(0, 0, "cold-start").await
+pub async fn start(bindings: DataValue) -> Result<()> {
+    run_counter(
+        encode_rkyv(&bindings).context("encode managed event bindings")?,
+        0,
+        0,
+        "cold-start",
+    )
+    .await
 }
 
 #[selium_guest::entrypoint]
-pub async fn resume(last_seq: u32, running_total: u32) -> Result<()> {
+pub async fn resume(bindings: DataValue, last_seq: u32, running_total: u32) -> Result<()> {
     // `resume` demonstrates re-entering the module with previously observed state supplied
     // as typed entrypoint arguments, not runtime-managed durable replay.
-    run_counter(last_seq, running_total, "resume").await
+    run_counter(
+        encode_rkyv(&bindings).context("encode managed event bindings")?,
+        last_seq,
+        running_total,
+        "resume",
+    )
+    .await
 }
 
-async fn run_counter(last_seq: u32, running_total: u32, mode: &str) -> Result<()> {
-    // This example keeps the event stream and checkpoint stream separate so readers can see
-    // the difference between incoming changes and emitted recovery state.
-    let delta_channel = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create delta channel")?;
-    let checkpoint_channel = io::create_channel(16, FRAME_BYTES)
-        .await
-        .context("create checkpoint channel")?;
+async fn run_counter(
+    bindings: Vec<u8>,
+    last_seq: u32,
+    running_total: u32,
+    mode: &str,
+) -> Result<()> {
+    // This example keeps the delta stream and checkpoint stream distinct, but the actual
+    // channels now come from managed contract endpoint bindings instead of guest-created queues.
 
-    spawn_checked(
-        "delta producer",
-        publish_deltas(delta_channel.queue_shared_id),
-    );
+    spawn_checked("delta producer", publish_deltas(bindings.clone()));
 
-    let mut delta_reader = io::attach_reader(&descriptor(delta_channel.queue_shared_id))
+    let mut delta_reader = io::managed_event_reader(&bindings, bindings::EVENT_COUNTER_DELTAS)
         .await
         .context("attach delta reader")?;
     let mut checkpoint_writer =
-        io::attach_writer(&descriptor(checkpoint_channel.queue_shared_id), 5)
+        io::managed_event_writer(&bindings, bindings::EVENT_COUNTER_CHECKPOINTS, 5)
             .await
             .context("attach checkpoint writer")?;
-    let mut checkpoint_reader = io::attach_reader(&descriptor(checkpoint_channel.queue_shared_id))
-        .await
-        .context("attach checkpoint reader")?;
+    let mut checkpoint_reader =
+        io::managed_event_reader(&bindings, bindings::EVENT_COUNTER_CHECKPOINTS)
+            .await
+            .context("attach checkpoint reader")?;
 
     let mut checkpoint = CounterCheckpoint {
         last_seq,
@@ -114,8 +122,8 @@ async fn run_counter(last_seq: u32, running_total: u32, mode: &str) -> Result<()
     idle_forever().await
 }
 
-async fn publish_deltas(delta_shared_id: u64) -> Result<()> {
-    let mut writer = io::attach_writer(&descriptor(delta_shared_id), 4)
+async fn publish_deltas(bindings: Vec<u8>) -> Result<()> {
+    let mut writer = io::managed_event_writer(&bindings, bindings::EVENT_COUNTER_DELTAS, 4)
         .await
         .context("attach delta writer")?;
     for delta in sample_deltas() {
@@ -146,14 +154,6 @@ fn expected_total(last_seq: u32, running_total: u32) -> u32 {
         .fold(running_total, |total, delta| {
             total.saturating_add(delta.amount)
         })
-}
-
-fn descriptor(shared_id: u64) -> io::ChannelDescriptor {
-    // Queue ids are the stable values worth keeping in checkpoints or passing between tasks.
-    io::ChannelDescriptor {
-        queue_shared_id: shared_id,
-        max_frame_bytes: FRAME_BYTES,
-    }
 }
 
 fn spawn_checked<F>(name: &'static str, future: F)
