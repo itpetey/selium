@@ -1047,17 +1047,17 @@ async fn activate_endpoint_bridge(
     let spec = build_active_endpoint_bridge_spec(payload, mode)?;
 
     let mut bridges = state.active_bridges.lock().await;
-    if let Some(existing) = bridges.get(&payload.bridge_id) {
-        if existing.spec == spec {
-            return Ok(ActivateEndpointBridgeResponse {
-                status: "ok".to_string(),
-                bridge_id: payload.bridge_id.clone(),
-                mode: spec.mode(),
-                target_node: spec.target_node().to_string(),
-                target_instance_id: spec.target_instance_id().to_string(),
-                already_active: true,
-            });
-        }
+    if let Some(existing) = bridges.get(&payload.bridge_id)
+        && existing.spec == spec
+    {
+        return Ok(ActivateEndpointBridgeResponse {
+            status: "ok".to_string(),
+            bridge_id: payload.bridge_id.clone(),
+            mode: spec.mode(),
+            target_node: spec.target_node().to_string(),
+            target_instance_id: spec.target_instance_id().to_string(),
+            already_active: true,
+        });
     }
     if let Some(existing) = bridges.remove(&payload.bridge_id) {
         existing.bridge_task.abort();

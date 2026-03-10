@@ -12,7 +12,6 @@ mod bindings;
 
 use bindings::EnrichedFrame;
 
-const FRAME_BYTES: u32 = 512;
 const RECV_TIMEOUT_MS: u32 = 1_000;
 
 #[selium_guest::entrypoint]

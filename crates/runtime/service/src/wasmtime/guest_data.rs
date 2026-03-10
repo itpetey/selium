@@ -49,7 +49,7 @@ pub fn write_poll_result(
     result: &GuestResult<Vec<u8>>,
 ) -> Result<WritePollResult, KernelError> {
     match result {
-        Ok(bytes) => write_encoded(caller, ptr, len, &bytes),
+        Ok(bytes) => write_encoded(caller, ptr, len, bytes),
         Err(err) => encode_for_guest(err, caller, ptr, len),
     }
 }

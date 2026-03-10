@@ -1,18 +1,15 @@
 //! Processor app used by the control-plane topology example.
 //! Today it validates its own contract types locally while the control plane models the deployment graph.
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
-use selium_guest::{io, time};
+use selium_guest::io;
 
 #[allow(dead_code)]
 mod bindings;
 
 use bindings::{EnrichedFrame, Frame};
 
-const FRAME_BYTES: u32 = 512;
 const SEND_TIMEOUT_MS: u32 = 1_000;
 const RECV_TIMEOUT_MS: u32 = 1_000;
 
