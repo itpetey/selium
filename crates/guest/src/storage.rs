@@ -1,4 +1,7 @@
-//! Guest-side helpers for runtime-managed storage.
+//! Guest-facing storage APIs for append-only logs and blob-backed snapshots.
+//!
+//! Use [`open_log`] for ordered event streams with replay and checkpoints, and
+//! [`open_blob_store`] for immutable blobs plus manifest pointers such as "current snapshot".
 
 use selium_abi::{
     StorageBlobGet, StorageBlobGetResult, StorageBlobPut, StorageBlobPutResult,
@@ -23,6 +26,7 @@ const BLOB_GET_CAPACITY: usize = 8192;
 const BLOB_PUT_CAPACITY: usize = 256;
 const MANIFEST_CAPACITY: usize = 256;
 
+/// Error returned by guest storage operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error(transparent)]
@@ -34,17 +38,20 @@ pub enum StorageError {
     },
 }
 
+/// Handle for one runtime-managed append-only log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Log {
     descriptor: StorageLogDescriptor,
 }
 
+/// Handle for one runtime-managed blob store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobStore {
     descriptor: StorageBlobStoreDescriptor,
 }
 
 impl Log {
+    /// Append one record to the log and return its assigned sequence number.
     pub async fn append(
         &self,
         timestamp_ms: u64,
@@ -76,6 +83,10 @@ impl Log {
         }
     }
 
+    /// Replay records starting at the requested position.
+    ///
+    /// The returned high watermark, when present, indicates the latest durable sequence known to
+    /// the runtime at replay time.
     pub async fn replay(
         &self,
         start: StorageReplayStart,
@@ -102,6 +113,7 @@ impl Log {
         }
     }
 
+    /// Store or update a named checkpoint for later replay resumes.
     pub async fn checkpoint(
         &self,
         name: impl Into<String>,
@@ -122,6 +134,9 @@ impl Log {
         ensure_ok("storage.log.checkpoint", status.code)
     }
 
+    /// Look up the sequence stored under a named checkpoint.
+    ///
+    /// Returns `Ok(None)` when the checkpoint does not exist.
     pub async fn checkpoint_sequence(
         &self,
         name: impl Into<String>,
@@ -144,6 +159,7 @@ impl Log {
         }
     }
 
+    /// Return the current lower/upper bounds reported for this log.
     pub async fn bounds(&self) -> Result<StorageLogBoundsResult, StorageError> {
         let args = encode_args(&StorageLogBounds {
             log_id: self.descriptor.resource_id,
@@ -164,12 +180,14 @@ impl Log {
         }
     }
 
+    /// Close the log handle.
     pub async fn close(self) -> Result<(), StorageError> {
         close(self.descriptor.resource_id, "storage.close(log)").await
     }
 }
 
 impl BlobStore {
+    /// Store one immutable blob and return its runtime-assigned blob identifier.
     pub async fn put(&self, bytes: impl Into<Vec<u8>>) -> Result<String, StorageError> {
         let args = encode_args(&StorageBlobPut {
             store_id: self.descriptor.resource_id,
@@ -194,6 +212,9 @@ impl BlobStore {
         }
     }
 
+    /// Fetch one blob by identifier.
+    ///
+    /// Returns `Ok(None)` when the blob does not exist.
     pub async fn get(&self, blob_id: impl Into<String>) -> Result<Option<Vec<u8>>, StorageError> {
         let args = encode_args(&StorageBlobGet {
             store_id: self.descriptor.resource_id,
@@ -215,6 +236,7 @@ impl BlobStore {
         }
     }
 
+    /// Point a named manifest entry at an existing blob identifier.
     pub async fn set_manifest(
         &self,
         name: impl Into<String>,
@@ -234,6 +256,9 @@ impl BlobStore {
         ensure_ok("storage.manifest.set", status.code)
     }
 
+    /// Resolve a named manifest entry to a blob identifier.
+    ///
+    /// Returns `Ok(None)` when the manifest entry does not exist.
     pub async fn manifest(&self, name: impl Into<String>) -> Result<Option<String>, StorageError> {
         let args = encode_args(&StorageManifestGet {
             store_id: self.descriptor.resource_id,
@@ -253,11 +278,13 @@ impl BlobStore {
         }
     }
 
+    /// Close the blob-store handle.
     pub async fn close(self) -> Result<(), StorageError> {
         close(self.descriptor.resource_id, "storage.close(blob-store)").await
     }
 }
 
+/// Open or create a named append-only log.
 pub async fn open_log(name: impl Into<String>) -> Result<Log, StorageError> {
     let args = encode_args(&StorageOpenLog { name: name.into() })?;
     let descriptor =
@@ -270,6 +297,7 @@ pub async fn open_log(name: impl Into<String>) -> Result<Log, StorageError> {
     Ok(Log { descriptor })
 }
 
+/// Open or create a named blob store.
 pub async fn open_blob_store(name: impl Into<String>) -> Result<BlobStore, StorageError> {
     let args = encode_args(&StorageOpenBlobStore { name: name.into() })?;
     let descriptor = DriverFuture::<
