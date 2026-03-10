@@ -1,0 +1,150 @@
+---
+title: "Applications"
+description: "Creating and running applications in Selium"
+---
+
+In Selium, an "application" refers to any WebAssembly (WASM) module that contains one or more entrypoints.
+
+Unlike virtual machines or containers, Selium applications do not have a guest operating system. Instead, your module runs as a standalone process, leveraging our `userland` library to perform network and filesystem I/O, and other system operations.
+
+## `./modules` directory
+
+The runtime needs a predictable place to find code and credentials. That is what the work directory is for:
+
+- `--work-dir` (or `SELIUM_WORK_DIR`) is the base directory
+- `certs/` holds TLS certificates
+- `modules/` holds WASM binaries
+
+When you install or launch a process (via `selium` or `ProcessBuilder`), Selium resolves the module path relative to `work_dir/modules`. For example, `hello.wasm` maps to `selium-work/modules/hello.wasm`. Modules launched at runtime (`selium-runtime --module <spec...>`) are also resolved in this way.
+
+## Entrypoints
+
+Entrypoints are the public functions that the runtime is able to call. Generally they will serve as your _main_ function, used to bootstrap your application.
+
+In Rust, you annotate these functions with `#[entrypoint]`:
+
+```rust
+use selium_userland::entrypoint;
+
+#[entrypoint]
+async fn start() {
+    // Your service logic here.
+}
+```
+
+Here's a few things to keep in mind for your entrypoints:
+- Entrypoints can be `async` or sync
+- Entrypoints _can_ accept arguments!
+- Return types must be `()` or `Result<(), E>`
+- You may accept at most one `Context` parameter (by value or `&Context`)
+- The CLI defaults to the entrypoint `start` if you leave the argument blank
+
+## Arguments
+
+Entrypoints are capable of accepting input parameters. In practice, you will pass them in one of three places:
+
+- `selium-runtime --module ...;params=...;args=...`
+- `selium start ... --param ... --arg ...`
+- `ProcessBuilder` from another guest
+
+Arguments can be simple scalars (integers) or byte buffers:
+
+- Scalars: `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`
+- Buffers: `utf8` (string), `buffer`/`hex` (raw bytes)
+- Resources: `resource` (a handle like `SharedChannel`)
+
+## Capabilities
+
+Capabilities are Selium's permission system. Any time your guest wants the host to do something (e.g. create/share a channel, open a socket, spawn a process, read time, etc.), the call is only allowed if the process was launched with the corresponding capability.
+
+Some common capability groups:
+
+- `ChannelLifecycle`: create, share, detach, drain, delete
+- `ChannelReader`: subscribe to channels
+- `ChannelWriter`: publish to channels
+- `ProcessLifecycle`: spawn or stop other processes
+- `NetQuic*` and `NetHttp*`: bind, accept, connect, read, write
+- `NetTlsServerConfig` / `NetTlsClientConfig`: create TLS configs for QUIC or HTTPS
+- `SingletonRegistry` / `SingletonLookup`: publish or resolve global singletons
+- `TimeRead`: read time helpers
+
+We strongly recommend that you only grant the specific capabilities that you require for any given process.
+
+## Singletons
+
+Singletons are used to ergonomically discover and load shared data, like channel handles. This is how system modules make themselves discoverable. For example, Switchboard and Atlas processes both register shared channel handles under a well-known ID that other guests resolve on demand.
+
+### Resolving (reading) a singleton
+
+Resolving a singleton is trivial using the `selium-userland` library `Context`:
+
+```rust
+use selium_userland::Context;
+
+let ctx = Context::current();
+let switchboard = ctx.require::<Switchboard>().await;
+```
+
+Under the hood this performs a singleton lookup and then builds a typed wrapper from the returned handle. To resolve singletons, the process needs the `SingletonLookup` capability.
+
+You can also retrieve the current `Context` using dependency injection:
+
+```rust
+#[entrypoint]
+async fn my_service(ctx: selium_userland::Context) -> Result<()> { ... }
+```
+
+### Registering a singleton
+
+User applications can also make use of singletons for exposing globally-unique data, like channel handles: a process creates some shared resource, shares it into the host registry, and then registers that shared handle under a stable ID. Registration requires the `SingletonRegistry` capability, and the resource itself must already be shareable (for example a channel you have exported via `Channel::share`).
+
+```rust
+use selium_userland::{
+    DependencyId,
+    io::{Channel, DriverError},
+    singleton,
+};
+
+// Pick a stable 16-byte identifier and keep it forever.
+// Duplicate identifiers will be rejected.
+const MY_SINGLETON: DependencyId = DependencyId([0; 16]);
+
+async fn register_my_singleton() -> Result<(), DriverError> {
+    let channel = Channel::create(64 * 1024).await?;
+    let shared = channel.share().await?;
+
+    // Register the shared handle in the host singleton registry.
+    singleton::register(MY_SINGLETON, shared.raw()).await?;
+    Ok(())
+}
+```
+
+On the resolution side (i.e. the process looking up your singleton), you can provide an ergonomic wrapper for users to resolve via the `Dependency` trait. Here's how Switchboard does it:
+
+```rust
+use selium_userland::{Dependency, DependencyDescriptor, dependency_id};
+
+impl Dependency for Switchboard {
+    type Handle = SharedChannel;
+    type Error = SwitchboardError;
+
+    const DESCRIPTOR: DependencyDescriptor = DependencyDescriptor {
+        name: "selium::Switchboard",
+        id: dependency_id!("selium.switchboard.singleton"),
+    };
+
+    async fn from_handle(handle: Self::Handle) -> Result<Self, Self::Error> {
+        Switchboard::attach(handle).await
+    }
+}
+```
+
+## Logging
+
+Your apps should use the `tracing` crate from the Tokio development team to perform logging. We've built specific logging integration around `tracing`: the `#[entrypoint]` macro initialises a bridge automatically that forwards typed log records over a dedicated channel.
+
+For modules loaded into the Runtime on start (via `selium-runtime --module` arg), the runtime will automatically subscribe to and emit these logs to stdout/err.
+
+You can also subscribe to application logs from the CLI when launching a process by using the `--attach` flag.
+
+If you're running the Selium Atlas module, you can publish logs to a URI using `--log-uri` (or `&log_uri=` in a module spec). Users can then discover and subscribe to the application's log channel for alerting, orchestration, etc.

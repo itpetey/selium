@@ -1,0 +1,48 @@
+---
+title: "Switchboard module"
+description: "Using the Switchboard module to extend Channels."
+---
+
+| Crate | Description | Docs |
+| ----- | ----------- | ---- |
+| selium-switchboard | Client library that applications implement | [docs.rs](https://docs.rs/selium-switchboard/latest/selium_switchboard/) |
+| selium-switchboard-core | Internal library that holds shared types | [docs.rs](https://docs.rs/selium-switchboard-core/latest/selium_switchboard_core/) |
+| selium-switchboard-protocol | Internal library that defines the client-server protocol | [docs.rs](https://docs.rs/selium-switchboard-protocol/latest/selium_switchboard_protocol/) |
+| selium-switchboard-server | WASM module that manages state and orchestrates channels | N/A |
+
+Switchboard is a declarative extension to the built in channels API. Every time a process creates, removes or modifies an endpoint (publisher, RPC server etc.), the Switchboard module computes the minimal channel wiring needed to fulfil the current state. This relieves developers from having to manage their own channels, and optimises the number of hops a message takes to reach its destination.
+
+Switchboard also provides enhanced messaging patterns on top of the built in `Reader` and `Writer` types, which you can read about below.
+
+## Usage
+
+The Switchboard server registers itself as a singleton (`selium.switchboard.singleton`). Processes can easily obtain a handle to the Switchboard via the [global `Context`](applications#singletons).
+
+To start the server module:
+
+```bash
+selium-runtime --module 'path=modules/selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry'
+```
+
+## Messaging patterns
+
+The client library gives you typed wrappers built on top of native channels:
+
+- **Publish/Subscribe**: `Publisher<T>` and `Subscriber<T>`
+- **Fanout**: `Fanout<T>` load-balances a stream across subscribers using a basic round-robin algorithm
+- **Request/Response (RPC)**: `Client<Req, Rep>` and `Server<Req, Rep>`
+
+Endpoints have built in connectivity rules that prevent incompatible endpoints from connecting to one another. For example, a `Publisher` cannot connect to a `Request`.
+
+## Example
+
+```rust
+#[entrypoint]
+async fn start(ctx: Context, server_endpoint: GuestResourceId) -> Result<()> {
+    let switchboard = ctx.require::<Switchboard>().await;
+    
+    let mut client = Client::create(&switchboard).await?;
+    client.connect(&switchboard, server_endpoint).await?;
+    client.request(...)
+}
+```

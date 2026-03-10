@@ -1,0 +1,76 @@
+---
+title: "Runtime"
+description: "Selium's server process"
+---
+
+The Selium runtime (`selium-runtime`) is the core server process. It loads your WebAssembly (WASM) modules, initialises the host drivers (channels, networking, etc.), and enforces capability checks so processes are individually sandboxed to your specifications.
+
+## Work directory
+
+The runtime needs a single place to look for code and credentials. That is the work directory (default `.` or `SELIUM_WORK_DIR`):
+
+- `certs/` for TLS certificates
+- `modules/` for WASM modules used to launch processes
+
+If you need to [re]generate your certificate bundle, you can use the runtime helper:
+
+```bash
+selium-runtime generate-certs --output-dir selium-work/certs
+```
+
+## Dependent modules
+
+The runtime can run on its own, but most local setups include a few system modules to make development easier:
+
+- **Remote client** (`selium_remote_client_server.wasm`): allows the `selium` CLI to orchestrate the server over the network.
+- **Switchboard** (`selium_switchboard_server.wasm`): typed messaging and automatic channel wiring.
+- **Atlas** (`selium_atlas_server.wasm`): lookup and discovery of resources by URI.
+
+Modules are loaded into the runtime at start up with the `--module` argument. `--module` tells the runtime which WASM module to load, the entrypoint to call, and the capabilities it should have. The argument's value is a semicolon-separated (`;`) list of `key=value` pairs:
+
+Required keys:
+
+- `path`: relative to the `modules/` subdirectory; no `..` segments
+- `capabilities`: comma-separated list of [capabilities](applications#capabilities)
+
+Optional keys:
+
+- `entrypoint`: defaults to "start"
+- `params`: comma-separated ABI types (see below)
+- `args`: comma-separated values
+- `log_uri`: string passed to the entrypoint for log registration
+
+### Params and args
+
+`params` and `args` are a low-level ABI mechanism for passing simple values into an entrypoint. The supported parameter kinds are:
+
+- `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`
+- `utf8` (string)
+- `buffer` / `hex` (raw bytes)
+- `resource` (a `u64` handle)
+
+If `params` is omitted, each `args` value must be typed (`utf8:localhost`, `u16:7000`).
+
+### Examples
+
+| Module path | Entrypoint | Capabilities | Parameters | Arguments | Log URI |
+| ----------- | ---------- | ------------ | ---------- | --------- | ------- |
+| `selium-work/modules/myproj/waf.wasm` | init | NetHttpsAccept, NetHttpsRead | `utf8`, `u16` | localhost, 7000 | _none_ |
+| `selium-work/modules/miner.wasm` | _none_ | ChannelLifecycle, ChannelWriter | `resource` | 14 | sel://miner/logs |
+| `selium-work/modules/dev_null.wasm` | _none_ | _none_ | _none_ | _none_ | _none_ |
+
+```bash
+selium-runtime \
+  # myproj/waf.wasm
+  --module 'path=myproj/waf.wasm;entrypoint=init;capabilities=NetHttpsAccept,NetHttpsRead;params=utf8,u16;args=localhost,7000'
+  # miner.wasm
+  --module 'path=miner.wasm;capabilities=ChannelLifecycle,ChannelWriter;args=resource:14;log_uri=sel://miner/logs'
+  # dev_null.wasm
+  --module 'path=dev_null.wasm;capabilities='
+```
+
+## Logging
+
+Selium runtime automatically includes logs from dependent modules in its own log output. Module logs are tagged with the `tracing` target of "selium.guest".
+
+Use `--log-format text|json` or `SELIUM_LOG_FORMAT` to control the runtime's stdout/err log format.

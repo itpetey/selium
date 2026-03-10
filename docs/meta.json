@@ -1,0 +1,14 @@
+{
+  "title": "Docs",
+  "pages": [
+    "index",
+    "getting-started",
+    "applications",
+    "channels",
+    "networking",
+    "runtime",
+    "remote-client",
+    "switchboard",
+    "atlas"
+  ]
+}

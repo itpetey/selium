@@ -1,0 +1,141 @@
+---
+title: "Getting started"
+description: "Install the CLI, scaffold a service, and deploy to Selium."
+---
+
+This guide gets you from zero to a running Selium service on your machine. You will:
+
+1. Install the Selium runtime and CLI.
+2. Build a tiny WASM service.
+3. Start a local runtime (with the remote client enabled).
+4. Launch your service and attach to its logs.
+
+## Prerequisites
+
+You will need stable Rust (see [rustup.rs](https://rustup.rs)), plus the WebAssembly target:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+## 1. Install the runtime and CLI
+
+We recommend using the install script to install `selium-runtime` (server) and `selium` (CLI):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSfL https://selium.com/install.sh | sh
+```
+
+### From source
+
+You can also build from source:
+
+```bash
+git clone https://github.com/seliumlabs/selium
+cd selium
+
+cargo build -p selium-runtime --release
+
+git clone https://github.com/seliumlabs/selium-modules
+
+cd selium-modules/remote-client
+cargo build -p selium-remote-client-server --target wasm32-unknown-unknown --release
+
+cd ../switchboard
+cargo build -p selium-switchboard-server --target wasm32-unknown-unknown --release
+
+cd ../atlas
+cargo build -p selium-atlas-server --target wasm32-unknown-unknown --release
+```
+
+You'll also need to create a work directory and generate some TLS certificates:
+
+```bash
+mkdir -p selium-work/{certs,modules}
+selium-runtime generate-certs --output-dir selium-work/certs
+```
+
+The certificates are used to secure the local QUIC server, which the CLI uses to talk to the runtime.
+
+The work directory holds two groups of important files:
+
+- `selium-work/certs` for TLS certificates
+- `selium-work/modules` for WASM modules (your apps and system modules)
+
+## 2. Create a service
+
+`src/lib.rs`:
+
+```rust
+use selium_userland::entrypoint;
+use tracing::info;
+
+#[entrypoint]
+fn hello() {
+    info!("hello from selium");
+}
+```
+
+`Cargo.toml`:
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+selium-userland = "1.0.0-alpha.5"
+tracing = "0.1"
+```
+
+Build to WASM and copy into the work dir:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/hello.wasm selium-work/modules/
+```
+
+## 3. Start the runtime in the background
+
+The below command will start a new Selium runtime instance, preloading the Remote Client, Switchboard, and Atlas modules.
+These modules add extra functionality on top of the core platform. Generally you'll need the Remote Client for CLI
+access, but the Switchboard and Atlas can be omitted for a leaner runtime. See the
+[echo-no-deps](https://github.com/seliumlabs/selium/tree/main/examples/echo-no-deps) example for details.
+
+For this guide, we'll assume you're using all three.
+
+```bash
+selium-runtime --work-dir selium-work \
+  --module 'path=selium_remote_client_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,ProcessLifecycle,NetQuicBind,NetQuicAccept,NetQuicRead,NetQuicWrite;args=utf8:localhost,u16:7000' \
+  --module 'path=selium_switchboard_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' \
+  --module 'path=selium_atlas_server.wasm;capabilities=ChannelLifecycle,ChannelReader,ChannelWriter,SingletonRegistry' &
+```
+
+## 4. Start your service with the CLI
+
+Start your example application with required capabilities. These are required for creating a channel to publish logs to
+(`ChannelLifecycle`), and writing to that channel (`ChannelWriter`).
+
+```bash
+selium --cert-dir selium-work/certs \
+  start hello.wasm start \
+  --capabilities ChannelLifecycle,ChannelWriter \
+  --attach
+```
+
+The CLI will print out the process's system ID, which you can use to stop it later:
+
+> Started process (id=...)
+
+```bash
+selium --cert-dir selium-work/certs stop <id>
+```
+
+## Next steps
+
+- Read **Applications** next to understand entrypoints, arguments, and capability grants.
+- If you want typed messaging and discovery, add **Switchboard** and **Atlas** to your mental model early.

@@ -1,0 +1,104 @@
+---
+title: "Channels"
+description: "The core of Selium's communication architecture."
+---
+
+Channels are the foundational primitive that guests use to communicate with each other, and with the host. All I/O transits over channels, even when it's not explicit (like logs).
+
+Channels are in-memory, many-to-many byte streams backed by a ring buffer, with explicit and composable backpressure rules. Yep, they're pretty bad arse!
+
+Before we go too far, keep these mental notes handy:
+
+- Every channel's buffer has an explicit capacity, which is measured in bytes, not number of messages
+- `Writer`s send frames _to_ others; `Reader`s receive frames _from_ others
+- `Reader`s and `Writer`s implement `Stream` and `Sink` so you can compose them with the rest of Rust's async ecosystem.
+
+## Buffer sizing
+
+A practical rule: the buffer should be comfortably larger than your largest frame multiplied by your expected concurrent writers. If you see `ReaderBehind` errors or a lot of `Ok(0)` writes under "drop" backpressure, increase capacity or reduce frame size.
+
+## Strong vs. Weak
+
+Channels support strong and weak readers/writers. The short version is: "strong" participates in correctness/backpressure accounting; "weak" is allowed to fall behind or drop state when idle.
+
+- **Strong Reader**: prevents writers from overwriting unread bytes
+- **Weak Reader**: can fall behind; recoverable on retry
+- **Strong Writer**: prevents other readers/writers from overtaking it
+- **Weak Writer**: can fall behind; recoverable on retry
+
+**Caution: Strong readers and writers WILL cause permanent backpressure if they do not continue to read/write.** Generally strong readers are safe if they are polled consistently. Strong writers are strongly discouraged unless you are actively designing against single-writer saturation.
+
+## Backpressure
+
+Backpressure is a channel setting you choose at creation time:
+
+- `ChannelBackpressure::Park` (default) waits for buffer space by yielding until ready.
+- `ChannelBackpressure::Drop` returns immediately when the buffer is full, dropping any data that could not be written.
+
+Use `Park` when you need delivery guarantees. Use `Drop` when sampling or best-effort is acceptable.
+
+## Flatbuffers
+
+Channels use Flatbuffers 'on the wire'. That is, all data sent on a channel uses Flatbuffers to encode/decode the data to/from bytes. Flatbuffers schemas are also useful for enforcing type safety on both the producer and consumer.
+
+From an application developer's perspective, this has a few implications:
+1. You must provide Flatbuffers schemas for your types (note we provide internal implementations for string, integer and byte array types).
+2. You should include a `build.rs` file (like the one below) to transpile your schemas into Rust
+3. You should use the `#[schema]` macro to define your Flatbuffers types in your application (this takes care of the plumbing)
+
+### `build.rs` example
+
+```rust
+use std::{ffi::OsStr, fs, path::Path};
+
+use flatbuffers_build::BuilderOptions;
+use flatc_fork::flatc;
+
+const SCHEMAS: [&str; 1] = ["schemas/<filename>.fbs"];
+
+fn main() {
+    println!("cargo::rerun-if-changed=schemas/");
+
+    BuilderOptions::new_with_files(SCHEMAS)
+        .set_output_path("src/fbs/")
+        .set_compiler(flatc().to_str().expect("Non UTF-8 path to flatc binary"))
+        .compile()
+        .expect("flatbuffer compilation failed");
+}
+```
+
+### Non-Flatbuffers integration
+
+If you want to define non-Flatbuffers types that can integrate with Selium's channels in a typesafe way, the `selium_userland::encoding` module provides the `FlatMsg` and `HasSchema` traits that you must implement:
+
+```rust
+impl FlatMsg for u32 {
+    fn encode(value: &Self) -> Vec<u8> {
+        value.to_le_bytes().into()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, InvalidFlatbuffer> {
+        Ok(u32::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?,
+        ))
+    }
+}
+
+impl HasSchema for u32 {
+    const SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        fqname: "unsigned_thirty_two_bit_int",
+        hash: [0, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3],
+    };
+}
+```
+
+## Sharing
+
+Channels are isolated to their creator's process by default. To share with other entrypoints and applications:
+1. Call `Channel::share()` to obtain a `SharedChannel` handle.
+2. Pass the handle to another process (for example via a process argument or singleton).
+3. Call `Channel::attach_shared()` on the receiving side.
+
+Under the hood, the host `Registry` stores the shared resource, while each guest has an `InstanceRegistry` with its own handle table. By design, it is impossible to access the `Registry` directly from an application. Instead you must use the `InstanceRegistry` table, which creates indirection to prevent forgery.
