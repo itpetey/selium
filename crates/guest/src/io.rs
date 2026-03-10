@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use selium_abi::{
     DataValue, GuestResourceId, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueRole,
-    QueueStatusCode, decode_rkyv,
+    QueueStatusCode, decode_rkyv, encode_rkyv,
 };
 use thiserror::Error;
 
@@ -23,6 +23,37 @@ pub struct ReceivedMessage {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedReceivedMessage<T> {
+    pub seq: u64,
+    pub writer_id: u32,
+    pub payload: T,
+}
+
+/// Guest-facing abstraction for managed endpoint bindings used by high-level I/O helpers.
+///
+/// This is implemented for structured `DataValue` bindings and the current encoded byte form,
+/// allowing guest code to migrate away from explicit `encode_rkyv` calls without breaking
+/// existing flows.
+pub trait ManagedBindings {
+    fn lookup_channel(
+        &self,
+        section: &str,
+        endpoint_kind: &str,
+        endpoint: &str,
+    ) -> Result<ChannelDescriptor, IoError>;
+}
+
+/// Guest-facing abstraction for typed payloads sent over high-level I/O channels.
+pub trait PayloadEncode {
+    fn encode_payload(&self) -> Result<Vec<u8>, IoError>;
+}
+
+/// Guest-facing abstraction for typed payloads received from high-level I/O channels.
+pub trait PayloadDecode: Sized {
+    fn decode_payload(bytes: &[u8]) -> Result<Self, IoError>;
+}
+
 #[derive(Debug, Error)]
 pub enum IoError {
     #[error(transparent)]
@@ -36,6 +67,12 @@ pub enum IoError {
     PayloadTooLarge { actual: usize, max: u32 },
     #[error("queue operation `{0}` returned missing payload")]
     MissingPayload(&'static str),
+    #[error("payload encode failed: {0}")]
+    EncodePayload(String),
+    #[error("payload decode failed: {0}")]
+    DecodePayload(String),
+    #[error("managed bindings decode failed: {0}")]
+    DecodeManagedBindings(String),
     #[error("invalid managed endpoint bindings: {0}")]
     InvalidManagedBindings(String),
 }
@@ -93,19 +130,22 @@ pub async fn attach_reader(channel: &ChannelDescriptor) -> Result<ChannelReader,
     })
 }
 
-pub async fn managed_event_writer(
-    bindings: &[u8],
+pub async fn managed_event_writer<B>(
+    bindings: &B,
     endpoint: &str,
     writer_id: u32,
-) -> Result<ChannelWriter, IoError> {
+) -> Result<ChannelWriter, IoError>
+where
+    B: ManagedBindings + ?Sized,
+{
     let channel = managed_endpoint_channel(bindings, "writers", "event", endpoint)?;
     attach_writer(&channel, writer_id).await
 }
 
-pub async fn managed_event_reader(
-    bindings: &[u8],
-    endpoint: &str,
-) -> Result<ChannelReader, IoError> {
+pub async fn managed_event_reader<B>(bindings: &B, endpoint: &str) -> Result<ChannelReader, IoError>
+where
+    B: ManagedBindings + ?Sized,
+{
     let channel = managed_endpoint_channel(bindings, "readers", "event", endpoint)?;
     attach_reader(&channel).await
 }
@@ -139,6 +179,15 @@ impl ChannelWriter {
         ensure_queue_ok("commit", committed.code)?;
 
         Ok(reservation.seq)
+    }
+
+    pub async fn send_typed<T: PayloadEncode>(
+        &mut self,
+        payload: &T,
+        timeout_ms: u32,
+    ) -> Result<u64, IoError> {
+        let payload = payload.encode_payload()?;
+        self.send(&payload, timeout_ms).await
     }
 
     pub async fn close(self) -> Result<(), IoError> {
@@ -184,6 +233,16 @@ impl ChannelReader {
         }
     }
 
+    pub async fn recv_typed<T: PayloadDecode>(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Option<TypedReceivedMessage<T>>, IoError> {
+        self.recv(timeout_ms)
+            .await?
+            .map(ReceivedMessage::into_typed)
+            .transpose()
+    }
+
     pub async fn close(self) -> Result<(), IoError> {
         let endpoint = queue::close(self.endpoint_id).await?;
         ensure_queue_ok("close(reader endpoint)", endpoint.code)?;
@@ -191,6 +250,76 @@ impl ChannelReader {
             shm::detach(resource_id).await?;
         }
         Ok(())
+    }
+}
+
+impl ReceivedMessage {
+    pub fn decode<T: PayloadDecode>(&self) -> Result<T, IoError> {
+        T::decode_payload(&self.payload)
+    }
+
+    pub fn into_typed<T: PayloadDecode>(self) -> Result<TypedReceivedMessage<T>, IoError> {
+        Ok(TypedReceivedMessage {
+            seq: self.seq,
+            writer_id: self.writer_id,
+            payload: T::decode_payload(&self.payload)?,
+        })
+    }
+}
+
+impl<T> PayloadEncode for T
+where
+    T: selium_abi::RkyvEncode,
+{
+    fn encode_payload(&self) -> Result<Vec<u8>, IoError> {
+        encode_payload_value(self)
+    }
+}
+
+impl<T> PayloadDecode for T
+where
+    T: rkyv::Archive + Sized,
+    for<'a> T::Archived: 'a
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    fn decode_payload(bytes: &[u8]) -> Result<Self, IoError> {
+        decode_payload_value(bytes)
+    }
+}
+
+impl ManagedBindings for DataValue {
+    fn lookup_channel(
+        &self,
+        section: &str,
+        endpoint_kind: &str,
+        endpoint: &str,
+    ) -> Result<ChannelDescriptor, IoError> {
+        managed_endpoint_channel_from_value(self, section, endpoint_kind, endpoint)
+    }
+}
+
+impl ManagedBindings for [u8] {
+    fn lookup_channel(
+        &self,
+        section: &str,
+        endpoint_kind: &str,
+        endpoint: &str,
+    ) -> Result<ChannelDescriptor, IoError> {
+        let value = decode_managed_bindings(self)?;
+        managed_endpoint_channel_from_value(&value, section, endpoint_kind, endpoint)
+    }
+}
+
+impl ManagedBindings for Vec<u8> {
+    fn lookup_channel(
+        &self,
+        section: &str,
+        endpoint_kind: &str,
+        endpoint: &str,
+    ) -> Result<ChannelDescriptor, IoError> {
+        self.as_slice()
+            .lookup_channel(section, endpoint_kind, endpoint)
     }
 }
 
@@ -202,14 +331,24 @@ fn ensure_queue_ok(operation: &'static str, status: QueueStatusCode) -> Result<(
     }
 }
 
-fn managed_endpoint_channel(
-    bindings: &[u8],
+fn managed_endpoint_channel<B>(
+    bindings: &B,
+    section: &str,
+    endpoint_kind: &str,
+    endpoint: &str,
+) -> Result<ChannelDescriptor, IoError>
+where
+    B: ManagedBindings + ?Sized,
+{
+    bindings.lookup_channel(section, endpoint_kind, endpoint)
+}
+
+fn managed_endpoint_channel_from_value(
+    value: &DataValue,
     section: &str,
     endpoint_kind: &str,
     endpoint: &str,
 ) -> Result<ChannelDescriptor, IoError> {
-    let value = decode_rkyv::<DataValue>(bindings)
-        .map_err(|err| IoError::InvalidManagedBindings(err.to_string()))?;
     let binding = value
         .get(section)
         .and_then(|section| section.get(endpoint_kind))
@@ -236,10 +375,28 @@ fn managed_endpoint_channel(
     })
 }
 
+fn decode_managed_bindings(bytes: &[u8]) -> Result<DataValue, IoError> {
+    decode_rkyv::<DataValue>(bytes).map_err(|err| IoError::DecodeManagedBindings(err.to_string()))
+}
+
+fn encode_payload_value<T: selium_abi::RkyvEncode>(value: &T) -> Result<Vec<u8>, IoError> {
+    encode_rkyv(value).map_err(|err| IoError::EncodePayload(err.to_string()))
+}
+
+fn decode_payload_value<T>(bytes: &[u8]) -> Result<T, IoError>
+where
+    T: rkyv::Archive + Sized,
+    for<'a> T::Archived: 'a
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    decode_rkyv(bytes).map_err(|err| IoError::DecodePayload(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_abi::encode_rkyv;
+    use rkyv::{Archive, Deserialize, Serialize};
 
     #[test]
     fn create_channel_returns_kernel_error_with_native_stub_driver() {
@@ -312,8 +469,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn managed_event_channel_accepts_structured_bindings() {
+        let bindings = managed_bindings_value();
+
+        let channel = managed_endpoint_channel(&bindings, "writers", "event", "shared")
+            .expect("event binding present");
+
+        assert_eq!(channel.queue_shared_id, 11);
+        assert_eq!(channel.max_frame_bytes, 256);
+    }
+
+    #[test]
+    fn received_message_decodes_typed_payload() {
+        let payload = TestPayload {
+            topic: "inventory".to_string(),
+            version: 3,
+        }
+        .encode_payload()
+        .expect("encode payload");
+        let message = ReceivedMessage {
+            seq: 7,
+            writer_id: 9,
+            payload,
+        };
+
+        let typed = message.into_typed::<TestPayload>().expect("decode payload");
+
+        assert_eq!(typed.seq, 7);
+        assert_eq!(typed.writer_id, 9);
+        assert_eq!(typed.payload.topic, "inventory");
+        assert_eq!(typed.payload.version, 3);
+    }
+
+    #[test]
+    fn received_message_reports_decode_errors() {
+        let message = ReceivedMessage {
+            seq: 1,
+            writer_id: 2,
+            payload: vec![1, 2, 3],
+        };
+
+        let err = message
+            .into_typed::<TestPayload>()
+            .expect_err("payload should be invalid");
+
+        assert!(matches!(err, IoError::DecodePayload(_)));
+    }
+
+    #[test]
+    fn send_typed_checks_encoded_payload_size() {
+        let mut writer = ChannelWriter {
+            endpoint_id: 1,
+            shm_resource_id: 2,
+            shm_shared_id: 3,
+            max_frame_bytes: 2,
+        };
+
+        let err = crate::block_on(writer.send_typed(&OversizedPayload, 0)).expect_err("too large");
+
+        assert!(matches!(err, IoError::PayloadTooLarge { .. }));
+    }
+
     fn managed_bindings_fixture() -> Vec<u8> {
-        encode_rkyv(&DataValue::Map(BTreeMap::from([
+        managed_bindings_value()
+            .encode_payload()
+            .expect("encode bindings fixture")
+    }
+
+    fn managed_bindings_value() -> DataValue {
+        DataValue::Map(BTreeMap::from([
             (
                 "writers".to_string(),
                 DataValue::Map(BTreeMap::from([
@@ -359,8 +584,7 @@ mod tests {
                     ),
                 ])),
             ),
-        ])))
-        .expect("encode fixture")
+        ]))
     }
 
     fn descriptor_value(queue_shared_id: u64, max_frame_bytes: u64) -> DataValue {
@@ -374,5 +598,20 @@ mod tests {
                 DataValue::U64(max_frame_bytes),
             ),
         ]))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+    #[rkyv(bytecheck())]
+    struct TestPayload {
+        topic: String,
+        version: u32,
+    }
+
+    struct OversizedPayload;
+
+    impl PayloadEncode for OversizedPayload {
+        fn encode_payload(&self) -> Result<Vec<u8>, IoError> {
+            Ok(vec![1, 2, 3])
+        }
     }
 }

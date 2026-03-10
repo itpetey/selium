@@ -48,18 +48,15 @@ fn __selium_extract_path_params(
         return None;
     }
     let mut params = std::collections::BTreeMap::new();
-    for (template_segment, actual_segment) in template_segments
-        .into_iter()
-        .zip(actual_segments)
-    {
-        if template_segment.starts_with('{') && template_segment.ends_with('}')
+    for (template_segment, actual_segment) in template_segments.into_iter().zip(actual_segments) {
+        if template_segment.starts_with('{')
+            && template_segment.ends_with('}')
             && template_segment.len() > 2
         {
-            params
-                .insert(
-                    template_segment[1..template_segment.len() - 1].to_string(),
-                    actual_segment.to_string(),
-                );
+            params.insert(
+                template_segment[1..template_segment.len() - 1].to_string(),
+                actual_segment.to_string(),
+            );
         } else if template_segment != actual_segment {
             return None;
         }

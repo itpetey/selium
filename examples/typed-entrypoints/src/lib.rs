@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::DataValue;
 use selium_guest::{io, time};
 
 #[allow(dead_code)]
@@ -38,11 +38,10 @@ async fn run_invocation(
 ) -> Result<()> {
     // All entrypoints funnel through one helper so the example can show that Selium passes
     // typed arguments into different entrypoints without changing the guest-side logic.
-    let bindings = encode_rkyv(bindings).context("encode launch managed-event bindings")?;
-    let mut writer = io::managed_event_writer(&bindings, bindings::EVENT_LAUNCH_RECORDED, 9)
+    let mut writer = io::managed_event_writer(bindings, bindings::EVENT_LAUNCH_RECORDED, 9)
         .await
         .context("attach launch writer")?;
-    let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_LAUNCH_RECORDED)
+    let mut reader = io::managed_event_reader(bindings, bindings::EVENT_LAUNCH_RECORDED)
         .await
         .context("attach launch reader")?;
 
@@ -54,19 +53,16 @@ async fn run_invocation(
     // The round-trip check makes the entrypoint arguments visible as normal contract-defined
     // data after they cross the ABI boundary into guest code.
     writer
-        .send(
-            &encode_rkyv(&record).context("encode launch record")?,
-            SEND_TIMEOUT_MS,
-        )
+        .send_typed(&record, SEND_TIMEOUT_MS)
         .await
         .context("send launch record")?;
 
-    let frame = reader
-        .recv(RECV_TIMEOUT_MS)
+    let observed = reader
+        .recv_typed::<LaunchRecord>(RECV_TIMEOUT_MS)
         .await
         .context("receive launch record")?
-        .context("missing launch record frame")?;
-    let observed = decode_rkyv::<LaunchRecord>(&frame.payload).context("decode launch record")?;
+        .context("missing launch record frame")?
+        .payload;
     ensure!(
         observed.service == record.service
             && observed.retries == record.retries

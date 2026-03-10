@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::DataValue;
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -20,8 +20,6 @@ const EVENT_COUNT: u32 = 3;
 pub async fn start(bindings: DataValue) -> Result<()> {
     // Both flows now bind to contract-defined managed event endpoints instead of guest-created
     // queues, while keeping the same fan-out plus acknowledgement startup proof.
-    let bindings = encode_rkyv(&bindings).context("encode managed event bindings")?;
-
     spawn_checked(
         "audit subscriber",
         run_subscriber("audit", bindings.clone()),
@@ -47,10 +45,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
             delta: i32::try_from(event_id).unwrap_or_default(),
         };
         event_writer
-            .send(
-                &encode_rkyv(&event).context("encode event")?,
-                SEND_TIMEOUT_MS,
-            )
+            .send_typed(&event, SEND_TIMEOUT_MS)
             .await
             .with_context(|| format!("send event {event_id}"))?;
     }
@@ -58,12 +53,12 @@ pub async fn start(bindings: DataValue) -> Result<()> {
     let expected = expected_acks();
     let mut seen = BTreeSet::new();
     while seen.len() < expected.len() {
-        let frame = ack_reader
-            .recv(RECV_TIMEOUT_MS)
+        let ack = ack_reader
+            .recv_typed::<DeliveryAck>(RECV_TIMEOUT_MS)
             .await
             .context("receive ack")?
-            .ok_or_else(|| anyhow!("timed out waiting for subscriber acks"))?;
-        let ack = decode_rkyv::<DeliveryAck>(&frame.payload).context("decode ack")?;
+            .ok_or_else(|| anyhow!("timed out waiting for subscriber acks"))?
+            .payload;
         seen.insert((ack.consumer, ack.event_id));
     }
 
@@ -71,7 +66,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
     idle_forever().await
 }
 
-async fn run_subscriber(consumer: &'static str, bindings: Vec<u8>) -> Result<()> {
+async fn run_subscriber(consumer: &'static str, bindings: DataValue) -> Result<()> {
     // Multiple readers attach to the same managed event endpoint, preserving the fan-out surface
     // while acknowledgements flow back on a separate managed endpoint.
     let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_INVENTORY_ADJUSTED)
@@ -86,21 +81,20 @@ async fn run_subscriber(consumer: &'static str, bindings: Vec<u8>) -> Result<()>
     .context("attach managed ack writer")?;
 
     loop {
-        let Some(frame) = reader
-            .recv(RECV_TIMEOUT_MS)
+        let Some(event) = reader
+            .recv_typed::<InventoryAdjusted>(RECV_TIMEOUT_MS)
             .await
             .context("receive broadcast event")?
         else {
             continue;
         };
 
-        let event = decode_rkyv::<InventoryAdjusted>(&frame.payload).context("decode event")?;
         let ack = DeliveryAck {
             consumer: consumer.to_string(),
-            event_id: event.event_id,
+            event_id: event.payload.event_id,
         };
         ack_writer
-            .send(&encode_rkyv(&ack).context("encode ack")?, SEND_TIMEOUT_MS)
+            .send_typed(&ack, SEND_TIMEOUT_MS)
             .await
             .with_context(|| format!("send ack from {consumer}"))?;
     }

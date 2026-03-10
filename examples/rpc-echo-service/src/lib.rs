@@ -4,7 +4,7 @@
 use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::DataValue;
 use selium_guest::{io, spawn, time};
 
 #[allow(dead_code)]
@@ -17,8 +17,6 @@ const RECV_TIMEOUT_MS: u32 = 5_000;
 
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
-    let bindings = encode_rkyv(&bindings).context("encode rpc managed-event bindings")?;
-
     // The client and server still show the request path and reply path explicitly, but now
     // they bind to contract-defined public endpoints instead of guest-created queues.
     spawn_checked("rpc server", run_server(bindings.clone()));
@@ -35,19 +33,16 @@ pub async fn start(bindings: DataValue) -> Result<()> {
         body: "hello from selium".to_string(),
     };
     request_writer
-        .send(
-            &encode_rkyv(&request).context("encode request")?,
-            SEND_TIMEOUT_MS,
-        )
+        .send_typed(&request, SEND_TIMEOUT_MS)
         .await
         .context("send request")?;
 
-    let frame = response_reader
-        .recv(RECV_TIMEOUT_MS)
+    let response = response_reader
+        .recv_typed::<EchoResponse>(RECV_TIMEOUT_MS)
         .await
         .context("receive response")?
-        .ok_or_else(|| anyhow!("rpc response timed out"))?;
-    let response = decode_rkyv::<EchoResponse>(&frame.payload).context("decode response")?;
+        .ok_or_else(|| anyhow!("rpc response timed out"))?
+        .payload;
 
     ensure!(
         response.correlation_id == request.correlation_id,
@@ -61,7 +56,7 @@ pub async fn start(bindings: DataValue) -> Result<()> {
     idle_forever().await
 }
 
-async fn run_server(bindings: Vec<u8>) -> Result<()> {
+async fn run_server(bindings: DataValue) -> Result<()> {
     let mut request_reader = io::managed_event_reader(&bindings, bindings::EVENT_ECHO_REQUESTED)
         .await
         .context("attach request reader")?;
@@ -71,26 +66,22 @@ async fn run_server(bindings: Vec<u8>) -> Result<()> {
             .context("attach response writer")?;
 
     loop {
-        let Some(frame) = request_reader
-            .recv(RECV_TIMEOUT_MS)
+        let Some(request) = request_reader
+            .recv_typed::<EchoRequest>(RECV_TIMEOUT_MS)
             .await
             .context("receive request")?
         else {
             continue;
         };
 
-        let request = decode_rkyv::<EchoRequest>(&frame.payload).context("decode request")?;
-        // The contract-generated types are plain Rust structs once serialized over the queue.
+        // The contract-generated types stay plain Rust structs at the guest I/O boundary.
         let response = EchoResponse {
-            correlation_id: request.correlation_id,
-            echoed: request.body,
+            correlation_id: request.payload.correlation_id,
+            echoed: request.payload.body,
         };
 
         response_writer
-            .send(
-                &encode_rkyv(&response).context("encode response")?,
-                SEND_TIMEOUT_MS,
-            )
+            .send_typed(&response, SEND_TIMEOUT_MS)
             .await
             .context("send response")?;
     }
