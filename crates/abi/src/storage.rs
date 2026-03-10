@@ -67,10 +67,15 @@ pub struct StorageLogAppend {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum StorageReplayStart {
+    /// Start from the oldest retained record.
     Earliest,
+    /// Start from the newest retained record.
     Latest,
+    /// Start from the first record whose sequence is at least this value.
     Sequence(u64),
+    /// Start from the first record at or after this timestamp in milliseconds.
     Timestamp(u64),
+    /// Start from the record associated with a named checkpoint.
     Checkpoint(String),
 }
 

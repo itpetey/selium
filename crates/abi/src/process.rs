@@ -10,13 +10,19 @@ use crate::{
 pub enum EntrypointArg {
     /// Immediate scalar value.
     Scalar(AbiScalarValue),
-    /// Raw buffer.
+    /// Raw buffer passed using the signature's buffer parameter convention.
     Buffer(Vec<u8>),
     /// Handle referring to a Selium resource.
+    ///
+    /// Use this when an entrypoint parameter semantically expects a resource handle rather than a
+    /// caller-chosen integer. Validation currently permits resource handles for `i32` and `u64`
+    /// scalar slots.
     Resource(GuestResourceId),
 }
 
 /// Invocation of a process entrypoint.
+///
+/// This pairs an [`AbiSignature`] with the concrete guest arguments a process should receive.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct EntrypointInvocation {
@@ -74,7 +80,7 @@ impl EntrypointInvocation {
         Ok(())
     }
 
-    /// Access the invocation signature.
+    /// Borrow the invocation signature.
     pub fn signature(&self) -> &AbiSignature {
         &self.signature
     }
