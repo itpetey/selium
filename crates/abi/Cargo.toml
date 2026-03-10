@@ -13,3 +13,6 @@ categories.workspace = true
 [dependencies]
 rkyv = { workspace = true, features = ["bytecheck", "std"] }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+selium-control-plane-api = { workspace = true }

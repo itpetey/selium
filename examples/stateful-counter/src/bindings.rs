@@ -28,11 +28,32 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct CounterDelta {
     pub seq: u32,
     pub amount: u32,
+}
+impl selium_abi::CanonicalSerialize for CounterDelta {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.seq)?;
+        encoder.encode_value(&self.amount)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for CounterDelta {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            seq: decoder.decode_value()?,
+            amount: decoder.decode_value()?,
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -40,6 +61,28 @@ pub struct CounterCheckpoint {
     pub last_seq: u32,
     pub running_total: u32,
     pub mode: String,
+}
+impl selium_abi::CanonicalSerialize for CounterCheckpoint {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.last_seq)?;
+        encoder.encode_value(&self.running_total)?;
+        encoder.encode_value(&self.mode)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for CounterCheckpoint {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            last_seq: decoder.decode_value()?,
+            running_total: decoder.decode_value()?,
+            mode: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_COUNTER_DELTAS: &str = "counter.deltas";
 pub const EVENT_COUNTER_CHECKPOINTS: &str = "counter.checkpoints";

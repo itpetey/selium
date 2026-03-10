@@ -28,6 +28,7 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[allow(dead_code)]
 fn __selium_extract_path_params(
     template: &str,
@@ -85,12 +86,54 @@ pub struct QuoteRequest {
     pub request_id: u32,
     pub quantity: u32,
 }
+impl selium_abi::CanonicalSerialize for QuoteRequest {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.request_id)?;
+        encoder.encode_value(&self.quantity)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for QuoteRequest {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            request_id: decoder.decode_value()?,
+            quantity: decoder.decode_value()?,
+        })
+    }
+}
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct QuoteResponse {
     pub request_id: u32,
     pub worker: String,
     pub total_cents: u32,
+}
+impl selium_abi::CanonicalSerialize for QuoteResponse {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.request_id)?;
+        encoder.encode_value(&self.worker)?;
+        encoder.encode_value(&self.total_cents)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for QuoteResponse {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            request_id: decoder.decode_value()?,
+            worker: decoder.decode_value()?,
+            total_cents: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_PRICING_QUOTE_WORKER_A_REQUESTS: &str = "pricing.quote_worker_a_requests";
 pub const EVENT_PRICING_QUOTE_WORKER_B_REQUESTS: &str = "pricing.quote_worker_b_requests";

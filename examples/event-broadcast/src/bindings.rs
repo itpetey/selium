@@ -28,6 +28,7 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct InventoryAdjusted {
@@ -35,11 +36,53 @@ pub struct InventoryAdjusted {
     pub sku: String,
     pub delta: i32,
 }
+impl selium_abi::CanonicalSerialize for InventoryAdjusted {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.event_id)?;
+        encoder.encode_value(&self.sku)?;
+        encoder.encode_value(&self.delta)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for InventoryAdjusted {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            event_id: decoder.decode_value()?,
+            sku: decoder.decode_value()?,
+            delta: decoder.decode_value()?,
+        })
+    }
+}
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct DeliveryAck {
     pub consumer: String,
     pub event_id: u32,
+}
+impl selium_abi::CanonicalSerialize for DeliveryAck {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.consumer)?;
+        encoder.encode_value(&self.event_id)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for DeliveryAck {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            consumer: decoder.decode_value()?,
+            event_id: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_INVENTORY_ADJUSTED: &str = "inventory.adjusted";
 pub const EVENT_INVENTORY_DELIVERY_ACKS: &str = "inventory.delivery_acks";

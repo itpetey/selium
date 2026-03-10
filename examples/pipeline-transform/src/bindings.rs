@@ -28,12 +28,35 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct RawOrder {
     pub order_id: u32,
     pub sku: String,
     pub quantity: u32,
+}
+impl selium_abi::CanonicalSerialize for RawOrder {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.order_id)?;
+        encoder.encode_value(&self.sku)?;
+        encoder.encode_value(&self.quantity)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for RawOrder {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            order_id: decoder.decode_value()?,
+            sku: decoder.decode_value()?,
+            quantity: decoder.decode_value()?,
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -42,11 +65,53 @@ pub struct ReservationRequest {
     pub reservation_key: String,
     pub units: u32,
 }
+impl selium_abi::CanonicalSerialize for ReservationRequest {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.order_id)?;
+        encoder.encode_value(&self.reservation_key)?;
+        encoder.encode_value(&self.units)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for ReservationRequest {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            order_id: decoder.decode_value()?,
+            reservation_key: decoder.decode_value()?,
+            units: decoder.decode_value()?,
+        })
+    }
+}
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct ProjectionApplied {
     pub order_id: u32,
     pub projection_key: String,
+}
+impl selium_abi::CanonicalSerialize for ProjectionApplied {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.order_id)?;
+        encoder.encode_value(&self.projection_key)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for ProjectionApplied {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            order_id: decoder.decode_value()?,
+            projection_key: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_INGRESS_ORDERS: &str = "ingress.orders";
 pub const EVENT_INVENTORY_RESERVATIONS: &str = "inventory.reservations";

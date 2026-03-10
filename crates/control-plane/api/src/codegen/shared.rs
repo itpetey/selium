@@ -76,12 +76,40 @@ pub(super) fn schema_tokens(schema: &SchemaDef) -> TokenStream {
         let ty = schema_field_type_tokens(&field.ty);
         quote!(pub #field_ident: #ty,)
     });
+    let encode_fields = schema.fields.iter().map(|field| {
+        let field_ident = field_ident(&field.name);
+        quote!(encoder.encode_value(&self.#field_ident)?;)
+    });
+    let decode_fields = schema.fields.iter().map(|field| {
+        let field_ident = field_ident(&field.name);
+        quote!(#field_ident: decoder.decode_value()?,)
+    });
 
     quote! {
         #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
         #[rkyv(bytecheck())]
         pub struct #schema_ident {
             #(#fields)*
+        }
+
+        impl selium_abi::CanonicalSerialize for #schema_ident {
+            fn encode_to(
+                &self,
+                encoder: &mut selium_abi::CanonicalEncoder,
+            ) -> Result<(), selium_abi::ContractCodecError> {
+                #(#encode_fields)*
+                Ok(())
+            }
+        }
+
+        impl selium_abi::CanonicalDeserialize for #schema_ident {
+            fn decode_from(
+                decoder: &mut selium_abi::CanonicalDecoder<'_>,
+            ) -> Result<Self, selium_abi::ContractCodecError> {
+                Ok(Self {
+                    #(#decode_fields)*
+                })
+            }
         }
     }
 }

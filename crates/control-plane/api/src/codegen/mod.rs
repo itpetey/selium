@@ -24,6 +24,18 @@ pub fn generate_rust_bindings(package: &ContractPackage) -> String {
 }
 
 fn generate_rust_bindings_tokens(package: &ContractPackage) -> TokenStream {
+    let needs_context_import = package
+        .services
+        .iter()
+        .any(|service| matches!(service.protocol.as_deref(), Some("http") | Some("quic")))
+        || !package.streams.is_empty();
+    let context_import = if needs_context_import {
+        quote!(
+            use anyhow::Context as _;
+        )
+    } else {
+        TokenStream::new()
+    };
     let runtime_helpers = runtime_helper_tokens(package);
     let schemas = package.schemas.iter().map(schema_tokens);
     let events = package.events.iter().map(event_const_tokens);
@@ -41,7 +53,7 @@ fn generate_rust_bindings_tokens(package: &ContractPackage) -> TokenStream {
     let stream_modules = package.streams.iter().map(generate_stream_module);
 
     quote! {
-        use anyhow::Context as _;
+        #context_import
         use rkyv::{Archive, Deserialize, Serialize};
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +87,9 @@ fn generate_rust_bindings_tokens(package: &ContractPackage) -> TokenStream {
             pub request_body: ServiceBodyBinding,
             pub response_body: ServiceBodyBinding,
         }
+
+        pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 =
+            selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 
         #runtime_helpers
 

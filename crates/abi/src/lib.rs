@@ -22,6 +22,7 @@ use std::{
 };
 use thiserror::Error;
 
+mod contract_codec;
 pub mod hostcalls;
 mod network;
 mod process;
@@ -32,6 +33,7 @@ mod storage;
 mod time;
 
 // pub use external::*;
+pub use contract_codec::*;
 pub use hostcalls::*;
 pub use network::*;
 pub use process::*;

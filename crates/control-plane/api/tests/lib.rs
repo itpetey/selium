@@ -137,6 +137,17 @@ fn rust_bindings_generation_is_non_empty() {
     assert!(generated.contains("pub mod upload"));
     assert!(generated.contains("pub mod mirror"));
     assert!(generated.contains("pub mod camera_raw"));
+    assert!(generated.contains("SELIUM_CONTRACT_CODEC_MAJOR_VERSION"));
+    assert!(generated.contains("impl selium_abi::CanonicalSerialize for Frame"));
+    assert!(generated.contains("encode_canonical"));
+}
+
+#[test]
+fn shared_conformance_fixture_suite_passes_reference_codec() {
+    let report = run_fixture_suite(&ReferenceCodec, &canonical_contract_fixture_suite());
+    report
+        .into_result()
+        .expect("shared conformance suite should pass reference codec");
 }
 
 #[test]

@@ -109,7 +109,7 @@ pub(super) fn generate_http_service_module(
             quote!(Ok(body))
         } else {
             quote!(
-                selium_abi::decode_rkyv::<#response_body_type>(&body)
+                selium_abi::decode_canonical::<#response_body_type>(&body)
                     .context("decode buffered response body")
             )
         };
@@ -131,7 +131,7 @@ pub(super) fn generate_http_service_module(
         let response_body_expr = if response_body_schema == "bytes" {
             quote!(response.clone())
         } else {
-            quote!(selium_abi::encode_rkyv(response).context("encode buffered response body")?)
+            quote!(selium_abi::encode_canonical(response).context("encode buffered response body")?)
         };
         quote! {
             pub async fn respond_buffered(
@@ -307,7 +307,7 @@ pub(super) fn generate_quic_service_module(service: &ServiceDef) -> TokenStream 
     let request_body_expr = if request_body_schema == "bytes" {
         quote!(request.clone())
     } else {
-        quote!(selium_abi::encode_rkyv(request).context("encode QUIC request")?)
+        quote!(selium_abi::encode_canonical(request).context("encode QUIC request")?)
     };
 
     let response_decode_expr = if response_body_schema == "bytes" {
@@ -315,7 +315,7 @@ pub(super) fn generate_quic_service_module(service: &ServiceDef) -> TokenStream 
     } else {
         quote!(
             Ok(Some(
-                selium_abi::decode_rkyv::<#response_type>(&response.body)
+                selium_abi::decode_canonical::<#response_type>(&response.body)
                     .context("decode QUIC response")?,
             ))
         )
@@ -325,7 +325,7 @@ pub(super) fn generate_quic_service_module(service: &ServiceDef) -> TokenStream 
         quote!(let request = buffered.body;)
     } else {
         quote!(
-            let request = selium_abi::decode_rkyv::<#request_type>(&buffered.body)
+            let request = selium_abi::decode_canonical::<#request_type>(&buffered.body)
                 .context("decode QUIC request")?;
         )
     };
@@ -333,7 +333,7 @@ pub(super) fn generate_quic_service_module(service: &ServiceDef) -> TokenStream 
     let response_body_expr = if response_body_schema == "bytes" {
         quote!(response.clone())
     } else {
-        quote!(selium_abi::encode_rkyv(response).context("encode QUIC response")?)
+        quote!(selium_abi::encode_canonical(response).context("encode QUIC response")?)
     };
 
     quote! {
@@ -435,7 +435,7 @@ pub(super) fn generate_stream_module(stream: &StreamDef) -> TokenStream {
         quote!(
             stream
                 .send(
-                    selium_abi::encode_rkyv(payload).context("encode QUIC stream payload")?,
+                    selium_abi::encode_canonical(payload).context("encode QUIC stream payload")?,
                     true,
                     timeout_ms,
                 )
@@ -446,7 +446,7 @@ pub(super) fn generate_stream_module(stream: &StreamDef) -> TokenStream {
         quote!(Ok(payload))
     } else {
         quote!(
-            selium_abi::decode_rkyv::<#payload_type>(&payload)
+            selium_abi::decode_canonical::<#payload_type>(&payload)
                 .context("decode QUIC stream payload")
         )
     };
@@ -500,7 +500,7 @@ fn field_to_string_expr(access: TokenStream, ty: &str, context: &str) -> TokenSt
         "bool" | "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
             quote!((#access).to_string())
         }
-        _ => quote!(selium_abi::encode_rkyv(&(#access)).context(#context)?.len().to_string()),
+        _ => quote!(selium_abi::encode_canonical(&(#access)).context(#context)?.len().to_string()),
     }
 }
 
@@ -612,6 +612,20 @@ mod tests {
         assert!(tokens.contains("{camera_id}"));
         assert!(tokens.contains("x-ts-ms"));
         assert!(tokens.contains("parse :: < u64 >"));
+        assert!(tokens.contains("encode_canonical"));
+        assert!(tokens.contains("decode_canonical"));
+    }
+
+    #[test]
+    fn typed_stream_module_uses_canonical_codec() {
+        let tokens = generate_stream_module(&StreamDef {
+            name: "camera.frames".to_string(),
+            payload_schema: "Frame".to_string(),
+        })
+        .to_string();
+
+        assert!(tokens.contains("encode_canonical"));
+        assert!(tokens.contains("decode_canonical"));
     }
 
     #[test]
@@ -624,7 +638,7 @@ mod tests {
 
         assert!(tokens.contains("stream"));
         assert!(tokens.contains("payload . clone ()"));
-        assert!(!tokens.contains("encode_rkyv"));
-        assert!(!tokens.contains("decode_rkyv"));
+        assert!(!tokens.contains("encode_canonical"));
+        assert!(!tokens.contains("decode_canonical"));
     }
 }

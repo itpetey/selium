@@ -28,10 +28,31 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct WorkerStatus {
     pub worker_id: u32,
     pub phase: String,
+}
+impl selium_abi::CanonicalSerialize for WorkerStatus {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.worker_id)?;
+        encoder.encode_value(&self.phase)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for WorkerStatus {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            worker_id: decoder.decode_value()?,
+            phase: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_SUPERVISOR_WORKER_STATUS: &str = "supervisor.worker_status";

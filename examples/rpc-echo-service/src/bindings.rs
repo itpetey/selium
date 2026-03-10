@@ -28,6 +28,7 @@ pub struct ServiceBinding {
     pub request_body: ServiceBodyBinding,
     pub response_body: ServiceBodyBinding,
 }
+pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 = selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
 #[allow(dead_code)]
 fn __selium_extract_path_params(
     template: &str,
@@ -85,11 +86,51 @@ pub struct EchoRequest {
     pub correlation_id: u32,
     pub body: String,
 }
+impl selium_abi::CanonicalSerialize for EchoRequest {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.correlation_id)?;
+        encoder.encode_value(&self.body)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for EchoRequest {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            correlation_id: decoder.decode_value()?,
+            body: decoder.decode_value()?,
+        })
+    }
+}
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct EchoResponse {
     pub correlation_id: u32,
     pub echoed: String,
+}
+impl selium_abi::CanonicalSerialize for EchoResponse {
+    fn encode_to(
+        &self,
+        encoder: &mut selium_abi::CanonicalEncoder,
+    ) -> Result<(), selium_abi::ContractCodecError> {
+        encoder.encode_value(&self.correlation_id)?;
+        encoder.encode_value(&self.echoed)?;
+        Ok(())
+    }
+}
+impl selium_abi::CanonicalDeserialize for EchoResponse {
+    fn decode_from(
+        decoder: &mut selium_abi::CanonicalDecoder<'_>,
+    ) -> Result<Self, selium_abi::ContractCodecError> {
+        Ok(Self {
+            correlation_id: decoder.decode_value()?,
+            echoed: decoder.decode_value()?,
+        })
+    }
 }
 pub const EVENT_ECHO_REQUESTED: &str = "echo.requested";
 pub const EVENT_ECHO_RESPONDED: &str = "echo.responded";

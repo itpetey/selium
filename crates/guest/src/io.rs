@@ -10,8 +10,9 @@
 use std::collections::BTreeMap;
 
 use selium_abi::{
-    DataValue, GuestResourceId, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueRole,
-    QueueStatusCode, decode_rkyv, encode_rkyv,
+    CanonicalDeserialize, CanonicalSerialize, DataValue, GuestResourceId, QueueCommit, QueueCreate,
+    QueueDelivery, QueueOverflow, QueueRole, QueueStatusCode, decode_canonical, decode_rkyv,
+    encode_canonical,
 };
 use thiserror::Error;
 
@@ -50,9 +51,8 @@ pub struct TypedReceivedMessage<T> {
 
 /// Guest-facing abstraction for managed endpoint bindings used by high-level I/O helpers.
 ///
-/// This is implemented for structured `DataValue` bindings and the current encoded byte form,
-/// allowing guest code to migrate away from explicit `encode_rkyv` calls without breaking
-/// existing flows.
+/// This is implemented for structured `DataValue` bindings and the encoded byte form, allowing
+/// guest code to pass managed bindings around without exposing the underlying codec choice.
 pub trait ManagedBindings {
     /// Resolve one channel binding from a managed bindings payload.
     ///
@@ -321,7 +321,7 @@ impl ReceivedMessage {
 
 impl<T> PayloadEncode for T
 where
-    T: selium_abi::RkyvEncode,
+    T: CanonicalSerialize,
 {
     fn encode_payload(&self) -> Result<Vec<u8>, IoError> {
         encode_payload_value(self)
@@ -330,10 +330,7 @@ where
 
 impl<T> PayloadDecode for T
 where
-    T: rkyv::Archive + Sized,
-    for<'a> T::Archived: 'a
-        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    T: CanonicalDeserialize,
 {
     fn decode_payload(bytes: &[u8]) -> Result<Self, IoError> {
         decode_payload_value(bytes)
@@ -428,21 +425,21 @@ fn managed_endpoint_channel_from_value(
 }
 
 fn decode_managed_bindings(bytes: &[u8]) -> Result<DataValue, IoError> {
-    decode_rkyv::<DataValue>(bytes).map_err(|err| IoError::DecodeManagedBindings(err.to_string()))
+    decode_canonical::<DataValue>(bytes).or_else(|canonical_err| {
+        decode_rkyv::<DataValue>(bytes).map_err(|rkyv_err| {
+            IoError::DecodeManagedBindings(format!(
+                "{canonical_err}; rkyv fallback also failed: {rkyv_err}"
+            ))
+        })
+    })
 }
 
-fn encode_payload_value<T: selium_abi::RkyvEncode>(value: &T) -> Result<Vec<u8>, IoError> {
-    encode_rkyv(value).map_err(|err| IoError::EncodePayload(err.to_string()))
+fn encode_payload_value<T: CanonicalSerialize>(value: &T) -> Result<Vec<u8>, IoError> {
+    encode_canonical(value).map_err(|err| IoError::EncodePayload(err.to_string()))
 }
 
-fn decode_payload_value<T>(bytes: &[u8]) -> Result<T, IoError>
-where
-    T: rkyv::Archive + Sized,
-    for<'a> T::Archived: 'a
-        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
-{
-    decode_rkyv(bytes).map_err(|err| IoError::DecodePayload(err.to_string()))
+fn decode_payload_value<T: CanonicalDeserialize>(bytes: &[u8]) -> Result<T, IoError> {
+    decode_canonical(bytes).map_err(|err| IoError::DecodePayload(err.to_string()))
 }
 
 #[cfg(test)]
@@ -524,6 +521,17 @@ mod tests {
     #[test]
     fn managed_event_channel_accepts_structured_bindings() {
         let bindings = managed_bindings_value();
+
+        let channel = managed_endpoint_channel(&bindings, "writers", "event", "shared")
+            .expect("event binding present");
+
+        assert_eq!(channel.queue_shared_id, 11);
+        assert_eq!(channel.max_frame_bytes, 256);
+    }
+
+    #[test]
+    fn managed_event_channel_accepts_legacy_rkyv_encoded_bindings() {
+        let bindings = selium_abi::encode_rkyv(&managed_bindings_value()).expect("encode bindings");
 
         let channel = managed_endpoint_channel(&bindings, "writers", "event", "shared")
             .expect("event binding present");
@@ -657,6 +665,28 @@ mod tests {
     struct TestPayload {
         topic: String,
         version: u32,
+    }
+
+    impl CanonicalSerialize for TestPayload {
+        fn encode_to(
+            &self,
+            encoder: &mut selium_abi::CanonicalEncoder,
+        ) -> Result<(), selium_abi::ContractCodecError> {
+            encoder.encode_value(&self.topic)?;
+            encoder.encode_value(&self.version)?;
+            Ok(())
+        }
+    }
+
+    impl CanonicalDeserialize for TestPayload {
+        fn decode_from(
+            decoder: &mut selium_abi::CanonicalDecoder<'_>,
+        ) -> Result<Self, selium_abi::ContractCodecError> {
+            Ok(Self {
+                topic: decoder.decode_value()?,
+                version: decoder.decode_value()?,
+            })
+        }
     }
 
     struct OversizedPayload;

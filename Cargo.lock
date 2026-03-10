@@ -1591,6 +1591,7 @@ name = "selium-abi"
 version = "0.1.0-alpha.0"
 dependencies = [
  "rkyv",
+ "selium-control-plane-api",
  "thiserror 2.0.18",
 ]
 
@@ -1603,6 +1604,8 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rkyv",
+ "serde",
+ "serde_json",
  "syn",
  "thiserror 2.0.18",
 ]
