@@ -10,14 +10,14 @@ This repository is the temporary monorepo for Selium's next architecture:
 
 ## Layout
 
-- `crates/{abi,kernel,runtime,guest}`: imported runtime/kernel/ABI guest baseline
+- `crates/{abi,kernel,runtime,guest}`: core ABI, runtime, and guest crates, including `selium-abi` for shared value/encoding types and the guest-facing `selium-guest` surface
 - `crates/cli`: CLI entrypoint
 - `crates/control-plane/*`: control-plane APIs, scheduler, runtime state machine, and daemon protocol
 - `crates/io/*`: generic host-managed I/O substrate (`consensus`, `tables`)
   - `.../core`: communication primitives and transport abstractions
   - `.../durability`: retention/replay/checkpoints
 - `crates/runtime/adaptors/*`: adapter SPI and engine-specific adapters
-- `crates/sdk/rust`: SDK runtime surface
+- `crates/sdk/rust`: host-side Rust SDK (`selium-sdk-rust`) for publish/subscribe/replay outside guest modules
 - `examples/`: end-user guest module projects that can be built and deployed onto a Selium runtime
 - `modules/*`: first-party system modules
   - `.../control-plane`: guest-side control-plane module + re-exported policy/runtime interfaces
@@ -31,11 +31,11 @@ Core scaffolding plus first functional cut is in place:
 - Scheduler and control-plane reconcile + runtime daemon actuation hooks
 - Runtime adapter validation (`wasmtime` executable, `microvm` stubbed/non-executable)
 - Core-io I/O with in-memory or kernel (queue+SHM) transport
-- Guest-side I/O facade (`selium_guest::io`) on queue + shared memory
+- Guest-side `selium-guest` entrypoints, executor helpers, and `selium_guest::io` facade on queue + shared memory
 - File-backed durable replay/checkpoints for channel persistence
 - Host-managed Raft primitives (`selium-io-consensus`) and table/view engine (`selium-io-tables`)
 - Control-plane runtime engine built atop committed Raft log entries with node registration/heartbeat
-- Rust SDK typed and byte-level publish/subscribe APIs
+- Host-side Rust SDK (`selium-sdk-rust`) typed and byte-level publish/subscribe APIs
 - CLI daemon-backed workflow (`deploy`, `connect`, `scale`, `observe`, `replay`, `nodes`, `idl`)
 - CLI runtime lifecycle commands (`start`, `stop`, `list`) with node targeting
 - Agent reconciliation loop command (`agent`) for schedule→start/stop execution via daemon APIs
@@ -58,7 +58,15 @@ Use [`examples/README.md`](examples/README.md) for the current example projects:
 
 ## Orientation
 
-If you're familiar with the previous architecture and need a map to the new codebase, start with [`docs/ORIENTATION.md`](docs/ORIENTATION.md).
+If you need a map to the current codebase and docs surface, start with [`docs/index.mdx`](docs/index.mdx).
+
+From there, use:
+
+- [`docs/index.mdx`](docs/index.mdx) for the platform overview and workflow split
+- [`docs/applications.mdx`](docs/applications.mdx) for `selium-guest` / `selium_guest`
+- [`docs/rust-sdk.mdx`](docs/rust-sdk.mdx) for `selium-sdk-rust`
+- [`docs/examples.mdx`](docs/examples.mdx) for example selection by workflow and guest API surface
+- [`docs/runtime.mdx`](docs/runtime.mdx) and [`docs/control-plane.mdx`](docs/control-plane.mdx) for daemon and reconciliation details
 
 ## Validation
 

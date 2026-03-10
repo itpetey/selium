@@ -7,10 +7,12 @@ Selium is a developer-first platform for running WebAssembly workloads as isolat
 
 - `selium-runtime` runs the local daemon, owns the work directory, terminates mTLS, and boots the control plane.
 - `selium` is the operational and control-plane CLI: `start`, `stop`, `list`, `deploy`, `connect`, `scale`, `observe`, `replay`, `nodes`, `agent`, and `idl`.
-- `selium_guest` is the guest-side API for entrypoints, process orchestration, managed I/O, network, storage, queue, shared-memory, session, and time hostcalls.
-- `selium-sdk-rust` is the host/client-side SDK for typed publishing, subscription, and replay outside a guest module.
+- `selium-guest` (`selium_guest` in Rust code) is the main guest-side crate: entrypoints, executor helpers, and guest hostcalls for I/O, process orchestration, network, storage, queue, shared memory, session, and time.
+- `selium-sdk-rust` (`selium_sdk_rust` in Rust code) is the host/client-side SDK for typed or byte-level publish/subscribe and replay outside a guest module.
 
 Selium still has the same core promise: strong isolation, explicit authority, and composable APIs. What changed is the mental model. The current workflow is contract-first and daemon-first.
+
+If your Rust code compiles into a Selium guest WASM module, start with `selium-guest`. If it runs alongside or outside the runtime, start with `selium-sdk-rust` instead. The shared ABI layer behind both stories is `selium-abi`, which defines guest-facing value types plus the `rkyv`-oriented encode/decode helpers used across guest and host Rust APIs.
 
 ## The current mental model
 
@@ -25,10 +27,11 @@ That split is intentional. Direct `start` is great for local iteration and one-o
 
 ## What Selium applications look like now
 
-Applications are plain WASM modules with entrypoints. Selium passes typed arguments across the ABI boundary, and public endpoint launches also prepend a bindings payload that guests use directly for managed event readers and writers. Service and stream workloads use generated helpers over `selium_guest::network`.
+Applications are plain WASM modules with entrypoints. Selium passes typed arguments across the ABI boundary through `selium-abi`, and public endpoint launches also prepend a bindings payload that guests use directly for managed event readers and writers. Service and stream workloads use generated helpers over `selium_guest::network`.
 
-In practice, most applications use a small set of building blocks:
+In practice, most guest modules use a small set of building blocks:
 
+- the crate-root `#[selium_guest::entrypoint]` macro plus `spawn`, `yield_now`, and `shutdown`
 - `selium_guest::io` for managed public event bindings
 - `selium_guest::process::ProcessBuilder` to start other Selium processes
 - `selium_guest::network` for daemon-managed ingress and egress plus generated service/stream sessions
@@ -60,8 +63,9 @@ Use these when you want stable identities and wiring between workloads:
 
 - Start with [Getting started](./getting-started) to run a local daemon and launch a real example.
 - Use [Examples](./examples) to pick a workflow before you go deeper.
+- Read [Guest API](./applications) for the `selium-guest` crate root, entrypoints, managed bindings, capabilities, and `ProcessBuilder`.
+- Read [Rust SDK](./rust-sdk) when your Rust code runs outside a guest module but still needs Selium publish/subscribe or replay flows.
 - Read [CLI](./cli) for the direct `start` / `stop` loop and the higher-level `deploy` / `connect` / `agent` flow.
-- Read [Guest API](./applications) for entrypoints, managed bindings, capabilities, and `ProcessBuilder`.
 - Keep [Runtime](./runtime) and [Control Plane](./control-plane) nearby when you need daemon config, workload identities, or reconciliation details.
 
 _Selium is still evolving quickly, but the daemon + CLI + contracts + workloads model is the one to learn against today._

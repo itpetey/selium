@@ -1,3 +1,9 @@
+//! Guest-side executor utilities used by Selium entrypoints.
+//!
+//! These helpers provide a small cooperative async surface for guest code: spawn background work,
+//! yield to let other tasks progress, wait for runtime shutdown, or drive a future to completion
+//! in native tests and low-level integration points.
+
 use core::{
     cell::RefCell,
     future::Future,
@@ -218,7 +224,7 @@ impl<T> JoinState<T> {
     }
 }
 
-/// Handle for awaiting the result of a spawned task.
+/// Future returned by [`spawn`] that resolves to the spawned task's output.
 pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
 }
@@ -293,7 +299,11 @@ pub fn wake(task_id: GuestUint) {
     host_wakers::wake(task_id);
 }
 
-/// Spawn a future so it can make progress alongside other guest tasks.
+/// Spawn `future` so it can make progress alongside other guest tasks.
+///
+/// The returned [`JoinHandle`] can be awaited for the task's output. Spawned work is cooperative:
+/// it advances when the guest executor continues polling, such as inside an entrypoint or
+/// [`block_on`].
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -319,12 +329,15 @@ where
     JoinHandle { state }
 }
 
-/// Yield execution to the guest scheduler once.
+/// Cooperatively yield once so other guest tasks can make progress.
 pub async fn yield_now() {
     YieldNow { yielded: false }.await;
 }
 
-/// Resolve when the runtime begins shutting this guest down.
+/// Wait until the runtime begins shutting the current guest down.
+///
+/// Long-running service loops can await this to start a graceful shutdown path when the host asks
+/// the guest to exit.
 pub async fn shutdown() {
     #[cfg(target_arch = "wasm32")]
     unsafe {
@@ -357,7 +370,10 @@ pub fn __signal_shutdown_for_tests() {
     });
 }
 
-/// Block on a future using Selium's guest-side executor.
+/// Drive `fut` to completion using Selium's guest-side executor.
+///
+/// This is primarily useful for native tests and low-level integration points. Real guest
+/// entrypoints are normally driven by the runtime rather than calling `block_on` directly.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     pin_mut!(fut);
     let wake_state = Arc::new(LocalWake::new());

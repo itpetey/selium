@@ -1,19 +1,50 @@
 ---
 title: "Rust SDK"
-description: "Use selium-sdk-rust for host-side publish, subscribe, and replay workflows."
+description: "Host-side Rust SDK for Selium publish, subscribe, and replay workflows."
 ---
 
-`selium-sdk-rust` is the host/client-side Rust facade for Selium's communication primitives. Use it when your code is **not** running as a guest module but still needs to publish, subscribe, or replay Selium data.
+`selium-sdk-rust` is the host-side Rust SDK for Selium publish, subscribe, and replay flows. Use it when your code is **not** running as a Selium WASM guest but still needs to interact with Selium channels.
+
+Typical users include tests, sidecars, adapters, ingest tools, and operator utilities. If your code is running inside a Selium guest module, use [Guest API](./applications) and the `selium-guest` crate instead.
 
 ## Start with a Context
 
-The SDK centers on `Context`:
+The SDK centers on `Context`, the host/client entry point for creating channels, publishing messages, subscribing, and replaying retained frames:
 
 - `Context::new()` for the default in-memory setup
-- `Context::builder()` when you want to inject a specific `CoreIo`
+- `Context::builder().with_core_io(...)` when you want to inject a specific `CoreIo`
+- `runtime_settings()` when you want to inspect the current runtime metadata on the context
 - `set_runtime_encoding(...)` when the runtime needs to enforce a particular encoding policy
 
-The default runtime encoding is `rkyv`, which matches the current contract and guest tooling story.
+The default runtime metadata records `rkyv`, which matches the current contract and guest tooling story. Typed publishers and subscribers in this crate still encode payloads as `rkyv` today even if you update the stored setting with `set_runtime_encoding(...)`.
+
+## Quick example
+
+```rust
+use rkyv::{Archive, Deserialize, Serialize};
+use selium_abi::decode_rkyv;
+use selium_io_core::ChannelKind;
+use selium_io_durability::{ReplayStart, RetentionPolicy};
+use selium_sdk_rust::Context;
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+struct DemoEvent {
+    id: u64,
+}
+
+let context = Context::new();
+context.ensure_channel("demo.events", ChannelKind::Event, RetentionPolicy::default())?;
+
+context
+    .publisher::<DemoEvent>("demo.events")
+    .publish(DemoEvent { id: 7 })?;
+
+let replay = context.replay_bytes("demo.events", ReplayStart::Earliest, 1)?;
+let event: DemoEvent = decode_rkyv(&replay[0])?;
+assert_eq!(event.id, 7);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## Create or reuse channels
 
@@ -22,28 +53,28 @@ The SDK exposes channel lifecycle directly:
 - `create_channel(name, ChannelKind, RetentionPolicy)`
 - `ensure_channel(name, ChannelKind, RetentionPolicy)`
 
-The current channel kinds are `Event`, `Rpc`, and `Stream`. Retention is configured with `RetentionPolicy { max_entries }`.
+The current channel kinds are `Event`, `Rpc`, and `Stream`. Retention is configured with `RetentionPolicy { max_entries }`, and `ensure_channel(...)` also validates that an existing channel still has the requested kind.
 
 ## Typed and byte-oriented publish/subscribe
 
 You can work at two levels:
 
-- `publisher<T>` and `subscriber<T>` for typed `rkyv` payloads
-- `byte_publisher` and `byte_subscriber` for raw byte frames
+- `publisher<T>` and `subscriber<T>(..., ReplayStart::...)` for typed `rkyv` payloads
+- `byte_publisher` and `byte_subscriber(..., ReplayStart::...)` for raw byte frames
 
-Typed publishers automatically encode payloads as `application/rkyv`. Subscribers decode them back into Rust types on receipt.
+Typed publishers automatically encode payloads as `application/rkyv`. Typed subscribers decode them back into Rust types on receipt. Use the byte-oriented API when you already have encoded frames or need interoperability with non-Rust producers and consumers.
 
 ## Replay and backfill
 
 Replay is part of the public SDK surface.
 
-- `subscriber(..., ReplayStart::Earliest | Latest | Sequence | Timestamp | Checkpoint)` lets you join a stream at the right point
+- `subscriber(..., ReplayStart::Earliest | Latest | Sequence | Timestamp | Checkpoint)` lets you start from the right point in retained channel history
 - `replay_bytes(channel, start, limit)` gives host-side tools a simple backfill path
 
 That makes the SDK useful for tests, ingest tools, sidecars, diagnostics, and adapters that need to bootstrap from history before switching to live traffic.
 
 ## When to use the SDK vs the guest crate
 
-- Use `selium-sdk-rust` for host-side or external Rust processes.
-- Use [Guest API](./applications) when the code is running inside a Selium WASM guest.
+- Use `selium-sdk-rust` for host-side or external Rust processes that need channels, publish/subscribe, or replay.
+- Use [Guest API](./applications) when the code is running inside a Selium WASM guest and needs guest hostcalls or managed bindings.
 - Use [Data Plane](./channels) when you want the broader mental model for events, services, streams, retention, and replay.

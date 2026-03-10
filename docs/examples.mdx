@@ -3,9 +3,11 @@ title: "Examples"
 description: "Choose the Selium example that matches the workflow or API you want to learn."
 ---
 
-Selium's examples are the fastest way to see the current platform in context. Each one includes a checked-in `.selium` contract and generated Rust bindings, but they do not all use the same operational path: `control-plane-topology` is the full `idl publish` → `deploy` → `connect` → `agent --once` flow, most single-module examples run against a daemon with `selium start` / `selium stop`, and the network examples run directly in `selium-runtime` with shipped runtime configs and stop with `Ctrl-C`.
+Selium's examples are the fastest way to see the current platform in context. Most of them are guest-module examples built around `selium-guest`, checked-in `.selium` contracts, and generated Rust bindings. If you need host-side publish/subscribe or replay flows outside a guest module, start with [Rust SDK](./rust-sdk) instead.
 
-Start with the shared setup in [examples/README.md](https://github.com/itpetey/selium/tree/main/examples). If you only read one example first, read [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology): it shows the current `idl publish` → `deploy` → `connect` → `agent --once` workflow end to end.
+The examples do not all use the same operational path: `control-plane-topology` is the full `idl publish` → `deploy` → `connect` → `agent --once` flow, most single-module examples run against a daemon with `selium start` / `selium stop`, and the network examples run directly in `selium-runtime` with shipped runtime configs and stop with `Ctrl-C`.
+
+Start with the shared setup in [examples/README.md](https://github.com/itpetey/selium/tree/main/examples). If you only read one example first, read [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology): it shows the current `idl publish` → `deploy` → `connect` → `agent --once` workflow end to end. Keep [Guest API](./applications) nearby for `selium-guest` reference details while you work through the guest examples.
 
 ## Choose by workflow
 
@@ -35,7 +37,7 @@ These examples use a running daemon plus `selium start` / `selium stop`, either 
 - [network-http-rpc](https://github.com/itpetey/selium/tree/main/examples/network-http-rpc): HTTPS request/response RPC over `selium_guest::network` with generated typed client/server helpers.
 - [network-quic-stream](https://github.com/itpetey/selium/tree/main/examples/network-quic-stream): raw QUIC stream I/O over the guest network layer with generated typed stream helpers.
 
-## Choose by API surface
+## Choose by guest API surface
 
 - **Control-plane workflow**: [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology)
 - **Direct CLI launch with `start --module-spec`**: [typed-entrypoints](https://github.com/itpetey/selium/tree/main/examples/typed-entrypoints)
@@ -43,6 +45,8 @@ These examples use a running daemon plus `selium start` / `selium stop`, either 
 - **`selium_guest::network`**: [network-http-rpc](https://github.com/itpetey/selium/tree/main/examples/network-http-rpc), [network-quic-stream](https://github.com/itpetey/selium/tree/main/examples/network-quic-stream)
 - **Managed event bindings and generated contract helpers**: [rpc-echo-service](https://github.com/itpetey/selium/tree/main/examples/rpc-echo-service), [event-broadcast](https://github.com/itpetey/selium/tree/main/examples/event-broadcast), [pipeline-transform](https://github.com/itpetey/selium/tree/main/examples/pipeline-transform), [scatter-gather](https://github.com/itpetey/selium/tree/main/examples/scatter-gather), [stateful-counter](https://github.com/itpetey/selium/tree/main/examples/stateful-counter), [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology)
 - **Restartable or stateful guest logic**: [stateful-counter](https://github.com/itpetey/selium/tree/main/examples/stateful-counter)
+
+If you are looking for host-side Rust integrations instead of guest modules, use [Rust SDK](./rust-sdk) rather than the example index.
 
 ## Example index
 
@@ -58,3 +62,5 @@ These examples use a running daemon plus `selium start` / `selium stop`, either 
 - [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology) — `contracts/analytics.topology.v1.selium`
 
 All example READMEs follow the same basic shape: `## Setup`, `## Contracts`, and `## Usage`. If you are updating a contract, regenerate the checked-in bindings before you build or deploy the example.
+
+Need the reference docs behind the examples? Read [Guest API](./applications) for `selium-guest`, [Rust SDK](./rust-sdk) for host-side channel workflows, and [Control Plane](./control-plane) for the reconciled `idl publish` → `deploy` → `connect` → `agent` path.

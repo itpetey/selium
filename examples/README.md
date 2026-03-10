@@ -1,6 +1,6 @@
 # Examples
 
-These examples are meant to be copied, built, and deployed by end users. Each project is a single guest module crate that validates its own discovery-managed messaging flow during startup and then stays alive until you stop it with `selium stop`.
+These examples are meant to be copied, built, and run by end users, but they do not all use the same operational path. Most directories are single guest-module crates that run against a daemon with `selium start` / `selium stop`, `control-plane-topology/` is the multi-workload `idl publish` / `deploy` / `connect` / `agent --once` reference, and the network examples run directly in `selium-runtime` with their shipped runtime configs.
 
 ## Projects
 
@@ -17,7 +17,7 @@ These examples are meant to be copied, built, and deployed by end users. Each pr
 
 ## Setup
 
-These examples assume you already have a Selium runtime daemon running. For local development from this repository, the smallest useful setup is:
+These examples assume you already have a Selium runtime daemon running. For local development from this repository, use the same daemon + CLI setup as `docs/getting-started.mdx`:
 
 ```bash
 cargo build -p selium-runtime -p selium
@@ -43,13 +43,13 @@ With an existing runtime, set these shell variables once and reuse them for any 
 ```bash
 export SELIUM_DAEMON=127.0.0.1:7100
 export SELIUM_NODE=local-node
-export SELIUM_WORK_DIR=/path/to/runtime/work-dir
-export SELIUM_CERT_DIR=/path/to/runtime/certs
+export SELIUM_WORK_DIR=$PWD/.selium-local
+export SELIUM_CERT_DIR=$SELIUM_WORK_DIR/certs
 ```
 
 Each example README includes a `## Setup`, `## Contracts`, and `## Usage` section with the exact commands for that project.
 
-Most single-crate examples bind their contract-defined endpoints directly on `start` with `--event-reader` and `--event-writer`. `control-plane-topology/` shows the same discovery-first model driven through the full `idl publish`, `deploy`, `connect`, and `agent --once` control-plane workflow.
+Most single-module examples bind their contract-defined endpoints directly on `start` with `--event-reader` and `--event-writer`. `typed-entrypoints/` shows the same daemon-backed path with `start --module-spec`, `control-plane-topology/` shows the full `idl publish`, `deploy`, `connect`, and `agent --once` control-plane workflow, and the network examples use `selium-runtime --config ... --module ...` directly with their checked-in `runtime.toml` files.
 
 ## Contracts
 

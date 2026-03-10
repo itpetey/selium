@@ -1,11 +1,11 @@
 ---
 title: "Guest API"
-description: "Programming guest modules with selium_guest in the current Selium model."
+description: "Programming guest modules with the selium-guest crate in the current Selium model."
 ---
 
-In Selium, an application is a WebAssembly module with one or more `#[selium_guest::entrypoint]` functions. The runtime starts those entrypoints as isolated processes and gives them only the capabilities, bindings, and managed resources you asked for.
+`selium-guest` is the main crate used inside guest modules compiled for the Selium runtime. In Rust source the package is imported as `selium_guest`, and a typical guest crate exposes one or more `#[selium_guest::entrypoint]` functions.
 
-There is no guest operating system inside the module. Instead, guest code uses `selium_guest` to talk to the host for I/O, process lifecycle, networking, storage, time, queue, and shared-memory operations.
+There is no guest operating system inside the module. Instead, guest code uses `selium_guest` to talk to the host for lifecycle, I/O, networking, storage, time, queue, and shared-memory operations. Most guests start with the crate-root helpers (`entrypoint`, `spawn`, `yield_now`, `shutdown`) and then move into the capability-specific modules they need.
 
 ## Module IDs and the work directory
 
@@ -23,17 +23,20 @@ Entrypoints are the guest functions the runtime is allowed to invoke. They are y
 In Rust, you annotate them with `#[selium_guest::entrypoint]`:
 
 ```rust
-use anyhow::Result;
-use selium_abi::DataValue;
+use std::time::Duration;
 
 #[selium_guest::entrypoint]
-pub async fn launch(bindings: DataValue, service: &str, retries: i32) -> Result<()> {
-    // Your process logic here.
+pub async fn start() -> Result<(), ()> {
+    let worker = selium_guest::spawn(async {
+        let _ = selium_guest::time::sleep(Duration::from_millis(10)).await;
+    });
+
+    worker.await;
     Ok(())
 }
 ```
 
-The important part is not just that entrypoints exist, but that Selium can pass typed ABI arguments into them. That is how the same module can expose multiple operational entrypoints such as `start`, `launch`, `reconfigure`, or worker-style child entrypoints started from another guest.
+That small example matches the crate's root surface: declare an entrypoint, optionally spawn guest tasks, and reach into modules like `time` from there. Entrypoints can also take typed ABI arguments, which is how the same module can expose multiple operational entrypoints such as `start`, `launch`, `reconfigure`, or worker-style child entrypoints started from another guest.
 
 ## Arguments
 
@@ -59,15 +62,16 @@ That is why many current examples begin like this:
 ```rust
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
-    let bindings = selium_abi::encode_rkyv(&bindings)?;
     let mut writer = selium_guest::io::managed_event_writer(&bindings, "echo.requested", 1).await?;
     Ok(())
 }
 ```
 
+`selium_guest::io` accepts either structured `DataValue` bindings or the current encoded byte form, so most new guest code can pass the bindings value directly.
+
 Use these helpers when you want the runtime or control plane to wire public event endpoints for you.
 
-For public services and streams, the generated bindings layer uses `selium_guest::network` sessions and the RPC/stream helpers instead. That is the pattern used by the current network examples and the surface to learn against for service and stream workloads.
+For public services and streams, the generated bindings layer uses `selium_guest::network::Session` handles plus the `selium_guest::network::rpc` and `selium_guest::network::stream` helpers. Reach for `listen(...)` when the runtime has already provisioned an inbound binding, and `connect(...)` / `quic::connect(...)` / `http::connect(...)` when the guest is opening an outbound session.
 
 ## ProcessBuilder
 
@@ -98,16 +102,16 @@ Grant as little authority as possible. For direct CLI launches, `selium start --
 
 ## Guest API surface
 
-The guest crate is intentionally split by host domain:
+The guest crate keeps its root surface intentionally small and splits the rest by host domain:
 
+- `selium_guest::entrypoint`, `spawn`, `yield_now`, and `shutdown` at the crate root for entrypoints and guest task coordination
+- `selium_guest::process`, `session`, and `time` for lifecycle-oriented hostcalls
 - `selium_guest::io` for managed public event bindings
-- `selium_guest::process` for guest-started child processes
 - `selium_guest::network` for managed ingress/egress sessions, streams, and RPC
 - `selium_guest::storage` for runtime-managed durable logs and blob stores
 - `selium_guest::queue` and `selium_guest::shm` for lower-level data-plane control
-- `selium_guest::session` and `selium_guest::time` for lifecycle and timing primitives
 
-Most user code should start with `io`, `process`, and the contract-generated bindings from `selium idl compile`, then reach for the lower-level modules only when you need more control.
+Most user code should start with the crate-root helpers, `io`, `process`, and the contract-generated bindings from `selium idl compile`, then reach for the lower-level modules only when you need more control.
 
 ## Choosing a launch path
 

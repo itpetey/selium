@@ -73,9 +73,11 @@ export SELIUM_WORK_DIR=$PWD/.selium-local
 export SELIUM_CERT_DIR=$SELIUM_WORK_DIR/certs
 ```
 
+Those same `SELIUM_*` variables are the shared setup reused by the daemon-backed examples in `examples/README.md`.
+
 ## 4. Run the `rpc-echo-service` example
 
-This repository already includes current examples built around the present mental model. We'll use `examples/rpc-echo-service`, which exercises contract publication plus managed public event bindings.
+This repository already includes current examples built around the present mental model. We'll use `examples/rpc-echo-service`, which follows the direct daemon + CLI path: publish a contract, launch a module with managed public event bindings, then inspect and stop it operationally.
 
 Change into the example directory:
 
@@ -159,7 +161,8 @@ cargo run -p selium -- \
 
 ## Next steps
 
-- Read [CLI](./cli) when you want the full command surface in one place.
-- Read [Guest API](./applications) to understand entrypoints, managed bindings, `ProcessBuilder`, and capability grants.
-- Read [Examples](./examples) to choose the next workflow to learn.
-- When you want the full desired-state workflow, pair [Control Plane](./control-plane) with `examples/control-plane-topology`: that is the reference `idl publish` + `deploy` + `connect` + `agent --once` flow.
+- Read [CLI](./cli) for the direct `start` / `stop` loop and the higher-level `deploy` / `connect` / `agent` flow.
+- Read [Guest API](./applications) for entrypoints, managed bindings, `ProcessBuilder`, and generated network helpers.
+- Read [Examples](./examples) to choose the next workflow to learn; the shared local setup lives in `examples/README.md`.
+- Keep [Runtime](./runtime) and [Control Plane](./control-plane) nearby when you need daemon config, workload identities, or reconciliation details.
+- When you want the full desired-state workflow, use `examples/control-plane-topology`: that is the reference `idl publish` + `deploy` + `connect` + `agent --once` flow.

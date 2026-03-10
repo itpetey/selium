@@ -1,7 +1,30 @@
-//! Guest-side helpers for Selium hostcalls.
+//! Guest-side APIs for writing Selium modules.
 //!
-//! This crate mirrors the current Selium hostcall surface:
-//! session, process, time, shared-memory, queue, and network operations.
+//! `selium-guest` is the main crate used inside guest modules compiled for the Selium runtime.
+//! A typical guest crate exposes one or more async entrypoints with [`entrypoint`], coordinates
+//! work with helpers like [`spawn`], [`yield_now`], and [`shutdown`], and calls capability-
+//! specific modules such as [`process`], [`session`], and [`time`] from those entrypoints.
+//!
+//! The crate keeps the root surface intentionally small:
+//!
+//! - the crate root re-exports the entrypoint macro and executor helpers used by most guests,
+//! - modules such as [`process`], [`session`], and [`time`] cover lifecycle-oriented hostcalls,
+//! - modules such as [`io`], [`network`], [`queue`], and [`shm`] expose data-plane operations.
+//!
+//! # Example
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! #[selium_guest::entrypoint]
+//! pub async fn start() -> Result<(), ()> {
+//!     let worker = selium_guest::spawn(async {
+//!         let _ = selium_guest::time::sleep(Duration::from_millis(10)).await;
+//!     });
+//!
+//!     worker.await;
+//!     Ok(())
+//! }
+//! ```
 
 extern crate self as selium_guest;
 
@@ -98,12 +121,12 @@ pub mod shm;
 pub mod storage;
 pub mod time;
 
-/// Re-export of the `rkyv` crate used for internal Selium serialisation.
+/// Re-export of the `rkyv` crate for guest code that needs Selium-compatible serialisation.
 pub use rkyv;
 
 pub use r#async::{block_on, shutdown, spawn, yield_now};
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use r#async::{__reset_shutdown_for_tests, __signal_shutdown_for_tests};
-/// Re-export of supported Selium macros for guest crates.
+/// Attribute macro for declaring async guest entrypoints that the Selium runtime can invoke.
 pub use selium_guest_macros::entrypoint;

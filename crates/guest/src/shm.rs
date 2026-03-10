@@ -1,4 +1,8 @@
-//! Guest-facing helpers for shared-memory hostcalls.
+//! Low-level shared-memory hostcalls for guest modules.
+//!
+//! Shared memory is typically used together with [`crate::queue`] for larger payload transfer. Most
+//! applications can prefer [`crate::io`] unless they need to manage offsets and attachments
+//! directly.
 
 use rkyv::Archive;
 use selium_abi::{
@@ -12,7 +16,10 @@ const SHM_DESCRIPTOR_CAPACITY: usize = core::mem::size_of::<<ShmDescriptor as Ar
 const RESOURCE_ID_CAPACITY: usize = core::mem::size_of::<<GuestResourceId as Archive>::Archived>();
 const READ_RESULT_OVERHEAD: usize = RKYV_VEC_OVERHEAD + core::mem::size_of::<u64>();
 
-/// Allocate a shared-memory region.
+/// Allocate a guest-owned shared-memory region.
+///
+/// The returned descriptor includes both the local resource id and the shareable id used by other
+/// participants to [`attach`].
 pub async fn alloc(size: GuestUint, align: GuestUint) -> Result<ShmDescriptor, DriverError> {
     let args = encode_args(&ShmAlloc { size, align })?;
     DriverFuture::<shm_alloc::Module, RkyvDecoder<ShmDescriptor>>::new(
@@ -23,7 +30,7 @@ pub async fn alloc(size: GuestUint, align: GuestUint) -> Result<ShmDescriptor, D
     .await
 }
 
-/// Share a local shared-memory resource.
+/// Convert an existing local shared-memory resource id into a shareable identifier.
 pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverError> {
     let args = encode_args(&ShmShare { resource_id })?;
     DriverFuture::<shm_share::Module, RkyvDecoder<GuestResourceId>>::new(
@@ -34,7 +41,7 @@ pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverErro
     .await
 }
 
-/// Attach a shared-memory resource by shared handle.
+/// Attach to a shared-memory region using its shared identifier.
 pub async fn attach(shared_id: GuestResourceId) -> Result<ShmDescriptor, DriverError> {
     let args = encode_args(&ShmAttach { shared_id })?;
     DriverFuture::<shm_attach::Module, RkyvDecoder<ShmDescriptor>>::new(
@@ -45,7 +52,7 @@ pub async fn attach(shared_id: GuestResourceId) -> Result<ShmDescriptor, DriverE
     .await
 }
 
-/// Detach a local shared-memory handle.
+/// Detach a local shared-memory handle when it is no longer needed.
 pub async fn detach(resource_id: GuestUint) -> Result<(), DriverError> {
     let args = encode_args(&ShmDetach { resource_id })?;
     DriverFuture::<shm_detach::Module, RkyvDecoder<()>>::new(&args, 0, RkyvDecoder::new())?.await?;
@@ -53,6 +60,8 @@ pub async fn detach(resource_id: GuestUint) -> Result<(), DriverError> {
 }
 
 /// Read bytes from a shared-memory region.
+///
+/// `offset` and `len` are interpreted relative to the attached region described by the resource id.
 pub async fn read(
     resource_id: GuestUint,
     offset: GuestUint,
@@ -72,7 +81,7 @@ pub async fn read(
     .await
 }
 
-/// Write bytes into a shared-memory region.
+/// Write bytes into a shared-memory region starting at the given offset.
 pub async fn write(
     resource_id: GuestUint,
     offset: GuestUint,

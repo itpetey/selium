@@ -1,4 +1,12 @@
-//! Shared Application Binary Interface helpers for Selium host ↔ guest calls.
+//! Low-level Application Binary Interface helpers for Selium host ↔ guest calls.
+//!
+//! Most guest crates should prefer higher-level APIs such as `selium-guest` or SDK wrappers.
+//! Reach for `selium-abi` when you need to work with the exact request/response payloads,
+//! capability identifiers, hostcall symbol metadata, or rkyv encoding used at the ABI boundary.
+//!
+//! The types in this crate describe the currently exposed wire format and helper utilities. They
+//! are intended to make low-level integration easier, but they do not promise more stability than
+//! the public API surface documented here.
 
 use rkyv::{
     Archive, Deserialize, Serialize,
@@ -95,7 +103,10 @@ impl<T> RkyvEncode for T where
 {
 }
 
-/// Runtime value container used in control-plane/table/query responses.
+/// Dynamically typed value used in ABI payloads that need JSON-like data.
+///
+/// This is primarily used when a hostcall returns structured data without a dedicated strongly
+/// typed schema.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(serialize_bounds(
     __S: rkyv::ser::Writer + rkyv::ser::Allocator,
@@ -106,29 +117,41 @@ impl<T> RkyvEncode for T where
     __C: rkyv::validation::ArchiveContext,
 )))]
 pub enum DataValue {
+    /// Absent value.
     Null,
+    /// Boolean value.
     Bool(bool),
+    /// Unsigned 64-bit integer.
     U64(u64),
+    /// Signed 64-bit integer.
     I64(i64),
+    /// UTF-8 string value.
     String(String),
+    /// Arbitrary binary payload.
     Bytes(Vec<u8>),
+    /// Ordered list of nested values.
     List(#[rkyv(omit_bounds)] Vec<DataValue>),
+    /// String-keyed map of nested values.
     Map(#[rkyv(omit_bounds)] BTreeMap<String, DataValue>),
 }
 
 impl DataValue {
+    /// Construct a null value.
     pub fn null() -> Self {
         Self::Null
     }
 
+    /// Construct a list value.
     pub fn list(values: Vec<DataValue>) -> Self {
         Self::List(values)
     }
 
+    /// Construct a map value.
     pub fn map(values: BTreeMap<String, DataValue>) -> Self {
         Self::Map(values)
     }
 
+    /// Look up a field by key when this value is a map.
     pub fn get(&self, key: &str) -> Option<&DataValue> {
         match self {
             DataValue::Map(map) => map.get(key),
@@ -136,6 +159,7 @@ impl DataValue {
         }
     }
 
+    /// Borrow the inner list when this value is a [`DataValue::List`].
     pub fn as_array(&self) -> Option<&[DataValue]> {
         match self {
             DataValue::List(values) => Some(values.as_slice()),
@@ -143,6 +167,7 @@ impl DataValue {
         }
     }
 
+    /// Borrow the inner string when this value is a [`DataValue::String`].
     pub fn as_str(&self) -> Option<&str> {
         match self {
             DataValue::String(value) => Some(value.as_str()),
@@ -150,6 +175,7 @@ impl DataValue {
         }
     }
 
+    /// Return the contained boolean when this value is a [`DataValue::Bool`].
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             DataValue::Bool(value) => Some(*value),
@@ -157,6 +183,7 @@ impl DataValue {
         }
     }
 
+    /// Return the contained integer when this value is a [`DataValue::U64`].
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             DataValue::U64(value) => Some(*value),
@@ -231,24 +258,43 @@ pub enum DriverPollResult {
 )]
 #[rkyv(bytecheck())]
 pub enum Capability {
+    /// Create, remove, or modify session entitlements.
     SessionLifecycle = 0,
+    /// Start and inspect guest processes.
     ProcessLifecycle = 1,
+    /// Read clocks or sleep.
     TimeRead = 2,
+    /// Allocate, share, or attach shared memory.
     SharedMemory = 3,
+    /// Create, share, attach, or close queues.
     QueueLifecycle = 4,
+    /// Reserve, commit, or cancel queue writes.
     QueueWriter = 5,
+    /// Wait for and acknowledge queue frames.
     QueueReader = 6,
+    /// Open listeners and generic network sessions.
     NetworkLifecycle = 7,
+    /// Initiate outbound network sessions.
     NetworkConnect = 8,
+    /// Accept inbound network sessions.
     NetworkAccept = 9,
+    /// Read from byte streams.
     NetworkStreamRead = 10,
+    /// Write to byte streams.
     NetworkStreamWrite = 11,
+    /// Initiate outbound RPC exchanges.
     NetworkRpcClient = 12,
+    /// Accept and respond to inbound RPC exchanges.
     NetworkRpcServer = 13,
+    /// Open or close storage resources.
     StorageLifecycle = 14,
+    /// Replay durable log data or query log metadata.
     StorageLogRead = 15,
+    /// Append to durable logs or manage checkpoints.
     StorageLogWrite = 16,
+    /// Load blobs or resolve manifests.
     StorageBlobRead = 17,
+    /// Store blobs or update manifests.
     StorageBlobWrite = 18,
 }
 
@@ -282,7 +328,10 @@ impl Capability {
 #[error("unknown capability identifier")]
 pub struct CapabilityDecodeError;
 
-/// Scalar value kinds supported by the ABI.
+/// Concrete scalar value carried across the ABI boundary.
+///
+/// Values narrower than a guest word are widened when lowered into a [`CallPlan`], while `i64`
+/// and `u64` values are split across two guest words.
 #[derive(Debug, Clone, Copy, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum AbiScalarValue {
@@ -308,7 +357,7 @@ pub enum AbiScalarValue {
     F64(f64),
 }
 
-/// Scalar kinds that can be part of an ABI signature.
+/// Scalar shapes that can appear in an [`AbiSignature`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum AbiScalarType {
@@ -340,11 +389,14 @@ pub enum AbiScalarType {
 pub enum AbiParam {
     /// An immediate scalar value.
     Scalar(AbiScalarType),
-    /// A byte buffer passed via (ptr, len) pair.
+    /// A byte buffer lowered to a `(ptr, len)` pair in guest words.
     Buffer,
 }
 
 /// Description of a guest entrypoint's parameters and results.
+///
+/// Use this when you need to validate or lower low-level calls without depending on a generated
+/// binding.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct AbiSignature {
@@ -352,17 +404,20 @@ pub struct AbiSignature {
     results: Vec<AbiParam>,
 }
 
-/// Values supplied for a call.
+/// Runtime value supplied for one ABI parameter.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum AbiValue {
     /// Scalar argument.
     Scalar(AbiScalarValue),
-    /// Buffer argument (passed via pointer/length).
+    /// Buffer argument that will be passed via pointer and length.
     Buffer(Vec<u8>),
 }
 
-/// Planned argument + buffer layout suitable for host execution.
+/// Planned argument and buffer layout suitable for host execution.
+///
+/// A [`CallPlan`] expands high-level [`AbiValue`] inputs into the guest-word arguments expected by
+/// the ABI and records any backing memory writes needed for buffer parameters.
 #[derive(Debug, Clone)]
 pub struct CallPlan {
     args: Vec<AbiScalarValue>,
@@ -370,7 +425,7 @@ pub struct CallPlan {
     base_offset: GuestUint,
 }
 
-/// Host-side write required to materialise a buffer value.
+/// Host-side write required to materialize a buffer value referenced by a [`CallPlan`].
 #[derive(Debug, Clone)]
 pub struct MemoryWrite {
     /// Offset inside the guest linear memory.
@@ -472,6 +527,7 @@ impl Display for Capability {
 }
 
 impl AbiScalarValue {
+    /// Return the scalar kind represented by this value.
     pub fn kind(&self) -> AbiScalarType {
         match self {
             AbiScalarValue::I8(_) => AbiScalarType::I8,
@@ -489,14 +545,17 @@ impl AbiScalarValue {
 }
 
 impl AbiSignature {
+    /// Construct a signature from parameter and result shapes.
     pub fn new(params: Vec<AbiParam>, results: Vec<AbiParam>) -> Self {
         Self { params, results }
     }
 
+    /// Borrow the declared parameter list.
     pub fn params(&self) -> &[AbiParam] {
         &self.params
     }
 
+    /// Borrow the declared result list.
     pub fn results(&self) -> &[AbiParam] {
         &self.results
     }
@@ -569,10 +628,15 @@ impl From<Vec<u8>> for AbiValue {
 }
 
 impl CallPlan {
+    /// Build a call plan using [`DEFAULT_BUFFER_BASE`] for transient buffers.
     pub fn new(signature: &AbiSignature, values: &[AbiValue]) -> Result<Self, CallPlanError> {
         Self::with_base(signature, values, DEFAULT_BUFFER_BASE)
     }
 
+    /// Build a call plan using an explicit starting offset for transient buffers.
+    ///
+    /// The returned plan contains flattened guest-word arguments and any memory writes required to
+    /// materialize buffer payloads before the call executes.
     pub fn with_base(
         signature: &AbiSignature,
         values: &[AbiValue],
@@ -651,14 +715,17 @@ impl CallPlan {
         })
     }
 
+    /// Borrow the flattened guest-word parameters for the call.
     pub fn params(&self) -> &[AbiScalarValue] {
         &self.args
     }
 
+    /// Borrow the guest-memory writes needed for buffer parameters.
     pub fn memory_writes(&self) -> &[MemoryWrite] {
         &self.writes
     }
 
+    /// Return the starting offset used when laying out transient buffers.
     pub fn base_offset(&self) -> GuestUint {
         self.base_offset
     }
@@ -682,7 +749,7 @@ impl TryFrom<GuestUint> for DriverPollResult {
     }
 }
 
-/// Encode a value into rkyv bytes using Selium's settings.
+/// Encode a value into rkyv bytes using the same settings expected by Selium hostcalls.
 pub fn encode_rkyv<T>(value: &T) -> Result<Vec<u8>, RkyvError>
 where
     T: RkyvEncode,
@@ -692,7 +759,7 @@ where
         .map_err(|err| RkyvError::Encode(err.to_string()))
 }
 
-/// Decode a value from rkyv bytes using Selium's settings.
+/// Decode a value from rkyv bytes using the same settings expected by Selium hostcalls.
 pub fn decode_rkyv<T>(bytes: &[u8]) -> Result<T, RkyvError>
 where
     T: Archive + Sized,
@@ -703,6 +770,8 @@ where
 }
 
 /// Encode a human-readable driver error message for guest consumption.
+///
+/// The returned payload is a little-endian `u32` byte length followed by the rkyv-encoded string.
 pub fn encode_driver_error_message(message: &str) -> Result<Vec<u8>, RkyvError> {
     let encoded = encode_rkyv(&message.to_string())?;
     let len = u32::try_from(encoded.len()).map_err(|_| {
@@ -730,6 +799,9 @@ pub fn decode_driver_error_message(bytes: &[u8]) -> Result<String, RkyvError> {
     decode_rkyv::<String>(payload)
 }
 
+/// Encode a successful driver poll result containing `len` payload bytes.
+///
+/// Returns `None` when `len` would collide with the reserved high-bit marker space.
 pub fn driver_encode_ready(len: GuestUint) -> Option<GuestUint> {
     if len > DRIVER_RESULT_READY_MAX {
         None
@@ -738,6 +810,10 @@ pub fn driver_encode_ready(len: GuestUint) -> Option<GuestUint> {
     }
 }
 
+/// Encode a driver poll error result.
+///
+/// A zero code is normalized to [`DRIVER_ERROR_MESSAGE_CODE`] because the high-bit marker alone is
+/// reserved for [`DriverPollResult::Pending`].
 pub fn driver_encode_error(mut code: GuestUint) -> GuestUint {
     if code == 0 {
         code = DRIVER_ERROR_MESSAGE_CODE;
@@ -745,6 +821,7 @@ pub fn driver_encode_error(mut code: GuestUint) -> GuestUint {
     DRIVER_RESULT_SPECIAL_FLAG | (code & DRIVER_RESULT_READY_MAX)
 }
 
+/// Decode a raw driver poll word into its semantic result.
 pub fn driver_decode_result(word: GuestUint) -> DriverPollResult {
     if word < DRIVER_RESULT_SPECIAL_FLAG {
         DriverPollResult::Ready(word)

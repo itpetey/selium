@@ -1,4 +1,8 @@
-//! Guest-facing helpers for queue control-plane hostcalls.
+//! Low-level queue hostcalls for guest modules.
+//!
+//! These functions expose the underlying queue primitives used by higher-level helpers such as
+//! [`crate::io`]. Reach for this module when you need explicit control over queue creation,
+//! reservations, acknowledgements, or stats.
 
 use rkyv::Archive;
 use selium_abi::{
@@ -21,7 +25,9 @@ const QUEUE_RESERVE_RESULT_CAPACITY: usize =
 const QUEUE_WAIT_RESULT_CAPACITY: usize =
     core::mem::size_of::<<QueueWaitResult as Archive>::Archived>();
 
-/// Create a queue and return local + shared handles.
+/// Create a queue and return both the local resource id and the shared id.
+///
+/// The shared id can be passed to other guests or stored in bindings so they can call [`attach`].
 pub async fn create(input: QueueCreate) -> Result<QueueDescriptor, DriverError> {
     let args = encode_args(&input)?;
     DriverFuture::<queue_create::Module, RkyvDecoder<QueueDescriptor>>::new(
@@ -32,7 +38,7 @@ pub async fn create(input: QueueCreate) -> Result<QueueDescriptor, DriverError> 
     .await
 }
 
-/// Share a local queue handle and return shared id.
+/// Convert an existing local queue resource id into a shareable queue identifier.
 pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverError> {
     let args = encode_args(&QueueShare { resource_id })?;
     DriverFuture::<queue_share::Module, RkyvDecoder<GuestResourceId>>::new(
@@ -43,7 +49,7 @@ pub async fn share(resource_id: GuestUint) -> Result<GuestResourceId, DriverErro
     .await
 }
 
-/// Attach to a shared queue as reader or writer.
+/// Attach to a shared queue as the requested reader or writer role.
 pub async fn attach(
     shared_id: GuestResourceId,
     role: QueueRole,
@@ -57,7 +63,9 @@ pub async fn attach(
     .await
 }
 
-/// Close a queue or endpoint local handle.
+/// Close a local queue or endpoint handle.
+///
+/// This does not revoke any previously-issued shared ids.
 pub async fn close(resource_id: GuestUint) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&QueueClose { resource_id })?;
     DriverFuture::<queue_close::Module, RkyvDecoder<QueueStatus>>::new(
@@ -68,7 +76,7 @@ pub async fn close(resource_id: GuestUint) -> Result<QueueStatus, DriverError> {
     .await
 }
 
-/// Retrieve queue stats for a local queue handle.
+/// Retrieve runtime-reported statistics for a local queue handle.
 pub async fn stats(queue_id: GuestUint) -> Result<QueueStatsResult, DriverError> {
     let args = encode_args(&QueueStats { queue_id })?;
     DriverFuture::<queue_stats::Module, RkyvDecoder<QueueStatsResult>>::new(
@@ -79,7 +87,9 @@ pub async fn stats(queue_id: GuestUint) -> Result<QueueStatsResult, DriverError>
     .await
 }
 
-/// Reserve writer capacity for one frame.
+/// Reserve capacity for one outbound frame on a writer endpoint.
+///
+/// The returned reservation id must be committed with [`commit`] or released with [`cancel`].
 pub async fn reserve(
     endpoint_id: GuestUint,
     len: u32,
@@ -98,7 +108,7 @@ pub async fn reserve(
     .await
 }
 
-/// Commit a previously reserved writer frame.
+/// Commit a previously reserved frame after writing its payload to shared memory.
 pub async fn commit(input: QueueCommit) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&input)?;
     DriverFuture::<queue_commit::Module, RkyvDecoder<QueueStatus>>::new(
@@ -109,7 +119,7 @@ pub async fn commit(input: QueueCommit) -> Result<QueueStatus, DriverError> {
     .await
 }
 
-/// Cancel a previously reserved writer frame.
+/// Cancel a previously reserved frame without committing payload data.
 pub async fn cancel(
     endpoint_id: GuestUint,
     reservation_id: u64,
@@ -127,6 +137,9 @@ pub async fn cancel(
 }
 
 /// Wait for the next readable frame on a reader endpoint.
+///
+/// Inspect the returned status code to distinguish successful delivery from timeout or other
+/// runtime conditions.
 pub async fn wait(endpoint_id: GuestUint, timeout_ms: u32) -> Result<QueueWaitResult, DriverError> {
     let args = encode_args(&QueueWait {
         endpoint_id,
@@ -140,7 +153,7 @@ pub async fn wait(endpoint_id: GuestUint, timeout_ms: u32) -> Result<QueueWaitRe
     .await
 }
 
-/// Acknowledge one delivered frame sequence.
+/// Acknowledge one delivered frame sequence so the runtime can release reader-side state.
 pub async fn ack(endpoint_id: GuestUint, seq: u64) -> Result<QueueStatus, DriverError> {
     let args = encode_args(&QueueAck { endpoint_id, seq })?;
     DriverFuture::<queue_ack::Module, RkyvDecoder<QueueStatus>>::new(

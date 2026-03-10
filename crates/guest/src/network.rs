@@ -1,4 +1,9 @@
-//! Protocol-neutral guest network APIs.
+//! Guest-facing network APIs for listeners, sessions, streams, and RPC exchanges.
+//!
+//! The top-level functions open protocol-specific listeners or client sessions. Once a session is
+//! established, use [`stream`] for byte-stream interactions or [`rpc`] for request/response style
+//! exchanges. The lightweight [`quic`] and [`http`] helpers simply preselect a protocol for
+//! [`connect`].
 
 use rkyv::Archive;
 use selium_abi::{
@@ -28,7 +33,7 @@ const RPC_ACCEPT_CAPACITY: usize = 2048;
 const RPC_RESPOND_CAPACITY: usize = 1024;
 const RPC_BODY_READ_CAPACITY: usize = 2048;
 
-/// Error returned by the guest network APIs.
+/// Error returned by guest network operations.
 #[derive(Debug, Error)]
 pub enum NetworkError {
     #[error(transparent)]
@@ -46,45 +51,45 @@ enum RpcBodyKind {
     Response,
 }
 
-/// Guest-visible listener handle.
+/// Handle for an inbound listener opened by the runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listener {
     descriptor: NetworkListenerDescriptor,
 }
 
-/// Guest-visible protocol session handle.
+/// Handle for a connected protocol session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     descriptor: NetworkSessionDescriptor,
 }
 
-/// Guest-visible stream handle.
+/// Handle for one stream interaction within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamChannel {
     resource_id: u32,
 }
 
-/// Guest-visible outbound RPC exchange.
+/// Handle for an outbound RPC exchange started by a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientExchange {
     descriptor: NetworkRpcClientExchangeDescriptor,
 }
 
-/// Guest-visible RPC body reader.
+/// Reader for an RPC request or response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyReader {
     descriptor: NetworkRpcBodyReaderDescriptor,
     kind: RpcBodyKind,
 }
 
-/// Guest-visible RPC body writer.
+/// Writer for an RPC request or response body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyWriter {
     descriptor: NetworkRpcBodyWriterDescriptor,
     kind: RpcBodyKind,
 }
 
-/// Accepted inbound RPC request plus response exchange handle.
+/// Accepted inbound RPC request together with the handle used to send the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerExchange {
     descriptor: NetworkRpcExchangeDescriptor,
@@ -93,14 +98,19 @@ pub struct ServerExchange {
 }
 
 impl Listener {
+    /// Return the transport/application protocol selected for this listener.
     pub fn protocol(&self) -> NetworkProtocol {
         self.descriptor.protocol
     }
 
+    /// Return the interaction kinds the listener supports for accepted sessions.
     pub fn interactions(&self) -> &[InteractionKind] {
         self.descriptor.interactions.as_slice()
     }
 
+    /// Wait for the next incoming session.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn accept(&self, timeout_ms: u32) -> Result<Option<Session>, NetworkError> {
         let args = encode_args(&NetworkAccept {
             listener_id: self.descriptor.resource_id,
@@ -124,26 +134,33 @@ impl Listener {
         }
     }
 
+    /// Close the listener handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(listener)").await
     }
 }
 
 impl Session {
+    /// Return the protocol in use for this session.
     pub fn protocol(&self) -> NetworkProtocol {
         self.descriptor.protocol
     }
 
+    /// Return the interaction kinds negotiated for this session.
     pub fn interactions(&self) -> &[InteractionKind] {
         self.descriptor.interactions.as_slice()
     }
 
+    /// Close the session handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(session)").await
     }
 }
 
 impl StreamChannel {
+    /// Send one stream chunk.
+    ///
+    /// Set `finish` to `true` on the final chunk to indicate end-of-stream.
     pub async fn send(
         &self,
         bytes: impl Into<Vec<u8>>,
@@ -165,6 +182,9 @@ impl StreamChannel {
         ensure_ok("stream.send", status.code)
     }
 
+    /// Receive the next stream chunk.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn recv(
         &self,
         max_bytes: u32,
@@ -190,12 +210,16 @@ impl StreamChannel {
         }
     }
 
+    /// Close the stream handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.resource_id, "close(stream)").await
     }
 }
 
 impl BodyReader {
+    /// Receive the next RPC body chunk.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn recv(
         &self,
         max_bytes: u32,
@@ -233,6 +257,9 @@ impl BodyReader {
         }
     }
 
+    /// Read the entire RPC body into memory.
+    ///
+    /// This helper keeps receiving chunks until a chunk marked `finish` is returned.
     pub async fn read_all(&self, max_bytes: u32, timeout_ms: u32) -> Result<Vec<u8>, NetworkError> {
         let mut body = Vec::new();
         loop {
@@ -248,12 +275,16 @@ impl BodyReader {
         Ok(body)
     }
 
+    /// Close the body reader handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(rpc-body-reader)").await
     }
 }
 
 impl BodyWriter {
+    /// Send one RPC body chunk.
+    ///
+    /// Set `finish` to `true` on the final chunk to indicate end-of-body.
     pub async fn send(
         &self,
         bytes: impl Into<Vec<u8>>,
@@ -281,10 +312,14 @@ impl BodyWriter {
         ensure_ok("rpc.body.send", status.code)
     }
 
+    /// Finish the body without sending additional bytes.
     pub async fn finish(&self, timeout_ms: u32) -> Result<(), NetworkError> {
         self.send(Vec::new(), true, timeout_ms).await
     }
 
+    /// Write an entire body in one call.
+    ///
+    /// Empty bodies are finished with no payload bytes.
     pub async fn write_all(
         &self,
         bytes: impl Into<Vec<u8>>,
@@ -298,12 +333,16 @@ impl BodyWriter {
         }
     }
 
+    /// Close the body writer handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(rpc-body-writer)").await
     }
 }
 
 impl ClientExchange {
+    /// Wait for the RPC response head and response body reader.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn await_response(
         self,
         timeout_ms: u32,
@@ -337,20 +376,24 @@ impl ClientExchange {
         }
     }
 
+    /// Close the client-side exchange handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(rpc-client-exchange)").await
     }
 }
 
 impl ServerExchange {
+    /// Borrow the accepted request head.
     pub fn request_head(&self) -> &NetworkRpcRequestHead {
         &self.request
     }
 
+    /// Borrow the reader for the accepted request body.
     pub fn request_body(&self) -> &BodyReader {
         &self.request_body
     }
 
+    /// Buffer the full request body into memory and return a complete request value.
     pub async fn buffered_request(
         &self,
         max_bytes: u32,
@@ -362,6 +405,9 @@ impl ServerExchange {
         })
     }
 
+    /// Send the response head and, if accepted, obtain a writer for the response body.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn respond_head(
         self,
         response: NetworkRpcResponseHead,
@@ -391,6 +437,7 @@ impl ServerExchange {
         }
     }
 
+    /// Send a complete response, including the body.
     pub async fn respond(
         self,
         response: NetworkRpcResponse,
@@ -406,11 +453,13 @@ impl ServerExchange {
         body.write_all(response.body, timeout_ms).await
     }
 
+    /// Close the server-side exchange handle.
     pub async fn close(self) -> Result<(), NetworkError> {
         close(self.descriptor.resource_id, "close(rpc-exchange)").await
     }
 }
 
+/// Open a named inbound network binding configured by the runtime.
 pub async fn listen(binding_name: impl Into<String>) -> Result<Listener, NetworkError> {
     let args = encode_args(&selium_abi::NetworkListen {
         binding_name: binding_name.into(),
@@ -425,6 +474,7 @@ pub async fn listen(binding_name: impl Into<String>) -> Result<Listener, Network
     Ok(Listener { descriptor })
 }
 
+/// Establish an outbound session using the selected protocol and connection profile.
 pub async fn connect(
     protocol: NetworkProtocol,
     profile_name: impl Into<String>,
@@ -445,9 +495,13 @@ pub async fn connect(
     Ok(Session { descriptor })
 }
 
+/// Stream-oriented helpers for a connected [`Session`].
 pub mod stream {
     use super::*;
 
+    /// Open an outbound stream on an existing session.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn open(session: &Session) -> Result<Option<StreamChannel>, NetworkError> {
         let args = encode_args(&NetworkStreamOpen {
             session_id: session.descriptor.resource_id,
@@ -471,6 +525,9 @@ pub mod stream {
         }
     }
 
+    /// Accept the next inbound stream on an existing session.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn accept(
         session: &Session,
         timeout_ms: u32,
@@ -499,9 +556,13 @@ pub mod stream {
     }
 }
 
+/// RPC-oriented helpers for a connected [`Session`].
 pub mod rpc {
     use super::*;
 
+    /// Start an outbound RPC exchange and obtain a writer for the request body.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn start(
         session: &Session,
         request: NetworkRpcRequestHead,
@@ -541,6 +602,10 @@ pub mod rpc {
         }
     }
 
+    /// Send a complete RPC request and buffer the full response into memory.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout` at either the start
+    /// or response-await step.
     pub async fn invoke(
         session: &Session,
         request: NetworkRpcRequest,
@@ -563,6 +628,9 @@ pub mod rpc {
         )))
     }
 
+    /// Accept the next inbound RPC request on a session.
+    ///
+    /// Returns `Ok(None)` when the runtime reports `WouldBlock` or `Timeout`.
     pub async fn accept(
         session: &Session,
         timeout_ms: u32,
@@ -601,9 +669,11 @@ pub mod rpc {
     }
 }
 
+/// Convenience helpers for QUIC sessions.
 pub mod quic {
     use super::*;
 
+    /// Establish an outbound QUIC session using the named profile and authority.
     pub async fn connect(
         profile_name: impl Into<String>,
         authority: impl Into<String>,
@@ -612,9 +682,11 @@ pub mod quic {
     }
 }
 
+/// Convenience helpers for HTTP sessions.
 pub mod http {
     use super::*;
 
+    /// Establish an outbound HTTP session using the named profile and authority.
     pub async fn connect(
         profile_name: impl Into<String>,
         authority: impl Into<String>,

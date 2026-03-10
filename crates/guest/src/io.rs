@@ -1,4 +1,11 @@
-//! Guest-side channel I/O facade built atop queue + shared-memory hostcalls.
+//! High-level queue-backed messaging helpers for guest modules.
+//!
+//! This module combines [`crate::queue`] and [`crate::shm`] into a simpler send/receive API for
+//! framed messages. Use it when you want byte or typed payload delivery without manually managing
+//! queue reservations and shared-memory attachments yourself.
+//!
+//! For applications that receive runtime-provided endpoint bindings, the managed endpoint helpers
+//! in this module can resolve channel descriptors directly from a bindings payload.
 
 use std::collections::BTreeMap;
 
@@ -10,23 +17,34 @@ use thiserror::Error;
 
 use crate::{queue, shm};
 
+/// Identifies a queue-backed channel that readers and writers can attach to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDescriptor {
+    /// Shared queue identifier passed to [`attach_writer`] or [`attach_reader`].
     pub queue_shared_id: GuestResourceId,
+    /// Maximum number of payload bytes accepted by a writer on this channel.
     pub max_frame_bytes: u32,
 }
 
+/// A message received from a channel reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedMessage {
+    /// Monotonic queue sequence assigned by the runtime.
     pub seq: u64,
+    /// Writer identifier supplied when the sender attached to the channel.
     pub writer_id: u32,
+    /// Raw payload bytes copied out of shared memory.
     pub payload: Vec<u8>,
 }
 
+/// A received message whose payload has already been decoded into a typed value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedReceivedMessage<T> {
+    /// Monotonic queue sequence assigned by the runtime.
     pub seq: u64,
+    /// Writer identifier supplied when the sender attached to the channel.
     pub writer_id: u32,
+    /// Decoded payload value.
     pub payload: T,
 }
 
@@ -36,6 +54,10 @@ pub struct TypedReceivedMessage<T> {
 /// allowing guest code to migrate away from explicit `encode_rkyv` calls without breaking
 /// existing flows.
 pub trait ManagedBindings {
+    /// Resolve one channel binding from a managed bindings payload.
+    ///
+    /// Implementations are expected to look up the requested section/kind/name triple and return
+    /// the queue descriptor needed to attach a reader or writer.
     fn lookup_channel(
         &self,
         section: &str,
@@ -44,16 +66,19 @@ pub trait ManagedBindings {
     ) -> Result<ChannelDescriptor, IoError>;
 }
 
-/// Guest-facing abstraction for typed payloads sent over high-level I/O channels.
+/// Encodes an application value before it is sent over a [`ChannelWriter`].
 pub trait PayloadEncode {
+    /// Serialize this payload into the byte representation written to the channel.
     fn encode_payload(&self) -> Result<Vec<u8>, IoError>;
 }
 
-/// Guest-facing abstraction for typed payloads received from high-level I/O channels.
+/// Decodes a typed payload from bytes received over a [`ChannelReader`].
 pub trait PayloadDecode: Sized {
+    /// Deserialize one payload from the bytes returned by the runtime.
     fn decode_payload(bytes: &[u8]) -> Result<Self, IoError>;
 }
 
+/// Error returned by high-level guest I/O helpers.
 #[derive(Debug, Error)]
 pub enum IoError {
     #[error(transparent)]
@@ -77,6 +102,7 @@ pub enum IoError {
     InvalidManagedBindings(String),
 }
 
+/// Sends framed payloads to one queue-backed channel.
 pub struct ChannelWriter {
     endpoint_id: u32,
     shm_resource_id: u32,
@@ -84,11 +110,16 @@ pub struct ChannelWriter {
     max_frame_bytes: u32,
 }
 
+/// Receives framed payloads from one queue-backed channel.
 pub struct ChannelReader {
     endpoint_id: u32,
     attached_shm: BTreeMap<GuestResourceId, u32>,
 }
 
+/// Create a new queue-backed channel with the given capacity and frame size.
+///
+/// The returned descriptor can be shared with readers and writers in the same guest module or
+/// stored in managed bindings for later attachment.
 pub async fn create_channel(
     capacity_frames: u32,
     max_frame_bytes: u32,
@@ -107,6 +138,10 @@ pub async fn create_channel(
     })
 }
 
+/// Attach a writer endpoint to an existing channel.
+///
+/// The writer allocates a shared-memory buffer sized for the channel's maximum frame length and
+/// reuses it across sends.
 pub async fn attach_writer(
     channel: &ChannelDescriptor,
     writer_id: u32,
@@ -122,6 +157,7 @@ pub async fn attach_writer(
     })
 }
 
+/// Attach a reader endpoint to an existing channel.
 pub async fn attach_reader(channel: &ChannelDescriptor) -> Result<ChannelReader, IoError> {
     let endpoint = queue::attach(channel.queue_shared_id, QueueRole::Reader).await?;
     Ok(ChannelReader {
@@ -130,6 +166,7 @@ pub async fn attach_reader(channel: &ChannelDescriptor) -> Result<ChannelReader,
     })
 }
 
+/// Resolve a managed event-writer endpoint and attach a [`ChannelWriter`] to it.
 pub async fn managed_event_writer<B>(
     bindings: &B,
     endpoint: &str,
@@ -142,6 +179,7 @@ where
     attach_writer(&channel, writer_id).await
 }
 
+/// Resolve a managed event-reader endpoint and attach a [`ChannelReader`] to it.
 pub async fn managed_event_reader<B>(bindings: &B, endpoint: &str) -> Result<ChannelReader, IoError>
 where
     B: ManagedBindings + ?Sized,
@@ -151,6 +189,10 @@ where
 }
 
 impl ChannelWriter {
+    /// Send one raw payload and return the queue sequence assigned to it.
+    ///
+    /// Returns [`IoError::PayloadTooLarge`] when `payload` exceeds the channel's configured frame
+    /// size. Queue timeout or backpressure conditions are surfaced as [`IoError::QueueStatus`].
     pub async fn send(&mut self, payload: &[u8], timeout_ms: u32) -> Result<u64, IoError> {
         let len = payload.len();
         if len > self.max_frame_bytes as usize {
@@ -181,6 +223,7 @@ impl ChannelWriter {
         Ok(reservation.seq)
     }
 
+    /// Encode and send one typed payload.
     pub async fn send_typed<T: PayloadEncode>(
         &mut self,
         payload: &T,
@@ -190,6 +233,7 @@ impl ChannelWriter {
         self.send(&payload, timeout_ms).await
     }
 
+    /// Close the writer endpoint and detach its shared-memory staging buffer.
     pub async fn close(self) -> Result<(), IoError> {
         let endpoint = queue::close(self.endpoint_id).await?;
         ensure_queue_ok("close(writer endpoint)", endpoint.code)?;
@@ -199,6 +243,10 @@ impl ChannelWriter {
 }
 
 impl ChannelReader {
+    /// Wait for the next message on the channel.
+    ///
+    /// Returns `Ok(None)` when the wait times out. Successful reads automatically acknowledge the
+    /// delivered frame after copying its bytes out of shared memory.
     pub async fn recv(&mut self, timeout_ms: u32) -> Result<Option<ReceivedMessage>, IoError> {
         let waited = queue::wait(self.endpoint_id, timeout_ms).await?;
         match waited.code {
@@ -233,6 +281,7 @@ impl ChannelReader {
         }
     }
 
+    /// Wait for the next message and decode it into a typed payload.
     pub async fn recv_typed<T: PayloadDecode>(
         &mut self,
         timeout_ms: u32,
@@ -243,6 +292,7 @@ impl ChannelReader {
             .transpose()
     }
 
+    /// Close the reader endpoint and detach any shared-memory regions attached while receiving.
     pub async fn close(self) -> Result<(), IoError> {
         let endpoint = queue::close(self.endpoint_id).await?;
         ensure_queue_ok("close(reader endpoint)", endpoint.code)?;
@@ -254,10 +304,12 @@ impl ChannelReader {
 }
 
 impl ReceivedMessage {
+    /// Decode the raw payload into a typed value without consuming the message.
     pub fn decode<T: PayloadDecode>(&self) -> Result<T, IoError> {
         T::decode_payload(&self.payload)
     }
 
+    /// Decode the raw payload into a typed value and return a typed message envelope.
     pub fn into_typed<T: PayloadDecode>(self) -> Result<TypedReceivedMessage<T>, IoError> {
         Ok(TypedReceivedMessage {
             seq: self.seq,

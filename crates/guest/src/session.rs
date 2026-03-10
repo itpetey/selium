@@ -1,4 +1,7 @@
 //! Guest-facing helpers for session lifecycle hostcalls.
+//!
+//! These functions let a guest manage child sessions: create them, remove them, grant or revoke
+//! capabilities, and attach or detach specific resources under those capabilities.
 
 use selium_abi::{
     Capability, GuestResourceId, GuestUint, SessionCreate, SessionEntitlement, SessionRemove,
@@ -7,7 +10,9 @@ use selium_abi::{
 
 use crate::driver::{DriverError, DriverFuture, RkyvDecoder, encode_args};
 
-/// Create a new session under `session_id` with the provided public key.
+/// Create a child session beneath `session_id` with the provided public key.
+///
+/// Returns the new child session identifier assigned by the runtime.
 pub async fn create(session_id: GuestUint, pubkey: [u8; 32]) -> Result<GuestUint, DriverError> {
     let args = encode_args(&SessionCreate { session_id, pubkey })?;
     DriverFuture::<session_create::Module, RkyvDecoder<GuestUint>>::new(
@@ -18,7 +23,7 @@ pub async fn create(session_id: GuestUint, pubkey: [u8; 32]) -> Result<GuestUint
     .await
 }
 
-/// Remove a child session.
+/// Remove child session `target_id` from parent session `session_id`.
 pub async fn remove(session_id: GuestUint, target_id: GuestUint) -> Result<(), DriverError> {
     let args = encode_args(&SessionRemove {
         session_id,
@@ -29,7 +34,7 @@ pub async fn remove(session_id: GuestUint, target_id: GuestUint) -> Result<(), D
     Ok(())
 }
 
-/// Grant a capability to a child session.
+/// Grant `capability` from parent session `session_id` to child session `target_id`.
 pub async fn add_entitlement(
     session_id: GuestUint,
     target_id: GuestUint,
@@ -49,7 +54,7 @@ pub async fn add_entitlement(
     Ok(())
 }
 
-/// Remove a capability from a child session.
+/// Revoke `capability` from child session `target_id`.
 pub async fn rm_entitlement(
     session_id: GuestUint,
     target_id: GuestUint,
@@ -69,7 +74,9 @@ pub async fn rm_entitlement(
     Ok(())
 }
 
-/// Grant a resource to a child session capability set.
+/// Grant `resource_id` under `capability` from `session_id` to `target_id`.
+///
+/// Returns `true` when the child's resource set changed.
 pub async fn add_resource(
     session_id: GuestUint,
     target_id: GuestUint,
@@ -91,7 +98,9 @@ pub async fn add_resource(
     Ok(changed != 0)
 }
 
-/// Remove a resource from a child session capability set.
+/// Remove `resource_id` under `capability` from child session `target_id`.
+///
+/// Returns `true` when the child's resource set changed.
 pub async fn rm_resource(
     session_id: GuestUint,
     target_id: GuestUint,

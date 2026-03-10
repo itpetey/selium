@@ -1,4 +1,7 @@
-//! Guest-side time helpers.
+//! Clock and sleep helpers for Selium guests.
+//!
+//! On `wasm32` targets these functions call into the Selium host. When running guest code natively
+//! in tests, they fall back to the local process clock so examples and unit tests can execute.
 
 use std::time::Duration;
 
@@ -15,10 +18,13 @@ use crate::driver::DriverError;
 #[cfg(target_arch = "wasm32")]
 use crate::driver::{DriverFuture, RkyvDecoder, encode_args};
 
-/// Snapshot of the host clock values.
+/// Snapshot returned by [`now`] containing wall-clock and monotonic millisecond values.
 pub use selium_abi::TimeNow as Now;
 
-/// Fetch the current host time values.
+/// Fetch the current host clock snapshot.
+///
+/// The returned [`Now`] contains both `unix_ms` (milliseconds since the Unix epoch) and
+/// `monotonic_ms` (a monotonic counter suitable for measuring elapsed time).
 #[cfg(target_arch = "wasm32")]
 pub async fn now() -> Result<TimeNow, DriverError> {
     let args = encode_args(&())?;
@@ -26,7 +32,7 @@ pub async fn now() -> Result<TimeNow, DriverError> {
         .await
 }
 
-/// Fetch the current time values, using the local clock when running natively.
+/// Fetch the current clock snapshot, using the local process clock when running natively.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn now() -> Result<TimeNow, DriverError> {
     Ok(TimeNow {
@@ -35,7 +41,7 @@ pub async fn now() -> Result<TimeNow, DriverError> {
     })
 }
 
-/// Sleep for the provided duration.
+/// Suspend the current guest task for at least `duration`.
 #[cfg(target_arch = "wasm32")]
 pub async fn sleep(duration: Duration) -> Result<(), DriverError> {
     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
@@ -44,7 +50,7 @@ pub async fn sleep(duration: Duration) -> Result<(), DriverError> {
     Ok(())
 }
 
-/// Sleep for the provided duration using the local clock.
+/// Suspend for at least `duration` using the local process clock.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn sleep(duration: Duration) -> Result<(), DriverError> {
     std::thread::sleep(duration);
