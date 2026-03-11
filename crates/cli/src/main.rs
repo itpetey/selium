@@ -46,13 +46,15 @@ use tokio::{signal, time::sleep};
 
 use crate::{
     config::{
-        AdaptorArg, AgentArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs,
+        AdaptorArg, AgentArgs, AttachArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs,
         DiscoverArgs, IdlArgs, IdlCommand, IdlCompileArgs, IdlPublishArgs, InventoryArgs,
         IsolationArg, ListArgs, NodesArgs, ObserveArgs, ReplayArgs, ScaleArgs, StartArgs, StopArgs,
         UsageArgs, load_cli,
     },
     daemon_client::{DaemonQuicClient, parse_daemon_addr},
 };
+
+const GUEST_LOG_STREAMS: [&str; 2] = ["stdout", "stderr"];
 
 #[tokio::main]
 async fn main() {
@@ -80,6 +82,7 @@ async fn run() -> Result<()> {
                 Command::Discover(args) => cmd_discover(daemon, args).await,
                 Command::Inventory(args) => cmd_inventory(daemon, args).await,
                 Command::Usage(args) => cmd_usage(daemon, args).await,
+                Command::Attach(args) => cmd_attach(daemon, args).await,
                 Command::Nodes(args) => cmd_nodes(daemon, args).await,
                 Command::Start(args) => cmd_start(daemon, args).await,
                 Command::Stop(args) => cmd_stop(daemon, args).await,
@@ -672,6 +675,17 @@ async fn cmd_usage(daemon: Arc<DaemonQuicClient>, args: UsageArgs) -> Result<()>
             .unwrap_or_else(|| "none".to_string())
     );
     Ok(())
+}
+
+async fn cmd_attach(daemon: Arc<DaemonQuicClient>, args: AttachArgs) -> Result<()> {
+    let selector = parse_guest_log_attach_selector(&args.target)?;
+    let streams = selector.stream_names()?;
+    let workload = selector.workload;
+    let _ = daemon;
+    Err(anyhow!(
+        "`selium attach` for {workload} streams [{}] is not available on this branch because the daemon guest-log subscription API is missing",
+        streams.join(", ")
+    ))
 }
 
 async fn cmd_nodes(daemon: Arc<DaemonQuicClient>, args: NodesArgs) -> Result<()> {
@@ -1590,6 +1604,141 @@ fn qualified_pipeline_key(tenant: &str, namespace: &str, pipeline: &str) -> Stri
     format!("{tenant}/{namespace}/{pipeline}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestLogAttachSelector {
+    workload: WorkloadRef,
+    stream_selector: GuestLogStreamSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuestLogStreamSelector {
+    Exact(String),
+    Prefix(String),
+}
+
+fn parse_guest_log_attach_selector(raw: &str) -> Result<GuestLogAttachSelector> {
+    let raw = raw.trim();
+    let (workload_raw, endpoint_raw) = raw.split_once('#').ok_or_else(|| {
+        anyhow!(
+            "attach selector must be formatted as `tenant/namespace/workload#event:stdout`, `...#event:stderr`, or `...#event:std*`"
+        )
+    })?;
+    let workload = parse_attach_workload_ref(workload_raw)?;
+    let (kind_raw, stream_raw) = endpoint_raw.split_once(':').ok_or_else(|| {
+        anyhow!(
+            "attach selector must be formatted as `tenant/namespace/workload#event:stdout`, `...#event:stderr`, or `...#event:std*`"
+        )
+    })?;
+    if kind_raw != ContractKind::Event.as_str() {
+        return Err(anyhow!(
+            "`selium attach` currently only supports guest log event selectors such as `tenant/namespace/workload#event:stdout`"
+        ));
+    }
+    if stream_raw.is_empty() {
+        return Err(anyhow!(
+            "attach selector must include a guest log stream name"
+        ));
+    }
+
+    let stream_selector = if stream_raw.contains('*') {
+        let Some(prefix) = stream_raw.strip_suffix('*') else {
+            return Err(anyhow!(
+                "attach guest log selectors only support a trailing `*` prefix wildcard, for example `tenant/namespace/workload#event:std*`"
+            ));
+        };
+        if prefix.contains('*') {
+            return Err(anyhow!(
+                "attach guest log selectors only support a trailing `*` prefix wildcard, for example `tenant/namespace/workload#event:std*`"
+            ));
+        }
+        GuestLogStreamSelector::Prefix(prefix.to_string())
+    } else {
+        GuestLogStreamSelector::Exact(stream_raw.to_string())
+    };
+
+    Ok(GuestLogAttachSelector {
+        workload,
+        stream_selector,
+    })
+}
+
+fn parse_attach_workload_ref(raw: &str) -> Result<WorkloadRef> {
+    let mut parts = raw.split('/');
+    let (Some(tenant), Some(namespace), Some(name), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(anyhow!(
+            "attach selector workload must be `tenant/namespace/workload`"
+        ));
+    };
+
+    let workload = WorkloadRef {
+        tenant: tenant.to_string(),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+    };
+    workload
+        .validate("attach selector")
+        .map_err(|err| anyhow!(err.to_string()))?;
+    Ok(workload)
+}
+
+impl GuestLogAttachSelector {
+    fn stream_names(&self) -> Result<Vec<String>> {
+        match &self.stream_selector {
+            GuestLogStreamSelector::Exact(name) => {
+                if GUEST_LOG_STREAMS.contains(&name.as_str()) {
+                    Ok(vec![name.clone()])
+                } else {
+                    Err(anyhow!(
+                        "`selium attach` only supports guest log streams `stdout`, `stderr`, or prefix wildcards like `std*`"
+                    ))
+                }
+            }
+            GuestLogStreamSelector::Prefix(prefix) => {
+                let pattern = DiscoveryPattern::Prefix(prefix.clone());
+                let streams = GUEST_LOG_STREAMS
+                    .into_iter()
+                    .filter(|stream| pattern.matches(stream))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if streams.is_empty() {
+                    Err(anyhow!(
+                        "guest log selector `{}#event:{}*` matched no guest log streams; try `stdout`, `stderr`, or `std*`",
+                        self.workload,
+                        prefix
+                    ))
+                } else {
+                    Ok(streams)
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_guest_log_payload(
+    endpoint: &PublicEndpointRef,
+    payload: &[u8],
+    label_streams: bool,
+) -> Vec<u8> {
+    if !label_streams {
+        return payload.to_vec();
+    }
+
+    let prefix = format!("[{}] ", endpoint.name);
+    let text = String::from_utf8_lossy(payload);
+    let mut rendered = Vec::with_capacity(payload.len() + prefix.len());
+    for line in text.split_inclusive('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        rendered.extend_from_slice(prefix.as_bytes());
+        rendered.extend_from_slice(line.as_bytes());
+    }
+    rendered
+}
+
 fn load_agent_state(path: &Path) -> Result<AgentState> {
     if !path.exists() {
         return Ok(AgentState::default());
@@ -2276,5 +2425,55 @@ mod tests {
                 "\"sample\":{\"workload_key\":\"tenant-a/media/ingest\",\"process_id\":\"process-7\",\"attribution\":{\"external_account_ref\":\"acct-123\",\"module_id\":\"ingest.wasm\"},\"window_start_ms\":1000,\"window_end_ms\":2000,\"trigger\":\"Interval\",\"cpu_time_millis\":10,\"memory_high_watermark_bytes\":4096,\"memory_byte_millis\":8192,\"ingress_bytes\":7,\"egress_bytes\":11,\"storage_read_bytes\":13,\"storage_write_bytes\":17}}],\"next_sequence\":42,\"high_watermark\":56}"
             )
         );
+    }
+
+    #[test]
+    fn parse_guest_log_attach_selector_accepts_exact_guest_stream() {
+        let selector = parse_guest_log_attach_selector("tenant-a/media/camera#event:stdout")
+            .expect("selector");
+
+        assert_eq!(
+            selector.workload,
+            workload_ref("tenant-a".into(), "media".into(), "camera".into())
+        );
+        assert_eq!(
+            selector.stream_names().expect("streams"),
+            vec!["stdout".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_guest_log_attach_selector_expands_prefix_to_guest_streams_only() {
+        let selector =
+            parse_guest_log_attach_selector("tenant-a/media/camera#event:std*").expect("selector");
+
+        assert_eq!(
+            selector.stream_names().expect("streams"),
+            vec!["stdout".to_string(), "stderr".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_guest_log_attach_selector_rejects_non_guest_stream_targets() {
+        let err = parse_guest_log_attach_selector("tenant-a/media/camera#event:camera.frames")
+            .expect("selector")
+            .stream_names()
+            .expect_err("non-guest stream should be rejected");
+
+        assert!(err.to_string().contains("only supports guest log streams"));
+    }
+
+    #[test]
+    fn render_guest_log_payload_labels_each_line_when_multiple_streams_are_attached() {
+        let endpoint = PublicEndpointRef {
+            workload: workload_ref("tenant-a".into(), "media".into(), "camera".into()),
+            kind: ContractKind::Event,
+            name: "stderr".to_string(),
+        };
+
+        let rendered = render_guest_log_payload(&endpoint, b"first\nsecond\n", true);
+        let rendered = String::from_utf8(rendered).expect("utf8");
+
+        assert_eq!(rendered, "[stderr] first\n[stderr] second\n");
     }
 }

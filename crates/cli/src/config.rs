@@ -44,6 +44,7 @@ pub(crate) enum Command {
     Discover(DiscoverArgs),
     Inventory(InventoryArgs),
     Usage(UsageArgs),
+    Attach(AttachArgs),
     Nodes(NodesArgs),
     Start(StartArgs),
     Stop(StopArgs),
@@ -192,6 +193,11 @@ pub(crate) struct UsageArgs {
     pub(crate) window_end_ms: Option<u64>,
     #[arg(long)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct AttachArgs {
+    pub(crate) target: String,
 }
 
 #[derive(Debug, Args)]
@@ -355,6 +361,8 @@ enum RawCommand {
     Inventory(RawInventoryArgs),
     /// Export attributed runtime usage records from a specific node daemon.
     Usage(RawUsageArgs),
+    /// Stream live guest logs from a workload-scoped event selector.
+    Attach(RawAttachArgs),
     /// List nodes that are considered live by the control plane.
     Nodes(RawNodesArgs),
     /// Start a specific instance directly on a node.
@@ -587,6 +595,15 @@ struct RawUsageArgs {
     json: bool,
 }
 
+/// Stream live guest logs from a workload-scoped event selector.
+#[derive(Debug, Args, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct RawAttachArgs {
+    /// Guest log selector, for example `tenant/namespace/workload#event:stdout`.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+}
+
 /// List nodes that are currently live.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
@@ -731,6 +748,7 @@ struct CliConfig {
     discover: Option<RawDiscoverArgs>,
     inventory: Option<RawInventoryArgs>,
     usage: Option<RawUsageArgs>,
+    attach: Option<RawAttachArgs>,
     nodes: Option<RawNodesArgs>,
     start: Option<RawStartArgs>,
     stop: Option<RawStopArgs>,
@@ -828,6 +846,7 @@ impl RawCommand {
             RawCommand::Discover(args) => Command::Discover(args.resolve()?),
             RawCommand::Inventory(args) => Command::Inventory(args.resolve()),
             RawCommand::Usage(args) => Command::Usage(args.resolve()?),
+            RawCommand::Attach(args) => Command::Attach(args.resolve()?),
             RawCommand::Nodes(args) => Command::Nodes(args.resolve()),
             RawCommand::Start(args) => Command::Start(args.resolve()?),
             RawCommand::Stop(args) => Command::Stop(args.resolve()?),
@@ -962,6 +981,14 @@ impl RawUsageArgs {
     }
 }
 
+impl RawAttachArgs {
+    fn resolve(self) -> Result<AttachArgs> {
+        Ok(AttachArgs {
+            target: required_arg("attach.target", self.target)?,
+        })
+    }
+}
+
 impl RawNodesArgs {
     fn resolve(self) -> NodesArgs {
         NodesArgs {
@@ -1058,6 +1085,7 @@ fn merge_cli_config(raw: &mut RawCli, matches: &clap::ArgMatches, config: CliCon
         discover,
         inventory,
         usage,
+        attach,
         nodes,
         start,
         stop,
@@ -1070,66 +1098,82 @@ fn merge_cli_config(raw: &mut RawCli, matches: &clap::ArgMatches, config: CliCon
         merge_daemon_connection_config(&mut raw.daemon, matches, daemon);
     }
 
-    match (
-        &mut raw.command,
-        deploy,
-        connect,
-        scale,
-        observe,
-        replay,
-        discover,
-        inventory,
-        usage,
-        nodes,
-        start,
-        stop,
-        list,
-        agent,
-        idl,
-    ) {
-        (RawCommand::Deploy(args), Some(cfg), _, _, _, _, _, _, _, _, _, _, _, _, _) => {
-            merge_deploy_config(args, matches.subcommand_matches("deploy"), cfg);
+    match &mut raw.command {
+        RawCommand::Deploy(args) => {
+            if let Some(cfg) = deploy {
+                merge_deploy_config(args, matches.subcommand_matches("deploy"), cfg);
+            }
         }
-        (RawCommand::Connect(args), _, Some(cfg), _, _, _, _, _, _, _, _, _, _, _, _) => {
-            merge_connect_config(args, matches.subcommand_matches("connect"), cfg);
+        RawCommand::Connect(args) => {
+            if let Some(cfg) = connect {
+                merge_connect_config(args, matches.subcommand_matches("connect"), cfg);
+            }
         }
-        (RawCommand::Scale(args), _, _, Some(cfg), _, _, _, _, _, _, _, _, _, _, _) => {
-            merge_scale_config(args, matches.subcommand_matches("scale"), cfg);
+        RawCommand::Scale(args) => {
+            if let Some(cfg) = scale {
+                merge_scale_config(args, matches.subcommand_matches("scale"), cfg);
+            }
         }
-        (RawCommand::Observe(args), _, _, _, Some(cfg), _, _, _, _, _, _, _, _, _, _) => {
-            merge_observe_config(args, matches.subcommand_matches("observe"), cfg);
+        RawCommand::Observe(args) => {
+            if let Some(cfg) = observe {
+                merge_observe_config(args, matches.subcommand_matches("observe"), cfg);
+            }
         }
-        (RawCommand::Replay(args), _, _, _, _, Some(cfg), _, _, _, _, _, _, _, _, _) => {
-            merge_replay_config(args, matches.subcommand_matches("replay"), cfg);
+        RawCommand::Replay(args) => {
+            if let Some(cfg) = replay {
+                merge_replay_config(args, matches.subcommand_matches("replay"), cfg);
+            }
         }
-        (RawCommand::Discover(args), _, _, _, _, _, Some(cfg), _, _, _, _, _, _, _, _) => {
-            merge_discover_config(args, matches.subcommand_matches("discover"), cfg);
+        RawCommand::Discover(args) => {
+            if let Some(cfg) = discover {
+                merge_discover_config(args, matches.subcommand_matches("discover"), cfg);
+            }
         }
-        (RawCommand::Inventory(args), _, _, _, _, _, _, Some(cfg), _, _, _, _, _, _, _) => {
-            merge_inventory_config(args, matches.subcommand_matches("inventory"), cfg);
+        RawCommand::Inventory(args) => {
+            if let Some(cfg) = inventory {
+                merge_inventory_config(args, matches.subcommand_matches("inventory"), cfg);
+            }
         }
-        (RawCommand::Usage(args), _, _, _, _, _, _, _, Some(cfg), _, _, _, _, _, _) => {
-            merge_usage_config(args, matches.subcommand_matches("usage"), cfg);
+        RawCommand::Usage(args) => {
+            if let Some(cfg) = usage {
+                merge_usage_config(args, matches.subcommand_matches("usage"), cfg);
+            }
         }
-        (RawCommand::Nodes(args), _, _, _, _, _, _, _, _, Some(cfg), _, _, _, _, _) => {
-            merge_nodes_config(args, matches.subcommand_matches("nodes"), cfg);
+        RawCommand::Attach(args) => {
+            if let Some(cfg) = attach {
+                merge_attach_config(args, matches.subcommand_matches("attach"), cfg);
+            }
         }
-        (RawCommand::Start(args), _, _, _, _, _, _, _, _, _, Some(cfg), _, _, _, _) => {
-            merge_start_config(args, matches.subcommand_matches("start"), cfg);
+        RawCommand::Nodes(args) => {
+            if let Some(cfg) = nodes {
+                merge_nodes_config(args, matches.subcommand_matches("nodes"), cfg);
+            }
         }
-        (RawCommand::Stop(args), _, _, _, _, _, _, _, _, _, _, Some(cfg), _, _, _) => {
-            merge_stop_config(args, matches.subcommand_matches("stop"), cfg);
+        RawCommand::Start(args) => {
+            if let Some(cfg) = start {
+                merge_start_config(args, matches.subcommand_matches("start"), cfg);
+            }
         }
-        (RawCommand::List(args), _, _, _, _, _, _, _, _, _, _, _, Some(cfg), _, _) => {
-            merge_list_config(args, matches.subcommand_matches("list"), cfg);
+        RawCommand::Stop(args) => {
+            if let Some(cfg) = stop {
+                merge_stop_config(args, matches.subcommand_matches("stop"), cfg);
+            }
         }
-        (RawCommand::Agent(args), _, _, _, _, _, _, _, _, _, _, _, _, Some(cfg), _) => {
-            merge_agent_config(args, matches.subcommand_matches("agent"), cfg);
+        RawCommand::List(args) => {
+            if let Some(cfg) = list {
+                merge_list_config(args, matches.subcommand_matches("list"), cfg);
+            }
         }
-        (RawCommand::Idl(args), _, _, _, _, _, _, _, _, _, _, _, _, _, Some(cfg)) => {
-            merge_idl_config(args, matches.subcommand_matches("idl"), cfg);
+        RawCommand::Agent(args) => {
+            if let Some(cfg) = agent {
+                merge_agent_config(args, matches.subcommand_matches("agent"), cfg);
+            }
         }
-        _ => {}
+        RawCommand::Idl(args) => {
+            if let Some(cfg) = idl {
+                merge_idl_config(args, matches.subcommand_matches("idl"), cfg);
+            }
+        }
     }
 }
 
@@ -1431,6 +1475,18 @@ fn merge_usage_config(
     merge_bool(&mut args.json, value_source("json"), config.json);
 }
 
+fn merge_attach_config(
+    args: &mut RawAttachArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: RawAttachArgs,
+) {
+    merge_option(
+        &mut args.target,
+        matches.and_then(|m| m.value_source("target")),
+        config.target,
+    );
+}
+
 fn merge_nodes_config(
     args: &mut RawNodesArgs,
     matches: Option<&clap::ArgMatches>,
@@ -1706,6 +1762,29 @@ replicas = 3
     }
 
     #[test]
+    fn attach_config_supplies_selector() {
+        let config = write_test_config(
+            r#"
+[attach]
+target = "tenant-a/media/camera#event:std*"
+"#,
+        );
+
+        let cli = load_cli_from([
+            "selium",
+            "--config",
+            config.to_str().expect("config path"),
+            "attach",
+        ])
+        .expect("parse cli");
+
+        let Command::Attach(args) = cli.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(args.target, "tenant-a/media/camera#event:std*");
+    }
+
+    #[test]
     fn start_command_rejects_legacy_instance_id_flag() {
         let err = load_cli_from([
             "selium",
@@ -1902,6 +1981,7 @@ module = "module.wasm"
         assert!(
             help.contains("Export attributed runtime usage records from a specific node daemon")
         );
+        assert!(help.contains("Stream live guest logs from a workload-scoped event selector"));
         assert!(help.contains("Run the reconciliation agent loop for a node"));
     }
 
@@ -1916,5 +1996,21 @@ module = "module.wasm"
         assert!(help.contains("Create or update a workload deployment in the control plane"));
         assert!(help.contains("Tenant that owns the workload"));
         assert!(help.contains("Contract to attach, formatted as `namespace/kind:name@version`"));
+    }
+
+    #[test]
+    fn attach_help_describes_guest_log_selector() {
+        let mut command = RawCli::command();
+        let attach = command
+            .find_subcommand_mut("attach")
+            .expect("attach subcommand");
+        let help = attach.render_long_help().to_string();
+
+        assert!(help.contains("Stream live guest logs from a workload-scoped event selector"));
+        assert!(
+            help.contains(
+                "Guest log selector, for example `tenant/namespace/workload#event:stdout`"
+            )
+        );
     }
 }
