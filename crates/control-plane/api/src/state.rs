@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
-    DiscoverableWorkload, DiscoveryState, IsolationProfile, NodeSpec, PipelineEndpoint,
-    PipelineSpec, PublicEndpointRef, WorkloadRef,
+    DiscoverableWorkload, DiscoveryState, ExternalAccountRef, IsolationProfile, NodeSpec,
+    PipelineEndpoint, PipelineSpec, PublicEndpointRef, WorkloadRef,
 };
 
 impl ControlPlaneState {
@@ -14,6 +14,8 @@ impl ControlPlaneState {
             NodeSpec {
                 name: "local-node".to_string(),
                 capacity_slots: 64,
+                allocatable_cpu_millis: None,
+                allocatable_memory_mib: None,
                 supported_isolation: vec![
                     IsolationProfile::Standard,
                     IsolationProfile::Hardened,
@@ -46,6 +48,11 @@ impl ControlPlaneState {
                 "replicas must be > 0".to_string(),
             ));
         }
+        validate_optional_external_account_ref(
+            &deployment.external_account_ref,
+            "deployment external account reference",
+            ApiError::InvalidDeployment,
+        )?;
 
         self.deployments
             .insert(deployment.workload.key(), deployment);
@@ -105,19 +112,39 @@ pub fn ensure_pipeline_consistency(state: &ControlPlaneState) -> std::result::Re
                 "pipeline namespace must not be empty".to_string(),
             ));
         }
+        let mut expected_external_account_ref = validate_optional_external_account_ref(
+            &pipeline.external_account_ref,
+            "pipeline external account reference",
+            ApiError::InvalidPipeline,
+        )?;
 
         for edge in &pipeline.edges {
             validate_pipeline_endpoint(state, pipeline, &edge.from, "source")?;
             validate_pipeline_endpoint(state, pipeline, &edge.to, "target")?;
 
             let from_key = edge.from.endpoint.workload.key();
-            if !state.deployments.contains_key(&from_key) {
-                return Err(ApiError::UnknownDeployment(from_key));
-            }
+            let from_deployment = state
+                .deployments
+                .get(&from_key)
+                .ok_or_else(|| ApiError::UnknownDeployment(from_key.clone()))?;
+            ensure_pipeline_external_account_ref(
+                pipeline,
+                from_deployment,
+                "source",
+                &mut expected_external_account_ref,
+            )?;
+
             let to_key = edge.to.endpoint.workload.key();
-            if !state.deployments.contains_key(&to_key) {
-                return Err(ApiError::UnknownDeployment(to_key));
-            }
+            let to_deployment = state
+                .deployments
+                .get(&to_key)
+                .ok_or_else(|| ApiError::UnknownDeployment(to_key.clone()))?;
+            ensure_pipeline_external_account_ref(
+                pipeline,
+                to_deployment,
+                "target",
+                &mut expected_external_account_ref,
+            )?;
         }
     }
 
@@ -234,6 +261,46 @@ fn validate_pipeline_endpoint(
             "{role} endpoint `{}` must be declared by workload `{}`",
             endpoint.endpoint, endpoint.endpoint.workload
         )));
+    }
+
+    Ok(())
+}
+
+fn validate_optional_external_account_ref(
+    reference: &Option<ExternalAccountRef>,
+    subject: &str,
+    invalid: fn(String) -> ApiError,
+) -> std::result::Result<Option<ExternalAccountRef>, ApiError> {
+    if let Some(reference) = reference {
+        reference.validate(subject, invalid)?;
+    }
+
+    Ok(reference.clone())
+}
+
+fn ensure_pipeline_external_account_ref(
+    pipeline: &PipelineSpec,
+    deployment: &DeploymentSpec,
+    role: &str,
+    expected: &mut Option<ExternalAccountRef>,
+) -> std::result::Result<(), ApiError> {
+    let Some(actual) = deployment.external_account_ref.as_ref() else {
+        return Ok(());
+    };
+
+    if let Some(expected_ref) = expected.as_ref() {
+        if actual != expected_ref {
+            let baseline = pipeline.external_account_ref.as_ref().map_or_else(
+                || format!("baseline workload attribution `{expected_ref}`"),
+                |pipeline_ref| format!("pipeline attribution `{pipeline_ref}`"),
+            );
+            return Err(ApiError::InvalidPipeline(format!(
+                "{role} workload `{}` external account reference `{actual}` must match {baseline}",
+                deployment.workload
+            )));
+        }
+    } else {
+        *expected = Some(actual.clone());
     }
 
     Ok(())
@@ -360,6 +427,12 @@ mod tests {
                     replicas: 1,
                     contracts: vec![contract.clone()],
                     isolation: IsolationProfile::Standard,
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    ephemeral_storage_mib: 0,
+                    bandwidth_profile: crate::BandwidthProfile::Standard,
+                    volume_mounts: Vec::new(),
+                    external_account_ref: None,
                 })
                 .expect("deployment");
         }
@@ -399,6 +472,12 @@ mod tests {
                 replicas: 1,
                 contracts: vec![event_contract(), service_contract(), stream_contract()],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: crate::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -490,6 +569,12 @@ mod tests {
                     shared_name_contract(ContractKind::Stream),
                 ],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: crate::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -537,6 +622,12 @@ mod tests {
                 replicas: 1,
                 contracts: Vec::new(),
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: crate::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -560,9 +651,100 @@ mod tests {
                     contract,
                 },
             }],
+            external_account_ref: None,
         });
 
         let err = ensure_pipeline_consistency(&state).expect_err("undeclared contract rejected");
         assert!(err.to_string().contains("must be declared by workload"));
+    }
+
+    #[test]
+    fn deployment_rejects_blank_external_account_reference() {
+        let mut state = sample_state();
+        let err = state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "ingest".to_string(),
+                },
+                module: "ingest.wasm".to_string(),
+                replicas: 1,
+                contracts: Vec::new(),
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: crate::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: Some(ExternalAccountRef {
+                    key: "   ".to_string(),
+                }),
+            })
+            .expect_err("blank external account reference rejected");
+
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn pipeline_consistency_rejects_mismatched_external_account_references() {
+        let mut state = sample_state();
+        let contract = event_contract();
+        let ingest = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        let detector = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "detector".to_string(),
+        };
+
+        for (workload, account) in [(ingest.clone(), "acct-a"), (detector.clone(), "acct-b")] {
+            state
+                .upsert_deployment(DeploymentSpec {
+                    workload,
+                    module: "module.wasm".to_string(),
+                    replicas: 1,
+                    contracts: vec![contract.clone()],
+                    isolation: IsolationProfile::Standard,
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    ephemeral_storage_mib: 0,
+                    bandwidth_profile: crate::BandwidthProfile::Standard,
+                    volume_mounts: Vec::new(),
+                    external_account_ref: Some(ExternalAccountRef {
+                        key: account.to_string(),
+                    }),
+                })
+                .expect("deployment");
+        }
+
+        state.upsert_pipeline(PipelineSpec {
+            name: "pipeline".to_string(),
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            edges: vec![PipelineEdge {
+                from: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: ingest,
+                        name: contract.name.clone(),
+                    },
+                    contract: contract.clone(),
+                },
+                to: PipelineEndpoint {
+                    endpoint: EventEndpointRef {
+                        workload: detector,
+                        name: contract.name.clone(),
+                    },
+                    contract,
+                },
+            }],
+            external_account_ref: None,
+        });
+
+        let err = ensure_pipeline_consistency(&state).expect_err("mismatch rejected");
+        assert!(err.to_string().contains("external account reference"));
     }
 }

@@ -1,6 +1,6 @@
 //! Deterministic control-plane state machine built on host-managed consensus + tables.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
@@ -10,7 +10,7 @@ use selium_control_plane_api::{
     OperationalProcessRecord, OperationalProcessSelector, PipelineSpec, ResolvedEndpoint,
     ResolvedWorkload, WorkloadRef, build_discovery_state, ensure_pipeline_consistency, parse_idl,
 };
-use selium_control_plane_scheduler::{build_plan, deployment_contract_usage};
+use selium_control_plane_scheduler::{SchedulePlan, build_plan, deployment_contract_usage};
 use selium_io_consensus::LogEntry;
 use selium_io_tables::{TableApplyResult, TableCommand, TableError, TableRecord, TableStore};
 use thiserror::Error;
@@ -42,14 +42,44 @@ pub enum Mutation {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum Query {
-    TableGet { table: String, key: String },
-    TableScan { table: String, limit: usize },
-    ViewGet { name: String },
+    TableGet {
+        table: String,
+        key: String,
+    },
+    TableScan {
+        table: String,
+        limit: usize,
+    },
+    ViewGet {
+        name: String,
+    },
     ControlPlaneState,
     ControlPlaneSummary,
-    DiscoveryState { scope: DiscoveryCapabilityScope },
-    ResolveDiscovery { request: DiscoveryRequest },
-    NodesLive { now_ms: u64, max_staleness_ms: u64 },
+    /// Return attributed workload, module, pipeline, and node inventory for external consumers.
+    AttributedInfrastructureInventory {
+        filter: AttributedInfrastructureFilter,
+    },
+    DiscoveryState {
+        scope: DiscoveryCapabilityScope,
+    },
+    ResolveDiscovery {
+        request: DiscoveryRequest,
+    },
+    NodesLive {
+        now_ms: u64,
+        max_staleness_ms: u64,
+    },
+}
+
+/// Exact-match filters for attributed infrastructure inventory queries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct AttributedInfrastructureFilter {
+    pub external_account_ref: Option<String>,
+    pub workload: Option<String>,
+    pub module: Option<String>,
+    pub pipeline: Option<String>,
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -245,9 +275,8 @@ impl ControlPlaneEngine {
                         DataValue::List(
                             self.control_plane
                                 .deployments
-                                .keys()
-                                .cloned()
-                                .map(DataValue::from)
+                                .values()
+                                .map(serialize_deployment_spec)
                                 .collect(),
                         ),
                     ),
@@ -263,34 +292,36 @@ impl ControlPlaneEngine {
                         ),
                     ),
                     (
-                        "nodes".to_string(),
+                        "pipeline_specs".to_string(),
                         DataValue::List(
                             self.control_plane
-                                .nodes
-                                .keys()
-                                .cloned()
-                                .map(DataValue::from)
+                                .pipelines
+                                .values()
+                                .map(serialize_pipeline_spec)
                                 .collect(),
                         ),
                     ),
                     (
-                        "schedule".to_string(),
-                        DataValue::Map(BTreeMap::from([
-                            (
-                                "instances".to_string(),
-                                DataValue::from(format!("{:?}", plan.instances)),
-                            ),
-                            (
-                                "node_slots".to_string(),
-                                DataValue::from(format!("{:?}", plan.node_slots)),
-                            ),
-                        ])),
+                        "nodes".to_string(),
+                        DataValue::List(
+                            self.control_plane
+                                .nodes
+                                .values()
+                                .map(serialize_node_spec)
+                                .collect(),
+                        ),
                     ),
+                    ("schedule".to_string(), serialize_schedule_plan(&plan)),
                     (
                         "contract_usage".to_string(),
-                        DataValue::from(format!("{:?}", usage)),
+                        serialize_string_set_map(&usage),
                     ),
                 ]))
+            }
+            Query::AttributedInfrastructureInventory { filter } => {
+                let plan = build_plan(&self.control_plane)
+                    .map_err(|err| RuntimeError::Scheduler(err.to_string()))?;
+                serialize_attributed_infrastructure_inventory(&self.control_plane, &plan, &filter)
             }
             Query::DiscoveryState { scope } => DataValue::Bytes(
                 encode_rkyv(&authorised_discovery_state(&self.control_plane, &scope)?)
@@ -325,8 +356,16 @@ impl ControlPlaneEngine {
                                 DataValue::from(node.capacity_slots),
                             ),
                             (
+                                "allocatable_cpu_millis".to_string(),
+                                serialize_optional_u32(node.allocatable_cpu_millis),
+                            ),
+                            (
+                                "allocatable_memory_mib".to_string(),
+                                serialize_optional_u32(node.allocatable_memory_mib),
+                            ),
+                            (
                                 "supported_isolation".to_string(),
-                                DataValue::from(format!("{:?}", node.supported_isolation)),
+                                serialize_isolation_profiles(&node.supported_isolation),
                             ),
                             (
                                 "last_heartbeat_ms".to_string(),
@@ -522,6 +561,787 @@ fn ok_status() -> DataValue {
     )]))
 }
 
+fn serialize_deployment_spec(spec: &DeploymentSpec) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("workload".to_string(), DataValue::from(spec.workload.key())),
+        ("module".to_string(), DataValue::from(spec.module.clone())),
+        ("replicas".to_string(), DataValue::from(spec.replicas)),
+        (
+            "external_account_ref".to_string(),
+            serialize_external_account_ref(&spec.external_account_ref),
+        ),
+        (
+            "isolation".to_string(),
+            DataValue::from(format!("{:?}", spec.isolation)),
+        ),
+        (
+            "resources".to_string(),
+            serialize_deployment_resources(spec),
+        ),
+    ]))
+}
+
+fn serialize_deployment_resources(spec: &DeploymentSpec) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("cpu_millis".to_string(), DataValue::from(spec.cpu_millis)),
+        ("memory_mib".to_string(), DataValue::from(spec.memory_mib)),
+        (
+            "ephemeral_storage_mib".to_string(),
+            DataValue::from(spec.ephemeral_storage_mib),
+        ),
+        (
+            "bandwidth_profile".to_string(),
+            DataValue::from(spec.bandwidth_profile.as_str()),
+        ),
+        (
+            "volume_mounts".to_string(),
+            DataValue::List(
+                spec.volume_mounts
+                    .iter()
+                    .map(|mount| {
+                        DataValue::Map(BTreeMap::from([
+                            ("name".to_string(), DataValue::from(mount.name.clone())),
+                            (
+                                "mount_path".to_string(),
+                                DataValue::from(mount.mount_path.clone()),
+                            ),
+                            ("read_only".to_string(), DataValue::from(mount.read_only)),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn serialize_pipeline_spec(spec: &PipelineSpec) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("pipeline".to_string(), DataValue::from(spec.key())),
+        (
+            "external_account_ref".to_string(),
+            serialize_external_account_ref(&spec.external_account_ref),
+        ),
+        ("edge_count".to_string(), DataValue::from(spec.edges.len())),
+    ]))
+}
+
+fn serialize_node_spec(spec: &NodeSpec) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("name".to_string(), DataValue::from(spec.name.clone())),
+        (
+            "capacity_slots".to_string(),
+            DataValue::from(spec.capacity_slots),
+        ),
+        (
+            "allocatable_cpu_millis".to_string(),
+            serialize_optional_u32(spec.allocatable_cpu_millis),
+        ),
+        (
+            "allocatable_memory_mib".to_string(),
+            serialize_optional_u32(spec.allocatable_memory_mib),
+        ),
+        (
+            "supported_isolation".to_string(),
+            serialize_isolation_profiles(&spec.supported_isolation),
+        ),
+        (
+            "daemon_addr".to_string(),
+            DataValue::from(spec.daemon_addr.clone()),
+        ),
+        (
+            "daemon_server_name".to_string(),
+            DataValue::from(spec.daemon_server_name.clone()),
+        ),
+        (
+            "last_heartbeat_ms".to_string(),
+            DataValue::from(spec.last_heartbeat_ms),
+        ),
+    ]))
+}
+
+fn serialize_schedule_plan(plan: &SchedulePlan) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "instances".to_string(),
+            DataValue::List(
+                plan.instances
+                    .iter()
+                    .map(|instance| {
+                        DataValue::Map(BTreeMap::from([
+                            (
+                                "deployment".to_string(),
+                                DataValue::from(instance.deployment.clone()),
+                            ),
+                            (
+                                "instance_id".to_string(),
+                                DataValue::from(instance.instance_id.clone()),
+                            ),
+                            ("node".to_string(), DataValue::from(instance.node.clone())),
+                            (
+                                "isolation".to_string(),
+                                DataValue::from(format!("{:?}", instance.isolation)),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "node_slots".to_string(),
+            serialize_string_u32_map(&plan.node_slots),
+        ),
+        (
+            "node_cpu_millis".to_string(),
+            serialize_string_u32_map(&plan.node_cpu_millis),
+        ),
+        (
+            "node_memory_mib".to_string(),
+            serialize_string_u32_map(&plan.node_memory_mib),
+        ),
+    ]))
+}
+
+#[derive(Debug, Clone)]
+struct InventoryInstance {
+    deployment: String,
+    workload: String,
+    module: String,
+    external_account_ref: Option<String>,
+    node: String,
+    instance_id: String,
+    isolation: String,
+}
+
+#[derive(Debug, Default)]
+struct ModuleInventory {
+    deployments: usize,
+    workloads: BTreeSet<String>,
+    external_account_refs: BTreeSet<String>,
+    nodes: BTreeSet<String>,
+}
+
+fn serialize_attributed_infrastructure_inventory(
+    state: &ControlPlaneState,
+    plan: &SchedulePlan,
+    filter: &AttributedInfrastructureFilter,
+) -> DataValue {
+    let instances = build_inventory_instances(state, plan);
+    let mut instances_by_workload = BTreeMap::<String, Vec<InventoryInstance>>::new();
+    let mut instances_by_node = BTreeMap::<String, Vec<InventoryInstance>>::new();
+    for instance in instances {
+        instances_by_workload
+            .entry(instance.workload.clone())
+            .or_default()
+            .push(instance.clone());
+        instances_by_node
+            .entry(instance.node.clone())
+            .or_default()
+            .push(instance);
+    }
+
+    let pipeline_scope = if let Some(pipeline_key) = filter.pipeline.as_deref() {
+        Some(
+            state
+                .pipelines
+                .get(pipeline_key)
+                .map(pipeline_workload_keys)
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+
+    let workloads = state
+        .deployments
+        .values()
+        .filter(|deployment| {
+            let scheduled = instances_by_workload
+                .get(&deployment.workload.key())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            workload_matches_filter(deployment, scheduled, filter, pipeline_scope.as_ref())
+        })
+        .collect::<Vec<_>>();
+
+    let workload_values = workloads
+        .iter()
+        .map(|deployment| {
+            let scheduled = instances_by_workload
+                .get(&deployment.workload.key())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            serialize_inventory_workload(deployment, scheduled)
+        })
+        .collect::<Vec<_>>();
+
+    let mut modules = BTreeMap::<String, ModuleInventory>::new();
+    for deployment in &workloads {
+        let scheduled = instances_by_workload
+            .get(&deployment.workload.key())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let module = modules.entry(deployment.module.clone()).or_default();
+        module.deployments += 1;
+        module.workloads.insert(deployment.workload.key());
+        if let Some(reference) = &deployment.external_account_ref {
+            module.external_account_refs.insert(reference.key.clone());
+        }
+        for instance in scheduled {
+            module.nodes.insert(instance.node.clone());
+        }
+    }
+
+    let pipeline_values = state
+        .pipelines
+        .values()
+        .filter(|pipeline| pipeline_matches_filter(pipeline, state, &instances_by_workload, filter))
+        .map(serialize_inventory_pipeline)
+        .collect::<Vec<_>>();
+
+    let module_values = modules
+        .into_iter()
+        .map(|(module_name, module)| {
+            DataValue::Map(BTreeMap::from([
+                ("module".to_string(), DataValue::from(module_name)),
+                (
+                    "deployment_count".to_string(),
+                    DataValue::from(module.deployments as u64),
+                ),
+                (
+                    "workloads".to_string(),
+                    DataValue::List(module.workloads.into_iter().map(DataValue::from).collect()),
+                ),
+                (
+                    "external_account_refs".to_string(),
+                    DataValue::List(
+                        module
+                            .external_account_refs
+                            .into_iter()
+                            .map(DataValue::from)
+                            .collect(),
+                    ),
+                ),
+                (
+                    "nodes".to_string(),
+                    DataValue::List(module.nodes.into_iter().map(DataValue::from).collect()),
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+
+    let node_values = state
+        .nodes
+        .values()
+        .filter_map(|node| {
+            let scheduled = instances_by_node
+                .get(&node.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let filtered_instances = scheduled
+                .iter()
+                .filter(|instance| {
+                    instance_matches_filter(instance, filter, pipeline_scope.as_ref())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if node_matches_filter(node, &filtered_instances, filter) {
+                Some(serialize_inventory_node(node, &filtered_instances))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    DataValue::Map(BTreeMap::from([
+        ("filters".to_string(), serialize_inventory_filter(filter)),
+        ("workloads".to_string(), DataValue::List(workload_values)),
+        ("pipelines".to_string(), DataValue::List(pipeline_values)),
+        ("modules".to_string(), DataValue::List(module_values)),
+        ("nodes".to_string(), DataValue::List(node_values)),
+    ]))
+}
+
+fn build_inventory_instances(
+    state: &ControlPlaneState,
+    plan: &SchedulePlan,
+) -> Vec<InventoryInstance> {
+    plan.instances
+        .iter()
+        .filter_map(|instance| {
+            let deployment = state.deployments.get(&instance.deployment)?;
+            Some(InventoryInstance {
+                deployment: instance.deployment.clone(),
+                workload: deployment.workload.key(),
+                module: deployment.module.clone(),
+                external_account_ref: deployment
+                    .external_account_ref
+                    .as_ref()
+                    .map(|reference| reference.key.clone()),
+                node: instance.node.clone(),
+                instance_id: instance.instance_id.clone(),
+                isolation: format!("{:?}", instance.isolation),
+            })
+        })
+        .collect()
+}
+
+fn serialize_inventory_filter(filter: &AttributedInfrastructureFilter) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "external_account_ref".to_string(),
+            filter
+                .external_account_ref
+                .clone()
+                .map_or(DataValue::Null, DataValue::from),
+        ),
+        (
+            "workload".to_string(),
+            filter
+                .workload
+                .clone()
+                .map_or(DataValue::Null, DataValue::from),
+        ),
+        (
+            "module".to_string(),
+            filter
+                .module
+                .clone()
+                .map_or(DataValue::Null, DataValue::from),
+        ),
+        (
+            "pipeline".to_string(),
+            filter
+                .pipeline
+                .clone()
+                .map_or(DataValue::Null, DataValue::from),
+        ),
+        (
+            "node".to_string(),
+            filter.node.clone().map_or(DataValue::Null, DataValue::from),
+        ),
+    ]))
+}
+
+fn serialize_inventory_workload(
+    spec: &DeploymentSpec,
+    instances: &[InventoryInstance],
+) -> DataValue {
+    let mut node_names = BTreeSet::new();
+    for instance in instances {
+        node_names.insert(instance.node.clone());
+    }
+    DataValue::Map(BTreeMap::from([
+        ("workload".to_string(), DataValue::from(spec.workload.key())),
+        ("module".to_string(), DataValue::from(spec.module.clone())),
+        (
+            "external_account_ref".to_string(),
+            serialize_external_account_ref(&spec.external_account_ref),
+        ),
+        ("replicas".to_string(), DataValue::from(spec.replicas)),
+        (
+            "isolation".to_string(),
+            DataValue::from(format!("{:?}", spec.isolation)),
+        ),
+        (
+            "resources".to_string(),
+            serialize_deployment_resources(spec),
+        ),
+        (
+            "contracts".to_string(),
+            DataValue::List(
+                spec.contracts
+                    .iter()
+                    .map(|contract| {
+                        DataValue::Map(BTreeMap::from([
+                            (
+                                "namespace".to_string(),
+                                DataValue::from(contract.namespace.clone()),
+                            ),
+                            ("kind".to_string(), DataValue::from(contract.kind.as_str())),
+                            ("name".to_string(), DataValue::from(contract.name.clone())),
+                            (
+                                "version".to_string(),
+                                DataValue::from(contract.version.clone()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "nodes".to_string(),
+            DataValue::List(node_names.into_iter().map(DataValue::from).collect()),
+        ),
+        (
+            "scheduled_instances".to_string(),
+            DataValue::List(instances.iter().map(serialize_inventory_instance).collect()),
+        ),
+    ]))
+}
+
+fn serialize_inventory_pipeline(spec: &PipelineSpec) -> DataValue {
+    let workloads = pipeline_workload_keys(spec);
+    DataValue::Map(BTreeMap::from([
+        ("pipeline".to_string(), DataValue::from(spec.key())),
+        (
+            "external_account_ref".to_string(),
+            serialize_external_account_ref(&spec.external_account_ref),
+        ),
+        (
+            "edge_count".to_string(),
+            DataValue::from(spec.edges.len() as u64),
+        ),
+        (
+            "workloads".to_string(),
+            DataValue::List(workloads.into_iter().map(DataValue::from).collect()),
+        ),
+        (
+            "edges".to_string(),
+            DataValue::List(
+                spec.edges
+                    .iter()
+                    .map(|edge| {
+                        DataValue::Map(BTreeMap::from([
+                            (
+                                "from".to_string(),
+                                DataValue::from(edge.from.endpoint.key()),
+                            ),
+                            ("to".to_string(), DataValue::from(edge.to.endpoint.key())),
+                            (
+                                "contract".to_string(),
+                                DataValue::Map(BTreeMap::from([
+                                    (
+                                        "namespace".to_string(),
+                                        DataValue::from(edge.from.contract.namespace.clone()),
+                                    ),
+                                    (
+                                        "kind".to_string(),
+                                        DataValue::from(edge.from.contract.kind.as_str()),
+                                    ),
+                                    (
+                                        "name".to_string(),
+                                        DataValue::from(edge.from.contract.name.clone()),
+                                    ),
+                                    (
+                                        "version".to_string(),
+                                        DataValue::from(edge.from.contract.version.clone()),
+                                    ),
+                                ])),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn serialize_inventory_node(node: &NodeSpec, instances: &[InventoryInstance]) -> DataValue {
+    let mut external_account_refs = BTreeSet::new();
+    for instance in instances {
+        if let Some(reference) = &instance.external_account_ref {
+            external_account_refs.insert(reference.clone());
+        }
+    }
+    DataValue::Map(BTreeMap::from([
+        ("name".to_string(), DataValue::from(node.name.clone())),
+        (
+            "capacity_slots".to_string(),
+            DataValue::from(node.capacity_slots),
+        ),
+        (
+            "allocatable_cpu_millis".to_string(),
+            serialize_optional_u32(node.allocatable_cpu_millis),
+        ),
+        (
+            "allocatable_memory_mib".to_string(),
+            serialize_optional_u32(node.allocatable_memory_mib),
+        ),
+        (
+            "supported_isolation".to_string(),
+            serialize_isolation_profiles(&node.supported_isolation),
+        ),
+        (
+            "daemon_addr".to_string(),
+            DataValue::from(node.daemon_addr.clone()),
+        ),
+        (
+            "daemon_server_name".to_string(),
+            DataValue::from(node.daemon_server_name.clone()),
+        ),
+        (
+            "last_heartbeat_ms".to_string(),
+            DataValue::from(node.last_heartbeat_ms),
+        ),
+        (
+            "external_account_refs".to_string(),
+            DataValue::List(
+                external_account_refs
+                    .into_iter()
+                    .map(DataValue::from)
+                    .collect(),
+            ),
+        ),
+        (
+            "scheduled_instances".to_string(),
+            DataValue::List(instances.iter().map(serialize_inventory_instance).collect()),
+        ),
+    ]))
+}
+
+fn serialize_inventory_instance(instance: &InventoryInstance) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "deployment".to_string(),
+            DataValue::from(instance.deployment.clone()),
+        ),
+        (
+            "workload".to_string(),
+            DataValue::from(instance.workload.clone()),
+        ),
+        (
+            "module".to_string(),
+            DataValue::from(instance.module.clone()),
+        ),
+        (
+            "external_account_ref".to_string(),
+            instance
+                .external_account_ref
+                .clone()
+                .map_or(DataValue::Null, DataValue::from),
+        ),
+        ("node".to_string(), DataValue::from(instance.node.clone())),
+        (
+            "instance_id".to_string(),
+            DataValue::from(instance.instance_id.clone()),
+        ),
+        (
+            "isolation".to_string(),
+            DataValue::from(instance.isolation.clone()),
+        ),
+    ]))
+}
+
+fn pipeline_workload_keys(spec: &PipelineSpec) -> BTreeSet<String> {
+    let mut workloads = BTreeSet::new();
+    for edge in &spec.edges {
+        workloads.insert(edge.from.endpoint.workload.key());
+        workloads.insert(edge.to.endpoint.workload.key());
+    }
+    workloads
+}
+
+fn workload_matches_filter(
+    spec: &DeploymentSpec,
+    instances: &[InventoryInstance],
+    filter: &AttributedInfrastructureFilter,
+    pipeline_scope: Option<&BTreeSet<String>>,
+) -> bool {
+    if let Some(reference) = filter.external_account_ref.as_deref() {
+        if spec
+            .external_account_ref
+            .as_ref()
+            .map(|value| value.key.as_str())
+            != Some(reference)
+        {
+            return false;
+        }
+    }
+    if let Some(workload) = filter.workload.as_deref() {
+        if spec.workload.key() != workload {
+            return false;
+        }
+    }
+    if let Some(module) = filter.module.as_deref() {
+        if spec.module != module {
+            return false;
+        }
+    }
+    if let Some(node) = filter.node.as_deref() {
+        if !instances.iter().any(|instance| instance.node == node) {
+            return false;
+        }
+    }
+    if let Some(scope) = pipeline_scope {
+        if !scope.contains(&spec.workload.key()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn pipeline_matches_filter(
+    spec: &PipelineSpec,
+    state: &ControlPlaneState,
+    instances_by_workload: &BTreeMap<String, Vec<InventoryInstance>>,
+    filter: &AttributedInfrastructureFilter,
+) -> bool {
+    if let Some(pipeline) = filter.pipeline.as_deref() {
+        if spec.key() != pipeline {
+            return false;
+        }
+    }
+    if let Some(reference) = filter.external_account_ref.as_deref() {
+        if spec
+            .external_account_ref
+            .as_ref()
+            .map(|value| value.key.as_str())
+            != Some(reference)
+        {
+            return false;
+        }
+    }
+    if let Some(workload) = filter.workload.as_deref() {
+        if !spec.edges.iter().any(|edge| {
+            edge.from.endpoint.workload.key() == workload
+                || edge.to.endpoint.workload.key() == workload
+        }) {
+            return false;
+        }
+    }
+    if let Some(module) = filter.module.as_deref() {
+        let has_module = spec.edges.iter().any(|edge| {
+            [
+                edge.from.endpoint.workload.key(),
+                edge.to.endpoint.workload.key(),
+            ]
+            .into_iter()
+            .any(|workload_key| {
+                state
+                    .deployments
+                    .get(&workload_key)
+                    .map(|deployment| deployment.module == module)
+                    .unwrap_or(false)
+            })
+        });
+        if !has_module {
+            return false;
+        }
+    }
+    if let Some(node) = filter.node.as_deref() {
+        let has_node = spec.edges.iter().any(|edge| {
+            [
+                edge.from.endpoint.workload.key(),
+                edge.to.endpoint.workload.key(),
+            ]
+            .into_iter()
+            .any(|workload_key| {
+                instances_by_workload
+                    .get(&workload_key)
+                    .map(|instances| instances.iter().any(|instance| instance.node == node))
+                    .unwrap_or(false)
+            })
+        });
+        if !has_node {
+            return false;
+        }
+    }
+    true
+}
+
+fn instance_matches_filter(
+    instance: &InventoryInstance,
+    filter: &AttributedInfrastructureFilter,
+    pipeline_scope: Option<&BTreeSet<String>>,
+) -> bool {
+    if let Some(reference) = filter.external_account_ref.as_deref() {
+        if instance.external_account_ref.as_deref() != Some(reference) {
+            return false;
+        }
+    }
+    if let Some(workload) = filter.workload.as_deref() {
+        if instance.workload != workload {
+            return false;
+        }
+    }
+    if let Some(module) = filter.module.as_deref() {
+        if instance.module != module {
+            return false;
+        }
+    }
+    if let Some(node) = filter.node.as_deref() {
+        if instance.node != node {
+            return false;
+        }
+    }
+    if let Some(scope) = pipeline_scope {
+        if !scope.contains(&instance.workload) {
+            return false;
+        }
+    }
+    true
+}
+
+fn node_matches_filter(
+    node: &NodeSpec,
+    filtered_instances: &[InventoryInstance],
+    filter: &AttributedInfrastructureFilter,
+) -> bool {
+    if let Some(node_name) = filter.node.as_deref() {
+        if node.name != node_name {
+            return false;
+        }
+    }
+    if filter.external_account_ref.is_some()
+        || filter.workload.is_some()
+        || filter.module.is_some()
+        || filter.pipeline.is_some()
+    {
+        return !filtered_instances.is_empty();
+    }
+    true
+}
+
+fn serialize_string_u32_map(values: &BTreeMap<String, u32>) -> DataValue {
+    DataValue::Map(
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), DataValue::from(*value)))
+            .collect(),
+    )
+}
+
+fn serialize_string_set_map(
+    values: &BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> DataValue {
+    DataValue::Map(
+        values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    DataValue::List(value.iter().cloned().map(DataValue::from).collect()),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn serialize_isolation_profiles(
+    profiles: &[selium_control_plane_api::IsolationProfile],
+) -> DataValue {
+    DataValue::List(
+        profiles
+            .iter()
+            .map(|profile| DataValue::from(format!("{:?}", profile)))
+            .collect(),
+    )
+}
+
+fn serialize_optional_u32(value: Option<u32>) -> DataValue {
+    value.map_or(DataValue::Null, DataValue::from)
+}
+
+fn serialize_external_account_ref(
+    external_account_ref: &Option<selium_control_plane_api::ExternalAccountRef>,
+) -> DataValue {
+    external_account_ref
+        .as_ref()
+        .map_or(DataValue::Null, |reference| {
+            DataValue::from(reference.key.clone())
+        })
+}
+
 fn serialize_table_record(record: &TableRecord) -> DataValue {
     DataValue::Map(BTreeMap::from([
         ("value".to_string(), record.value.clone()),
@@ -561,7 +1381,9 @@ fn serialize_table_result(result: TableApplyResult) -> DataValue {
 mod tests {
     use super::*;
     use selium_control_plane_api::{
-        ContractKind, ContractRef, DiscoveryPattern, IsolationProfile, PublicEndpointRef, parse_idl,
+        BandwidthProfile, ContractKind, ContractRef, DiscoveryPattern, EventEndpointRef,
+        ExternalAccountRef, IsolationProfile, PipelineEdge, PipelineEndpoint, PipelineSpec,
+        PublicEndpointRef, VolumeMount, parse_idl,
     };
     use selium_io_consensus::{ConsensusConfig, RaftNode};
 
@@ -631,6 +1453,12 @@ mod tests {
                     replicas,
                     contracts: vec![event_contract()],
                     isolation: IsolationProfile::Standard,
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    ephemeral_storage_mib: 0,
+                    bandwidth_profile: BandwidthProfile::Standard,
+                    volume_mounts: Vec::new(),
+                    external_account_ref: None,
                 })
                 .expect("deployment");
         }
@@ -664,6 +1492,12 @@ mod tests {
                 replicas: 2,
                 contracts: vec![event_contract(), service_contract(), stream_contract()],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -700,6 +1534,12 @@ mod tests {
                     shared_name_contract(ContractKind::Stream),
                 ],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -763,18 +1603,359 @@ mod tests {
                         replicas: 1,
                         contracts: vec![],
                         isolation: selium_control_plane_api::IsolationProfile::Standard,
+                        cpu_millis: 500,
+                        memory_mib: 256,
+                        ephemeral_storage_mib: 128,
+                        bandwidth_profile: BandwidthProfile::High,
+                        volume_mounts: vec![VolumeMount {
+                            name: "scratch".to_string(),
+                            mount_path: "/data".to_string(),
+                            read_only: false,
+                        }],
+                        external_account_ref: Some(ExternalAccountRef {
+                            key: "acct-123".to_string(),
+                        }),
                     },
                 },
             )
             .expect("upsert");
 
+        engine
+            .apply_mutation(
+                2,
+                Mutation::UpsertNode {
+                    spec: NodeSpec {
+                        name: "local-node".to_string(),
+                        capacity_slots: 0,
+                        allocatable_cpu_millis: Some(2_000),
+                        allocatable_memory_mib: Some(4_096),
+                        supported_isolation: vec![IsolationProfile::Standard],
+                        daemon_addr: "127.0.0.1:7100".to_string(),
+                        daemon_server_name: "localhost".to_string(),
+                        last_heartbeat_ms: 42,
+                    },
+                },
+            )
+            .expect("node");
+
         let query = engine.query(Query::ControlPlaneSummary).expect("summary");
-        assert!(
+        let deployments = query
+            .result
+            .get("deployments")
+            .and_then(DataValue::as_array)
+            .expect("deployments array");
+        let resources = deployments[0]
+            .get("resources")
+            .expect("deployment resources");
+        assert_eq!(
+            resources.get("cpu_millis").and_then(DataValue::as_u64),
+            Some(500)
+        );
+        assert_eq!(
+            resources
+                .get("bandwidth_profile")
+                .and_then(DataValue::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            deployments[0]
+                .get("external_account_ref")
+                .and_then(DataValue::as_str),
+            Some("acct-123")
+        );
+        assert_eq!(
             query
                 .result
-                .get("deployments")
+                .get("schedule")
+                .and_then(|schedule| schedule.get("node_cpu_millis"))
+                .and_then(|usage| usage.get("local-node"))
+                .and_then(DataValue::as_u64),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn attributed_inventory_query_filters_workloads_modules_pipelines_and_nodes() {
+        let mut engine = ControlPlaneEngine::default();
+        engine
+            .apply_mutation(
+                1,
+                Mutation::PublishIdl {
+                    idl: "package media.pipeline.v1;\n\
+                         schema Frame { camera_id: string; }\n\
+                         event camera.frames(Frame) { replay: enabled; }"
+                        .to_string(),
+                },
+            )
+            .expect("publish idl");
+
+        let account = ExternalAccountRef {
+            key: "acct-123".to_string(),
+        };
+        for (index, workload_name, module) in [
+            (2, "ingest", "ingest.wasm"),
+            (3, "detector", "detector.wasm"),
+        ] {
+            engine
+                .apply_mutation(
+                    index,
+                    Mutation::UpsertDeployment {
+                        spec: DeploymentSpec {
+                            workload: WorkloadRef {
+                                tenant: "tenant-a".to_string(),
+                                namespace: "media".to_string(),
+                                name: workload_name.to_string(),
+                            },
+                            module: module.to_string(),
+                            replicas: 1,
+                            contracts: vec![event_contract()],
+                            isolation: IsolationProfile::Standard,
+                            cpu_millis: 250,
+                            memory_mib: 128,
+                            ephemeral_storage_mib: 0,
+                            bandwidth_profile: BandwidthProfile::Standard,
+                            volume_mounts: Vec::new(),
+                            external_account_ref: Some(account.clone()),
+                        },
+                    },
+                )
+                .expect("deployment");
+        }
+        engine
+            .apply_mutation(
+                4,
+                Mutation::UpsertDeployment {
+                    spec: DeploymentSpec {
+                        workload: WorkloadRef {
+                            tenant: "tenant-b".to_string(),
+                            namespace: "media".to_string(),
+                            name: "observer".to_string(),
+                        },
+                        module: "observer.wasm".to_string(),
+                        replicas: 1,
+                        contracts: vec![event_contract()],
+                        isolation: IsolationProfile::Standard,
+                        cpu_millis: 100,
+                        memory_mib: 64,
+                        ephemeral_storage_mib: 0,
+                        bandwidth_profile: BandwidthProfile::Low,
+                        volume_mounts: Vec::new(),
+                        external_account_ref: Some(ExternalAccountRef {
+                            key: "acct-999".to_string(),
+                        }),
+                    },
+                },
+            )
+            .expect("observer deployment");
+        engine
+            .apply_mutation(
+                5,
+                Mutation::UpsertPipeline {
+                    spec: PipelineSpec {
+                        name: "camera".to_string(),
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        edges: vec![PipelineEdge {
+                            from: PipelineEndpoint {
+                                endpoint: EventEndpointRef {
+                                    workload: WorkloadRef {
+                                        tenant: "tenant-a".to_string(),
+                                        namespace: "media".to_string(),
+                                        name: "ingest".to_string(),
+                                    },
+                                    name: "camera.frames".to_string(),
+                                },
+                                contract: event_contract(),
+                            },
+                            to: PipelineEndpoint {
+                                endpoint: EventEndpointRef {
+                                    workload: WorkloadRef {
+                                        tenant: "tenant-a".to_string(),
+                                        namespace: "media".to_string(),
+                                        name: "detector".to_string(),
+                                    },
+                                    name: "camera.frames".to_string(),
+                                },
+                                contract: event_contract(),
+                            },
+                        }],
+                        external_account_ref: Some(account.clone()),
+                    },
+                },
+            )
+            .expect("pipeline");
+
+        let query = engine
+            .query(Query::AttributedInfrastructureInventory {
+                filter: AttributedInfrastructureFilter {
+                    external_account_ref: Some(account.key.clone()),
+                    ..Default::default()
+                },
+            })
+            .expect("inventory query");
+
+        let workloads = query
+            .result
+            .get("workloads")
+            .and_then(DataValue::as_array)
+            .expect("workloads");
+        assert_eq!(workloads.len(), 2);
+        assert!(workloads.iter().all(|workload| {
+            workload
+                .get("external_account_ref")
+                .and_then(DataValue::as_str)
+                == Some("acct-123")
+        }));
+
+        let modules = query
+            .result
+            .get("modules")
+            .and_then(DataValue::as_array)
+            .expect("modules");
+        assert_eq!(modules.len(), 2);
+        assert!(modules.iter().all(|module| {
+            module
+                .get("external_account_refs")
                 .and_then(DataValue::as_array)
-                .is_some()
+                .is_some_and(|refs| refs.iter().all(|value| value.as_str() == Some("acct-123")))
+        }));
+
+        let pipelines = query
+            .result
+            .get("pipelines")
+            .and_then(DataValue::as_array)
+            .expect("pipelines");
+        assert_eq!(pipelines.len(), 1);
+        assert_eq!(
+            pipelines[0].get("pipeline").and_then(DataValue::as_str),
+            Some("tenant-a/media/camera")
+        );
+
+        let nodes = query
+            .result
+            .get("nodes")
+            .and_then(DataValue::as_array)
+            .expect("nodes");
+        assert_eq!(nodes.len(), 1);
+        let scheduled_instances = nodes[0]
+            .get("scheduled_instances")
+            .and_then(DataValue::as_array)
+            .expect("scheduled instances");
+        assert_eq!(scheduled_instances.len(), 2);
+        assert!(scheduled_instances.iter().all(|instance| {
+            instance
+                .get("external_account_ref")
+                .and_then(DataValue::as_str)
+                == Some("acct-123")
+        }));
+    }
+
+    #[test]
+    fn control_plane_state_query_preserves_resource_fields() {
+        let mut engine = ControlPlaneEngine::default();
+        engine
+            .apply_mutation(
+                1,
+                Mutation::PublishIdl {
+                    idl: "package media.pipeline.v1;\n\
+                         schema Frame { camera_id: string; }\n\
+                         event camera.frames(Frame) { replay: enabled; }"
+                        .to_string(),
+                },
+            )
+            .expect("publish idl");
+
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "default".to_string(),
+            name: "echo".to_string(),
+        };
+        let external_account_ref = ExternalAccountRef {
+            key: "acct-456".to_string(),
+        };
+
+        engine
+            .apply_mutation(
+                2,
+                Mutation::UpsertDeployment {
+                    spec: DeploymentSpec {
+                        workload: workload.clone(),
+                        module: "echo.wasm".to_string(),
+                        replicas: 1,
+                        contracts: vec![event_contract()],
+                        isolation: IsolationProfile::Standard,
+                        cpu_millis: 750,
+                        memory_mib: 512,
+                        ephemeral_storage_mib: 64,
+                        bandwidth_profile: BandwidthProfile::Low,
+                        volume_mounts: vec![VolumeMount {
+                            name: "cache".to_string(),
+                            mount_path: "/cache".to_string(),
+                            read_only: true,
+                        }],
+                        external_account_ref: Some(external_account_ref.clone()),
+                    },
+                },
+            )
+            .expect("deployment");
+        engine
+            .apply_mutation(
+                3,
+                Mutation::UpsertPipeline {
+                    spec: PipelineSpec {
+                        name: "echo".to_string(),
+                        tenant: workload.tenant.clone(),
+                        namespace: workload.namespace.clone(),
+                        edges: vec![PipelineEdge {
+                            from: PipelineEndpoint {
+                                endpoint: EventEndpointRef {
+                                    workload: workload.clone(),
+                                    name: "camera.frames".to_string(),
+                                },
+                                contract: event_contract(),
+                            },
+                            to: PipelineEndpoint {
+                                endpoint: EventEndpointRef {
+                                    workload: workload.clone(),
+                                    name: "camera.frames".to_string(),
+                                },
+                                contract: event_contract(),
+                            },
+                        }],
+                        external_account_ref: Some(external_account_ref.clone()),
+                    },
+                },
+            )
+            .expect("pipeline");
+
+        let state_bytes = match engine
+            .query(Query::ControlPlaneState)
+            .expect("state query")
+            .result
+        {
+            DataValue::Bytes(bytes) => bytes,
+            other => panic!("expected state bytes, got {other:?}"),
+        };
+        let state = decode_rkyv::<ControlPlaneState>(&state_bytes).expect("decode state");
+        let deployment = state
+            .deployments
+            .get("tenant-a/default/echo")
+            .expect("deployment");
+
+        assert_eq!(deployment.cpu_millis, 750);
+        assert_eq!(deployment.memory_mib, 512);
+        assert_eq!(deployment.bandwidth_profile, BandwidthProfile::Low);
+        assert_eq!(deployment.volume_mounts.len(), 1);
+        assert_eq!(
+            deployment.external_account_ref,
+            Some(external_account_ref.clone())
+        );
+        assert_eq!(
+            state
+                .pipelines
+                .get("tenant-a/default/echo")
+                .and_then(|pipeline| pipeline.external_account_ref.as_ref()),
+            Some(&external_account_ref)
         );
     }
 

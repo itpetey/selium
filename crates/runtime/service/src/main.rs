@@ -18,6 +18,7 @@ mod daemon;
 mod kernel;
 mod modules;
 mod providers;
+mod usage;
 mod wasmtime;
 
 fn initialise_tracing(format: LogFormat) -> Result<()> {

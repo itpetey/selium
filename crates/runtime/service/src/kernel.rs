@@ -19,6 +19,7 @@ use tokio::sync::Notify;
 
 use crate::{
     providers::module_repository_fs::FilesystemModuleRepository,
+    usage::RuntimeUsageCollector,
     wasmtime::runtime::{WasmtimeProcessDriver, WasmtimeRuntime},
     wasmtime::{
         guest_async::GuestAsync,
@@ -28,6 +29,7 @@ use crate::{
 
 /// Where WASM modules are stored.
 const MODULES_SUBDIR: &str = "modules";
+const USAGE_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
     let modules_dir: PathBuf = work_dir.as_ref().join(MODULES_SUBDIR);
@@ -173,9 +175,11 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
 
     let shutdown = Arc::new(Notify::new());
     let guest_async = builder.add_capability(Arc::new(GuestAsync::new(Arc::clone(&shutdown))));
+    let usage = RuntimeUsageCollector::file_backed(work_dir.as_ref(), USAGE_SAMPLE_PERIOD)?;
     let wasmtime_runtime = Arc::new(WasmtimeRuntime::new(
         capability_ops.clone(),
         Arc::clone(&guest_async),
+        usage,
     )?);
     let module_repository: Arc<FilesystemModuleRepository> =
         builder.add_capability(Arc::new(FilesystemModuleRepository::new(&modules_dir)));

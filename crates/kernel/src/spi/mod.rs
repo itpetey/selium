@@ -8,4 +8,5 @@ pub mod session;
 pub mod shared_memory;
 pub mod storage;
 pub mod time;
+pub mod usage;
 pub mod wake_mailbox;

@@ -12,6 +12,8 @@ use selium_abi::{
 
 use crate::guest_error::GuestError;
 
+use super::usage::UsageRecorder;
+
 /// Boxed future returned by runtime storage capabilities.
 pub type StorageFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>;
 
@@ -20,6 +22,7 @@ pub type StorageFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send 
 pub struct StorageProcessPolicy {
     logs: HashSet<String>,
     blobs: HashSet<String>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 impl StorageProcessPolicy {
@@ -31,7 +34,14 @@ impl StorageProcessPolicy {
         Self {
             logs: logs.into_iter().collect(),
             blobs: blobs.into_iter().collect(),
+            usage_recorder: None,
         }
+    }
+
+    /// Attach a runtime usage recorder to this policy.
+    pub fn with_usage_recorder(mut self, usage_recorder: Arc<dyn UsageRecorder>) -> Self {
+        self.usage_recorder = Some(usage_recorder);
+        self
     }
 
     /// Return whether the process may use the named durable log.
@@ -42,6 +52,11 @@ impl StorageProcessPolicy {
     /// Return whether the process may use the named blob store.
     pub fn allows_blob(&self, name: &str) -> bool {
         self.blobs.contains(name)
+    }
+
+    /// Return the usage recorder bound to this process, if present.
+    pub fn usage_recorder(&self) -> Option<Arc<dyn UsageRecorder>> {
+        self.usage_recorder.clone()
     }
 }
 

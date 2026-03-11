@@ -114,6 +114,12 @@ pub(crate) struct DaemonArgs {
     /// Capacity slots advertised for this node.
     #[arg(long, default_value_t = 64)]
     pub(crate) cp_capacity_slots: u32,
+    /// Allocatable CPU advertised for this node in millicores.
+    #[arg(long)]
+    pub(crate) cp_allocatable_cpu_millis: Option<u32>,
+    /// Allocatable memory advertised for this node in MiB.
+    #[arg(long)]
+    pub(crate) cp_allocatable_memory_mib: Option<u32>,
     /// Heartbeat interval for node liveness updates (milliseconds).
     #[arg(long, default_value_t = 1000)]
     pub(crate) cp_heartbeat_interval_ms: u64,
@@ -241,6 +247,8 @@ struct DaemonConfig {
     cp_public_addr: Option<String>,
     cp_server_name: Option<String>,
     cp_capacity_slots: Option<u32>,
+    cp_allocatable_cpu_millis: Option<u32>,
+    cp_allocatable_memory_mib: Option<u32>,
     cp_heartbeat_interval_ms: Option<u64>,
 }
 
@@ -401,6 +409,16 @@ fn merge_daemon_config(
         &mut args.cp_capacity_slots,
         value_source("cp_capacity_slots"),
         config.cp_capacity_slots,
+    );
+    merge_optional(
+        &mut args.cp_allocatable_cpu_millis,
+        value_source("cp_allocatable_cpu_millis"),
+        config.cp_allocatable_cpu_millis,
+    );
+    merge_optional(
+        &mut args.cp_allocatable_memory_mib,
+        value_source("cp_allocatable_memory_mib"),
+        config.cp_allocatable_memory_mib,
     );
     merge_value(
         &mut args.cp_heartbeat_interval_ms,

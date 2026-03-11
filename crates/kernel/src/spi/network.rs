@@ -13,6 +13,8 @@ use selium_abi::{
 
 use crate::guest_error::GuestError;
 
+use super::usage::UsageRecorder;
+
 /// Boxed future returned by runtime network capabilities.
 pub type NetworkFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'static>>;
 
@@ -21,6 +23,7 @@ pub type NetworkFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send 
 pub struct NetworkProcessPolicy {
     egress_profiles: HashSet<String>,
     ingress_bindings: HashSet<String>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 impl NetworkProcessPolicy {
@@ -32,7 +35,14 @@ impl NetworkProcessPolicy {
         Self {
             egress_profiles: egress_profiles.into_iter().collect(),
             ingress_bindings: ingress_bindings.into_iter().collect(),
+            usage_recorder: None,
         }
+    }
+
+    /// Attach a runtime usage recorder to this policy.
+    pub fn with_usage_recorder(mut self, usage_recorder: Arc<dyn UsageRecorder>) -> Self {
+        self.usage_recorder = Some(usage_recorder);
+        self
     }
 
     /// Return whether the process may use the named egress profile.
@@ -43,6 +53,11 @@ impl NetworkProcessPolicy {
     /// Return whether the process may use the named ingress binding.
     pub fn allows_ingress_binding(&self, name: &str) -> bool {
         self.ingress_bindings.contains(name)
+    }
+
+    /// Return the usage recorder bound to this process, if present.
+    pub fn usage_recorder(&self) -> Option<Arc<dyn UsageRecorder>> {
+        self.usage_recorder.clone()
     }
 }
 

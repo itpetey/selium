@@ -31,6 +31,7 @@ mod session;
 mod shm;
 mod storage;
 mod time;
+mod usage;
 
 // pub use external::*;
 pub use contract_codec::*;
@@ -42,6 +43,7 @@ pub use session::*;
 pub use shm::*;
 pub use storage::*;
 pub use time::*;
+pub use usage::*;
 
 /// Guest pointer-sized signed integer.
 pub type GuestInt = i32;

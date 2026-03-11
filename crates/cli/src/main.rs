@@ -15,11 +15,12 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
 use selium_control_plane_protocol::{
-    EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest, ListResponse,
-    ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
-    MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse, ReplayApiRequest,
-    ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StartResponse,
-    StopRequest, StopResponse, StreamBridgeSemantics, StreamLifecycleMode,
+    Empty, EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest,
+    ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
+    MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
+    ReplayApiRequest, ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode,
+    StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
+    StreamBridgeSemantics, StreamLifecycleMode,
 };
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
@@ -101,6 +102,12 @@ async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<(
                 replicas: args.replicas,
                 contracts,
                 isolation: args.isolation.into(),
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: selium_module_control_plane::api::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             },
         },
     )
@@ -148,6 +155,7 @@ async fn cmd_connect(daemon: Arc<DaemonQuicClient>, args: ConnectArgs) -> Result
             tenant: args.tenant,
             namespace: args.namespace,
             edges: Vec::new(),
+            external_account_ref: None,
         });
         pipeline.edges.push(edge);
         pipeline.clone()
@@ -183,17 +191,230 @@ async fn cmd_scale(daemon: Arc<DaemonQuicClient>, args: ScaleArgs) -> Result<()>
 }
 
 async fn cmd_observe(daemon: Arc<DaemonQuicClient>, args: ObserveArgs) -> Result<()> {
-    let _ = args.json;
     let snapshot = cp_query_value(&daemon, Query::ControlPlaneSummary, false).await?;
-    println!("{:#?}", snapshot);
+    let status: StatusApiResponse = daemon.request(Method::ControlStatus, &Empty {}).await?;
+    let metrics: MetricsApiResponse = daemon.request(Method::ControlMetrics, &Empty {}).await?;
+
+    if args.json {
+        println!(
+            "{}",
+            data_value_to_json(&observe_value(snapshot, &status, &metrics))
+        );
+    } else {
+        println!("{:#?}", snapshot);
+        println!(
+            "health node={} role={} leader={} term={} commit_index={} last_applied={}",
+            status.node_id,
+            status.role,
+            status.leader_id.as_deref().unwrap_or("none"),
+            status.current_term,
+            status.commit_index,
+            status.last_applied,
+        );
+        println!(
+            "metrics deployments={} pipelines={} nodes={} peers={} tables={} durable_events={}",
+            metrics.deployment_count,
+            metrics.pipeline_count,
+            metrics.node_count,
+            metrics.peer_count,
+            metrics.table_count,
+            metrics.durable_events.unwrap_or(0),
+        );
+    }
     Ok(())
+}
+
+fn observe_value(
+    summary: DataValue,
+    status: &StatusApiResponse,
+    metrics: &MetricsApiResponse,
+) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("summary".to_string(), summary),
+        ("health".to_string(), status_value(status)),
+        ("metrics".to_string(), metrics_value(metrics)),
+    ]))
+}
+
+fn status_value(status: &StatusApiResponse) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "node_id".to_string(),
+            DataValue::from(status.node_id.clone()),
+        ),
+        ("role".to_string(), DataValue::from(status.role.clone())),
+        (
+            "current_term".to_string(),
+            DataValue::from(status.current_term),
+        ),
+        (
+            "leader_id".to_string(),
+            status
+                .leader_id
+                .clone()
+                .map(DataValue::from)
+                .unwrap_or(DataValue::Null),
+        ),
+        (
+            "commit_index".to_string(),
+            DataValue::from(status.commit_index),
+        ),
+        (
+            "last_applied".to_string(),
+            DataValue::from(status.last_applied),
+        ),
+        (
+            "peers".to_string(),
+            DataValue::List(status.peers.iter().cloned().map(DataValue::from).collect()),
+        ),
+        (
+            "table_count".to_string(),
+            DataValue::from(status.table_count),
+        ),
+        (
+            "durable_events".to_string(),
+            status
+                .durable_events
+                .map(DataValue::from)
+                .unwrap_or(DataValue::Null),
+        ),
+    ]))
+}
+
+fn metrics_value(metrics: &MetricsApiResponse) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "node_id".to_string(),
+            DataValue::from(metrics.node_id.clone()),
+        ),
+        (
+            "deployment_count".to_string(),
+            DataValue::from(metrics.deployment_count),
+        ),
+        (
+            "pipeline_count".to_string(),
+            DataValue::from(metrics.pipeline_count),
+        ),
+        (
+            "node_count".to_string(),
+            DataValue::from(metrics.node_count),
+        ),
+        (
+            "peer_count".to_string(),
+            DataValue::from(metrics.peer_count),
+        ),
+        (
+            "table_count".to_string(),
+            DataValue::from(metrics.table_count),
+        ),
+        (
+            "commit_index".to_string(),
+            DataValue::from(metrics.commit_index),
+        ),
+        (
+            "last_applied".to_string(),
+            DataValue::from(metrics.last_applied),
+        ),
+        (
+            "durable_events".to_string(),
+            metrics
+                .durable_events
+                .map(DataValue::from)
+                .unwrap_or(DataValue::Null),
+        ),
+    ]))
+}
+
+fn data_value_to_json(value: &DataValue) -> String {
+    let mut out = String::new();
+    write_data_value_json(&mut out, value);
+    out
+}
+
+fn write_data_value_json(out: &mut String, value: &DataValue) {
+    use std::fmt::Write as _;
+
+    match value {
+        DataValue::Null => out.push_str("null"),
+        DataValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        DataValue::U64(value) => {
+            let _ = write!(out, "{value}");
+        }
+        DataValue::I64(value) => {
+            let _ = write!(out, "{value}");
+        }
+        DataValue::String(value) => {
+            out.push('"');
+            write_json_string_content(out, value);
+            out.push('"');
+        }
+        DataValue::Bytes(bytes) => {
+            out.push('[');
+            for (idx, byte) in bytes.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{byte}");
+            }
+            out.push(']');
+        }
+        DataValue::List(values) => {
+            out.push('[');
+            for (idx, item) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_data_value_json(out, item);
+            }
+            out.push(']');
+        }
+        DataValue::Map(values) => {
+            out.push('{');
+            for (idx, (key, item)) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                write_json_string_content(out, key);
+                out.push_str("\":");
+                write_data_value_json(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_json_string_content(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
 }
 
 async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<()> {
     let replay: ReplayApiResponse = daemon
         .request(
             Method::ControlReplay,
-            &ReplayApiRequest { limit: args.limit },
+            &ReplayApiRequest {
+                limit: args.limit,
+                since_sequence: None,
+                external_account_ref: None,
+                workload: None,
+                module: None,
+                pipeline: None,
+                node: None,
+            },
         )
         .await?;
 
@@ -293,8 +514,10 @@ async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()>
             Method::StartInstance,
             &StartRequest {
                 node_id: args.node,
+                workload_key: args.replica_key.clone(),
                 instance_id: args.replica_key,
                 module_spec,
+                external_account_ref: None,
                 managed_endpoint_bindings,
             },
         )
@@ -588,8 +811,13 @@ async fn execute_daemon_actions(
                         Method::StartInstance,
                         &StartRequest {
                             node_id: node.to_string(),
+                            workload_key: deployment.clone(),
                             instance_id: instance_id.clone(),
                             module_spec,
+                            external_account_ref: spec
+                                .external_account_ref
+                                .as_ref()
+                                .map(|reference| reference.key.clone()),
                             managed_endpoint_bindings: managed_endpoint_bindings.clone(),
                         },
                     )
@@ -753,5 +981,65 @@ mod tests {
         assert!(spec.contains("path=echo.wasm"));
         assert!(spec.contains("adaptor=wasmtime"));
         assert!(spec.contains("queue_writer"));
+    }
+
+    #[test]
+    fn observe_value_groups_health_and_metrics() {
+        let value = observe_value(
+            DataValue::Map(BTreeMap::from([(
+                "deployments".to_string(),
+                DataValue::List(vec![DataValue::from("tenant-a/media/router")]),
+            )])),
+            &StatusApiResponse {
+                node_id: "node-a".to_string(),
+                role: "Leader".to_string(),
+                current_term: 3,
+                leader_id: Some("node-a".to_string()),
+                commit_index: 9,
+                last_applied: 9,
+                peers: vec!["node-b".to_string()],
+                table_count: 2,
+                durable_events: Some(10),
+            },
+            &MetricsApiResponse {
+                node_id: "node-a".to_string(),
+                deployment_count: 1,
+                pipeline_count: 0,
+                node_count: 2,
+                peer_count: 1,
+                table_count: 2,
+                commit_index: 9,
+                last_applied: 9,
+                durable_events: Some(10),
+            },
+        );
+
+        assert_eq!(
+            value
+                .get("health")
+                .and_then(|health| health.get("role"))
+                .and_then(DataValue::as_str),
+            Some("Leader")
+        );
+        assert_eq!(
+            value
+                .get("metrics")
+                .and_then(|metrics| metrics.get("deployment_count"))
+                .and_then(DataValue::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn data_value_to_json_escapes_strings() {
+        let value = DataValue::Map(BTreeMap::from([(
+            "note".to_string(),
+            DataValue::from("line\n\"two\""),
+        )]));
+
+        assert_eq!(
+            data_value_to_json(&value),
+            "{\"note\":\"line\\n\\\"two\\\"\"}"
+        );
     }
 }

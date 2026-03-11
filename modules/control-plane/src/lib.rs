@@ -9,16 +9,19 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use rkyv::{Archive, Deserialize, Serialize};
-use selium_abi::{DataValue, StorageReplayStart, decode_rkyv, encode_rkyv};
+use selium_abi::{
+    DataValue, StorageLogBoundsResult, StorageLogRecord, StorageReplayStart, decode_rkyv,
+    encode_rkyv,
+};
 use selium_control_plane_api::{
-    ContractKind, ControlPlaneState, IsolationProfile, NodeSpec, PublicEndpointRef,
+    ContractKind, ControlPlaneState, DeploymentSpec, IsolationProfile, NodeSpec, PublicEndpointRef,
 };
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, AppendEntriesApiRequest,
     DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, EndpointBridgeSemantics,
     EventBridgeSemantics, EventDeliveryMode, ListResponse, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, Method, MutateApiRequest, MutateApiResponse,
-    QueryApiRequest, QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, MetricsApiResponse, MutateApiRequest,
+    MutateApiResponse, QueryApiRequest, QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest,
     ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StatusApiResponse, StopRequest,
     StreamBridgeSemantics, StreamLifecycleMode, decode_envelope, decode_payload,
     encode_error_response, encode_response, is_error, is_request,
@@ -124,6 +127,8 @@ pub struct ControlPlaneModuleConfig {
     pub public_daemon_addr: String,
     pub public_daemon_server_name: String,
     pub capacity_slots: u32,
+    pub allocatable_cpu_millis: Option<u32>,
+    pub allocatable_memory_mib: Option<u32>,
     pub heartbeat_interval_ms: u64,
     pub bootstrap_leader: bool,
     pub peers: Vec<PeerTarget>,
@@ -519,10 +524,14 @@ async fn handle_request_frame(frame: Vec<u8>, state: SharedState) -> Result<Vec<
             let response = handle_status(Rc::clone(&state)).await?;
             encode_response(envelope.method, envelope.request_id, &response)
         }
+        Method::ControlMetrics => {
+            let response = handle_metrics(Rc::clone(&state)).await?;
+            encode_response(envelope.method, envelope.request_id, &response)
+        }
         Method::ControlReplay => {
             let payload: selium_control_plane_protocol::ReplayApiRequest =
                 decode_payload(&envelope).context("decode replay")?;
-            let response = handle_replay(Rc::clone(&state), payload.limit).await?;
+            let response = handle_replay(Rc::clone(&state), payload).await?;
             encode_response(envelope.method, envelope.request_id, &response)
         }
         Method::RaftRequestVote => {
@@ -713,26 +722,393 @@ async fn handle_status(state: SharedState) -> Result<StatusApiResponse> {
     })
 }
 
-async fn handle_replay(state: SharedState, limit: usize) -> Result<ReplayApiResponse> {
+async fn handle_metrics(state: SharedState) -> Result<MetricsApiResponse> {
+    let (status, peer_count, snapshot, event_log) = {
+        let borrowed = state.borrow();
+        (
+            borrowed.raft.status(),
+            borrowed.config.peers.len(),
+            borrowed.engine.snapshot(),
+            borrowed.event_log,
+        )
+    };
+    Ok(MetricsApiResponse {
+        node_id: status.node_id,
+        deployment_count: snapshot.control_plane.deployments.len(),
+        pipeline_count: snapshot.control_plane.pipelines.len(),
+        node_count: snapshot.control_plane.nodes.len(),
+        peer_count,
+        table_count: snapshot.tables.tables().len(),
+        commit_index: status.commit_index,
+        last_applied: status.last_applied,
+        durable_events: event_log.bounds().await?.latest_sequence,
+    })
+}
+
+async fn handle_replay(
+    state: SharedState,
+    request: selium_control_plane_protocol::ReplayApiRequest,
+) -> Result<ReplayApiResponse> {
     let event_log = state.borrow().event_log;
-    let (records, _) = event_log
-        .replay(StorageReplayStart::Latest, limit as u32)
+    let bounds = event_log.bounds().await?;
+    let start_sequence = replay_start_sequence(&bounds, &request);
+    let Some(start) = start_sequence else {
+        return Ok(ReplayApiResponse {
+            events: Vec::new(),
+            start_sequence: None,
+            high_watermark: bounds.latest_sequence,
+        });
+    };
+
+    let limit = replay_fetch_limit(&bounds, start, request.limit);
+    if limit == 0 {
+        return Ok(ReplayApiResponse {
+            events: Vec::new(),
+            start_sequence: Some(start),
+            high_watermark: bounds.latest_sequence,
+        });
+    }
+
+    let (records, high_watermark) = event_log
+        .replay(StorageReplayStart::Sequence(start), limit)
         .await?;
-    let events = records
+    let events = select_replay_records(records, &request)
         .into_iter()
-        .map(|record| {
-            decode_rkyv::<DurableCommittedEntry>(&record.payload)
-                .map(|entry| {
-                    DataValue::Map(BTreeMap::from([
-                        ("idempotency_key".to_string(), entry.idempotency_key.into()),
-                        ("index".to_string(), entry.index.into()),
-                        ("term".to_string(), entry.term.into()),
-                    ]))
-                })
-                .unwrap_or_else(|_| DataValue::Bytes(record.payload))
-        })
+        .map(replay_record_value)
         .collect();
-    Ok(ReplayApiResponse { events })
+    Ok(ReplayApiResponse {
+        events,
+        start_sequence: Some(start),
+        high_watermark,
+    })
+}
+
+fn replay_start_sequence(
+    bounds: &StorageLogBoundsResult,
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+) -> Option<u64> {
+    if request.limit == 0 {
+        return None;
+    }
+    let first = bounds.first_sequence?;
+    let latest = bounds.latest_sequence?;
+    if let Some(sequence) = request.since_sequence {
+        return Some(sequence.max(first));
+    }
+    if replay_has_filters(request) {
+        return Some(first);
+    }
+    let window = request.limit.saturating_sub(1) as u64;
+    Some(latest.saturating_sub(window).max(first))
+}
+
+fn replay_fetch_limit(
+    bounds: &StorageLogBoundsResult,
+    start_sequence: u64,
+    requested: usize,
+) -> u32 {
+    if requested == 0 {
+        return 0;
+    }
+    let Some(latest) = bounds.latest_sequence else {
+        return 0;
+    };
+    if start_sequence > latest {
+        return 0;
+    }
+    latest
+        .saturating_sub(start_sequence)
+        .saturating_add(1)
+        .min(u32::MAX as u64) as u32
+}
+
+fn replay_has_filters(request: &selium_control_plane_protocol::ReplayApiRequest) -> bool {
+    request.external_account_ref.is_some()
+        || request.workload.is_some()
+        || request.module.is_some()
+        || request.pipeline.is_some()
+        || request.node.is_some()
+}
+
+fn select_replay_records(
+    records: Vec<StorageLogRecord>,
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+) -> Vec<StorageLogRecord> {
+    let mut matching = records
+        .into_iter()
+        .filter(|record| replay_record_matches(record, request))
+        .collect::<Vec<_>>();
+    if request.since_sequence.is_some() {
+        matching.truncate(request.limit);
+        return matching;
+    }
+    let keep = matching.len().saturating_sub(request.limit);
+    matching.drain(0..keep);
+    matching
+}
+
+fn replay_record_matches(
+    record: &StorageLogRecord,
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+) -> bool {
+    match_header(
+        &record.headers,
+        "external_account_ref",
+        request.external_account_ref.as_deref(),
+    ) && match_header(&record.headers, "workload", request.workload.as_deref())
+        && match_header(&record.headers, "module", request.module.as_deref())
+        && match_header(&record.headers, "pipeline", request.pipeline.as_deref())
+        && match_header(&record.headers, "node", request.node.as_deref())
+}
+
+fn match_header(headers: &BTreeMap<String, String>, key: &str, expected: Option<&str>) -> bool {
+    expected.is_none_or(|value| headers.get(key).map(String::as_str) == Some(value))
+}
+
+fn replay_record_value(record: StorageLogRecord) -> DataValue {
+    let mut event = BTreeMap::from([
+        ("sequence".to_string(), DataValue::from(record.sequence)),
+        (
+            "timestamp_ms".to_string(),
+            DataValue::from(record.timestamp_ms),
+        ),
+        (
+            "headers".to_string(),
+            DataValue::Map(
+                record
+                    .headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), DataValue::from(value.clone())))
+                    .collect(),
+            ),
+        ),
+    ]);
+
+    match decode_rkyv::<DurableCommittedEntry>(&record.payload) {
+        Ok(entry) => {
+            event.insert(
+                "idempotency_key".to_string(),
+                DataValue::from(entry.idempotency_key.clone()),
+            );
+            event.insert("index".to_string(), DataValue::from(entry.index));
+            event.insert("term".to_string(), DataValue::from(entry.term));
+            if let Ok(envelope) = ControlPlaneEngine::decode_mutation(&entry.payload) {
+                let mut audit = audit_event_fields(&entry, &envelope.mutation);
+                for key in ["external_account_ref", "module"] {
+                    if !audit.contains_key(key) {
+                        if let Some(value) = record.headers.get(key) {
+                            audit.insert(key.to_string(), DataValue::from(value.clone()));
+                        }
+                    }
+                }
+                event.insert("audit".to_string(), DataValue::Map(audit));
+            }
+        }
+        Err(_) => {
+            event.insert("payload".to_string(), DataValue::Bytes(record.payload));
+        }
+    }
+
+    DataValue::Map(event)
+}
+
+fn audit_event_fields(
+    entry: &DurableCommittedEntry,
+    mutation: &Mutation,
+) -> BTreeMap<String, DataValue> {
+    let mut audit = BTreeMap::from([
+        (
+            "actor_kind".to_string(),
+            DataValue::from(mutation_actor_kind(mutation)),
+        ),
+        (
+            "mutation_kind".to_string(),
+            DataValue::from(mutation_kind(mutation)),
+        ),
+        (
+            "idempotency_key".to_string(),
+            DataValue::from(entry.idempotency_key.clone()),
+        ),
+        ("index".to_string(), DataValue::from(entry.index)),
+        ("term".to_string(), DataValue::from(entry.term)),
+    ]);
+    audit.extend(mutation_target_fields(mutation));
+    audit
+}
+
+fn audit_headers(
+    state: Option<&ControlPlaneState>,
+    mutation: &Mutation,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::from([
+        ("source".to_string(), "control-plane".to_string()),
+        ("event_kind".to_string(), "audit".to_string()),
+        (
+            "actor_kind".to_string(),
+            mutation_actor_kind(mutation).to_string(),
+        ),
+        (
+            "mutation_kind".to_string(),
+            mutation_kind(mutation).to_string(),
+        ),
+    ]);
+    match mutation {
+        Mutation::UpsertDeployment { spec } => {
+            headers.insert("workload".to_string(), spec.workload.to_string());
+            headers.insert("module".to_string(), spec.module.clone());
+            if let Some(reference) = &spec.external_account_ref {
+                headers.insert("external_account_ref".to_string(), reference.key.clone());
+            }
+        }
+        Mutation::SetScale { workload, .. } => {
+            headers.insert("workload".to_string(), workload.to_string());
+            if let Some(deployment) = state.and_then(|state| state.deployments.get(&workload.key()))
+            {
+                headers.insert("module".to_string(), deployment.module.clone());
+                if let Some(reference) = &deployment.external_account_ref {
+                    headers.insert("external_account_ref".to_string(), reference.key.clone());
+                }
+            }
+        }
+        Mutation::UpsertPipeline { spec } => {
+            headers.insert(
+                "pipeline".to_string(),
+                format!("{}/{}/{}", spec.tenant, spec.namespace, spec.name),
+            );
+            if let Some(reference) = &spec.external_account_ref {
+                headers.insert("external_account_ref".to_string(), reference.key.clone());
+            }
+        }
+        Mutation::UpsertNode { spec } => {
+            headers.insert("node".to_string(), spec.name.clone());
+        }
+        Mutation::PublishIdl { .. } | Mutation::Table { .. } => {}
+    }
+    headers
+}
+
+fn mutation_actor_kind(mutation: &Mutation) -> &'static str {
+    match mutation {
+        Mutation::UpsertNode { .. } => "system",
+        Mutation::PublishIdl { .. }
+        | Mutation::UpsertDeployment { .. }
+        | Mutation::UpsertPipeline { .. }
+        | Mutation::SetScale { .. }
+        | Mutation::Table { .. } => "operator",
+    }
+}
+
+fn mutation_kind(mutation: &Mutation) -> &'static str {
+    match mutation {
+        Mutation::PublishIdl { .. } => "publish_idl",
+        Mutation::UpsertDeployment { .. } => "upsert_deployment",
+        Mutation::UpsertPipeline { .. } => "upsert_pipeline",
+        Mutation::UpsertNode { .. } => "upsert_node",
+        Mutation::SetScale { .. } => "set_scale",
+        Mutation::Table { .. } => "table",
+    }
+}
+
+fn mutation_target_fields(mutation: &Mutation) -> BTreeMap<String, DataValue> {
+    match mutation {
+        Mutation::PublishIdl { .. } | Mutation::Table { .. } => BTreeMap::new(),
+        Mutation::UpsertDeployment { spec } => BTreeMap::from([
+            (
+                "workload".to_string(),
+                DataValue::from(spec.workload.to_string()),
+            ),
+            ("replicas".to_string(), DataValue::from(spec.replicas)),
+            ("module".to_string(), DataValue::from(spec.module.clone())),
+            (
+                "external_account_ref".to_string(),
+                serialize_external_account_ref(&spec.external_account_ref),
+            ),
+            (
+                "resources".to_string(),
+                serialize_deployment_resources(spec),
+            ),
+        ]),
+        Mutation::UpsertPipeline { spec } => BTreeMap::from([
+            (
+                "pipeline".to_string(),
+                DataValue::from(format!("{}/{}/{}", spec.tenant, spec.namespace, spec.name)),
+            ),
+            (
+                "external_account_ref".to_string(),
+                serialize_external_account_ref(&spec.external_account_ref),
+            ),
+            ("edge_count".to_string(), DataValue::from(spec.edges.len())),
+        ]),
+        Mutation::UpsertNode { spec } => BTreeMap::from([
+            ("node".to_string(), DataValue::from(spec.name.clone())),
+            (
+                "capacity_slots".to_string(),
+                DataValue::from(spec.capacity_slots),
+            ),
+            (
+                "allocatable_cpu_millis".to_string(),
+                serialize_optional_u32(spec.allocatable_cpu_millis),
+            ),
+            (
+                "allocatable_memory_mib".to_string(),
+                serialize_optional_u32(spec.allocatable_memory_mib),
+            ),
+        ]),
+        Mutation::SetScale { workload, replicas } => BTreeMap::from([
+            (
+                "workload".to_string(),
+                DataValue::from(workload.to_string()),
+            ),
+            ("replicas".to_string(), DataValue::from(*replicas)),
+        ]),
+    }
+}
+
+fn serialize_deployment_resources(spec: &DeploymentSpec) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("cpu_millis".to_string(), DataValue::from(spec.cpu_millis)),
+        ("memory_mib".to_string(), DataValue::from(spec.memory_mib)),
+        (
+            "ephemeral_storage_mib".to_string(),
+            DataValue::from(spec.ephemeral_storage_mib),
+        ),
+        (
+            "bandwidth_profile".to_string(),
+            DataValue::from(spec.bandwidth_profile.as_str()),
+        ),
+        (
+            "volume_mounts".to_string(),
+            DataValue::List(
+                spec.volume_mounts
+                    .iter()
+                    .map(|mount| {
+                        DataValue::Map(BTreeMap::from([
+                            ("name".to_string(), DataValue::from(mount.name.clone())),
+                            (
+                                "mount_path".to_string(),
+                                DataValue::from(mount.mount_path.clone()),
+                            ),
+                            ("read_only".to_string(), DataValue::from(mount.read_only)),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn serialize_optional_u32(value: Option<u32>) -> DataValue {
+    value.map_or(DataValue::Null, DataValue::from)
+}
+
+fn serialize_external_account_ref(
+    external_account_ref: &Option<selium_control_plane_api::ExternalAccountRef>,
+) -> DataValue {
+    external_account_ref
+        .as_ref()
+        .map_or(DataValue::Null, |reference| {
+            DataValue::from(reference.key.clone())
+        })
 }
 
 async fn handle_request_vote(
@@ -840,6 +1216,8 @@ async fn publish_heartbeat(state: SharedState) -> Result<()> {
             spec: NodeSpec {
                 name: state.borrow().config.node_id.clone(),
                 capacity_slots: state.borrow().config.capacity_slots,
+                allocatable_cpu_millis: state.borrow().config.allocatable_cpu_millis,
+                allocatable_memory_mib: state.borrow().config.allocatable_memory_mib,
                 supported_isolation: vec![
                     IsolationProfile::Standard,
                     IsolationProfile::Hardened,
@@ -930,8 +1308,13 @@ async fn execute_daemon_actions(
                     Method::StartInstance,
                     &StartRequest {
                         node_id: node.to_string(),
+                        workload_key: deployment.clone(),
                         instance_id: instance_id.clone(),
                         module_spec,
+                        external_account_ref: spec
+                            .external_account_ref
+                            .as_ref()
+                            .map(|reference| reference.key.clone()),
                         managed_endpoint_bindings: managed_endpoint_bindings.clone(),
                     },
                 )
@@ -1021,10 +1404,12 @@ async fn apply_committed(state: SharedState) -> Result<BTreeMap<u64, MutationRes
             .dedupe
             .insert(envelope.idempotency_key.clone(), response.clone());
         let event_log = state.borrow().event_log;
+        let snapshot = state.borrow().engine.snapshot();
+        let headers = audit_headers(Some(&snapshot.control_plane), &envelope.mutation);
         event_log
             .append(
                 time::now().await?.unix_ms,
-                BTreeMap::from([("source".to_string(), "control-plane".to_string())]),
+                headers,
                 encode_rkyv(&DurableCommittedEntry {
                     idempotency_key: envelope.idempotency_key,
                     index: entry.index,
@@ -1267,9 +1652,10 @@ fn anyhow_from_runtime(err: RuntimeError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_control_plane_protocol::ReplayApiRequest;
     use selium_control_plane_api::{
-        ContractRef, DeploymentSpec, EventEndpointRef, PipelineEdge, PipelineEndpoint,
-        PipelineSpec, WorkloadRef, parse_idl,
+        BandwidthProfile, ContractRef, DeploymentSpec, EventEndpointRef, ExternalAccountRef,
+        PipelineEdge, PipelineEndpoint, PipelineSpec, VolumeMount, WorkloadRef, parse_idl,
     };
 
     const SAMPLE_IDL: &str = r#"
@@ -1299,6 +1685,12 @@ event camera.frames(Frame) {
                 replicas: 2,
                 contracts: Vec::new(),
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -1358,6 +1750,12 @@ event camera.frames(Frame) {
                     replicas: 1,
                     contracts: vec![contract.clone()],
                     isolation: IsolationProfile::Standard,
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    ephemeral_storage_mib: 0,
+                    bandwidth_profile: BandwidthProfile::Standard,
+                    volume_mounts: Vec::new(),
+                    external_account_ref: None,
                 })
                 .expect("deployment");
         }
@@ -1381,6 +1779,7 @@ event camera.frames(Frame) {
                     contract,
                 },
             }],
+            external_account_ref: None,
         });
 
         let desired = build_plan(&state).expect("schedule");
@@ -1426,6 +1825,12 @@ event camera.frames(Frame) {
                     replicas: 1,
                     contracts: vec![contract.clone()],
                     isolation: IsolationProfile::Standard,
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    ephemeral_storage_mib: 0,
+                    bandwidth_profile: BandwidthProfile::Standard,
+                    volume_mounts: Vec::new(),
+                    external_account_ref: None,
                 })
                 .expect("deployment");
         }
@@ -1449,6 +1854,7 @@ event camera.frames(Frame) {
                     contract,
                 },
             }],
+            external_account_ref: None,
         });
 
         let desired = build_plan(&state).expect("schedule");
@@ -1582,5 +1988,319 @@ event camera.frames(Frame) {
             binding.endpoint_kind == ContractKind::Stream
                 && binding.binding_type == ManagedEndpointBindingType::Session
         }));
+    }
+
+    #[test]
+    fn replay_record_value_includes_structured_operator_audit_fields() {
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "router".to_string(),
+        };
+        let workload_key = workload.to_string();
+        let mut state = ControlPlaneState::default();
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: workload.clone(),
+                module: "router.wasm".to_string(),
+                replicas: 1,
+                contracts: Vec::new(),
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: Some(ExternalAccountRef {
+                    key: "acct-123".to_string(),
+                }),
+            })
+            .expect("seed deployment");
+        let envelope = MutationEnvelope {
+            idempotency_key: "audit-1".to_string(),
+            mutation: Mutation::SetScale {
+                workload: workload.clone(),
+                replicas: 3,
+            },
+        };
+        let committed = DurableCommittedEntry {
+            idempotency_key: envelope.idempotency_key.clone(),
+            index: 7,
+            term: 2,
+            payload: ControlPlaneEngine::encode_mutation(&envelope).expect("encode mutation"),
+        };
+        let record = StorageLogRecord {
+            sequence: 11,
+            timestamp_ms: 42,
+            headers: audit_headers(Some(&state), &envelope.mutation),
+            payload: encode_rkyv(&committed).expect("encode committed entry"),
+        };
+
+        let value = replay_record_value(record);
+        assert_eq!(value.get("sequence").and_then(DataValue::as_u64), Some(11));
+        assert_eq!(value.get("index").and_then(DataValue::as_u64), Some(7));
+        let audit = value.get("audit").expect("audit section");
+        assert_eq!(
+            audit.get("actor_kind").and_then(DataValue::as_str),
+            Some("operator")
+        );
+        assert_eq!(
+            audit.get("mutation_kind").and_then(DataValue::as_str),
+            Some("set_scale")
+        );
+        assert_eq!(
+            audit.get("workload").and_then(DataValue::as_str),
+            Some(workload_key.as_str())
+        );
+        assert_eq!(
+            audit.get("module").and_then(DataValue::as_str),
+            Some("router.wasm")
+        );
+        assert_eq!(audit.get("replicas").and_then(DataValue::as_u64), Some(3));
+        assert_eq!(
+            audit
+                .get("external_account_ref")
+                .and_then(DataValue::as_str),
+            Some("acct-123")
+        );
+    }
+
+    #[test]
+    fn replay_record_value_includes_declared_resource_fields() {
+        let envelope = MutationEnvelope {
+            idempotency_key: "audit-2".to_string(),
+            mutation: Mutation::UpsertDeployment {
+                spec: DeploymentSpec {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "router".to_string(),
+                    },
+                    module: "router.wasm".to_string(),
+                    replicas: 1,
+                    contracts: Vec::new(),
+                    isolation: IsolationProfile::Standard,
+                    cpu_millis: 600,
+                    memory_mib: 512,
+                    ephemeral_storage_mib: 128,
+                    bandwidth_profile: BandwidthProfile::High,
+                    volume_mounts: vec![VolumeMount {
+                        name: "scratch".to_string(),
+                        mount_path: "/scratch".to_string(),
+                        read_only: false,
+                    }],
+                    external_account_ref: Some(ExternalAccountRef {
+                        key: "acct-789".to_string(),
+                    }),
+                },
+            },
+        };
+        let committed = DurableCommittedEntry {
+            idempotency_key: envelope.idempotency_key.clone(),
+            index: 8,
+            term: 2,
+            payload: ControlPlaneEngine::encode_mutation(&envelope).expect("encode mutation"),
+        };
+        let record = StorageLogRecord {
+            sequence: 12,
+            timestamp_ms: 43,
+            headers: audit_headers(None, &envelope.mutation),
+            payload: encode_rkyv(&committed).expect("encode committed entry"),
+        };
+
+        let event = replay_record_value(record);
+        let audit = event.get("audit").expect("audit section");
+
+        assert_eq!(
+            audit
+                .get("resources")
+                .and_then(|resources| resources.get("cpu_millis"))
+                .and_then(DataValue::as_u64),
+            Some(600)
+        );
+        assert_eq!(
+            audit
+                .get("resources")
+                .and_then(|resources| resources.get("bandwidth_profile"))
+                .and_then(DataValue::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            audit
+                .get("external_account_ref")
+                .and_then(DataValue::as_str),
+            Some("acct-789")
+        );
+        assert_eq!(
+            event
+                .get("headers")
+                .and_then(|headers| headers.get("external_account_ref"))
+                .and_then(DataValue::as_str),
+            Some("acct-789")
+        );
+    }
+
+    #[test]
+    fn replay_record_value_includes_pipeline_external_account_reference() {
+        let contract = ContractRef {
+            namespace: "media.pipeline".to_string(),
+            kind: selium_control_plane_api::ContractKind::Event,
+            name: "camera.frames".to_string(),
+            version: "v1".to_string(),
+        };
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "router".to_string(),
+        };
+        let envelope = MutationEnvelope {
+            idempotency_key: "audit-3".to_string(),
+            mutation: Mutation::UpsertPipeline {
+                spec: PipelineSpec {
+                    name: "camera".to_string(),
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    edges: vec![PipelineEdge {
+                        from: PipelineEndpoint {
+                            endpoint: EventEndpointRef {
+                                workload: workload.clone(),
+                                name: contract.name.clone(),
+                            },
+                            contract: contract.clone(),
+                        },
+                        to: PipelineEndpoint {
+                            endpoint: EventEndpointRef {
+                                workload,
+                                name: contract.name.clone(),
+                            },
+                            contract,
+                        },
+                    }],
+                    external_account_ref: Some(ExternalAccountRef {
+                        key: "acct-321".to_string(),
+                    }),
+                },
+            },
+        };
+        let committed = DurableCommittedEntry {
+            idempotency_key: envelope.idempotency_key.clone(),
+            index: 9,
+            term: 2,
+            payload: ControlPlaneEngine::encode_mutation(&envelope).expect("encode mutation"),
+        };
+        let record = StorageLogRecord {
+            sequence: 13,
+            timestamp_ms: 44,
+            headers: audit_headers(None, &envelope.mutation),
+            payload: encode_rkyv(&committed).expect("encode committed entry"),
+        };
+
+        let event = replay_record_value(record);
+        let audit = event.get("audit").expect("audit section");
+
+        assert_eq!(
+            audit.get("pipeline").and_then(DataValue::as_str),
+            Some("tenant-a/media/camera")
+        );
+        assert_eq!(
+            audit
+                .get("external_account_ref")
+                .and_then(DataValue::as_str),
+            Some("acct-321")
+        );
+        assert_eq!(
+            event
+                .get("headers")
+                .and_then(|headers| headers.get("external_account_ref"))
+                .and_then(DataValue::as_str),
+            Some("acct-321")
+        );
+    }
+
+    #[test]
+    fn audit_headers_classify_node_upserts_as_system() {
+        let headers = audit_headers(
+            None,
+            &Mutation::UpsertNode {
+                spec: NodeSpec {
+                    name: "node-a".to_string(),
+                    capacity_slots: 64,
+                    allocatable_cpu_millis: Some(2_000),
+                    allocatable_memory_mib: Some(4_096),
+                    supported_isolation: vec![IsolationProfile::Standard],
+                    daemon_addr: "127.0.0.1:7100".to_string(),
+                    daemon_server_name: "localhost".to_string(),
+                    last_heartbeat_ms: 0,
+                },
+            },
+        );
+
+        assert_eq!(headers.get("actor_kind"), Some(&"system".to_string()));
+        assert_eq!(
+            headers.get("mutation_kind"),
+            Some(&"upsert_node".to_string())
+        );
+        assert_eq!(headers.get("node"), Some(&"node-a".to_string()));
+    }
+
+    #[test]
+    fn replay_selection_respects_since_sequence_and_header_filters() {
+        let request = ReplayApiRequest {
+            limit: 2,
+            since_sequence: Some(12),
+            external_account_ref: Some("acct-123".to_string()),
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+        let bounds = StorageLogBoundsResult {
+            code: selium_abi::StorageStatusCode::Ok,
+            first_sequence: Some(10),
+            latest_sequence: Some(14),
+            next_sequence: 15,
+        };
+        assert_eq!(replay_start_sequence(&bounds, &request), Some(12));
+
+        let selected = select_replay_records(
+            vec![
+                StorageLogRecord {
+                    sequence: 12,
+                    timestamp_ms: 1,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-123".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 13,
+                    timestamp_ms: 2,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-999".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 14,
+                    timestamp_ms: 3,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-123".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![12, 14]
+        );
     }
 }

@@ -23,6 +23,7 @@ use selium_kernel::{
     spi::storage::{
         BlobStoreHandle, LogHandle, StorageCapability, StorageFuture, StorageProcessPolicy,
     },
+    spi::usage::UsageRecorder,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -57,11 +58,13 @@ pub enum StorageError {
 #[derive(Clone, Debug)]
 pub struct RuntimeLog {
     store: Arc<Mutex<DurableLogStore>>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeBlobStore {
     path: PathBuf,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone)]
@@ -162,6 +165,7 @@ impl StorageCapability for StorageService {
             Ok(LogHandle {
                 inner: RuntimeLog {
                     store: Arc::new(Mutex::new(store)),
+                    usage_recorder: policy.usage_recorder(),
                 },
             })
         })
@@ -180,6 +184,7 @@ impl StorageCapability for StorageService {
             Ok(BlobStoreHandle {
                 inner: RuntimeBlobStore {
                     path: definition.path,
+                    usage_recorder: policy.usage_recorder(),
                 },
             })
         })
@@ -193,9 +198,11 @@ impl StorageCapability for StorageService {
         let log = log.clone();
         Box::pin(async move {
             let mut store = log.store.lock().await;
+            let payload_len = input.payload.len() as u64;
             let record = store
                 .append(input.timestamp_ms, input.headers, input.payload)
                 .map_err(storage_other)?;
+            record_storage_write(&log.usage_recorder, payload_len);
             Ok(StorageLogAppendResult {
                 code: StorageStatusCode::Ok,
                 sequence: Some(record.sequence),
@@ -214,6 +221,12 @@ impl StorageCapability for StorageService {
             let batch = store
                 .replay(map_replay_start(input.start), input.limit as usize)
                 .map_err(storage_other)?;
+            let payload_bytes = batch
+                .records
+                .iter()
+                .map(|record| record.payload.len() as u64)
+                .sum();
+            record_storage_read(&log.usage_recorder, payload_bytes);
             Ok(StorageLogReplayResult {
                 code: StorageStatusCode::Ok,
                 records: batch
@@ -285,12 +298,14 @@ impl StorageCapability for StorageService {
     ) -> StorageFuture<StorageBlobPutResult, Self::Error> {
         let store = store.clone();
         Box::pin(async move {
+            let payload_len = input.bytes.len() as u64;
             let blob_id = blob_id_for(&input.bytes);
             fs::create_dir_all(blob_dir(&store.path)).map_err(storage_other)?;
             let path = blob_path(&store.path, &blob_id);
             if !path.exists() {
                 fs::write(&path, input.bytes).map_err(storage_other)?;
             }
+            record_storage_write(&store.usage_recorder, payload_len);
             Ok(StorageBlobPutResult {
                 code: StorageStatusCode::Ok,
                 blob_id: Some(blob_id),
@@ -312,9 +327,11 @@ impl StorageCapability for StorageService {
                     bytes: None,
                 });
             }
+            let bytes = fs::read(path).map_err(storage_other)?;
+            record_storage_read(&store.usage_recorder, bytes.len() as u64);
             Ok(StorageBlobGetResult {
                 code: StorageStatusCode::Ok,
-                bytes: Some(fs::read(path).map_err(storage_other)?),
+                bytes: Some(bytes),
             })
         })
     }
@@ -326,9 +343,11 @@ impl StorageCapability for StorageService {
     ) -> StorageFuture<StorageStatus, Self::Error> {
         let store = store.clone();
         Box::pin(async move {
+            let bytes = input.blob_id.len() as u64;
             fs::create_dir_all(manifest_dir(&store.path)).map_err(storage_other)?;
             fs::write(manifest_path(&store.path, &input.name), input.blob_id)
                 .map_err(storage_other)?;
+            record_storage_write(&store.usage_recorder, bytes);
             Ok(ok_status())
         })
     }
@@ -348,6 +367,7 @@ impl StorageCapability for StorageService {
                 });
             }
             let blob_id = fs::read_to_string(path).map_err(storage_other)?;
+            record_storage_read(&store.usage_recorder, blob_id.len() as u64);
             Ok(StorageManifestGetResult {
                 code: StorageStatusCode::Ok,
                 blob_id: Some(blob_id),
@@ -370,6 +390,22 @@ impl StorageCapability for StorageService {
 fn ok_status() -> StorageStatus {
     StorageStatus {
         code: StorageStatusCode::Ok,
+    }
+}
+
+fn record_storage_read(usage_recorder: &Option<Arc<dyn UsageRecorder>>, bytes: u64) {
+    if bytes > 0
+        && let Some(usage_recorder) = usage_recorder
+    {
+        usage_recorder.record_storage_read(bytes);
+    }
+}
+
+fn record_storage_write(usage_recorder: &Option<Arc<dyn UsageRecorder>>, bytes: u64) {
+    if bytes > 0
+        && let Some(usage_recorder) = usage_recorder
+    {
+        usage_recorder.record_storage_write(bytes);
     }
 }
 
@@ -424,7 +460,33 @@ impl From<StorageError> for GuestError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[derive(Debug, Default)]
+    struct TestUsageRecorder {
+        read_bytes: AtomicU64,
+        write_bytes: AtomicU64,
+    }
+
+    impl UsageRecorder for TestUsageRecorder {
+        fn record_network_ingress(&self, _bytes: u64) {}
+
+        fn record_network_egress(&self, _bytes: u64) {}
+
+        fn record_storage_read(&self, bytes: u64) {
+            self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        fn record_storage_write(&self, bytes: u64) {
+            self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
 
     fn temp_dir() -> PathBuf {
         let id = SystemTime::now()
@@ -438,6 +500,7 @@ mod tests {
     async fn blob_store_round_trip_uses_content_ids() {
         let dir = temp_dir();
         let service = StorageService::new();
+        let usage = Arc::new(TestUsageRecorder::default());
         service
             .register_blob_store(StorageBlobStoreDefinition {
                 name: "snapshots".to_string(),
@@ -447,10 +510,10 @@ mod tests {
 
         let store = service
             .open_blob_store(
-                Arc::new(StorageProcessPolicy::new(
-                    Vec::<String>::new(),
-                    ["snapshots".to_string()],
-                )),
+                Arc::new(
+                    StorageProcessPolicy::new(Vec::<String>::new(), ["snapshots".to_string()])
+                        .with_usage_recorder(usage.clone()),
+                ),
                 StorageOpenBlobStore {
                     name: "snapshots".to_string(),
                 },
@@ -480,5 +543,7 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(loaded.bytes.expect("bytes"), b"hello".to_vec());
+        assert_eq!(usage.write_bytes.load(Ordering::Relaxed), 5);
+        assert_eq!(usage.read_bytes.load(Ordering::Relaxed), 5);
     }
 }

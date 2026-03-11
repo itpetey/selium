@@ -14,6 +14,12 @@ pub struct ProcessStartRequest<'a> {
     pub process_id: ResourceId,
     pub module_id: &'a str,
     pub name: &'a str,
+    /// Stable Selium workload key when the process belongs to a control-plane-managed workload.
+    pub workload_key: Option<&'a str>,
+    /// Stable Selium instance identifier for checkpointing and durable metadata.
+    pub instance_id: Option<&'a str>,
+    /// Opaque external account reference supplied by Selium control-plane resources.
+    pub external_account_ref: Option<&'a str>,
     pub capabilities: Vec<Capability>,
     pub network_egress_profiles: Vec<String>,
     pub network_ingress_bindings: Vec<String>,
@@ -122,6 +128,9 @@ mod tests {
                     process_id,
                     module_id: "m",
                     name: "n",
+                    workload_key: None,
+                    instance_id: None,
+                    external_account_ref: None,
                     capabilities: vec![Capability::TimeRead],
                     network_egress_profiles: Vec::new(),
                     network_ingress_bindings: Vec::new(),

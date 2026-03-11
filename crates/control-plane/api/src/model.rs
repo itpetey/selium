@@ -243,6 +243,57 @@ pub enum IsolationProfile {
     Microvm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum BandwidthProfile {
+    Low,
+    #[default]
+    Standard,
+    High,
+}
+
+impl BandwidthProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Standard => "standard",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct VolumeMount {
+    pub name: String,
+    pub mount_path: String,
+    pub read_only: bool,
+}
+
+/// Stable opaque reference to an account record owned outside Selium.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ExternalAccountRef {
+    /// Opaque account key supplied by an external attribution system.
+    pub key: String,
+}
+
+impl ExternalAccountRef {
+    pub(crate) fn validate(
+        &self,
+        subject: &str,
+        invalid: fn(String) -> ApiError,
+    ) -> std::result::Result<(), ApiError> {
+        validate_identity_segment(&self.key, &format!("{subject} key"), invalid)
+    }
+}
+
+impl fmt::Display for ExternalAccountRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct DeploymentSpec {
@@ -251,6 +302,13 @@ pub struct DeploymentSpec {
     pub replicas: u32,
     pub contracts: Vec<ContractRef>,
     pub isolation: IsolationProfile,
+    pub cpu_millis: u32,
+    pub memory_mib: u32,
+    pub ephemeral_storage_mib: u32,
+    pub bandwidth_profile: BandwidthProfile,
+    pub volume_mounts: Vec<VolumeMount>,
+    /// Stable opaque external account reference used for attribution hand-off.
+    pub external_account_ref: Option<ExternalAccountRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -274,6 +332,8 @@ pub struct PipelineSpec {
     pub tenant: String,
     pub namespace: String,
     pub edges: Vec<PipelineEdge>,
+    /// Stable opaque external account reference used for attribution hand-off.
+    pub external_account_ref: Option<ExternalAccountRef>,
 }
 
 impl PipelineSpec {
@@ -287,6 +347,8 @@ impl PipelineSpec {
 pub struct NodeSpec {
     pub name: String,
     pub capacity_slots: u32,
+    pub allocatable_cpu_millis: Option<u32>,
+    pub allocatable_memory_mib: Option<u32>,
     pub supported_isolation: Vec<IsolationProfile>,
     pub daemon_addr: String,
     pub daemon_server_name: String,

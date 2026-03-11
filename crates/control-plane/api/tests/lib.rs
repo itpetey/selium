@@ -183,6 +183,12 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 version: "v1".to_string(),
             }],
             isolation: IsolationProfile::Standard,
+            cpu_millis: 0,
+            memory_mib: 0,
+            ephemeral_storage_mib: 0,
+            bandwidth_profile: BandwidthProfile::Standard,
+            volume_mounts: Vec::new(),
+            external_account_ref: None,
         })
         .expect("deployment");
     state
@@ -201,6 +207,12 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 version: "v1".to_string(),
             }],
             isolation: IsolationProfile::Standard,
+            cpu_millis: 0,
+            memory_mib: 0,
+            ephemeral_storage_mib: 0,
+            bandwidth_profile: BandwidthProfile::Standard,
+            volume_mounts: Vec::new(),
+            external_account_ref: None,
         })
         .expect("deployment");
 
@@ -242,6 +254,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
                 },
             },
         }],
+        external_account_ref: None,
     });
 
     ensure_pipeline_consistency(&state).expect("consistent");
@@ -269,6 +282,12 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
                 version: "v1".to_string(),
             }],
             isolation: IsolationProfile::Standard,
+            cpu_millis: 0,
+            memory_mib: 0,
+            ephemeral_storage_mib: 0,
+            bandwidth_profile: BandwidthProfile::Standard,
+            volume_mounts: Vec::new(),
+            external_account_ref: None,
         })
         .expect("deployment");
     state
@@ -287,6 +306,12 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
                 version: "v1".to_string(),
             }],
             isolation: IsolationProfile::Standard,
+            cpu_millis: 0,
+            memory_mib: 0,
+            ephemeral_storage_mib: 0,
+            bandwidth_profile: BandwidthProfile::Standard,
+            volume_mounts: Vec::new(),
+            external_account_ref: None,
         })
         .expect("deployment");
 
@@ -328,6 +353,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
                 },
             },
         }],
+        external_account_ref: None,
     });
 
     let err = ensure_pipeline_consistency(&state).expect_err("must fail");

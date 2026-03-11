@@ -38,6 +38,7 @@ use selium_kernel::{
         NetworkCapability, NetworkFuture, NetworkProcessPolicy, RespondedRpc, RpcBodyReaderHandle,
         RpcBodyWriterHandle, SessionHandle, StartedRpc, StreamHandle,
     },
+    spi::usage::UsageRecorder,
 };
 use thiserror::Error;
 use tokio::{
@@ -174,41 +175,54 @@ trait ProtocolRpcBodyWriter: Send + Sync {
 #[derive(Clone)]
 pub struct RuntimeListener {
     inner: Arc<dyn ProtocolListener>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone)]
 pub struct RuntimeSession {
     inner: Arc<dyn ProtocolSession>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone)]
 pub struct RuntimeStream {
     inner: Arc<dyn ProtocolStream>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 pub struct RuntimeRpcExchange {
     inner: Box<dyn ProtocolRpcExchange>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 pub struct RuntimeRpcClientExchange {
     inner: Box<dyn ProtocolRpcClientExchange>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone)]
 pub struct RuntimeRpcBodyReader {
     inner: Arc<dyn ProtocolRpcBodyReader>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 #[derive(Clone)]
 pub struct RuntimeRpcBodyWriter {
     inner: Arc<dyn ProtocolRpcBodyWriter>,
+    usage_recorder: Option<Arc<dyn UsageRecorder>>,
 }
 
 impl RuntimeListener {
     fn new(inner: impl ProtocolListener + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 
     fn protocol(&self) -> NetworkProtocol {
@@ -224,7 +238,13 @@ impl RuntimeSession {
     fn new(inner: impl ProtocolSession + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 
     fn protocol(&self) -> NetworkProtocol {
@@ -240,7 +260,13 @@ impl RuntimeStream {
     fn new(inner: impl ProtocolStream + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 }
 
@@ -248,7 +274,13 @@ impl RuntimeRpcExchange {
     fn new(inner: impl ProtocolRpcExchange + 'static) -> Self {
         Self {
             inner: Box::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 }
 
@@ -256,7 +288,13 @@ impl RuntimeRpcClientExchange {
     fn new(inner: impl ProtocolRpcClientExchange + 'static) -> Self {
         Self {
             inner: Box::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 }
 
@@ -264,7 +302,13 @@ impl RuntimeRpcBodyReader {
     fn new(inner: impl ProtocolRpcBodyReader + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 }
 
@@ -272,7 +316,13 @@ impl RuntimeRpcBodyWriter {
     fn new(inner: impl ProtocolRpcBodyWriter + 'static) -> Self {
         Self {
             inner: Arc::new(inner),
+            usage_recorder: None,
         }
+    }
+
+    fn with_usage_recorder(mut self, usage_recorder: Option<Arc<dyn UsageRecorder>>) -> Self {
+        self.usage_recorder = usage_recorder;
+        self
     }
 }
 
@@ -452,7 +502,10 @@ impl NetworkCapability for NetworkService {
             let interactions = binding.interactions.clone();
             let protocol = binding.protocol;
             let driver = service.driver_for(protocol)?;
-            let listener = driver.listen(binding).await?;
+            let listener = driver
+                .listen(binding)
+                .await?
+                .with_usage_recorder(policy.usage_recorder());
             Ok(ListenerHandle {
                 protocol,
                 interactions,
@@ -479,7 +532,10 @@ impl NetworkCapability for NetworkService {
             let interactions = profile.interactions.clone();
             let protocol = profile.protocol;
             let driver = service.driver_for(protocol)?;
-            let session = driver.connect(profile, input.authority).await?;
+            let session = driver
+                .connect(profile, input.authority)
+                .await?
+                .with_usage_recorder(policy.usage_recorder());
             Ok(SessionHandle {
                 protocol,
                 interactions,
@@ -493,14 +549,36 @@ impl NetworkCapability for NetworkService {
         listener: &Self::Listener,
         timeout_ms: u32,
     ) -> NetworkFuture<AcceptedSession<Self::Session>, Self::Error> {
-        listener.inner.accept(timeout_ms)
+        let inner = Arc::clone(&listener.inner);
+        let usage_recorder = listener.usage_recorder.clone();
+        Box::pin(async move {
+            let accepted = inner.accept(timeout_ms).await?;
+            Ok(AcceptedSession {
+                code: accepted.code,
+                session: accepted.session.map(|session| SessionHandle {
+                    protocol: session.protocol,
+                    interactions: session.interactions,
+                    inner: session.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn stream_open(
         &self,
         session: &Self::Session,
     ) -> NetworkFuture<AcceptedStream<Self::Stream>, Self::Error> {
-        session.inner.stream_open()
+        let inner = Arc::clone(&session.inner);
+        let usage_recorder = session.usage_recorder.clone();
+        Box::pin(async move {
+            let opened = inner.stream_open().await?;
+            Ok(AcceptedStream {
+                code: opened.code,
+                stream: opened.stream.map(|stream| StreamHandle {
+                    inner: stream.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn stream_accept(
@@ -508,7 +586,17 @@ impl NetworkCapability for NetworkService {
         session: &Self::Session,
         timeout_ms: u32,
     ) -> NetworkFuture<AcceptedStream<Self::Stream>, Self::Error> {
-        session.inner.stream_accept(timeout_ms)
+        let inner = Arc::clone(&session.inner);
+        let usage_recorder = session.usage_recorder.clone();
+        Box::pin(async move {
+            let accepted = inner.stream_accept(timeout_ms).await?;
+            Ok(AcceptedStream {
+                code: accepted.code,
+                stream: accepted.stream.map(|stream| StreamHandle {
+                    inner: stream.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn stream_send(
@@ -516,7 +604,16 @@ impl NetworkCapability for NetworkService {
         stream: &Self::Stream,
         input: NetworkStreamSend,
     ) -> NetworkFuture<NetworkStatus, Self::Error> {
-        stream.inner.send(input)
+        let inner = Arc::clone(&stream.inner);
+        let usage_recorder = stream.usage_recorder.clone();
+        let bytes = input.bytes.len() as u64;
+        Box::pin(async move {
+            let status = inner.send(input).await?;
+            if status.code == NetworkStatusCode::Ok {
+                record_network_egress(&usage_recorder, bytes);
+            }
+            Ok(status)
+        })
     }
 
     fn stream_recv(
@@ -524,7 +621,20 @@ impl NetworkCapability for NetworkService {
         stream: &Self::Stream,
         input: NetworkStreamRecv,
     ) -> NetworkFuture<NetworkStreamRecvResult, Self::Error> {
-        stream.inner.recv(input)
+        let inner = Arc::clone(&stream.inner);
+        let usage_recorder = stream.usage_recorder.clone();
+        Box::pin(async move {
+            let result = inner.recv(input).await?;
+            if result.code == NetworkStatusCode::Ok {
+                let bytes = result
+                    .chunk
+                    .as_ref()
+                    .map(|chunk| chunk.bytes.len() as u64)
+                    .unwrap_or_default();
+                record_network_ingress(&usage_recorder, bytes);
+            }
+            Ok(result)
+        })
     }
 
     fn rpc_invoke(
@@ -532,7 +642,20 @@ impl NetworkCapability for NetworkService {
         session: &Self::Session,
         input: NetworkRpcInvoke,
     ) -> NetworkFuture<StartedRpc<Self::RpcClientExchange, Self::RpcBodyWriter>, Self::Error> {
-        session.inner.rpc_invoke(input)
+        let inner = Arc::clone(&session.inner);
+        let usage_recorder = session.usage_recorder.clone();
+        Box::pin(async move {
+            let started = inner.rpc_invoke(input).await?;
+            Ok(StartedRpc {
+                code: started.code,
+                exchange: started
+                    .exchange
+                    .map(|exchange| exchange.with_usage_recorder(usage_recorder.clone())),
+                request_body: started.request_body.map(|body| RpcBodyWriterHandle {
+                    inner: body.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn rpc_await(
@@ -540,7 +663,20 @@ impl NetworkCapability for NetworkService {
         exchange: Self::RpcClientExchange,
         input: NetworkRpcAwait,
     ) -> NetworkFuture<AwaitedRpc<Self::RpcBodyReader>, Self::Error> {
-        exchange.inner.await_response(input)
+        let RuntimeRpcClientExchange {
+            inner,
+            usage_recorder,
+        } = exchange;
+        Box::pin(async move {
+            let awaited = inner.await_response(input).await?;
+            Ok(AwaitedRpc {
+                code: awaited.code,
+                response: awaited.response,
+                response_body: awaited.response_body.map(|body| RpcBodyReaderHandle {
+                    inner: body.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn rpc_accept(
@@ -548,7 +684,21 @@ impl NetworkCapability for NetworkService {
         session: &Self::Session,
         timeout_ms: u32,
     ) -> NetworkFuture<AcceptedRpc<Self::RpcExchange, Self::RpcBodyReader>, Self::Error> {
-        session.inner.rpc_accept(timeout_ms)
+        let inner = Arc::clone(&session.inner);
+        let usage_recorder = session.usage_recorder.clone();
+        Box::pin(async move {
+            let accepted = inner.rpc_accept(timeout_ms).await?;
+            Ok(AcceptedRpc {
+                code: accepted.code,
+                exchange: accepted
+                    .exchange
+                    .map(|exchange| exchange.with_usage_recorder(usage_recorder.clone())),
+                request: accepted.request,
+                request_body: accepted.request_body.map(|body| RpcBodyReaderHandle {
+                    inner: body.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn rpc_respond(
@@ -556,7 +706,19 @@ impl NetworkCapability for NetworkService {
         exchange: Self::RpcExchange,
         input: NetworkRpcRespond,
     ) -> NetworkFuture<RespondedRpc<Self::RpcBodyWriter>, Self::Error> {
-        exchange.inner.respond(input)
+        let RuntimeRpcExchange {
+            inner,
+            usage_recorder,
+        } = exchange;
+        Box::pin(async move {
+            let responded = inner.respond(input).await?;
+            Ok(RespondedRpc {
+                code: responded.code,
+                response_body: responded.response_body.map(|body| RpcBodyWriterHandle {
+                    inner: body.inner.with_usage_recorder(usage_recorder.clone()),
+                }),
+            })
+        })
     }
 
     fn rpc_body_read(
@@ -564,7 +726,20 @@ impl NetworkCapability for NetworkService {
         body: &Self::RpcBodyReader,
         input: NetworkRpcBodyRead,
     ) -> NetworkFuture<NetworkRpcBodyReadResult, Self::Error> {
-        body.inner.read(input)
+        let inner = Arc::clone(&body.inner);
+        let usage_recorder = body.usage_recorder.clone();
+        Box::pin(async move {
+            let result = inner.read(input).await?;
+            if result.code == NetworkStatusCode::Ok {
+                let bytes = result
+                    .chunk
+                    .as_ref()
+                    .map(|chunk| chunk.bytes.len() as u64)
+                    .unwrap_or_default();
+                record_network_ingress(&usage_recorder, bytes);
+            }
+            Ok(result)
+        })
     }
 
     fn rpc_body_write(
@@ -572,7 +747,16 @@ impl NetworkCapability for NetworkService {
         body: &Self::RpcBodyWriter,
         input: NetworkRpcBodyWrite,
     ) -> NetworkFuture<NetworkStatus, Self::Error> {
-        body.inner.write(input)
+        let inner = Arc::clone(&body.inner);
+        let usage_recorder = body.usage_recorder.clone();
+        let bytes = input.bytes.len() as u64;
+        Box::pin(async move {
+            let status = inner.write(input).await?;
+            if status.code == NetworkStatusCode::Ok {
+                record_network_egress(&usage_recorder, bytes);
+            }
+            Ok(status)
+        })
     }
 
     fn close_listener(
@@ -1776,6 +1960,22 @@ fn ok_status() -> NetworkStatus {
     }
 }
 
+fn record_network_ingress(usage_recorder: &Option<Arc<dyn UsageRecorder>>, bytes: u64) {
+    if bytes > 0
+        && let Some(usage_recorder) = usage_recorder
+    {
+        usage_recorder.record_network_ingress(bytes);
+    }
+}
+
+fn record_network_egress(usage_recorder: &Option<Arc<dyn UsageRecorder>>, bytes: u64) {
+    if bytes > 0
+        && let Some(usage_recorder) = usage_recorder
+    {
+        usage_recorder.record_network_egress(bytes);
+    }
+}
+
 fn unsupported_stream() -> NetworkFuture<AcceptedStream<RuntimeStream>, NetworkError> {
     Box::pin(async {
         Ok(AcceptedStream {
@@ -1853,6 +2053,58 @@ fn network_other(err: impl fmt::Display) -> NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    #[derive(Debug, Default)]
+    struct TestUsageRecorder {
+        ingress_bytes: AtomicU64,
+        egress_bytes: AtomicU64,
+    }
+
+    impl UsageRecorder for TestUsageRecorder {
+        fn record_network_ingress(&self, bytes: u64) {
+            self.ingress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        fn record_network_egress(&self, bytes: u64) {
+            self.egress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        fn record_storage_read(&self, _bytes: u64) {}
+
+        fn record_storage_write(&self, _bytes: u64) {}
+    }
+
+    #[derive(Debug)]
+    struct TestStream;
+
+    impl ProtocolStream for TestStream {
+        fn send(&self, _input: NetworkStreamSend) -> NetworkFuture<NetworkStatus, NetworkError> {
+            Box::pin(async { Ok(ok_status()) })
+        }
+
+        fn recv(
+            &self,
+            _input: NetworkStreamRecv,
+        ) -> NetworkFuture<NetworkStreamRecvResult, NetworkError> {
+            Box::pin(async {
+                Ok(NetworkStreamRecvResult {
+                    code: NetworkStatusCode::Ok,
+                    chunk: Some(NetworkStreamChunk {
+                        bytes: b"pong".to_vec(),
+                        finish: true,
+                    }),
+                })
+            })
+        }
+
+        fn close(&self) -> NetworkFuture<NetworkStatus, NetworkError> {
+            Box::pin(async { Ok(ok_status()) })
+        }
+    }
 
     #[test]
     fn authority_allowed_supports_exact_and_suffix_patterns() {
@@ -1874,5 +2126,39 @@ mod tests {
     fn derive_server_name_strips_scheme_and_port() {
         assert_eq!(derive_server_name("https://localhost:7443"), "localhost");
         assert_eq!(derive_server_name("quic://127.0.0.1:7443"), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn stream_usage_recording_tracks_send_and_recv_bytes() {
+        let service = NetworkService::new();
+        let usage = Arc::new(TestUsageRecorder::default());
+        let stream = RuntimeStream::new(TestStream).with_usage_recorder(Some(usage.clone()));
+
+        service
+            .stream_send(
+                &stream,
+                NetworkStreamSend {
+                    stream_id: 0,
+                    bytes: b"ping".to_vec(),
+                    finish: false,
+                    timeout_ms: 1,
+                },
+            )
+            .await
+            .expect("send");
+        service
+            .stream_recv(
+                &stream,
+                NetworkStreamRecv {
+                    stream_id: 0,
+                    max_bytes: 16,
+                    timeout_ms: 1,
+                },
+            )
+            .await
+            .expect("recv");
+
+        assert_eq!(usage.egress_bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(usage.ingress_bytes.load(Ordering::Relaxed), 4);
     }
 }

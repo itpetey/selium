@@ -28,6 +28,7 @@ pub enum Method {
     ControlReplay = 4,
     RaftRequestVote = 5,
     RaftAppendEntries = 6,
+    ControlMetrics = 7,
     StartInstance = 100,
     StopInstance = 101,
     ListInstances = 102,
@@ -45,6 +46,7 @@ impl Method {
             4 => Some(Self::ControlReplay),
             5 => Some(Self::RaftRequestVote),
             6 => Some(Self::RaftAppendEntries),
+            7 => Some(Self::ControlMetrics),
             100 => Some(Self::StartInstance),
             101 => Some(Self::StopInstance),
             102 => Some(Self::ListInstances),
@@ -129,14 +131,43 @@ pub struct StatusApiResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
+pub struct MetricsApiResponse {
+    pub node_id: String,
+    pub deployment_count: usize,
+    pub pipeline_count: usize,
+    pub node_count: usize,
+    pub peer_count: usize,
+    pub table_count: usize,
+    pub commit_index: u64,
+    pub last_applied: u64,
+    pub durable_events: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
 pub struct ReplayApiRequest {
+    /// Return at most this many matching events.
     pub limit: usize,
+    /// Start replay from this sequence when present.
+    pub since_sequence: Option<u64>,
+    /// Restrict results to this external account reference when present.
+    pub external_account_ref: Option<String>,
+    /// Restrict results to this workload key when present.
+    pub workload: Option<String>,
+    /// Restrict results to this module identifier when present.
+    pub module: Option<String>,
+    /// Restrict results to this pipeline key when present.
+    pub pipeline: Option<String>,
+    /// Restrict results to this node name when present.
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct ReplayApiResponse {
     pub events: Vec<DataValue>,
+    pub start_sequence: Option<u64>,
+    pub high_watermark: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -179,8 +210,10 @@ pub struct ManagedEndpointBinding {
 #[rkyv(bytecheck())]
 pub struct StartRequest {
     pub node_id: String,
+    pub workload_key: String,
     pub instance_id: String,
     pub module_spec: String,
+    pub external_account_ref: Option<String>,
     pub managed_endpoint_bindings: Vec<ManagedEndpointBinding>,
 }
 
@@ -559,14 +592,18 @@ mod tests {
             7,
             &StartRequest {
                 node_id: "node-a".to_string(),
+                workload_key: "tenant-a/media/ingest".to_string(),
                 instance_id: "inst-1".to_string(),
                 module_spec: "path=demo.wasm".to_string(),
+                external_account_ref: Some("acct-42".to_string()),
                 managed_endpoint_bindings: vec![binding.clone()],
             },
         )
         .expect("encode");
         let envelope = decode_envelope(&bytes).expect("decode envelope");
         let decoded: StartRequest = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded.workload_key, "tenant-a/media/ingest");
+        assert_eq!(decoded.external_account_ref.as_deref(), Some("acct-42"));
         assert_eq!(decoded.managed_endpoint_bindings, vec![binding]);
     }
 
@@ -673,5 +710,54 @@ mod tests {
         let decoded: DeliverBridgeMessageRequest =
             decode_payload(&envelope).expect("decode payload");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_metrics_response_round_trips() {
+        let response = MetricsApiResponse {
+            node_id: "node-a".to_string(),
+            deployment_count: 2,
+            pipeline_count: 1,
+            node_count: 3,
+            peer_count: 2,
+            table_count: 4,
+            commit_index: 9,
+            last_applied: 9,
+            durable_events: Some(12),
+        };
+        let bytes = encode_response(Method::ControlMetrics, 31, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: MetricsApiResponse = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn control_replay_request_and_response_round_trip_filters_and_bounds() {
+        let request = ReplayApiRequest {
+            limit: 25,
+            since_sequence: Some(41),
+            external_account_ref: Some("acct-123".to_string()),
+            workload: Some("tenant-a/media/ingest".to_string()),
+            module: Some("ingest.wasm".to_string()),
+            pipeline: Some("tenant-a/media/camera".to_string()),
+            node: Some("node-a".to_string()),
+        };
+        let bytes = encode_request(Method::ControlReplay, 37, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: ReplayApiRequest = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+
+        let response = ReplayApiResponse {
+            events: vec![DataValue::Map(BTreeMap::from([(
+                "sequence".to_string(),
+                DataValue::from(41_u64),
+            )]))],
+            start_sequence: Some(41),
+            high_watermark: Some(56),
+        };
+        let bytes = encode_response(Method::ControlReplay, 38, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: ReplayApiResponse = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, response);
     }
 }

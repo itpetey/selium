@@ -479,6 +479,8 @@ async fn bootstrap_control_plane(
         public_daemon_addr: addresses.public_addr.to_string(),
         public_daemon_server_name: args.cp_server_name.clone(),
         capacity_slots: args.cp_capacity_slots,
+        allocatable_cpu_millis: args.cp_allocatable_cpu_millis,
+        allocatable_memory_mib: args.cp_allocatable_memory_mib,
         heartbeat_interval_ms: args.cp_heartbeat_interval_ms,
         bootstrap_leader: args.cp_bootstrap_leader,
         peers,
@@ -729,6 +731,7 @@ async fn handle_stream_request(
         Method::ControlMutate
         | Method::ControlQuery
         | Method::ControlStatus
+        | Method::ControlMetrics
         | Method::ControlReplay
         | Method::RaftRequestVote
         | Method::RaftAppendEntries => match state.control_plane.request_raw(&bytes).await {
@@ -799,11 +802,16 @@ async fn handle_stream_request(
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
             };
             let specs = vec![module_spec];
-            let spawned = match modules::spawn_from_cli(
+            let spawned = match modules::spawn_from_cli_with_context(
                 &state.kernel,
                 &state.registry,
                 &state.work_dir,
                 &specs,
+                modules::ProcessLaunchContext {
+                    workload_key: Some(&payload.workload_key),
+                    instance_id: Some(&payload.instance_id),
+                    external_account_ref: payload.external_account_ref.as_deref(),
+                },
             )
             .await
             {

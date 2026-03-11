@@ -4,10 +4,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_control_plane_api::{
-    ContractRef, ControlPlaneState, EventEndpointRef, IsolationProfile, PublicEndpointRef,
-    WorkloadRef, collect_contracts_for_workload, ensure_pipeline_consistency,
+    ContractRef, ControlPlaneState, DeploymentSpec, EventEndpointRef, IsolationProfile, NodeSpec,
+    PublicEndpointRef, WorkloadRef, collect_contracts_for_workload, ensure_pipeline_consistency,
 };
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+struct NodeUsage {
+    slots: u32,
+    cpu_millis: u32,
+    memory_mib: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -23,6 +31,8 @@ pub struct ScheduledInstance {
 pub struct SchedulePlan {
     pub instances: Vec<ScheduledInstance>,
     pub node_slots: BTreeMap<String, u32>,
+    pub node_cpu_millis: BTreeMap<String, u32>,
+    pub node_memory_mib: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -38,7 +48,7 @@ pub struct ScheduledEndpointBridgeIntent {
     pub contract: ContractRef,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 pub enum ScheduleError {
     #[error("pipeline is inconsistent: {0}")]
     InconsistentPipeline(String),
@@ -54,6 +64,8 @@ pub enum ScheduleError {
         required: u32,
         available: u32,
     },
+    #[error("insufficient allocatable resources to place deployment `{0}`")]
+    InsufficientResources(String),
 }
 
 pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleError> {
@@ -68,8 +80,10 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
     let mut node_order = schedulable_nodes.iter().cloned().collect::<Vec<_>>();
     node_order.sort_unstable();
 
-    let mut used_slots: BTreeMap<String, u32> =
-        node_order.iter().map(|node| (node.clone(), 0)).collect();
+    let mut usage: BTreeMap<String, NodeUsage> = node_order
+        .iter()
+        .map(|node| (node.clone(), NodeUsage::default()))
+        .collect();
     let mut instances = Vec::new();
 
     for deployment in state.deployments.values() {
@@ -79,57 +93,104 @@ pub fn build_plan(state: &ControlPlaneState) -> Result<SchedulePlan, ScheduleErr
                 deployment.workload.to_string(),
             ));
         }
+        for ordinal in 0..deployment.replicas {
+            let Some(node) = select_node_for_replica(state, deployment, &eligible, &usage, ordinal)
+            else {
+                return Err(schedule_failure(state, deployment, &eligible, &usage));
+            };
 
-        let mut remaining = deployment.replicas;
-        let mut placed = 0;
-        while remaining > 0 {
-            let node = &eligible[placed as usize % eligible.len()];
-            let used = *used_slots.get(node).unwrap_or(&0);
-            let capacity = state
-                .nodes
-                .get(node)
-                .map(|node| node.capacity_slots)
-                .unwrap_or(0);
-
-            if used < capacity {
-                let ordinal = deployment.replicas - remaining;
-                instances.push(ScheduledInstance {
-                    deployment: deployment.workload.key(),
-                    instance_id: internal_instance_id(&deployment.workload, ordinal),
-                    node: node.clone(),
-                    isolation: deployment.isolation.clone(),
-                });
-                used_slots.insert(node.clone(), used + 1);
-                remaining -= 1;
-            }
-
-            placed += 1;
-            if placed > eligible.len() as u32 * deployment.replicas.max(1) {
-                let available = eligible
-                    .iter()
-                    .map(|node| {
-                        let cap = state
-                            .nodes
-                            .get(node)
-                            .map(|node| node.capacity_slots)
-                            .unwrap_or(0);
-                        let used = used_slots.get(node).copied().unwrap_or(0);
-                        cap.saturating_sub(used)
-                    })
-                    .sum();
-                return Err(ScheduleError::InsufficientCapacity {
-                    deployment: deployment.workload.to_string(),
-                    required: deployment.replicas,
-                    available,
-                });
-            }
+            instances.push(ScheduledInstance {
+                deployment: deployment.workload.key(),
+                instance_id: internal_instance_id(&deployment.workload, ordinal),
+                node: node.clone(),
+                isolation: deployment.isolation.clone(),
+            });
+            record_usage(
+                usage.get_mut(&node).expect("tracked node usage"),
+                deployment,
+            );
         }
     }
 
     Ok(SchedulePlan {
         instances,
-        node_slots: used_slots,
+        node_slots: usage
+            .iter()
+            .map(|(node, used)| (node.clone(), used.slots))
+            .collect(),
+        node_cpu_millis: usage
+            .iter()
+            .map(|(node, used)| (node.clone(), used.cpu_millis))
+            .collect(),
+        node_memory_mib: usage
+            .iter()
+            .map(|(node, used)| (node.clone(), used.memory_mib))
+            .collect(),
     })
+}
+
+fn select_node_for_replica(
+    state: &ControlPlaneState,
+    deployment: &DeploymentSpec,
+    eligible: &[String],
+    usage: &BTreeMap<String, NodeUsage>,
+    ordinal: u32,
+) -> Option<String> {
+    for offset in 0..eligible.len() {
+        let node_name = &eligible[(ordinal as usize + offset) % eligible.len()];
+        let node = state.nodes.get(node_name)?;
+        let used = usage.get(node_name).copied().unwrap_or_default();
+        if node_can_fit(node, deployment, used) {
+            return Some(node_name.clone());
+        }
+    }
+    None
+}
+
+fn node_can_fit(node: &NodeSpec, deployment: &DeploymentSpec, used: NodeUsage) -> bool {
+    let slots_fit = node.capacity_slots == 0 || used.slots < node.capacity_slots;
+    let cpu_fit = node
+        .allocatable_cpu_millis
+        .is_none_or(|capacity| used.cpu_millis + deployment.cpu_millis <= capacity);
+    let memory_fit = node
+        .allocatable_memory_mib
+        .is_none_or(|capacity| used.memory_mib + deployment.memory_mib <= capacity);
+    slots_fit && cpu_fit && memory_fit
+}
+
+fn record_usage(usage: &mut NodeUsage, deployment: &DeploymentSpec) {
+    usage.slots += 1;
+    usage.cpu_millis += deployment.cpu_millis;
+    usage.memory_mib += deployment.memory_mib;
+}
+
+fn schedule_failure(
+    state: &ControlPlaneState,
+    deployment: &DeploymentSpec,
+    eligible: &[String],
+    usage: &BTreeMap<String, NodeUsage>,
+) -> ScheduleError {
+    if deployment.cpu_millis > 0 || deployment.memory_mib > 0 {
+        return ScheduleError::InsufficientResources(deployment.workload.to_string());
+    }
+
+    let available = eligible
+        .iter()
+        .map(|node| {
+            let capacity = state
+                .nodes
+                .get(node)
+                .map(|node| node.capacity_slots)
+                .unwrap_or(0);
+            let used = usage.get(node).copied().unwrap_or_default().slots;
+            capacity.saturating_sub(used)
+        })
+        .sum();
+    ScheduleError::InsufficientCapacity {
+        deployment: deployment.workload.to_string(),
+        required: deployment.replicas,
+        available,
+    }
 }
 
 fn schedulable_node_names(state: &ControlPlaneState) -> BTreeSet<String> {
@@ -286,7 +347,8 @@ fn eligible_nodes(
 #[cfg(test)]
 mod tests {
     use selium_control_plane_api::{
-        ContractRef, DeploymentSpec, PipelineEdge, PipelineEndpoint, PipelineSpec, parse_idl,
+        BandwidthProfile, ContractRef, DeploymentSpec, PipelineEdge, PipelineEndpoint,
+        PipelineSpec, parse_idl,
     };
 
     use super::*;
@@ -322,6 +384,12 @@ mod tests {
                     version: "v1".to_string(),
                 }],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
         state
@@ -340,6 +408,12 @@ mod tests {
                     version: "v1".to_string(),
                 }],
                 isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
             })
             .expect("deployment");
 
@@ -381,6 +455,7 @@ mod tests {
                     },
                 },
             }],
+            external_account_ref: None,
         });
 
         state
@@ -391,10 +466,67 @@ mod tests {
         let state = sample_state();
         let plan = build_plan(&state).expect("plan");
         assert_eq!(plan.instances.len(), 3);
+        assert_eq!(plan.node_cpu_millis.get("local-node"), Some(&0));
+        assert_eq!(plan.node_memory_mib.get("local-node"), Some(&0));
         assert!(
             plan.instances
                 .iter()
                 .all(|instance| instance.node == "local-node")
+        );
+    }
+
+    #[test]
+    fn builds_plan_using_allocatable_resources_without_slots() {
+        let mut state = sample_state();
+        let node = state.nodes.get_mut("local-node").expect("local node");
+        node.capacity_slots = 0;
+        node.allocatable_cpu_millis = Some(2_000);
+        node.allocatable_memory_mib = Some(4_096);
+        for deployment in state.deployments.values_mut() {
+            deployment.cpu_millis = 500;
+            deployment.memory_mib = 512;
+        }
+
+        let plan = build_plan(&state).expect("plan");
+
+        assert_eq!(plan.instances.len(), 3);
+        assert_eq!(plan.node_cpu_millis.get("local-node"), Some(&1_500));
+        assert_eq!(plan.node_memory_mib.get("local-node"), Some(&1_536));
+    }
+
+    #[test]
+    fn rejects_when_allocatable_cpu_is_exceeded() {
+        let mut state = ControlPlaneState::new_local_default();
+        let node = state.nodes.get_mut("local-node").expect("local node");
+        node.capacity_slots = 0;
+        node.allocatable_cpu_millis = Some(1_000);
+        node.allocatable_memory_mib = Some(4_096);
+
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "ingest".to_string(),
+                },
+                module: "ingest.wasm".to_string(),
+                replicas: 2,
+                contracts: Vec::new(),
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 600,
+                memory_mib: 256,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
+            })
+            .expect("deployment");
+
+        let err = build_plan(&state).expect_err("insufficient cpu");
+
+        assert_eq!(
+            err,
+            ScheduleError::InsufficientResources("tenant-a/media/ingest".to_string())
         );
     }
 
