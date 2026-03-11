@@ -882,8 +882,11 @@ fn take_u32(iter: &mut std::slice::Iter<Val>, msg: &str) -> Result<u32, wasmtime
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::atomic::{AtomicBool, Ordering}, task::Waker};
     use selium_kernel::spi::wake_mailbox::WakeMailbox;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        task::Waker,
+    };
 
     struct TestMailbox {
         closed: AtomicBool,
@@ -919,7 +922,9 @@ mod tests {
             false
         }
 
-        fn wait_for_signal<'a>(&'a self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        fn wait_for_signal<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
             Box::pin(async move {
                 self.notify.notified().await;
             })

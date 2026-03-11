@@ -124,9 +124,9 @@ pub mod time;
 /// Re-export of the `rkyv` crate for guest code that needs Selium-compatible serialisation.
 pub use rkyv;
 
-pub use r#async::{block_on, shutdown, spawn, yield_now};
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use r#async::{__reset_shutdown_for_tests, __signal_shutdown_for_tests};
+pub use r#async::{block_on, shutdown, spawn, yield_now};
 /// Attribute macro for declaring async guest entrypoints that the Selium runtime can invoke.
 pub use selium_guest_macros::entrypoint;

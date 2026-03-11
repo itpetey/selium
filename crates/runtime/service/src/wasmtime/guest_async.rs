@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-use selium_kernel::{
-    KernelError,
-    registry::InstanceRegistry,
-    spi::wake_mailbox::WakeMailbox,
-};
+use selium_kernel::{KernelError, registry::InstanceRegistry, spi::wake_mailbox::WakeMailbox};
 use tokio::{select, sync::Notify};
 use wasmtime::{Caller, Linker};
 
@@ -53,7 +49,10 @@ impl GuestAsync {
                 "selium::async",
                 "wait_for_shutdown",
                 move |caller: Caller<'_, InstanceRegistry>, ()| {
-                    Box::new(shutdown_wait(Arc::clone(&shutdown), caller.data().mailbox()))
+                    Box::new(shutdown_wait(
+                        Arc::clone(&shutdown),
+                        caller.data().mailbox(),
+                    ))
                 },
             )
             .map_err(|err| KernelError::Engine(err.to_string()))?;
@@ -61,10 +60,7 @@ impl GuestAsync {
     }
 }
 
-async fn shutdown_wait(
-    shutdown: Arc<Notify>,
-    mailbox: Option<&'static dyn WakeMailbox>,
-) {
+async fn shutdown_wait(shutdown: Arc<Notify>, mailbox: Option<&'static dyn WakeMailbox>) {
     let Some(mailbox) = mailbox else {
         shutdown.notified().await;
         return;
@@ -86,7 +82,12 @@ async fn shutdown_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{pin::Pin, sync::atomic::{AtomicBool, Ordering}, task::Waker, time::Duration};
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Waker,
+        time::Duration,
+    };
 
     struct TestMailbox {
         closed: AtomicBool,
