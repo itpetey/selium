@@ -520,7 +520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -845,9 +845,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libm"
@@ -968,7 +968,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1203,9 +1203,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -1428,7 +1428,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1494,7 +1494,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1531,9 +1531,9 @@ dependencies = [
 
 [[package]]
 name = "schannel"
-version = "0.1.28"
+version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891d81b926048e76efe18581bf793546b4c0eaf8448d72be8de2bbee5fd166e1"
+checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "selium"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "selium-abi"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-control-plane-api",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "selium-control-plane-api"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "prettyplease",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "selium-control-plane-protocol"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "rkyv",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "selium-control-plane-runtime"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-abi",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "selium-control-plane-scheduler"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-control-plane-api",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "selium-guest"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "futures",
  "rkyv",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "selium-guest-macros"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "selium-io-consensus"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "thiserror 2.0.18",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "selium-io-core"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "parking_lot",
  "rkyv",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "selium-io-durability"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-abi",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "selium-io-tables"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-abi",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "selium-kernel"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "selium-module-control-plane"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "rkyv",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "selium-module-io-demo"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "selium-runtime"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1885,7 +1885,6 @@ dependencies = [
  "selium-abi",
  "selium-control-plane-api",
  "selium-control-plane-protocol",
- "selium-control-plane-runtime",
  "selium-io-durability",
  "selium-kernel",
  "selium-module-control-plane",
@@ -1904,14 +1903,14 @@ dependencies = [
 
 [[package]]
 name = "selium-runtime-adaptor-microvm"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "selium-runtime-adaptor-spi",
 ]
 
 [[package]]
 name = "selium-runtime-adaptor-spi"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "selium-abi",
  "thiserror 2.0.18",
@@ -1919,14 +1918,14 @@ dependencies = [
 
 [[package]]
 name = "selium-runtime-adaptor-wasmtime"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "selium-runtime-adaptor-spi",
 ]
 
 [[package]]
 name = "selium-runtime-network"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1948,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "selium-runtime-storage"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1961,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "selium-sdk-rust"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 dependencies = [
  "parking_lot",
  "rkyv",
@@ -2082,7 +2081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2787,7 +2786,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3141,18 +3140,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
+checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
+checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -38,7 +38,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.6"
 edition = "2024"
 description = "Selium next-generation monorepo"
 readme = "README.md"
@@ -50,8 +50,8 @@ categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
 anyhow = { version = "1.0", default-features = false }
-bytes = { version = "1.11", default-features = false }
 blake3 = { version = "1.8", default-features = false }
+bytes = { version = "1.11", default-features = false }
 clap = { version = "4.5", default-features = false }
 futures = { version = "0.3", default-features = false }
 futures-util = { version = "0.3", default-features = false }
@@ -81,24 +81,24 @@ trybuild = { version = "1.0", default-features = false }
 uuid = { version = "1.22", default-features = false }
 wasmtime = { version = "42.0", default-features = false }
 
-selium-abi = { path = "crates/abi", version = "0.1.0-alpha.0" }
-selium-guest = { path = "crates/guest", version = "0.1.0-alpha.0" }
-selium-kernel = { path = "crates/kernel", version = "0.1.0-alpha.0" }
+selium-abi = { path = "crates/abi", version = "1.0.0-alpha.6" }
+selium-guest = { path = "crates/guest", version = "1.0.0-alpha.6" }
+selium-kernel = { path = "crates/kernel", version = "1.0.0-alpha.6" }
 
-selium-control-plane-api = { path = "crates/control-plane/api", version = "0.1.0-alpha.0" }
-selium-control-plane-protocol = { path = "crates/control-plane/protocol", version = "0.1.0-alpha.0" }
-selium-control-plane-runtime = { path = "crates/control-plane/runtime", version = "0.1.0-alpha.0" }
-selium-control-plane-scheduler = { path = "crates/control-plane/scheduler", version = "0.1.0-alpha.0" }
-selium-io-consensus = { path = "crates/io/consensus", version = "0.1.0-alpha.0" }
-selium-io-core = { path = "crates/io/core", version = "0.1.0-alpha.0" }
-selium-io-durability = { path = "crates/io/durability", version = "0.1.0-alpha.0" }
-selium-io-tables = { path = "crates/io/tables", version = "0.1.0-alpha.0" }
-selium-module-control-plane = { path = "modules/control-plane", version = "0.1.0-alpha.0" }
-selium-runtime-adaptor-microvm = { path = "crates/runtime/adaptors/microvm-adaptor", version = "0.1.0-alpha.0" }
-selium-runtime-adaptor-spi = { path = "crates/runtime/adaptors/spi", version = "0.1.0-alpha.0" }
-selium-runtime-adaptor-wasmtime = { path = "crates/runtime/adaptors/wasmtime-adaptor", version = "0.1.0-alpha.0" }
-selium-runtime-network = { path = "crates/runtime/network", version = "0.1.0-alpha.0" }
-selium-runtime-storage = { path = "crates/runtime/storage", version = "0.1.0-alpha.0" }
+selium-control-plane-api = { path = "crates/control-plane/api", version = "1.0.0-alpha.6" }
+selium-control-plane-protocol = { path = "crates/control-plane/protocol", version = "1.0.0-alpha.6" }
+selium-control-plane-runtime = { path = "crates/control-plane/runtime", version = "1.0.0-alpha.6" }
+selium-control-plane-scheduler = { path = "crates/control-plane/scheduler", version = "1.0.0-alpha.6" }
+selium-io-consensus = { path = "crates/io/consensus", version = "1.0.0-alpha.6" }
+selium-io-core = { path = "crates/io/core", version = "1.0.0-alpha.6" }
+selium-io-durability = { path = "crates/io/durability", version = "1.0.0-alpha.6" }
+selium-io-tables = { path = "crates/io/tables", version = "1.0.0-alpha.6" }
+selium-module-control-plane = { path = "modules/control-plane", version = "1.0.0-alpha.6" }
+selium-runtime-adaptor-microvm = { path = "crates/runtime/adaptors/microvm-adaptor", version = "1.0.0-alpha.6" }
+selium-runtime-adaptor-spi = { path = "crates/runtime/adaptors/spi", version = "1.0.0-alpha.6" }
+selium-runtime-adaptor-wasmtime = { path = "crates/runtime/adaptors/wasmtime-adaptor", version = "1.0.0-alpha.6" }
+selium-runtime-network = { path = "crates/runtime/network", version = "1.0.0-alpha.6" }
+selium-runtime-storage = { path = "crates/runtime/storage", version = "1.0.0-alpha.6" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
