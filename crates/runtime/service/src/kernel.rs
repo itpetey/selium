@@ -61,7 +61,7 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
 
     // Shared memory.
     let shm_driver = builder.add_capability(SharedMemoryDriver::new());
-    let shm = shm::operations(shm_driver);
+    let shm = shm::operations(Arc::clone(&shm_driver));
     capability_ops
         .entry(Capability::SharedMemory)
         .or_default()
@@ -183,6 +183,7 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
         capability_ops.clone(),
         Arc::clone(&guest_async),
         Arc::clone(&usage),
+        Arc::clone(&shm_driver),
     )?);
     let module_repository: Arc<FilesystemModuleRepository> =
         builder.add_capability(Arc::new(FilesystemModuleRepository::new(&modules_dir)));

@@ -69,7 +69,7 @@ where
     decode_rkyv(&bytes).map_err(|err| KernelError::Driver(err.to_string()))
 }
 
-fn read_guest_bytes(
+pub(crate) fn read_guest_bytes(
     caller: &mut Caller<'_, InstanceRegistry>,
     ptr: GuestInt,
     len: GuestUint,

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     rc::Rc,
@@ -16,21 +17,26 @@ use quinn::{Connection, Endpoint, Incoming};
 use rustls::{RootCertStore, pki_types::PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
 use selium_abi::{
-    Capability, DataValue, InteractionKind, NetworkProtocol, QueueAck, QueueAttach, QueueCommit,
-    QueueCreate, QueueDelivery, QueueOverflow, QueueReserve, QueueRole, QueueStatusCode, ShmAlloc,
-    decode_rkyv, encode_rkyv,
+    Capability, DataValue, InteractionKind, NetworkProtocol, ProcessLogBindings, QueueAck,
+    QueueAttach, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueReserve, QueueRole,
+    QueueStatusCode, ShmAlloc, decode_rkyv, encode_rkyv,
 };
-use selium_control_plane_api::{ContractKind, PublicEndpointRef};
+use selium_control_plane_api::{
+    ContractKind, ControlPlaneState, DiscoveryCapabilityScope, DiscoveryOperation,
+    DiscoveryRequest, DiscoveryResolution, DiscoveryTarget, NodeSpec, OperationalProcessRecord,
+    PublicEndpointRef,
+};
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, BridgeMessage,
     DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, DeliverBridgeMessageRequest,
-    DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics,
-    EventBridgeMessage, ListRequest, ListResponse, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, Method, RuntimeUsageApiRequest,
-    RuntimeUsageApiResponse, ServiceBridgeMessage, ServiceMessagePhase, StartRequest,
-    StartResponse, StatusApiResponse, StopRequest, StopResponse, StreamBridgeMessage,
-    decode_envelope, decode_error, decode_payload, encode_error_response, encode_request,
-    encode_response, is_error, is_request, read_framed, write_framed,
+    DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics, Envelope,
+    EventBridgeMessage, GuestLogEvent, ListRequest, ListResponse, ManagedEndpointBinding,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, QueryApiRequest, QueryApiResponse,
+    RuntimeUsageApiRequest, RuntimeUsageApiResponse, ServiceBridgeMessage, ServiceMessagePhase,
+    StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
+    StreamBridgeMessage, SubscribeGuestLogsRequest, SubscribeGuestLogsResponse, decode_envelope,
+    decode_error, decode_payload, encode_error_response, encode_request, encode_response,
+    is_error, is_request, read_framed, write_framed,
 };
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
@@ -43,12 +49,14 @@ use selium_kernel::{
     spi::{queue::QueueCapability, shared_memory::SharedMemoryCapability},
 };
 use selium_module_control_plane::{
+    runtime::Query,
     ControlPlaneModuleConfig, ENTRYPOINT, EVENT_LOG_NAME, INTERNAL_BINDING_NAME, MODULE_ID,
     PEER_PROFILE_NAME, PeerTarget, SNAPSHOT_BLOB_STORE_NAME,
 };
 use selium_runtime_network::{NetworkEgressProfile, NetworkIngressBinding, NetworkService};
 use selium_runtime_storage::{StorageBlobStoreDefinition, StorageLogDefinition, StorageService};
 use tokio::{
+    io::AsyncWrite,
     signal,
     sync::{Mutex, Notify},
     task::{JoinHandle, LocalSet, spawn_local},
@@ -63,6 +71,8 @@ const QUIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGED_EVENT_QUEUE_DEPTH: u32 = 64;
 const MANAGED_EVENT_MAX_FRAME_BYTES: u32 = 64 * 1024;
 const MANAGED_EVENT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const GUEST_LOG_STDOUT_ENDPOINT: &str = "stdout";
+const GUEST_LOG_STDERR_ENDPOINT: &str = "stderr";
 
 struct DaemonState {
     node_id: String,
@@ -75,6 +85,7 @@ struct DaemonState {
     service_response_bindings:
         Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
     active_bridges: Mutex<BTreeMap<String, ActiveEndpointBridge>>,
+    host_subscription_id: AtomicU64,
     control_plane: Arc<LocalControlPlaneClient>,
     control_plane_process_id: usize,
     tls_paths: ManagedEventTlsPaths,
@@ -182,6 +193,20 @@ struct BridgeMessageDelivery {
     message: Option<BridgeMessage>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedGuestLogSubscription {
+    target: OperationalProcessRecord,
+    source_node: NodeSpec,
+    local_node: NodeSpec,
+    streams: Vec<PublicEndpointRef>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveGuestLogSubscription {
+    instance_id: String,
+    bridge_ids: Vec<String>,
+}
+
 struct ControlPlaneTlsPaths<'a> {
     cert_path: &'a Path,
     key_path: &'a Path,
@@ -269,6 +294,37 @@ impl LocalControlPlaneClient {
         }
 
         Err(anyhow!("timed out waiting for guest control-plane module"))
+    }
+
+    async fn query_value(&self, query: Query, allow_stale: bool) -> Result<DataValue> {
+        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = encode_request(
+            Method::ControlQuery,
+            request_id,
+            &QueryApiRequest { query, allow_stale },
+        )
+        .context("encode control-plane query")?;
+        let response = self.request_raw(&frame).await?;
+        let envelope = decode_envelope(&response).context("decode control-plane query response")?;
+        if envelope.method != Method::ControlQuery || envelope.request_id != request_id {
+            bail!("control-plane query returned mismatched envelope");
+        }
+        if is_error(&envelope) {
+            let err = decode_error(&envelope).context("decode control-plane query error")?;
+            bail!("control-plane guest reported {}: {}", err.code, err.message);
+        }
+        let response: QueryApiResponse =
+            decode_payload(&envelope).context("decode control-plane query payload")?;
+        if let Some(error) = response.error {
+            bail!(
+                "control-plane query failed: {} (leader_hint={:?})",
+                error,
+                response.leader_hint
+            );
+        }
+        response
+            .result
+            .ok_or_else(|| anyhow!("control-plane query returned no result"))
     }
 
     async fn reset_connection(&self) {
@@ -400,6 +456,7 @@ pub(crate) async fn run_daemon(
         target_bindings: Mutex::new(BTreeMap::new()),
         service_response_bindings: Mutex::new(BTreeMap::new()),
         active_bridges: Mutex::new(BTreeMap::new()),
+        host_subscription_id: AtomicU64::new(1),
         control_plane,
         control_plane_process_id,
         tls_paths: ManagedEventTlsPaths {
@@ -689,18 +746,12 @@ async fn handle_incoming(state: Rc<DaemonState>, incoming: Incoming) -> Result<(
     loop {
         match connection.accept_bi().await {
             Ok((mut send, mut recv)) => {
-                let response = match handle_stream_request(Rc::clone(&state), &mut recv).await {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
+                let state = Rc::clone(&state);
+                spawn_local(async move {
+                    if let Err(err) = handle_stream(state, &mut send, &mut recv).await {
                         tracing::warn!("stream request error: {err:#}");
-                        continue;
                     }
-                };
-
-                if let Err(err) = write_framed(&mut send, &response).await {
-                    tracing::warn!("stream response write error: {err:#}");
-                }
-                let _ = send.finish();
+                });
             }
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => break,
             Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
@@ -711,23 +762,46 @@ async fn handle_incoming(state: Rc<DaemonState>, incoming: Incoming) -> Result<(
     Ok(())
 }
 
-async fn handle_stream_request(
+async fn handle_stream(
     state: Rc<DaemonState>,
+    send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let bytes = read_framed(recv).await.context("read request frame")?;
     let envelope = decode_envelope(&bytes).context("decode request envelope")?;
 
     if !is_request(&envelope) {
-        return encode_error_response(
+        let response = encode_error_response(
             envelope.method,
             envelope.request_id,
             400,
             "invalid frame flags",
             false,
-        );
+        )?;
+        write_framed(send, &response)
+            .await
+            .context("write invalid request response")?;
+        let _ = send.finish();
+        return Ok(());
     }
 
+    if envelope.method == Method::SubscribeGuestLogs {
+        return handle_guest_log_subscription_stream(state, send, envelope).await;
+    }
+
+    let response = handle_stream_request(state, &bytes, envelope).await?;
+    write_framed(send, &response)
+        .await
+        .context("write response frame")?;
+    let _ = send.finish();
+    Ok(())
+}
+
+async fn handle_stream_request(
+    state: Rc<DaemonState>,
+    bytes: &[u8],
+    envelope: Envelope,
+) -> Result<Vec<u8>> {
     match envelope.method {
         Method::ControlMutate
         | Method::ControlQuery
@@ -795,6 +869,11 @@ async fn handle_stream_request(
                 Ok(bindings) => bindings,
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
             };
+            let guest_log_bindings =
+                match ensure_guest_log_bindings(&state, &payload.instance_id).await {
+                    Ok(bindings) => bindings,
+                    Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
+                };
             let module_spec = match append_managed_endpoint_bindings_arg(
                 &payload.module_spec,
                 managed_endpoint_bindings.as_deref(),
@@ -802,6 +881,7 @@ async fn handle_stream_request(
                 Ok(spec) => spec,
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
             };
+            let module_spec = append_guest_log_bindings(&module_spec, guest_log_bindings);
             let specs = vec![module_spec];
             let spawned = match modules::spawn_from_cli_with_context(
                 &state.kernel,
@@ -1039,6 +1119,7 @@ async fn handle_stream_request(
                 Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
             }
         }
+        Method::SubscribeGuestLogs => unreachable!("subscription streams are handled separately"),
     }
 }
 
@@ -1085,6 +1166,429 @@ fn next_runtime_usage_sequence(
         selium_abi::RuntimeUsageReplayStart::Checkpoint(_) => advanced,
         _ => advanced,
     }
+}
+
+async fn handle_guest_log_subscription_stream(
+    state: Rc<DaemonState>,
+    send: &mut quinn::SendStream,
+    envelope: Envelope,
+) -> Result<()> {
+    let payload: SubscribeGuestLogsRequest = match decode_payload(&envelope) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let response = rpc_decode_error(envelope.method, envelope.request_id, err)?;
+            write_framed(send, &response)
+                .await
+                .context("write subscription decode error")?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let resolved = match resolve_guest_log_subscription(&state, &payload).await {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            let response = encode_error_response(
+                envelope.method,
+                envelope.request_id,
+                400,
+                err.to_string(),
+                false,
+            )?;
+            write_framed(send, &response)
+                .await
+                .context("write subscription resolution error")?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let subscription = match activate_guest_log_subscription(&state, &resolved).await {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let response = rpc_server_error(envelope.method, envelope.request_id, err)?;
+            write_framed(send, &response)
+                .await
+                .context("write subscription setup error")?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    let response = encode_response(
+        envelope.method,
+        envelope.request_id,
+        &SubscribeGuestLogsResponse {
+            status: "ok".to_string(),
+            target_node: resolved.target.node.clone(),
+            target_instance_id: resolved.target.replica_key.clone(),
+            streams: resolved.streams.clone(),
+        },
+    )?;
+
+    let stream_result = async {
+        write_framed(send, &response)
+            .await
+            .context("write subscription response")?;
+        stream_guest_log_events(&state, &subscription.instance_id, &resolved.streams, send).await
+    }
+    .await;
+    let cleanup_result = deactivate_guest_log_subscription(&state, &resolved, &subscription).await;
+    let _ = send.finish();
+
+    if let Err(err) = cleanup_result {
+        return Err(err);
+    }
+    match stream_result {
+        Ok(()) => Ok(()),
+        Err(err) if is_closed_stream_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn resolve_guest_log_subscription(
+    state: &Rc<DaemonState>,
+    payload: &SubscribeGuestLogsRequest,
+) -> Result<ResolvedGuestLogSubscription> {
+    resolve_guest_log_subscription_with(&state.node_id, payload, |query| {
+        state.control_plane.query_value(query, true)
+    })
+    .await
+}
+
+async fn resolve_guest_log_subscription_with<F, Fut>(
+    local_node_id: &str,
+    payload: &SubscribeGuestLogsRequest,
+    query_value: F,
+) -> Result<ResolvedGuestLogSubscription>
+where
+    F: Fn(Query) -> Fut,
+    Fut: Future<Output = Result<DataValue>>,
+{
+    let target = decode_query_bytes::<DiscoveryResolution>(
+        query_value(Query::ResolveDiscovery {
+            request: DiscoveryRequest {
+                operation: DiscoveryOperation::Discover,
+                target: DiscoveryTarget::RunningProcess(payload.target.clone()),
+                scope: DiscoveryCapabilityScope::allow_all(),
+            },
+        })
+        .await?,
+        "running process discovery",
+    )?;
+    let DiscoveryResolution::RunningProcess(target) = target else {
+        bail!("control-plane returned non-process discovery for guest log target");
+    };
+
+    let control_plane = decode_query_bytes::<ControlPlaneState>(
+        query_value(Query::ControlPlaneState).await?,
+        "control-plane state",
+    )?;
+    let source_node = control_plane
+        .nodes
+        .get(&target.node)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown node `{}` for replica `{}`",
+                target.node,
+                target.replica_key
+            )
+        })?;
+    let local_node = control_plane
+        .nodes
+        .get(local_node_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("current daemon node `{local_node_id}` is missing from control-plane state")
+        })?;
+
+    let mut seen = BTreeSet::new();
+    let mut streams = Vec::new();
+    for stream_name in &payload.stream_names {
+        let stream_name = stream_name.trim();
+        if stream_name.is_empty() {
+            bail!("log stream names must not be empty");
+        }
+        if !seen.insert(stream_name.to_string()) {
+            continue;
+        }
+        let endpoint = PublicEndpointRef {
+            workload: target.workload.clone(),
+            kind: ContractKind::Event,
+            name: stream_name.to_string(),
+        };
+        let resolution = decode_query_bytes::<DiscoveryResolution>(
+            query_value(Query::ResolveDiscovery {
+                request: DiscoveryRequest {
+                    operation: DiscoveryOperation::Bind,
+                    target: DiscoveryTarget::Endpoint(endpoint),
+                    scope: DiscoveryCapabilityScope::allow_all(),
+                },
+            })
+            .await?,
+            "guest log endpoint discovery",
+        )?;
+        let DiscoveryResolution::Endpoint(resolved) = resolution else {
+            bail!("control-plane returned non-endpoint discovery for guest log stream");
+        };
+        if resolved.endpoint.kind != ContractKind::Event {
+            bail!(
+                "guest log stream `{}` resolved to non-event endpoint kind {:?}",
+                resolved.endpoint.name,
+                resolved.endpoint.kind
+            );
+        }
+        streams.push(resolved.endpoint);
+    }
+    if streams.is_empty() {
+        bail!("at least one guest log stream is required");
+    }
+
+    Ok(ResolvedGuestLogSubscription {
+        target,
+        source_node,
+        local_node,
+        streams,
+    })
+}
+
+fn decode_query_bytes<T>(value: DataValue, subject: &str) -> Result<T>
+where
+    T: rkyv::Archive + Sized,
+    for<'a> T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    let bytes = match value {
+        DataValue::Bytes(bytes) => bytes,
+        other => bail!("invalid {subject} payload (expected bytes), got {other:?}"),
+    };
+    decode_rkyv(&bytes).with_context(|| format!("decode {subject}"))
+}
+
+async fn activate_guest_log_subscription(
+    state: &Rc<DaemonState>,
+    resolved: &ResolvedGuestLogSubscription,
+) -> Result<ActiveGuestLogSubscription> {
+    let subscription_id = state.host_subscription_id.fetch_add(1, Ordering::Relaxed);
+    let instance_id = format!("host-log-subscription-{subscription_id}");
+    let bindings = resolved
+        .streams
+        .iter()
+        .map(|endpoint| ManagedEndpointBinding {
+            endpoint_name: endpoint.name.clone(),
+            endpoint_kind: ContractKind::Event,
+            role: ManagedEndpointRole::Ingress,
+            binding_type: ManagedEndpointBindingType::OneWay,
+        })
+        .collect::<Vec<_>>();
+    ensure_managed_endpoint_bindings(state, &instance_id, &bindings).await?;
+
+    let mut bridge_ids = Vec::new();
+    for endpoint in &resolved.streams {
+        let bridge_id = format!("{instance_id}:{}", endpoint.name);
+        let request = ActivateEndpointBridgeRequest {
+            node_id: resolved.target.node.clone(),
+            bridge_id: bridge_id.clone(),
+            source_instance_id: resolved.target.replica_key.clone(),
+            source_endpoint: endpoint.clone(),
+            target_instance_id: instance_id.clone(),
+            target_node: state.node_id.clone(),
+            target_daemon_addr: resolved.local_node.daemon_addr.clone(),
+            target_daemon_server_name: resolved.local_node.daemon_server_name.clone(),
+            target_endpoint: endpoint.clone(),
+            semantics: EndpointBridgeSemantics::Event(
+                selium_control_plane_protocol::EventBridgeSemantics {
+                    delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+                },
+            ),
+        };
+        let activation = if resolved.target.node == state.node_id {
+            activate_endpoint_bridge(state, &request).await
+        } else {
+            activate_endpoint_bridge_remote(&state.tls_paths, &resolved.source_node, &request).await
+        };
+        if let Err(err) = activation {
+            let partial = ActiveGuestLogSubscription {
+                instance_id: instance_id.clone(),
+                bridge_ids,
+            };
+            let _ = deactivate_guest_log_subscription(state, resolved, &partial).await;
+            return Err(err);
+        }
+        bridge_ids.push(bridge_id);
+    }
+
+    Ok(ActiveGuestLogSubscription {
+        instance_id,
+        bridge_ids,
+    })
+}
+
+async fn deactivate_guest_log_subscription(
+    state: &Rc<DaemonState>,
+    resolved: &ResolvedGuestLogSubscription,
+    subscription: &ActiveGuestLogSubscription,
+) -> Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
+    for bridge_id in &subscription.bridge_ids {
+        let request = DeactivateEndpointBridgeRequest {
+            node_id: resolved.target.node.clone(),
+            bridge_id: bridge_id.clone(),
+        };
+        let outcome = if resolved.target.node == state.node_id {
+            deactivate_endpoint_bridge(state, &request)
+                .await
+                .map(|_| ())
+        } else {
+            deactivate_endpoint_bridge_remote(&state.tls_paths, &resolved.source_node, &request)
+                .await
+                .map(|_| ())
+        };
+        if let Err(err) = outcome
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+    }
+    state
+        .target_bindings
+        .lock()
+        .await
+        .retain(|(instance_id, _, _), _| instance_id != &subscription.instance_id);
+
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn stream_guest_log_events<W>(
+    state: &DaemonState,
+    subscription_instance_id: &str,
+    streams: &[PublicEndpointRef],
+    writer: &mut W,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut readers = Vec::new();
+    for endpoint in streams {
+        let queue = {
+            let bindings = state.target_bindings.lock().await;
+            bindings
+                .get(&endpoint_key(subscription_instance_id, endpoint))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "subscription queue missing for `{}` on `{subscription_instance_id}`",
+                        endpoint.name
+                    )
+                })?
+        };
+        let reader = QueueService
+            .attach(
+                &queue.queue,
+                QueueAttach {
+                    shared_id: 0,
+                    role: QueueRole::Reader,
+                },
+            )
+            .with_context(|| format!("attach guest log reader for `{}`", endpoint.name))?;
+        readers.push((endpoint.clone(), reader));
+    }
+
+    loop {
+        for (endpoint, reader) in &readers {
+            let waited = QueueService
+                .wait(reader, MANAGED_EVENT_RETRY_DELAY.as_millis() as u32)
+                .await
+                .with_context(|| format!("wait for guest log `{}`", endpoint.name))?;
+            match waited.code {
+                QueueStatusCode::Timeout => continue,
+                QueueStatusCode::Ok => {
+                    let Some(frame) = waited.frame else {
+                        continue;
+                    };
+                    let payload = read_managed_event_frame(
+                        state,
+                        frame.shm_shared_id,
+                        frame.offset,
+                        frame.len,
+                    )
+                    .await?;
+                    let event = GuestLogEvent {
+                        endpoint: endpoint.clone(),
+                        payload,
+                    };
+                    let frame_bytes = encode_rkyv(&event).context("encode guest log event")?;
+                    write_framed(writer, &frame_bytes)
+                        .await
+                        .with_context(|| format!("write guest log `{}`", endpoint.name))?;
+                    QueueService
+                        .ack(
+                            reader,
+                            QueueAck {
+                                endpoint_id: 0,
+                                seq: frame.seq,
+                            },
+                        )
+                        .with_context(|| format!("ack guest log `{}`", endpoint.name))?;
+                }
+                other => {
+                    bail!(
+                        "guest log queue wait failed for `{}` with {other:?}",
+                        endpoint.name
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn is_closed_stream_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
+async fn activate_endpoint_bridge_remote(
+    tls_paths: &ManagedEventTlsPaths,
+    node: &NodeSpec,
+    payload: &ActivateEndpointBridgeRequest,
+) -> Result<ActivateEndpointBridgeResponse> {
+    request_remote_daemon(
+        tls_paths,
+        &node.daemon_addr,
+        &node.daemon_server_name,
+        Method::ActivateEndpointBridge,
+        payload,
+    )
+    .await
+}
+
+async fn deactivate_endpoint_bridge_remote(
+    tls_paths: &ManagedEventTlsPaths,
+    node: &NodeSpec,
+    payload: &DeactivateEndpointBridgeRequest,
+) -> Result<DeactivateEndpointBridgeResponse> {
+    request_remote_daemon(
+        tls_paths,
+        &node.daemon_addr,
+        &node.daemon_server_name,
+        Method::DeactivateEndpointBridge,
+        payload,
+    )
+    .await
 }
 
 async fn activate_endpoint_bridge(
@@ -1351,6 +1855,38 @@ fn encode_managed_endpoint_section(
         .collect()
 }
 
+async fn ensure_guest_log_bindings(
+    state: &DaemonState,
+    instance_id: &str,
+) -> Result<ProcessLogBindings> {
+    let stdout = ensure_managed_endpoint_queue(
+        state,
+        instance_id,
+        &guest_log_binding(GUEST_LOG_STDOUT_ENDPOINT),
+    )
+    .await?;
+    let stderr = ensure_managed_endpoint_queue(
+        state,
+        instance_id,
+        &guest_log_binding(GUEST_LOG_STDERR_ENDPOINT),
+    )
+    .await?;
+
+    Ok(ProcessLogBindings {
+        stdout_queue_shared_id: Some(stdout.queue_shared_id),
+        stderr_queue_shared_id: Some(stderr.queue_shared_id),
+    })
+}
+
+fn guest_log_binding(endpoint_name: &str) -> ManagedEndpointBinding {
+    ManagedEndpointBinding {
+        endpoint_name: endpoint_name.to_string(),
+        endpoint_kind: ContractKind::Event,
+        role: ManagedEndpointRole::Egress,
+        binding_type: ManagedEndpointBindingType::OneWay,
+    }
+}
+
 async fn ensure_managed_endpoint_queue(
     state: &DaemonState,
     instance_id: &str,
@@ -1474,6 +2010,35 @@ fn append_managed_endpoint_bindings_arg(
     }
 
     Ok(entries.join(";"))
+}
+
+fn append_guest_log_bindings(module_spec: &str, bindings: ProcessLogBindings) -> String {
+    if bindings.is_empty() {
+        return module_spec.to_string();
+    }
+
+    let mut entries: Vec<String> = module_spec
+        .replace(';', "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if let Some(shared_id) = bindings.stdout_queue_shared_id {
+        entries.push(format!(
+            "{}={shared_id}",
+            modules::MODULE_SPEC_GUEST_LOG_STDOUT_QUEUE_SHARED_ID
+        ));
+    }
+    if let Some(shared_id) = bindings.stderr_queue_shared_id {
+        entries.push(format!(
+            "{}={shared_id}",
+            modules::MODULE_SPEC_GUEST_LOG_STDERR_QUEUE_SHARED_ID
+        ));
+    }
+
+    entries.join(";")
 }
 
 fn prepend_module_spec_value(prefix: &str, existing: &str) -> String {
@@ -2174,14 +2739,19 @@ async fn enqueue_managed_stream_frame(
     enqueue_managed_event_frame(state, queue, &payload).await
 }
 
-async fn deliver_bridge_message_remote(
-    tls_paths: ManagedEventTlsPaths,
+async fn request_remote_daemon<Req, Resp>(
+    tls_paths: &ManagedEventTlsPaths,
     target_daemon_addr: &str,
     target_daemon_server_name: &str,
-    target_instance_id: &str,
-    target_endpoint: &PublicEndpointRef,
-    message: BridgeMessage,
-) -> Result<BridgeMessageDelivery> {
+    method: Method,
+    payload: &Req,
+) -> Result<Resp>
+where
+    Req: selium_abi::RkyvEncode,
+    Resp: rkyv::Archive + Sized,
+    for<'a> Resp::Archived: rkyv::Deserialize<Resp, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
     let endpoint = build_client_endpoint(
         &tls_paths.ca_cert,
         &tls_paths.client_cert,
@@ -2198,16 +2768,8 @@ async fn deliver_bridge_message_remote(
     .map_err(|_| anyhow!("timed out"))
     .context("connect remote daemon")??;
     let request_id = 1;
-    let frame = encode_request(
-        Method::DeliverBridgeMessage,
-        request_id,
-        &DeliverBridgeMessageRequest {
-            target_instance_id: target_instance_id.to_string(),
-            target_endpoint: target_endpoint.clone(),
-            message,
-        },
-    )
-    .context("encode remote frame delivery")?;
+    let frame =
+        encode_request(method, request_id, payload).context("encode remote daemon request")?;
     let (mut send, mut recv) = timeout(QUIC_REQUEST_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| anyhow!("timed out"))
@@ -2222,12 +2784,36 @@ async fn deliver_bridge_message_remote(
         .map_err(|_| anyhow!("timed out"))
         .context("read remote route response")??;
     let envelope = decode_envelope(&response).context("decode remote route response")?;
+    if envelope.method != method || envelope.request_id != request_id {
+        bail!("remote daemon response mismatch");
+    }
     if is_error(&envelope) {
         let err = decode_error(&envelope).context("decode remote route error")?;
         bail!("remote daemon returned {}: {}", err.code, err.message);
     }
-    let delivered: DeliverBridgeMessageResponse =
-        decode_payload(&envelope).context("decode remote route delivery")?;
+    decode_payload(&envelope).context("decode remote route payload")
+}
+
+async fn deliver_bridge_message_remote(
+    tls_paths: ManagedEventTlsPaths,
+    target_daemon_addr: &str,
+    target_daemon_server_name: &str,
+    target_instance_id: &str,
+    target_endpoint: &PublicEndpointRef,
+    message: BridgeMessage,
+) -> Result<BridgeMessageDelivery> {
+    let delivered: DeliverBridgeMessageResponse = request_remote_daemon(
+        &tls_paths,
+        target_daemon_addr,
+        target_daemon_server_name,
+        Method::DeliverBridgeMessage,
+        &DeliverBridgeMessageRequest {
+            target_instance_id: target_instance_id.to_string(),
+            target_endpoint: target_endpoint.clone(),
+            message,
+        },
+    )
+    .await?;
     Ok(BridgeMessageDelivery {
         delivered: delivered.delivered,
         message: delivered.message,
@@ -2371,7 +2957,12 @@ mod tests {
     };
 
     use selium_abi::{RuntimeUsageQuery, RuntimeUsageReplayStart, decode_rkyv};
-    use selium_control_plane_api::WorkloadRef;
+    use selium_control_plane_api::{
+        ContractRef, ControlPlaneState, DeploymentSpec, IsolationProfile, NodeSpec,
+        OperationalProcessSelector, WorkloadRef, parse_idl,
+    };
+    use selium_module_control_plane::runtime::ControlPlaneEngine;
+    use tokio::io::duplex;
 
     use crate::usage::{ProcessUsageAttribution, RuntimeUsageCollector};
 
@@ -2546,6 +3137,276 @@ mod tests {
                 .await
                 .expect("read target frame");
         assert_eq!(payload, b"frame-remote");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_endpoint_bridge_forwards_local_guest_log_event_frames() {
+        LocalSet::new()
+            .run_until(async {
+                let state = sample_state("local-node");
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .insert("source-1".to_string(), 7);
+                ensure_guest_log_bindings(&state, "source-1")
+                    .await
+                    .expect("register guest log bindings");
+                ensure_managed_endpoint_bindings(
+                    &state,
+                    "target-1",
+                    &[ManagedEndpointBinding {
+                        endpoint_name: GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                        endpoint_kind: ContractKind::Event,
+                        role: ManagedEndpointRole::Ingress,
+                        binding_type:
+                            selium_control_plane_protocol::ManagedEndpointBindingType::OneWay,
+                    }],
+                )
+                .await
+                .expect("register target binding");
+
+                let response = activate_endpoint_bridge(
+                    &state,
+                    &ActivateEndpointBridgeRequest {
+                        node_id: "local-node".to_string(),
+                        bridge_id: "bridge-guest-log".to_string(),
+                        source_instance_id: "source-1".to_string(),
+                        source_endpoint: sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
+                        target_instance_id: "target-1".to_string(),
+                        target_node: "local-node".to_string(),
+                        target_daemon_addr: "127.0.0.1:7100".to_string(),
+                        target_daemon_server_name: "localhost".to_string(),
+                        target_endpoint: sample_endpoint("attach", GUEST_LOG_STDOUT_ENDPOINT),
+                        semantics: selium_control_plane_protocol::EndpointBridgeSemantics::Event(
+                            selium_control_plane_protocol::EventBridgeSemantics {
+                                delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+                            },
+                        ),
+                    },
+                )
+                .await
+                .expect("activate guest log route");
+                assert_eq!(response.mode, EndpointBridgeMode::Local);
+
+                let source = state
+                    .source_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
+                    ))
+                    .cloned()
+                    .expect("guest log source binding present");
+                let target = state
+                    .target_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "target-1",
+                        &sample_endpoint("attach", GUEST_LOG_STDOUT_ENDPOINT),
+                    ))
+                    .cloned()
+                    .expect("target binding present");
+
+                enqueue_managed_event_frame(&state, &source.queue, b"guest stdout")
+                    .await
+                    .expect("enqueue guest log frame");
+
+                let reader = QueueService
+                    .attach(
+                        &target.queue,
+                        QueueAttach {
+                            shared_id: 0,
+                            role: QueueRole::Reader,
+                        },
+                    )
+                    .expect("attach target reader");
+                let waited = QueueService
+                    .wait(&reader, 2_000)
+                    .await
+                    .expect("wait target frame");
+                let frame = waited.frame.expect("frame available");
+                let payload =
+                    read_managed_event_frame(&state, frame.shm_shared_id, frame.offset, frame.len)
+                        .await
+                        .expect("read target frame");
+                assert_eq!(payload, b"guest stdout");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_guest_log_subscription_accepts_exact_stdout_and_stderr() {
+        let engine = guest_log_resolution_engine(1);
+        let resolved = resolve_guest_log_subscription_with(
+            "local-node",
+            &SubscribeGuestLogsRequest {
+                target: OperationalProcessSelector::ReplicaKey(
+                    "tenant=tenant-a;namespace=media;workload=ingest;replica=0".to_string(),
+                ),
+                stream_names: vec![
+                    GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                    GUEST_LOG_STDERR_ENDPOINT.to_string(),
+                ],
+            },
+            |query| async { engine_query(&engine, query) },
+        )
+        .await
+        .expect("resolve guest log subscription");
+
+        assert_eq!(resolved.target.node, "local-node");
+        assert_eq!(
+            resolved.target.replica_key,
+            "tenant=tenant-a;namespace=media;workload=ingest;replica=0"
+        );
+        assert_eq!(
+            resolved
+                .streams
+                .iter()
+                .map(|endpoint| endpoint.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![GUEST_LOG_STDOUT_ENDPOINT, GUEST_LOG_STDERR_ENDPOINT]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_guest_log_subscription_reports_ambiguous_workloads() {
+        let engine = guest_log_resolution_engine(2);
+        let err = resolve_guest_log_subscription_with(
+            "local-node",
+            &SubscribeGuestLogsRequest {
+                target: OperationalProcessSelector::Workload(WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "ingest".to_string(),
+                }),
+                stream_names: vec![GUEST_LOG_STDOUT_ENDPOINT.to_string()],
+            },
+            |query| async { engine_query(&engine, query) },
+        )
+        .await
+        .expect_err("ambiguous workload target");
+
+        assert!(err.to_string().contains("specify a replica key"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_guest_log_subscription_reports_unknown_streams() {
+        let engine = guest_log_resolution_engine(1);
+        let err = resolve_guest_log_subscription_with(
+            "local-node",
+            &SubscribeGuestLogsRequest {
+                target: OperationalProcessSelector::ReplicaKey(
+                    "tenant=tenant-a;namespace=media;workload=ingest;replica=0".to_string(),
+                ),
+                stream_names: vec!["stdx".to_string()],
+            },
+            |query| async { engine_query(&engine, query) },
+        )
+        .await
+        .expect_err("unknown stream target");
+
+        assert!(err.to_string().contains("unknown endpoint"));
+        assert!(err.to_string().contains("stdx"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn guest_log_subscription_streams_live_stdout_and_stderr_frames() {
+        LocalSet::new()
+            .run_until(async {
+                let state = sample_state("local-node");
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .insert("source-1".to_string(), 7);
+                ensure_guest_log_bindings(&state, "source-1")
+                    .await
+                    .expect("register guest log bindings");
+
+                let resolved = ResolvedGuestLogSubscription {
+                    target: OperationalProcessRecord {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        replica_key: "source-1".to_string(),
+                        node: "local-node".to_string(),
+                    },
+                    source_node: sample_node("local-node", "127.0.0.1:7100", "localhost"),
+                    local_node: sample_node("local-node", "127.0.0.1:7100", "localhost"),
+                    streams: vec![
+                        sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
+                        sample_endpoint("ingest", GUEST_LOG_STDERR_ENDPOINT),
+                    ],
+                };
+                let subscription = activate_guest_log_subscription(&state, &resolved)
+                    .await
+                    .expect("activate guest log subscription");
+
+                let stdout_queue = state
+                    .source_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
+                    ))
+                    .cloned()
+                    .expect("stdout queue present");
+                let stderr_queue = state
+                    .source_bindings
+                    .lock()
+                    .await
+                    .get(&endpoint_key(
+                        "source-1",
+                        &sample_endpoint("ingest", GUEST_LOG_STDERR_ENDPOINT),
+                    ))
+                    .cloned()
+                    .expect("stderr queue present");
+
+                let (mut client, mut server) = duplex(4096);
+                let state_for_task = Rc::clone(&state);
+                let instance_id = subscription.instance_id.clone();
+                let streams = resolved.streams.clone();
+                let stream_task = spawn_local(async move {
+                    stream_guest_log_events(&state_for_task, &instance_id, &streams, &mut server)
+                        .await
+                });
+
+                enqueue_managed_event_frame(&state, &stdout_queue.queue, b"hello stdout")
+                    .await
+                    .expect("enqueue stdout frame");
+                enqueue_managed_event_frame(&state, &stderr_queue.queue, b"hello stderr")
+                    .await
+                    .expect("enqueue stderr frame");
+
+                let first: GuestLogEvent =
+                    decode_rkyv(&read_framed(&mut client).await.expect("read first frame"))
+                        .expect("decode first guest log event");
+                let second: GuestLogEvent =
+                    decode_rkyv(&read_framed(&mut client).await.expect("read second frame"))
+                        .expect("decode second guest log event");
+                assert_eq!(first.endpoint.name, GUEST_LOG_STDOUT_ENDPOINT);
+                assert_eq!(first.payload, b"hello stdout");
+                assert_eq!(second.endpoint.name, GUEST_LOG_STDERR_ENDPOINT);
+                assert_eq!(second.payload, b"hello stderr");
+
+                drop(client);
+                enqueue_managed_event_frame(&state, &stdout_queue.queue, b"goodbye")
+                    .await
+                    .expect("enqueue disconnect frame");
+                let stream_result = stream_task.await.expect("stream task join");
+                assert!(stream_result.is_err());
+
+                deactivate_guest_log_subscription(&state, &resolved, &subscription)
+                    .await
+                    .expect("deactivate guest log subscription");
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3480,6 +4341,83 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn append_guest_log_bindings_adds_hidden_queue_ids() {
+        let spec = append_guest_log_bindings(
+            "path=demo.wasm;capabilities=time_read",
+            ProcessLogBindings {
+                stdout_queue_shared_id: Some(11),
+                stderr_queue_shared_id: Some(22),
+            },
+        );
+
+        assert_eq!(
+            spec,
+            "path=demo.wasm;capabilities=time_read;guest_log_stdout_queue_shared_id=11;guest_log_stderr_queue_shared_id=22"
+        );
+    }
+
+    fn sample_node(name: &str, daemon_addr: &str, daemon_server_name: &str) -> NodeSpec {
+        NodeSpec {
+            name: name.to_string(),
+            capacity_slots: 8,
+            allocatable_cpu_millis: None,
+            allocatable_memory_mib: None,
+            supported_isolation: vec![IsolationProfile::Standard],
+            daemon_addr: daemon_addr.to_string(),
+            daemon_server_name: daemon_server_name.to_string(),
+            last_heartbeat_ms: 0,
+        }
+    }
+
+    fn guest_log_resolution_engine(replicas: usize) -> ControlPlaneEngine {
+        let mut state = ControlPlaneState::new_local_default();
+        let package = parse_idl(
+            r#"
+            package media.camera.v1;
+            schema Frame { payload: bytes; }
+            event camera.frames(Frame) { replay: enabled; }
+            "#,
+        )
+        .expect("parse package");
+        state
+            .registry
+            .register_package(package)
+            .expect("register package");
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "media".to_string(),
+                    name: "ingest".to_string(),
+                },
+                module: "ingest.wasm".to_string(),
+                replicas: replicas as u32,
+                contracts: vec![ContractRef {
+                    namespace: "media.camera".to_string(),
+                    kind: ContractKind::Event,
+                    name: "camera.frames".to_string(),
+                    version: "v1".to_string(),
+                }],
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: selium_control_plane_api::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
+            })
+            .expect("register deployment");
+        ControlPlaneEngine::new(state)
+    }
+
+    fn engine_query(engine: &ControlPlaneEngine, query: Query) -> Result<DataValue> {
+        Ok(engine
+            .query(query)
+            .map_err(|err| anyhow!(err.to_string()))?
+            .result)
+    }
+
     fn sample_state(node_id: &str) -> Rc<DaemonState> {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3501,6 +4439,7 @@ mod tests {
             target_bindings: Mutex::new(BTreeMap::new()),
             service_response_bindings: Mutex::new(BTreeMap::new()),
             active_bridges: Mutex::new(BTreeMap::new()),
+            host_subscription_id: AtomicU64::new(1),
             control_plane: Arc::new(LocalControlPlaneClient {
                 endpoint,
                 addr: "127.0.0.1:1".parse().expect("dummy addr"),

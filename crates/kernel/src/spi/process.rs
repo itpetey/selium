@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use selium_abi::{Capability, EntrypointInvocation};
+use selium_abi::{Capability, EntrypointInvocation, ProcessLogBindings};
 
 use crate::{
     guest_error::GuestError,
@@ -21,6 +21,7 @@ pub struct ProcessStartRequest<'a> {
     /// Opaque external account reference supplied by Selium control-plane resources.
     pub external_account_ref: Option<&'a str>,
     pub capabilities: Vec<Capability>,
+    pub guest_log_bindings: ProcessLogBindings,
     pub network_egress_profiles: Vec<String>,
     pub network_ingress_bindings: Vec<String>,
     pub storage_logs: Vec<String>,
@@ -132,6 +133,7 @@ mod tests {
                     instance_id: None,
                     external_account_ref: None,
                     capabilities: vec![Capability::TimeRead],
+                    guest_log_bindings: ProcessLogBindings::default(),
                     network_egress_profiles: Vec::new(),
                     network_ingress_bindings: Vec::new(),
                     storage_logs: Vec::new(),

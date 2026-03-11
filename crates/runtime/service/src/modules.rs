@@ -7,7 +7,7 @@ use crate::wasmtime::runtime::{Error as WasmtimeError, WasmtimeProcess, Wasmtime
 use anyhow::{Context, Result, anyhow, bail};
 use selium_abi::{
     AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, Capability, EntrypointArg,
-    EntrypointInvocation,
+    EntrypointInvocation, ProcessLogBindings,
 };
 use selium_kernel::{
     Kernel, KernelError,
@@ -26,6 +26,10 @@ use tracing::info;
 const DEFAULT_ENTRYPOINT: &str = "start";
 const DEFAULT_ADAPTOR: AdaptorKind = AdaptorKind::Wasmtime;
 const DEFAULT_PROFILE: ExecutionProfile = ExecutionProfile::Standard;
+pub(crate) const MODULE_SPEC_GUEST_LOG_STDOUT_QUEUE_SHARED_ID: &str =
+    "guest_log_stdout_queue_shared_id";
+pub(crate) const MODULE_SPEC_GUEST_LOG_STDERR_QUEUE_SHARED_ID: &str =
+    "guest_log_stderr_queue_shared_id";
 
 #[derive(Default)]
 struct ModuleArgs {
@@ -46,6 +50,7 @@ struct ModuleSpec {
     module_path: PathBuf,
     entrypoint: String,
     capabilities: Vec<Capability>,
+    guest_log_bindings: ProcessLogBindings,
     network_egress_profiles: Vec<String>,
     network_ingress_bindings: Vec<String>,
     storage_logs: Vec<String>,
@@ -61,6 +66,8 @@ struct ModuleSpecBuilder {
     path: Option<String>,
     entrypoint: Option<String>,
     capabilities: Option<Vec<Capability>>,
+    guest_log_stdout_queue_shared_id: Option<u64>,
+    guest_log_stderr_queue_shared_id: Option<u64>,
     network_egress_profiles: Option<Vec<String>>,
     network_ingress_bindings: Option<Vec<String>>,
     storage_logs: Option<Vec<String>>,
@@ -99,6 +106,8 @@ impl ModuleSpecBuilder {
         self.path.is_none()
             && self.entrypoint.is_none()
             && self.capabilities.is_none()
+            && self.guest_log_stdout_queue_shared_id.is_none()
+            && self.guest_log_stderr_queue_shared_id.is_none()
             && self.network_egress_profiles.is_none()
             && self.network_ingress_bindings.is_none()
             && self.storage_logs.is_none()
@@ -286,6 +295,18 @@ fn parse_module_spec(raw: &str, work_dir: &Path) -> Result<ModuleSpec> {
                 }
                 builder.capabilities = Some(parse_capabilities(value)?);
             }
+            MODULE_SPEC_GUEST_LOG_STDOUT_QUEUE_SHARED_ID => {
+                if builder.guest_log_stdout_queue_shared_id.is_some() {
+                    return Err(anyhow!("entry {line_no}: duplicate stdout guest log queue"));
+                }
+                builder.guest_log_stdout_queue_shared_id = Some(parse_u64_value(value, key)?);
+            }
+            MODULE_SPEC_GUEST_LOG_STDERR_QUEUE_SHARED_ID => {
+                if builder.guest_log_stderr_queue_shared_id.is_some() {
+                    return Err(anyhow!("entry {line_no}: duplicate stderr guest log queue"));
+                }
+                builder.guest_log_stderr_queue_shared_id = Some(parse_u64_value(value, key)?);
+            }
             "network_egress_profiles" | "network-egress-profiles" => {
                 if builder.network_egress_profiles.is_some() {
                     return Err(anyhow!(
@@ -357,6 +378,10 @@ fn build_module_spec(builder: ModuleSpecBuilder, _work_dir: &Path) -> Result<Mod
         .entrypoint
         .unwrap_or_else(|| DEFAULT_ENTRYPOINT.to_string());
     let capabilities = builder.capabilities.unwrap_or_default();
+    let guest_log_bindings = ProcessLogBindings {
+        stdout_queue_shared_id: builder.guest_log_stdout_queue_shared_id,
+        stderr_queue_shared_id: builder.guest_log_stderr_queue_shared_id,
+    };
     let network_egress_profiles = builder.network_egress_profiles.unwrap_or_default();
     let network_ingress_bindings = builder.network_ingress_bindings.unwrap_or_default();
     let storage_logs = builder.storage_logs.unwrap_or_default();
@@ -388,6 +413,7 @@ fn build_module_spec(builder: ModuleSpecBuilder, _work_dir: &Path) -> Result<Mod
         module_path,
         entrypoint,
         capabilities,
+        guest_log_bindings,
         network_egress_profiles,
         network_ingress_bindings,
         storage_logs,
@@ -430,6 +456,11 @@ fn normalize_module_id(path: PathBuf) -> PathBuf {
         }
         _ => path,
     }
+}
+
+fn parse_u64_value(raw: &str, key: &str) -> Result<u64> {
+    raw.parse::<u64>()
+        .with_context(|| format!("invalid {key} value `{raw}`"))
 }
 
 fn parse_capabilities(raw: &str) -> Result<Vec<Capability>> {
@@ -781,6 +812,7 @@ async fn spawn_module(
         module_path,
         entrypoint,
         capabilities,
+        guest_log_bindings,
         network_egress_profiles,
         network_ingress_bindings,
         storage_logs,
@@ -823,6 +855,7 @@ async fn spawn_module(
                 instance_id: launch_context.instance_id,
                 external_account_ref: launch_context.external_account_ref,
                 capabilities,
+                guest_log_bindings,
                 network_egress_profiles,
                 network_ingress_bindings,
                 storage_logs,
@@ -955,8 +988,27 @@ mod tests {
         assert_eq!(spec.adaptor, AdaptorKind::Wasmtime);
         assert_eq!(spec.profile, ExecutionProfile::Standard);
         assert_eq!(spec.capabilities, vec![Capability::TimeRead]);
+        assert_eq!(spec.guest_log_bindings, ProcessLogBindings::default());
         assert_eq!(spec.params, Vec::<AbiParam>::new());
         assert_eq!(spec.args, Vec::<EntrypointArg>::new());
+    }
+
+    #[test]
+    fn parse_module_spec_accepts_guest_log_queue_shared_ids() {
+        let work_dir = Path::new(".");
+        let spec = parse_module_spec(
+            "path=mod.wasm;capabilities=time_read;guest_log_stdout_queue_shared_id=12;guest_log_stderr_queue_shared_id=34",
+            work_dir,
+        )
+        .expect("spec");
+
+        assert_eq!(
+            spec.guest_log_bindings,
+            ProcessLogBindings {
+                stdout_queue_shared_id: Some(12),
+                stderr_queue_shared_id: Some(34),
+            }
+        );
     }
 
     #[test]

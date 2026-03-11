@@ -98,6 +98,9 @@ impl ContractKind {
     }
 }
 
+pub const GUEST_LOG_STDOUT_ENDPOINT: &str = "stdout";
+pub const GUEST_LOG_STDERR_ENDPOINT: &str = "stderr";
+
 /// User-facing public endpoint identity for discovery across contract kinds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -458,7 +461,7 @@ pub struct DiscoverableWorkload {
 #[rkyv(bytecheck())]
 pub struct DiscoverableEndpoint {
     pub endpoint: PublicEndpointRef,
-    pub contract: ContractRef,
+    pub contract: Option<ContractRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize, Default)]
@@ -479,7 +482,7 @@ pub struct ResolvedWorkload {
 #[rkyv(bytecheck())]
 pub struct ResolvedEndpoint {
     pub endpoint: PublicEndpointRef,
-    pub contract: ContractRef,
+    pub contract: Option<ContractRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]

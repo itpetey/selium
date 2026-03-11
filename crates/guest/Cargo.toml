@@ -19,4 +19,4 @@ rkyv = { workspace = true }
 selium-abi = { workspace = true }
 selium-guest-macros = { path = "macros" }
 thiserror = { workspace = true, features = ["std"] }
-tracing = { workspace = true }
+tracing = { workspace = true, features = ["std"] }

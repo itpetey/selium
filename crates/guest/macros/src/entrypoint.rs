@@ -224,6 +224,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let entrypoint = quote! {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn #orig_ident(#(#entrypoint_inputs),*) {
+            let _guest_logging = selium_guest::__enter_guest_logging();
             #(#decode_bindings)*
             #run_user
         }

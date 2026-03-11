@@ -1397,8 +1397,9 @@ mod tests {
     use super::*;
     use selium_control_plane_api::{
         BandwidthProfile, ContractKind, ContractRef, DiscoveryPattern, EventEndpointRef,
-        ExternalAccountRef, IsolationProfile, PipelineEdge, PipelineEndpoint, PipelineSpec,
-        PublicEndpointRef, VolumeMount, parse_idl,
+        ExternalAccountRef, GUEST_LOG_STDERR_ENDPOINT, GUEST_LOG_STDOUT_ENDPOINT,
+        IsolationProfile, PipelineEdge, PipelineEndpoint, PipelineSpec, PublicEndpointRef,
+        VolumeMount, parse_idl,
     };
     use selium_io_consensus::{ConsensusConfig, RaftNode};
 
@@ -2117,14 +2118,22 @@ mod tests {
         let discovery: DiscoveryState = decode_rkyv(bytes).expect("decode discovery");
 
         assert_eq!(discovery.workloads.len(), 1);
-        assert_eq!(discovery.endpoints.len(), 1);
+        assert_eq!(discovery.endpoints.len(), 3);
         assert_eq!(
             discovery.workloads[0].workload.key(),
             "tenant-a/media/ingest"
         );
         assert_eq!(
-            discovery.endpoints[0].endpoint.key(),
-            "tenant-a/media/ingest#event:camera.frames"
+            discovery
+                .endpoints
+                .iter()
+                .map(|record| record.endpoint.key())
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant-a/media/ingest#event:camera.frames".to_string(),
+                "tenant-a/media/ingest#event:stderr".to_string(),
+                "tenant-a/media/ingest#event:stdout".to_string(),
+            ]
         );
     }
 
@@ -2195,18 +2204,44 @@ mod tests {
                     namespace: "media".to_string(),
                     name: "ingest".to_string(),
                 },
-                endpoints: vec![selium_control_plane_api::DiscoverableEndpoint {
-                    endpoint: PublicEndpointRef {
-                        workload: WorkloadRef {
-                            tenant: "tenant-a".to_string(),
-                            namespace: "media".to_string(),
-                            name: "ingest".to_string(),
+                endpoints: vec![
+                    selium_control_plane_api::DiscoverableEndpoint {
+                        endpoint: PublicEndpointRef {
+                            workload: WorkloadRef {
+                                tenant: "tenant-a".to_string(),
+                                namespace: "media".to_string(),
+                                name: "ingest".to_string(),
+                            },
+                            kind: ContractKind::Event,
+                            name: "camera.frames".to_string(),
                         },
-                        kind: ContractKind::Event,
-                        name: "camera.frames".to_string(),
+                        contract: Some(event_contract()),
                     },
-                    contract: event_contract(),
-                }],
+                    selium_control_plane_api::DiscoverableEndpoint {
+                        endpoint: PublicEndpointRef {
+                            workload: WorkloadRef {
+                                tenant: "tenant-a".to_string(),
+                                namespace: "media".to_string(),
+                                name: "ingest".to_string(),
+                            },
+                            kind: ContractKind::Event,
+                            name: GUEST_LOG_STDERR_ENDPOINT.to_string(),
+                        },
+                        contract: None,
+                    },
+                    selium_control_plane_api::DiscoverableEndpoint {
+                        endpoint: PublicEndpointRef {
+                            workload: WorkloadRef {
+                                tenant: "tenant-a".to_string(),
+                                namespace: "media".to_string(),
+                                name: "ingest".to_string(),
+                            },
+                            kind: ContractKind::Event,
+                            name: GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                        },
+                        contract: None,
+                    }
+                ],
             })
         );
     }
@@ -2255,7 +2290,7 @@ mod tests {
                     kind: ContractKind::Event,
                     name: "camera.frames".to_string(),
                 },
-                contract: event_contract(),
+                contract: Some(event_contract()),
             })
         );
     }
@@ -2288,6 +2323,8 @@ mod tests {
             endpoint_keys,
             vec![
                 "tenant-a/media/router#event:camera.frames".to_string(),
+                "tenant-a/media/router#event:stderr".to_string(),
+                "tenant-a/media/router#event:stdout".to_string(),
                 "tenant-a/media/router#service:camera.detect".to_string(),
                 "tenant-a/media/router#stream:camera.raw".to_string(),
             ]
@@ -2338,7 +2375,7 @@ mod tests {
                     kind: ContractKind::Service,
                     name: "camera.detect".to_string(),
                 },
-                contract: service_contract(),
+                contract: Some(service_contract()),
             })
         );
     }
@@ -2387,7 +2424,7 @@ mod tests {
                     kind: ContractKind::Stream,
                     name: "camera.raw".to_string(),
                 },
-                contract: stream_contract(),
+                contract: Some(stream_contract()),
             })
         );
     }
@@ -2442,10 +2479,92 @@ mod tests {
                         kind,
                         name: "camera.shared".to_string(),
                     },
-                    contract: shared_name_contract(kind),
+                    contract: Some(shared_name_contract(kind)),
                 })
             );
         }
+    }
+
+    #[test]
+    fn discovery_state_prefix_filters_guest_std_endpoints() {
+        let engine = discovery_engine();
+        let query = engine
+            .query(Query::DiscoveryState {
+                scope: DiscoveryCapabilityScope {
+                    operations: vec![DiscoveryOperation::Discover],
+                    workloads: vec![DiscoveryPattern::Prefix(String::new())],
+                    endpoints: vec![DiscoveryPattern::Prefix(
+                        "tenant-a/media/ingest#event:std".to_string(),
+                    )],
+                    allow_operational_processes: false,
+                },
+            })
+            .expect("discovery state");
+        let DataValue::Bytes(bytes) = &query.result else {
+            panic!("expected bytes result");
+        };
+        let discovery: DiscoveryState = decode_rkyv(bytes).expect("decode discovery");
+
+        assert_eq!(
+            discovery
+                .endpoints
+                .iter()
+                .map(|record| record.endpoint.key())
+                .collect::<Vec<_>>(),
+            vec![
+                "tenant-a/media/ingest#event:stderr".to_string(),
+                "tenant-a/media/ingest#event:stdout".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_guest_log_endpoint_bind_omits_replica_identity() {
+        let engine = discovery_engine();
+        let query = engine
+            .query(Query::ResolveDiscovery {
+                request: DiscoveryRequest {
+                    operation: DiscoveryOperation::Bind,
+                    target: DiscoveryTarget::Endpoint(PublicEndpointRef {
+                        workload: WorkloadRef {
+                            tenant: "tenant-a".to_string(),
+                            namespace: "media".to_string(),
+                            name: "ingest".to_string(),
+                        },
+                        kind: ContractKind::Event,
+                        name: GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                    }),
+                    scope: DiscoveryCapabilityScope {
+                        operations: vec![DiscoveryOperation::Bind],
+                        workloads: vec![DiscoveryPattern::Exact(
+                            "tenant-a/media/ingest".to_string(),
+                        )],
+                        endpoints: Vec::new(),
+                        allow_operational_processes: false,
+                    },
+                },
+            })
+            .expect("resolve guest log endpoint bind");
+        let DataValue::Bytes(bytes) = &query.result else {
+            panic!("expected bytes result");
+        };
+        let resolution: DiscoveryResolution = decode_rkyv(bytes).expect("decode resolution");
+
+        assert_eq!(
+            resolution,
+            DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                endpoint: PublicEndpointRef {
+                    workload: WorkloadRef {
+                        tenant: "tenant-a".to_string(),
+                        namespace: "media".to_string(),
+                        name: "ingest".to_string(),
+                    },
+                    kind: ContractKind::Event,
+                    name: GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                },
+                contract: None,
+            })
+        );
     }
 
     #[test]

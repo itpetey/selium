@@ -10,7 +10,7 @@ use rkyv::{
 use selium_abi::{
     DataValue, RkyvEncode, RuntimeUsageQuery, RuntimeUsageRecord, decode_rkyv, encode_rkyv,
 };
-use selium_control_plane_api::{ContractKind, PublicEndpointRef};
+use selium_control_plane_api::{ContractKind, OperationalProcessSelector, PublicEndpointRef};
 use selium_control_plane_runtime::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,6 +38,7 @@ pub enum Method {
     DeactivateEndpointBridge = 104,
     DeliverBridgeMessage = 105,
     RuntimeUsageQuery = 106,
+    SubscribeGuestLogs = 107,
 }
 
 impl Method {
@@ -57,6 +58,7 @@ impl Method {
             104 => Some(Self::DeactivateEndpointBridge),
             105 => Some(Self::DeliverBridgeMessage),
             106 => Some(Self::RuntimeUsageQuery),
+            107 => Some(Self::SubscribeGuestLogs),
             _ => None,
         }
     }
@@ -287,6 +289,29 @@ pub struct StopResponse {
 pub struct ListResponse {
     pub instances: BTreeMap<String, usize>,
     pub active_bridges: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct SubscribeGuestLogsRequest {
+    pub target: OperationalProcessSelector,
+    pub stream_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct SubscribeGuestLogsResponse {
+    pub status: String,
+    pub target_node: String,
+    pub target_instance_id: String,
+    pub streams: Vec<PublicEndpointRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct GuestLogEvent {
+    pub endpoint: PublicEndpointRef,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -850,5 +875,45 @@ mod tests {
         let envelope = decode_envelope(&bytes).expect("decode envelope");
         let decoded: RuntimeUsageApiResponse = decode_payload(&envelope).expect("decode payload");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn subscribe_guest_logs_round_trips_request() {
+        let request = SubscribeGuestLogsRequest {
+            target: OperationalProcessSelector::Workload(selium_control_plane_api::WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "camera".to_string(),
+            }),
+            stream_names: vec!["stdout".to_string(), "stderr".to_string()],
+        };
+        let bytes = encode_request(Method::SubscribeGuestLogs, 31, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: SubscribeGuestLogsRequest = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn subscribe_guest_logs_round_trips_response_and_frames() {
+        let response = SubscribeGuestLogsResponse {
+            status: "ok".to_string(),
+            target_node: "node-a".to_string(),
+            target_instance_id: "tenant=tenant-a;namespace=media;workload=camera;replica=0"
+                .to_string(),
+            streams: vec![sample_endpoint(ContractKind::Event, "stdout")],
+        };
+        let bytes = encode_response(Method::SubscribeGuestLogs, 32, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: SubscribeGuestLogsResponse =
+            decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, response);
+
+        let event = GuestLogEvent {
+            endpoint: sample_endpoint(ContractKind::Event, "stderr"),
+            payload: b"guest log".to_vec(),
+        };
+        let bytes = encode_rkyv(&event).expect("encode event");
+        let decoded: GuestLogEvent = decode_rkyv(&bytes).expect("decode event");
+        assert_eq!(decoded, event);
     }
 }

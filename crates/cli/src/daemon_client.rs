@@ -17,10 +17,10 @@ use rkyv::{
 };
 use rustls::{RootCertStore, pki_types::PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
-use selium_abi::RkyvEncode;
+use selium_abi::{RkyvEncode, decode_rkyv};
 use selium_control_plane_protocol::{
-    Method, decode_envelope, decode_error, decode_payload, encode_request, is_error, read_framed,
-    write_framed,
+    GuestLogEvent, Method, SubscribeGuestLogsRequest, SubscribeGuestLogsResponse, decode_envelope,
+    decode_error, decode_payload, encode_request, is_error, read_framed, write_framed,
 };
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -37,6 +37,13 @@ pub(crate) struct DaemonQuicClient {
     server_name: String,
     connection: Mutex<Option<Connection>>,
     request_id: AtomicU64,
+}
+
+#[allow(dead_code)]
+pub(crate) struct GuestLogSubscription {
+    _connection: Connection,
+    recv: quinn::RecvStream,
+    pub(crate) response: SubscribeGuestLogsResponse,
 }
 
 impl DaemonQuicClient {
@@ -124,6 +131,46 @@ impl DaemonQuicClient {
         decode_payload::<Resp>(&envelope).context("decode daemon payload")
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn subscribe_guest_logs(
+        &self,
+        payload: &SubscribeGuestLogsRequest,
+    ) -> Result<GuestLogSubscription> {
+        let connection = self.connection().await?;
+        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        let frame = encode_request(Method::SubscribeGuestLogs, request_id, payload)
+            .context("encode guest log subscription request")?;
+        let (mut send, mut recv) = timeout(DAEMON_REQUEST_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("open guest log subscription stream")??;
+
+        timeout(DAEMON_REQUEST_TIMEOUT, write_framed(&mut send, &frame))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("write guest log subscription request")??;
+        let _ = send.finish();
+
+        let response = timeout(DAEMON_REQUEST_TIMEOUT, read_framed(&mut recv))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("read guest log subscription response")??;
+        let envelope = decode_envelope(&response).context("decode subscription response")?;
+        if envelope.method != Method::SubscribeGuestLogs || envelope.request_id != request_id {
+            return Err(anyhow!("daemon response mismatch"));
+        }
+        if is_error(&envelope) {
+            let error = decode_error(&envelope).context("decode daemon error")?;
+            return Err(anyhow!("daemon error {}: {}", error.code, error.message));
+        }
+
+        Ok(GuestLogSubscription {
+            _connection: connection,
+            recv,
+            response: decode_payload(&envelope).context("decode subscription payload")?,
+        })
+    }
+
     pub(crate) async fn reset_connection(&self) {
         let mut guard = self.connection.lock().await;
         if let Some(connection) = guard.take() {
@@ -152,6 +199,28 @@ impl DaemonQuicClient {
         let mut guard = self.connection.lock().await;
         *guard = Some(connection.clone());
         Ok(connection)
+    }
+}
+
+impl GuestLogSubscription {
+    #[allow(dead_code)]
+    pub(crate) async fn next_event(&mut self) -> Result<Option<GuestLogEvent>> {
+        match read_framed(&mut self.recv).await {
+            Ok(frame) => decode_rkyv(&frame)
+                .context("decode guest log event")
+                .map(Some),
+            Err(err) => {
+                if err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+                }) {
+                    Ok(None)
+                } else {
+                    Err(err).context("read guest log event")
+                }
+            }
+        }
     }
 }
 

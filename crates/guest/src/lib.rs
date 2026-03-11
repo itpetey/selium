@@ -112,6 +112,7 @@ pub mod abi;
 mod r#async;
 pub mod driver;
 pub mod durability;
+mod guest_log;
 pub mod io;
 pub mod network;
 pub mod process;
@@ -128,5 +129,7 @@ pub use rkyv;
 #[doc(hidden)]
 pub use r#async::{__reset_shutdown_for_tests, __signal_shutdown_for_tests};
 pub use r#async::{block_on, shutdown, spawn, yield_now};
+#[doc(hidden)]
+pub use guest_log::__enter_guest_logging;
 /// Attribute macro for declaring async guest entrypoints that the Selium runtime can invoke.
 pub use selium_guest_macros::entrypoint;

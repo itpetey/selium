@@ -10,7 +10,7 @@ use std::{
 
 use selium_abi::{
     self, AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, AbiValue, CallPlan, CallPlanError,
-    Capability, EntrypointInvocation, hostcalls,
+    Capability, EntrypointInvocation, ProcessLogBindings, hostcalls,
 };
 use selium_kernel::{
     KernelError,
@@ -30,6 +30,7 @@ use wasmtime::{Caller, Config, Engine, Func, Linker, Memory, Module, Store, Val,
 use super::{
     guest_async::GuestAsync,
     guest_data::{GuestInt, GuestUint, write_poll_result},
+    guest_logs::{GuestLogState, link_guest_logs},
     hostcall_linker::LinkableOperation,
     mailbox,
 };
@@ -43,6 +44,7 @@ pub struct WasmtimeRuntime {
     available_caps: RwLock<HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>>,
     guest_async: Arc<GuestAsync>,
     usage: Arc<RuntimeUsageCollector>,
+    shared_memory: Arc<selium_kernel::services::shared_memory_service::SharedMemoryDriver>,
 }
 
 pub struct WasmtimeRunRequest<'a> {
@@ -59,6 +61,7 @@ pub struct WasmtimeRunRequest<'a> {
     pub network_ingress_bindings: &'a [String],
     pub storage_logs: &'a [String],
     pub storage_blobs: &'a [String],
+    pub guest_log_bindings: ProcessLogBindings,
     pub entrypoint: EntrypointInvocation,
 }
 
@@ -142,6 +145,7 @@ impl WasmtimeRuntime {
         available_caps: HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>,
         guest_async: Arc<GuestAsync>,
         usage: Arc<RuntimeUsageCollector>,
+        shared_memory: Arc<selium_kernel::services::shared_memory_service::SharedMemoryDriver>,
     ) -> Result<Self, Error> {
         let mut config = Config::new();
         config.memory_may_move(false);
@@ -151,6 +155,7 @@ impl WasmtimeRuntime {
             available_caps: RwLock::new(available_caps),
             guest_async,
             usage,
+            shared_memory,
         })
     }
 
@@ -183,6 +188,7 @@ impl WasmtimeRuntime {
             network_ingress_bindings,
             storage_logs,
             storage_blobs,
+            guest_log_bindings,
             entrypoint,
         } = request;
         let mut linker = Linker::new(&self.engine);
@@ -213,6 +219,12 @@ impl WasmtimeRuntime {
         }
 
         self.guest_async.link(&mut linker)?;
+        let guest_log_state = Arc::new(GuestLogState::new(guest_log_bindings));
+        link_guest_logs(
+            &mut linker,
+            Arc::clone(&self.shared_memory),
+            Arc::clone(&guest_log_state),
+        )?;
 
         let instance_registry = registry.instance().map_err(KernelError::from)?;
         let mut store = Store::new(&self.engine, instance_registry);
@@ -239,6 +251,10 @@ impl WasmtimeRuntime {
         store
             .data_mut()
             .insert_extension(identity)
+            .map_err(KernelError::from)?;
+        store
+            .data_mut()
+            .insert_extension(guest_log_bindings)
             .map_err(KernelError::from)?;
         store
             .data_mut()
@@ -335,6 +351,8 @@ impl WasmtimeRuntime {
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let entrypoint_name = name.to_string();
         let usage_for_task = usage.clone();
+        let runtime_registry = Arc::clone(registry);
+        let shared_memory = Arc::clone(&self.shared_memory);
         let handle = tokio::spawn(async move {
             // Wait for registration before invoking entrypoint. This prevents races between
             // guests registering resources and the process_id being set on the registry.
@@ -363,6 +381,12 @@ impl WasmtimeRuntime {
                     entrypoint = %entrypoint_name,
                     "guest entrypoint failed: {err:#}"
                 ),
+            }
+            if let Err(err) = guest_log_state
+                .close_all(&runtime_registry, shared_memory.as_ref())
+                .await
+            {
+                warn!(process_id, "failed to close guest log streams: {err}");
             }
             if let Err(err) = usage_for_task.finish().await {
                 warn!(process_id, "runtime usage final emission failed: {err:#}");
@@ -427,6 +451,7 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                 network_ingress_bindings,
                 storage_logs,
                 storage_blobs,
+                guest_log_bindings,
                 entrypoint,
             } = request;
             let bytes = inner.repository.read(module_id)?;
@@ -447,6 +472,7 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                     network_ingress_bindings: &network_ingress_bindings,
                     storage_logs: &storage_logs,
                     storage_blobs: &storage_blobs,
+                    guest_log_bindings,
                     entrypoint,
                 })
                 .await
@@ -942,11 +968,24 @@ fn take_u32(iter: &mut std::slice::Iter<Val>, msg: &str) -> Result<u32, wasmtime
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_abi::{
+        ProcessLogBindings, QueueAck, QueueAttach, QueueCreate, QueueDelivery, QueueOverflow,
+        QueueRole, QueueStatusCode, ShmRegion,
+    };
     use selium_kernel::spi::wake_mailbox::WakeMailbox;
+    use selium_kernel::{
+        registry::{ResourceHandle, ResourceType},
+        services::{
+            queue_service::{QueueService, QueueState},
+            shared_memory_service::SharedMemoryDriver,
+        },
+        spi::{queue::QueueCapability, shared_memory::SharedMemoryCapability},
+    };
     use std::{
         sync::atomic::{AtomicBool, Ordering},
         task::Waker,
     };
+    use tokio::sync::Notify;
 
     struct TestMailbox {
         closed: AtomicBool,
@@ -1074,5 +1113,164 @@ mod tests {
 
         assert!(mailbox.is_closed());
         assert!(process.handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn guest_logs_are_forwarded_into_stdout_and_stderr_event_queues() {
+        let shutdown = Arc::new(Notify::new());
+        let usage = RuntimeUsageCollector::in_memory(Duration::from_millis(10));
+        let shared_memory = Arc::new(SharedMemoryDriver::new());
+        let runtime = WasmtimeRuntime::new(
+            HashMap::new(),
+            Arc::new(GuestAsync::new(Arc::clone(&shutdown))),
+            Arc::clone(&usage),
+            Arc::clone(&shared_memory),
+        )
+        .expect("runtime");
+        let registry = Arc::new(Registry::new());
+        let (stdout_queue, stdout_shared_id) = make_test_queue(&registry);
+        let (stderr_queue, stderr_shared_id) = make_test_queue(&registry);
+        let process_id = registry
+            .reserve(None, ResourceType::Process)
+            .expect("process");
+        let module = Module::new(&runtime.engine, guest_log_test_module_bytes()).expect("module");
+
+        runtime
+            .run(WasmtimeRunRequest {
+                registry: &registry,
+                process_id,
+                module_id: "guest-log-test",
+                module,
+                name: "start",
+                workload_key: None,
+                instance_id: None,
+                external_account_ref: None,
+                capabilities: &[],
+                network_egress_profiles: &[],
+                network_ingress_bindings: &[],
+                storage_logs: &[],
+                storage_blobs: &[],
+                guest_log_bindings: ProcessLogBindings {
+                    stdout_queue_shared_id: Some(stdout_shared_id),
+                    stderr_queue_shared_id: Some(stderr_shared_id),
+                },
+                entrypoint: EntrypointInvocation::new(
+                    AbiSignature::new(Vec::new(), Vec::new()),
+                    Vec::new(),
+                )
+                .expect("entrypoint"),
+            })
+            .await
+            .expect("run");
+
+        let process = registry
+            .remove(ResourceHandle::<WasmtimeProcess>::new(process_id))
+            .expect("process handle");
+        process.handle.await.expect("join").expect("guest result");
+
+        let stdout_frames =
+            drain_queue_payloads(&registry, &shared_memory, &stdout_queue, stdout_shared_id).await;
+        let stderr_frames =
+            drain_queue_payloads(&registry, &shared_memory, &stderr_queue, stderr_shared_id).await;
+
+        assert_eq!(stdout_frames, vec![b"guest stdout".to_vec()]);
+        assert_eq!(stderr_frames, vec![b"guest stderr".to_vec()]);
+    }
+
+    fn make_test_queue(registry: &Arc<Registry>) -> (QueueState, u64) {
+        let queue = QueueService
+            .create(QueueCreate {
+                capacity_frames: 8,
+                max_frame_bytes: 64 * 1024,
+                delivery: QueueDelivery::Lossless,
+                overflow: QueueOverflow::Block,
+            })
+            .expect("queue");
+        let handle = registry
+            .add(queue.clone(), None, ResourceType::Queue)
+            .expect("queue handle");
+        let shared_id = registry
+            .share_handle(handle.into_id())
+            .expect("share queue");
+        (queue, shared_id)
+    }
+
+    fn guest_log_test_module_bytes() -> Vec<u8> {
+        vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0a, 0x02, 0x60, 0x03, 0x7f,
+            0x7f, 0x7f, 0x00, 0x60, 0x00, 0x00, 0x02, 0x15, 0x01, 0x0b, 0x73, 0x65, 0x6c, 0x69,
+            0x75, 0x6d, 0x3a, 0x3a, 0x6c, 0x6f, 0x67, 0x05, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00,
+            0x00, 0x03, 0x02, 0x01, 0x01, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x12, 0x02, 0x06,
+            0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x05, 0x73, 0x74, 0x61, 0x72, 0x74,
+            0x00, 0x01, 0x0a, 0x14, 0x01, 0x12, 0x00, 0x41, 0x01, 0x41, 0x00, 0x41, 0x0c, 0x10,
+            0x00, 0x41, 0x02, 0x41, 0x20, 0x41, 0x0c, 0x10, 0x00, 0x0b, 0x0b, 0x23, 0x02, 0x00,
+            0x41, 0x00, 0x0b, 0x0c, 0x67, 0x75, 0x65, 0x73, 0x74, 0x20, 0x73, 0x74, 0x64, 0x6f,
+            0x75, 0x74, 0x00, 0x41, 0x20, 0x0b, 0x0c, 0x67, 0x75, 0x65, 0x73, 0x74, 0x20, 0x73,
+            0x74, 0x64, 0x65, 0x72, 0x72,
+        ]
+    }
+
+    async fn drain_queue_payloads(
+        registry: &Arc<Registry>,
+        shared_memory: &SharedMemoryDriver,
+        queue: &QueueState,
+        shared_id: u64,
+    ) -> Vec<Vec<u8>> {
+        let reader = QueueService
+            .attach(
+                queue,
+                QueueAttach {
+                    shared_id,
+                    role: QueueRole::Reader,
+                },
+            )
+            .expect("attach reader");
+        let mut frames = Vec::new();
+
+        loop {
+            let waited = QueueService.wait(&reader, 0).await.expect("wait");
+            if waited.code != QueueStatusCode::Ok {
+                break;
+            }
+            let frame = waited.frame.expect("frame");
+            frames.push(read_queue_payload(
+                registry,
+                shared_memory,
+                frame.shm_shared_id,
+                frame.offset,
+                frame.len,
+            ));
+            QueueService
+                .ack(
+                    &reader,
+                    QueueAck {
+                        endpoint_id: 0,
+                        seq: frame.seq,
+                    },
+                )
+                .expect("ack");
+        }
+
+        frames
+    }
+
+    fn read_queue_payload(
+        registry: &Arc<Registry>,
+        shared_memory: &SharedMemoryDriver,
+        shm_shared_id: u64,
+        offset: u32,
+        len: u32,
+    ) -> Vec<u8> {
+        let shm_id = registry.resolve_shared(shm_shared_id).expect("shared shm");
+        let region = registry
+            .with(
+                ResourceHandle::<ShmRegion>::new(shm_id),
+                |region: &mut ShmRegion| *region,
+            )
+            .expect("region");
+        let bytes = shared_memory
+            .read(region, offset, len)
+            .expect("read region");
+        bytes
     }
 }

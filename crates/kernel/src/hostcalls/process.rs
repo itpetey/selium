@@ -2,7 +2,7 @@ use std::{convert::TryFrom, future::Future, sync::Arc};
 
 use selium_abi::{
     AbiParam, AbiScalarType, AbiScalarValue, AbiValue, EntrypointArg, EntrypointInvocation,
-    GuestResourceId, ProcessStart,
+    GuestResourceId, ProcessLogBindings, ProcessStart,
 };
 use tracing::debug;
 
@@ -18,6 +18,7 @@ struct PreparedProcessStart {
     module_id: String,
     name: String,
     capabilities: Vec<selium_abi::Capability>,
+    guest_log_bindings: ProcessLogBindings,
     network_egress_profiles: Vec<String>,
     network_ingress_bindings: Vec<String>,
     storage_logs: Vec<String>,
@@ -169,6 +170,12 @@ where
             storage_blobs,
             entrypoint,
         } = input;
+        let guest_log_bindings = context
+            .registry()
+            .extension::<ProcessLogBindings>()
+            .as_deref()
+            .copied()
+            .unwrap_or_default();
 
         let preparation = (|| -> GuestResult<PreparedProcessStart> {
             entrypoint
@@ -179,6 +186,7 @@ where
                 module_id,
                 name,
                 capabilities,
+                guest_log_bindings,
                 network_egress_profiles,
                 network_ingress_bindings,
                 storage_logs,
@@ -192,6 +200,7 @@ where
                 module_id,
                 name,
                 capabilities,
+                guest_log_bindings,
                 network_egress_profiles,
                 network_ingress_bindings,
                 storage_logs,
@@ -214,6 +223,7 @@ where
                         instance_id: None,
                         external_account_ref: None,
                         capabilities,
+                        guest_log_bindings,
                         network_egress_profiles,
                         network_ingress_bindings,
                         storage_logs,

@@ -4,6 +4,51 @@ use crate::{
     AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, CallPlanError, GuestResourceId,
 };
 
+/// Runtime-managed stream used for guest log forwarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum GuestLogStream {
+    Stdout,
+    Stderr,
+}
+
+impl GuestLogStream {
+    pub const fn as_raw(self) -> u32 {
+        match self {
+            Self::Stdout => 1,
+            Self::Stderr => 2,
+        }
+    }
+
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Stdout),
+            2 => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// Runtime-managed stdout/stderr queues attached to a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProcessLogBindings {
+    pub stdout_queue_shared_id: Option<GuestResourceId>,
+    pub stderr_queue_shared_id: Option<GuestResourceId>,
+}
+
+impl ProcessLogBindings {
+    pub const fn is_empty(self) -> bool {
+        self.stdout_queue_shared_id.is_none() && self.stderr_queue_shared_id.is_none()
+    }
+
+    pub const fn queue_shared_id(self, stream: GuestLogStream) -> Option<GuestResourceId> {
+        match stream {
+            GuestLogStream::Stdout => self.stdout_queue_shared_id,
+            GuestLogStream::Stderr => self.stderr_queue_shared_id,
+        }
+    }
+}
+
 /// Argument supplied to a process entrypoint.
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -199,5 +244,27 @@ mod tests {
         };
 
         invocation.validate().expect("resources are accepted");
+    }
+
+    #[test]
+    fn guest_log_stream_round_trips_raw_codes() {
+        assert_eq!(GuestLogStream::from_raw(1), Some(GuestLogStream::Stdout));
+        assert_eq!(GuestLogStream::from_raw(2), Some(GuestLogStream::Stderr));
+        assert_eq!(GuestLogStream::Stdout.as_raw(), 1);
+        assert_eq!(GuestLogStream::Stderr.as_raw(), 2);
+        assert_eq!(GuestLogStream::from_raw(9), None);
+    }
+
+    #[test]
+    fn process_log_bindings_select_queue_by_stream() {
+        let bindings = ProcessLogBindings {
+            stdout_queue_shared_id: Some(11),
+            stderr_queue_shared_id: Some(22),
+        };
+
+        assert!(!bindings.is_empty());
+        assert_eq!(bindings.queue_shared_id(GuestLogStream::Stdout), Some(11));
+        assert_eq!(bindings.queue_shared_id(GuestLogStream::Stderr), Some(22));
+        assert!(ProcessLogBindings::default().is_empty());
     }
 }

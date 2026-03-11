@@ -4,6 +4,7 @@ mod daemon_client;
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,6 +25,7 @@ use selium_control_plane_protocol::{
     ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest, RuntimeUsageApiResponse,
     ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StartResponse, StatusApiResponse,
     StopRequest, StopResponse, StreamBridgeSemantics, StreamLifecycleMode,
+    SubscribeGuestLogsRequest,
 };
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
@@ -603,7 +605,7 @@ async fn cmd_discover(daemon: Arc<DaemonQuicClient>, args: DiscoverArgs) -> Resu
                     println!(
                         "endpoint {} contract={}",
                         endpoint.endpoint.key(),
-                        contract_ref_key(&endpoint.contract)
+                        contract_ref_key(endpoint.contract.as_ref())
                     );
                 }
                 DiscoveryResolution::RunningProcess(process) => {
@@ -679,13 +681,36 @@ async fn cmd_usage(daemon: Arc<DaemonQuicClient>, args: UsageArgs) -> Result<()>
 
 async fn cmd_attach(daemon: Arc<DaemonQuicClient>, args: AttachArgs) -> Result<()> {
     let selector = parse_guest_log_attach_selector(&args.target)?;
-    let streams = selector.stream_names()?;
-    let workload = selector.workload;
-    let _ = daemon;
-    Err(anyhow!(
-        "`selium attach` for {workload} streams [{}] is not available on this branch because the daemon guest-log subscription API is missing",
-        streams.join(", ")
-    ))
+    let stream_names = selector.stream_names()?;
+    let target = OperationalProcessSelector::Workload(selector.workload);
+    let mut subscription = daemon
+        .subscribe_guest_logs(&SubscribeGuestLogsRequest {
+            target,
+            stream_names,
+        })
+        .await?;
+    let label_streams = subscription.response.streams.len() > 1;
+    let mut out = std::io::stdout();
+
+    loop {
+        tokio::select! {
+            _ = signal::ctrl_c() => break,
+            event = subscription.next_event() => {
+                match event? {
+                    Some(event) => {
+                        let rendered = render_guest_log_payload(&event.endpoint, &event.payload, label_streams);
+                        if !rendered.is_empty() {
+                            out.write_all(&rendered).context("write attach output")?;
+                            out.flush().context("flush attach output")?;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn cmd_nodes(daemon: Arc<DaemonQuicClient>, args: NodesArgs) -> Result<()> {
@@ -1430,7 +1455,11 @@ fn parse_public_endpoint_key(value: &str) -> Result<PublicEndpointRef> {
     })
 }
 
-fn contract_ref_value(contract: &ContractRef) -> DataValue {
+fn contract_ref_value(contract: Option<&ContractRef>) -> DataValue {
+    let Some(contract) = contract else {
+        return DataValue::Null;
+    };
+
     DataValue::Map(BTreeMap::from([
         (
             "namespace".to_string(),
@@ -1451,13 +1480,18 @@ fn contract_ref_value(contract: &ContractRef) -> DataValue {
     ]))
 }
 
-fn contract_ref_key(contract: &ContractRef) -> String {
-    format!(
-        "{}/{}:{}@{}",
-        contract.namespace,
-        contract.kind.as_str(),
-        contract.name,
-        contract.version
+fn contract_ref_key(contract: Option<&ContractRef>) -> String {
+    contract.map_or_else(
+        || "synthetic".to_string(),
+        |contract| {
+            format!(
+                "{}/{}:{}@{}",
+                contract.namespace,
+                contract.kind.as_str(),
+                contract.name,
+                contract.version
+            )
+        },
     )
 }
 
@@ -1503,7 +1537,7 @@ fn discoverable_endpoint_value(endpoint: &DiscoverableEndpoint) -> DataValue {
         ),
         (
             "contract".to_string(),
-            contract_ref_value(&endpoint.contract),
+            contract_ref_value(endpoint.contract.as_ref()),
         ),
     ]))
 }
@@ -1537,7 +1571,7 @@ fn resolved_endpoint_value(endpoint: &ResolvedEndpoint) -> DataValue {
         ),
         (
             "contract".to_string(),
-            contract_ref_value(&endpoint.contract),
+            contract_ref_value(endpoint.contract.as_ref()),
         ),
     ]))
 }
@@ -2131,12 +2165,12 @@ mod tests {
             }],
             endpoints: vec![DiscoverableEndpoint {
                 endpoint: endpoint.clone(),
-                contract: ContractRef {
+                contract: Some(ContractRef {
                     namespace: "media.pipeline".to_string(),
                     kind: ContractKind::Service,
                     name: "camera.detect".to_string(),
                     version: "v1".to_string(),
-                },
+                }),
             }],
         };
 
@@ -2247,12 +2281,12 @@ mod tests {
                     kind: ContractKind::Event,
                     name: "ingest.frames".to_string(),
                 },
-                contract: ContractRef {
+                contract: Some(ContractRef {
                     namespace: "analytics.topology".to_string(),
                     kind: ContractKind::Event,
                     name: "ingest.frames".to_string(),
                     version: "v1".to_string(),
-                },
+                }),
             },
         )));
 

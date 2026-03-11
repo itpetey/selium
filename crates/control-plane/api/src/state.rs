@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
-    DiscoverableWorkload, DiscoveryState, ExternalAccountRef, IsolationProfile, NodeSpec,
-    PipelineEndpoint, PipelineSpec, PublicEndpointRef, WorkloadRef,
+    DiscoverableWorkload, DiscoveryState, GUEST_LOG_STDERR_ENDPOINT, GUEST_LOG_STDOUT_ENDPOINT,
+    ExternalAccountRef, IsolationProfile, NodeSpec, PipelineEndpoint, PipelineSpec,
+    PublicEndpointRef, WorkloadRef,
 };
 
 impl ControlPlaneState {
@@ -327,7 +328,22 @@ fn deployment_public_endpoints(
             endpoint.key(),
             DiscoverableEndpoint {
                 endpoint,
-                contract: contract.clone(),
+                contract: Some(contract.clone()),
+            },
+        );
+    }
+
+    for name in [GUEST_LOG_STDERR_ENDPOINT, GUEST_LOG_STDOUT_ENDPOINT] {
+        let endpoint = PublicEndpointRef {
+            workload: deployment.workload.clone(),
+            kind: ContractKind::Event,
+            name: name.to_string(),
+        };
+        endpoints.insert(
+            endpoint.key(),
+            DiscoverableEndpoint {
+                endpoint,
+                contract: None,
             },
         );
     }
@@ -499,11 +515,76 @@ mod tests {
             workload_endpoint_keys,
             vec![
                 "tenant-a/media/ingest#event:camera.frames".to_string(),
+                "tenant-a/media/ingest#event:stderr".to_string(),
+                "tenant-a/media/ingest#event:stdout".to_string(),
                 "tenant-a/media/ingest#service:camera.detect".to_string(),
                 "tenant-a/media/ingest#stream:camera.raw".to_string(),
             ]
         );
         assert_eq!(endpoint_keys, workload_endpoint_keys);
+    }
+
+    #[test]
+    fn discovery_state_includes_synthetic_guest_log_endpoints() {
+        let mut state = sample_state();
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+
+        state
+            .upsert_deployment(DeploymentSpec {
+                workload: workload.clone(),
+                module: "ingest.wasm".to_string(),
+                replicas: 1,
+                contracts: vec![event_contract()],
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 0,
+                memory_mib: 0,
+                ephemeral_storage_mib: 0,
+                bandwidth_profile: crate::BandwidthProfile::Standard,
+                volume_mounts: Vec::new(),
+                external_account_ref: None,
+            })
+            .expect("deployment");
+
+        let discovery = build_discovery_state(&state).expect("discovery");
+        let endpoints = discovery
+            .endpoints
+            .into_iter()
+            .filter(|record| record.endpoint.workload == workload)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            endpoints,
+            vec![
+                DiscoverableEndpoint {
+                    endpoint: PublicEndpointRef {
+                        workload: workload.clone(),
+                        kind: ContractKind::Event,
+                        name: "camera.frames".to_string(),
+                    },
+                    contract: Some(event_contract()),
+                },
+                DiscoverableEndpoint {
+                    endpoint: PublicEndpointRef {
+                        workload: workload.clone(),
+                        kind: ContractKind::Event,
+                        name: GUEST_LOG_STDERR_ENDPOINT.to_string(),
+                    },
+                    contract: None,
+                },
+                DiscoverableEndpoint {
+                    endpoint: PublicEndpointRef {
+                        workload,
+                        kind: ContractKind::Event,
+                        name: GUEST_LOG_STDOUT_ENDPOINT.to_string(),
+                    },
+                    contract: None,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -588,6 +669,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "tenant-a/media/router#event:camera.shared".to_string(),
+                "tenant-a/media/router#event:stderr".to_string(),
+                "tenant-a/media/router#event:stdout".to_string(),
                 "tenant-a/media/router#service:camera.shared".to_string(),
                 "tenant-a/media/router#stream:camera.shared".to_string(),
             ]
@@ -596,12 +679,14 @@ mod tests {
             discovery
                 .endpoints
                 .iter()
-                .map(|record| record.contract.kind)
+                .map(|record| record.contract.as_ref().map(|contract| contract.kind))
                 .collect::<Vec<_>>(),
             vec![
-                ContractKind::Event,
-                ContractKind::Service,
-                ContractKind::Stream,
+                Some(ContractKind::Event),
+                None,
+                None,
+                Some(ContractKind::Service),
+                Some(ContractKind::Stream),
             ]
         );
     }

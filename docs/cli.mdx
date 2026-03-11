@@ -51,6 +51,7 @@ The read-side commands are:
 - `replay` for recent control-plane events, with cursor and attribution filters plus `--json` output
 - `inventory` for attributed workload, module, pipeline, and node inventory with `--json` output
 - `usage` for attributed runtime usage export from a specific node daemon with `--json` output
+- `attach tenant/namespace/workload#event:stdout` (or `stderr` / `std*`) for live guest logs
 
 ## External-consumer adoption cookbook
 
@@ -193,6 +194,16 @@ The JSON response includes `records`, `next_sequence`, and `high_watermark`. Eac
 - **`discover --resolve-endpoint ...` does not pin the workload you meant**: use the full endpoint key shape `tenant/namespace/workload#kind:name`, then carry the returned workload key forward into `replay` and `usage`.
 - **`usage` cannot find records**: pick a `live` node from `selium nodes --json` and pass its `name` to `selium usage --node ...`. Unlike control-plane replay, runtime usage export is daemon-scoped and must target one live node.
 - **`nodes` shows no live daemon in local or staging environments**: increase `--max-staleness-ms` so recent heartbeats still count as live before you choose the usage-export target.
+
+## Guest log attach
+
+`attach` is currently scoped to workload guest log event selectors only:
+
+- `tenant/namespace/workload#event:stdout`
+- `tenant/namespace/workload#event:stderr`
+- `tenant/namespace/workload#event:std*`
+
+When a selector resolves to multiple guest log streams, each output line is prefixed with the stream name so `stdout` and `stderr` stay distinguishable.
 
 ## Know which identity you are holding
 
