@@ -7,7 +7,9 @@ use rkyv::{
     Archive, Deserialize, Serialize,
     api::high::{HighDeserializer, HighValidator},
 };
-use selium_abi::{DataValue, RkyvEncode, decode_rkyv, encode_rkyv};
+use selium_abi::{
+    DataValue, RkyvEncode, RuntimeUsageQuery, RuntimeUsageRecord, decode_rkyv, encode_rkyv,
+};
 use selium_control_plane_api::{ContractKind, PublicEndpointRef};
 use selium_control_plane_runtime::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
@@ -35,6 +37,7 @@ pub enum Method {
     ActivateEndpointBridge = 103,
     DeactivateEndpointBridge = 104,
     DeliverBridgeMessage = 105,
+    RuntimeUsageQuery = 106,
 }
 
 impl Method {
@@ -53,6 +56,7 @@ impl Method {
             103 => Some(Self::ActivateEndpointBridge),
             104 => Some(Self::DeactivateEndpointBridge),
             105 => Some(Self::DeliverBridgeMessage),
+            106 => Some(Self::RuntimeUsageQuery),
             _ => None,
         }
     }
@@ -148,7 +152,7 @@ pub struct MetricsApiResponse {
 pub struct ReplayApiRequest {
     /// Return at most this many matching events.
     pub limit: usize,
-    /// Start replay from this sequence when present.
+    /// Inclusive sequence cursor to resume replay from when present.
     pub since_sequence: Option<u64>,
     /// Restrict results to this external account reference when present.
     pub external_account_ref: Option<String>,
@@ -165,8 +169,35 @@ pub struct ReplayApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct ReplayApiResponse {
+    /// Filtered replay events in response order.
     pub events: Vec<DataValue>,
+    /// Durable sequence the replay scan started from.
     pub start_sequence: Option<u64>,
+    /// Sequence cursor external consumers can resume from on the next call.
+    pub next_sequence: Option<u64>,
+    /// Latest durable sequence known to the replay log at query time.
+    pub high_watermark: Option<u64>,
+}
+
+/// Runtime-daemon request for attributed runtime usage export.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct RuntimeUsageApiRequest {
+    /// Node expected to serve this daemon request.
+    pub node_id: String,
+    /// Replay anchor and Wave 2 filter set to apply.
+    pub query: RuntimeUsageQuery,
+}
+
+/// Attributed runtime usage records returned by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct RuntimeUsageApiResponse {
+    /// Bounded immutable usage records that matched the query.
+    pub records: Vec<RuntimeUsageRecord>,
+    /// Sequence cursor external consumers can resume from on the next call.
+    pub next_sequence: Option<u64>,
+    /// Latest durable sequence known to the runtime usage log at query time.
     pub high_watermark: Option<u64>,
 }
 
@@ -753,11 +784,64 @@ mod tests {
                 DataValue::from(41_u64),
             )]))],
             start_sequence: Some(41),
+            next_sequence: Some(42),
             high_watermark: Some(56),
         };
         let bytes = encode_response(Method::ControlReplay, 38, &response).expect("encode");
         let envelope = decode_envelope(&bytes).expect("decode envelope");
         let decoded: ReplayApiResponse = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn runtime_usage_query_request_and_response_round_trip_filters_and_cursor() {
+        let request = RuntimeUsageApiRequest {
+            node_id: "node-a".to_string(),
+            query: RuntimeUsageQuery {
+                start: selium_abi::RuntimeUsageReplayStart::Sequence(41),
+                limit: 25,
+                external_account_ref: Some("acct-123".to_string()),
+                workload: Some("tenant-a/media/ingest".to_string()),
+                module: Some("ingest.wasm".to_string()),
+                window_start_ms: Some(1_000),
+                window_end_ms: Some(2_000),
+            },
+        };
+        let bytes = encode_request(Method::RuntimeUsageQuery, 39, &request).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: RuntimeUsageApiRequest = decode_payload(&envelope).expect("decode payload");
+        assert_eq!(decoded, request);
+
+        let response = RuntimeUsageApiResponse {
+            records: vec![RuntimeUsageRecord {
+                sequence: 41,
+                timestamp_ms: 1_500,
+                headers: BTreeMap::from([("module_id".to_string(), "ingest.wasm".to_string())]),
+                sample: selium_abi::RuntimeUsageSample {
+                    workload_key: "tenant-a/media/ingest".to_string(),
+                    process_id: "process-7".to_string(),
+                    attribution: selium_abi::RuntimeUsageAttribution {
+                        external_account_ref: Some("acct-123".to_string()),
+                        module_id: "ingest.wasm".to_string(),
+                    },
+                    window_start_ms: 1_000,
+                    window_end_ms: 2_000,
+                    trigger: selium_abi::RuntimeUsageSampleTrigger::Interval,
+                    cpu_time_millis: 1_000,
+                    memory_high_watermark_bytes: 4_096,
+                    memory_byte_millis: 4_096_000,
+                    ingress_bytes: 7,
+                    egress_bytes: 11,
+                    storage_read_bytes: 13,
+                    storage_write_bytes: 17,
+                },
+            }],
+            next_sequence: Some(42),
+            high_watermark: Some(56),
+        };
+        let bytes = encode_response(Method::RuntimeUsageQuery, 40, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+        let decoded: RuntimeUsageApiResponse = decode_payload(&envelope).expect("decode payload");
         assert_eq!(decoded, response);
     }
 }

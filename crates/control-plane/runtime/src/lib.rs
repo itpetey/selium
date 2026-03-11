@@ -1848,6 +1848,18 @@ mod tests {
                 .and_then(DataValue::as_str)
                 == Some("acct-123")
         }));
+
+        let filters = query.result.get("filters").expect("serialized filters");
+        assert_eq!(
+            filters
+                .get("external_account_ref")
+                .and_then(DataValue::as_str),
+            Some("acct-123")
+        );
+        assert!(filters.get("workload").is_some());
+        assert!(filters.get("module").is_some());
+        assert!(filters.get("pipeline").is_some());
+        assert!(filters.get("node").is_some());
     }
 
     #[test]

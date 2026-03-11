@@ -47,7 +47,68 @@ The read-side commands are:
 
 - `nodes` for node inventory and liveness
 - `observe` for the current control-plane view
-- `replay` for recent control-plane events, optionally filtered by tenant, namespace, or workload
+- `replay` for recent control-plane events, with cursor and attribution filters plus `--json` output
+- `inventory` for attributed workload, module, pipeline, and node inventory with `--json` output
+- `usage` for attributed runtime usage export from a specific node daemon with `--json` output
+
+## External-consumer export examples
+
+Use the read-side export commands with `--json` when you need stable, machine-consumable output for downstream attribution systems.
+
+### Export attributed infrastructure inventory
+
+This query gives external consumers a bounded Selium-native inventory surface that still carries the opaque `external_account_ref` for joins:
+
+```bash
+selium inventory \
+  --external-account-ref acct-123 \
+  --workload tenant-a/media/ingest \
+  --json
+```
+
+The response contains filtered `workloads`, `modules`, `pipelines`, and `nodes` arrays, each exposing Selium-native identifiers plus any attached `external_account_ref` values.
+
+### Replay control-plane attribution events incrementally
+
+Use `replay` when an external consumer needs durable mutation history together with a replay cursor:
+
+```bash
+selium replay \
+  --since-sequence 41 \
+  --external-account-ref acct-123 \
+  --workload-key tenant-a/media/ingest \
+  --module ingest.wasm \
+  --pipeline tenant-a/media/camera \
+  --node node-a \
+  --limit 25 \
+  --json
+```
+
+The JSON response includes:
+
+- `start_sequence`: the durable replay point used for this batch
+- `next_sequence`: the cursor you can pass back on the next replay call
+- `high_watermark`: the newest durable replay sequence available at query time
+- `events`: the filtered replay events, each still carrying Selium-native resource identity so downstream systems can join them back to deployments, workloads, modules, and pipelines without Selium owning the external account model
+
+### Export attributed runtime usage records
+
+Use `usage` when an external consumer needs immutable sampled runtime usage plus the next durable resume cursor:
+
+```bash
+selium usage \
+  --node node-a \
+  --since-sequence 41 \
+  --external-account-ref acct-123 \
+  --workload tenant-a/media/ingest \
+  --module ingest.wasm \
+  --window-start-ms 1000 \
+  --window-end-ms 2000 \
+  --limit 25 \
+  --json
+```
+
+The JSON response includes `records`, `next_sequence`, and `high_watermark`. Each usage record carries both Selium-native identity (`sample.workload_key`, `sample.attribution.module_id`) and the opaque join key (`sample.attribution.external_account_ref`) so downstream systems can meter, rate, or bill without Selium modelling external account lifecycle state.
 
 ## Know which identity you are holding
 

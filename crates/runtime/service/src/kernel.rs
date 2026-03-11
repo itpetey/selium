@@ -175,11 +175,14 @@ pub fn build(work_dir: impl AsRef<Path>) -> Result<(Kernel, Arc<Notify>)> {
 
     let shutdown = Arc::new(Notify::new());
     let guest_async = builder.add_capability(Arc::new(GuestAsync::new(Arc::clone(&shutdown))));
-    let usage = RuntimeUsageCollector::file_backed(work_dir.as_ref(), USAGE_SAMPLE_PERIOD)?;
+    let usage = builder.add_capability(RuntimeUsageCollector::file_backed(
+        work_dir.as_ref(),
+        USAGE_SAMPLE_PERIOD,
+    )?);
     let wasmtime_runtime = Arc::new(WasmtimeRuntime::new(
         capability_ops.clone(),
         Arc::clone(&guest_async),
-        usage,
+        Arc::clone(&usage),
     )?);
     let module_repository: Arc<FilesystemModuleRepository> =
         builder.add_capability(Arc::new(FilesystemModuleRepository::new(&modules_dir)));

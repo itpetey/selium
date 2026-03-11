@@ -70,8 +70,8 @@ async fn replay_usage_filters_by_attribution_and_time_window() {
             start: RuntimeUsageReplayStart::Earliest,
             limit: 10,
             external_account_ref: Some("acct-a".to_string()),
-            workload_key: Some("workload-a".to_string()),
-            module_id: Some("module-a".to_string()),
+            workload: Some("workload-a".to_string()),
+            module: Some("module-a".to_string()),
             window_start_ms: Some(first_record.sample.window_start_ms),
             window_end_ms: Some(first_record.sample.window_end_ms.saturating_add(1)),
         })
@@ -146,8 +146,8 @@ async fn restart_recovery_advances_next_sample_window() {
             start: RuntimeUsageReplayStart::Earliest,
             limit: 10,
             external_account_ref: Some("acct-a".to_string()),
-            workload_key: Some("workload-a".to_string()),
-            module_id: Some("module-a".to_string()),
+            workload: Some("workload-a".to_string()),
+            module: Some("module-a".to_string()),
             window_start_ms: None,
             window_end_ms: None,
         })
@@ -173,8 +173,8 @@ async fn replay_all(collector: &RuntimeUsageCollector) -> RuntimeUsageQueryResul
             start: RuntimeUsageReplayStart::Earliest,
             limit: 10,
             external_account_ref: None,
-            workload_key: None,
-            module_id: None,
+            workload: None,
+            module: None,
             window_start_ms: None,
             window_end_ms: None,
         })

@@ -26,10 +26,11 @@ use selium_control_plane_protocol::{
     DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, DeliverBridgeMessageRequest,
     DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics,
     EventBridgeMessage, ListRequest, ListResponse, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, Method, ServiceBridgeMessage,
-    ServiceMessagePhase, StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
-    StreamBridgeMessage, decode_envelope, decode_error, decode_payload, encode_error_response,
-    encode_request, encode_response, is_error, is_request, read_framed, write_framed,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, RuntimeUsageApiRequest,
+    RuntimeUsageApiResponse, ServiceBridgeMessage, ServiceMessagePhase, StartRequest,
+    StartResponse, StatusApiResponse, StopRequest, StopResponse, StreamBridgeMessage,
+    decode_envelope, decode_error, decode_payload, encode_error_response, encode_request,
+    encode_response, is_error, is_request, read_framed, write_framed,
 };
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
@@ -1019,6 +1020,63 @@ async fn handle_stream_request(
                 },
             )
         }
+        Method::RuntimeUsageQuery => {
+            let payload: RuntimeUsageApiRequest = match decode_payload(&envelope) {
+                Ok(payload) => payload,
+                Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
+            };
+            if payload.node_id != state.node_id {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    404,
+                    format!("node `{}` not served by this daemon", payload.node_id),
+                    false,
+                );
+            }
+            match query_runtime_usage(&state, &payload).await {
+                Ok(response) => encode_response(envelope.method, envelope.request_id, &response),
+                Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
+            }
+        }
+    }
+}
+
+async fn query_runtime_usage(
+    state: &DaemonState,
+    payload: &RuntimeUsageApiRequest,
+) -> Result<RuntimeUsageApiResponse> {
+    let collector = state
+        .kernel
+        .get::<crate::usage::RuntimeUsageCollector>()
+        .cloned()
+        .ok_or_else(|| anyhow!("runtime usage collector unavailable"))?;
+    let result = collector.replay_usage(&payload.query).await?;
+    let high_watermark = result.high_watermark;
+    Ok(RuntimeUsageApiResponse {
+        next_sequence: next_runtime_usage_sequence(&payload.query, &result.records, high_watermark),
+        records: result.records,
+        high_watermark,
+    })
+}
+
+fn next_runtime_usage_sequence(
+    query: &selium_abi::RuntimeUsageQuery,
+    records: &[selium_abi::RuntimeUsageRecord],
+    high_watermark: Option<u64>,
+) -> Option<u64> {
+    if query.limit == 0 {
+        return None;
+    }
+    if let Some(record) = records.last() {
+        return Some(record.sequence.saturating_add(1));
+    }
+    let advanced = high_watermark.map(|sequence| sequence.saturating_add(1));
+    match query.start {
+        selium_abi::RuntimeUsageReplayStart::Sequence(sequence) => {
+            Some(advanced.map_or(sequence, |next| next.max(sequence)))
+        }
+        _ => advanced,
     }
 }
 
@@ -2305,8 +2363,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use selium_abi::decode_rkyv;
+    use selium_abi::{RuntimeUsageQuery, RuntimeUsageReplayStart, decode_rkyv};
     use selium_control_plane_api::WorkloadRef;
+
+    use crate::usage::{ProcessUsageAttribution, RuntimeUsageCollector};
 
     #[tokio::test(flavor = "current_thread")]
     async fn activate_endpoint_bridge_forwards_local_event_frames() {
@@ -3145,6 +3205,149 @@ mod tests {
             spec,
             "path=demo.wasm;args=buffer:hex:4142,utf8:search,i32:5"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_usage_query_returns_bounded_records_and_resume_cursor() {
+        let state = sample_state("node-a");
+        let collector = state
+            .kernel
+            .get::<RuntimeUsageCollector>()
+            .expect("runtime usage collector")
+            .clone();
+        let first = collector
+            .register_process(
+                "tenant-a/media/ingest",
+                "process-a",
+                ProcessUsageAttribution {
+                    instance_id: Some("tenant-a/media/ingest/0".to_string()),
+                    external_account_ref: Some("acct-a".to_string()),
+                    module_id: "module-a".to_string(),
+                },
+            )
+            .await
+            .expect("register first process");
+        sleep(Duration::from_millis(2)).await;
+        first.finish().await.expect("finish first process");
+
+        sleep(Duration::from_millis(2)).await;
+
+        let second = collector
+            .register_process(
+                "tenant-a/media/ingest",
+                "process-b",
+                ProcessUsageAttribution {
+                    instance_id: Some("tenant-a/media/ingest/1".to_string()),
+                    external_account_ref: Some("acct-a".to_string()),
+                    module_id: "module-a".to_string(),
+                },
+            )
+            .await
+            .expect("register second process");
+        sleep(Duration::from_millis(2)).await;
+        second.finish().await.expect("finish second process");
+
+        let response = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Earliest,
+                    limit: 1,
+                    external_account_ref: Some("acct-a".to_string()),
+                    workload: Some("tenant-a/media/ingest".to_string()),
+                    module: Some("module-a".to_string()),
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect("query runtime usage");
+
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].sample.process_id, "process-a");
+        assert_eq!(response.records[0].sample.attribution.module_id, "module-a");
+        let high_watermark = response.high_watermark.expect("high watermark");
+        assert!(high_watermark >= response.records[0].sequence);
+        assert_eq!(
+            response.next_sequence,
+            Some(response.records[0].sequence.saturating_add(1))
+        );
+
+        let resumed = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Sequence(
+                        response.next_sequence.expect("resume sequence"),
+                    ),
+                    limit: 10,
+                    external_account_ref: Some("acct-a".to_string()),
+                    workload: Some("tenant-a/media/ingest".to_string()),
+                    module: Some("module-a".to_string()),
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect("resume runtime usage query");
+
+        assert_eq!(resumed.records.len(), 1);
+        assert_eq!(resumed.records[0].sample.process_id, "process-b");
+        assert_eq!(resumed.high_watermark, Some(high_watermark));
+        assert_eq!(
+            resumed.next_sequence,
+            Some(resumed.records[0].sequence.saturating_add(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_usage_query_zero_limit_returns_watermark_without_advancing_cursor() {
+        let state = sample_state("node-a");
+        let collector = state
+            .kernel
+            .get::<crate::usage::RuntimeUsageCollector>()
+            .cloned()
+            .expect("collector available");
+        let handle = collector
+            .register_process(
+                "tenant-a/media/ingest",
+                "process-a",
+                ProcessUsageAttribution {
+                    instance_id: Some("tenant-a/media/ingest/0".to_string()),
+                    external_account_ref: Some("acct-a".to_string()),
+                    module_id: "module-a".to_string(),
+                },
+            )
+            .await
+            .expect("register process");
+        sleep(Duration::from_millis(2)).await;
+        handle.finish().await.expect("finish process");
+
+        let response = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Sequence(1),
+                    limit: 0,
+                    external_account_ref: Some("acct-a".to_string()),
+                    workload: Some("tenant-a/media/ingest".to_string()),
+                    module: Some("module-a".to_string()),
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect("query runtime usage");
+
+        assert!(response.records.is_empty());
+        assert!(response.high_watermark.is_some());
+        assert_eq!(response.next_sequence, None);
     }
 
     fn sample_state(node_id: &str) -> Rc<DaemonState> {

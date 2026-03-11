@@ -64,14 +64,36 @@ You can work at two levels:
 
 Typed publishers automatically encode payloads as `application/rkyv`. Typed subscribers decode them back into Rust types on receipt. Use the byte-oriented API when you already have encoded frames or need interoperability with non-Rust producers and consumers.
 
+When you need durable metadata as well as the payload, use `Context::replay_frames(...)` and `ByteSubscriber::recv_frame()`. These preserve the frame `sequence`, `timestamp_ms`, `headers`, `channel`, and `payload`, while `replay_bytes(...)` and `ByteSubscriber::recv()` remain available for payload-only compatibility.
+
 ## Replay and backfill
 
 Replay is part of the public SDK surface.
 
 - `subscriber(..., ReplayStart::Earliest | Latest | Sequence | Timestamp | Checkpoint)` lets you start from the right point in retained channel history
+- `Context::replay_frames(channel, start, limit)` preserves frame headers and other durable metadata for event/log consumers
 - `replay_bytes(channel, start, limit)` gives host-side tools a simple backfill path
 
 That makes the SDK useful for tests, ingest tools, sidecars, diagnostics, and adapters that need to bootstrap from history before switching to live traffic.
+
+### Metadata-preserving replay example
+
+```rust
+use selium_io_durability::ReplayStart;
+use selium_sdk_rust::Context;
+
+let context = Context::new();
+let replay = context.replay_frames("demo.events", ReplayStart::Earliest, 1)?;
+
+let frame = &replay[0];
+let external_account_ref = frame.headers.get("external_account_ref");
+
+assert_eq!(external_account_ref, Some(&"acct-ext-123".to_string()));
+assert_eq!(frame.payload, b"raw event bytes".to_vec());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+For external-consumer handoff code, treat `Frame` as the durable envelope: `frame.sequence` is your replay cursor, `frame.timestamp_ms` is your event time, `frame.headers["external_account_ref"]` preserves the opaque join key, and `frame.payload` remains the raw domain bytes you decode on your side.
 
 ## When to use the SDK vs the guest crate
 

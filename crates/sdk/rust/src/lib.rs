@@ -58,6 +58,9 @@ use selium_io_core::{
 use selium_io_durability::{ReplayStart, RetentionPolicy};
 use thiserror::Error;
 
+/// Durable channel frame returned by metadata-preserving replay and subscription APIs.
+pub use selium_io_core::Frame;
+
 #[derive(Debug, Error)]
 /// Errors produced while encoding or decoding typed SDK payloads.
 pub enum CodecError {
@@ -255,10 +258,24 @@ impl Context {
         })
     }
 
+    /// Replays retained frames from a channel while preserving durable metadata.
+    ///
+    /// Use this when you need sequence numbers, timestamps, headers, or the
+    /// channel name alongside the payload bytes.
+    pub fn replay_frames(
+        &self,
+        channel: &str,
+        start: ReplayStart,
+        limit: usize,
+    ) -> Result<Vec<Frame>, SdkError> {
+        Ok(self.inner.io.replay(channel, start, limit)?)
+    }
+
     /// Replays retained payloads from a channel as raw bytes.
     ///
     /// This is useful for backfilling host-side state before switching to live
-    /// subscription.
+    /// subscription. Use [`Context::replay_frames`] when you also need sequence,
+    /// timestamp, headers, or channel metadata.
     pub fn replay_bytes(
         &self,
         channel: &str,
@@ -266,9 +283,7 @@ impl Context {
         limit: usize,
     ) -> Result<Vec<Vec<u8>>, SdkError> {
         Ok(self
-            .inner
-            .io
-            .replay(channel, start, limit)?
+            .replay_frames(channel, start, limit)?
             .into_iter()
             .map(|frame| frame.payload)
             .collect())
@@ -390,48 +405,19 @@ where
 }
 
 impl ByteSubscriber {
+    /// Waits for the next frame and preserves its durable metadata.
+    pub async fn recv_frame(&mut self) -> Result<Frame, SdkError> {
+        Ok(self.inner.recv().await?)
+    }
+
     /// Waits for the next payload and returns its raw bytes.
+    ///
+    /// Use [`ByteSubscriber::recv_frame`] when you also need sequence,
+    /// timestamp, headers, or channel metadata.
     pub async fn recv(&mut self) -> Result<Vec<u8>, SdkError> {
-        let frame = self.inner.recv().await?;
-        Ok(frame.payload)
+        Ok(self.recv_frame().await?.payload)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rkyv::{Archive, Deserialize, Serialize};
-
-    #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-    #[rkyv(bytecheck())]
-    struct DemoEvent {
-        id: u64,
-    }
-
-    #[test]
-    fn typed_publish_replay_round_trip() {
-        let context = Context::new();
-        context
-            .create_channel(
-                "demo.events",
-                ChannelKind::Event,
-                RetentionPolicy::default(),
-            )
-            .expect("create channel");
-
-        let publisher = context.publisher::<DemoEvent>("demo.events");
-        publisher.publish(DemoEvent { id: 7 }).expect("publish");
-
-        let replay = context
-            .replay_bytes("demo.events", ReplayStart::Earliest, 10)
-            .expect("replay");
-        let value: DemoEvent = decode_rkyv(&replay[0]).expect("decode");
-        assert_eq!(value.id, 7);
-    }
-
-    #[test]
-    fn runtime_encoding_defaults_to_rkyv() {
-        let context = Context::new();
-        assert_eq!(context.runtime_settings().enforced_encoding, "rkyv");
-    }
-}
+mod tests;

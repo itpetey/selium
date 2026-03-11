@@ -198,8 +198,8 @@ impl RuntimeUsageCollector {
             start: RuntimeUsageReplayStart::Earliest,
             limit: usize::MAX,
             external_account_ref: None,
-            workload_key: None,
-            module_id: None,
+            workload: None,
+            module: None,
             window_start_ms: None,
             window_end_ms: None,
         })
@@ -444,13 +444,13 @@ fn sample_matches_query(sample: &RuntimeUsageSample, query: &RuntimeUsageQuery) 
     {
         return false;
     }
-    if let Some(workload_key) = query.workload_key.as_deref()
-        && sample.workload_key != workload_key
+    if let Some(workload) = query.workload.as_deref()
+        && sample.workload_key != workload
     {
         return false;
     }
-    if let Some(module_id) = query.module_id.as_deref()
-        && sample.attribution.module_id != module_id
+    if let Some(module) = query.module.as_deref()
+        && sample.attribution.module_id != module
     {
         return false;
     }
