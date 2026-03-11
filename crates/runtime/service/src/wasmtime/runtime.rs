@@ -33,6 +33,7 @@ use super::{
     hostcall_linker::LinkableOperation,
     mailbox,
 };
+use crate::usage::{ProcessUsageAttribution, ProcessUsageHandle, RuntimeUsageCollector};
 
 const PREALLOC_PAGES: u64 = 256;
 
@@ -41,13 +42,18 @@ pub struct WasmtimeRuntime {
     pub(crate) engine: Engine,
     available_caps: RwLock<HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>>,
     guest_async: Arc<GuestAsync>,
+    usage: Arc<RuntimeUsageCollector>,
 }
 
 pub struct WasmtimeRunRequest<'a> {
     pub registry: &'a Arc<Registry>,
     pub process_id: ResourceId,
+    pub module_id: &'a str,
     pub module: Module,
     pub name: &'a str,
+    pub workload_key: Option<&'a str>,
+    pub instance_id: Option<&'a str>,
+    pub external_account_ref: Option<&'a str>,
     pub capabilities: &'a [Capability],
     pub network_egress_profiles: &'a [String],
     pub network_ingress_bindings: &'a [String],
@@ -59,14 +65,20 @@ pub struct WasmtimeRunRequest<'a> {
 pub struct WasmtimeProcess {
     handle: JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>,
     mailbox: &'static dyn selium_kernel::spi::wake_mailbox::WakeMailbox,
+    usage: Arc<ProcessUsageHandle>,
 }
 
 impl WasmtimeProcess {
     fn new(
         handle: JoinHandle<Result<Vec<AbiValue>, wasmtime::Error>>,
         mailbox: &'static dyn selium_kernel::spi::wake_mailbox::WakeMailbox,
+        usage: Arc<ProcessUsageHandle>,
     ) -> Self {
-        Self { handle, mailbox }
+        Self {
+            handle,
+            mailbox,
+            usage,
+        }
     }
 }
 
@@ -129,6 +141,7 @@ impl WasmtimeRuntime {
     pub fn new(
         available_caps: HashMap<Capability, Vec<Arc<dyn LinkableOperation>>>,
         guest_async: Arc<GuestAsync>,
+        usage: Arc<RuntimeUsageCollector>,
     ) -> Result<Self, Error> {
         let mut config = Config::new();
         config.memory_may_move(false);
@@ -137,6 +150,7 @@ impl WasmtimeRuntime {
             engine: Engine::new(&config)?,
             available_caps: RwLock::new(available_caps),
             guest_async,
+            usage,
         })
     }
 
@@ -158,8 +172,12 @@ impl WasmtimeRuntime {
         let WasmtimeRunRequest {
             registry,
             process_id,
+            module_id,
             module,
             name,
+            workload_key,
+            instance_id,
+            external_account_ref,
             capabilities,
             network_egress_profiles,
             network_ingress_bindings,
@@ -198,6 +216,21 @@ impl WasmtimeRuntime {
 
         let instance_registry = registry.instance().map_err(KernelError::from)?;
         let mut store = Store::new(&self.engine, instance_registry);
+        let process_id_string = process_id.to_string();
+        let workload_key_string = workload_key.unwrap_or(&process_id_string).to_string();
+        let usage = self
+            .usage
+            .register_process(
+                workload_key_string,
+                process_id_string,
+                ProcessUsageAttribution {
+                    instance_id: instance_id.map(ToString::to_string),
+                    external_account_ref: external_account_ref.map(ToString::to_string),
+                    module_id: module_id.to_string(),
+                },
+            )
+            .await
+            .map_err(|err| Error::Kernel(KernelError::Driver(err.to_string())))?;
         store
             .data_mut()
             .set_process_id(process_id)
@@ -209,17 +242,23 @@ impl WasmtimeRuntime {
             .map_err(KernelError::from)?;
         store
             .data_mut()
-            .insert_extension(selium_kernel::spi::network::NetworkProcessPolicy::new(
-                network_egress_profiles.iter().cloned(),
-                network_ingress_bindings.iter().cloned(),
-            ))
+            .insert_extension(
+                selium_kernel::spi::network::NetworkProcessPolicy::new(
+                    network_egress_profiles.iter().cloned(),
+                    network_ingress_bindings.iter().cloned(),
+                )
+                .with_usage_recorder(usage.clone()),
+            )
             .map_err(KernelError::from)?;
         store
             .data_mut()
-            .insert_extension(selium_kernel::spi::storage::StorageProcessPolicy::new(
-                storage_logs.iter().cloned(),
-                storage_blobs.iter().cloned(),
-            ))
+            .insert_extension(
+                selium_kernel::spi::storage::StorageProcessPolicy::new(
+                    storage_logs.iter().cloned(),
+                    storage_blobs.iter().cloned(),
+                )
+                .with_usage_recorder(usage.clone()),
+            )
             .map_err(KernelError::from)?;
         // Limit linear memory growth to keep the mailbox pointers stable across the
         // instance lifetime. We preallocate and then lock the limit to the current
@@ -231,7 +270,12 @@ impl WasmtimeRuntime {
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
             Error::Kernel(KernelError::Driver("guest memory missing".to_string()))
         })?;
-        preallocate_memory(&memory, &mut store);
+        let memory_bytes = preallocate_memory(&memory, &mut store);
+        usage.set_memory_high_watermark_bytes(memory_bytes as u64);
+        store
+            .data_mut()
+            .set_memory_limit(memory_bytes)
+            .map_err(KernelError::from)?;
         let mb = unsafe { mailbox::create_guest_mailbox(&memory, &mut store) };
         store
             .data_mut()
@@ -290,6 +334,7 @@ impl WasmtimeRuntime {
         let signature_clone = signature.clone();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let entrypoint_name = name.to_string();
+        let usage_for_task = usage.clone();
         let handle = tokio::spawn(async move {
             // Wait for registration before invoking entrypoint. This prevents races between
             // guests registering resources and the process_id being set on the registry.
@@ -319,11 +364,14 @@ impl WasmtimeRuntime {
                     "guest entrypoint failed: {err:#}"
                 ),
             }
+            if let Err(err) = usage_for_task.finish().await {
+                warn!(process_id, "runtime usage final emission failed: {err:#}");
+            }
             result
         });
 
         registry
-            .initialise(process_id, WasmtimeProcess::new(handle, mb))
+            .initialise(process_id, WasmtimeProcess::new(handle, mb, usage))
             .map_err(|err| Error::Kernel(KernelError::from(err)))?;
 
         // Trigger entrypoint exec
@@ -371,6 +419,9 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                 process_id,
                 module_id,
                 name,
+                workload_key,
+                instance_id,
+                external_account_ref,
                 capabilities,
                 network_egress_profiles,
                 network_ingress_bindings,
@@ -385,8 +436,12 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                 .run(WasmtimeRunRequest {
                     registry,
                     process_id,
+                    module_id,
                     module,
                     name,
+                    workload_key,
+                    instance_id,
+                    external_account_ref,
                     capabilities: &capabilities,
                     network_egress_profiles: &network_egress_profiles,
                     network_ingress_bindings: &network_ingress_bindings,
@@ -413,6 +468,10 @@ async fn stop_process(process: &mut WasmtimeProcess) -> Result<(), Error> {
     {
         process.handle.abort();
         let _ = (&mut process.handle).await;
+    }
+
+    if let Err(err) = process.usage.finish().await {
+        warn!("runtime usage termination emission failed: {err:#}");
     }
 
     Ok(())
@@ -449,7 +508,7 @@ fn materialise_plan(
     Ok(())
 }
 
-fn preallocate_memory(memory: &Memory, store: &mut Store<InstanceRegistry>) {
+fn preallocate_memory(memory: &Memory, store: &mut Store<InstanceRegistry>) -> usize {
     let mut current = memory.size(&mut *store);
     if current < PREALLOC_PAGES {
         let delta = PREALLOC_PAGES - current;
@@ -460,6 +519,7 @@ fn preallocate_memory(memory: &Memory, store: &mut Store<InstanceRegistry>) {
     }
     let bytes = memory.data_size(&*store);
     debug!(pages = current, bytes, "prepared guest linear memory");
+    bytes
 }
 
 fn prepare_params(param_types: &[ValType], scalars: &[AbiScalarValue]) -> Result<Vec<Val>, String> {
@@ -988,6 +1048,19 @@ mod tests {
 
     #[tokio::test]
     async fn stop_process_closes_mailbox_and_waits_for_guest_exit() {
+        let usage = crate::usage::RuntimeUsageCollector::in_memory(Duration::from_secs(60));
+        let usage = usage
+            .register_process(
+                "test-workload",
+                "test-process",
+                ProcessUsageAttribution {
+                    instance_id: Some("test-instance".to_string()),
+                    external_account_ref: None,
+                    module_id: "test.module".to_string(),
+                },
+            )
+            .await
+            .expect("register usage handle");
         let mailbox: &'static TestMailbox = Box::leak(Box::new(TestMailbox::new()));
         let wait_mailbox = mailbox;
         let handle = tokio::spawn(async move {
@@ -995,7 +1068,7 @@ mod tests {
             assert!(wait_mailbox.is_closed());
             Ok(Vec::new())
         });
-        let mut process = WasmtimeProcess::new(handle, mailbox);
+        let mut process = WasmtimeProcess::new(handle, mailbox, usage);
 
         stop_process(&mut process).await.expect("stop process");
 

@@ -33,6 +33,13 @@ struct ModuleArgs {
     args: Vec<EntrypointArg>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProcessLaunchContext<'a> {
+    pub workload_key: Option<&'a str>,
+    pub instance_id: Option<&'a str>,
+    pub external_account_ref: Option<&'a str>,
+}
+
 #[derive(Debug)]
 struct ModuleSpec {
     module_label: String,
@@ -142,6 +149,23 @@ pub async fn spawn_from_cli(
     work_dir: impl AsRef<Path>,
     specs: &[String],
 ) -> Result<Vec<ResourceId>> {
+    spawn_from_cli_with_context(
+        kernel,
+        registry,
+        work_dir,
+        specs,
+        ProcessLaunchContext::default(),
+    )
+    .await
+}
+
+pub async fn spawn_from_cli_with_context(
+    kernel: &Kernel,
+    registry: &Arc<Registry>,
+    work_dir: impl AsRef<Path>,
+    specs: &[String],
+    launch_context: ProcessLaunchContext<'_>,
+) -> Result<Vec<ResourceId>> {
     let specs = parse_module_specs(specs, work_dir.as_ref())?;
     validate_runtime_grants(kernel, &specs).await?;
     let runtime = kernel.get::<WasmtimeProcessDriver>().ok_or_else(|| {
@@ -152,7 +176,7 @@ pub async fn spawn_from_cli(
 
     let mut processes = Vec::with_capacity(specs.len());
     for spec in specs {
-        let process_id = spawn_module(runtime, registry, spec).await?;
+        let process_id = spawn_module(runtime, registry, spec, launch_context).await?;
         processes.push(process_id);
     }
 
@@ -745,6 +769,7 @@ async fn spawn_module(
     runtime: &WasmtimeProcessDriver,
     registry: &Arc<Registry>,
     spec: ModuleSpec,
+    launch_context: ProcessLaunchContext<'_>,
 ) -> Result<ResourceId> {
     let process_id = registry
         .reserve(None, ResourceType::Process)
@@ -794,6 +819,9 @@ async fn spawn_module(
                 process_id,
                 module_id,
                 name: &entrypoint,
+                workload_key: launch_context.workload_key,
+                instance_id: launch_context.instance_id,
+                external_account_ref: launch_context.external_account_ref,
                 capabilities,
                 network_egress_profiles,
                 network_ingress_bindings,
