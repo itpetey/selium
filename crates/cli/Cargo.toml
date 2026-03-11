@@ -6,16 +6,35 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
-clap = { workspace = true, features = ["derive", "std"] }
-quinn = { workspace = true, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
+clap = { workspace = true, features = [
+  "derive",
+  "error-context",
+  "help",
+  "std",
+  "suggestions",
+  "usage"
+] }
+quinn = { workspace = true, features = [
+  "platform-verifier",
+  "runtime-tokio",
+  "rustls-ring"
+] }
 rkyv = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
-serde = { workspace = true, features = ["derive", "std"] }
 selium-abi = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
 selium-module-control-plane = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+serde = { workspace = true, features = ["derive", "std"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time"
+] }
 toml = { workspace = true, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]

@@ -200,21 +200,34 @@ pub(crate) struct IdlArgs {
 #[derive(Debug, Clone, Copy, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum IsolationArg {
+    /// Use the default sandboxing profile.
     Standard,
+    /// Use the hardened profile with stricter isolation.
     Hardened,
+    /// Run inside a microVM-backed isolation boundary.
     Microvm,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum AdaptorArg {
+    /// Run the module with the Wasmtime adaptor.
     Wasmtime,
+    /// Run the module with the microVM adaptor.
     Microvm,
 }
 
+/// Manage Selium control-plane resources and node instances.
+///
+/// Most command options can be loaded from a TOML file with `--config` and then
+/// overridden on the command line.
 #[derive(Debug, Parser)]
-#[command(name = "selium", about = "Selium platform CLI")]
+#[command(
+    name = "selium",
+    about = "Manage Selium control-plane resources and node instances."
+)]
 struct RawCli {
+    /// Load default option values from a TOML configuration file.
     #[arg(short = 'c', long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
     #[command(flatten)]
@@ -223,173 +236,246 @@ struct RawCli {
     command: RawCommand,
 }
 
+/// Connection settings used when talking to a Selium daemon over QUIC.
 #[derive(Debug, Args, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawDaemonConnectionArgs {
-    #[arg(long)]
+    /// Daemon address in `HOST:PORT` form.
+    #[arg(long, value_name = "HOST:PORT")]
     daemon_addr: Option<String>,
-    #[arg(long)]
+    /// TLS server name expected from the daemon certificate.
+    #[arg(long, value_name = "NAME")]
     daemon_server_name: Option<String>,
-    #[arg(long)]
+    /// Path to the CA certificate used to verify the daemon.
+    #[arg(long, value_name = "PATH")]
     ca_cert: Option<PathBuf>,
-    #[arg(long)]
+    /// Path to the client certificate presented to the daemon.
+    #[arg(long, value_name = "PATH")]
     client_cert: Option<PathBuf>,
-    #[arg(long)]
+    /// Path to the client private key presented to the daemon.
+    #[arg(long, value_name = "PATH")]
     client_key: Option<PathBuf>,
 }
 
+/// Top-level commands exposed by the Selium CLI.
 #[derive(Debug, Subcommand)]
 enum RawCommand {
+    /// Create or update a workload deployment in the control plane.
     Deploy(RawDeployArgs),
+    /// Connect two workloads through a named event pipeline edge.
     Connect(RawConnectArgs),
+    /// Change the desired replica count for a workload.
     Scale(RawScaleArgs),
+    /// Print a summary of the current control-plane state.
     Observe(RawObserveArgs),
+    /// Show recent control-plane replay events.
     Replay(RawReplayArgs),
+    /// List nodes that are considered live by the control plane.
     Nodes(RawNodesArgs),
+    /// Start a specific instance directly on a node.
     Start(RawStartArgs),
+    /// Stop a specific instance on a node.
     Stop(RawStopArgs),
+    /// List running instances, either for one node or for every known node.
     List(RawListArgs),
+    /// Run the reconciliation agent loop for a node.
     Agent(RawAgentArgs),
+    /// Compile or publish interface definition language (IDL) files.
     Idl(RawIdlArgs),
 }
 
+/// Create or update a deployment for a workload.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawDeployArgs {
-    #[arg(long)]
+    /// Tenant that owns the workload.
+    #[arg(long, value_name = "TENANT")]
     tenant: Option<String>,
-    #[arg(long)]
+    /// Namespace that contains the workload.
+    #[arg(long, value_name = "NAMESPACE")]
     namespace: Option<String>,
-    #[arg(long, alias = "app")]
+    /// Workload name within the tenant and namespace.
+    #[arg(long, alias = "app", value_name = "WORKLOAD")]
     #[serde(alias = "app")]
     workload: Option<String>,
-    #[arg(long)]
+    /// Module identifier or artifact path for the deployment.
+    #[arg(long, value_name = "MODULE")]
     module: Option<String>,
-    #[arg(long)]
+    /// Desired number of replicas for the workload.
+    #[arg(long, value_name = "COUNT")]
     replicas: Option<u32>,
-    #[arg(long, value_enum)]
+    /// Isolation profile to apply to new replicas.
+    #[arg(long, value_enum, value_name = "PROFILE")]
     isolation: Option<IsolationArg>,
-    #[arg(long = "contract")]
+    /// Contract to attach, formatted as `namespace/kind:name@version`.
+    #[arg(long = "contract", value_name = "CONTRACT")]
     contracts: Vec<String>,
 }
 
+/// Add an event pipeline edge between two workloads.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawConnectArgs {
-    #[arg(long)]
+    /// Pipeline name to create or update.
+    #[arg(long, value_name = "PIPELINE")]
     pipeline: Option<String>,
-    #[arg(long)]
+    /// Tenant that owns both workloads.
+    #[arg(long, value_name = "TENANT")]
     tenant: Option<String>,
-    #[arg(long)]
+    /// Namespace that contains both workloads.
+    #[arg(long, value_name = "NAMESPACE")]
     namespace: Option<String>,
-    #[arg(long, alias = "from-app")]
+    /// Source workload that emits the endpoint.
+    #[arg(long, alias = "from-app", value_name = "WORKLOAD")]
     #[serde(alias = "from-app")]
     from_workload: Option<String>,
-    #[arg(long, alias = "to-app")]
+    /// Destination workload that consumes the endpoint.
+    #[arg(long, alias = "to-app", value_name = "WORKLOAD")]
     #[serde(alias = "to-app")]
     to_workload: Option<String>,
-    #[arg(long)]
+    /// Shared event endpoint name on both workloads.
+    #[arg(long, value_name = "ENDPOINT")]
     endpoint: Option<String>,
-    #[arg(long)]
+    /// Event contract for the edge, formatted as `namespace/kind:name@version`.
+    #[arg(long, value_name = "CONTRACT")]
     contract: Option<String>,
 }
 
+/// Set the desired replica count for an existing workload.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawScaleArgs {
-    #[arg(long)]
+    /// Tenant that owns the workload.
+    #[arg(long, value_name = "TENANT")]
     tenant: Option<String>,
-    #[arg(long)]
+    /// Namespace that contains the workload.
+    #[arg(long, value_name = "NAMESPACE")]
     namespace: Option<String>,
-    #[arg(long, alias = "app")]
+    /// Workload name within the tenant and namespace.
+    #[arg(long, alias = "app", value_name = "WORKLOAD")]
     #[serde(alias = "app")]
     workload: Option<String>,
-    #[arg(long)]
+    /// Desired number of replicas.
+    #[arg(long, value_name = "COUNT")]
     replicas: Option<u32>,
 }
 
+/// Print a control-plane summary.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawObserveArgs {
+    /// Request machine-readable output when supported.
     #[arg(long)]
     json: bool,
 }
 
+/// Inspect recently replayed control-plane events.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawReplayArgs {
-    #[arg(long)]
+    /// Maximum number of replay events to fetch.
+    #[arg(long, value_name = "COUNT")]
     limit: Option<usize>,
-    #[arg(long)]
+    /// Filter output to a tenant when combined with namespace and workload.
+    #[arg(long, value_name = "TENANT")]
     tenant: Option<String>,
-    #[arg(long)]
+    /// Filter output to a namespace when combined with tenant and workload.
+    #[arg(long, value_name = "NAMESPACE")]
     namespace: Option<String>,
-    #[arg(long, alias = "app")]
+    /// Filter output to a workload when combined with tenant and namespace.
+    #[arg(long, alias = "app", value_name = "WORKLOAD")]
     #[serde(alias = "app")]
     workload: Option<String>,
 }
 
+/// List nodes that are currently live.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawNodesArgs {
-    #[arg(long)]
+    /// Maximum node age, in milliseconds, before a node is treated as stale.
+    #[arg(long, value_name = "MILLISECONDS")]
     max_staleness_ms: Option<u64>,
+    /// Print the raw node payload instead of the compact table.
     #[arg(long)]
     json: bool,
 }
 
+/// Start a specific instance directly on a node.
+///
+/// Provide either `--module-spec` to send a prebuilt runtime module spec, or
+/// `--module` to let the CLI build one from the remaining flags.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 struct RawStartArgs {
-    #[arg(long)]
+    /// Node name that should host the instance.
+    #[arg(long, value_name = "NODE")]
     node: Option<String>,
-    #[arg(long = "replica-key")]
+    /// Stable replica identifier for the instance.
+    #[arg(long = "replica-key", value_name = "REPLICA")]
     replica_key: Option<String>,
-    #[arg(long)]
+    /// Prebuilt runtime module spec to send as-is.
+    #[arg(long, value_name = "SPEC")]
     module_spec: Option<String>,
-    #[arg(long)]
+    /// Module path or identifier used to build a runtime spec.
+    #[arg(long, value_name = "MODULE")]
     module: Option<String>,
-    #[arg(long = "adaptor", value_enum)]
+    /// Runtime adaptor used when building a module spec from `--module`.
+    #[arg(long = "adaptor", value_enum, value_name = "ADAPTOR")]
     adaptor: Option<AdaptorArg>,
-    #[arg(long, value_enum)]
+    /// Isolation profile used when building a module spec from `--module`.
+    #[arg(long, value_enum, value_name = "PROFILE")]
     isolation: Option<IsolationArg>,
-    #[arg(long = "capability")]
+    /// Capability to include when building a module spec from `--module`.
+    #[arg(long = "capability", value_name = "CAPABILITY")]
     capabilities: Vec<String>,
-    #[arg(long = "event-reader")]
+    /// Managed event endpoint to expose as an ingress reader.
+    #[arg(long = "event-reader", value_name = "ENDPOINT")]
     event_readers: Vec<String>,
-    #[arg(long = "event-writer")]
+    /// Managed event endpoint to expose as an egress writer.
+    #[arg(long = "event-writer", value_name = "ENDPOINT")]
     event_writers: Vec<String>,
 }
 
+/// Stop a specific instance on a node.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 struct RawStopArgs {
-    #[arg(long)]
+    /// Node name that currently hosts the instance.
+    #[arg(long, value_name = "NODE")]
     node: Option<String>,
-    #[arg(long = "replica-key")]
+    /// Replica identifier to stop.
+    #[arg(long = "replica-key", value_name = "REPLICA")]
     replica_key: Option<String>,
 }
 
+/// List running instances.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawListArgs {
-    #[arg(long)]
+    /// Restrict the query to one node; omit to inspect every known node.
+    #[arg(long, value_name = "NODE")]
     node: Option<String>,
 }
 
+/// Reconcile one node against the control-plane state.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawAgentArgs {
-    #[arg(long)]
+    /// Node name to reconcile.
+    #[arg(long, value_name = "NODE")]
     node: Option<String>,
-    #[arg(long)]
+    /// Delay between reconciliation loops in milliseconds.
+    #[arg(long, value_name = "MILLISECONDS")]
     interval_ms: Option<u64>,
+    /// Run one reconciliation pass and exit.
     #[arg(long)]
     once: bool,
-    #[arg(long)]
+    /// Path to the persisted agent state snapshot.
+    #[arg(long, value_name = "PATH")]
     agent_state: Option<PathBuf>,
 }
 
+/// Compile or publish IDL files.
 #[derive(Debug, Args, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawIdlArgs {
@@ -397,10 +483,13 @@ struct RawIdlArgs {
     command: RawIdlCommand,
 }
 
+/// Operations for Selium IDL files.
 #[derive(Debug, Clone, Deserialize, Subcommand)]
 #[serde(rename_all = "kebab-case")]
 enum RawIdlCommand {
+    /// Generate Rust bindings from an IDL file.
     Compile(RawIdlCompileArgs),
+    /// Publish an IDL file to the control plane.
     Publish(RawIdlPublishArgs),
 }
 
@@ -410,19 +499,24 @@ impl Default for RawIdlCommand {
     }
 }
 
+/// Generate Rust bindings from an IDL file.
 #[derive(Debug, Args, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawIdlCompileArgs {
-    #[arg(long)]
+    /// Input IDL file to compile.
+    #[arg(long, value_name = "PATH")]
     input: Option<PathBuf>,
-    #[arg(long)]
+    /// Output path for the generated Rust source.
+    #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 }
 
+/// Publish an IDL file to the control plane.
 #[derive(Debug, Args, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 struct RawIdlPublishArgs {
-    #[arg(long)]
+    /// Input IDL file to publish.
+    #[arg(long, value_name = "PATH")]
     input: Option<PathBuf>,
 }
 
@@ -1224,5 +1318,28 @@ module = "module.wasm"
         .expect_err("legacy config key should be rejected");
 
         assert!(format!("{err:#}").contains("unknown field `instance-id`"));
+    }
+
+    #[test]
+    fn root_help_describes_top_level_commands() {
+        let mut command = RawCli::command();
+        let help = command.render_long_help().to_string();
+
+        assert!(help.contains("Manage Selium control-plane resources and node instances."));
+        assert!(help.contains("Create or update a workload deployment in the control plane"));
+        assert!(help.contains("Run the reconciliation agent loop for a node"));
+    }
+
+    #[test]
+    fn deploy_help_describes_required_options() {
+        let mut command = RawCli::command();
+        let deploy = command
+            .find_subcommand_mut("deploy")
+            .expect("deploy subcommand");
+        let help = deploy.render_long_help().to_string();
+
+        assert!(help.contains("Create or update a workload deployment in the control plane"));
+        assert!(help.contains("Tenant that owns the workload"));
+        assert!(help.contains("Contract to attach, formatted as `namespace/kind:name@version`"));
     }
 }
