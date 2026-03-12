@@ -19,10 +19,11 @@ use rustls_pemfile::{certs, private_key};
 use selium_abi::{DataValue, decode_rkyv};
 use selium_control_plane_api::ControlPlaneState;
 use selium_control_plane_protocol::{
-    Method, QueryApiRequest, QueryApiResponse, decode_envelope, decode_error, decode_payload,
-    encode_request, is_error, read_framed, write_framed,
+    Method, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
+    decode_envelope, decode_error, decode_payload, encode_request, is_error, read_framed,
+    write_framed,
 };
-use selium_control_plane_runtime::Query;
+use selium_control_plane_runtime::{Mutation, Query};
 use tokio::time::{sleep, timeout};
 
 const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
@@ -397,6 +398,55 @@ impl ClusterHarness {
             needle,
             last_output
         )
+    }
+
+    pub async fn mutate_control_plane(
+        &self,
+        daemon_addr: &str,
+        idempotency_key: &str,
+        mutation: Mutation,
+    ) -> Result<MutateApiResponse> {
+        let addr = daemon_addr.parse().context("parse daemon addr")?;
+        let endpoint = self.build_query_endpoint()?;
+        let connecting = endpoint
+            .connect(addr, DEFAULT_SERVER_NAME)
+            .context("connect daemon")?;
+        let connection = timeout(DIRECT_QUERY_TIMEOUT, connecting)
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("await daemon connect")??;
+        let (mut send, mut recv) = timeout(DIRECT_QUERY_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("open QUIC stream")??;
+        let frame = encode_request(
+            Method::ControlMutate,
+            1,
+            &MutateApiRequest {
+                idempotency_key: idempotency_key.to_string(),
+                mutation,
+            },
+        )
+        .context("encode control mutation")?;
+        timeout(DIRECT_QUERY_TIMEOUT, write_framed(&mut send, &frame))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("write control mutation")??;
+        let _ = send.finish();
+        let frame = timeout(DIRECT_QUERY_TIMEOUT, read_framed(&mut recv))
+            .await
+            .map_err(|_| anyhow!("timed out"))
+            .context("read control mutation response")??;
+        connection.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+
+        let envelope = decode_envelope(&frame).context("decode response envelope")?;
+        if is_error(&envelope) {
+            let error = decode_error(&envelope).context("decode daemon error")?;
+            bail!("daemon error {}: {}", error.code, error.message);
+        }
+
+        decode_payload(&envelope).context("decode mutate payload")
     }
 
     async fn query_control_plane_state(
