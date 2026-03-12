@@ -80,10 +80,45 @@ selium discover \
 That response resolves the selected workload, endpoint, or running process using the control plane's existing discovery state. Once you know the workload and endpoint you care about, list live nodes that can serve runtime usage export:
 
 ```bash
-selium nodes --json
+selium nodes --max-staleness-ms 20000 --json
 ```
 
 The node JSON includes `name`, `daemon_addr`, `daemon_server_name`, `live`, and `supported_isolation`. Use `name` as the `selium usage --node ...` selector when collecting attributed runtime usage from a live daemon.
+
+#### Operator runbook: discover -> nodes -> first bounded replay/usage pull
+
+Use this as the default external-consumer handoff when you need to move from Selium discovery to the first machine-consumable export batch:
+
+1. Discover candidate workloads and public endpoints for the tenant or namespace you care about.
+2. Resolve one concrete endpoint so you can pin the exact Selium-native workload key you will join against downstream.
+3. List live nodes and select the daemon that will serve runtime usage export.
+4. Start with a bounded replay pull for control-plane audit history.
+5. Start with a bounded usage pull from the selected live node, then continue from the returned `next_sequence`.
+
+```bash
+selium discover \
+  --workload-prefix tenant-a/analytics/topology- \
+  --json
+
+selium discover \
+  --resolve-endpoint tenant-a/analytics/topology-ingress#event:ingest.frames \
+  --json
+
+selium nodes --json
+
+selium replay \
+  --workload-key tenant-a/analytics/topology-ingress \
+  --limit 1 \
+  --json
+
+selium usage \
+  --node node-a \
+  --workload tenant-a/analytics/topology-ingress \
+  --limit 1 \
+  --json
+```
+
+Keep the first replay/usage call deliberately small (`--limit 1` or another low bound) so downstream consumers can validate identity joins before widening the window. `replay` follows the discovered workload key, while `usage` must target one live daemon from `selium nodes --json` plus the workload key you resolved during discovery. If you are bootstrapping against a slower local or staging cluster, set `--max-staleness-ms` high enough that recent heartbeats still count as live.
 
 ### Export attributed infrastructure inventory
 
