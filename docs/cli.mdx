@@ -52,13 +52,36 @@ The read-side commands are:
 - `inventory` for attributed workload, module, pipeline, and node inventory with `--json` output
 - `usage` for attributed runtime usage export from a specific node daemon with `--json` output
 
-## External-consumer export examples
+## External-consumer adoption cookbook
 
-Use the read-side export commands with `--json` when you need stable, machine-consumable output for downstream attribution systems.
+Use the read-side export commands with `--json` when Selium needs to hand stable, machine-consumable inventory, replay, and usage data to an external consumer. The already-tested adoption loops are:
 
-### Discover workloads, endpoints, and live usage-export nodes
+1. **inventory -> replay** for a control-plane bootstrap plus delta catch-up
+2. **discover -> nodes -> replay/usage** for a live handoff onto one concrete workload and one live daemon
 
-Use `discover` first when an external consumer needs to find Selium-native workload and endpoint identities without prior repository knowledge:
+If the downstream consumer is a host-side Rust process, keep [Rust SDK](./rust-sdk) nearby for payload decoding and metadata-preserving replay helpers. The CLI remains the authoritative source for the control-plane and daemon command flow.
+
+### 1. Bootstrap with inventory, then continue from replay deltas
+
+Start with inventory when you need one bounded snapshot of workloads, modules, pipelines, and nodes before switching to replay:
+
+```bash
+selium inventory \
+  --external-account-ref acct-123 \
+  --workload tenant-a/media/ingest \
+  --json
+```
+
+The JSON response contains:
+
+- `snapshot_marker.last_applied`: the control-plane snapshot position reflected by this inventory export
+- `workloads`, `modules`, `pipelines`, and `nodes`: filtered arrays exposing Selium-native identifiers plus any attached `external_account_ref` values
+
+For the bootstrap-to-replay handoff, continue from the next durable sequence after that marker. For example, if `snapshot_marker.last_applied` is `41`, resume with `selium replay --since-sequence 42 ... --json` so downstream consumers only ingest mutations that landed after the exported inventory snapshot.
+
+### 2. Discover workloads, endpoints, and live usage-export nodes
+
+Use `discover` when an external consumer needs to find Selium-native workload and endpoint identities without prior repository knowledge:
 
 ```bash
 selium discover \
@@ -85,7 +108,7 @@ selium nodes --max-staleness-ms 20000 --json
 
 The node JSON includes `name`, `daemon_addr`, `daemon_server_name`, `live`, and `supported_isolation`. Use `name` as the `selium usage --node ...` selector when collecting attributed runtime usage from a live daemon.
 
-#### Operator runbook: discover -> nodes -> first bounded replay/usage pull
+#### Cookbook handoff: discover -> nodes -> first bounded replay/usage pull
 
 Use this as the default external-consumer handoff when you need to move from Selium discovery to the first machine-consumable export batch:
 
@@ -120,25 +143,7 @@ selium usage \
 
 Keep the first replay/usage call deliberately small (`--limit 1` or another low bound) so downstream consumers can validate identity joins before widening the window. `replay` follows the discovered workload key, while `usage` must target one live daemon from `selium nodes --json` plus the workload key you resolved during discovery. If you are bootstrapping against a slower local or staging cluster, set `--max-staleness-ms` high enough that recent heartbeats still count as live.
 
-### Export attributed infrastructure inventory
-
-This query gives external consumers a bounded Selium-native inventory surface that still carries the opaque `external_account_ref` for joins:
-
-```bash
-selium inventory \
-  --external-account-ref acct-123 \
-  --workload tenant-a/media/ingest \
-  --json
-```
-
-The JSON response contains:
-
-- `snapshot_marker.last_applied`: the control-plane snapshot position reflected by this inventory export
-- `workloads`, `modules`, `pipelines`, and `nodes`: filtered arrays exposing Selium-native identifiers plus any attached `external_account_ref` values
-
-For a bootstrap-to-replay handoff, first capture the inventory JSON, then resume control-plane replay from the next sequence after that marker. For example, if `snapshot_marker.last_applied` is `41`, continue with `selium replay --since-sequence 42 ... --json` so downstream consumers only ingest deltas that landed after the exported inventory snapshot.
-
-### Replay control-plane attribution events incrementally
+### 3. Continue replay incrementally
 
 Use `replay` when an external consumer needs durable mutation history together with a replay cursor:
 
@@ -161,7 +166,7 @@ The JSON response includes:
 - `high_watermark`: the newest durable replay sequence available at query time
 - `events`: the filtered replay events, each still carrying Selium-native resource identity so downstream systems can join them back to deployments, workloads, modules, and pipelines without Selium owning the external account model
 
-### Export attributed runtime usage records
+### 4. Continue usage export incrementally
 
 Use `usage` when an external consumer needs immutable sampled runtime usage plus the next durable resume cursor:
 
@@ -179,6 +184,15 @@ selium usage \
 ```
 
 The JSON response includes `records`, `next_sequence`, and `high_watermark`. Each usage record carries both Selium-native identity (`sample.workload_key`, `sample.attribution.module_id`) and the opaque join key (`sample.attribution.external_account_ref`) so downstream systems can meter, rate, or bill without Selium modelling external account lifecycle state.
+
+### Troubleshooting appendix
+
+- **`inventory` is missing the workload or `external_account_ref` you expected**: confirm you are filtering with the exact control-plane workload key (`tenant/namespace/workload`) and the same opaque account key attached to the deployment or pipeline. The bootstrap flow only sees resources already committed to the control plane.
+- **The replay handoff repeats snapshot-time data**: resume from `snapshot_marker.last_applied + 1`, not from the marker itself. The inventory bootstrap smoke test uses this exact cursor handoff to avoid replaying pre-snapshot mutations.
+- **`replay` returns no events even though the command succeeds**: check `next_sequence` and `high_watermark` in the JSON response. An empty batch can still be correct when no post-cursor mutations match the filters you supplied.
+- **`discover --resolve-endpoint ...` does not pin the workload you meant**: use the full endpoint key shape `tenant/namespace/workload#kind:name`, then carry the returned workload key forward into `replay` and `usage`.
+- **`usage` cannot find records**: pick a `live` node from `selium nodes --json` and pass its `name` to `selium usage --node ...`. Unlike control-plane replay, runtime usage export is daemon-scoped and must target one live node.
+- **`nodes` shows no live daemon in local or staging environments**: increase `--max-staleness-ms` so recent heartbeats still count as live before you choose the usage-export target.
 
 ## Know which identity you are holding
 
