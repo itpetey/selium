@@ -1737,6 +1737,47 @@ mod tests {
     }
 
     #[test]
+    fn replay_json_preserves_external_consumer_cursor_and_event_fields() {
+        let json = data_value_to_json(&replay_response_value(&ReplayApiResponse {
+            events: vec![DataValue::Map(BTreeMap::from([
+                (
+                    "external_account_ref".to_string(),
+                    DataValue::from("acct-123"),
+                ),
+                (
+                    "headers".to_string(),
+                    DataValue::Map(BTreeMap::from([(
+                        "mutation_kind".to_string(),
+                        DataValue::from("set_scale"),
+                    )])),
+                ),
+                ("replicas".to_string(), DataValue::from(3_u64)),
+                ("sequence".to_string(), DataValue::from(41_u64)),
+                (
+                    "workload".to_string(),
+                    DataValue::from("tenant-a/media/ingest"),
+                ),
+            ]))],
+            start_sequence: Some(41),
+            next_sequence: Some(42),
+            high_watermark: Some(56),
+        }));
+
+        assert_eq!(
+            json,
+            concat!(
+                "{\"events\":[{",
+                "\"external_account_ref\":\"acct-123\",",
+                "\"headers\":{\"mutation_kind\":\"set_scale\"},",
+                "\"replicas\":3,",
+                "\"sequence\":41,",
+                "\"workload\":\"tenant-a/media/ingest\"",
+                "}],\"high_watermark\":56,\"next_sequence\":42,\"start_sequence\":41}"
+            )
+        );
+    }
+
+    #[test]
     fn data_value_to_json_preserves_inventory_snapshot_marker() {
         let value = DataValue::Map(BTreeMap::from([
             (
@@ -1752,6 +1793,173 @@ mod tests {
         assert_eq!(
             data_value_to_json(&value),
             "{\"snapshot_marker\":{\"last_applied\":41},\"workloads\":[]}"
+        );
+    }
+
+    #[test]
+    fn inventory_json_preserves_external_consumer_filter_and_resume_fields() {
+        let scheduled_instance = DataValue::Map(BTreeMap::from([
+            (
+                "deployment".to_string(),
+                DataValue::from("tenant-a/media/ingest"),
+            ),
+            (
+                "external_account_ref".to_string(),
+                DataValue::from("acct-123"),
+            ),
+            (
+                "instance_id".to_string(),
+                DataValue::from("node-a/ingest-0"),
+            ),
+            ("isolation".to_string(), DataValue::from("Standard")),
+            ("module".to_string(), DataValue::from("ingest.wasm")),
+            ("node".to_string(), DataValue::from("node-a")),
+            (
+                "workload".to_string(),
+                DataValue::from("tenant-a/media/ingest"),
+            ),
+        ]));
+        let value = DataValue::Map(BTreeMap::from([
+            (
+                "snapshot_marker".to_string(),
+                DataValue::Map(BTreeMap::from([(
+                    "last_applied".to_string(),
+                    DataValue::from(41_u64),
+                )])),
+            ),
+            (
+                "filters".to_string(),
+                DataValue::Map(BTreeMap::from([
+                    (
+                        "external_account_ref".to_string(),
+                        DataValue::from("acct-123"),
+                    ),
+                    ("module".to_string(), DataValue::from("ingest.wasm")),
+                    ("node".to_string(), DataValue::from("node-a")),
+                    (
+                        "pipeline".to_string(),
+                        DataValue::from("tenant-a/media/camera"),
+                    ),
+                    (
+                        "workload".to_string(),
+                        DataValue::from("tenant-a/media/ingest"),
+                    ),
+                ])),
+            ),
+            (
+                "workloads".to_string(),
+                DataValue::List(vec![DataValue::Map(BTreeMap::from([
+                    ("contracts".to_string(), DataValue::List(Vec::new())),
+                    (
+                        "external_account_ref".to_string(),
+                        DataValue::from("acct-123"),
+                    ),
+                    ("isolation".to_string(), DataValue::from("Standard")),
+                    ("module".to_string(), DataValue::from("ingest.wasm")),
+                    (
+                        "nodes".to_string(),
+                        DataValue::List(vec![DataValue::from("node-a")]),
+                    ),
+                    ("replicas".to_string(), DataValue::from(1_u64)),
+                    (
+                        "resources".to_string(),
+                        DataValue::Map(BTreeMap::from([
+                            ("bandwidth_profile".to_string(), DataValue::from("Standard")),
+                            ("cpu_millis".to_string(), DataValue::from(250_u64)),
+                            ("ephemeral_storage_mib".to_string(), DataValue::from(0_u64)),
+                            ("memory_mib".to_string(), DataValue::from(128_u64)),
+                        ])),
+                    ),
+                    (
+                        "scheduled_instances".to_string(),
+                        DataValue::List(vec![scheduled_instance.clone()]),
+                    ),
+                    (
+                        "workload".to_string(),
+                        DataValue::from("tenant-a/media/ingest"),
+                    ),
+                ]))]),
+            ),
+            (
+                "pipelines".to_string(),
+                DataValue::List(vec![DataValue::Map(BTreeMap::from([
+                    ("edge_count".to_string(), DataValue::from(0_u64)),
+                    ("edges".to_string(), DataValue::List(Vec::new())),
+                    (
+                        "external_account_ref".to_string(),
+                        DataValue::from("acct-123"),
+                    ),
+                    (
+                        "pipeline".to_string(),
+                        DataValue::from("tenant-a/media/camera"),
+                    ),
+                    ("workloads".to_string(), DataValue::List(Vec::new())),
+                ]))]),
+            ),
+            (
+                "modules".to_string(),
+                DataValue::List(vec![DataValue::Map(BTreeMap::from([
+                    ("deployment_count".to_string(), DataValue::from(1_u64)),
+                    (
+                        "external_account_refs".to_string(),
+                        DataValue::List(vec![DataValue::from("acct-123")]),
+                    ),
+                    ("module".to_string(), DataValue::from("ingest.wasm")),
+                    (
+                        "nodes".to_string(),
+                        DataValue::List(vec![DataValue::from("node-a")]),
+                    ),
+                    (
+                        "workloads".to_string(),
+                        DataValue::List(vec![DataValue::from("tenant-a/media/ingest")]),
+                    ),
+                ]))]),
+            ),
+            (
+                "nodes".to_string(),
+                DataValue::List(vec![DataValue::Map(BTreeMap::from([
+                    (
+                        "allocatable_cpu_millis".to_string(),
+                        DataValue::from(2_000_u64),
+                    ),
+                    (
+                        "allocatable_memory_mib".to_string(),
+                        DataValue::from(4_096_u64),
+                    ),
+                    ("capacity_slots".to_string(), DataValue::from(8_u64)),
+                    ("daemon_addr".to_string(), DataValue::from("127.0.0.1:7200")),
+                    (
+                        "daemon_server_name".to_string(),
+                        DataValue::from("selium-node-a"),
+                    ),
+                    (
+                        "external_account_refs".to_string(),
+                        DataValue::List(vec![DataValue::from("acct-123")]),
+                    ),
+                    ("last_heartbeat_ms".to_string(), DataValue::from(100_u64)),
+                    ("name".to_string(), DataValue::from("node-a")),
+                    (
+                        "scheduled_instances".to_string(),
+                        DataValue::List(vec![scheduled_instance]),
+                    ),
+                    (
+                        "supported_isolation".to_string(),
+                        DataValue::List(vec![DataValue::from("Standard")]),
+                    ),
+                ]))]),
+            ),
+        ]));
+
+        assert_eq!(
+            data_value_to_json(&value),
+            concat!(
+                "{\"filters\":{\"external_account_ref\":\"acct-123\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"pipeline\":\"tenant-a/media/camera\",\"workload\":\"tenant-a/media/ingest\"},",
+                "\"modules\":[{\"deployment_count\":1,\"external_account_refs\":[\"acct-123\"],\"module\":\"ingest.wasm\",\"nodes\":[\"node-a\"],\"workloads\":[\"tenant-a/media/ingest\"]}],",
+                "\"nodes\":[{\"allocatable_cpu_millis\":2000,\"allocatable_memory_mib\":4096,\"capacity_slots\":8,\"daemon_addr\":\"127.0.0.1:7200\",\"daemon_server_name\":\"selium-node-a\",\"external_account_refs\":[\"acct-123\"],\"last_heartbeat_ms\":100,\"name\":\"node-a\",\"scheduled_instances\":[{\"deployment\":\"tenant-a/media/ingest\",\"external_account_ref\":\"acct-123\",\"instance_id\":\"node-a/ingest-0\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"workload\":\"tenant-a/media/ingest\"}],\"supported_isolation\":[\"Standard\"]}],",
+                "\"pipelines\":[{\"edge_count\":0,\"edges\":[],\"external_account_ref\":\"acct-123\",\"pipeline\":\"tenant-a/media/camera\",\"workloads\":[]}],",
+                "\"snapshot_marker\":{\"last_applied\":41},",
+                "\"workloads\":[{\"contracts\":[],\"external_account_ref\":\"acct-123\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"nodes\":[\"node-a\"],\"replicas\":1,\"resources\":{\"bandwidth_profile\":\"Standard\",\"cpu_millis\":250,\"ephemeral_storage_mib\":0,\"memory_mib\":128},\"scheduled_instances\":[{\"deployment\":\"tenant-a/media/ingest\",\"external_account_ref\":\"acct-123\",\"instance_id\":\"node-a/ingest-0\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"workload\":\"tenant-a/media/ingest\"}],\"workload\":\"tenant-a/media/ingest\"}]}"
+            )
         );
     }
 
@@ -1878,6 +2086,38 @@ mod tests {
     }
 
     #[test]
+    fn discover_resolution_json_preserves_endpoint_contract_fields() {
+        let json = data_value_to_json(&discovery_resolution_value(&DiscoveryResolution::Endpoint(
+            ResolvedEndpoint {
+                endpoint: PublicEndpointRef {
+                    workload: workload_ref(
+                        "tenant-a".to_string(),
+                        "analytics".to_string(),
+                        "topology-ingress".to_string(),
+                    ),
+                    kind: ContractKind::Event,
+                    name: "ingest.frames".to_string(),
+                },
+                contract: ContractRef {
+                    namespace: "analytics.topology".to_string(),
+                    kind: ContractKind::Event,
+                    name: "ingest.frames".to_string(),
+                    version: "v1".to_string(),
+                },
+            },
+        )));
+
+        assert_eq!(
+            json,
+            concat!(
+                "{\"contract\":{\"kind\":\"event\",\"name\":\"ingest.frames\",\"namespace\":\"analytics.topology\",\"version\":\"v1\"},",
+                "\"endpoint\":{\"endpoint\":\"tenant-a/analytics/topology-ingress#event:ingest.frames\",\"kind\":\"event\",\"name\":\"ingest.frames\",\"workload\":\"tenant-a/analytics/topology-ingress\"},",
+                "\"kind\":\"endpoint\"}"
+            )
+        );
+    }
+
+    #[test]
     fn replay_request_prefers_workload_key_filter() {
         let request = replay_request(&ReplayArgs {
             limit: 25,
@@ -1994,5 +2234,47 @@ mod tests {
         assert!(json.contains("\"high_watermark\":56"));
         assert!(json.contains("\"memory_byte_millis\":8192"));
         assert!(json.contains("\"module_id\":\"ingest.wasm\""));
+    }
+
+    #[test]
+    fn usage_json_preserves_external_consumer_cursor_and_attribution_fields() {
+        let json = runtime_usage_response_json(&RuntimeUsageApiResponse {
+            records: vec![RuntimeUsageRecord {
+                sequence: 41,
+                timestamp_ms: 1_500,
+                headers: BTreeMap::from([(
+                    "external_account_ref".to_string(),
+                    "acct-123".to_string(),
+                )]),
+                sample: selium_abi::RuntimeUsageSample {
+                    workload_key: "tenant-a/media/ingest".to_string(),
+                    process_id: "process-7".to_string(),
+                    attribution: selium_abi::RuntimeUsageAttribution {
+                        external_account_ref: Some("acct-123".to_string()),
+                        module_id: "ingest.wasm".to_string(),
+                    },
+                    window_start_ms: 1_000,
+                    window_end_ms: 2_000,
+                    trigger: selium_abi::RuntimeUsageSampleTrigger::Interval,
+                    cpu_time_millis: 10,
+                    memory_high_watermark_bytes: 4_096,
+                    memory_byte_millis: 8_192,
+                    ingress_bytes: 7,
+                    egress_bytes: 11,
+                    storage_read_bytes: 13,
+                    storage_write_bytes: 17,
+                },
+            }],
+            next_sequence: Some(42),
+            high_watermark: Some(56),
+        });
+
+        assert_eq!(
+            json,
+            concat!(
+                "{\"records\":[{\"sequence\":41,\"timestamp_ms\":1500,\"headers\":{\"external_account_ref\":\"acct-123\"},",
+                "\"sample\":{\"workload_key\":\"tenant-a/media/ingest\",\"process_id\":\"process-7\",\"attribution\":{\"external_account_ref\":\"acct-123\",\"module_id\":\"ingest.wasm\"},\"window_start_ms\":1000,\"window_end_ms\":2000,\"trigger\":\"Interval\",\"cpu_time_millis\":10,\"memory_high_watermark_bytes\":4096,\"memory_byte_millis\":8192,\"ingress_bytes\":7,\"egress_bytes\":11,\"storage_read_bytes\":13,\"storage_write_bytes\":17}}],\"next_sequence\":42,\"high_watermark\":56}"
+            )
+        );
     }
 }
