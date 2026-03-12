@@ -45,6 +45,7 @@ Use these when you want stable names and desired-state workflows:
 
 The read-side commands are:
 
+- `discover` for workload, endpoint, and running-process discovery with `--json` output
 - `nodes` for node inventory and liveness
 - `observe` for the current control-plane view
 - `replay` for recent control-plane events, with cursor and attribution filters plus `--json` output
@@ -54,6 +55,35 @@ The read-side commands are:
 ## External-consumer export examples
 
 Use the read-side export commands with `--json` when you need stable, machine-consumable output for downstream attribution systems.
+
+### Discover workloads, endpoints, and live usage-export nodes
+
+Use `discover` first when an external consumer needs to find Selium-native workload and endpoint identities without prior repository knowledge:
+
+```bash
+selium discover \
+  --workload-prefix tenant-a/media/ \
+  --json
+```
+
+The discovery JSON contains `workloads` plus contract-bound `endpoints`, all keyed by Selium-native workload and public-endpoint identity.
+
+When you need to resolve one concrete target, use one of the explicit resolve flags:
+
+```bash
+selium discover \
+  --resolve-endpoint tenant-a/media/router#service:camera.detect \
+  --workload tenant-a/media/router \
+  --json
+```
+
+That response resolves the selected workload, endpoint, or running process using the control plane's existing discovery state. Once you know the workload and endpoint you care about, list live nodes that can serve runtime usage export:
+
+```bash
+selium nodes --json
+```
+
+The node JSON includes `name`, `daemon_addr`, `daemon_server_name`, `live`, and `supported_isolation`. Use `name` as the `selium usage --node ...` selector when collecting attributed runtime usage from a live daemon.
 
 ### Export attributed infrastructure inventory
 
@@ -66,7 +96,12 @@ selium inventory \
   --json
 ```
 
-The response contains filtered `workloads`, `modules`, `pipelines`, and `nodes` arrays, each exposing Selium-native identifiers plus any attached `external_account_ref` values.
+The JSON response contains:
+
+- `snapshot_marker.last_applied`: the control-plane snapshot position reflected by this inventory export
+- `workloads`, `modules`, `pipelines`, and `nodes`: filtered arrays exposing Selium-native identifiers plus any attached `external_account_ref` values
+
+For a bootstrap-to-replay handoff, first capture the inventory JSON, then resume control-plane replay from the next sequence after that marker. For example, if `snapshot_marker.last_applied` is `41`, continue with `selium replay --since-sequence 42 ... --json` so downstream consumers only ingest deltas that landed after the exported inventory snapshot.
 
 ### Replay control-plane attribution events incrementally
 

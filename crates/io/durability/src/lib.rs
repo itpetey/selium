@@ -140,7 +140,7 @@ impl DurableLog {
         if name.trim().is_empty() {
             return Err(DurabilityError::InvalidCheckpointName);
         }
-        self.ensure_sequence_is_retained(sequence)?;
+        self.ensure_sequence_is_checkpointable(sequence)?;
         self.checkpoints.insert(name, sequence);
         Ok(())
     }
@@ -152,6 +152,14 @@ impl DurableLog {
     pub fn replay(&self, start: ReplayStart, limit: usize) -> Result<ReplayBatch, DurabilityError> {
         let high_watermark = self.latest_sequence();
         if self.records.is_empty() {
+            if let ReplayStart::Checkpoint(name) = &start {
+                let sequence = self
+                    .checkpoints
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| DurabilityError::UnknownCheckpoint(name.clone()))?;
+                self.ensure_sequence_is_checkpointable(sequence)?;
+            }
             return Ok(ReplayBatch {
                 records: Vec::new(),
                 high_watermark,
@@ -191,11 +199,15 @@ impl DurableLog {
                     .get(&name)
                     .copied()
                     .ok_or(DurabilityError::UnknownCheckpoint(name))?;
-                self.ensure_sequence_is_retained(sequence)?;
-                self.records
-                    .iter()
-                    .filter(|record| record.sequence >= sequence)
-                    .collect::<Vec<_>>()
+                if sequence == self.next_sequence {
+                    Vec::new()
+                } else {
+                    self.ensure_sequence_is_retained(sequence)?;
+                    self.records
+                        .iter()
+                        .filter(|record| record.sequence >= sequence)
+                        .collect::<Vec<_>>()
+                }
             }
         };
 
@@ -209,6 +221,13 @@ impl DurableLog {
             records,
             high_watermark,
         })
+    }
+
+    fn ensure_sequence_is_checkpointable(&self, sequence: u64) -> Result<(), DurabilityError> {
+        if sequence == self.next_sequence {
+            return Ok(());
+        }
+        self.ensure_sequence_is_retained(sequence)
     }
 
     fn ensure_sequence_is_retained(&self, sequence: u64) -> Result<(), DurabilityError> {
@@ -378,6 +397,27 @@ mod tests {
             .expect("replay");
         assert_eq!(batch.records.len(), 2);
         assert_eq!(batch.records[0].sequence, second.sequence);
+    }
+
+    #[test]
+    fn checkpoint_can_store_next_sequence_resume_cursor() {
+        let mut log = DurableLog::default();
+        log.append(10, BTreeMap::new(), record_payload(1));
+        log.append(20, BTreeMap::new(), record_payload(2));
+        let cursor = log.next_sequence();
+        log.checkpoint("cursor", cursor).expect("checkpoint");
+
+        let empty = log
+            .replay(ReplayStart::Checkpoint("cursor".to_string()), 10)
+            .expect("replay empty cursor");
+        assert!(empty.records.is_empty());
+
+        let appended = log.append(30, BTreeMap::new(), record_payload(3));
+        let resumed = log
+            .replay(ReplayStart::Checkpoint("cursor".to_string()), 10)
+            .expect("replay resumed cursor");
+        assert_eq!(resumed.records.len(), 1);
+        assert_eq!(resumed.records[0].sequence, appended.sequence);
     }
 
     #[test]

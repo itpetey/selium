@@ -181,7 +181,6 @@ impl ControlPlaneEngine {
     ) -> Result<MutationResponse, RuntimeError> {
         let envelope = Self::decode_mutation(&entry.payload)?;
         let result = self.apply_mutation(entry.index, envelope.mutation)?;
-        self.last_applied = self.last_applied.max(entry.index);
         Ok(MutationResponse {
             index: entry.index,
             result,
@@ -193,7 +192,7 @@ impl ControlPlaneEngine {
         index: u64,
         mutation: Mutation,
     ) -> Result<DataValue, RuntimeError> {
-        match mutation {
+        let result: Result<DataValue, RuntimeError> = match mutation {
             Mutation::PublishIdl { idl } => {
                 let package = parse_idl(&idl)?;
                 let report = self.control_plane.registry.register_package(package)?;
@@ -237,7 +236,10 @@ impl ControlPlaneEngine {
                 let applied = self.tables.apply(command, index)?;
                 Ok(serialize_table_result(applied))
             }
-        }
+        };
+        let result = result?;
+        self.last_applied = self.last_applied.max(index);
+        Ok(result)
     }
 
     pub fn query(&self, query: Query) -> Result<QueryResponse, RuntimeError> {
@@ -321,7 +323,12 @@ impl ControlPlaneEngine {
             Query::AttributedInfrastructureInventory { filter } => {
                 let plan = build_plan(&self.control_plane)
                     .map_err(|err| RuntimeError::Scheduler(err.to_string()))?;
-                serialize_attributed_infrastructure_inventory(&self.control_plane, &plan, &filter)
+                serialize_attributed_infrastructure_inventory(
+                    &self.control_plane,
+                    &plan,
+                    &filter,
+                    self.last_applied,
+                )
             }
             Query::DiscoveryState { scope } => DataValue::Bytes(
                 encode_rkyv(&authorised_discovery_state(&self.control_plane, &scope)?)
@@ -724,6 +731,7 @@ fn serialize_attributed_infrastructure_inventory(
     state: &ControlPlaneState,
     plan: &SchedulePlan,
     filter: &AttributedInfrastructureFilter,
+    last_applied: u64,
 ) -> DataValue {
     let instances = build_inventory_instances(state, plan);
     let mut instances_by_workload = BTreeMap::<String, Vec<InventoryInstance>>::new();
@@ -853,6 +861,13 @@ fn serialize_attributed_infrastructure_inventory(
         .collect::<Vec<_>>();
 
     DataValue::Map(BTreeMap::from([
+        (
+            "snapshot_marker".to_string(),
+            DataValue::Map(BTreeMap::from([(
+                "last_applied".to_string(),
+                DataValue::from(last_applied),
+            )])),
+        ),
         ("filters".to_string(), serialize_inventory_filter(filter)),
         ("workloads".to_string(), DataValue::List(workload_values)),
         ("pipelines".to_string(), DataValue::List(pipeline_values)),
@@ -1675,6 +1690,84 @@ mod tests {
     }
 
     #[test]
+    fn nodes_live_query_preserves_usage_export_connection_fields() {
+        let mut engine = ControlPlaneEngine::new(ControlPlaneState::default());
+        engine
+            .apply_mutation(
+                1,
+                Mutation::UpsertNode {
+                    spec: NodeSpec {
+                        name: "node-a".to_string(),
+                        capacity_slots: 8,
+                        allocatable_cpu_millis: Some(4_000),
+                        allocatable_memory_mib: Some(8_192),
+                        supported_isolation: vec![
+                            IsolationProfile::Standard,
+                            IsolationProfile::Hardened,
+                        ],
+                        daemon_addr: "127.0.0.1:7200".to_string(),
+                        daemon_server_name: "selium-node-a".to_string(),
+                        last_heartbeat_ms: 95,
+                    },
+                },
+            )
+            .expect("node");
+
+        let query = engine
+            .query(Query::NodesLive {
+                now_ms: 100,
+                max_staleness_ms: 10,
+            })
+            .expect("nodes live");
+        let nodes = query
+            .result
+            .get("nodes")
+            .and_then(DataValue::as_array)
+            .expect("nodes array");
+        assert_eq!(query.result.get("now_ms").and_then(DataValue::as_u64), Some(100));
+        assert_eq!(
+            query.result
+                .get("max_staleness_ms")
+                .and_then(DataValue::as_u64),
+            Some(10)
+        );
+
+        let node = nodes
+            .iter()
+            .find(|node| node.get("name").and_then(DataValue::as_str) == Some("node-a"))
+            .expect("node-a record");
+        assert_eq!(node.get("name").and_then(DataValue::as_str), Some("node-a"));
+        assert_eq!(
+            node.get("daemon_addr").and_then(DataValue::as_str),
+            Some("127.0.0.1:7200")
+        );
+        assert_eq!(
+            node.get("daemon_server_name").and_then(DataValue::as_str),
+            Some("selium-node-a")
+        );
+        assert_eq!(node.get("live").and_then(DataValue::as_bool), Some(true));
+        assert_eq!(node.get("age_ms").and_then(DataValue::as_u64), Some(5));
+        assert_eq!(
+            node.get("allocatable_cpu_millis")
+                .and_then(DataValue::as_u64),
+            Some(4_000)
+        );
+        assert_eq!(
+            node.get("allocatable_memory_mib")
+                .and_then(DataValue::as_u64),
+            Some(8_192)
+        );
+        let supported_isolation = node
+            .get("supported_isolation")
+            .and_then(DataValue::as_array)
+            .expect("supported isolation array")
+            .iter()
+            .filter_map(DataValue::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(supported_isolation, vec!["Standard", "Hardened"]);
+    }
+
+    #[test]
     fn attributed_inventory_query_filters_workloads_modules_pipelines_and_nodes() {
         let mut engine = ControlPlaneEngine::default();
         engine
@@ -1848,6 +1941,17 @@ mod tests {
                 .and_then(DataValue::as_str)
                 == Some("acct-123")
         }));
+
+        let snapshot_marker = query
+            .result
+            .get("snapshot_marker")
+            .expect("snapshot marker");
+        assert_eq!(
+            snapshot_marker
+                .get("last_applied")
+                .and_then(DataValue::as_u64),
+            Some(5)
+        );
 
         let filters = query.result.get("filters").expect("serialized filters");
         assert_eq!(

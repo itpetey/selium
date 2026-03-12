@@ -13,35 +13,43 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::{
+    DataValue, RuntimeUsageQuery, RuntimeUsageRecord, RuntimeUsageReplayStart, decode_rkyv,
+    encode_rkyv,
+};
 use selium_control_plane_protocol::{
     Empty, EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest,
     ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
     MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
-    ReplayApiRequest, ReplayApiResponse, ServiceBridgeSemantics, ServiceCorrelationMode,
-    StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
-    StreamBridgeSemantics, StreamLifecycleMode,
+    ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest, RuntimeUsageApiResponse,
+    ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StartResponse, StatusApiResponse,
+    StopRequest, StopResponse, StreamBridgeSemantics, StreamLifecycleMode,
 };
 use selium_module_control_plane::{
     AgentState, ReconcileAction,
     api::{
-        ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, EventEndpointRef,
-        PipelineEdge, PipelineEndpoint, PipelineSpec, WorkloadRef, collect_contracts_for_workload,
-        ensure_pipeline_consistency, generate_rust_bindings, parse_contract_ref, parse_idl,
+        ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
+        DiscoverableWorkload, DiscoveryCapabilityScope, DiscoveryOperation, DiscoveryPattern,
+        DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, EventEndpointRef,
+        OperationalProcessRecord, OperationalProcessSelector, PipelineEdge, PipelineEndpoint,
+        PipelineSpec, PublicEndpointRef, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
+        collect_contracts_for_workload, ensure_pipeline_consistency, generate_rust_bindings,
+        parse_contract_ref, parse_idl,
     },
     apply, build_module_spec as build_runtime_module_spec,
     default_capabilities as default_runtime_capabilities,
     deployment_module_spec as build_deployment_module_spec, reconcile,
-    runtime::{Mutation, Query},
+    runtime::{AttributedInfrastructureFilter, Mutation, Query},
     scheduler::build_plan,
 };
 use tokio::{signal, time::sleep};
 
 use crate::{
     config::{
-        AdaptorArg, AgentArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs, IdlArgs,
-        IdlCommand, IdlCompileArgs, IdlPublishArgs, IsolationArg, ListArgs, NodesArgs, ObserveArgs,
-        ReplayArgs, ScaleArgs, StartArgs, StopArgs, load_cli,
+        AdaptorArg, AgentArgs, Command, ConnectArgs, DaemonConnectionArgs, DeployArgs,
+        DiscoverArgs, IdlArgs, IdlCommand, IdlCompileArgs, IdlPublishArgs, InventoryArgs,
+        IsolationArg, ListArgs, NodesArgs, ObserveArgs, ReplayArgs, ScaleArgs, StartArgs, StopArgs,
+        UsageArgs, load_cli,
     },
     daemon_client::{DaemonQuicClient, parse_daemon_addr},
 };
@@ -69,6 +77,9 @@ async fn run() -> Result<()> {
                 Command::Scale(args) => cmd_scale(daemon, args).await,
                 Command::Observe(args) => cmd_observe(daemon, args).await,
                 Command::Replay(args) => cmd_replay(daemon, args).await,
+                Command::Discover(args) => cmd_discover(daemon, args).await,
+                Command::Inventory(args) => cmd_inventory(daemon, args).await,
+                Command::Usage(args) => cmd_usage(daemon, args).await,
                 Command::Nodes(args) => cmd_nodes(daemon, args).await,
                 Command::Start(args) => cmd_start(daemon, args).await,
                 Command::Stop(args) => cmd_stop(daemon, args).await,
@@ -325,6 +336,108 @@ fn metrics_value(metrics: &MetricsApiResponse) -> DataValue {
     ]))
 }
 
+fn optional_u64_value(value: Option<u64>) -> DataValue {
+    value.map(DataValue::from).unwrap_or(DataValue::Null)
+}
+
+fn replay_response_value(replay: &ReplayApiResponse) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "start_sequence".to_string(),
+            optional_u64_value(replay.start_sequence),
+        ),
+        (
+            "next_sequence".to_string(),
+            optional_u64_value(replay.next_sequence),
+        ),
+        (
+            "high_watermark".to_string(),
+            optional_u64_value(replay.high_watermark),
+        ),
+        ("events".to_string(), DataValue::List(replay.events.clone())),
+    ]))
+}
+
+fn optional_json_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn optional_json_str(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn string_map_json(map: &BTreeMap<String, String>) -> String {
+    let pairs = map
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{pairs}}}")
+}
+
+fn runtime_usage_record_json(record: &RuntimeUsageRecord) -> String {
+    let sample = &record.sample;
+    format!(
+        concat!(
+            "{{",
+            "\"sequence\":{},",
+            "\"timestamp_ms\":{},",
+            "\"headers\":{},",
+            "\"sample\":{{",
+            "\"workload_key\":\"{}\",",
+            "\"process_id\":\"{}\",",
+            "\"attribution\":{{\"external_account_ref\":{},\"module_id\":\"{}\"}},",
+            "\"window_start_ms\":{},",
+            "\"window_end_ms\":{},",
+            "\"trigger\":\"{:?}\",",
+            "\"cpu_time_millis\":{},",
+            "\"memory_high_watermark_bytes\":{},",
+            "\"memory_byte_millis\":{},",
+            "\"ingress_bytes\":{},",
+            "\"egress_bytes\":{},",
+            "\"storage_read_bytes\":{},",
+            "\"storage_write_bytes\":{}",
+            "}}",
+            "}}"
+        ),
+        record.sequence,
+        record.timestamp_ms,
+        string_map_json(&record.headers),
+        escape_json(&sample.workload_key),
+        escape_json(&sample.process_id),
+        optional_json_str(sample.attribution.external_account_ref.as_deref()),
+        escape_json(&sample.attribution.module_id),
+        sample.window_start_ms,
+        sample.window_end_ms,
+        sample.trigger,
+        sample.cpu_time_millis,
+        sample.memory_high_watermark_bytes,
+        sample.memory_byte_millis,
+        sample.ingress_bytes,
+        sample.egress_bytes,
+        sample.storage_read_bytes,
+        sample.storage_write_bytes,
+    )
+}
+
+fn runtime_usage_response_json(response: &RuntimeUsageApiResponse) -> String {
+    let records = response
+        .records
+        .iter()
+        .map(runtime_usage_record_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"records\":[{records}],\"next_sequence\":{},\"high_watermark\":{}}}",
+        optional_json_u64(response.next_sequence),
+        optional_json_u64(response.high_watermark)
+    )
+}
+
 fn data_value_to_json(value: &DataValue) -> String {
     let mut out = String::new();
     write_data_value_json(&mut out, value);
@@ -402,24 +515,36 @@ fn write_json_string_content(out: &mut String, value: &str) {
     }
 }
 
+fn escape_json(value: &str) -> String {
+    let mut out = String::new();
+    write_json_string_content(&mut out, value);
+    out
+}
+
 async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<()> {
+    let replay_request = replay_request(&args)?;
     let replay: ReplayApiResponse = daemon
-        .request(
-            Method::ControlReplay,
-            &ReplayApiRequest {
-                limit: args.limit,
-                since_sequence: None,
-                external_account_ref: None,
-                workload: None,
-                module: None,
-                pipeline: None,
-                node: None,
-            },
-        )
+        .request(Method::ControlReplay, &replay_request)
         .await?;
 
-    println!("replay events: {}", replay.events.len());
-    if let Some(workload) = replay_workload_ref(args)? {
+    if args.json {
+        println!("{}", data_value_to_json(&replay_response_value(&replay)));
+        return Ok(());
+    }
+
+    println!(
+        "replay events={} start_sequence={} high_watermark={}",
+        replay.events.len(),
+        replay
+            .start_sequence
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        replay
+            .high_watermark
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    if let Some(workload) = replay_selected_workload(args)? {
         let state = cp_query_state(&daemon, true).await?;
         let contracts = collect_contracts_for_workload(&state, &workload)
             .into_iter()
@@ -428,6 +553,124 @@ async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<(
         println!("workload contracts: {}", contracts.join(", "));
     }
     println!("{:#?}", replay.events);
+    Ok(())
+}
+
+async fn cmd_discover(daemon: Arc<DaemonQuicClient>, args: DiscoverArgs) -> Result<()> {
+    match discover_query(&args)? {
+        DiscoverQuery::State(scope) => {
+            let discovery = cp_query_discovery_state(&daemon, scope, true).await?;
+            if args.json {
+                println!("{}", data_value_to_json(&discovery_state_value(&discovery)));
+                return Ok(());
+            }
+
+            println!(
+                "discover workloads={} endpoints={}",
+                discovery.workloads.len(),
+                discovery.endpoints.len()
+            );
+            for workload in &discovery.workloads {
+                println!(
+                    "{} endpoints={}",
+                    workload.workload.key(),
+                    workload.endpoints.len()
+                );
+            }
+        }
+        DiscoverQuery::Resolve(request) => {
+            let resolution = cp_query_discovery_resolution(&daemon, request, true).await?;
+            if args.json {
+                println!(
+                    "{}",
+                    data_value_to_json(&discovery_resolution_value(&resolution))
+                );
+                return Ok(());
+            }
+
+            match resolution {
+                DiscoveryResolution::Workload(workload) => {
+                    println!(
+                        "workload {} endpoints={}",
+                        workload.workload.key(),
+                        workload.endpoints.len()
+                    );
+                }
+                DiscoveryResolution::Endpoint(endpoint) => {
+                    println!(
+                        "endpoint {} contract={}",
+                        endpoint.endpoint.key(),
+                        contract_ref_key(&endpoint.contract)
+                    );
+                }
+                DiscoveryResolution::RunningProcess(process) => {
+                    println!(
+                        "running_process workload={} replica_key={} node={}",
+                        process.workload.key(),
+                        process.replica_key,
+                        process.node
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_inventory(daemon: Arc<DaemonQuicClient>, args: InventoryArgs) -> Result<()> {
+    let inventory = cp_query_value(
+        &daemon,
+        Query::AttributedInfrastructureInventory {
+            filter: AttributedInfrastructureFilter {
+                external_account_ref: args.external_account_ref,
+                workload: args.workload,
+                module: args.module,
+                pipeline: args.pipeline,
+                node: args.node,
+            },
+        },
+        true,
+    )
+    .await?;
+
+    if args.json {
+        println!("{}", data_value_to_json(&inventory));
+        return Ok(());
+    }
+
+    println!(
+        "inventory workloads={} pipelines={} modules={} nodes={}",
+        list_len(&inventory, "workloads"),
+        list_len(&inventory, "pipelines"),
+        list_len(&inventory, "modules"),
+        list_len(&inventory, "nodes")
+    );
+    Ok(())
+}
+
+async fn cmd_usage(daemon: Arc<DaemonQuicClient>, args: UsageArgs) -> Result<()> {
+    let usage: RuntimeUsageApiResponse = daemon
+        .request(Method::RuntimeUsageQuery, &runtime_usage_request(&args)?)
+        .await?;
+
+    if args.json {
+        println!("{}", runtime_usage_response_json(&usage));
+        return Ok(());
+    }
+
+    println!(
+        "usage records={} next_sequence={} high_watermark={}",
+        usage.records.len(),
+        usage
+            .next_sequence
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        usage
+            .high_watermark
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
     Ok(())
 }
 
@@ -443,7 +686,7 @@ async fn cmd_nodes(daemon: Arc<DaemonQuicClient>, args: NodesArgs) -> Result<()>
     .await?;
 
     if args.json {
-        println!("{:#?}", nodes);
+        println!("{}", data_value_to_json(&nodes));
     } else {
         let list = nodes
             .get("nodes")
@@ -747,6 +990,40 @@ async fn cp_query_value(
         .ok_or_else(|| anyhow!("control-plane query returned no result"))
 }
 
+async fn cp_query_discovery_state(
+    daemon: &DaemonQuicClient,
+    scope: DiscoveryCapabilityScope,
+    allow_stale: bool,
+) -> Result<DiscoveryState> {
+    let value = cp_query_value(daemon, Query::DiscoveryState { scope }, allow_stale).await?;
+    let bytes = match value {
+        DataValue::Bytes(bytes) => bytes,
+        other => {
+            return Err(anyhow!(
+                "invalid discovery state payload (expected bytes), got {other:?}"
+            ));
+        }
+    };
+    decode_rkyv(&bytes).context("decode discovery state")
+}
+
+async fn cp_query_discovery_resolution(
+    daemon: &DaemonQuicClient,
+    request: DiscoveryRequest,
+    allow_stale: bool,
+) -> Result<DiscoveryResolution> {
+    let value = cp_query_value(daemon, Query::ResolveDiscovery { request }, allow_stale).await?;
+    let bytes = match value {
+        DataValue::Bytes(bytes) => bytes,
+        other => {
+            return Err(anyhow!(
+                "invalid discovery resolution payload (expected bytes), got {other:?}"
+            ));
+        }
+    };
+    decode_rkyv(&bytes).context("decode discovery resolution")
+}
+
 async fn cp_query_state(daemon: &DaemonQuicClient, allow_stale: bool) -> Result<ControlPlaneState> {
     let value = cp_query_value(daemon, Query::ControlPlaneState, allow_stale).await?;
     let bytes = match value {
@@ -908,16 +1185,405 @@ fn workload_ref(tenant: String, namespace: String, workload: String) -> Workload
     }
 }
 
-fn replay_workload_ref(args: ReplayArgs) -> Result<Option<WorkloadRef>> {
-    match (args.tenant, args.namespace, args.workload) {
-        (Some(tenant), Some(namespace), Some(workload)) => {
-            Ok(Some(workload_ref(tenant, namespace, workload)))
-        }
-        (None, None, None) => Ok(None),
+fn replay_request(args: &ReplayArgs) -> Result<ReplayApiRequest> {
+    Ok(ReplayApiRequest {
+        limit: args.limit,
+        since_sequence: args.since_sequence,
+        checkpoint: None,
+        save_checkpoint: None,
+        external_account_ref: args.external_account_ref.clone(),
+        workload: replay_workload_key(args)?,
+        module: args.module.clone(),
+        pipeline: args.pipeline.clone(),
+        node: args.node.clone(),
+    })
+}
+
+fn runtime_usage_request(args: &UsageArgs) -> Result<RuntimeUsageApiRequest> {
+    Ok(RuntimeUsageApiRequest {
+        node_id: args.node.clone(),
+        query: RuntimeUsageQuery {
+            start: runtime_usage_start(args)?,
+            save_checkpoint: None,
+            limit: args.limit,
+            external_account_ref: args.external_account_ref.clone(),
+            workload: args.workload.clone(),
+            module: args.module.clone(),
+            window_start_ms: args.window_start_ms,
+            window_end_ms: args.window_end_ms,
+        },
+    })
+}
+
+fn runtime_usage_start(args: &UsageArgs) -> Result<RuntimeUsageReplayStart> {
+    match (args.latest, args.since_sequence, args.since_timestamp_ms) {
+        (false, None, None) => Ok(RuntimeUsageReplayStart::Earliest),
+        (true, None, None) => Ok(RuntimeUsageReplayStart::Latest),
+        (false, Some(sequence), None) => Ok(RuntimeUsageReplayStart::Sequence(sequence)),
+        (false, None, Some(timestamp_ms)) => Ok(RuntimeUsageReplayStart::Timestamp(timestamp_ms)),
+        _ => Err(anyhow!(
+            "provide at most one of --latest, --since-sequence, or --since-timestamp-ms when exporting runtime usage"
+        )),
+    }
+}
+
+fn replay_workload_key(args: &ReplayArgs) -> Result<Option<String>> {
+    match (
+        args.workload_key.as_deref(),
+        args.tenant.as_deref(),
+        args.namespace.as_deref(),
+        args.workload.as_deref(),
+    ) {
+        (Some(workload_key), None, None, None) => Ok(Some(workload_key.to_string())),
+        (None, Some(tenant), Some(namespace), Some(workload)) => Ok(Some(
+            workload_ref(
+                tenant.to_string(),
+                namespace.to_string(),
+                workload.to_string(),
+            )
+            .key(),
+        )),
+        (None, None, None, None) => Ok(None),
+        (Some(_), _, _, _) => Err(anyhow!(
+            "provide either --workload-key or --tenant/--namespace/--workload when filtering replay output"
+        )),
         _ => Err(anyhow!(
             "provide --tenant, --namespace, and --workload together when filtering replay output"
         )),
     }
+}
+
+fn replay_selected_workload(args: ReplayArgs) -> Result<Option<WorkloadRef>> {
+    match (
+        args.workload_key,
+        args.tenant,
+        args.namespace,
+        args.workload,
+    ) {
+        (Some(workload_key), None, None, None) => parse_workload_key(&workload_key).map(Some),
+        (None, Some(tenant), Some(namespace), Some(workload)) => {
+            Ok(Some(workload_ref(tenant, namespace, workload)))
+        }
+        (None, None, None, None) => Ok(None),
+        (Some(_), _, _, _) => Err(anyhow!(
+            "provide either --workload-key or --tenant/--namespace/--workload when filtering replay output"
+        )),
+        _ => Err(anyhow!(
+            "provide --tenant, --namespace, and --workload together when filtering replay output"
+        )),
+    }
+}
+
+enum DiscoverQuery {
+    State(DiscoveryCapabilityScope),
+    Resolve(DiscoveryRequest),
+}
+
+fn discover_query(args: &DiscoverArgs) -> Result<DiscoverQuery> {
+    if let Some(workload_key) = args.resolve_workload.as_deref() {
+        let workload = parse_workload_key(workload_key)?;
+        return Ok(DiscoverQuery::Resolve(DiscoveryRequest {
+            scope: discovery_scope(
+                args,
+                Some(DiscoveryPattern::Exact(workload.key())),
+                DiscoveryOperation::Discover,
+                false,
+            ),
+            operation: DiscoveryOperation::Discover,
+            target: DiscoveryTarget::Workload(workload),
+        }));
+    }
+
+    if let Some(endpoint_key) = args.resolve_endpoint.as_deref() {
+        let endpoint = parse_public_endpoint_key(endpoint_key)?;
+        return Ok(DiscoverQuery::Resolve(DiscoveryRequest {
+            scope: discovery_scope(
+                args,
+                Some(DiscoveryPattern::Exact(endpoint.workload.key())),
+                DiscoveryOperation::Bind,
+                false,
+            ),
+            operation: DiscoveryOperation::Bind,
+            target: DiscoveryTarget::Endpoint(endpoint),
+        }));
+    }
+
+    if let Some(workload_key) = args.resolve_running_workload.as_deref() {
+        let workload = parse_workload_key(workload_key)?;
+        return Ok(DiscoverQuery::Resolve(DiscoveryRequest {
+            scope: discovery_scope(
+                args,
+                Some(DiscoveryPattern::Exact(workload.key())),
+                DiscoveryOperation::Discover,
+                true,
+            ),
+            operation: DiscoveryOperation::Discover,
+            target: DiscoveryTarget::RunningProcess(OperationalProcessSelector::Workload(workload)),
+        }));
+    }
+
+    if let Some(replica_key) = args.resolve_replica_key.as_deref() {
+        return Ok(DiscoverQuery::Resolve(DiscoveryRequest {
+            scope: discovery_scope(args, None, DiscoveryOperation::Discover, true),
+            operation: DiscoveryOperation::Discover,
+            target: DiscoveryTarget::RunningProcess(OperationalProcessSelector::ReplicaKey(
+                replica_key.to_string(),
+            )),
+        }));
+    }
+
+    Ok(DiscoverQuery::State(discovery_scope(
+        args,
+        None,
+        DiscoveryOperation::Discover,
+        false,
+    )))
+}
+
+fn discovery_scope(
+    args: &DiscoverArgs,
+    default_workload: Option<DiscoveryPattern>,
+    operation: DiscoveryOperation,
+    require_operational_processes: bool,
+) -> DiscoveryCapabilityScope {
+    let mut workloads = args
+        .workloads
+        .iter()
+        .cloned()
+        .map(DiscoveryPattern::Exact)
+        .collect::<Vec<_>>();
+    workloads.extend(
+        args.workload_prefixes
+            .iter()
+            .cloned()
+            .map(DiscoveryPattern::Prefix),
+    );
+    if workloads.is_empty() {
+        workloads.push(default_workload.unwrap_or_else(|| DiscoveryPattern::Prefix(String::new())));
+    }
+
+    DiscoveryCapabilityScope {
+        operations: vec![operation],
+        workloads,
+        endpoints: Vec::new(),
+        allow_operational_processes: args.allow_operational_processes
+            || require_operational_processes,
+    }
+}
+
+fn parse_workload_key(value: &str) -> Result<WorkloadRef> {
+    let mut parts = value.split('/');
+    let (Some(tenant), Some(namespace), Some(workload), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(anyhow!(
+            "workload keys must use tenant/namespace/workload form, got {value}"
+        ));
+    };
+    Ok(workload_ref(
+        tenant.to_string(),
+        namespace.to_string(),
+        workload.to_string(),
+    ))
+}
+
+fn parse_public_endpoint_key(value: &str) -> Result<PublicEndpointRef> {
+    let (workload_key, endpoint_key) = value.split_once('#').ok_or_else(|| {
+        anyhow!(
+            "public endpoint keys must use tenant/namespace/workload#kind:name form, got {value}"
+        )
+    })?;
+    let workload = parse_workload_key(workload_key)?;
+    let (kind, name) = endpoint_key.split_once(':').ok_or_else(|| {
+        anyhow!(
+            "public endpoint keys must use tenant/namespace/workload#kind:name form, got {value}"
+        )
+    })?;
+    let kind = match kind {
+        "event" => ContractKind::Event,
+        "service" => ContractKind::Service,
+        "stream" => ContractKind::Stream,
+        other => {
+            return Err(anyhow!(
+                "unsupported public endpoint kind {other}; expected event, service, or stream"
+            ));
+        }
+    };
+    Ok(PublicEndpointRef {
+        workload,
+        kind,
+        name: name.to_string(),
+    })
+}
+
+fn contract_ref_value(contract: &ContractRef) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "namespace".to_string(),
+            DataValue::from(contract.namespace.to_string()),
+        ),
+        (
+            "kind".to_string(),
+            DataValue::from(contract.kind.as_str().to_string()),
+        ),
+        (
+            "name".to_string(),
+            DataValue::from(contract.name.to_string()),
+        ),
+        (
+            "version".to_string(),
+            DataValue::from(contract.version.to_string()),
+        ),
+    ]))
+}
+
+fn contract_ref_key(contract: &ContractRef) -> String {
+    format!(
+        "{}/{}:{}@{}",
+        contract.namespace,
+        contract.kind.as_str(),
+        contract.name,
+        contract.version
+    )
+}
+
+fn public_endpoint_value(endpoint: &PublicEndpointRef) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("endpoint".to_string(), DataValue::from(endpoint.key())),
+        (
+            "workload".to_string(),
+            DataValue::from(endpoint.workload.key()),
+        ),
+        (
+            "kind".to_string(),
+            DataValue::from(endpoint.kind.as_str().to_string()),
+        ),
+        ("name".to_string(), DataValue::from(endpoint.name.clone())),
+    ]))
+}
+
+fn discoverable_workload_value(workload: &DiscoverableWorkload) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "workload".to_string(),
+            DataValue::from(workload.workload.key()),
+        ),
+        (
+            "endpoints".to_string(),
+            DataValue::List(
+                workload
+                    .endpoints
+                    .iter()
+                    .map(public_endpoint_value)
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn discoverable_endpoint_value(endpoint: &DiscoverableEndpoint) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "endpoint".to_string(),
+            public_endpoint_value(&endpoint.endpoint),
+        ),
+        (
+            "contract".to_string(),
+            contract_ref_value(&endpoint.contract),
+        ),
+    ]))
+}
+
+fn resolved_workload_value(workload: &ResolvedWorkload) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("kind".to_string(), DataValue::from("workload".to_string())),
+        (
+            "workload".to_string(),
+            DataValue::from(workload.workload.key()),
+        ),
+        (
+            "endpoints".to_string(),
+            DataValue::List(
+                workload
+                    .endpoints
+                    .iter()
+                    .map(discoverable_endpoint_value)
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn resolved_endpoint_value(endpoint: &ResolvedEndpoint) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        ("kind".to_string(), DataValue::from("endpoint".to_string())),
+        (
+            "endpoint".to_string(),
+            public_endpoint_value(&endpoint.endpoint),
+        ),
+        (
+            "contract".to_string(),
+            contract_ref_value(&endpoint.contract),
+        ),
+    ]))
+}
+
+fn operational_process_value(process: &OperationalProcessRecord) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "kind".to_string(),
+            DataValue::from("running_process".to_string()),
+        ),
+        (
+            "workload".to_string(),
+            DataValue::from(process.workload.key()),
+        ),
+        (
+            "replica_key".to_string(),
+            DataValue::from(process.replica_key.clone()),
+        ),
+        ("node".to_string(), DataValue::from(process.node.clone())),
+    ]))
+}
+
+fn discovery_state_value(discovery: &DiscoveryState) -> DataValue {
+    DataValue::Map(BTreeMap::from([
+        (
+            "workloads".to_string(),
+            DataValue::List(
+                discovery
+                    .workloads
+                    .iter()
+                    .map(discoverable_workload_value)
+                    .collect(),
+            ),
+        ),
+        (
+            "endpoints".to_string(),
+            DataValue::List(
+                discovery
+                    .endpoints
+                    .iter()
+                    .map(discoverable_endpoint_value)
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn discovery_resolution_value(resolution: &DiscoveryResolution) -> DataValue {
+    match resolution {
+        DiscoveryResolution::Workload(workload) => resolved_workload_value(workload),
+        DiscoveryResolution::Endpoint(endpoint) => resolved_endpoint_value(endpoint),
+        DiscoveryResolution::RunningProcess(process) => operational_process_value(process),
+    }
+}
+
+fn list_len(value: &DataValue, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(DataValue::as_array)
+        .map_or(0, |items| items.len())
 }
 
 fn qualified_pipeline_key(tenant: &str, namespace: &str, pipeline: &str) -> String {
@@ -1041,5 +1707,295 @@ mod tests {
             data_value_to_json(&value),
             "{\"note\":\"line\\n\\\"two\\\"\"}"
         );
+    }
+
+    #[test]
+    fn replay_response_value_preserves_cursor_fields() {
+        let value = replay_response_value(&ReplayApiResponse {
+            events: vec![DataValue::Map(BTreeMap::from([(
+                "sequence".to_string(),
+                DataValue::from(41_u64),
+            )]))],
+            start_sequence: Some(41),
+            next_sequence: Some(42),
+            high_watermark: Some(56),
+        });
+
+        assert_eq!(
+            value.get("start_sequence").and_then(DataValue::as_u64),
+            Some(41)
+        );
+        assert_eq!(
+            value.get("next_sequence").and_then(DataValue::as_u64),
+            Some(42)
+        );
+        assert_eq!(
+            value.get("high_watermark").and_then(DataValue::as_u64),
+            Some(56)
+        );
+        assert_eq!(list_len(&value, "events"), 1);
+    }
+
+    #[test]
+    fn data_value_to_json_preserves_inventory_snapshot_marker() {
+        let value = DataValue::Map(BTreeMap::from([
+            (
+                "snapshot_marker".to_string(),
+                DataValue::Map(BTreeMap::from([(
+                    "last_applied".to_string(),
+                    DataValue::from(41_u64),
+                )])),
+            ),
+            ("workloads".to_string(), DataValue::List(Vec::new())),
+        ]));
+
+        assert_eq!(
+            data_value_to_json(&value),
+            "{\"snapshot_marker\":{\"last_applied\":41},\"workloads\":[]}"
+        );
+    }
+
+    #[test]
+    fn discovery_state_value_preserves_machine_consumable_output_shape() {
+        let workload = workload_ref(
+            "tenant-a".to_string(),
+            "media".to_string(),
+            "router".to_string(),
+        );
+        let endpoint = PublicEndpointRef {
+            workload: workload.clone(),
+            kind: ContractKind::Service,
+            name: "camera.detect".to_string(),
+        };
+        let discovery = DiscoveryState {
+            workloads: vec![DiscoverableWorkload {
+                workload: workload.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            endpoints: vec![DiscoverableEndpoint {
+                endpoint: endpoint.clone(),
+                contract: ContractRef {
+                    namespace: "media.pipeline".to_string(),
+                    kind: ContractKind::Service,
+                    name: "camera.detect".to_string(),
+                    version: "v1".to_string(),
+                },
+            }],
+        };
+
+        assert_eq!(
+            data_value_to_json(&discovery_state_value(&discovery)),
+            "{\"endpoints\":[{\"contract\":{\"kind\":\"service\",\"name\":\"camera.detect\",\"namespace\":\"media.pipeline\",\"version\":\"v1\"},\"endpoint\":{\"endpoint\":\"tenant-a/media/router#service:camera.detect\",\"kind\":\"service\",\"name\":\"camera.detect\",\"workload\":\"tenant-a/media/router\"}}],\"workloads\":[{\"endpoints\":[{\"endpoint\":\"tenant-a/media/router#service:camera.detect\",\"kind\":\"service\",\"name\":\"camera.detect\",\"workload\":\"tenant-a/media/router\"}],\"workload\":\"tenant-a/media/router\"}]}"
+        );
+    }
+
+    #[test]
+    fn data_value_to_json_preserves_nodes_live_capability_fields() {
+        let value = DataValue::Map(BTreeMap::from([
+            ("now_ms".to_string(), DataValue::from(100_u64)),
+            (
+                "nodes".to_string(),
+                DataValue::List(vec![DataValue::Map(BTreeMap::from([
+                    ("name".to_string(), DataValue::from("node-a")),
+                    (
+                        "daemon_addr".to_string(),
+                        DataValue::from("127.0.0.1:7200"),
+                    ),
+                    (
+                        "daemon_server_name".to_string(),
+                        DataValue::from("selium-node-a"),
+                    ),
+                    ("live".to_string(), DataValue::from(true)),
+                    (
+                        "supported_isolation".to_string(),
+                        DataValue::List(vec![
+                            DataValue::from("standard"),
+                            DataValue::from("hardened"),
+                        ]),
+                    ),
+                ]))]),
+            ),
+        ]));
+
+        assert_eq!(
+            data_value_to_json(&value),
+            "{\"nodes\":[{\"daemon_addr\":\"127.0.0.1:7200\",\"daemon_server_name\":\"selium-node-a\",\"live\":true,\"name\":\"node-a\",\"supported_isolation\":[\"standard\",\"hardened\"]}],\"now_ms\":100}"
+        );
+    }
+
+    #[test]
+    fn discover_query_defaults_scope_to_resolved_endpoint_workload() {
+        let DiscoverQuery::Resolve(request) = discover_query(&DiscoverArgs {
+            workloads: Vec::new(),
+            workload_prefixes: Vec::new(),
+            resolve_workload: None,
+            resolve_endpoint: Some("tenant-a/media/router#service:camera.detect".to_string()),
+            resolve_running_workload: None,
+            resolve_replica_key: None,
+            allow_operational_processes: false,
+            json: true,
+        })
+        .expect("build discovery request") else {
+            panic!("expected resolve request");
+        };
+
+        assert_eq!(request.operation, DiscoveryOperation::Bind);
+        assert_eq!(request.scope.operations, vec![DiscoveryOperation::Bind]);
+        assert_eq!(request.scope.workloads.len(), 1);
+        assert_eq!(
+            request.scope.workloads[0],
+            DiscoveryPattern::Exact("tenant-a/media/router".to_string())
+        );
+    }
+
+    #[test]
+    fn discovery_resolution_value_preserves_running_process_fields() {
+        let value = discovery_resolution_value(&DiscoveryResolution::RunningProcess(
+            OperationalProcessRecord {
+                workload: workload_ref(
+                    "tenant-a".to_string(),
+                    "media".to_string(),
+                    "router".to_string(),
+                ),
+                replica_key: "router-0001".to_string(),
+                node: "node-a".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            value.get("kind").and_then(DataValue::as_str),
+            Some("running_process")
+        );
+        assert_eq!(
+            value.get("workload").and_then(DataValue::as_str),
+            Some("tenant-a/media/router")
+        );
+        assert_eq!(
+            value.get("replica_key").and_then(DataValue::as_str),
+            Some("router-0001")
+        );
+        assert_eq!(
+            value.get("node").and_then(DataValue::as_str),
+            Some("node-a")
+        );
+    }
+
+    #[test]
+    fn replay_request_prefers_workload_key_filter() {
+        let request = replay_request(&ReplayArgs {
+            limit: 25,
+            since_sequence: Some(41),
+            external_account_ref: Some("acct-123".to_string()),
+            workload_key: Some("tenant-a/media/ingest".to_string()),
+            tenant: None,
+            namespace: None,
+            workload: None,
+            module: Some("ingest.wasm".to_string()),
+            pipeline: Some("tenant-a/media/camera".to_string()),
+            node: Some("node-a".to_string()),
+            json: true,
+        })
+        .expect("build replay request");
+
+        assert_eq!(request.since_sequence, Some(41));
+        assert_eq!(request.external_account_ref.as_deref(), Some("acct-123"));
+        assert_eq!(request.workload.as_deref(), Some("tenant-a/media/ingest"));
+        assert_eq!(request.module.as_deref(), Some("ingest.wasm"));
+        assert_eq!(request.pipeline.as_deref(), Some("tenant-a/media/camera"));
+        assert_eq!(request.node.as_deref(), Some("node-a"));
+    }
+
+    #[test]
+    fn replay_request_rejects_mixed_workload_filters() {
+        let err = replay_request(&ReplayArgs {
+            limit: 10,
+            since_sequence: None,
+            external_account_ref: None,
+            workload_key: Some("tenant-a/media/ingest".to_string()),
+            tenant: Some("tenant-a".to_string()),
+            namespace: Some("media".to_string()),
+            workload: Some("ingest".to_string()),
+            module: None,
+            pipeline: None,
+            node: None,
+            json: false,
+        })
+        .expect_err("mixed workload filters should fail");
+
+        assert!(
+            err.to_string()
+                .contains("either --workload-key or --tenant/--namespace/--workload")
+        );
+    }
+
+    #[test]
+    fn runtime_usage_request_preserves_filters_and_cursor() {
+        let request = runtime_usage_request(&UsageArgs {
+            node: "node-a".to_string(),
+            limit: 25,
+            latest: false,
+            since_sequence: Some(41),
+            since_timestamp_ms: None,
+            external_account_ref: Some("acct-123".to_string()),
+            workload: Some("tenant-a/media/ingest".to_string()),
+            module: Some("ingest.wasm".to_string()),
+            window_start_ms: Some(1_000),
+            window_end_ms: Some(2_000),
+            json: true,
+        })
+        .expect("build runtime usage request");
+
+        assert_eq!(request.node_id, "node-a");
+        assert_eq!(request.query.start, RuntimeUsageReplayStart::Sequence(41));
+        assert_eq!(
+            request.query.external_account_ref.as_deref(),
+            Some("acct-123")
+        );
+        assert_eq!(
+            request.query.workload.as_deref(),
+            Some("tenant-a/media/ingest")
+        );
+        assert_eq!(request.query.module.as_deref(), Some("ingest.wasm"));
+        assert_eq!(request.query.window_start_ms, Some(1_000));
+        assert_eq!(request.query.window_end_ms, Some(2_000));
+    }
+
+    #[test]
+    fn runtime_usage_response_json_preserves_cursor_fields() {
+        let json = runtime_usage_response_json(&RuntimeUsageApiResponse {
+            records: vec![RuntimeUsageRecord {
+                sequence: 41,
+                timestamp_ms: 1_500,
+                headers: BTreeMap::from([(
+                    "external_account_ref".to_string(),
+                    "acct-123".to_string(),
+                )]),
+                sample: selium_abi::RuntimeUsageSample {
+                    workload_key: "tenant-a/media/ingest".to_string(),
+                    process_id: "process-7".to_string(),
+                    attribution: selium_abi::RuntimeUsageAttribution {
+                        external_account_ref: Some("acct-123".to_string()),
+                        module_id: "ingest.wasm".to_string(),
+                    },
+                    window_start_ms: 1_000,
+                    window_end_ms: 2_000,
+                    trigger: selium_abi::RuntimeUsageSampleTrigger::Interval,
+                    cpu_time_millis: 10,
+                    memory_high_watermark_bytes: 4096,
+                    memory_byte_millis: 8192,
+                    ingress_bytes: 7,
+                    egress_bytes: 11,
+                    storage_read_bytes: 13,
+                    storage_write_bytes: 17,
+                },
+            }],
+            next_sequence: Some(42),
+            high_watermark: Some(56),
+        });
+
+        assert!(json.contains("\"next_sequence\":42"));
+        assert!(json.contains("\"high_watermark\":56"));
+        assert!(json.contains("\"memory_byte_millis\":8192"));
+        assert!(json.contains("\"module_id\":\"ingest.wasm\""));
     }
 }

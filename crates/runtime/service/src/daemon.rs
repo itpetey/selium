@@ -1053,8 +1053,14 @@ async fn query_runtime_usage(
         .ok_or_else(|| anyhow!("runtime usage collector unavailable"))?;
     let result = collector.replay_usage(&payload.query).await?;
     let high_watermark = result.high_watermark;
+    let next_sequence =
+        next_runtime_usage_sequence(&payload.query, &result.records, high_watermark);
+    if let Some(name) = payload.query.save_checkpoint.as_deref() {
+        let checkpoint_sequence = next_sequence.unwrap_or(collector.next_sequence().await);
+        collector.checkpoint(name, checkpoint_sequence).await?;
+    }
     Ok(RuntimeUsageApiResponse {
-        next_sequence: next_runtime_usage_sequence(&payload.query, &result.records, high_watermark),
+        next_sequence,
         records: result.records,
         high_watermark,
     })
@@ -1076,6 +1082,7 @@ fn next_runtime_usage_sequence(
         selium_abi::RuntimeUsageReplayStart::Sequence(sequence) => {
             Some(advanced.map_or(sequence, |next| next.max(sequence)))
         }
+        selium_abi::RuntimeUsageReplayStart::Checkpoint(_) => advanced,
         _ => advanced,
     }
 }
@@ -3253,6 +3260,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 query: RuntimeUsageQuery {
                     start: RuntimeUsageReplayStart::Earliest,
+                    save_checkpoint: None,
                     limit: 1,
                     external_account_ref: Some("acct-a".to_string()),
                     workload: Some("tenant-a/media/ingest".to_string()),
@@ -3283,6 +3291,7 @@ mod tests {
                     start: RuntimeUsageReplayStart::Sequence(
                         response.next_sequence.expect("resume sequence"),
                     ),
+                    save_checkpoint: None,
                     limit: 10,
                     external_account_ref: Some("acct-a".to_string()),
                     workload: Some("tenant-a/media/ingest".to_string()),
@@ -3333,6 +3342,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 query: RuntimeUsageQuery {
                     start: RuntimeUsageReplayStart::Sequence(1),
+                    save_checkpoint: None,
                     limit: 0,
                     external_account_ref: Some("acct-a".to_string()),
                     workload: Some("tenant-a/media/ingest".to_string()),
@@ -3348,6 +3358,126 @@ mod tests {
         assert!(response.records.is_empty());
         assert!(response.high_watermark.is_some());
         assert_eq!(response.next_sequence, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_usage_query_can_save_and_resume_named_checkpoint() {
+        let state = sample_state("node-a");
+        let collector = state
+            .kernel
+            .get::<crate::usage::RuntimeUsageCollector>()
+            .cloned()
+            .expect("collector available");
+        let first = collector
+            .register_process(
+                "tenant-a/media/ingest",
+                "process-a",
+                ProcessUsageAttribution {
+                    instance_id: Some("tenant-a/media/ingest/0".to_string()),
+                    external_account_ref: Some("acct-a".to_string()),
+                    module_id: "module-a".to_string(),
+                },
+            )
+            .await
+            .expect("register first process");
+        sleep(Duration::from_millis(2)).await;
+        first.finish().await.expect("finish first process");
+
+        let second = collector
+            .register_process(
+                "tenant-a/media/ingest",
+                "process-b",
+                ProcessUsageAttribution {
+                    instance_id: Some("tenant-a/media/ingest/1".to_string()),
+                    external_account_ref: Some("acct-a".to_string()),
+                    module_id: "module-a".to_string(),
+                },
+            )
+            .await
+            .expect("register second process");
+        sleep(Duration::from_millis(2)).await;
+        second.finish().await.expect("finish second process");
+
+        let response = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Earliest,
+                    save_checkpoint: Some("usage-export".to_string()),
+                    limit: 1,
+                    external_account_ref: Some("acct-a".to_string()),
+                    workload: Some("tenant-a/media/ingest".to_string()),
+                    module: Some("module-a".to_string()),
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect("query runtime usage");
+
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].sample.process_id, "process-a");
+        assert_eq!(
+            collector.checkpoint_sequence("usage-export").await,
+            response.next_sequence
+        );
+
+        let resumed = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Checkpoint("usage-export".to_string()),
+                    save_checkpoint: Some("usage-export".to_string()),
+                    limit: 10,
+                    external_account_ref: Some("acct-a".to_string()),
+                    workload: Some("tenant-a/media/ingest".to_string()),
+                    module: Some("module-a".to_string()),
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect("resume named checkpoint");
+
+        assert_eq!(resumed.records.len(), 1);
+        assert_eq!(resumed.records[0].sample.process_id, "process-b");
+        assert_eq!(
+            collector.checkpoint_sequence("usage-export").await,
+            resumed.next_sequence
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_usage_query_missing_checkpoint_fails_deterministically() {
+        let state = sample_state("node-a");
+        let err = query_runtime_usage(
+            &state,
+            &RuntimeUsageApiRequest {
+                node_id: "node-a".to_string(),
+                query: RuntimeUsageQuery {
+                    start: RuntimeUsageReplayStart::Checkpoint("missing".to_string()),
+                    save_checkpoint: None,
+                    limit: 10,
+                    external_account_ref: None,
+                    workload: None,
+                    module: None,
+                    window_start_ms: None,
+                    window_end_ms: None,
+                },
+            },
+        )
+        .await
+        .expect_err("missing checkpoint should fail");
+
+        assert!(err.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("checkpoint `missing` does not exist")
+        }));
     }
 
     fn sample_state(node_id: &str) -> Rc<DaemonState> {

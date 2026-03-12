@@ -68,6 +68,7 @@ async fn replay_usage_filters_by_attribution_and_time_window() {
     let result = collector
         .replay_usage(&RuntimeUsageQuery {
             start: RuntimeUsageReplayStart::Earliest,
+            save_checkpoint: None,
             limit: 10,
             external_account_ref: Some("acct-a".to_string()),
             workload: Some("workload-a".to_string()),
@@ -144,6 +145,7 @@ async fn restart_recovery_advances_next_sample_window() {
     let replayed = recovered
         .replay_usage(&RuntimeUsageQuery {
             start: RuntimeUsageReplayStart::Earliest,
+            save_checkpoint: None,
             limit: 10,
             external_account_ref: Some("acct-a".to_string()),
             workload: Some("workload-a".to_string()),
@@ -171,6 +173,7 @@ async fn replay_all(collector: &RuntimeUsageCollector) -> RuntimeUsageQueryResul
     collector
         .replay_usage(&RuntimeUsageQuery {
             start: RuntimeUsageReplayStart::Earliest,
+            save_checkpoint: None,
             limit: 10,
             external_account_ref: None,
             workload: None,

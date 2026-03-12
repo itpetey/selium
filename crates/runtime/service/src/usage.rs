@@ -192,10 +192,27 @@ impl RuntimeUsageCollector {
         })
     }
 
+    pub(crate) async fn checkpoint(&self, name: impl Into<String>, sequence: u64) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        store
+            .checkpoint(name, sequence)
+            .context("checkpoint runtime usage replay cursor")
+    }
+
+    pub(crate) async fn next_sequence(&self) -> u64 {
+        self.inner.store.lock().await.next_sequence()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn checkpoint_sequence(&self, name: &str) -> Option<u64> {
+        self.inner.store.lock().await.checkpoint_sequence(name)
+    }
+
     #[cfg(test)]
     async fn read_samples(&self) -> Vec<RuntimeUsageSample> {
         self.replay_usage(&RuntimeUsageQuery {
             start: RuntimeUsageReplayStart::Earliest,
+            save_checkpoint: None,
             limit: usize::MAX,
             external_account_ref: None,
             workload: None,
@@ -435,6 +452,7 @@ fn effective_replay_start(query: &RuntimeUsageQuery) -> ReplayStart {
         RuntimeUsageReplayStart::Latest => ReplayStart::Latest,
         RuntimeUsageReplayStart::Sequence(sequence) => ReplayStart::Sequence(sequence),
         RuntimeUsageReplayStart::Timestamp(timestamp_ms) => ReplayStart::Timestamp(timestamp_ms),
+        RuntimeUsageReplayStart::Checkpoint(ref name) => ReplayStart::Checkpoint(name.clone()),
     }
 }
 

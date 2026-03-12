@@ -41,6 +41,9 @@ pub(crate) enum Command {
     Scale(ScaleArgs),
     Observe(ObserveArgs),
     Replay(ReplayArgs),
+    Discover(DiscoverArgs),
+    Inventory(InventoryArgs),
+    Usage(UsageArgs),
     Nodes(NodesArgs),
     Start(StartArgs),
     Stop(StopArgs),
@@ -108,11 +111,87 @@ pub(crate) struct ReplayArgs {
     #[arg(long, default_value_t = 50)]
     pub(crate) limit: usize,
     #[arg(long)]
+    pub(crate) since_sequence: Option<u64>,
+    #[arg(long)]
+    pub(crate) external_account_ref: Option<String>,
+    #[arg(long)]
+    pub(crate) workload_key: Option<String>,
+    #[arg(long)]
     pub(crate) tenant: Option<String>,
     #[arg(long)]
     pub(crate) namespace: Option<String>,
     #[arg(long, alias = "app")]
     pub(crate) workload: Option<String>,
+    #[arg(long)]
+    pub(crate) module: Option<String>,
+    #[arg(long)]
+    pub(crate) pipeline: Option<String>,
+    #[arg(long)]
+    pub(crate) node: Option<String>,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DiscoverArgs {
+    #[arg(long = "workload")]
+    pub(crate) workloads: Vec<String>,
+    #[arg(long = "workload-prefix")]
+    pub(crate) workload_prefixes: Vec<String>,
+    #[arg(long)]
+    pub(crate) resolve_workload: Option<String>,
+    #[arg(long)]
+    pub(crate) resolve_endpoint: Option<String>,
+    #[arg(long)]
+    pub(crate) resolve_running_workload: Option<String>,
+    #[arg(long)]
+    pub(crate) resolve_replica_key: Option<String>,
+    #[arg(long)]
+    pub(crate) allow_operational_processes: bool,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InventoryArgs {
+    #[arg(long)]
+    pub(crate) external_account_ref: Option<String>,
+    #[arg(long)]
+    pub(crate) workload: Option<String>,
+    #[arg(long)]
+    pub(crate) module: Option<String>,
+    #[arg(long)]
+    pub(crate) pipeline: Option<String>,
+    #[arg(long)]
+    pub(crate) node: Option<String>,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UsageArgs {
+    #[arg(long)]
+    pub(crate) node: String,
+    #[arg(long, default_value_t = 50)]
+    pub(crate) limit: usize,
+    #[arg(long)]
+    pub(crate) latest: bool,
+    #[arg(long)]
+    pub(crate) since_sequence: Option<u64>,
+    #[arg(long)]
+    pub(crate) since_timestamp_ms: Option<u64>,
+    #[arg(long)]
+    pub(crate) external_account_ref: Option<String>,
+    #[arg(long)]
+    pub(crate) workload: Option<String>,
+    #[arg(long)]
+    pub(crate) module: Option<String>,
+    #[arg(long)]
+    pub(crate) window_start_ms: Option<u64>,
+    #[arg(long)]
+    pub(crate) window_end_ms: Option<u64>,
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +349,12 @@ enum RawCommand {
     Observe(RawObserveArgs),
     /// Show recent control-plane replay events.
     Replay(RawReplayArgs),
+    /// Discover workloads, endpoints, and running processes from Selium-native state.
+    Discover(RawDiscoverArgs),
+    /// Query attributed infrastructure inventory for external consumers.
+    Inventory(RawInventoryArgs),
+    /// Export attributed runtime usage records from a specific node daemon.
+    Usage(RawUsageArgs),
     /// List nodes that are considered live by the control plane.
     Nodes(RawNodesArgs),
     /// Start a specific instance directly on a node.
@@ -376,6 +461,15 @@ struct RawReplayArgs {
     /// Maximum number of replay events to fetch.
     #[arg(long, value_name = "COUNT")]
     limit: Option<usize>,
+    /// Start replay from this durable sequence, inclusive.
+    #[arg(long, value_name = "SEQUENCE")]
+    since_sequence: Option<u64>,
+    /// Filter output to one opaque external account reference.
+    #[arg(long, value_name = "EXTERNAL_ACCOUNT_REF")]
+    external_account_ref: Option<String>,
+    /// Filter output to one fully-qualified workload key.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    workload_key: Option<String>,
     /// Filter output to a tenant when combined with namespace and workload.
     #[arg(long, value_name = "TENANT")]
     tenant: Option<String>,
@@ -386,6 +480,111 @@ struct RawReplayArgs {
     #[arg(long, alias = "app", value_name = "WORKLOAD")]
     #[serde(alias = "app")]
     workload: Option<String>,
+    /// Filter output to one Selium module identifier.
+    #[arg(long, value_name = "MODULE")]
+    module: Option<String>,
+    /// Filter output to one fully-qualified pipeline key.
+    #[arg(long, value_name = "TENANT/NAMESPACE/PIPELINE")]
+    pipeline: Option<String>,
+    /// Filter output to one node name.
+    #[arg(long, value_name = "NODE")]
+    node: Option<String>,
+    /// Print the replay payload as machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Discover workloads, endpoints, and running processes from Selium-native state.
+#[derive(Debug, Args, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct RawDiscoverArgs {
+    /// Restrict discovery to one exact workload key. Repeat to include multiple workloads.
+    #[arg(long = "workload", value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    workloads: Vec<String>,
+    /// Restrict discovery to workloads whose keys start with this prefix. Repeat to include multiple prefixes.
+    #[arg(long = "workload-prefix", value_name = "PREFIX")]
+    workload_prefixes: Vec<String>,
+    /// Resolve one workload to its discoverable public endpoints.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    resolve_workload: Option<String>,
+    /// Resolve one public endpoint to its bound contract.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD#KIND:ENDPOINT")]
+    resolve_endpoint: Option<String>,
+    /// Resolve one workload to a running process, preserving operational replica identity when unambiguous.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    resolve_running_workload: Option<String>,
+    /// Resolve one exact running replica key.
+    #[arg(long, value_name = "REPLICA_KEY")]
+    resolve_replica_key: Option<String>,
+    /// Permit running-process discovery output when resolving operational targets.
+    #[arg(long)]
+    allow_operational_processes: bool,
+    /// Print the discovery payload as machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Query attributed workload, module, pipeline, and node inventory.
+#[derive(Debug, Args, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct RawInventoryArgs {
+    /// Filter output to one opaque external account reference.
+    #[arg(long, value_name = "EXTERNAL_ACCOUNT_REF")]
+    external_account_ref: Option<String>,
+    /// Filter output to one fully-qualified workload key.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    workload: Option<String>,
+    /// Filter output to one Selium module identifier.
+    #[arg(long, value_name = "MODULE")]
+    module: Option<String>,
+    /// Filter output to one fully-qualified pipeline key.
+    #[arg(long, value_name = "TENANT/NAMESPACE/PIPELINE")]
+    pipeline: Option<String>,
+    /// Filter output to one node name.
+    #[arg(long, value_name = "NODE")]
+    node: Option<String>,
+    /// Print the inventory payload as machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Export attributed runtime usage records from a specific node daemon.
+#[derive(Debug, Args, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+struct RawUsageArgs {
+    /// Node expected to serve the runtime usage export.
+    #[arg(long, value_name = "NODE")]
+    node: Option<String>,
+    /// Maximum number of runtime usage records to fetch.
+    #[arg(long, value_name = "COUNT")]
+    limit: Option<usize>,
+    /// Start from the newest retained usage record.
+    #[arg(long)]
+    latest: bool,
+    /// Start from this durable usage sequence, inclusive.
+    #[arg(long, value_name = "SEQUENCE")]
+    since_sequence: Option<u64>,
+    /// Start from this durable usage timestamp, inclusive.
+    #[arg(long, value_name = "TIMESTAMP_MS")]
+    since_timestamp_ms: Option<u64>,
+    /// Filter output to one opaque external account reference.
+    #[arg(long, value_name = "EXTERNAL_ACCOUNT_REF")]
+    external_account_ref: Option<String>,
+    /// Filter output to one fully-qualified workload key.
+    #[arg(long, value_name = "TENANT/NAMESPACE/WORKLOAD")]
+    workload: Option<String>,
+    /// Filter output to one Selium module identifier.
+    #[arg(long, value_name = "MODULE")]
+    module: Option<String>,
+    /// Filter output to samples whose window overlaps this inclusive lower bound.
+    #[arg(long, value_name = "TIMESTAMP_MS")]
+    window_start_ms: Option<u64>,
+    /// Filter output to samples whose window overlaps this exclusive upper bound.
+    #[arg(long, value_name = "TIMESTAMP_MS")]
+    window_end_ms: Option<u64>,
+    /// Print the runtime usage payload as machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// List nodes that are currently live.
@@ -529,6 +728,9 @@ struct CliConfig {
     scale: Option<RawScaleArgs>,
     observe: Option<RawObserveArgs>,
     replay: Option<RawReplayArgs>,
+    discover: Option<RawDiscoverArgs>,
+    inventory: Option<RawInventoryArgs>,
+    usage: Option<RawUsageArgs>,
     nodes: Option<RawNodesArgs>,
     start: Option<RawStartArgs>,
     stop: Option<RawStopArgs>,
@@ -623,6 +825,9 @@ impl RawCommand {
             RawCommand::Scale(args) => Command::Scale(args.resolve()?),
             RawCommand::Observe(args) => Command::Observe(args.resolve()),
             RawCommand::Replay(args) => Command::Replay(args.resolve()),
+            RawCommand::Discover(args) => Command::Discover(args.resolve()?),
+            RawCommand::Inventory(args) => Command::Inventory(args.resolve()),
+            RawCommand::Usage(args) => Command::Usage(args.resolve()?),
             RawCommand::Nodes(args) => Command::Nodes(args.resolve()),
             RawCommand::Start(args) => Command::Start(args.resolve()?),
             RawCommand::Stop(args) => Command::Stop(args.resolve()?),
@@ -682,10 +887,78 @@ impl RawReplayArgs {
     fn resolve(self) -> ReplayArgs {
         ReplayArgs {
             limit: self.limit.unwrap_or(50),
+            since_sequence: self.since_sequence,
+            external_account_ref: self.external_account_ref,
+            workload_key: self.workload_key,
             tenant: self.tenant,
             namespace: self.namespace,
             workload: self.workload,
+            module: self.module,
+            pipeline: self.pipeline,
+            node: self.node,
+            json: self.json,
         }
+    }
+}
+
+impl RawDiscoverArgs {
+    fn resolve(self) -> Result<DiscoverArgs> {
+        let resolve_target_count = [
+            self.resolve_workload.is_some(),
+            self.resolve_endpoint.is_some(),
+            self.resolve_running_workload.is_some(),
+            self.resolve_replica_key.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if resolve_target_count > 1 {
+            return Err(anyhow!(
+                "provide at most one of --resolve-workload, --resolve-endpoint, --resolve-running-workload, or --resolve-replica-key"
+            ));
+        }
+
+        Ok(DiscoverArgs {
+            workloads: self.workloads,
+            workload_prefixes: self.workload_prefixes,
+            resolve_workload: self.resolve_workload,
+            resolve_endpoint: self.resolve_endpoint,
+            resolve_running_workload: self.resolve_running_workload,
+            resolve_replica_key: self.resolve_replica_key,
+            allow_operational_processes: self.allow_operational_processes,
+            json: self.json,
+        })
+    }
+}
+
+impl RawInventoryArgs {
+    fn resolve(self) -> InventoryArgs {
+        InventoryArgs {
+            external_account_ref: self.external_account_ref,
+            workload: self.workload,
+            module: self.module,
+            pipeline: self.pipeline,
+            node: self.node,
+            json: self.json,
+        }
+    }
+}
+
+impl RawUsageArgs {
+    fn resolve(self) -> Result<UsageArgs> {
+        Ok(UsageArgs {
+            node: self.node.context("usage --node is required")?,
+            limit: self.limit.unwrap_or(50),
+            latest: self.latest,
+            since_sequence: self.since_sequence,
+            since_timestamp_ms: self.since_timestamp_ms,
+            external_account_ref: self.external_account_ref,
+            workload: self.workload,
+            module: self.module,
+            window_start_ms: self.window_start_ms,
+            window_end_ms: self.window_end_ms,
+            json: self.json,
+        })
     }
 }
 
@@ -782,6 +1055,9 @@ fn merge_cli_config(raw: &mut RawCli, matches: &clap::ArgMatches, config: CliCon
         scale,
         observe,
         replay,
+        discover,
+        inventory,
+        usage,
         nodes,
         start,
         stop,
@@ -801,6 +1077,9 @@ fn merge_cli_config(raw: &mut RawCli, matches: &clap::ArgMatches, config: CliCon
         scale,
         observe,
         replay,
+        discover,
+        inventory,
+        usage,
         nodes,
         start,
         stop,
@@ -808,37 +1087,46 @@ fn merge_cli_config(raw: &mut RawCli, matches: &clap::ArgMatches, config: CliCon
         agent,
         idl,
     ) {
-        (RawCommand::Deploy(args), Some(cfg), _, _, _, _, _, _, _, _, _, _) => {
+        (RawCommand::Deploy(args), Some(cfg), _, _, _, _, _, _, _, _, _, _, _, _, _) => {
             merge_deploy_config(args, matches.subcommand_matches("deploy"), cfg);
         }
-        (RawCommand::Connect(args), _, Some(cfg), _, _, _, _, _, _, _, _, _) => {
+        (RawCommand::Connect(args), _, Some(cfg), _, _, _, _, _, _, _, _, _, _, _, _) => {
             merge_connect_config(args, matches.subcommand_matches("connect"), cfg);
         }
-        (RawCommand::Scale(args), _, _, Some(cfg), _, _, _, _, _, _, _, _) => {
+        (RawCommand::Scale(args), _, _, Some(cfg), _, _, _, _, _, _, _, _, _, _, _) => {
             merge_scale_config(args, matches.subcommand_matches("scale"), cfg);
         }
-        (RawCommand::Observe(args), _, _, _, Some(cfg), _, _, _, _, _, _, _) => {
+        (RawCommand::Observe(args), _, _, _, Some(cfg), _, _, _, _, _, _, _, _, _, _) => {
             merge_observe_config(args, matches.subcommand_matches("observe"), cfg);
         }
-        (RawCommand::Replay(args), _, _, _, _, Some(cfg), _, _, _, _, _, _) => {
+        (RawCommand::Replay(args), _, _, _, _, Some(cfg), _, _, _, _, _, _, _, _, _) => {
             merge_replay_config(args, matches.subcommand_matches("replay"), cfg);
         }
-        (RawCommand::Nodes(args), _, _, _, _, _, Some(cfg), _, _, _, _, _) => {
+        (RawCommand::Discover(args), _, _, _, _, _, Some(cfg), _, _, _, _, _, _, _, _) => {
+            merge_discover_config(args, matches.subcommand_matches("discover"), cfg);
+        }
+        (RawCommand::Inventory(args), _, _, _, _, _, _, Some(cfg), _, _, _, _, _, _, _) => {
+            merge_inventory_config(args, matches.subcommand_matches("inventory"), cfg);
+        }
+        (RawCommand::Usage(args), _, _, _, _, _, _, _, Some(cfg), _, _, _, _, _, _) => {
+            merge_usage_config(args, matches.subcommand_matches("usage"), cfg);
+        }
+        (RawCommand::Nodes(args), _, _, _, _, _, _, _, _, Some(cfg), _, _, _, _, _) => {
             merge_nodes_config(args, matches.subcommand_matches("nodes"), cfg);
         }
-        (RawCommand::Start(args), _, _, _, _, _, _, Some(cfg), _, _, _, _) => {
+        (RawCommand::Start(args), _, _, _, _, _, _, _, _, _, Some(cfg), _, _, _, _) => {
             merge_start_config(args, matches.subcommand_matches("start"), cfg);
         }
-        (RawCommand::Stop(args), _, _, _, _, _, _, _, Some(cfg), _, _, _) => {
+        (RawCommand::Stop(args), _, _, _, _, _, _, _, _, _, _, Some(cfg), _, _, _) => {
             merge_stop_config(args, matches.subcommand_matches("stop"), cfg);
         }
-        (RawCommand::List(args), _, _, _, _, _, _, _, _, Some(cfg), _, _) => {
+        (RawCommand::List(args), _, _, _, _, _, _, _, _, _, _, _, Some(cfg), _, _) => {
             merge_list_config(args, matches.subcommand_matches("list"), cfg);
         }
-        (RawCommand::Agent(args), _, _, _, _, _, _, _, _, _, Some(cfg), _) => {
+        (RawCommand::Agent(args), _, _, _, _, _, _, _, _, _, _, _, _, Some(cfg), _) => {
             merge_agent_config(args, matches.subcommand_matches("agent"), cfg);
         }
-        (RawCommand::Idl(args), _, _, _, _, _, _, _, _, _, _, Some(cfg)) => {
+        (RawCommand::Idl(args), _, _, _, _, _, _, _, _, _, _, _, _, _, Some(cfg)) => {
             merge_idl_config(args, matches.subcommand_matches("idl"), cfg);
         }
         _ => {}
@@ -994,6 +1282,21 @@ fn merge_replay_config(
 ) {
     let value_source = |name| matches.and_then(|m| m.value_source(name));
     merge_option(&mut args.limit, value_source("limit"), config.limit);
+    merge_option(
+        &mut args.since_sequence,
+        value_source("since_sequence"),
+        config.since_sequence,
+    );
+    merge_option(
+        &mut args.external_account_ref,
+        value_source("external_account_ref"),
+        config.external_account_ref,
+    );
+    merge_option(
+        &mut args.workload_key,
+        value_source("workload_key"),
+        config.workload_key,
+    );
     merge_option(&mut args.tenant, value_source("tenant"), config.tenant);
     merge_option(
         &mut args.namespace,
@@ -1005,6 +1308,127 @@ fn merge_replay_config(
         value_source("workload"),
         config.workload,
     );
+    merge_option(&mut args.module, value_source("module"), config.module);
+    merge_option(
+        &mut args.pipeline,
+        value_source("pipeline"),
+        config.pipeline,
+    );
+    merge_option(&mut args.node, value_source("node"), config.node);
+    merge_bool(&mut args.json, value_source("json"), config.json);
+}
+
+fn merge_discover_config(
+    args: &mut RawDiscoverArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: RawDiscoverArgs,
+) {
+    let value_source = |name| matches.and_then(|m| m.value_source(name));
+    merge_vec(
+        &mut args.workloads,
+        value_source("workloads"),
+        config.workloads,
+    );
+    merge_vec(
+        &mut args.workload_prefixes,
+        value_source("workload_prefixes"),
+        config.workload_prefixes,
+    );
+    merge_option(
+        &mut args.resolve_workload,
+        value_source("resolve_workload"),
+        config.resolve_workload,
+    );
+    merge_option(
+        &mut args.resolve_endpoint,
+        value_source("resolve_endpoint"),
+        config.resolve_endpoint,
+    );
+    merge_option(
+        &mut args.resolve_running_workload,
+        value_source("resolve_running_workload"),
+        config.resolve_running_workload,
+    );
+    merge_option(
+        &mut args.resolve_replica_key,
+        value_source("resolve_replica_key"),
+        config.resolve_replica_key,
+    );
+    merge_bool(
+        &mut args.allow_operational_processes,
+        value_source("allow_operational_processes"),
+        config.allow_operational_processes,
+    );
+    merge_bool(&mut args.json, value_source("json"), config.json);
+}
+
+fn merge_inventory_config(
+    args: &mut RawInventoryArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: RawInventoryArgs,
+) {
+    let value_source = |name| matches.and_then(|m| m.value_source(name));
+    merge_option(
+        &mut args.external_account_ref,
+        value_source("external_account_ref"),
+        config.external_account_ref,
+    );
+    merge_option(
+        &mut args.workload,
+        value_source("workload"),
+        config.workload,
+    );
+    merge_option(&mut args.module, value_source("module"), config.module);
+    merge_option(
+        &mut args.pipeline,
+        value_source("pipeline"),
+        config.pipeline,
+    );
+    merge_option(&mut args.node, value_source("node"), config.node);
+    merge_bool(&mut args.json, value_source("json"), config.json);
+}
+
+fn merge_usage_config(
+    args: &mut RawUsageArgs,
+    matches: Option<&clap::ArgMatches>,
+    config: RawUsageArgs,
+) {
+    let value_source = |name| matches.and_then(|m| m.value_source(name));
+    merge_option(&mut args.node, value_source("node"), config.node);
+    merge_option(&mut args.limit, value_source("limit"), config.limit);
+    merge_bool(&mut args.latest, value_source("latest"), config.latest);
+    merge_option(
+        &mut args.since_sequence,
+        value_source("since_sequence"),
+        config.since_sequence,
+    );
+    merge_option(
+        &mut args.since_timestamp_ms,
+        value_source("since_timestamp_ms"),
+        config.since_timestamp_ms,
+    );
+    merge_option(
+        &mut args.external_account_ref,
+        value_source("external_account_ref"),
+        config.external_account_ref,
+    );
+    merge_option(
+        &mut args.workload,
+        value_source("workload"),
+        config.workload,
+    );
+    merge_option(&mut args.module, value_source("module"), config.module);
+    merge_option(
+        &mut args.window_start_ms,
+        value_source("window_start_ms"),
+        config.window_start_ms,
+    );
+    merge_option(
+        &mut args.window_end_ms,
+        value_source("window_end_ms"),
+        config.window_end_ms,
+    );
+    merge_bool(&mut args.json, value_source("json"), config.json);
 }
 
 fn merge_nodes_config(
@@ -1321,12 +1745,163 @@ module = "module.wasm"
     }
 
     #[test]
+    fn replay_command_preserves_export_filters_and_json_flag() {
+        let cli = load_cli_from([
+            "selium",
+            "replay",
+            "--limit",
+            "25",
+            "--since-sequence",
+            "41",
+            "--external-account-ref",
+            "acct-123",
+            "--workload-key",
+            "tenant-a/media/ingest",
+            "--module",
+            "ingest.wasm",
+            "--pipeline",
+            "tenant-a/media/camera",
+            "--node",
+            "node-a",
+            "--json",
+        ])
+        .expect("parse replay command");
+
+        let Command::Replay(args) = cli.command else {
+            panic!("expected replay command");
+        };
+        assert_eq!(args.limit, 25);
+        assert_eq!(args.since_sequence, Some(41));
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-123"));
+        assert_eq!(args.workload_key.as_deref(), Some("tenant-a/media/ingest"));
+        assert_eq!(args.module.as_deref(), Some("ingest.wasm"));
+        assert_eq!(args.pipeline.as_deref(), Some("tenant-a/media/camera"));
+        assert_eq!(args.node.as_deref(), Some("node-a"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn inventory_command_parses_external_consumer_filters() {
+        let cli = load_cli_from([
+            "selium",
+            "inventory",
+            "--external-account-ref",
+            "acct-123",
+            "--workload",
+            "tenant-a/media/ingest",
+            "--module",
+            "ingest.wasm",
+            "--pipeline",
+            "tenant-a/media/camera",
+            "--node",
+            "node-a",
+            "--json",
+        ])
+        .expect("parse inventory command");
+
+        let Command::Inventory(args) = cli.command else {
+            panic!("expected inventory command");
+        };
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-123"));
+        assert_eq!(args.workload.as_deref(), Some("tenant-a/media/ingest"));
+        assert_eq!(args.module.as_deref(), Some("ingest.wasm"));
+        assert_eq!(args.pipeline.as_deref(), Some("tenant-a/media/camera"));
+        assert_eq!(args.node.as_deref(), Some("node-a"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn usage_command_parses_export_cursor_and_filters() {
+        let cli = load_cli_from([
+            "selium",
+            "usage",
+            "--node",
+            "node-a",
+            "--limit",
+            "25",
+            "--since-sequence",
+            "41",
+            "--external-account-ref",
+            "acct-123",
+            "--workload",
+            "tenant-a/media/ingest",
+            "--module",
+            "ingest.wasm",
+            "--window-start-ms",
+            "1000",
+            "--window-end-ms",
+            "2000",
+            "--json",
+        ])
+        .expect("parse usage command");
+
+        let Command::Usage(args) = cli.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(args.node, "node-a");
+        assert_eq!(args.limit, 25);
+        assert_eq!(args.since_sequence, Some(41));
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-123"));
+        assert_eq!(args.workload.as_deref(), Some("tenant-a/media/ingest"));
+        assert_eq!(args.module.as_deref(), Some("ingest.wasm"));
+        assert_eq!(args.window_start_ms, Some(1_000));
+        assert_eq!(args.window_end_ms, Some(2_000));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn discover_command_parses_state_filters() {
+        let cli = load_cli_from([
+            "selium",
+            "discover",
+            "--workload",
+            "tenant-a/media/router",
+            "--workload-prefix",
+            "tenant-a/",
+            "--allow-operational-processes",
+            "--json",
+        ])
+        .expect("parse discover command");
+
+        let Command::Discover(args) = cli.command else {
+            panic!("expected discover command");
+        };
+        assert_eq!(args.workloads, vec!["tenant-a/media/router".to_string()]);
+        assert_eq!(args.workload_prefixes, vec!["tenant-a/".to_string()]);
+        assert!(args.allow_operational_processes);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn discover_command_rejects_multiple_resolve_targets() {
+        let err = load_cli_from([
+            "selium",
+            "discover",
+            "--resolve-workload",
+            "tenant-a/media/router",
+            "--resolve-endpoint",
+            "tenant-a/media/router#service:camera.detect",
+        ])
+        .expect_err("multiple resolve targets should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("provide at most one of --resolve-workload")
+        );
+    }
+
+    #[test]
     fn root_help_describes_top_level_commands() {
         let mut command = RawCli::command();
         let help = command.render_long_help().to_string();
 
         assert!(help.contains("Manage Selium control-plane resources and node instances."));
         assert!(help.contains("Create or update a workload deployment in the control plane"));
+        assert!(help.contains("Discover workloads, endpoints, and running processes"));
+        assert!(help.contains("Query attributed infrastructure inventory for external consumers"));
+        assert!(
+            help.contains("Export attributed runtime usage records from a specific node daemon")
+        );
         assert!(help.contains("Run the reconciliation agent loop for a node"));
     }
 

@@ -154,6 +154,10 @@ pub struct ReplayApiRequest {
     pub limit: usize,
     /// Inclusive sequence cursor to resume replay from when present.
     pub since_sequence: Option<u64>,
+    /// Optional Selium-managed checkpoint name to resolve into the replay start cursor.
+    pub checkpoint: Option<String>,
+    /// Optional Selium-managed checkpoint name to create or advance to the response cursor.
+    pub save_checkpoint: Option<String>,
     /// Restrict results to this external account reference when present.
     pub external_account_ref: Option<String>,
     /// Restrict results to this workload key when present.
@@ -766,7 +770,9 @@ mod tests {
     fn control_replay_request_and_response_round_trip_filters_and_bounds() {
         let request = ReplayApiRequest {
             limit: 25,
-            since_sequence: Some(41),
+            since_sequence: None,
+            checkpoint: Some("replay-cursor".to_string()),
+            save_checkpoint: Some("replay-cursor-next".to_string()),
             external_account_ref: Some("acct-123".to_string()),
             workload: Some("tenant-a/media/ingest".to_string()),
             module: Some("ingest.wasm".to_string()),
@@ -798,7 +804,8 @@ mod tests {
         let request = RuntimeUsageApiRequest {
             node_id: "node-a".to_string(),
             query: RuntimeUsageQuery {
-                start: selium_abi::RuntimeUsageReplayStart::Sequence(41),
+                start: selium_abi::RuntimeUsageReplayStart::Checkpoint("usage-cursor".to_string()),
+                save_checkpoint: Some("usage-cursor-next".to_string()),
                 limit: 25,
                 external_account_ref: Some("acct-123".to_string()),
                 workload: Some("tenant-a/media/ingest".to_string()),

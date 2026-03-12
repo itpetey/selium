@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{
     DataValue, StorageLogBoundsResult, StorageLogRecord, StorageReplayStart, decode_rkyv,
@@ -751,34 +751,80 @@ async fn handle_replay(
 ) -> Result<ReplayApiResponse> {
     let event_log = state.borrow().event_log;
     let bounds = event_log.bounds().await?;
-    let start_sequence = replay_start_sequence(&bounds, &request);
+    let checkpoint_sequence = replay_requested_checkpoint_sequence(&event_log, &request).await?;
+    let start_sequence = replay_start_sequence(&bounds, &request, checkpoint_sequence);
     let Some(start) = start_sequence else {
+        if let Some(name) = request.save_checkpoint.as_deref() {
+            event_log
+                .checkpoint(
+                    name,
+                    replay_checkpoint_sequence_to_save(
+                        &request,
+                        checkpoint_sequence,
+                        None,
+                        bounds.next_sequence,
+                    ),
+                )
+                .await?;
+        }
         return Ok(ReplayApiResponse {
             events: Vec::new(),
             start_sequence: None,
+            next_sequence: None,
             high_watermark: bounds.latest_sequence,
         });
     };
 
     let limit = replay_fetch_limit(&bounds, start, request.limit);
     if limit == 0 {
+        let next_sequence = replay_next_sequence(&request, &[], bounds.latest_sequence);
+        if let Some(name) = request.save_checkpoint.as_deref() {
+            event_log
+                .checkpoint(
+                    name,
+                    replay_checkpoint_sequence_to_save(
+                        &request,
+                        checkpoint_sequence,
+                        next_sequence,
+                        bounds.next_sequence,
+                    ),
+                )
+                .await?;
+        }
         return Ok(ReplayApiResponse {
             events: Vec::new(),
             start_sequence: Some(start),
+            next_sequence,
             high_watermark: bounds.latest_sequence,
         });
     }
 
-    let (records, high_watermark) = event_log
-        .replay(StorageReplayStart::Sequence(start), limit)
-        .await?;
-    let events = select_replay_records(records, &request)
-        .into_iter()
-        .map(replay_record_value)
-        .collect();
+    let replay_start = request
+        .checkpoint
+        .as_ref()
+        .map(|name| StorageReplayStart::Checkpoint(name.clone()))
+        .unwrap_or(StorageReplayStart::Sequence(start));
+    let (records, high_watermark) = event_log.replay(replay_start, limit).await?;
+    let selected = select_replay_records(records, &request);
+    let next_sequence = replay_next_sequence(&request, &selected, high_watermark);
+    if let Some(name) = request.save_checkpoint.as_deref() {
+        event_log
+            .checkpoint(
+                name,
+                replay_checkpoint_sequence_to_save(
+                    &request,
+                    checkpoint_sequence,
+                    next_sequence,
+                    bounds.next_sequence,
+                ),
+            )
+            .await?;
+    }
+    let events = selected.into_iter().map(replay_record_value).collect();
     Ok(ReplayApiResponse {
         events,
         start_sequence: Some(start),
+        next_sequence,
         high_watermark,
     })
 }
@@ -786,9 +832,13 @@ async fn handle_replay(
 fn replay_start_sequence(
     bounds: &StorageLogBoundsResult,
     request: &selium_control_plane_protocol::ReplayApiRequest,
+    checkpoint_sequence: Option<u64>,
 ) -> Option<u64> {
     if request.limit == 0 {
         return None;
+    }
+    if let Some(sequence) = checkpoint_sequence {
+        return Some(sequence);
     }
     let first = bounds.first_sequence?;
     let latest = bounds.latest_sequence?;
@@ -830,6 +880,10 @@ fn replay_has_filters(request: &selium_control_plane_protocol::ReplayApiRequest)
         || request.node.is_some()
 }
 
+fn replay_pages_forward(request: &selium_control_plane_protocol::ReplayApiRequest) -> bool {
+    request.since_sequence.is_some() || request.checkpoint.is_some() || replay_has_filters(request)
+}
+
 fn select_replay_records(
     records: Vec<StorageLogRecord>,
     request: &selium_control_plane_protocol::ReplayApiRequest,
@@ -838,13 +892,79 @@ fn select_replay_records(
         .into_iter()
         .filter(|record| replay_record_matches(record, request))
         .collect::<Vec<_>>();
-    if request.since_sequence.is_some() {
+    if replay_pages_forward(request) {
         matching.truncate(request.limit);
         return matching;
     }
     let keep = matching.len().saturating_sub(request.limit);
     matching.drain(0..keep);
     matching
+}
+
+fn replay_next_sequence(
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+    records: &[StorageLogRecord],
+    high_watermark: Option<u64>,
+) -> Option<u64> {
+    if request.limit == 0 {
+        return None;
+    }
+    if let Some(record) = records.last() {
+        return Some(record.sequence.saturating_add(1));
+    }
+    let advanced = high_watermark.map(|sequence| sequence.saturating_add(1));
+    if replay_pages_forward(request) {
+        return request
+            .since_sequence
+            .map(|sequence| advanced.map_or(sequence, |next| next.max(sequence)))
+            .or(advanced);
+    }
+    advanced
+}
+
+fn replay_requested_checkpoint_name(
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+) -> Result<Option<&str>> {
+    let Some(name) = request.checkpoint.as_deref() else {
+        return Ok(None);
+    };
+    if request.since_sequence.is_some() {
+        bail!("replay request cannot set both since_sequence and checkpoint");
+    }
+    if name.trim().is_empty() {
+        bail!("invalid checkpoint name");
+    }
+    Ok(Some(name))
+}
+
+fn replay_checkpoint_sequence_or_err(name: &str, checkpoint_sequence: Option<u64>) -> Result<u64> {
+    checkpoint_sequence.ok_or_else(|| anyhow!("checkpoint `{name}` does not exist"))
+}
+
+async fn replay_requested_checkpoint_sequence(
+    event_log: &storage::Log,
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+) -> Result<Option<u64>> {
+    let Some(name) = replay_requested_checkpoint_name(request)? else {
+        return Ok(None);
+    };
+    let checkpoint_sequence = event_log.checkpoint_sequence(name).await?;
+    Ok(Some(replay_checkpoint_sequence_or_err(
+        name,
+        checkpoint_sequence,
+    )?))
+}
+
+fn replay_checkpoint_sequence_to_save(
+    request: &selium_control_plane_protocol::ReplayApiRequest,
+    checkpoint_sequence: Option<u64>,
+    next_sequence: Option<u64>,
+    current_next_sequence: u64,
+) -> u64 {
+    next_sequence
+        .or(checkpoint_sequence)
+        .or(request.since_sequence)
+        .unwrap_or(current_next_sequence)
 }
 
 fn replay_record_matches(
@@ -1652,11 +1772,11 @@ fn anyhow_from_runtime(err: RuntimeError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_control_plane_protocol::ReplayApiRequest;
     use selium_control_plane_api::{
         BandwidthProfile, ContractRef, DeploymentSpec, EventEndpointRef, ExternalAccountRef,
         PipelineEdge, PipelineEndpoint, PipelineSpec, VolumeMount, WorkloadRef, parse_idl,
     };
+    use selium_control_plane_protocol::ReplayApiRequest;
 
     const SAMPLE_IDL: &str = r#"
 package media.pipeline.v1;
@@ -2248,6 +2368,8 @@ event camera.frames(Frame) {
         let request = ReplayApiRequest {
             limit: 2,
             since_sequence: Some(12),
+            checkpoint: None,
+            save_checkpoint: None,
             external_account_ref: Some("acct-123".to_string()),
             workload: None,
             module: None,
@@ -2260,7 +2382,7 @@ event camera.frames(Frame) {
             latest_sequence: Some(14),
             next_sequence: 15,
         };
-        assert_eq!(replay_start_sequence(&bounds, &request), Some(12));
+        assert_eq!(replay_start_sequence(&bounds, &request, None), Some(12));
 
         let selected = select_replay_records(
             vec![
@@ -2301,6 +2423,200 @@ event camera.frames(Frame) {
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
             vec![12, 14]
+        );
+        assert_eq!(
+            replay_next_sequence(&request, &selected, Some(14)),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn replay_selection_with_filters_and_no_cursor_pages_forward() {
+        let request = ReplayApiRequest {
+            limit: 2,
+            since_sequence: None,
+            checkpoint: None,
+            save_checkpoint: None,
+            external_account_ref: Some("acct-123".to_string()),
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+
+        let selected = select_replay_records(
+            vec![
+                StorageLogRecord {
+                    sequence: 11,
+                    timestamp_ms: 1,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-123".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 12,
+                    timestamp_ms: 2,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-999".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 13,
+                    timestamp_ms: 3,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-123".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 14,
+                    timestamp_ms: 4,
+                    headers: BTreeMap::from([(
+                        "external_account_ref".to_string(),
+                        "acct-123".to_string(),
+                    )]),
+                    payload: Vec::new(),
+                },
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![11, 13]
+        );
+        assert_eq!(
+            replay_next_sequence(&request, &selected, Some(14)),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn replay_next_sequence_preserves_cursor_ahead_of_high_watermark() {
+        let request = ReplayApiRequest {
+            limit: 5,
+            since_sequence: Some(25),
+            checkpoint: None,
+            save_checkpoint: None,
+            external_account_ref: Some("acct-123".to_string()),
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+
+        assert_eq!(replay_next_sequence(&request, &[], Some(14)), Some(25));
+    }
+
+    #[test]
+    fn replay_checkpoint_pages_forward_and_advances_cursor() {
+        let request = ReplayApiRequest {
+            limit: 2,
+            since_sequence: None,
+            checkpoint: Some("replay-cursor".to_string()),
+            save_checkpoint: Some("replay-cursor-next".to_string()),
+            external_account_ref: None,
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+        let bounds = StorageLogBoundsResult {
+            code: selium_abi::StorageStatusCode::Ok,
+            first_sequence: Some(10),
+            latest_sequence: Some(14),
+            next_sequence: 15,
+        };
+
+        assert_eq!(replay_start_sequence(&bounds, &request, Some(13)), Some(13));
+
+        let selected = select_replay_records(
+            vec![
+                StorageLogRecord {
+                    sequence: 13,
+                    timestamp_ms: 3,
+                    headers: BTreeMap::new(),
+                    payload: Vec::new(),
+                },
+                StorageLogRecord {
+                    sequence: 14,
+                    timestamp_ms: 4,
+                    headers: BTreeMap::new(),
+                    payload: Vec::new(),
+                },
+            ],
+            &request,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![13, 14]
+        );
+        let next_sequence = replay_next_sequence(&request, &selected, Some(14));
+        assert_eq!(next_sequence, Some(15));
+        assert_eq!(
+            replay_checkpoint_sequence_to_save(
+                &request,
+                Some(13),
+                next_sequence,
+                bounds.next_sequence
+            ),
+            15
+        );
+    }
+
+    #[test]
+    fn replay_checkpoint_errors_are_deterministic() {
+        let invalid = ReplayApiRequest {
+            limit: 10,
+            since_sequence: Some(7),
+            checkpoint: Some("named".to_string()),
+            save_checkpoint: None,
+            external_account_ref: None,
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+        assert_eq!(
+            replay_requested_checkpoint_name(&invalid)
+                .expect_err("mixed cursor should fail")
+                .to_string(),
+            "replay request cannot set both since_sequence and checkpoint"
+        );
+
+        assert_eq!(
+            replay_checkpoint_sequence_or_err("missing", None)
+                .expect_err("unknown checkpoint should fail")
+                .to_string(),
+            "checkpoint `missing` does not exist"
+        );
+
+        let request = ReplayApiRequest {
+            limit: 10,
+            since_sequence: None,
+            checkpoint: Some("missing".to_string()),
+            save_checkpoint: None,
+            external_account_ref: None,
+            workload: None,
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+        assert_eq!(
+            replay_checkpoint_sequence_to_save(&request, Some(12), None, 15),
+            12
         );
     }
 }

@@ -74,6 +74,8 @@ pub enum RuntimeUsageReplayStart {
     Sequence(u64),
     /// Replay records whose durable timestamp is at or after the provided Unix millisecond value.
     Timestamp(u64),
+    /// Replay from the durable sequence stored under the provided Selium-managed checkpoint name.
+    Checkpoint(String),
 }
 
 /// Filterable replay request for immutable runtime usage records.
@@ -82,14 +84,22 @@ pub enum RuntimeUsageReplayStart {
 pub struct RuntimeUsageQuery {
     /// Replay cursor to start from before applying attribute and window filters.
     pub start: RuntimeUsageReplayStart,
+    /// Optional Selium-managed checkpoint name to create or advance to the response cursor.
+    pub save_checkpoint: Option<String>,
     /// Maximum number of matching records to return after filtering.
     pub limit: usize,
     /// Optional opaque external account reference to match.
     pub external_account_ref: Option<String>,
-    /// Optional Selium workload key to match.
-    pub workload_key: Option<String>,
+    /// Optional Selium workload identifier to match.
+    ///
+    /// This filter name is aligned with control-plane replay and inventory queries even though the
+    /// immutable usage payload still stores the field as `workload_key`.
+    pub workload: Option<String>,
     /// Optional Selium module identifier to match.
-    pub module_id: Option<String>,
+    ///
+    /// This filter name is aligned with control-plane replay and inventory queries even though the
+    /// immutable usage payload and record headers still store the field as `module_id`.
+    pub module: Option<String>,
     /// Optional inclusive lower bound for overlapping sample windows, in Unix milliseconds.
     pub window_start_ms: Option<u64>,
     /// Optional exclusive upper bound for overlapping sample windows, in Unix milliseconds.
