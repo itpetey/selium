@@ -93,7 +93,53 @@ assert_eq!(frame.payload, b"raw event bytes".to_vec());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-For external-consumer handoff code, treat `Frame` as the durable envelope: `frame.sequence` is your replay cursor, `frame.timestamp_ms` is your event time, `frame.headers["external_account_ref"]` preserves the opaque join key, and `frame.payload` remains the raw domain bytes you decode on your side.
+For external-consumer handoff code, treat `Frame` as the durable envelope: `frame.sequence` is your replay cursor, `frame.timestamp_ms` is your event time, `frame.headers.get("external_account_ref")` preserves the opaque join key, and `frame.payload` remains the raw domain bytes you decode on your side.
+
+### External-consumer replay → live handoff cookbook
+
+Use the same durable cursor for both phases:
+
+1. Load the last committed `next_sequence` from your own checkpoint store (or start at `1` for a fresh consumer).
+2. Call `Context::replay_frames(...)` with `ReplayStart::Sequence(next_sequence)` to backfill retained frames.
+3. Process each `Frame`, then advance `next_sequence = frame.sequence + 1` after your handler succeeds.
+4. Switch to `byte_subscriber(..., ReplayStart::Sequence(next_sequence))` and keep consuming with `recv_frame()` so the live path preserves the same metadata envelope.
+
+```rust
+use selium_io_durability::ReplayStart;
+use selium_sdk_rust::Context;
+
+async fn consume_external_feed(
+    context: &Context,
+    mut next_sequence: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let replay = context.replay_frames(
+        "usage.events",
+        ReplayStart::Sequence(next_sequence),
+        256,
+    )?;
+
+    for frame in &replay {
+        let external_account_ref = frame.headers.get("external_account_ref");
+        let workload_key = frame.headers.get("workload_key");
+        let _ = (external_account_ref, workload_key, &frame.payload);
+        next_sequence = frame.sequence + 1;
+    }
+
+    let mut subscriber = context.byte_subscriber(
+        "usage.events",
+        ReplayStart::Sequence(next_sequence),
+    )?;
+
+    loop {
+        let frame = subscriber.recv_frame().await?;
+        let _ = frame.headers.get("external_account_ref");
+        next_sequence = frame.sequence + 1;
+        // Persist `next_sequence` after your application commits the frame.
+    }
+}
+```
+
+This recipe stays entirely on the existing SDK surface: `replay_frames(...)` gives you the durable backlog, `ReplayStart::Sequence(...)` is the stored resume cursor, and `recv_frame()` preserves `headers`, `timestamp_ms`, and `payload` on the live path.
 
 ## When to use the SDK vs the guest crate
 
