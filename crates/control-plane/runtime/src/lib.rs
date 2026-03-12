@@ -1724,9 +1724,13 @@ mod tests {
             .get("nodes")
             .and_then(DataValue::as_array)
             .expect("nodes array");
-        assert_eq!(query.result.get("now_ms").and_then(DataValue::as_u64), Some(100));
         assert_eq!(
-            query.result
+            query.result.get("now_ms").and_then(DataValue::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            query
+                .result
                 .get("max_staleness_ms")
                 .and_then(DataValue::as_u64),
             Some(10)

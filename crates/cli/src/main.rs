@@ -1797,10 +1797,7 @@ mod tests {
                 "nodes".to_string(),
                 DataValue::List(vec![DataValue::Map(BTreeMap::from([
                     ("name".to_string(), DataValue::from("node-a")),
-                    (
-                        "daemon_addr".to_string(),
-                        DataValue::from("127.0.0.1:7200"),
-                    ),
+                    ("daemon_addr".to_string(), DataValue::from("127.0.0.1:7200")),
                     (
                         "daemon_server_name".to_string(),
                         DataValue::from("selium-node-a"),

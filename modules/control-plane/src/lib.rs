@@ -2431,6 +2431,138 @@ event camera.frames(Frame) {
     }
 
     #[test]
+    fn inventory_snapshot_marker_hands_off_to_replay_since_sequence() {
+        let account = ExternalAccountRef {
+            key: "acct-123".to_string(),
+        };
+        let workload = WorkloadRef {
+            tenant: "tenant-a".to_string(),
+            namespace: "media".to_string(),
+            name: "ingest".to_string(),
+        };
+        let mut engine = ControlPlaneEngine::default();
+        engine
+            .apply_mutation(
+                1,
+                Mutation::UpsertDeployment {
+                    spec: DeploymentSpec {
+                        workload: workload.clone(),
+                        module: "ingest.wasm".to_string(),
+                        replicas: 1,
+                        contracts: Vec::new(),
+                        isolation: IsolationProfile::Standard,
+                        cpu_millis: 250,
+                        memory_mib: 128,
+                        ephemeral_storage_mib: 0,
+                        bandwidth_profile: BandwidthProfile::Standard,
+                        volume_mounts: Vec::new(),
+                        external_account_ref: Some(account.clone()),
+                    },
+                },
+            )
+            .expect("deployment");
+        engine
+            .apply_mutation(
+                2,
+                Mutation::SetScale {
+                    workload: workload.clone(),
+                    replicas: 2,
+                },
+            )
+            .expect("scale to snapshot state");
+
+        let inventory = engine
+            .query(runtime::Query::AttributedInfrastructureInventory {
+                filter: runtime::AttributedInfrastructureFilter {
+                    external_account_ref: Some(account.key.clone()),
+                    ..Default::default()
+                },
+            })
+            .expect("inventory query");
+        let last_applied = inventory
+            .result
+            .get("snapshot_marker")
+            .and_then(|marker| marker.get("last_applied"))
+            .and_then(DataValue::as_u64)
+            .expect("snapshot marker last_applied");
+
+        let request = ReplayApiRequest {
+            limit: 10,
+            since_sequence: Some(last_applied.saturating_add(1)),
+            checkpoint: None,
+            save_checkpoint: None,
+            external_account_ref: Some(account.key.clone()),
+            workload: Some(workload.to_string()),
+            module: None,
+            pipeline: None,
+            node: None,
+        };
+        let bounds = StorageLogBoundsResult {
+            code: selium_abi::StorageStatusCode::Ok,
+            first_sequence: Some(1),
+            latest_sequence: Some(3),
+            next_sequence: 4,
+        };
+
+        assert_eq!(last_applied, 2);
+        let start_sequence =
+            replay_start_sequence(&bounds, &request, None).expect("start sequence");
+        assert_eq!(start_sequence, 3);
+        assert_eq!(
+            replay_fetch_limit(&bounds, start_sequence, request.limit),
+            1
+        );
+
+        let snapshot_state = engine.snapshot().control_plane;
+        let delta_record = StorageLogRecord {
+            sequence: 3,
+            timestamp_ms: 3,
+            headers: audit_headers(
+                Some(&snapshot_state),
+                &Mutation::SetScale {
+                    workload: workload.clone(),
+                    replicas: 3,
+                },
+            ),
+            payload: encode_rkyv(&DurableCommittedEntry {
+                idempotency_key: "scale-3".to_string(),
+                index: 3,
+                term: 1,
+                payload: ControlPlaneEngine::encode_mutation(&MutationEnvelope {
+                    idempotency_key: "scale-3".to_string(),
+                    mutation: Mutation::SetScale {
+                        workload: workload.clone(),
+                        replicas: 3,
+                    },
+                })
+                .expect("encode delta mutation"),
+            })
+            .expect("encode delta record"),
+        };
+
+        let selected = select_replay_records(vec![delta_record], &request);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(replay_next_sequence(&request, &selected, Some(3)), Some(4));
+
+        let event = replay_record_value(selected.into_iter().next().expect("delta record"));
+        assert_eq!(event.get("sequence").and_then(DataValue::as_u64), Some(3));
+        assert_eq!(event.get("index").and_then(DataValue::as_u64), Some(3));
+        assert_eq!(
+            event
+                .get("audit")
+                .and_then(|audit| audit.get("replicas"))
+                .and_then(DataValue::as_u64),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn replay_selection_with_filters_and_no_cursor_pages_forward() {
         let request = ReplayApiRequest {
             limit: 2,
