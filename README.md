@@ -72,6 +72,11 @@ From there, use:
 
 From repo root:
 
+- Use `cargo check -p <crate>` / `cargo test -p <crate>` for package-scoped default-feature iteration while you are changing a focused surface.
+- Use the workspace commands below as the repo-wide baseline before handoff; CI runs the same default-feature command shapes.
+- Keep any non-default feature verification package-scoped and explicit instead of appending feature flags to the generic workspace commands.
+
+- `cargo check --workspace --all-targets`
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace --all-targets`
