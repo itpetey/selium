@@ -29,8 +29,12 @@ rkyv = { workspace = true }
 rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
 selium-abi = { workspace = true }
+selium-control-plane-agent = { workspace = true }
+selium-control-plane-api = { workspace = true }
+selium-control-plane-core = { workspace = true }
+selium-control-plane-scheduler = { workspace = true }
 selium-control-plane-protocol = { workspace = true }
-selium-module-control-plane = { workspace = true }
+selium-runtime-support = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 tokio = { workspace = true, features = [
   "io-util",
@@ -44,5 +48,5 @@ tokio = { workspace = true, features = [
 toml = { workspace = true, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]
-selium-control-plane-api = { workspace = true }
 selium-control-plane-runtime = { workspace = true }
+selium-runtime-support = { workspace = true }

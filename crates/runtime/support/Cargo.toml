@@ -1,0 +1,16 @@
+[package]
+name = "selium-runtime-support"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+quinn = { workspace = true, features = ["platform-verifier", "runtime-tokio", "rustls-ring"] }
+rustls = { workspace = true, features = ["ring", "std"] }
+rustls-pemfile = { workspace = true, features = ["std"] }
+selium-abi = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
+toml = { workspace = true, features = ["parse", "serde", "std"] }

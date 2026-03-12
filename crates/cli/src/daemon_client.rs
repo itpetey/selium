@@ -1,26 +1,22 @@
 use std::{
-    fs,
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, anyhow};
-use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{Connection, Endpoint};
 use rkyv::{
     Archive,
     api::high::{HighDeserializer, HighValidator},
 };
-use rustls::{RootCertStore, pki_types::PrivateKeyDer};
-use rustls_pemfile::{certs, private_key};
 use selium_abi::{RkyvEncode, decode_rkyv};
 use selium_control_plane_protocol::{
     GuestLogEvent, Method, SubscribeGuestLogsRequest, SubscribeGuestLogsResponse, decode_envelope,
-    decode_error, decode_payload, encode_request, is_error, read_framed, write_framed,
+    decode_error, decode_payload, encode_request, is_error,
+};
+use selium_runtime_support::{
+    ClientTlsPaths, build_quic_client_endpoint, parse_socket_addr, read_framed, write_framed,
 };
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -29,6 +25,7 @@ use crate::config::DaemonConnectionArgs;
 
 const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_CONTROL_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct DaemonQuicClient {
@@ -70,18 +67,14 @@ impl DaemonQuicClient {
             "127.0.0.1:0"
         }
         .parse::<SocketAddr>()?;
-
-        let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
-        let roots = load_root_store(ca_cert)?;
-        let cert_chain = load_cert_chain(client_cert)?;
-        let key = load_private_key(client_key)?;
-
-        let tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(cert_chain, key)
-            .context("build QUIC TLS client config")?;
-        let quic_crypto = QuicClientConfig::try_from(tls).context("build QUIC crypto config")?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
+        let endpoint = build_quic_client_endpoint(
+            bind,
+            ClientTlsPaths {
+                ca_cert,
+                client_cert: Some(client_cert),
+                client_key: Some(client_key),
+            },
+        )?;
 
         Ok(Self {
             endpoint,
@@ -227,59 +220,13 @@ impl GuestLogSubscription {
 fn request_timeout(method: Method) -> Duration {
     match method {
         Method::StartInstance => DAEMON_START_TIMEOUT,
+        Method::ControlQuery => DAEMON_CONTROL_QUERY_TIMEOUT,
         _ => DAEMON_REQUEST_TIMEOUT,
     }
 }
 
 pub(crate) fn parse_daemon_addr(raw: &str) -> Result<SocketAddr> {
-    let raw = raw
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("quic://")
-        .trim_end_matches('/');
-
-    if let Ok(addr) = raw.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-
-    raw.to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("no socket addresses for daemon `{raw}`"))
-}
-
-fn load_root_store(path: &Path) -> Result<RootCertStore> {
-    let pem = fs::read(path).with_context(|| format!("read CA cert {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    let mut store = RootCertStore::empty();
-    for cert in certs(&mut reader) {
-        let cert = cert.context("parse CA cert")?;
-        store
-            .add(cert)
-            .map_err(|err| anyhow!("add CA cert to root store: {err}"))?;
-    }
-    Ok(store)
-}
-
-fn load_cert_chain(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let pem = fs::read(path).with_context(|| format!("read cert {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    let mut chain = Vec::new();
-    for cert in certs(&mut reader) {
-        chain.push(cert.context("parse cert")?);
-    }
-    if chain.is_empty() {
-        return Err(anyhow!("no certs found in {}", path.display()));
-    }
-    Ok(chain)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let pem = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    private_key(&mut reader)
-        .context("parse private key")?
-        .ok_or_else(|| anyhow!("no private key in {}", path.display()))
+    parse_socket_addr(raw).map_err(|err| anyhow!("parse daemon addr: {err:#}"))
 }
 
 #[cfg(test)]

@@ -6,24 +6,22 @@ use std::{
     net::UdpSocket,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::Endpoint;
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::{RootCertStore, pki_types::PrivateKeyDer};
-use rustls_pemfile::{certs, private_key};
 use selium_abi::{DataValue, decode_rkyv};
 use selium_control_plane_api::ControlPlaneState;
+use selium_control_plane_core::{Mutation, Query};
 use selium_control_plane_protocol::{
     Method, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
-    decode_envelope, decode_error, decode_payload, encode_request, is_error, read_framed,
-    write_framed,
+    decode_envelope, decode_error, decode_payload, encode_request, is_error,
 };
-use selium_control_plane_runtime::{Mutation, Query};
+use selium_runtime_support::{
+    ClientTlsPaths, build_quic_client_endpoint, read_framed, write_framed,
+};
 use tokio::time::{sleep, timeout};
 
 const USER_ECHO_MANIFEST: &str = "examples/rpc-echo-service/Cargo.toml";
@@ -324,7 +322,8 @@ impl ClusterHarness {
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("await daemon connect: timed out")
+            if (stderr.contains("await daemon connect: timed out")
+                || stderr.contains("read response: timed out"))
                 && attempt < CLI_CONNECT_TIMEOUT_RETRIES
             {
                 thread::sleep(CLI_CONNECT_TIMEOUT_BACKOFF);
@@ -521,17 +520,17 @@ impl ClusterHarness {
 
     fn build_query_endpoint(&self) -> Result<Endpoint> {
         let bind = "127.0.0.1:0".parse().expect("client bind");
-        let mut endpoint = Endpoint::client(bind).context("create QUIC client endpoint")?;
-        let roots = load_root_store(&self.cert_dir.join("ca.crt"))?;
-        let cert_chain = load_cert_chain(&self.cert_dir.join("client.crt"))?;
-        let key = load_private_key(&self.cert_dir.join("client.key"))?;
-        let tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(cert_chain, key)
-            .context("build QUIC TLS client config")?;
-        let quic_crypto = QuicClientConfig::try_from(tls).context("build QUIC crypto config")?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
-        Ok(endpoint)
+        let ca_cert = self.cert_dir.join("ca.crt");
+        let client_cert = self.cert_dir.join("client.crt");
+        let client_key = self.cert_dir.join("client.key");
+        build_quic_client_endpoint(
+            bind,
+            ClientTlsPaths {
+                ca_cert: &ca_cert,
+                client_cert: Some(&client_cert),
+                client_key: Some(&client_key),
+            },
+        )
     }
 
     fn fetch_live_nodes(&self, daemon_addr: &str) -> Result<BTreeSet<String>> {
@@ -832,40 +831,6 @@ fn repo_root() -> Result<PathBuf> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("resolve repo root from {}", manifest_dir.display()))
-}
-
-fn load_root_store(path: &Path) -> Result<RootCertStore> {
-    let pem = fs::read(path).with_context(|| format!("read CA cert {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    let mut store = RootCertStore::empty();
-    for cert in certs(&mut reader) {
-        let cert = cert.context("parse CA cert")?;
-        store
-            .add(cert)
-            .map_err(|err| anyhow!("add CA cert to root store: {err}"))?;
-    }
-    Ok(store)
-}
-
-fn load_cert_chain(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let pem = fs::read(path).with_context(|| format!("read cert {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    let mut chain = Vec::new();
-    for cert in certs(&mut reader) {
-        chain.push(cert.context("parse cert")?);
-    }
-    if chain.is_empty() {
-        bail!("no certs found in {}", path.display());
-    }
-    Ok(chain)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let pem = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
-    let mut reader = std::io::Cursor::new(pem);
-    private_key(&mut reader)
-        .context("parse private key")?
-        .ok_or_else(|| anyhow!("no private key in {}", path.display()))
 }
 
 fn allocate_ports(count: usize) -> Result<Vec<u16>> {

@@ -1,15 +1,15 @@
-use std::{
-    ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{ffi::OsString, path::PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
 use selium_abi::{InteractionKind, NetworkProtocol};
+use selium_runtime_support::load_toml_config;
 use serde::Deserialize;
+
+#[cfg(test)]
+use std::fs;
 
 #[derive(Copy, Clone, Debug, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -465,15 +465,6 @@ fn should_apply_config(source: Option<ValueSource>) -> bool {
         source,
         Some(ValueSource::CommandLine | ValueSource::EnvVariable)
     )
-}
-
-fn load_toml_config<T>(path: &Path) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("read config file {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parse TOML config {}", path.display()))
 }
 
 #[cfg(test)]

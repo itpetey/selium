@@ -13,7 +13,7 @@ const INGRESS_REPLICA: &str =
 const PROCESSOR_REPLICA: &str =
     "tenant=tenant-a;namespace=analytics;workload=topology-processor;replica=0";
 const SINK_REPLICA: &str = "tenant=tenant-a;namespace=analytics;workload=topology-sink;replica=0";
-const REMOTE_DELIVERY: &str = "delivered remote managed event frame tenant-a/analytics/topology-ingress#ingest.frames -> tenant-a/analytics/topology-processor#ingest.frames";
+const REMOTE_DELIVERY: &str = "delivered remote managed event frame tenant-a/analytics/topology-ingress#event:ingest.frames -> tenant-a/analytics/topology-processor#event:ingest.frames";
 const PROCESSOR_TO_SINK_EDGE: &str = "tenant-a/analytics/topology-processor#process.enriched";
 const SINK_EDGE: &str = "tenant-a/analytics/topology-sink#process.enriched";
 

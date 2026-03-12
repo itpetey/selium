@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::DataValue;
 use selium_guest::{io, time};
 
 #[allow(dead_code)]
@@ -16,20 +16,19 @@ const RECV_TIMEOUT_MS: u32 = 1_000;
 
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
-    let bindings = encode_rkyv(&bindings).context("encode sink managed-event bindings")?;
     let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_PROCESS_ENRICHED)
         .await
         .context("attach sink enriched reader")?;
 
     let decoded = loop {
         let Some(frame) = reader
-            .recv(RECV_TIMEOUT_MS)
+            .recv_typed::<EnrichedFrame>(RECV_TIMEOUT_MS)
             .await
             .context("receive enriched frame")?
         else {
             continue;
         };
-        break decode_rkyv::<EnrichedFrame>(&frame.payload).context("decode enriched frame")?;
+        break frame.payload;
     };
     ensure!(
         decoded.source == "ingress" && decoded.seq > 0 && decoded.stage == "normalized",

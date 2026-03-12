@@ -1,5 +1,6 @@
 mod config;
 mod daemon_client;
+mod output;
 
 use std::{
     collections::BTreeMap,
@@ -15,35 +16,33 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use selium_abi::{
-    DataValue, RuntimeUsageQuery, RuntimeUsageRecord, RuntimeUsageReplayStart, decode_rkyv,
-    encode_rkyv,
+    DataValue, RuntimeUsageQuery, RuntimeUsageRecord, RuntimeUsageReplayStart, data_value_to_json,
+    decode_rkyv, encode_rkyv,
 };
-use selium_control_plane_protocol::{
-    Empty, EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ListRequest,
-    ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
-    MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
-    ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest, RuntimeUsageApiResponse,
-    ServiceBridgeSemantics, ServiceCorrelationMode, StartRequest, StartResponse, StatusApiResponse,
-    StopRequest, StopResponse, StreamBridgeSemantics, StreamLifecycleMode,
-    SubscribeGuestLogsRequest,
-};
-use selium_module_control_plane::{
-    AgentState, ReconcileAction,
-    api::{
-        ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
-        DiscoverableWorkload, DiscoveryCapabilityScope, DiscoveryOperation, DiscoveryPattern,
-        DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, EventEndpointRef,
-        OperationalProcessRecord, OperationalProcessSelector, PipelineEdge, PipelineEndpoint,
-        PipelineSpec, PublicEndpointRef, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
-        collect_contracts_for_workload, ensure_pipeline_consistency, generate_rust_bindings,
-        parse_contract_ref, parse_idl,
-    },
-    apply, build_module_spec as build_runtime_module_spec,
+use selium_control_plane_agent::{
+    AgentState, ReconcileAction, apply, build_module_spec as build_runtime_module_spec,
     default_capabilities as default_runtime_capabilities,
-    deployment_module_spec as build_deployment_module_spec, reconcile,
-    runtime::{AttributedInfrastructureFilter, Mutation, Query},
-    scheduler::build_plan,
+    deployment_module_spec as build_deployment_module_spec, endpoint_bridge_semantics, reconcile,
 };
+use selium_control_plane_api::{
+    ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
+    DiscoverableWorkload, DiscoveryCapabilityScope, DiscoveryOperation, DiscoveryPattern,
+    DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, EventEndpointRef,
+    OperationalProcessRecord, OperationalProcessSelector, PipelineEdge, PipelineEndpoint,
+    PipelineSpec, PublicEndpointRef, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
+    build_discovery_state, collect_contracts_for_workload, ensure_pipeline_consistency,
+    generate_rust_bindings,
+    parse_contract_ref, parse_idl,
+};
+use selium_control_plane_core::{AttributedInfrastructureFilter, Mutation, Query};
+use selium_control_plane_protocol::{
+    Empty, ListRequest, ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType,
+    ManagedEndpointRole, Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse,
+    QueryApiRequest, QueryApiResponse, ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest,
+    RuntimeUsageApiResponse, StartRequest, StartResponse, StatusApiResponse, StopRequest,
+    StopResponse, SubscribeGuestLogsRequest,
+};
+use selium_control_plane_scheduler::build_plan;
 use tokio::{signal, time::sleep};
 
 use crate::{
@@ -54,6 +53,10 @@ use crate::{
         UsageArgs, load_cli,
     },
     daemon_client::{DaemonQuicClient, parse_daemon_addr},
+    output::{
+        format_contract, observe_value, print_instance_map, render_guest_log_payload,
+        replay_response_value, runtime_usage_response_json,
+    },
 };
 
 const GUEST_LOG_STREAMS: [&str; 2] = ["stdout", "stderr"];
@@ -121,7 +124,7 @@ async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<(
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
-                bandwidth_profile: selium_module_control_plane::api::BandwidthProfile::Standard,
+                bandwidth_profile: selium_control_plane_api::BandwidthProfile::Standard,
                 volume_mounts: Vec::new(),
                 external_account_ref: None,
             },
@@ -240,292 +243,6 @@ async fn cmd_observe(daemon: Arc<DaemonQuicClient>, args: ObserveArgs) -> Result
     Ok(())
 }
 
-fn observe_value(
-    summary: DataValue,
-    status: &StatusApiResponse,
-    metrics: &MetricsApiResponse,
-) -> DataValue {
-    DataValue::Map(BTreeMap::from([
-        ("summary".to_string(), summary),
-        ("health".to_string(), status_value(status)),
-        ("metrics".to_string(), metrics_value(metrics)),
-    ]))
-}
-
-fn status_value(status: &StatusApiResponse) -> DataValue {
-    DataValue::Map(BTreeMap::from([
-        (
-            "node_id".to_string(),
-            DataValue::from(status.node_id.clone()),
-        ),
-        ("role".to_string(), DataValue::from(status.role.clone())),
-        (
-            "current_term".to_string(),
-            DataValue::from(status.current_term),
-        ),
-        (
-            "leader_id".to_string(),
-            status
-                .leader_id
-                .clone()
-                .map(DataValue::from)
-                .unwrap_or(DataValue::Null),
-        ),
-        (
-            "commit_index".to_string(),
-            DataValue::from(status.commit_index),
-        ),
-        (
-            "last_applied".to_string(),
-            DataValue::from(status.last_applied),
-        ),
-        (
-            "peers".to_string(),
-            DataValue::List(status.peers.iter().cloned().map(DataValue::from).collect()),
-        ),
-        (
-            "table_count".to_string(),
-            DataValue::from(status.table_count),
-        ),
-        (
-            "durable_events".to_string(),
-            status
-                .durable_events
-                .map(DataValue::from)
-                .unwrap_or(DataValue::Null),
-        ),
-    ]))
-}
-
-fn metrics_value(metrics: &MetricsApiResponse) -> DataValue {
-    DataValue::Map(BTreeMap::from([
-        (
-            "node_id".to_string(),
-            DataValue::from(metrics.node_id.clone()),
-        ),
-        (
-            "deployment_count".to_string(),
-            DataValue::from(metrics.deployment_count),
-        ),
-        (
-            "pipeline_count".to_string(),
-            DataValue::from(metrics.pipeline_count),
-        ),
-        (
-            "node_count".to_string(),
-            DataValue::from(metrics.node_count),
-        ),
-        (
-            "peer_count".to_string(),
-            DataValue::from(metrics.peer_count),
-        ),
-        (
-            "table_count".to_string(),
-            DataValue::from(metrics.table_count),
-        ),
-        (
-            "commit_index".to_string(),
-            DataValue::from(metrics.commit_index),
-        ),
-        (
-            "last_applied".to_string(),
-            DataValue::from(metrics.last_applied),
-        ),
-        (
-            "durable_events".to_string(),
-            metrics
-                .durable_events
-                .map(DataValue::from)
-                .unwrap_or(DataValue::Null),
-        ),
-    ]))
-}
-
-fn optional_u64_value(value: Option<u64>) -> DataValue {
-    value.map(DataValue::from).unwrap_or(DataValue::Null)
-}
-
-fn replay_response_value(replay: &ReplayApiResponse) -> DataValue {
-    DataValue::Map(BTreeMap::from([
-        (
-            "start_sequence".to_string(),
-            optional_u64_value(replay.start_sequence),
-        ),
-        (
-            "next_sequence".to_string(),
-            optional_u64_value(replay.next_sequence),
-        ),
-        (
-            "high_watermark".to_string(),
-            optional_u64_value(replay.high_watermark),
-        ),
-        ("events".to_string(), DataValue::List(replay.events.clone())),
-    ]))
-}
-
-fn optional_json_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn optional_json_str(value: Option<&str>) -> String {
-    value
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn string_map_json(map: &BTreeMap<String, String>) -> String {
-    let pairs = map
-        .iter()
-        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{pairs}}}")
-}
-
-fn runtime_usage_record_json(record: &RuntimeUsageRecord) -> String {
-    let sample = &record.sample;
-    format!(
-        concat!(
-            "{{",
-            "\"sequence\":{},",
-            "\"timestamp_ms\":{},",
-            "\"headers\":{},",
-            "\"sample\":{{",
-            "\"workload_key\":\"{}\",",
-            "\"process_id\":\"{}\",",
-            "\"attribution\":{{\"external_account_ref\":{},\"module_id\":\"{}\"}},",
-            "\"window_start_ms\":{},",
-            "\"window_end_ms\":{},",
-            "\"trigger\":\"{:?}\",",
-            "\"cpu_time_millis\":{},",
-            "\"memory_high_watermark_bytes\":{},",
-            "\"memory_byte_millis\":{},",
-            "\"ingress_bytes\":{},",
-            "\"egress_bytes\":{},",
-            "\"storage_read_bytes\":{},",
-            "\"storage_write_bytes\":{}",
-            "}}",
-            "}}"
-        ),
-        record.sequence,
-        record.timestamp_ms,
-        string_map_json(&record.headers),
-        escape_json(&sample.workload_key),
-        escape_json(&sample.process_id),
-        optional_json_str(sample.attribution.external_account_ref.as_deref()),
-        escape_json(&sample.attribution.module_id),
-        sample.window_start_ms,
-        sample.window_end_ms,
-        sample.trigger,
-        sample.cpu_time_millis,
-        sample.memory_high_watermark_bytes,
-        sample.memory_byte_millis,
-        sample.ingress_bytes,
-        sample.egress_bytes,
-        sample.storage_read_bytes,
-        sample.storage_write_bytes,
-    )
-}
-
-fn runtime_usage_response_json(response: &RuntimeUsageApiResponse) -> String {
-    let records = response
-        .records
-        .iter()
-        .map(runtime_usage_record_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"records\":[{records}],\"next_sequence\":{},\"high_watermark\":{}}}",
-        optional_json_u64(response.next_sequence),
-        optional_json_u64(response.high_watermark)
-    )
-}
-
-fn data_value_to_json(value: &DataValue) -> String {
-    let mut out = String::new();
-    write_data_value_json(&mut out, value);
-    out
-}
-
-fn write_data_value_json(out: &mut String, value: &DataValue) {
-    use std::fmt::Write as _;
-
-    match value {
-        DataValue::Null => out.push_str("null"),
-        DataValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        DataValue::U64(value) => {
-            let _ = write!(out, "{value}");
-        }
-        DataValue::I64(value) => {
-            let _ = write!(out, "{value}");
-        }
-        DataValue::String(value) => {
-            out.push('"');
-            write_json_string_content(out, value);
-            out.push('"');
-        }
-        DataValue::Bytes(bytes) => {
-            out.push('[');
-            for (idx, byte) in bytes.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                let _ = write!(out, "{byte}");
-            }
-            out.push(']');
-        }
-        DataValue::List(values) => {
-            out.push('[');
-            for (idx, item) in values.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                write_data_value_json(out, item);
-            }
-            out.push(']');
-        }
-        DataValue::Map(values) => {
-            out.push('{');
-            for (idx, (key, item)) in values.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                out.push('"');
-                write_json_string_content(out, key);
-                out.push_str("\":");
-                write_data_value_json(out, item);
-            }
-            out.push('}');
-        }
-    }
-}
-
-fn write_json_string_content(out: &mut String, value: &str) {
-    use std::fmt::Write as _;
-
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                let _ = write!(out, "\\u{:04x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-}
-
-fn escape_json(value: &str) -> String {
-    let mut out = String::new();
-    write_json_string_content(&mut out, value);
-    out
-}
-
 async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<()> {
     let replay_request = replay_request(&args)?;
     let replay: ReplayApiResponse = daemon
@@ -564,7 +281,8 @@ async fn cmd_replay(daemon: Arc<DaemonQuicClient>, args: ReplayArgs) -> Result<(
 async fn cmd_discover(daemon: Arc<DaemonQuicClient>, args: DiscoverArgs) -> Result<()> {
     match discover_query(&args)? {
         DiscoverQuery::State(scope) => {
-            let discovery = cp_query_discovery_state(&daemon, scope, true).await?;
+            let state = cp_query_state(&daemon, true).await?;
+            let discovery = local_discovery_state(&state, &scope)?;
             if args.json {
                 println!("{}", data_value_to_json(&discovery_state_value(&discovery)));
                 return Ok(());
@@ -584,7 +302,8 @@ async fn cmd_discover(daemon: Arc<DaemonQuicClient>, args: DiscoverArgs) -> Resu
             }
         }
         DiscoverQuery::Resolve(request) => {
-            let resolution = cp_query_discovery_resolution(&daemon, request, true).await?;
+            let state = cp_query_state(&daemon, true).await?;
+            let resolution = local_discovery_resolution(&state, request)?;
             if args.json {
                 println!(
                     "{}",
@@ -952,26 +671,6 @@ fn cmd_idl_compile(args: IdlCompileArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_instance_map(instances: &BTreeMap<String, usize>) {
-    for (instance, pid) in instances {
-        println!("{instance} {pid}");
-    }
-}
-
-fn endpoint_bridge_semantics(kind: ContractKind) -> EndpointBridgeSemantics {
-    match kind {
-        ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
-            delivery: EventDeliveryMode::Frame,
-        }),
-        ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
-            correlation: ServiceCorrelationMode::RequestId,
-        }),
-        ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
-            lifecycle: StreamLifecycleMode::SessionFrames,
-        }),
-    }
-}
-
 async fn cp_mutate(daemon: &DaemonQuicClient, mutation: Mutation) -> Result<DataValue> {
     static IDEMPOTENCY_COUNTER: AtomicU64 = AtomicU64::new(1);
     let key = format!(
@@ -1029,40 +728,6 @@ async fn cp_query_value(
         .ok_or_else(|| anyhow!("control-plane query returned no result"))
 }
 
-async fn cp_query_discovery_state(
-    daemon: &DaemonQuicClient,
-    scope: DiscoveryCapabilityScope,
-    allow_stale: bool,
-) -> Result<DiscoveryState> {
-    let value = cp_query_value(daemon, Query::DiscoveryState { scope }, allow_stale).await?;
-    let bytes = match value {
-        DataValue::Bytes(bytes) => bytes,
-        other => {
-            return Err(anyhow!(
-                "invalid discovery state payload (expected bytes), got {other:?}"
-            ));
-        }
-    };
-    decode_rkyv(&bytes).context("decode discovery state")
-}
-
-async fn cp_query_discovery_resolution(
-    daemon: &DaemonQuicClient,
-    request: DiscoveryRequest,
-    allow_stale: bool,
-) -> Result<DiscoveryResolution> {
-    let value = cp_query_value(daemon, Query::ResolveDiscovery { request }, allow_stale).await?;
-    let bytes = match value {
-        DataValue::Bytes(bytes) => bytes,
-        other => {
-            return Err(anyhow!(
-                "invalid discovery resolution payload (expected bytes), got {other:?}"
-            ));
-        }
-    };
-    decode_rkyv(&bytes).context("decode discovery resolution")
-}
-
 async fn cp_query_state(daemon: &DaemonQuicClient, allow_stale: bool) -> Result<ControlPlaneState> {
     let value = cp_query_value(daemon, Query::ControlPlaneState, allow_stale).await?;
     let bytes = match value {
@@ -1074,6 +739,160 @@ async fn cp_query_state(daemon: &DaemonQuicClient, allow_stale: bool) -> Result<
         }
     };
     decode_rkyv(&bytes).context("decode control-plane state")
+}
+
+fn local_discovery_state(
+    state: &ControlPlaneState,
+    scope: &DiscoveryCapabilityScope,
+) -> Result<DiscoveryState> {
+    let discovery = build_discovery_state(state)?;
+    let workloads = discovery
+        .workloads
+        .into_iter()
+        .filter(|record| scope.allows_workload(DiscoveryOperation::Discover, &record.workload))
+        .collect();
+    let endpoints = discovery
+        .endpoints
+        .into_iter()
+        .filter(|record| scope.allows_endpoint(DiscoveryOperation::Discover, &record.endpoint))
+        .collect();
+
+    Ok(DiscoveryState {
+        workloads,
+        endpoints,
+    })
+}
+
+fn local_discovery_resolution(
+    state: &ControlPlaneState,
+    request: DiscoveryRequest,
+) -> Result<DiscoveryResolution> {
+    let discovery = build_discovery_state(state)?;
+
+    match request.target {
+        DiscoveryTarget::Workload(workload) => {
+            if !request.scope.allows_workload(request.operation, &workload) {
+                return Err(ApiError::Unauthorised {
+                    operation: request.operation.as_str().to_string(),
+                    subject: workload.key(),
+                }
+                .into());
+            }
+
+            if !discovery
+                .workloads
+                .iter()
+                .any(|record| record.workload == workload)
+            {
+                return Err(ApiError::UnknownDeployment(workload.key()).into());
+            }
+
+            let endpoints = discovery
+                .endpoints
+                .iter()
+                .filter(|record| record.endpoint.workload == workload)
+                .cloned()
+                .collect();
+
+            Ok(DiscoveryResolution::Workload(ResolvedWorkload {
+                workload,
+                endpoints,
+            }))
+        }
+        DiscoveryTarget::Endpoint(endpoint) => {
+            if !request.scope.allows_endpoint(request.operation, &endpoint) {
+                return Err(ApiError::Unauthorised {
+                    operation: request.operation.as_str().to_string(),
+                    subject: endpoint.key(),
+                }
+                .into());
+            }
+
+            let endpoint_record = discovery
+                .endpoints
+                .into_iter()
+                .find(|record| record.endpoint == endpoint)
+                .ok_or_else(|| ApiError::UnknownEndpoint(endpoint.key()))?;
+
+            Ok(DiscoveryResolution::Endpoint(ResolvedEndpoint {
+                endpoint,
+                contract: endpoint_record.contract,
+            }))
+        }
+        DiscoveryTarget::RunningProcess(selector) => {
+            if request.operation == DiscoveryOperation::Bind {
+                return Err(ApiError::InvalidBindTarget(
+                    "running process discovery is operational-only".to_string(),
+                )
+                .into());
+            }
+
+            let plan = build_plan(state).map_err(|err| anyhow!("scheduler error: {err}"))?;
+            let record = match selector {
+                OperationalProcessSelector::ReplicaKey(replica_key) => {
+                    let instance = plan
+                        .instances
+                        .iter()
+                        .find(|instance| instance.instance_id == replica_key)
+                        .ok_or_else(|| ApiError::UnknownDeployment(replica_key.clone()))?;
+                    let workload = state
+                        .deployments
+                        .get(&instance.deployment)
+                        .map(|deployment| deployment.workload.clone())
+                        .ok_or_else(|| ApiError::UnknownDeployment(instance.deployment.clone()))?;
+                    if !request.scope.allows_operational_process_discovery(&workload) {
+                        return Err(ApiError::Unauthorised {
+                            operation: DiscoveryOperation::Discover.as_str().to_string(),
+                            subject: workload.key(),
+                        }
+                        .into());
+                    }
+
+                    OperationalProcessRecord {
+                        workload,
+                        replica_key: instance.instance_id.clone(),
+                        node: instance.node.clone(),
+                    }
+                }
+                OperationalProcessSelector::Workload(workload) => {
+                    if !request.scope.allows_operational_process_discovery(&workload) {
+                        return Err(ApiError::Unauthorised {
+                            operation: DiscoveryOperation::Discover.as_str().to_string(),
+                            subject: workload.key(),
+                        }
+                        .into());
+                    }
+
+                    let mut matches = plan
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.deployment == workload.key())
+                        .map(|instance| OperationalProcessRecord {
+                            workload: workload.clone(),
+                            replica_key: instance.instance_id.clone(),
+                            node: instance.node.clone(),
+                        })
+                        .collect::<Vec<_>>();
+
+                    if matches.is_empty() {
+                        return Err(ApiError::UnknownDeployment(workload.key()).into());
+                    }
+                    if matches.len() > 1 {
+                        return Err(ApiError::AmbiguousProcess(format!(
+                            "{} has {} replicas; specify a replica key",
+                            workload,
+                            matches.len()
+                        ))
+                        .into());
+                    }
+
+                    matches.remove(0)
+                }
+            };
+
+            Ok(DiscoveryResolution::RunningProcess(record))
+        }
+    }
 }
 
 async fn node_client(
@@ -1150,32 +969,25 @@ async fn execute_daemon_actions(
                     )
                     .await?;
             }
-            ReconcileAction::EnsureEndpointBridge {
-                bridge_id,
-                source_instance_id,
-                source_endpoint,
-                target_instance_id,
-                target_node,
-                target_endpoint,
-            } => {
+            ReconcileAction::EnsureEndpointBridge(action) => {
                 let target_spec = state
                     .nodes
-                    .get(target_node)
-                    .ok_or_else(|| anyhow!("unknown target node `{target_node}`"))?;
+                    .get(&action.target_node)
+                    .ok_or_else(|| anyhow!("unknown target node `{}`", action.target_node))?;
                 let _ = node_client
                     .request::<_, selium_control_plane_protocol::ActivateEndpointBridgeResponse>(
                         Method::ActivateEndpointBridge,
                         &selium_control_plane_protocol::ActivateEndpointBridgeRequest {
                             node_id: node.to_string(),
-                            bridge_id: bridge_id.clone(),
-                            source_instance_id: source_instance_id.clone(),
-                            source_endpoint: source_endpoint.clone(),
-                            target_instance_id: target_instance_id.clone(),
-                            target_node: target_node.clone(),
+                            bridge_id: action.bridge_id.clone(),
+                            source_instance_id: action.source_instance_id.clone(),
+                            source_endpoint: action.source_endpoint.clone(),
+                            target_instance_id: action.target_instance_id.clone(),
+                            target_node: action.target_node.clone(),
                             target_daemon_addr: target_spec.daemon_addr.clone(),
                             target_daemon_server_name: target_spec.daemon_server_name.clone(),
-                            target_endpoint: target_endpoint.clone(),
-                            semantics: endpoint_bridge_semantics(source_endpoint.kind),
+                            target_endpoint: action.target_endpoint.clone(),
+                            semantics: endpoint_bridge_semantics(action.source_endpoint.kind),
                         },
                     )
                     .await?;
@@ -1750,29 +1562,6 @@ impl GuestLogAttachSelector {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn render_guest_log_payload(
-    endpoint: &PublicEndpointRef,
-    payload: &[u8],
-    label_streams: bool,
-) -> Vec<u8> {
-    if !label_streams {
-        return payload.to_vec();
-    }
-
-    let prefix = format!("[{}] ", endpoint.name);
-    let text = String::from_utf8_lossy(payload);
-    let mut rendered = Vec::with_capacity(payload.len() + prefix.len());
-    for line in text.split_inclusive('\n') {
-        if line.is_empty() {
-            continue;
-        }
-        rendered.extend_from_slice(prefix.as_bytes());
-        rendered.extend_from_slice(line.as_bytes());
-    }
-    rendered
-}
-
 fn load_agent_state(path: &Path) -> Result<AgentState> {
     if !path.exists() {
         return Ok(AgentState::default());
@@ -1797,16 +1586,6 @@ fn save_agent_state(path: &Path, state: &AgentState) -> Result<()> {
     Ok(())
 }
 
-fn format_contract(contract: ContractRef) -> String {
-    format!(
-        "{}/{}:{}@{}",
-        contract.namespace,
-        contract.kind.as_str(),
-        contract.name,
-        contract.version
-    )
-}
-
 fn unix_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1816,698 +1595,4 @@ fn unix_ms() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn module_spec_contains_expected_capabilities() {
-        let spec = build_module_spec(
-            "echo.wasm",
-            AdaptorArg::Wasmtime,
-            IsolationArg::Standard,
-            default_runtime_capabilities(),
-        );
-        assert!(spec.contains("path=echo.wasm"));
-        assert!(spec.contains("adaptor=wasmtime"));
-        assert!(spec.contains("queue_writer"));
-    }
-
-    #[test]
-    fn observe_value_groups_health_and_metrics() {
-        let value = observe_value(
-            DataValue::Map(BTreeMap::from([(
-                "deployments".to_string(),
-                DataValue::List(vec![DataValue::from("tenant-a/media/router")]),
-            )])),
-            &StatusApiResponse {
-                node_id: "node-a".to_string(),
-                role: "Leader".to_string(),
-                current_term: 3,
-                leader_id: Some("node-a".to_string()),
-                commit_index: 9,
-                last_applied: 9,
-                peers: vec!["node-b".to_string()],
-                table_count: 2,
-                durable_events: Some(10),
-            },
-            &MetricsApiResponse {
-                node_id: "node-a".to_string(),
-                deployment_count: 1,
-                pipeline_count: 0,
-                node_count: 2,
-                peer_count: 1,
-                table_count: 2,
-                commit_index: 9,
-                last_applied: 9,
-                durable_events: Some(10),
-            },
-        );
-
-        assert_eq!(
-            value
-                .get("health")
-                .and_then(|health| health.get("role"))
-                .and_then(DataValue::as_str),
-            Some("Leader")
-        );
-        assert_eq!(
-            value
-                .get("metrics")
-                .and_then(|metrics| metrics.get("deployment_count"))
-                .and_then(DataValue::as_u64),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn data_value_to_json_escapes_strings() {
-        let value = DataValue::Map(BTreeMap::from([(
-            "note".to_string(),
-            DataValue::from("line\n\"two\""),
-        )]));
-
-        assert_eq!(
-            data_value_to_json(&value),
-            "{\"note\":\"line\\n\\\"two\\\"\"}"
-        );
-    }
-
-    #[test]
-    fn replay_response_value_preserves_cursor_fields() {
-        let value = replay_response_value(&ReplayApiResponse {
-            events: vec![DataValue::Map(BTreeMap::from([(
-                "sequence".to_string(),
-                DataValue::from(41_u64),
-            )]))],
-            start_sequence: Some(41),
-            next_sequence: Some(42),
-            high_watermark: Some(56),
-        });
-
-        assert_eq!(
-            value.get("start_sequence").and_then(DataValue::as_u64),
-            Some(41)
-        );
-        assert_eq!(
-            value.get("next_sequence").and_then(DataValue::as_u64),
-            Some(42)
-        );
-        assert_eq!(
-            value.get("high_watermark").and_then(DataValue::as_u64),
-            Some(56)
-        );
-        assert_eq!(list_len(&value, "events"), 1);
-    }
-
-    #[test]
-    fn replay_json_preserves_external_consumer_cursor_and_event_fields() {
-        let json = data_value_to_json(&replay_response_value(&ReplayApiResponse {
-            events: vec![DataValue::Map(BTreeMap::from([
-                (
-                    "external_account_ref".to_string(),
-                    DataValue::from("acct-123"),
-                ),
-                (
-                    "headers".to_string(),
-                    DataValue::Map(BTreeMap::from([(
-                        "mutation_kind".to_string(),
-                        DataValue::from("set_scale"),
-                    )])),
-                ),
-                ("replicas".to_string(), DataValue::from(3_u64)),
-                ("sequence".to_string(), DataValue::from(41_u64)),
-                (
-                    "workload".to_string(),
-                    DataValue::from("tenant-a/media/ingest"),
-                ),
-            ]))],
-            start_sequence: Some(41),
-            next_sequence: Some(42),
-            high_watermark: Some(56),
-        }));
-
-        assert_eq!(
-            json,
-            concat!(
-                "{\"events\":[{",
-                "\"external_account_ref\":\"acct-123\",",
-                "\"headers\":{\"mutation_kind\":\"set_scale\"},",
-                "\"replicas\":3,",
-                "\"sequence\":41,",
-                "\"workload\":\"tenant-a/media/ingest\"",
-                "}],\"high_watermark\":56,\"next_sequence\":42,\"start_sequence\":41}"
-            )
-        );
-    }
-
-    #[test]
-    fn data_value_to_json_preserves_inventory_snapshot_marker() {
-        let value = DataValue::Map(BTreeMap::from([
-            (
-                "snapshot_marker".to_string(),
-                DataValue::Map(BTreeMap::from([(
-                    "last_applied".to_string(),
-                    DataValue::from(41_u64),
-                )])),
-            ),
-            ("workloads".to_string(), DataValue::List(Vec::new())),
-        ]));
-
-        assert_eq!(
-            data_value_to_json(&value),
-            "{\"snapshot_marker\":{\"last_applied\":41},\"workloads\":[]}"
-        );
-    }
-
-    #[test]
-    fn inventory_json_preserves_external_consumer_filter_and_resume_fields() {
-        let scheduled_instance = DataValue::Map(BTreeMap::from([
-            (
-                "deployment".to_string(),
-                DataValue::from("tenant-a/media/ingest"),
-            ),
-            (
-                "external_account_ref".to_string(),
-                DataValue::from("acct-123"),
-            ),
-            (
-                "instance_id".to_string(),
-                DataValue::from("node-a/ingest-0"),
-            ),
-            ("isolation".to_string(), DataValue::from("Standard")),
-            ("module".to_string(), DataValue::from("ingest.wasm")),
-            ("node".to_string(), DataValue::from("node-a")),
-            (
-                "workload".to_string(),
-                DataValue::from("tenant-a/media/ingest"),
-            ),
-        ]));
-        let value = DataValue::Map(BTreeMap::from([
-            (
-                "snapshot_marker".to_string(),
-                DataValue::Map(BTreeMap::from([(
-                    "last_applied".to_string(),
-                    DataValue::from(41_u64),
-                )])),
-            ),
-            (
-                "filters".to_string(),
-                DataValue::Map(BTreeMap::from([
-                    (
-                        "external_account_ref".to_string(),
-                        DataValue::from("acct-123"),
-                    ),
-                    ("module".to_string(), DataValue::from("ingest.wasm")),
-                    ("node".to_string(), DataValue::from("node-a")),
-                    (
-                        "pipeline".to_string(),
-                        DataValue::from("tenant-a/media/camera"),
-                    ),
-                    (
-                        "workload".to_string(),
-                        DataValue::from("tenant-a/media/ingest"),
-                    ),
-                ])),
-            ),
-            (
-                "workloads".to_string(),
-                DataValue::List(vec![DataValue::Map(BTreeMap::from([
-                    ("contracts".to_string(), DataValue::List(Vec::new())),
-                    (
-                        "external_account_ref".to_string(),
-                        DataValue::from("acct-123"),
-                    ),
-                    ("isolation".to_string(), DataValue::from("Standard")),
-                    ("module".to_string(), DataValue::from("ingest.wasm")),
-                    (
-                        "nodes".to_string(),
-                        DataValue::List(vec![DataValue::from("node-a")]),
-                    ),
-                    ("replicas".to_string(), DataValue::from(1_u64)),
-                    (
-                        "resources".to_string(),
-                        DataValue::Map(BTreeMap::from([
-                            ("bandwidth_profile".to_string(), DataValue::from("Standard")),
-                            ("cpu_millis".to_string(), DataValue::from(250_u64)),
-                            ("ephemeral_storage_mib".to_string(), DataValue::from(0_u64)),
-                            ("memory_mib".to_string(), DataValue::from(128_u64)),
-                        ])),
-                    ),
-                    (
-                        "scheduled_instances".to_string(),
-                        DataValue::List(vec![scheduled_instance.clone()]),
-                    ),
-                    (
-                        "workload".to_string(),
-                        DataValue::from("tenant-a/media/ingest"),
-                    ),
-                ]))]),
-            ),
-            (
-                "pipelines".to_string(),
-                DataValue::List(vec![DataValue::Map(BTreeMap::from([
-                    ("edge_count".to_string(), DataValue::from(0_u64)),
-                    ("edges".to_string(), DataValue::List(Vec::new())),
-                    (
-                        "external_account_ref".to_string(),
-                        DataValue::from("acct-123"),
-                    ),
-                    (
-                        "pipeline".to_string(),
-                        DataValue::from("tenant-a/media/camera"),
-                    ),
-                    ("workloads".to_string(), DataValue::List(Vec::new())),
-                ]))]),
-            ),
-            (
-                "modules".to_string(),
-                DataValue::List(vec![DataValue::Map(BTreeMap::from([
-                    ("deployment_count".to_string(), DataValue::from(1_u64)),
-                    (
-                        "external_account_refs".to_string(),
-                        DataValue::List(vec![DataValue::from("acct-123")]),
-                    ),
-                    ("module".to_string(), DataValue::from("ingest.wasm")),
-                    (
-                        "nodes".to_string(),
-                        DataValue::List(vec![DataValue::from("node-a")]),
-                    ),
-                    (
-                        "workloads".to_string(),
-                        DataValue::List(vec![DataValue::from("tenant-a/media/ingest")]),
-                    ),
-                ]))]),
-            ),
-            (
-                "nodes".to_string(),
-                DataValue::List(vec![DataValue::Map(BTreeMap::from([
-                    (
-                        "allocatable_cpu_millis".to_string(),
-                        DataValue::from(2_000_u64),
-                    ),
-                    (
-                        "allocatable_memory_mib".to_string(),
-                        DataValue::from(4_096_u64),
-                    ),
-                    ("capacity_slots".to_string(), DataValue::from(8_u64)),
-                    ("daemon_addr".to_string(), DataValue::from("127.0.0.1:7200")),
-                    (
-                        "daemon_server_name".to_string(),
-                        DataValue::from("selium-node-a"),
-                    ),
-                    (
-                        "external_account_refs".to_string(),
-                        DataValue::List(vec![DataValue::from("acct-123")]),
-                    ),
-                    ("last_heartbeat_ms".to_string(), DataValue::from(100_u64)),
-                    ("name".to_string(), DataValue::from("node-a")),
-                    (
-                        "scheduled_instances".to_string(),
-                        DataValue::List(vec![scheduled_instance]),
-                    ),
-                    (
-                        "supported_isolation".to_string(),
-                        DataValue::List(vec![DataValue::from("Standard")]),
-                    ),
-                ]))]),
-            ),
-        ]));
-
-        assert_eq!(
-            data_value_to_json(&value),
-            concat!(
-                "{\"filters\":{\"external_account_ref\":\"acct-123\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"pipeline\":\"tenant-a/media/camera\",\"workload\":\"tenant-a/media/ingest\"},",
-                "\"modules\":[{\"deployment_count\":1,\"external_account_refs\":[\"acct-123\"],\"module\":\"ingest.wasm\",\"nodes\":[\"node-a\"],\"workloads\":[\"tenant-a/media/ingest\"]}],",
-                "\"nodes\":[{\"allocatable_cpu_millis\":2000,\"allocatable_memory_mib\":4096,\"capacity_slots\":8,\"daemon_addr\":\"127.0.0.1:7200\",\"daemon_server_name\":\"selium-node-a\",\"external_account_refs\":[\"acct-123\"],\"last_heartbeat_ms\":100,\"name\":\"node-a\",\"scheduled_instances\":[{\"deployment\":\"tenant-a/media/ingest\",\"external_account_ref\":\"acct-123\",\"instance_id\":\"node-a/ingest-0\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"workload\":\"tenant-a/media/ingest\"}],\"supported_isolation\":[\"Standard\"]}],",
-                "\"pipelines\":[{\"edge_count\":0,\"edges\":[],\"external_account_ref\":\"acct-123\",\"pipeline\":\"tenant-a/media/camera\",\"workloads\":[]}],",
-                "\"snapshot_marker\":{\"last_applied\":41},",
-                "\"workloads\":[{\"contracts\":[],\"external_account_ref\":\"acct-123\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"nodes\":[\"node-a\"],\"replicas\":1,\"resources\":{\"bandwidth_profile\":\"Standard\",\"cpu_millis\":250,\"ephemeral_storage_mib\":0,\"memory_mib\":128},\"scheduled_instances\":[{\"deployment\":\"tenant-a/media/ingest\",\"external_account_ref\":\"acct-123\",\"instance_id\":\"node-a/ingest-0\",\"isolation\":\"Standard\",\"module\":\"ingest.wasm\",\"node\":\"node-a\",\"workload\":\"tenant-a/media/ingest\"}],\"workload\":\"tenant-a/media/ingest\"}]}"
-            )
-        );
-    }
-
-    #[test]
-    fn discovery_state_value_preserves_machine_consumable_output_shape() {
-        let workload = workload_ref(
-            "tenant-a".to_string(),
-            "media".to_string(),
-            "router".to_string(),
-        );
-        let endpoint = PublicEndpointRef {
-            workload: workload.clone(),
-            kind: ContractKind::Service,
-            name: "camera.detect".to_string(),
-        };
-        let discovery = DiscoveryState {
-            workloads: vec![DiscoverableWorkload {
-                workload: workload.clone(),
-                endpoints: vec![endpoint.clone()],
-            }],
-            endpoints: vec![DiscoverableEndpoint {
-                endpoint: endpoint.clone(),
-                contract: Some(ContractRef {
-                    namespace: "media.pipeline".to_string(),
-                    kind: ContractKind::Service,
-                    name: "camera.detect".to_string(),
-                    version: "v1".to_string(),
-                }),
-            }],
-        };
-
-        assert_eq!(
-            data_value_to_json(&discovery_state_value(&discovery)),
-            "{\"endpoints\":[{\"contract\":{\"kind\":\"service\",\"name\":\"camera.detect\",\"namespace\":\"media.pipeline\",\"version\":\"v1\"},\"endpoint\":{\"endpoint\":\"tenant-a/media/router#service:camera.detect\",\"kind\":\"service\",\"name\":\"camera.detect\",\"workload\":\"tenant-a/media/router\"}}],\"workloads\":[{\"endpoints\":[{\"endpoint\":\"tenant-a/media/router#service:camera.detect\",\"kind\":\"service\",\"name\":\"camera.detect\",\"workload\":\"tenant-a/media/router\"}],\"workload\":\"tenant-a/media/router\"}]}"
-        );
-    }
-
-    #[test]
-    fn data_value_to_json_preserves_nodes_live_capability_fields() {
-        let value = DataValue::Map(BTreeMap::from([
-            ("now_ms".to_string(), DataValue::from(100_u64)),
-            (
-                "nodes".to_string(),
-                DataValue::List(vec![DataValue::Map(BTreeMap::from([
-                    ("name".to_string(), DataValue::from("node-a")),
-                    ("daemon_addr".to_string(), DataValue::from("127.0.0.1:7200")),
-                    (
-                        "daemon_server_name".to_string(),
-                        DataValue::from("selium-node-a"),
-                    ),
-                    ("live".to_string(), DataValue::from(true)),
-                    (
-                        "supported_isolation".to_string(),
-                        DataValue::List(vec![
-                            DataValue::from("standard"),
-                            DataValue::from("hardened"),
-                        ]),
-                    ),
-                ]))]),
-            ),
-        ]));
-
-        assert_eq!(
-            data_value_to_json(&value),
-            "{\"nodes\":[{\"daemon_addr\":\"127.0.0.1:7200\",\"daemon_server_name\":\"selium-node-a\",\"live\":true,\"name\":\"node-a\",\"supported_isolation\":[\"standard\",\"hardened\"]}],\"now_ms\":100}"
-        );
-    }
-
-    #[test]
-    fn discover_query_defaults_scope_to_resolved_endpoint_workload() {
-        let DiscoverQuery::Resolve(request) = discover_query(&DiscoverArgs {
-            workloads: Vec::new(),
-            workload_prefixes: Vec::new(),
-            resolve_workload: None,
-            resolve_endpoint: Some("tenant-a/media/router#service:camera.detect".to_string()),
-            resolve_running_workload: None,
-            resolve_replica_key: None,
-            allow_operational_processes: false,
-            json: true,
-        })
-        .expect("build discovery request") else {
-            panic!("expected resolve request");
-        };
-
-        assert_eq!(request.operation, DiscoveryOperation::Bind);
-        assert_eq!(request.scope.operations, vec![DiscoveryOperation::Bind]);
-        assert_eq!(request.scope.workloads.len(), 1);
-        assert_eq!(
-            request.scope.workloads[0],
-            DiscoveryPattern::Exact("tenant-a/media/router".to_string())
-        );
-    }
-
-    #[test]
-    fn discovery_resolution_value_preserves_running_process_fields() {
-        let value = discovery_resolution_value(&DiscoveryResolution::RunningProcess(
-            OperationalProcessRecord {
-                workload: workload_ref(
-                    "tenant-a".to_string(),
-                    "media".to_string(),
-                    "router".to_string(),
-                ),
-                replica_key: "router-0001".to_string(),
-                node: "node-a".to_string(),
-            },
-        ));
-
-        assert_eq!(
-            value.get("kind").and_then(DataValue::as_str),
-            Some("running_process")
-        );
-        assert_eq!(
-            value.get("workload").and_then(DataValue::as_str),
-            Some("tenant-a/media/router")
-        );
-        assert_eq!(
-            value.get("replica_key").and_then(DataValue::as_str),
-            Some("router-0001")
-        );
-        assert_eq!(
-            value.get("node").and_then(DataValue::as_str),
-            Some("node-a")
-        );
-    }
-
-    #[test]
-    fn discover_resolution_json_preserves_endpoint_contract_fields() {
-        let json = data_value_to_json(&discovery_resolution_value(&DiscoveryResolution::Endpoint(
-            ResolvedEndpoint {
-                endpoint: PublicEndpointRef {
-                    workload: workload_ref(
-                        "tenant-a".to_string(),
-                        "analytics".to_string(),
-                        "topology-ingress".to_string(),
-                    ),
-                    kind: ContractKind::Event,
-                    name: "ingest.frames".to_string(),
-                },
-                contract: Some(ContractRef {
-                    namespace: "analytics.topology".to_string(),
-                    kind: ContractKind::Event,
-                    name: "ingest.frames".to_string(),
-                    version: "v1".to_string(),
-                }),
-            },
-        )));
-
-        assert_eq!(
-            json,
-            concat!(
-                "{\"contract\":{\"kind\":\"event\",\"name\":\"ingest.frames\",\"namespace\":\"analytics.topology\",\"version\":\"v1\"},",
-                "\"endpoint\":{\"endpoint\":\"tenant-a/analytics/topology-ingress#event:ingest.frames\",\"kind\":\"event\",\"name\":\"ingest.frames\",\"workload\":\"tenant-a/analytics/topology-ingress\"},",
-                "\"kind\":\"endpoint\"}"
-            )
-        );
-    }
-
-    #[test]
-    fn replay_request_prefers_workload_key_filter() {
-        let request = replay_request(&ReplayArgs {
-            limit: 25,
-            since_sequence: Some(41),
-            external_account_ref: Some("acct-123".to_string()),
-            workload_key: Some("tenant-a/media/ingest".to_string()),
-            tenant: None,
-            namespace: None,
-            workload: None,
-            module: Some("ingest.wasm".to_string()),
-            pipeline: Some("tenant-a/media/camera".to_string()),
-            node: Some("node-a".to_string()),
-            json: true,
-        })
-        .expect("build replay request");
-
-        assert_eq!(request.since_sequence, Some(41));
-        assert_eq!(request.external_account_ref.as_deref(), Some("acct-123"));
-        assert_eq!(request.workload.as_deref(), Some("tenant-a/media/ingest"));
-        assert_eq!(request.module.as_deref(), Some("ingest.wasm"));
-        assert_eq!(request.pipeline.as_deref(), Some("tenant-a/media/camera"));
-        assert_eq!(request.node.as_deref(), Some("node-a"));
-    }
-
-    #[test]
-    fn replay_request_rejects_mixed_workload_filters() {
-        let err = replay_request(&ReplayArgs {
-            limit: 10,
-            since_sequence: None,
-            external_account_ref: None,
-            workload_key: Some("tenant-a/media/ingest".to_string()),
-            tenant: Some("tenant-a".to_string()),
-            namespace: Some("media".to_string()),
-            workload: Some("ingest".to_string()),
-            module: None,
-            pipeline: None,
-            node: None,
-            json: false,
-        })
-        .expect_err("mixed workload filters should fail");
-
-        assert!(
-            err.to_string()
-                .contains("either --workload-key or --tenant/--namespace/--workload")
-        );
-    }
-
-    #[test]
-    fn runtime_usage_request_preserves_filters_and_cursor() {
-        let request = runtime_usage_request(&UsageArgs {
-            node: "node-a".to_string(),
-            limit: 25,
-            latest: false,
-            since_sequence: Some(41),
-            since_timestamp_ms: None,
-            external_account_ref: Some("acct-123".to_string()),
-            workload: Some("tenant-a/media/ingest".to_string()),
-            module: Some("ingest.wasm".to_string()),
-            window_start_ms: Some(1_000),
-            window_end_ms: Some(2_000),
-            json: true,
-        })
-        .expect("build runtime usage request");
-
-        assert_eq!(request.node_id, "node-a");
-        assert_eq!(request.query.start, RuntimeUsageReplayStart::Sequence(41));
-        assert_eq!(
-            request.query.external_account_ref.as_deref(),
-            Some("acct-123")
-        );
-        assert_eq!(
-            request.query.workload.as_deref(),
-            Some("tenant-a/media/ingest")
-        );
-        assert_eq!(request.query.module.as_deref(), Some("ingest.wasm"));
-        assert_eq!(request.query.window_start_ms, Some(1_000));
-        assert_eq!(request.query.window_end_ms, Some(2_000));
-    }
-
-    #[test]
-    fn runtime_usage_response_json_preserves_cursor_fields() {
-        let json = runtime_usage_response_json(&RuntimeUsageApiResponse {
-            records: vec![RuntimeUsageRecord {
-                sequence: 41,
-                timestamp_ms: 1_500,
-                headers: BTreeMap::from([(
-                    "external_account_ref".to_string(),
-                    "acct-123".to_string(),
-                )]),
-                sample: selium_abi::RuntimeUsageSample {
-                    workload_key: "tenant-a/media/ingest".to_string(),
-                    process_id: "process-7".to_string(),
-                    attribution: selium_abi::RuntimeUsageAttribution {
-                        external_account_ref: Some("acct-123".to_string()),
-                        module_id: "ingest.wasm".to_string(),
-                    },
-                    window_start_ms: 1_000,
-                    window_end_ms: 2_000,
-                    trigger: selium_abi::RuntimeUsageSampleTrigger::Interval,
-                    cpu_time_millis: 10,
-                    memory_high_watermark_bytes: 4096,
-                    memory_byte_millis: 8192,
-                    ingress_bytes: 7,
-                    egress_bytes: 11,
-                    storage_read_bytes: 13,
-                    storage_write_bytes: 17,
-                },
-            }],
-            next_sequence: Some(42),
-            high_watermark: Some(56),
-        });
-
-        assert!(json.contains("\"next_sequence\":42"));
-        assert!(json.contains("\"high_watermark\":56"));
-        assert!(json.contains("\"memory_byte_millis\":8192"));
-        assert!(json.contains("\"module_id\":\"ingest.wasm\""));
-    }
-
-    #[test]
-    fn usage_json_preserves_external_consumer_cursor_and_attribution_fields() {
-        let json = runtime_usage_response_json(&RuntimeUsageApiResponse {
-            records: vec![RuntimeUsageRecord {
-                sequence: 41,
-                timestamp_ms: 1_500,
-                headers: BTreeMap::from([(
-                    "external_account_ref".to_string(),
-                    "acct-123".to_string(),
-                )]),
-                sample: selium_abi::RuntimeUsageSample {
-                    workload_key: "tenant-a/media/ingest".to_string(),
-                    process_id: "process-7".to_string(),
-                    attribution: selium_abi::RuntimeUsageAttribution {
-                        external_account_ref: Some("acct-123".to_string()),
-                        module_id: "ingest.wasm".to_string(),
-                    },
-                    window_start_ms: 1_000,
-                    window_end_ms: 2_000,
-                    trigger: selium_abi::RuntimeUsageSampleTrigger::Interval,
-                    cpu_time_millis: 10,
-                    memory_high_watermark_bytes: 4_096,
-                    memory_byte_millis: 8_192,
-                    ingress_bytes: 7,
-                    egress_bytes: 11,
-                    storage_read_bytes: 13,
-                    storage_write_bytes: 17,
-                },
-            }],
-            next_sequence: Some(42),
-            high_watermark: Some(56),
-        });
-
-        assert_eq!(
-            json,
-            concat!(
-                "{\"records\":[{\"sequence\":41,\"timestamp_ms\":1500,\"headers\":{\"external_account_ref\":\"acct-123\"},",
-                "\"sample\":{\"workload_key\":\"tenant-a/media/ingest\",\"process_id\":\"process-7\",\"attribution\":{\"external_account_ref\":\"acct-123\",\"module_id\":\"ingest.wasm\"},\"window_start_ms\":1000,\"window_end_ms\":2000,\"trigger\":\"Interval\",\"cpu_time_millis\":10,\"memory_high_watermark_bytes\":4096,\"memory_byte_millis\":8192,\"ingress_bytes\":7,\"egress_bytes\":11,\"storage_read_bytes\":13,\"storage_write_bytes\":17}}],\"next_sequence\":42,\"high_watermark\":56}"
-            )
-        );
-    }
-
-    #[test]
-    fn parse_guest_log_attach_selector_accepts_exact_guest_stream() {
-        let selector = parse_guest_log_attach_selector("tenant-a/media/camera#event:stdout")
-            .expect("selector");
-
-        assert_eq!(
-            selector.workload,
-            workload_ref("tenant-a".into(), "media".into(), "camera".into())
-        );
-        assert_eq!(
-            selector.stream_names().expect("streams"),
-            vec!["stdout".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_guest_log_attach_selector_expands_prefix_to_guest_streams_only() {
-        let selector =
-            parse_guest_log_attach_selector("tenant-a/media/camera#event:std*").expect("selector");
-
-        assert_eq!(
-            selector.stream_names().expect("streams"),
-            vec!["stdout".to_string(), "stderr".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_guest_log_attach_selector_rejects_non_guest_stream_targets() {
-        let err = parse_guest_log_attach_selector("tenant-a/media/camera#event:camera.frames")
-            .expect("selector")
-            .stream_names()
-            .expect_err("non-guest stream should be rejected");
-
-        assert!(err.to_string().contains("only supports guest log streams"));
-    }
-
-    #[test]
-    fn render_guest_log_payload_labels_each_line_when_multiple_streams_are_attached() {
-        let endpoint = PublicEndpointRef {
-            workload: workload_ref("tenant-a".into(), "media".into(), "camera".into()),
-            kind: ContractKind::Event,
-            name: "stderr".to_string(),
-        };
-
-        let rendered = render_guest_log_payload(&endpoint, b"first\nsecond\n", true);
-        let rendered = String::from_utf8(rendered).expect("utf8");
-
-        assert_eq!(rendered, "[stderr] first\n[stderr] second\n");
-    }
-}
+mod tests;

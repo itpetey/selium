@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 use selium_control_plane_api::{
     BandwidthProfile, DeploymentSpec, ExternalAccountRef, IsolationProfile, WorkloadRef,
 };
-use selium_control_plane_runtime::Mutation;
+use selium_control_plane_core::Mutation;
 
 use support::cluster_harness::{ClusterHarness, ClusterHarnessConfig};
 

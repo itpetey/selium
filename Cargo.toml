@@ -3,7 +3,9 @@ resolver = "2"
 members = [
   "crates/abi",
   "crates/cli",
+  "crates/control-plane/agent",
   "crates/control-plane/api",
+  "crates/control-plane/core",
   "crates/control-plane/protocol",
   "crates/control-plane/runtime",
   "crates/control-plane/scheduler",
@@ -18,6 +20,7 @@ members = [
   "crates/runtime/adaptors/spi",
   "crates/runtime/adaptors/wasmtime-adaptor",
   "crates/runtime/network",
+  "crates/runtime/support",
   "crates/runtime/service",
   "crates/runtime/storage",
   "crates/sdk/rust",
@@ -86,6 +89,8 @@ selium-guest = { path = "crates/guest", version = "1.0.0-alpha.6" }
 selium-kernel = { path = "crates/kernel", version = "1.0.0-alpha.6" }
 
 selium-control-plane-api = { path = "crates/control-plane/api", version = "1.0.0-alpha.6" }
+selium-control-plane-agent = { path = "crates/control-plane/agent", version = "1.0.0-alpha.6" }
+selium-control-plane-core = { path = "crates/control-plane/core", version = "1.0.0-alpha.6" }
 selium-control-plane-protocol = { path = "crates/control-plane/protocol", version = "1.0.0-alpha.6" }
 selium-control-plane-runtime = { path = "crates/control-plane/runtime", version = "1.0.0-alpha.6" }
 selium-control-plane-scheduler = { path = "crates/control-plane/scheduler", version = "1.0.0-alpha.6" }
@@ -98,6 +103,7 @@ selium-runtime-adaptor-microvm = { path = "crates/runtime/adaptors/microvm-adapt
 selium-runtime-adaptor-spi = { path = "crates/runtime/adaptors/spi", version = "1.0.0-alpha.6" }
 selium-runtime-adaptor-wasmtime = { path = "crates/runtime/adaptors/wasmtime-adaptor", version = "1.0.0-alpha.6" }
 selium-runtime-network = { path = "crates/runtime/network", version = "1.0.0-alpha.6" }
+selium-runtime-support = { path = "crates/runtime/support", version = "1.0.0-alpha.6" }
 selium-runtime-storage = { path = "crates/runtime/storage", version = "1.0.0-alpha.6" }
 
 [workspace.lints.rust]

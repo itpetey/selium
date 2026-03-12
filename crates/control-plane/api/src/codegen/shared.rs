@@ -2,72 +2,9 @@ use proc_macro2::{Ident, Literal, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::{
-    ContractPackage, EventDef, SchemaDef, ServiceBodyDef, ServiceBodyMode, ServiceDef,
-    ServiceFieldBinding, StreamDef,
+    EventDef, SchemaDef, ServiceBodyDef, ServiceBodyMode, ServiceDef, ServiceFieldBinding,
+    StreamDef,
 };
-
-pub(super) fn runtime_helper_tokens(package: &ContractPackage) -> TokenStream {
-    if package.services.is_empty() && package.streams.is_empty() {
-        return TokenStream::new();
-    }
-
-    quote! {
-        #[allow(dead_code)]
-        fn __selium_extract_path_params(
-            template: &str,
-            actual: &str,
-        ) -> Option<std::collections::BTreeMap<String, String>> {
-            let template_segments = if template.trim_matches('/').is_empty() {
-                Vec::new()
-            } else {
-                template.trim_matches('/').split('/').collect::<Vec<_>>()
-            };
-            let actual_segments = if actual.trim_matches('/').is_empty() {
-                Vec::new()
-            } else {
-                actual.trim_matches('/').split('/').collect::<Vec<_>>()
-            };
-            if template_segments.len() != actual_segments.len() {
-                return None;
-            }
-            let mut params = std::collections::BTreeMap::new();
-            for (template_segment, actual_segment) in
-                template_segments.into_iter().zip(actual_segments)
-            {
-                if template_segment.starts_with('{')
-                    && template_segment.ends_with('}')
-                    && template_segment.len() > 2
-                {
-                    params.insert(
-                        template_segment[1..template_segment.len() - 1].to_string(),
-                        actual_segment.to_string(),
-                    );
-                } else if template_segment != actual_segment {
-                    return None;
-                }
-            }
-            Some(params)
-        }
-
-        #[allow(dead_code)]
-        async fn __selium_read_stream_message(
-            stream: &selium_guest::network::StreamChannel,
-            max_bytes: u32,
-            timeout_ms: u32,
-        ) -> anyhow::Result<Vec<u8>> {
-            let mut payload = Vec::new();
-            loop {
-                let Some(chunk) = stream.recv(max_bytes, timeout_ms).await? else {
-                    continue;
-                };
-                payload.extend_from_slice(&chunk.bytes);
-                if chunk.finish {
-                    return Ok(payload);
-                }
-            }
-        }
-    }
-}
 
 pub(super) fn schema_tokens(schema: &SchemaDef) -> TokenStream {
     let schema_ident = type_ident(&schema.name);

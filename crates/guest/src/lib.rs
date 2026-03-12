@@ -110,6 +110,7 @@ macro_rules! driver_module {
 
 pub mod abi;
 mod r#async;
+pub mod bindings;
 pub mod driver;
 pub mod durability;
 mod guest_log;

@@ -6,10 +6,7 @@ use quote::quote;
 
 use crate::ContractPackage;
 
-use self::shared::{
-    event_const_tokens, runtime_helper_tokens, schema_tokens, service_const_tokens,
-    stream_const_tokens,
-};
+use self::shared::{event_const_tokens, schema_tokens, service_const_tokens, stream_const_tokens};
 use self::transports::{
     generate_http_service_module, generate_quic_service_module, generate_stream_module,
 };
@@ -36,7 +33,6 @@ fn generate_rust_bindings_tokens(package: &ContractPackage) -> TokenStream {
     } else {
         TokenStream::new()
     };
-    let runtime_helpers = runtime_helper_tokens(package);
     let schemas = package.schemas.iter().map(schema_tokens);
     let events = package.events.iter().map(event_const_tokens);
     let services = package.services.iter().map(service_const_tokens);
@@ -54,44 +50,12 @@ fn generate_rust_bindings_tokens(package: &ContractPackage) -> TokenStream {
 
     quote! {
         #context_import
+        #[allow(unused_imports)]
+        pub use selium_guest::bindings::{
+            ServiceBinding, ServiceBodyBinding, ServiceBodyMode, ServiceFieldBinding,
+            SELIUM_CONTRACT_CODEC_MAJOR_VERSION,
+        };
         use rkyv::{Archive, Deserialize, Serialize};
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum ServiceBodyMode {
-            None,
-            Buffered,
-            Stream,
-        }
-
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct ServiceBodyBinding {
-            pub mode: ServiceBodyMode,
-            pub schema: Option<&'static str>,
-        }
-
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct ServiceFieldBinding {
-            pub field: &'static str,
-            pub target: &'static str,
-        }
-
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub struct ServiceBinding {
-            pub name: &'static str,
-            pub request_schema: &'static str,
-            pub response_schema: &'static str,
-            pub protocol: Option<&'static str>,
-            pub method: Option<&'static str>,
-            pub path: Option<&'static str>,
-            pub request_headers: &'static [ServiceFieldBinding],
-            pub request_body: ServiceBodyBinding,
-            pub response_body: ServiceBodyBinding,
-        }
-
-        pub const SELIUM_CONTRACT_CODEC_MAJOR_VERSION: u8 =
-            selium_abi::CONTRACT_CODEC_MAJOR_VERSION;
-
-        #runtime_helpers
 
         #(#schemas)*
         #(#events)*

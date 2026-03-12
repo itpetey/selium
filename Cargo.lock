@@ -1578,10 +1578,13 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "selium-abi",
+ "selium-control-plane-agent",
  "selium-control-plane-api",
+ "selium-control-plane-core",
  "selium-control-plane-protocol",
  "selium-control-plane-runtime",
- "selium-module-control-plane",
+ "selium-control-plane-scheduler",
+ "selium-runtime-support",
  "serde",
  "tokio",
  "toml",
@@ -1594,6 +1597,16 @@ dependencies = [
  "rkyv",
  "selium-control-plane-api",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "selium-control-plane-agent"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "rkyv",
+ "selium-control-plane-api",
+ "selium-control-plane-protocol",
+ "selium-control-plane-scheduler",
 ]
 
 [[package]]
@@ -1612,6 +1625,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-control-plane-core"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "rkyv",
+ "selium-abi",
+ "selium-control-plane-api",
+ "selium-io-tables",
+]
+
+[[package]]
 name = "selium-control-plane-protocol"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -1619,9 +1642,8 @@ dependencies = [
  "rkyv",
  "selium-abi",
  "selium-control-plane-api",
- "selium-control-plane-runtime",
+ "selium-control-plane-core",
  "selium-io-consensus",
- "tokio",
 ]
 
 [[package]]
@@ -1631,6 +1653,7 @@ dependencies = [
  "rkyv",
  "selium-abi",
  "selium-control-plane-api",
+ "selium-control-plane-core",
  "selium-control-plane-scheduler",
  "selium-io-consensus",
  "selium-io-tables",
@@ -1770,6 +1793,7 @@ dependencies = [
 name = "selium-guest"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "futures",
  "rkyv",
  "selium-abi",
@@ -1851,7 +1875,9 @@ dependencies = [
  "anyhow",
  "rkyv",
  "selium-abi",
+ "selium-control-plane-agent",
  "selium-control-plane-api",
+ "selium-control-plane-core",
  "selium-control-plane-protocol",
  "selium-control-plane-runtime",
  "selium-control-plane-scheduler",
@@ -1883,16 +1909,19 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "selium-abi",
+ "selium-control-plane-agent",
  "selium-control-plane-api",
+ "selium-control-plane-core",
  "selium-control-plane-protocol",
+ "selium-control-plane-runtime",
  "selium-io-durability",
  "selium-kernel",
- "selium-module-control-plane",
  "selium-runtime-adaptor-microvm",
  "selium-runtime-adaptor-spi",
  "selium-runtime-adaptor-wasmtime",
  "selium-runtime-network",
  "selium-runtime-storage",
+ "selium-runtime-support",
  "serde",
  "tokio",
  "toml",
@@ -1937,8 +1966,8 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "selium-abi",
- "selium-control-plane-protocol",
  "selium-kernel",
+ "selium-runtime-support",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -1956,6 +1985,21 @@ dependencies = [
  "selium-kernel",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "selium-runtime-support"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "anyhow",
+ "quinn",
+ "rustls",
+ "rustls-pemfile",
+ "selium-abi",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "toml",
 ]
 
 [[package]]

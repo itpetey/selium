@@ -275,7 +275,7 @@ pub(super) fn generate_http_service_module(
                 if head.method != #method {
                     return Err(anyhow::anyhow!(#unexpected_method_msg, head.method));
                 }
-                let params = __selium_extract_path_params(#path, &head.path)
+                let params = selium_guest::bindings::extract_path_params(#path, &head.path)
                     .ok_or_else(|| anyhow::anyhow!(#unexpected_path_msg, head.path))?;
                 Ok(#request_type {
                     #(#request_inits)*
@@ -485,7 +485,9 @@ pub(super) fn generate_stream_module(stream: &StreamDef) -> TokenStream {
                 max_bytes: u32,
                 timeout_ms: u32,
             ) -> anyhow::Result<#payload_type> {
-                let payload = __selium_read_stream_message(stream, max_bytes, timeout_ms).await?;
+                let payload =
+                    selium_guest::bindings::read_stream_message(stream, max_bytes, timeout_ms)
+                        .await?;
                 #recv_expr
             }
         }

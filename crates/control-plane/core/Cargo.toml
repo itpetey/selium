@@ -1,0 +1,11 @@
+[package]
+name = "selium-control-plane-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+rkyv = { workspace = true }
+selium-abi = { workspace = true }
+selium-control-plane-api = { workspace = true }
+selium-io-tables = { workspace = true }

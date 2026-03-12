@@ -7,25 +7,37 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptorKind {
+    /// Run workloads in the Wasmtime-based adaptor.
     Wasmtime,
+    /// Run workloads in the microVM-based adaptor.
     Microvm,
 }
 
+/// Execution isolation profiles understood by runtime adaptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionProfile {
+    /// Standard process isolation.
     Standard,
+    /// Hardened process isolation.
     Hardened,
+    /// Dedicated microVM isolation.
     Microvm,
 }
 
+/// Validated module launch specification passed to runtime adaptors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
+    /// Logical module identifier or path.
     pub module_id: String,
+    /// Guest entrypoint to invoke.
     pub entrypoint: String,
+    /// Capabilities granted to the workload.
     pub capabilities: Vec<Capability>,
+    /// Required execution profile.
     pub profile: ExecutionProfile,
 }
 
+/// Errors raised while resolving or validating adaptor execution.
 #[derive(Debug, Error)]
 pub enum AdaptorError {
     #[error("adaptor not configured")]
@@ -38,11 +50,17 @@ pub enum AdaptorError {
     NotExecutable(AdaptorKind),
 }
 
+/// Common interface implemented by runtime adaptors.
 pub trait RuntimeAdaptor {
+    /// Return the adaptor kind identifier.
     fn kind(&self) -> AdaptorKind;
+    /// Return the human-readable adaptor name.
     fn adaptor_name(&self) -> &'static str;
+    /// Return the execution profiles supported by this adaptor.
     fn supported_profiles(&self) -> &'static [ExecutionProfile];
+    /// Validate a module specification before launch.
     fn validate(&self, spec: &ModuleSpec) -> Result<(), AdaptorError>;
+    /// Report whether the adaptor can execute workloads on the current node.
     fn executable(&self) -> bool {
         true
     }

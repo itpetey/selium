@@ -2,7 +2,7 @@
 //! Today it validates its own contract types locally while the control plane models the deployment graph.
 
 use anyhow::{Context, Result};
-use selium_abi::{DataValue, decode_rkyv, encode_rkyv};
+use selium_abi::DataValue;
 use selium_guest::io;
 
 #[allow(dead_code)]
@@ -15,7 +15,6 @@ const RECV_TIMEOUT_MS: u32 = 1_000;
 
 #[selium_guest::entrypoint]
 pub async fn start(bindings: DataValue) -> Result<()> {
-    let bindings = encode_rkyv(&bindings).context("encode processor managed-event bindings")?;
     let mut reader = io::managed_event_reader(&bindings, bindings::EVENT_INGEST_FRAMES)
         .await
         .context("attach processor ingest reader")?;
@@ -25,23 +24,19 @@ pub async fn start(bindings: DataValue) -> Result<()> {
 
     loop {
         let Some(frame) = reader
-            .recv(RECV_TIMEOUT_MS)
+            .recv_typed::<Frame>(RECV_TIMEOUT_MS)
             .await
             .context("receive ingest frame")?
         else {
             continue;
         };
-        let frame = decode_rkyv::<Frame>(&frame.payload).context("decode ingest frame")?;
         let enriched = EnrichedFrame {
-            source: frame.source,
-            seq: frame.seq,
+            source: frame.payload.source,
+            seq: frame.payload.seq,
             stage: "normalized".to_string(),
         };
         writer
-            .send(
-                &encode_rkyv(&enriched).context("encode enriched frame")?,
-                SEND_TIMEOUT_MS,
-            )
+            .send_typed(&enriched, SEND_TIMEOUT_MS)
             .await
             .with_context(|| format!("forward enriched frame {}", enriched.seq))?;
     }

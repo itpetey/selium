@@ -21,8 +21,8 @@ quinn = { workspace = true, features = ["platform-verifier", "runtime-tokio", "r
 rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
 selium-abi = { workspace = true }
-selium-control-plane-protocol = { workspace = true }
 selium-kernel = { workspace = true, features = ["services"] }
+selium-runtime-support = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 tokio-rustls = { workspace = true, features = ["ring"] }

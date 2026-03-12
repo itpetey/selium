@@ -1,15 +1,15 @@
-use std::{
-    ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
-use selium_module_control_plane::api::IsolationProfile;
+use selium_control_plane_api::IsolationProfile;
+use selium_runtime_support::load_toml_config;
 use serde::Deserialize;
+
+#[cfg(test)]
+use std::fs;
 
 #[derive(Debug, Parser)]
 #[command(name = "selium", about = "Selium platform CLI")]
@@ -1657,15 +1657,6 @@ fn should_apply_config(source: Option<ValueSource>) -> bool {
 
 fn required_arg<T>(name: &str, value: Option<T>) -> Result<T> {
     value.ok_or_else(|| anyhow!("missing required configuration for `{name}`"))
-}
-
-fn load_toml_config<T>(path: &Path) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("read config file {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("parse TOML config {}", path.display()))
 }
 
 #[cfg(test)]

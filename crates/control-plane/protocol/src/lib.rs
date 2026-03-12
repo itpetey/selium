@@ -11,9 +11,8 @@ use selium_abi::{
     DataValue, RkyvEncode, RuntimeUsageQuery, RuntimeUsageRecord, decode_rkyv, encode_rkyv,
 };
 use selium_control_plane_api::{ContractKind, OperationalProcessSelector, PublicEndpointRef};
-use selium_control_plane_runtime::{Mutation, Query};
+use selium_control_plane_core::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const FLAG_REQUEST: u16 = 0x01;
@@ -595,32 +594,6 @@ fn encode_envelope(envelope: &Envelope) -> Result<Vec<u8>> {
     out.extend_from_slice(&payload_len.to_be_bytes());
     out.extend_from_slice(&envelope.payload);
     Ok(out)
-}
-
-pub async fn write_framed<W>(writer: &mut W, payload: &[u8]) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let len: u32 = payload
-        .len()
-        .try_into()
-        .map_err(|_| anyhow!("frame too large"))?;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-pub async fn read_framed<R>(reader: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok(payload)
 }
 
 #[cfg(test)]

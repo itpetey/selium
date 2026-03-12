@@ -139,6 +139,17 @@ pub enum DataValue {
     Map(#[rkyv(omit_bounds)] BTreeMap<String, DataValue>),
 }
 
+/// Errors raised while encoding or decoding length-prefixed frames.
+#[derive(Debug, Error)]
+pub enum FramingError {
+    #[error("frame payload exceeds u32 length prefix")]
+    PayloadTooLarge,
+    #[error("frame shorter than 4-byte length prefix")]
+    MissingLengthPrefix,
+    #[error("frame payload length mismatch: expected {expected}, got {actual}")]
+    LengthMismatch { expected: usize, actual: usize },
+}
+
 impl DataValue {
     /// Construct a null value.
     pub fn null() -> Self {
@@ -192,6 +203,117 @@ impl DataValue {
         match self {
             DataValue::U64(value) => Some(*value),
             _ => None,
+        }
+    }
+}
+
+/// Encode a payload as a big-endian length-prefixed frame.
+pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FramingError> {
+    let len = u32::try_from(payload.len()).map_err(|_| FramingError::PayloadTooLarge)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Decode the payload from a complete big-endian length-prefixed frame.
+pub fn decode_frame(frame: &[u8]) -> Result<Vec<u8>, FramingError> {
+    let payload_len = decode_frame_len(frame.get(..4).ok_or(FramingError::MissingLengthPrefix)?)?;
+    let payload = frame
+        .get(4..)
+        .ok_or(FramingError::MissingLengthPrefix)?
+        .to_vec();
+    if payload.len() != payload_len {
+        return Err(FramingError::LengthMismatch {
+            expected: payload_len,
+            actual: payload.len(),
+        });
+    }
+    Ok(payload)
+}
+
+/// Decode the payload length from a 4-byte big-endian frame prefix.
+pub fn decode_frame_len(prefix: &[u8]) -> Result<usize, FramingError> {
+    let bytes = prefix
+        .try_into()
+        .map_err(|_| FramingError::MissingLengthPrefix)?;
+    Ok(u32::from_be_bytes(bytes) as usize)
+}
+
+/// Render a [`DataValue`] into compact JSON.
+pub fn data_value_to_json(value: &DataValue) -> String {
+    let mut out = String::new();
+    write_data_value_json(&mut out, value);
+    out
+}
+
+fn write_data_value_json(out: &mut String, value: &DataValue) {
+    use std::fmt::Write as _;
+
+    match value {
+        DataValue::Null => out.push_str("null"),
+        DataValue::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        DataValue::U64(value) => {
+            let _ = write!(out, "{value}");
+        }
+        DataValue::I64(value) => {
+            let _ = write!(out, "{value}");
+        }
+        DataValue::String(value) => {
+            out.push('"');
+            write_json_string_content(out, value);
+            out.push('"');
+        }
+        DataValue::Bytes(bytes) => {
+            out.push('[');
+            for (idx, byte) in bytes.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{byte}");
+            }
+            out.push(']');
+        }
+        DataValue::List(values) => {
+            out.push('[');
+            for (idx, item) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_data_value_json(out, item);
+            }
+            out.push(']');
+        }
+        DataValue::Map(values) => {
+            out.push('{');
+            for (idx, (key, item)) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                write_json_string_content(out, key);
+                out.push_str("\":");
+                write_data_value_json(out, item);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_json_string_content(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
         }
     }
 }

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
-    DiscoverableWorkload, DiscoveryState, GUEST_LOG_STDERR_ENDPOINT, GUEST_LOG_STDOUT_ENDPOINT,
-    ExternalAccountRef, IsolationProfile, NodeSpec, PipelineEndpoint, PipelineSpec,
+    DiscoverableWorkload, DiscoveryState, ExternalAccountRef, GUEST_LOG_STDERR_ENDPOINT,
+    GUEST_LOG_STDOUT_ENDPOINT, IsolationProfile, NodeSpec, PipelineEndpoint, PipelineSpec,
     PublicEndpointRef, WorkloadRef,
 };
 

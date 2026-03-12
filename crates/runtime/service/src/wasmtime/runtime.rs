@@ -1268,9 +1268,8 @@ mod tests {
                 |region: &mut ShmRegion| *region,
             )
             .expect("region");
-        let bytes = shared_memory
+        shared_memory
             .read(region, offset, len)
-            .expect("read region");
-        bytes
+            .expect("read region")
     }
 }
