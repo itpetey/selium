@@ -12,6 +12,8 @@ Run commands from repo root:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace --all-targets`
 
+Use `cargo check -p <crate>` / `cargo test -p <crate>` for package-scoped default-feature iteration while developing a focused change. Treat the workspace commands above as the repo-wide baseline mirrored by CI, and keep any non-default feature verification package-scoped and explicit.
+
 For WASM modules, build any module crate with `--target wasm32-unknown-unknown`, e.g. `cargo build --release --target wasm32-unknown-unknown -p selium-module-control-plane`.
 
 ## Coding Style & Naming Conventions

@@ -43,6 +43,39 @@
 //! assert_eq!(event.id, 7);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! # External-consumer replay handoff
+//!
+//! ```no_run
+//! use selium_io_durability::ReplayStart;
+//! use selium_sdk_rust::Context;
+//!
+//! async fn consume_external_feed(
+//!     context: &Context,
+//!     mut next_sequence: u64,
+//! ) -> Result<(), Box<dyn std::error::Error>> {
+//!     let replay = context.replay_frames(
+//!         "usage.events",
+//!         ReplayStart::Sequence(next_sequence),
+//!         256,
+//!     )?;
+//!
+//!     for frame in &replay {
+//!         let external_account_ref = frame.headers.get("external_account_ref");
+//!         let _ = (external_account_ref, &frame.payload);
+//!         next_sequence = frame.sequence + 1;
+//!     }
+//!
+//!     let mut subscriber = context.byte_subscriber(
+//!         "usage.events",
+//!         ReplayStart::Sequence(next_sequence),
+//!     )?;
+//!     let frame = subscriber.recv_frame().await?;
+//!     next_sequence = frame.sequence + 1;
+//!     let _ = next_sequence;
+//!     Ok(())
+//! }
+//! ```
 
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 

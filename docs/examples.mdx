@@ -9,6 +9,15 @@ The examples do not all use the same operational path: `control-plane-topology` 
 
 Start with the shared setup in [examples/README.md](https://github.com/itpetey/selium/tree/main/examples). If you only read one example first, read [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology): it shows the current `idl publish` → `deploy` → `connect` → `agent --once` workflow end to end. Keep [Guest API](./applications) nearby for `selium-guest` reference details while you work through the guest examples.
 
+## External-consumer follow-up
+
+If you are using an example to seed a real topology and then hand Selium data to an external consumer:
+
+- start with [control-plane-topology](https://github.com/itpetey/selium/tree/main/examples/control-plane-topology) for a concrete `idl publish` → `deploy` → `connect` → `agent --once` setup
+- then read [CLI](./cli) for the external-consumer adoption cookbook covering inventory bootstrap, discovery, replay, and usage handoff
+- use the CLI page's troubleshooting appendix when the bootstrap or resume cursor handoff is unclear
+- keep [Rust SDK](./rust-sdk) nearby if the downstream consumer is a host-side Rust process rather than a guest module
+
 ## Choose by workflow
 
 ### Control-plane-managed workloads
@@ -63,4 +72,4 @@ If you are looking for host-side Rust integrations instead of guest modules, use
 
 All example READMEs follow the same basic shape: `## Setup`, `## Contracts`, and `## Usage`. If you are updating a contract, regenerate the checked-in bindings before you build or deploy the example.
 
-Need the reference docs behind the examples? Read [Guest API](./applications) for `selium-guest`, [Rust SDK](./rust-sdk) for host-side channel workflows, and [Control Plane](./control-plane) for the reconciled `idl publish` → `deploy` → `connect` → `agent` path.
+Need the reference docs behind the examples? Read [Guest API](./applications) for `selium-guest`, [Rust SDK](./rust-sdk) for host-side channel workflows, [CLI](./cli) for the external-consumer cookbook and troubleshooting appendix, and [Control Plane](./control-plane) for the reconciled `idl publish` → `deploy` → `connect` → `agent` path.
