@@ -3,9 +3,10 @@
 use std::{convert::TryFrom, future::ready, sync::Arc};
 
 use selium_abi::{
-    GuestResourceId, GuestUint, QueueAck, QueueAttach, QueueClose, QueueCommit, QueueCreate,
-    QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult, QueueShare, QueueStats,
-    QueueStatsResult, QueueStatus, QueueStatusCode, QueueWait, QueueWaitResult, ShmRegion,
+    Capability, GuestResourceId, GuestUint, QueueAck, QueueAttach, QueueClose, QueueCommit,
+    QueueCreate, QueueDescriptor, QueueEndpoint, QueueReserve, QueueReserveResult, QueueRole,
+    QueueShare, QueueStats, QueueStatsResult, QueueStatus, QueueStatusCode, QueueWait,
+    QueueWaitResult, ShmRegion,
 };
 
 use crate::{
@@ -69,11 +70,13 @@ where
         let inner = self.0.clone();
 
         let result = (|| -> GuestResult<QueueDescriptor> {
+            super::ensure_capability_authorised(context.registry(), Capability::QueueLifecycle)?;
             let queue = inner.create(input).map_err(Into::into)?;
             let slot = context
                 .registry_mut()
                 .insert(queue, None, ResourceType::Queue)
                 .map_err(GuestError::from)?;
+            super::grant_registered_slot(context.registry(), slot, &[Capability::QueueLifecycle])?;
             let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
             let shared_id = context
                 .registry()
@@ -107,7 +110,11 @@ impl Contract for QueueShareDriver {
         let result = (|| -> GuestResult<GuestResourceId> {
             let slot =
                 usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
-            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let resource_id = super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueLifecycle,
+                slot,
+            )?;
             let meta = context
                 .registry()
                 .registry()
@@ -146,11 +153,12 @@ where
         let inner = self.0.clone();
 
         let result = (|| -> GuestResult<QueueEndpoint> {
-            let queue_id = context
-                .registry()
-                .registry()
-                .resolve_shared(input.shared_id)
-                .ok_or(GuestError::NotFound)?;
+            let endpoint_capability = queue_endpoint_capability(input.role);
+            let queue_id = super::ensure_shared_resource_authorised_any(
+                context.registry(),
+                &[Capability::QueueLifecycle, endpoint_capability],
+                input.shared_id,
+            )?;
             let meta = context
                 .registry()
                 .registry()
@@ -172,6 +180,11 @@ where
                 .registry_mut()
                 .insert(endpoint, None, ResourceType::QueueEndpoint)
                 .map_err(GuestError::from)?;
+            super::grant_registered_slot(
+                context.registry(),
+                slot,
+                &[Capability::QueueLifecycle, endpoint_capability],
+            )?;
             let resource_id = GuestUint::try_from(slot).map_err(|_| GuestError::InvalidArgument)?;
 
             Ok(QueueEndpoint { resource_id })
@@ -207,6 +220,7 @@ where
                 .registry()
                 .metadata(resource_id)
                 .ok_or(GuestError::NotFound)?;
+            authorise_queue_close(context.registry(), slot, meta.kind)?;
 
             match meta.kind {
                 ResourceType::Queue => {
@@ -231,6 +245,30 @@ where
     }
 }
 
+fn authorise_queue_close(
+    registry: &crate::registry::InstanceRegistry,
+    slot: usize,
+    kind: ResourceType,
+) -> GuestResult<()> {
+    let capabilities = match kind {
+        ResourceType::Queue => &[Capability::QueueLifecycle][..],
+        ResourceType::QueueEndpoint => &[
+            Capability::QueueLifecycle,
+            Capability::QueueReader,
+            Capability::QueueWriter,
+        ][..],
+        _ => return Err(GuestError::InvalidArgument),
+    };
+    super::ensure_slot_authorised_any(registry, capabilities, slot).map(|_| ())
+}
+
+fn queue_endpoint_capability(role: QueueRole) -> Capability {
+    match role {
+        QueueRole::Reader => Capability::QueueReader,
+        QueueRole::Writer { .. } => Capability::QueueWriter,
+    }
+}
+
 impl<Impl> Contract for QueueStatsDriver<Impl>
 where
     Impl: QueueCapability + Clone + Send + 'static,
@@ -250,6 +288,7 @@ where
 
         let result = (|| -> GuestResult<QueueStatsResult> {
             let slot = usize::try_from(input.queue_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(context.registry(), Capability::QueueLifecycle, slot)?;
             let queue = context
                 .registry()
                 .with::<QueueState, _>(slot, |queue| queue.clone())
@@ -285,6 +324,11 @@ where
         let result = (|| -> GuestResult<(QueueEndpointState, QueueReserve)> {
             let endpoint_slot =
                 usize::try_from(input.endpoint_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueWriter,
+                endpoint_slot,
+            )?;
             let endpoint = context
                 .registry()
                 .with::<QueueEndpointState, _>(endpoint_slot, |endpoint| endpoint.clone())
@@ -319,6 +363,11 @@ where
         let result = (|| -> GuestResult<QueueStatus> {
             let endpoint_slot =
                 usize::try_from(input.endpoint_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueWriter,
+                endpoint_slot,
+            )?;
             let endpoint = context
                 .registry()
                 .with::<QueueEndpointState, _>(endpoint_slot, |endpoint| endpoint.clone())
@@ -338,11 +387,11 @@ where
                 return Ok(status);
             }
 
-            let shm_id = context
-                .registry()
-                .registry()
-                .resolve_shared(input.shm_shared_id)
-                .ok_or(GuestError::NotFound)?;
+            let shm_id = super::ensure_shared_resource_authorised(
+                context.registry(),
+                Capability::SharedMemory,
+                input.shm_shared_id,
+            )?;
             let meta = context
                 .registry()
                 .registry()
@@ -393,6 +442,11 @@ where
         let result = (|| -> GuestResult<QueueStatus> {
             let endpoint_slot =
                 usize::try_from(input.endpoint_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueWriter,
+                endpoint_slot,
+            )?;
             let endpoint = context
                 .registry()
                 .with::<QueueEndpointState, _>(endpoint_slot, |endpoint| endpoint.clone())
@@ -426,6 +480,11 @@ where
         let result = (|| -> GuestResult<(QueueEndpointState, u32)> {
             let endpoint_slot =
                 usize::try_from(input.endpoint_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueReader,
+                endpoint_slot,
+            )?;
             let endpoint = context
                 .registry()
                 .with::<QueueEndpointState, _>(endpoint_slot, |endpoint| endpoint.clone())
@@ -460,6 +519,11 @@ where
         let result = (|| -> GuestResult<QueueStatus> {
             let endpoint_slot =
                 usize::try_from(input.endpoint_id).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_slot_authorised(
+                context.registry(),
+                Capability::QueueReader,
+                endpoint_slot,
+            )?;
             let endpoint = context
                 .registry()
                 .with::<QueueEndpointState, _>(endpoint_slot, |endpoint| endpoint.clone())
@@ -518,4 +582,230 @@ where
             selium_abi::hostcall_contract!(QUEUE_ACK),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::{HashMap, HashSet};
+
+    use selium_abi::{QueueAttach, QueueCreate, QueueDelivery, QueueOverflow, QueueRole};
+
+    use crate::{
+        registry::Registry,
+        services::{
+            queue_service::QueueService,
+            session_service::{ResourceScope, RootSession, Session, SessionAuthnMethod},
+        },
+    };
+
+    struct TestContext {
+        registry: crate::registry::InstanceRegistry,
+    }
+
+    impl HostcallContext for TestContext {
+        fn registry(&self) -> &crate::registry::InstanceRegistry {
+            &self.registry
+        }
+
+        fn registry_mut(&mut self) -> &mut crate::registry::InstanceRegistry {
+            &mut self.registry
+        }
+
+        fn mailbox_base(&mut self) -> Option<usize> {
+            None
+        }
+    }
+
+    fn registry_with_capabilities(
+        capabilities: Vec<Capability>,
+    ) -> crate::registry::InstanceRegistry {
+        let registry = Registry::new();
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(Session::bootstrap(capabilities, [0; 32])))
+            .expect("root session");
+        instance
+    }
+
+    fn registry_with_scoped_entitlements(
+        entitlements: HashMap<Capability, ResourceScope>,
+    ) -> crate::registry::InstanceRegistry {
+        let registry = Registry::new();
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(Session::bootstrap_with_scoped_principal(
+                entitlements,
+                [0; 32],
+                selium_abi::PrincipalRef::new(selium_abi::PrincipalKind::Internal, "runtime"),
+                SessionAuthnMethod::Delegated,
+            )))
+            .expect("root session");
+        instance
+    }
+
+    #[test]
+    fn queue_close_allows_reader_holders_to_close_endpoints() {
+        let instance = registry_with_capabilities(vec![Capability::QueueReader]);
+        let slot = instance
+            .registrar()
+            .insert((), None, ResourceType::QueueEndpoint)
+            .expect("insert endpoint");
+
+        authorise_queue_close(&instance, slot, ResourceType::QueueEndpoint)
+            .expect("endpoint close should be authorised");
+    }
+
+    #[test]
+    fn queue_close_still_requires_lifecycle_for_queue_roots() {
+        let instance = registry_with_capabilities(vec![Capability::QueueReader]);
+        let slot = instance
+            .registrar()
+            .insert((), None, ResourceType::Queue)
+            .expect("insert queue");
+
+        let err = authorise_queue_close(&instance, slot, ResourceType::Queue)
+            .expect_err("queue close should require lifecycle");
+        assert!(matches!(err, GuestError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn queue_attach_allows_reader_scope_on_shared_queue() {
+        let driver = QueueAttachDriver(QueueService);
+        let mut instance = registry_with_scoped_entitlements(HashMap::from([(
+            Capability::QueueReader,
+            ResourceScope::Some(HashSet::new()),
+        )]));
+        let queue = QueueService
+            .create(QueueCreate {
+                capacity_frames: 8,
+                max_frame_bytes: 128,
+                delivery: QueueDelivery::Lossless,
+                overflow: QueueOverflow::Block,
+            })
+            .expect("create queue");
+        let slot = instance
+            .insert(queue, None, ResourceType::Queue)
+            .expect("insert queue");
+        let resource_id = instance.entry(slot).expect("resource id");
+        let shared_id = instance
+            .registry()
+            .share_handle(resource_id)
+            .expect("share queue");
+        instance
+            .registrar()
+            .grant_root_session_resources(&[Capability::QueueReader], resource_id)
+            .expect("grant reader scope");
+        let mut ctx = TestContext { registry: instance };
+
+        let endpoint = driver
+            .to_future(
+                &mut ctx,
+                QueueAttach {
+                    shared_id,
+                    role: QueueRole::Reader,
+                },
+            )
+            .await
+            .expect("reader attach should succeed");
+
+        assert!(endpoint.resource_id > 0);
+        authorise_queue_close(
+            ctx.registry(),
+            endpoint.resource_id as usize,
+            ResourceType::QueueEndpoint,
+        )
+        .expect("scoped reader should retain endpoint access");
+    }
+
+    #[tokio::test]
+    async fn queue_attach_reader_scope_does_not_gain_writer_access() {
+        let driver = QueueAttachDriver(QueueService);
+        let reserve_driver = QueueReserveDriver(QueueService);
+        let mut instance = registry_with_scoped_entitlements(HashMap::from([(
+            Capability::QueueReader,
+            ResourceScope::Some(HashSet::new()),
+        )]));
+        let queue = QueueService
+            .create(QueueCreate {
+                capacity_frames: 8,
+                max_frame_bytes: 128,
+                delivery: QueueDelivery::Lossless,
+                overflow: QueueOverflow::Block,
+            })
+            .expect("create queue");
+        let slot = instance
+            .insert(queue, None, ResourceType::Queue)
+            .expect("insert queue");
+        let resource_id = instance.entry(slot).expect("resource id");
+        let shared_id = instance
+            .registry()
+            .share_handle(resource_id)
+            .expect("share queue");
+        instance
+            .registrar()
+            .grant_root_session_resources(&[Capability::QueueReader], resource_id)
+            .expect("grant reader scope");
+        let mut ctx = TestContext { registry: instance };
+
+        let endpoint = driver
+            .to_future(
+                &mut ctx,
+                QueueAttach {
+                    shared_id,
+                    role: QueueRole::Reader,
+                },
+            )
+            .await
+            .expect("reader attach should succeed");
+
+        let err = reserve_driver
+            .to_future(
+                &mut ctx,
+                QueueReserve {
+                    endpoint_id: endpoint.resource_id,
+                    len: 8,
+                    timeout_ms: 0,
+                },
+            )
+            .await
+            .expect_err("reader endpoint should not reserve");
+        assert!(matches!(err, GuestError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn queue_create_grants_scoped_lifecycle_to_created_queue() {
+        let driver = QueueCreateDriver(QueueService);
+        let share_driver = QueueShareDriver;
+        let mut ctx = TestContext {
+            registry: registry_with_scoped_entitlements(HashMap::from([(
+                Capability::QueueLifecycle,
+                ResourceScope::Some(HashSet::new()),
+            )])),
+        };
+
+        let descriptor = driver
+            .to_future(
+                &mut ctx,
+                QueueCreate {
+                    capacity_frames: 8,
+                    max_frame_bytes: 128,
+                    delivery: QueueDelivery::Lossless,
+                    overflow: QueueOverflow::Block,
+                },
+            )
+            .await
+            .expect("create queue");
+
+        share_driver
+            .to_future(
+                &mut ctx,
+                QueueShare {
+                    resource_id: descriptor.resource_id,
+                },
+            )
+            .await
+            .expect("scoped lifecycle should retain queue access");
+    }
 }

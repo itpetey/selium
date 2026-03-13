@@ -1,19 +1,436 @@
-
 use super::*;
 use std::{
     fs,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use selium_abi::{RuntimeUsageQuery, RuntimeUsageReplayStart, decode_rkyv};
-use selium_control_plane_api::{
-    ContractRef, ControlPlaneState, DeploymentSpec, IsolationProfile, NodeSpec,
-    OperationalProcessSelector, WorkloadRef, parse_idl,
+use clap::Parser;
+use selium_abi::{
+    PrincipalKind, PrincipalRef, RuntimeUsageQuery, RuntimeUsageReplayStart, decode_rkyv,
 };
+use selium_control_plane_api::{
+    ContractRef, ControlPlaneState, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryPattern,
+    IsolationProfile, NodeSpec, OperationalProcessSelector, WorkloadRef, parse_idl,
+};
+use selium_control_plane_core::{Mutation, Query};
 use selium_control_plane_runtime::ControlPlaneEngine;
 use tokio::io::duplex;
 
+use crate::auth::AccessPolicy;
+use crate::config::{ServerCommand, ServerOptions};
 use crate::usage::{ProcessUsageAttribution, RuntimeUsageCollector};
+
+#[test]
+fn resolve_internal_tls_paths_fall_back_to_server_identity_when_client_identity_missing() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-peer-fallback-{unique}"));
+    fs::create_dir_all(work_dir.join("certs")).expect("create cert dir");
+
+    let (cert, key) = resolve_internal_client_tls_paths(&work_dir, None, None)
+        .expect("resolve internal client tls");
+
+    assert!(cert.is_none());
+    assert!(key.is_none());
+}
+
+#[test]
+fn resolve_peer_tls_paths_prefers_generated_client_identity_when_available() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-peer-client-{unique}"));
+    fs::create_dir_all(work_dir.join("certs")).expect("create cert dir");
+    fs::write(work_dir.join("certs/peer.crt"), b"cert").expect("write peer cert");
+    fs::write(work_dir.join("certs/peer.key"), b"key").expect("write peer key");
+
+    let (cert, key) = resolve_peer_client_tls_paths(&work_dir, None, None)
+        .expect("resolve peer tls")
+        .expect("generated peer identity should be selected when present");
+
+    assert_eq!(cert, work_dir.join("certs/peer.crt"));
+    assert_eq!(key, work_dir.join("certs/peer.key"));
+}
+
+#[test]
+fn resolve_peer_tls_paths_require_a_client_identity() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-peer-missing-{unique}"));
+    fs::create_dir_all(work_dir.join("certs")).expect("create cert dir");
+
+    let identity =
+        resolve_peer_client_tls_paths(&work_dir, None, None).expect("resolve peer tls paths");
+
+    assert!(identity.is_none());
+}
+
+#[test]
+fn ensure_workload_authorised_rejects_out_of_scope_workloads() {
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=control_write;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    ensure_workload_authorised(
+        &request_context,
+        Method::StartInstance,
+        "tenant-a/api",
+        "instance start",
+    )
+    .expect("authorised workload");
+    let err = ensure_workload_authorised(
+        &request_context,
+        Method::StartInstance,
+        "tenant-b/api",
+        "instance start",
+    )
+    .expect_err("workload should be denied");
+    assert!(
+        err.to_string()
+            .contains("unauthorised workload `tenant-b/api` for instance start")
+    );
+}
+
+#[test]
+fn default_access_grant_does_not_include_peer_rights() {
+    let grant = default_access_grant_spec(&PrincipalRef::new(
+        PrincipalKind::Machine,
+        "client.localhost",
+    ));
+
+    assert!(!grant.contains("peer"));
+}
+
+#[test]
+fn default_peer_access_grant_is_reserved_for_peer_identity() {
+    let grant = default_peer_access_grant_spec();
+
+    assert!(grant.contains("principal=runtime-peer:*"));
+    assert!(grant.contains("methods=peer"));
+    assert!(grant.contains("workloads=*"));
+    assert!(grant.contains("endpoints=*"));
+}
+
+#[test]
+fn build_access_policy_preserves_peer_grant_when_custom_grants_are_configured() {
+    let opts = ServerOptions::try_parse_from([
+        "selium-runtime",
+        "daemon",
+        "--access-grant",
+        "principal=machine:client.localhost;methods=control_read;workloads=tenant-a/*",
+    ])
+    .expect("parse opts");
+    let Some(ServerCommand::Daemon(args)) = opts.command else {
+        panic!("expected daemon command");
+    };
+    let policy = build_access_policy(Path::new("."), &args).expect("policy");
+    let peer = policy.resolve(
+        PrincipalRef::new(PrincipalKind::RuntimePeer, "peer.localhost"),
+        "fp".to_string(),
+    );
+
+    assert!(peer.allows(Method::RaftAppendEntries));
+    assert!(peer.allows(Method::DeliverBridgeMessage));
+}
+
+#[test]
+fn build_access_policy_uses_custom_generated_cert_principals() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-policy-{unique}"));
+    let cert_dir = work_dir.join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    crate::certs::generate_certificates(
+        &cert_dir,
+        "Test CA",
+        "localhost",
+        "client.localhost",
+        "machine",
+        "operator-123",
+        "peer.localhost",
+        "runtime-peer",
+        "raft-peer-456",
+    )
+    .expect("generate certs");
+
+    let opts = ServerOptions::try_parse_from(["selium-runtime", "daemon"]).expect("parse opts");
+    let Some(ServerCommand::Daemon(args)) = opts.command else {
+        panic!("expected daemon command");
+    };
+    let policy = build_access_policy(&work_dir, &args).expect("policy");
+    let operator = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "operator-123"),
+        "fp".to_string(),
+    );
+    let peer = policy.resolve(
+        PrincipalRef::new(PrincipalKind::RuntimePeer, "raft-peer-456"),
+        "fp".to_string(),
+    );
+
+    assert!(operator.allows(Method::ControlQuery));
+    assert!(peer.allows(Method::RaftAppendEntries));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_control_plane_request_classifies_local_decode_and_auth_errors() {
+    let state = sample_state("node-a");
+    let bad_policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=control_read;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = bad_policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let bad_frame = encode_request(Method::ControlQuery, 1, &Empty {}).expect("encode frame");
+    let bad_envelope = decode_envelope(&bad_frame).expect("decode envelope");
+    let bad_err =
+        forward_control_plane_request(&state, &request_context, &bad_frame, &bad_envelope)
+            .await
+            .expect_err("decode should fail locally");
+    assert!(matches!(
+        bad_err,
+        ForwardControlPlaneError::Local {
+            status: 400,
+            retryable: false,
+            ..
+        }
+    ));
+
+    let forbidden_frame = encode_request(
+        Method::ControlQuery,
+        2,
+        &QueryApiRequest {
+            query: Query::TableGet {
+                table: "deployments".to_string(),
+                key: "tenant-b/media/api".to_string(),
+            },
+            allow_stale: false,
+        },
+    )
+    .expect("encode forbidden frame");
+    let forbidden_envelope = decode_envelope(&forbidden_frame).expect("decode envelope");
+    let forbidden_err = forward_control_plane_request(
+        &state,
+        &request_context,
+        &forbidden_frame,
+        &forbidden_envelope,
+    )
+    .await
+    .expect_err("query should be forbidden locally");
+    assert!(matches!(
+        forbidden_err,
+        ForwardControlPlaneError::Local {
+            status: 403,
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn bridge_visibility_follows_visible_instance_scope() {
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=node_manage;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+    let visible_instances = BTreeSet::from(["source-1".to_string()]);
+    let local_instances = BTreeSet::from(["source-1".to_string(), "target-1".to_string()]);
+    let hidden_target = ActiveEndpointBridgeSpec::Event(ActiveEventEndpointBridgeSpec {
+        source_instance_id: "source-1".to_string(),
+        source_endpoint: sample_endpoint("router", "frames"),
+        target_instance_id: "target-1".to_string(),
+        target_endpoint: PublicEndpointRef {
+            workload: WorkloadRef {
+                tenant: "tenant-b".to_string(),
+                namespace: "media".to_string(),
+                name: "detector".to_string(),
+            },
+            kind: ContractKind::Event,
+            name: "frames".to_string(),
+        },
+        mode: EndpointBridgeMode::Local,
+        target_node: "node-a".to_string(),
+        target_daemon_addr: "127.0.0.1:7100".to_string(),
+        target_daemon_server_name: "localhost".to_string(),
+    });
+
+    assert!(!bridge_visible_for_list_instances(
+        &request_context,
+        &visible_instances,
+        &local_instances,
+        &hidden_target,
+    ));
+}
+
+#[test]
+fn rewrite_mutation_requires_full_access_for_unscoped_mutations() {
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=control_write;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let err = rewrite_mutation_for_authorisation(
+        Mutation::UpsertNode {
+            spec: NodeSpec {
+                name: "node-a".to_string(),
+                capacity_slots: 1,
+                allocatable_cpu_millis: None,
+                allocatable_memory_mib: None,
+                supported_isolation: vec![IsolationProfile::Standard],
+                daemon_addr: "127.0.0.1:7100".to_string(),
+                daemon_server_name: "localhost".to_string(),
+                last_heartbeat_ms: 0,
+            },
+        },
+        &request_context,
+    )
+    .expect_err("node mutation should require full access");
+    assert!(
+        err.to_string()
+            .contains("mutation requires full workload access")
+    );
+}
+
+#[test]
+fn rewrite_query_rejects_raw_queries_without_full_access() {
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=control_read;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let err = rewrite_query_for_authorisation(
+        Query::TableGet {
+            table: "deployments".to_string(),
+            key: "tenant-b/media/api".to_string(),
+        },
+        &request_context,
+        Method::ControlQuery,
+    )
+    .expect_err("raw table query should require full access");
+    assert!(
+        err.to_string()
+            .contains("query requires full workload and endpoint access")
+    );
+}
+
+#[test]
+fn rewrite_query_rejects_raw_queries_without_full_endpoint_access() {
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=control_read;workloads=*;endpoints=tenant-a/media/router#service:*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let err = rewrite_query_for_authorisation(
+        Query::ControlPlaneState,
+        &request_context,
+        Method::ControlQuery,
+    )
+    .expect_err("raw state query should require full endpoint access");
+    assert!(
+        err.to_string()
+            .contains("query requires full workload and endpoint access")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn instance_endpoint_authorisation_rejects_bridge_targets_outside_scope() {
+    let state = sample_state("node-a");
+    state.instance_workloads.lock().await.insert(
+        "target-1".to_string(),
+        "tenant-b/media/detector".to_string(),
+    );
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=bridge_manage;endpoints=tenant-a/media/ingest#event:*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let err = ensure_instance_endpoint_authorised(
+        &state,
+        &request_context,
+        Method::DeliverBridgeMessage,
+        "target-1",
+        &sample_endpoint("detector", "camera.frames"),
+        "bridge target endpoint",
+    )
+    .await
+    .expect_err("bridge target should be denied");
+
+    assert!(
+        err.to_string()
+            .contains("unauthorised endpoint `tenant-a/media/detector#event:camera.frames`")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn instance_endpoint_authorisation_rejects_workload_mismatches() {
+    let state = sample_state("node-a");
+    state
+        .instance_workloads
+        .lock()
+        .await
+        .insert("target-1".to_string(), "tenant-a/media/router".to_string());
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=bridge_manage;workloads=tenant-a/*;endpoints=*"
+            .to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+
+    let err = ensure_instance_endpoint_authorised(
+        &state,
+        &request_context,
+        Method::DeliverBridgeMessage,
+        "target-1",
+        &sample_endpoint("detector", "camera.frames"),
+        "bridge target endpoint",
+    )
+    .await
+    .expect_err("mismatched workload should be denied");
+
+    assert!(
+        err.to_string().contains(
+            "endpoint `tenant-a/media/detector#event:camera.frames` does not match instance `target-1` workload `tenant-a/media/router`"
+        )
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn activate_endpoint_bridge_forwards_local_event_frames() {
@@ -296,6 +713,7 @@ async fn resolve_guest_log_subscription_accepts_exact_stdout_and_stderr() {
                 GUEST_LOG_STDERR_ENDPOINT.to_string(),
             ],
         },
+        DiscoveryCapabilityScope::allow_all(),
         |query| async { engine_query(&engine, query) },
     )
     .await
@@ -329,6 +747,7 @@ async fn resolve_guest_log_subscription_reports_ambiguous_workloads() {
             }),
             stream_names: vec![GUEST_LOG_STDOUT_ENDPOINT.to_string()],
         },
+        DiscoveryCapabilityScope::allow_all(),
         |query| async { engine_query(&engine, query) },
     )
     .await
@@ -348,6 +767,7 @@ async fn resolve_guest_log_subscription_reports_unknown_streams() {
             ),
             stream_names: vec!["stdx".to_string()],
         },
+        DiscoveryCapabilityScope::allow_all(),
         |query| async { engine_query(&engine, query) },
     )
     .await
@@ -355,6 +775,31 @@ async fn resolve_guest_log_subscription_reports_unknown_streams() {
 
     assert!(err.to_string().contains("unknown endpoint"));
     assert!(err.to_string().contains("stdx"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn guest_log_resolution_classifies_unauthorised_scope_as_forbidden() {
+    let engine = guest_log_resolution_engine(1);
+    let err = resolve_guest_log_subscription_with(
+        "local-node",
+        &SubscribeGuestLogsRequest {
+            target: OperationalProcessSelector::ReplicaKey(
+                "tenant=tenant-a;namespace=media;workload=ingest;replica=0".to_string(),
+            ),
+            stream_names: vec![GUEST_LOG_STDOUT_ENDPOINT.to_string()],
+        },
+        DiscoveryCapabilityScope {
+            operations: vec![DiscoveryOperation::Discover, DiscoveryOperation::Bind],
+            workloads: vec![DiscoveryPattern::Prefix("tenant-a/".to_string())],
+            endpoints: vec![DiscoveryPattern::Prefix(String::new())],
+            allow_operational_processes: false,
+        },
+        |query| async { engine_query(&engine, query) },
+    )
+    .await
+    .expect_err("operational process discovery should be denied");
+
+    assert_eq!(classify_guest_log_resolution_error(&err), 403);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1494,6 +1939,7 @@ fn sample_state(node_id: &str) -> Rc<DaemonState> {
         registry,
         work_dir,
         processes: Mutex::new(BTreeMap::new()),
+        instance_workloads: Mutex::new(BTreeMap::new()),
         source_bindings: Mutex::new(BTreeMap::new()),
         target_bindings: Mutex::new(BTreeMap::new()),
         service_response_bindings: Mutex::new(BTreeMap::new()),
@@ -1509,9 +1955,10 @@ fn sample_state(node_id: &str) -> Rc<DaemonState> {
         control_plane_process_id: 0,
         tls_paths: ManagedEventTlsPaths {
             ca_cert: PathBuf::new(),
-            client_cert: PathBuf::new(),
-            client_key: PathBuf::new(),
+            client_cert: None,
+            client_key: None,
         },
+        access_policy: AccessPolicy::default(),
     })
 }
 

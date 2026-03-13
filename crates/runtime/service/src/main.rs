@@ -12,6 +12,7 @@ use crate::config::{
     RuntimeStorageConfig, ServerCommand, StorageBlobConfig, StorageLogConfig, load_server_options,
 };
 
+mod auth;
 mod certs;
 mod config;
 mod daemon;
@@ -58,6 +59,11 @@ async fn main() -> Result<()> {
             &cert_args.ca_common_name,
             &cert_args.server_name,
             &cert_args.client_name,
+            &cert_args.client_principal_kind,
+            &cert_args.client_principal_id,
+            &cert_args.peer_name,
+            &cert_args.peer_principal_kind,
+            &cert_args.peer_principal_id,
         )?;
         return Ok(());
     }

@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use selium_abi::{TimeNow, TimeSleep};
+use selium_abi::{Capability, TimeNow, TimeSleep};
 
 use crate::guest_error::GuestResult;
 use crate::spi::time::TimeCapability;
@@ -28,14 +28,19 @@ where
 
     fn to_future<C>(
         &self,
-        _context: &mut C,
+        context: &mut C,
         _input: Self::Input,
     ) -> impl Future<Output = GuestResult<Self::Output>> + Send + 'static
     where
         C: HostcallContext,
     {
         let inner = self.0.clone();
-        async move { inner.now().map_err(Into::into) }
+        let authorisation =
+            super::ensure_capability_authorised(context.registry(), Capability::TimeRead);
+        async move {
+            authorisation?;
+            inner.now().map_err(Into::into)
+        }
     }
 }
 
@@ -48,14 +53,19 @@ where
 
     fn to_future<C>(
         &self,
-        _context: &mut C,
+        context: &mut C,
         input: Self::Input,
     ) -> impl Future<Output = GuestResult<Self::Output>> + Send + 'static
     where
         C: HostcallContext,
     {
         let inner = self.0.clone();
-        async move { inner.sleep(input).await.map_err(Into::into) }
+        let authorisation =
+            super::ensure_capability_authorised(context.registry(), Capability::TimeRead);
+        async move {
+            authorisation?;
+            inner.sleep(input).await.map_err(Into::into)
+        }
     }
 }
 
@@ -81,7 +91,12 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use crate::registry::{InstanceRegistry, Registry};
+    use selium_abi::Capability;
+
+    use crate::{
+        registry::{InstanceRegistry, Registry},
+        services::session_service::{RootSession, Session},
+    };
 
     #[derive(Clone)]
     struct TestTimeCapability {
@@ -126,8 +141,15 @@ mod tests {
     }
 
     fn context() -> TestContext {
+        context_with_capabilities(Capability::ALL.to_vec())
+    }
+
+    fn context_with_capabilities(capabilities: Vec<Capability>) -> TestContext {
         let registry = Registry::new();
-        let instance = registry.instance().expect("instance");
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(Session::bootstrap(capabilities, [0; 32])))
+            .expect("root session");
         TestContext { registry: instance }
     }
 
@@ -158,5 +180,23 @@ mod tests {
             .await
             .expect("sleep");
         assert_eq!(*slept.lock().expect("slept lock"), vec![15]);
+    }
+
+    #[tokio::test]
+    async fn now_driver_requires_time_capability() {
+        let capability = TestTimeCapability {
+            slept: Arc::new(Mutex::new(Vec::new())),
+        };
+        let driver = TimeNowDriver(capability);
+        let mut ctx = context_with_capabilities(Vec::new());
+
+        let err = driver
+            .to_future(&mut ctx, ())
+            .await
+            .expect_err("missing session entitlement should deny");
+        assert!(matches!(
+            err,
+            crate::guest_error::GuestError::PermissionDenied
+        ));
     }
 }

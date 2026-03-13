@@ -9,10 +9,20 @@ use uuid::Uuid;
 #[cfg(feature = "service-session")]
 use crate::spi::session::SessionLifecycleCapability;
 use crate::{guest_error::GuestError, registry::ResourceId};
-use selium_abi::Capability;
+use selium_abi::{Capability, PrincipalKind, PrincipalRef};
 
 type Result<T, E = SessionError> = std::result::Result<T, E>;
 
+/// Authentication method used to mint a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthnMethod {
+    /// Runtime-created bootstrap session.
+    InternalBootstrap,
+    /// Child session delegated from an existing parent session.
+    Delegated,
+}
+
+#[derive(Clone)]
 pub struct Session {
     /// The registry ID for this session.
     id: Uuid,
@@ -25,14 +35,23 @@ pub struct Session {
     /// Capabilities that this session is entitled to consume, and which resources it may
     /// consume the capability for.
     entitlements: HashMap<Capability, ResourceScope>,
+    /// Authenticated principal attached to this session.
+    principal: PrincipalRef,
+    /// Authentication method used to mint this session.
+    authn_method: SessionAuthnMethod,
     /// Public key for this session holder; used for identifying valid payloads.
     _pubkey: [u8; 32],
 }
+
+/// Root identity-bearing session attached to a launched guest instance.
+#[derive(Clone)]
+pub struct RootSession(pub Session);
 
 /// The resources accessible by a capability grant.
 /// None = "cannot use this capability on any resources",
 /// Some = "can only use this capability on the given resources",
 /// Any = "can use this capability on any resource"
+#[derive(Debug, Clone)]
 pub enum ResourceScope {
     None,
     Some(HashSet<ResourceId>),
@@ -59,9 +78,33 @@ impl Session {
     /// Note that we don't accept any entitlement resource restrictions as they won't yet
     /// exist. Best practice is to send every capability enabled in the current kernel.
     pub fn bootstrap(entitlements: Vec<Capability>, pubkey: [u8; 32]) -> Self {
+        Self::bootstrap_with_principal(
+            entitlements,
+            pubkey,
+            PrincipalRef::new(PrincipalKind::Internal, "runtime"),
+            SessionAuthnMethod::InternalBootstrap,
+        )
+    }
+
+    /// Construct a bootstrap session for a specific authenticated principal.
+    pub fn bootstrap_with_principal(
+        entitlements: Vec<Capability>,
+        pubkey: [u8; 32],
+        principal: PrincipalRef,
+        authn_method: SessionAuthnMethod,
+    ) -> Self {
         let entitlements =
             HashMap::from_iter(entitlements.into_iter().map(|id| (id, ResourceScope::Any)));
+        Self::bootstrap_with_scoped_principal(entitlements, pubkey, principal, authn_method)
+    }
 
+    /// Construct a bootstrap session with explicit scoped entitlements.
+    pub fn bootstrap_with_scoped_principal(
+        entitlements: HashMap<Capability, ResourceScope>,
+        pubkey: [u8; 32],
+        principal: PrincipalRef,
+        authn_method: SessionAuthnMethod,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             #[cfg(feature = "service-session")]
@@ -69,6 +112,8 @@ impl Session {
             #[cfg(not(feature = "service-session"))]
             _parent: Uuid::nil(),
             entitlements,
+            principal,
+            authn_method,
             _pubkey: pubkey,
         }
     }
@@ -104,8 +149,53 @@ impl Session {
             #[cfg(not(feature = "service-session"))]
             _parent: self.id,
             entitlements,
+            principal: self.principal.clone(),
+            authn_method: SessionAuthnMethod::Delegated,
             _pubkey: pubkey,
         })
+    }
+
+    /// Return the principal authenticated for this session.
+    pub fn principal(&self) -> &PrincipalRef {
+        &self.principal
+    }
+
+    /// Return the authentication method used to create this session.
+    pub fn authn_method(&self) -> SessionAuthnMethod {
+        self.authn_method
+    }
+
+    /// Return a scoped entitlement set for the requested capabilities.
+    pub fn scoped_entitlements_for(
+        &self,
+        capabilities: &[Capability],
+    ) -> Result<HashMap<Capability, ResourceScope>> {
+        let mut entitlements = HashMap::with_capacity(capabilities.len());
+        for capability in capabilities {
+            let scope = self
+                .entitlements
+                .get(capability)
+                .ok_or(SessionError::EntitlementScope)?
+                .clone();
+            entitlements.insert(*capability, scope);
+        }
+        Ok(entitlements)
+    }
+
+    /// Authorise an action that is scoped only to a capability and not to a concrete resource.
+    pub fn allows_capability(&self, capability: Capability) -> bool {
+        let success = matches!(
+            self.entitlements.get(&capability),
+            Some(ResourceScope::Any | ResourceScope::Some(_))
+        );
+
+        if success {
+            debug!(session = %self.id, capability = ?capability, status = "success", "authorise_capability");
+        } else {
+            warn!(session = %self.id, capability = ?capability, status = "fail", "authorise_capability");
+        }
+
+        success
     }
 
     /// Authenticate a payload against this session's public key. If successful, the
@@ -333,6 +423,8 @@ mod tests {
                 Capability::SharedMemory,
                 ResourceScope::Some(set(&[1, 2])),
             )]),
+            principal: PrincipalRef::new(PrincipalKind::Internal, "test"),
+            authn_method: SessionAuthnMethod::InternalBootstrap,
             _pubkey: [0; 32],
         };
 
@@ -355,6 +447,8 @@ mod tests {
             #[cfg(not(feature = "service-session"))]
             _parent: Uuid::nil(),
             entitlements: HashMap::from([(Capability::TimeRead, ResourceScope::None)]),
+            principal: PrincipalRef::new(PrincipalKind::Internal, "test"),
+            authn_method: SessionAuthnMethod::InternalBootstrap,
             _pubkey: [0; 32],
         };
 
@@ -375,6 +469,33 @@ mod tests {
             .revoke_resource(Capability::TimeRead, 1)
             .expect_err("cannot revoke from Any scope");
         assert!(matches!(err, SessionError::RevokeOnAny));
+    }
+
+    #[test]
+    fn scoped_entitlements_for_preserves_resource_scope() {
+        let session = Session {
+            id: Uuid::new_v4(),
+            #[cfg(feature = "service-session")]
+            parent: Uuid::nil(),
+            #[cfg(not(feature = "service-session"))]
+            _parent: Uuid::nil(),
+            entitlements: HashMap::from([(
+                Capability::StorageBlobRead,
+                ResourceScope::Some(set(&[7])),
+            )]),
+            principal: PrincipalRef::new(PrincipalKind::Internal, "test"),
+            authn_method: SessionAuthnMethod::Delegated,
+            _pubkey: [0; 32],
+        };
+
+        let entitlements = session
+            .scoped_entitlements_for(&[Capability::StorageBlobRead])
+            .expect("scoped entitlements");
+
+        assert!(matches!(
+            entitlements.get(&Capability::StorageBlobRead),
+            Some(ResourceScope::Some(ids)) if ids.contains(&7) && ids.len() == 1
+        ));
     }
 
     #[test]

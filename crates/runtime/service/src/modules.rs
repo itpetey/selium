@@ -42,6 +42,7 @@ pub(crate) struct ProcessLaunchContext<'a> {
     pub workload_key: Option<&'a str>,
     pub instance_id: Option<&'a str>,
     pub external_account_ref: Option<&'a str>,
+    pub principal: Option<&'a selium_abi::PrincipalRef>,
 }
 
 #[derive(Debug)]
@@ -854,6 +855,15 @@ async fn spawn_module(
                 workload_key: launch_context.workload_key,
                 instance_id: launch_context.instance_id,
                 external_account_ref: launch_context.external_account_ref,
+                principal: launch_context.principal,
+                entitlements: std::collections::HashMap::from_iter(
+                    capabilities.iter().copied().map(|capability| {
+                        (
+                            capability,
+                            selium_kernel::services::session_service::ResourceScope::Any,
+                        )
+                    }),
+                ),
                 capabilities,
                 guest_log_bindings,
                 network_egress_profiles,

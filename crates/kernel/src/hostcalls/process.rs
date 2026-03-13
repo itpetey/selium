@@ -1,8 +1,8 @@
 use std::{convert::TryFrom, future::Future, sync::Arc};
 
 use selium_abi::{
-    AbiParam, AbiScalarType, AbiScalarValue, AbiValue, EntrypointArg, EntrypointInvocation,
-    GuestResourceId, ProcessLogBindings, ProcessStart,
+    AbiParam, AbiScalarType, AbiScalarValue, AbiValue, Capability, EntrypointArg,
+    EntrypointInvocation, GuestResourceId, ProcessLogBindings, ProcessStart,
 };
 use tracing::debug;
 
@@ -160,6 +160,10 @@ where
     {
         let inner = self.0.clone();
         let registry = context.registry().registry_arc();
+        let registrar = context.registry().registrar();
+        let root_session = context
+            .registry()
+            .extension::<crate::services::session_service::RootSession>();
         let ProcessStart {
             module_id,
             name,
@@ -177,37 +181,61 @@ where
             .copied()
             .unwrap_or_default();
 
-        let preparation = (|| -> GuestResult<PreparedProcessStart> {
+        let preparation = (|| -> GuestResult<(
+            PreparedProcessStart,
+            Arc<crate::services::session_service::RootSession>,
+            std::collections::HashMap<Capability, crate::services::session_service::ResourceScope>,
+        )> {
+            super::ensure_capability_authorised(context.registry(), Capability::ProcessLifecycle)?;
+            let root_session = root_session.ok_or(GuestError::PermissionDenied)?;
             entrypoint
                 .validate()
                 .map_err(|err| GuestError::from(KernelError::Driver(err.to_string())))?;
             let entrypoint = entrypoint.resolve_resources(context.registry())?;
-            Ok(PreparedProcessStart {
-                module_id,
-                name,
-                capabilities,
-                guest_log_bindings,
-                network_egress_profiles,
-                network_ingress_bindings,
-                storage_logs,
-                storage_blobs,
-                entrypoint,
-            })
+            let entitlements = root_session
+                .0
+                .scoped_entitlements_for(&capabilities)
+                .map_err(|_| GuestError::PermissionDenied)?;
+            Ok((
+                PreparedProcessStart {
+                    module_id,
+                    name,
+                    capabilities,
+                    guest_log_bindings,
+                    network_egress_profiles,
+                    network_ingress_bindings,
+                    storage_logs,
+                    storage_blobs,
+                    entrypoint,
+                },
+                root_session,
+                entitlements,
+            ))
         })();
 
         async move {
-            let PreparedProcessStart {
-                module_id,
-                name,
-                capabilities,
-                guest_log_bindings,
-                network_egress_profiles,
-                network_ingress_bindings,
-                storage_logs,
-                storage_blobs,
-                entrypoint,
-            } = preparation?;
-            debug!(%module_id, %name, capabilities = ?capabilities, "process_start requested");
+            let (
+                PreparedProcessStart {
+                    module_id,
+                    name,
+                    capabilities,
+                    guest_log_bindings,
+                    network_egress_profiles,
+                    network_ingress_bindings,
+                    storage_logs,
+                    storage_blobs,
+                    entrypoint,
+                },
+                root_session,
+                entitlements,
+            ) = preparation?;
+            debug!(
+                %module_id,
+                %name,
+                principal = %root_session.0.principal(),
+                capabilities = ?capabilities,
+                "process_start requested"
+            );
             let process_id = registry
                 .reserve(None, ResourceType::Process)
                 .map_err(GuestError::from)?;
@@ -222,6 +250,8 @@ where
                         workload_key: None,
                         instance_id: None,
                         external_account_ref: None,
+                        principal: Some(root_session.0.principal()),
+                        entitlements,
                         capabilities,
                         guest_log_bindings,
                         network_egress_profiles,
@@ -239,6 +269,9 @@ where
                     return Err(err.into());
                 }
             }
+            registrar
+                .grant_root_session_resources(&[Capability::ProcessLifecycle], process_id)
+                .map_err(GuestError::from)?;
 
             let handle =
                 GuestResourceId::try_from(process_id).map_err(|_| GuestError::InvalidArgument)?;
@@ -264,8 +297,17 @@ where
     {
         let inner = self.0.clone();
         let registry = context.registry().registry_arc();
+        let authorisation = (|| -> GuestResult<()> {
+            let handle = ResourceId::try_from(input).map_err(|_| GuestError::InvalidArgument)?;
+            super::ensure_resource_authorised(
+                context.registry(),
+                Capability::ProcessLifecycle,
+                handle,
+            )
+        })();
 
         async move {
+            authorisation?;
             let handle = ResourceId::try_from(input).map_err(|_| GuestError::InvalidArgument)?;
             if let Some(meta) = registry.metadata(handle)
                 && meta.kind != ResourceType::Process
@@ -302,11 +344,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use selium_abi::{AbiSignature, Capability};
 
-    use crate::registry::{Registry, ResourceType};
+    use crate::{
+        registry::{Registry, ResourceType},
+        services::session_service::{ResourceScope, RootSession, Session, SessionAuthnMethod},
+    };
 
     struct TestContext {
         registry: InstanceRegistry,
@@ -327,8 +375,19 @@ mod tests {
     }
 
     fn context() -> TestContext {
+        context_with_capabilities(Capability::ALL.to_vec())
+    }
+
+    fn context_with_capabilities(capabilities: Vec<Capability>) -> TestContext {
+        context_with_root_session(Session::bootstrap(capabilities, [0; 32]))
+    }
+
+    fn context_with_root_session(root_session: Session) -> TestContext {
         let registry = Registry::new();
-        let instance = registry.instance().expect("instance");
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(root_session))
+            .expect("root session");
         TestContext { registry: instance }
     }
 
@@ -336,6 +395,7 @@ mod tests {
     struct StartCapability {
         fail: bool,
         seen_process_id: Arc<Mutex<Option<ResourceId>>>,
+        seen_entitlements: Arc<Mutex<Option<HashMap<Capability, ResourceScope>>>>,
     }
 
     impl ProcessLifecycleCapability for StartCapability {
@@ -349,6 +409,8 @@ mod tests {
         ) -> impl Future<Output = Result<(), Self::Error>> + Send {
             let fail = self.fail;
             *self.seen_process_id.lock().expect("process id lock") = Some(request.process_id);
+            *self.seen_entitlements.lock().expect("entitlements lock") =
+                Some(request.entitlements.clone());
             async move {
                 if fail {
                     Err(GuestError::Subsystem("start failed".to_string()))
@@ -378,6 +440,33 @@ mod tests {
             _request: ProcessStartRequest<'_>,
         ) -> Result<(), Self::Error> {
             Ok(())
+        }
+
+        async fn stop(&self, instance: &mut Self::Process) -> Result<(), Self::Error> {
+            *self.stopped.lock().expect("stop lock") = true;
+            instance.push_str(":stopped");
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScopedLifecycleCapability {
+        stopped: Arc<Mutex<bool>>,
+    }
+
+    impl ProcessLifecycleCapability for ScopedLifecycleCapability {
+        type Process = String;
+        type Error = GuestError;
+
+        fn start(
+            &self,
+            registry: &Arc<crate::registry::Registry>,
+            request: ProcessStartRequest<'_>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            registry
+                .initialise(request.process_id, "child".to_string())
+                .expect("initialise child process");
+            async { Ok(()) }
         }
 
         async fn stop(&self, instance: &mut Self::Process) -> Result<(), Self::Error> {
@@ -417,6 +506,7 @@ mod tests {
         let capability = StartCapability {
             fail: true,
             seen_process_id: Arc::clone(&process_id_seen),
+            seen_entitlements: Arc::new(Mutex::new(None)),
         };
         let driver = ProcessStartDriver(capability);
         let mut ctx = context();
@@ -442,6 +532,90 @@ mod tests {
         assert!(matches!(err, GuestError::Subsystem(_)));
         let process_id = (*process_id_seen.lock().expect("process lock")).expect("process id");
         assert!(ctx.registry().registry().metadata(process_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn process_start_driver_rejects_child_capabilities_outside_root_session() {
+        let process_id_seen = Arc::new(Mutex::new(None));
+        let driver = ProcessStartDriver(StartCapability {
+            fail: false,
+            seen_process_id: Arc::clone(&process_id_seen),
+            seen_entitlements: Arc::new(Mutex::new(None)),
+        });
+        let mut ctx = context_with_capabilities(vec![Capability::ProcessLifecycle]);
+        let input = ProcessStart {
+            module_id: "m".to_string(),
+            name: "n".to_string(),
+            capabilities: vec![Capability::StorageBlobRead],
+            network_egress_profiles: Vec::new(),
+            network_ingress_bindings: Vec::new(),
+            storage_logs: Vec::new(),
+            storage_blobs: Vec::new(),
+            entrypoint: EntrypointInvocation::new(
+                AbiSignature::new(Vec::new(), Vec::new()),
+                Vec::new(),
+            )
+            .expect("entrypoint"),
+        };
+
+        let err = driver
+            .to_future(&mut ctx, input)
+            .await
+            .expect_err("child capability should be denied");
+        assert!(matches!(err, GuestError::PermissionDenied));
+        assert!(process_id_seen.lock().expect("process lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn process_start_driver_preserves_scoped_child_entitlements() {
+        let process_id_seen = Arc::new(Mutex::new(None));
+        let seen_entitlements = Arc::new(Mutex::new(None));
+        let driver = ProcessStartDriver(StartCapability {
+            fail: false,
+            seen_process_id: Arc::clone(&process_id_seen),
+            seen_entitlements: Arc::clone(&seen_entitlements),
+        });
+        let mut ctx = context_with_root_session(Session::bootstrap_with_scoped_principal(
+            HashMap::from([
+                (Capability::ProcessLifecycle, ResourceScope::Any),
+                (
+                    Capability::StorageBlobRead,
+                    ResourceScope::Some(std::collections::HashSet::from([7usize])),
+                ),
+            ]),
+            [0; 32],
+            selium_abi::PrincipalRef::new(selium_abi::PrincipalKind::Internal, "test"),
+            SessionAuthnMethod::Delegated,
+        ));
+        let input = ProcessStart {
+            module_id: "m".to_string(),
+            name: "n".to_string(),
+            capabilities: vec![Capability::StorageBlobRead],
+            network_egress_profiles: Vec::new(),
+            network_ingress_bindings: Vec::new(),
+            storage_logs: Vec::new(),
+            storage_blobs: Vec::new(),
+            entrypoint: EntrypointInvocation::new(
+                AbiSignature::new(Vec::new(), Vec::new()),
+                Vec::new(),
+            )
+            .expect("entrypoint"),
+        };
+
+        let handle = driver
+            .to_future(&mut ctx, input)
+            .await
+            .expect("start should succeed");
+        assert!(handle > 0);
+        let entitlements = seen_entitlements
+            .lock()
+            .expect("entitlements lock")
+            .clone()
+            .expect("captured entitlements");
+        assert!(matches!(
+            entitlements.get(&Capability::StorageBlobRead),
+            Some(ResourceScope::Some(ids)) if ids.contains(&7usize) && ids.len() == 1
+        ));
     }
 
     #[tokio::test]
@@ -481,5 +655,49 @@ mod tests {
             .await
             .expect("stop succeeds");
         assert!(*stopped.lock().expect("stopped lock"));
+    }
+
+    #[tokio::test]
+    async fn process_start_driver_grants_scoped_process_lifecycle_access() {
+        let stopped = Arc::new(Mutex::new(false));
+        let start_driver = ProcessStartDriver(ScopedLifecycleCapability {
+            stopped: Arc::clone(&stopped),
+        });
+        let stop_driver = ProcessStopDriver(ScopedLifecycleCapability {
+            stopped: Arc::clone(&stopped),
+        });
+        let mut ctx = context_with_root_session(Session::bootstrap_with_scoped_principal(
+            HashMap::from([(
+                Capability::ProcessLifecycle,
+                ResourceScope::Some(std::collections::HashSet::new()),
+            )]),
+            [0; 32],
+            selium_abi::PrincipalRef::new(selium_abi::PrincipalKind::Internal, "test"),
+            SessionAuthnMethod::Delegated,
+        ));
+        let input = ProcessStart {
+            module_id: "m".to_string(),
+            name: "n".to_string(),
+            capabilities: Vec::new(),
+            network_egress_profiles: Vec::new(),
+            network_ingress_bindings: Vec::new(),
+            storage_logs: Vec::new(),
+            storage_blobs: Vec::new(),
+            entrypoint: EntrypointInvocation::new(
+                AbiSignature::new(Vec::new(), Vec::new()),
+                Vec::new(),
+            )
+            .expect("entrypoint"),
+        };
+
+        let handle = start_driver
+            .to_future(&mut ctx, input)
+            .await
+            .expect("start succeeds");
+        stop_driver
+            .to_future(&mut ctx, handle)
+            .await
+            .expect("scoped process manager should stop child");
+        assert!(*stopped.lock().expect("stop lock"));
     }
 }

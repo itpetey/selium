@@ -10,7 +10,7 @@ use std::{
 
 use selium_abi::{
     self, AbiParam, AbiScalarType, AbiScalarValue, AbiSignature, AbiValue, CallPlan, CallPlanError,
-    Capability, EntrypointInvocation, ProcessLogBindings, hostcalls,
+    Capability, EntrypointInvocation, PrincipalRef, ProcessLogBindings, hostcalls,
 };
 use selium_kernel::{
     KernelError,
@@ -18,6 +18,7 @@ use selium_kernel::{
     guest_error::GuestError,
     hostcalls::process::EntrypointInvocationExt,
     registry::{InstanceRegistry, ProcessIdentity, Registry, ResourceId},
+    services::session_service::{RootSession, Session, SessionAuthnMethod},
     spi::{
         module_repository::{ModuleRepositoryError, ModuleRepositoryReadCapability},
         process::{ProcessLifecycleCapability, ProcessStartRequest},
@@ -56,6 +57,8 @@ pub struct WasmtimeRunRequest<'a> {
     pub workload_key: Option<&'a str>,
     pub instance_id: Option<&'a str>,
     pub external_account_ref: Option<&'a str>,
+    pub principal: Option<&'a PrincipalRef>,
+    pub entitlements: HashMap<Capability, selium_kernel::services::session_service::ResourceScope>,
     pub capabilities: &'a [Capability],
     pub network_egress_profiles: &'a [String],
     pub network_ingress_bindings: &'a [String],
@@ -183,6 +186,8 @@ impl WasmtimeRuntime {
             workload_key,
             instance_id,
             external_account_ref,
+            principal,
+            entitlements,
             capabilities,
             network_egress_profiles,
             network_ingress_bindings,
@@ -252,6 +257,24 @@ impl WasmtimeRuntime {
             .data_mut()
             .insert_extension(identity)
             .map_err(KernelError::from)?;
+        let root_session = Session::bootstrap_with_scoped_principal(
+            entitlements,
+            [0; 32],
+            principal.cloned().unwrap_or_else(|| {
+                PrincipalRef::new(selium_abi::PrincipalKind::Internal, module_id)
+            }),
+            SessionAuthnMethod::InternalBootstrap,
+        );
+        store
+            .data_mut()
+            .insert_extension(RootSession(root_session))
+            .map_err(KernelError::from)?;
+        if let Some(principal) = principal.cloned() {
+            store
+                .data_mut()
+                .insert_extension(principal)
+                .map_err(KernelError::from)?;
+        }
         store
             .data_mut()
             .insert_extension(guest_log_bindings)
@@ -446,6 +469,8 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                 workload_key,
                 instance_id,
                 external_account_ref,
+                principal,
+                entitlements,
                 capabilities,
                 network_egress_profiles,
                 network_ingress_bindings,
@@ -467,6 +492,8 @@ impl ProcessLifecycleCapability for WasmtimeProcessDriver {
                     workload_key,
                     instance_id,
                     external_account_ref,
+                    principal,
+                    entitlements,
                     capabilities: &capabilities,
                     network_egress_profiles: &network_egress_profiles,
                     network_ingress_bindings: &network_ingress_bindings,
@@ -1145,6 +1172,8 @@ mod tests {
                 workload_key: None,
                 instance_id: None,
                 external_account_ref: None,
+                principal: None,
+                entitlements: HashMap::new(),
                 capabilities: &[],
                 network_egress_profiles: &[],
                 network_ingress_bindings: &[],

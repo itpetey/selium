@@ -18,7 +18,7 @@ use crate::{
     KernelError,
     r#async::futures::FutureSharedState,
     guest_error::GuestResult,
-    services::session_service::{Session, SessionError},
+    services::session_service::{RootSession, Session, SessionError},
     spi::wake_mailbox::WakeMailbox,
 };
 
@@ -994,6 +994,32 @@ impl InstanceRegistrar {
     /// Retrieve the entry for the given slot.
     pub fn entry(&self, idx: usize) -> Option<ResourceId> {
         self.resolve_instance_handle(idx)
+    }
+
+    /// Grant newly created resources back into the root session's scoped entitlements.
+    pub fn grant_root_session_resources(
+        &self,
+        capabilities: &[Capability],
+        resource: ResourceId,
+    ) -> Result<(), RegistryError> {
+        self.with_instance_state(|state| {
+            let type_id = TypeId::of::<RootSession>();
+            let Some(extension) = state.extensions.get(&type_id).cloned() else {
+                return Err(RegistryError::MissingInstance);
+            };
+            let mut root_session = extension
+                .downcast::<RootSession>()
+                .map_err(|_| RegistryError::InvalidReservation)?;
+            for capability in capabilities {
+                Arc::make_mut(&mut root_session)
+                    .0
+                    .grant_resource(*capability, resource);
+            }
+            let extension: Arc<dyn Any + Send + Sync> = root_session;
+            state.extensions.insert(type_id, extension);
+            Ok(())
+        })
+        .ok_or(RegistryError::MissingInstance)?
     }
 }
 

@@ -2,7 +2,9 @@ mod guest_logs;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     future::Future,
+    io::BufReader,
     net::SocketAddr,
     path::{Path, PathBuf},
     rc::Rc,
@@ -28,17 +30,18 @@ use selium_control_plane_api::{
     DiscoveryRequest, DiscoveryResolution, DiscoveryTarget, NodeSpec, OperationalProcessRecord,
     PublicEndpointRef,
 };
-use selium_control_plane_core::Query;
+use selium_control_plane_core::{Mutation, Query};
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, BridgeMessage,
     DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, DeliverBridgeMessageRequest,
     DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics, Envelope,
     EventBridgeMessage, GuestLogEvent, ListRequest, ListResponse, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, Method, QueryApiRequest, QueryApiResponse,
-    RuntimeUsageApiRequest, RuntimeUsageApiResponse, ServiceBridgeMessage, ServiceMessagePhase,
-    StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse, StreamBridgeMessage,
-    SubscribeGuestLogsRequest, SubscribeGuestLogsResponse, decode_envelope, decode_error,
-    decode_payload, encode_error_response, encode_request, encode_response, is_error, is_request,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, MutateApiRequest, QueryApiRequest,
+    QueryApiResponse, ReplayApiRequest, RuntimeUsageApiRequest, RuntimeUsageApiResponse,
+    ServiceBridgeMessage, ServiceMessagePhase, StartRequest, StartResponse, StatusApiResponse,
+    StopRequest, StopResponse, StreamBridgeMessage, SubscribeGuestLogsRequest,
+    SubscribeGuestLogsResponse, decode_envelope, decode_error, decode_payload,
+    encode_error_response, encode_request, encode_response, is_error, is_request,
 };
 use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
@@ -63,15 +66,23 @@ use tokio::{
     task::{JoinHandle, LocalSet, spawn_local},
     time::{Duration, sleep, timeout},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(test)]
 use self::guest_logs::{
-    activate_guest_log_subscription, deactivate_guest_log_subscription,
-    resolve_guest_log_subscription_with, stream_guest_log_events,
+    activate_guest_log_subscription, classify_guest_log_resolution_error,
+    deactivate_guest_log_subscription, resolve_guest_log_subscription_with,
+    stream_guest_log_events,
 };
 use self::guest_logs::{handle_guest_log_subscription_stream, query_runtime_usage};
-use crate::{config::DaemonArgs, modules};
+use crate::{
+    auth::{
+        AccessPolicy, AuthenticatedRequestContext, peer_fingerprint, principal_from_cert,
+        principal_from_connection,
+    },
+    config::DaemonArgs,
+    modules,
+};
 
 const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const QUIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -88,6 +99,7 @@ struct DaemonState {
     registry: Arc<Registry>,
     work_dir: PathBuf,
     processes: Mutex<BTreeMap<String, usize>>,
+    instance_workloads: Mutex<BTreeMap<String, String>>,
     source_bindings: Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
     target_bindings: Mutex<BTreeMap<(String, ContractKind, String), ManagedEventEndpointQueue>>,
     service_response_bindings:
@@ -97,6 +109,7 @@ struct DaemonState {
     control_plane: Arc<LocalControlPlaneClient>,
     control_plane_process_id: usize,
     tls_paths: ManagedEventTlsPaths,
+    access_policy: AccessPolicy,
 }
 
 #[derive(Clone)]
@@ -127,6 +140,14 @@ impl ActiveEndpointBridgeSpec {
         }
     }
 
+    fn source_endpoint(&self) -> &PublicEndpointRef {
+        match self {
+            Self::Event(spec) => &spec.source_endpoint,
+            Self::Service(spec) => &spec.source_endpoint,
+            Self::Stream(spec) => &spec.source_endpoint,
+        }
+    }
+
     fn mode(&self) -> EndpointBridgeMode {
         match self {
             Self::Event(spec) => spec.mode,
@@ -148,6 +169,14 @@ impl ActiveEndpointBridgeSpec {
             Self::Event(spec) => &spec.target_instance_id,
             Self::Service(spec) => &spec.target_instance_id,
             Self::Stream(spec) => &spec.target_instance_id,
+        }
+    }
+
+    fn target_endpoint(&self) -> &PublicEndpointRef {
+        match self {
+            Self::Event(spec) => &spec.target_endpoint,
+            Self::Service(spec) => &spec.target_endpoint,
+            Self::Stream(spec) => &spec.target_endpoint,
         }
     }
 }
@@ -191,8 +220,14 @@ struct ActiveStreamEndpointBridgeSpec {
 #[derive(Debug, Clone)]
 struct ManagedEventTlsPaths {
     ca_cert: PathBuf,
-    client_cert: PathBuf,
-    client_key: PathBuf,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+}
+
+impl ManagedEventTlsPaths {
+    fn client_identity(&self) -> Option<(&Path, &Path)> {
+        self.client_cert.as_deref().zip(self.client_key.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,8 +254,10 @@ struct ControlPlaneTlsPaths<'a> {
     cert_path: &'a Path,
     key_path: &'a Path,
     ca_path: &'a Path,
-    peer_cert_path: &'a Path,
-    peer_key_path: &'a Path,
+    internal_client_cert_path: Option<&'a Path>,
+    internal_client_key_path: Option<&'a Path>,
+    peer_cert_path: Option<&'a Path>,
+    peer_key_path: Option<&'a Path>,
 }
 
 struct ControlPlaneAddresses<'a> {
@@ -241,8 +278,8 @@ impl LocalControlPlaneClient {
         addr: SocketAddr,
         server_name: String,
         ca_path: &Path,
-        client_cert_path: &Path,
-        client_key_path: &Path,
+        client_cert_path: Option<&Path>,
+        client_key_path: Option<&Path>,
     ) -> Result<Self> {
         Ok(Self {
             endpoint: build_client_endpoint(ca_path, client_cert_path, client_key_path)?,
@@ -259,7 +296,9 @@ impl LocalControlPlaneClient {
                 Ok(response) => return Ok(response),
                 Err(err) if attempt == 0 => {
                     self.reset_connection().await;
-                    tracing::warn!("retrying guest control-plane proxy request after error: {err:#}");
+                    tracing::warn!(
+                        "retrying guest control-plane proxy request after error: {err:#}"
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -434,16 +473,21 @@ pub(crate) async fn run_daemon(
 
     let cert_path = make_abs(&work_dir, &args.quic_cert);
     let key_path = make_abs(&work_dir, &args.quic_key);
-    let peer_cert_path = args
-        .quic_peer_cert
-        .as_ref()
-        .map(|path| make_abs(&work_dir, path))
-        .unwrap_or_else(|| cert_path.clone());
-    let peer_key_path = args
-        .quic_peer_key
-        .as_ref()
-        .map(|path| make_abs(&work_dir, path))
-        .unwrap_or_else(|| key_path.clone());
+    let peer_client_identity = resolve_peer_client_tls_paths(
+        &work_dir,
+        args.quic_peer_cert.as_deref(),
+        args.quic_peer_key.as_deref(),
+    )?;
+    if !args.cp_peers.is_empty() && peer_client_identity.is_none() {
+        bail!(
+            "outbound peer TLS requires --quic-peer-cert/--quic-peer-key or certs/peer.crt and certs/peer.key"
+        );
+    }
+    let (internal_client_cert_path, internal_client_key_path) = resolve_internal_client_tls_paths(
+        &work_dir,
+        args.quic_peer_cert.as_deref(),
+        args.quic_peer_key.as_deref(),
+    )?;
     let ca_path = make_abs(&work_dir, &args.quic_ca);
     let public_addr = args
         .cp_public_addr
@@ -458,8 +502,12 @@ pub(crate) async fn run_daemon(
         cert_path: &cert_path,
         key_path: &key_path,
         ca_path: &ca_path,
-        peer_cert_path: &peer_cert_path,
-        peer_key_path: &peer_key_path,
+        internal_client_cert_path: internal_client_cert_path.as_deref(),
+        internal_client_key_path: internal_client_key_path.as_deref(),
+        peer_cert_path: peer_client_identity
+            .as_ref()
+            .map(|(cert, _)| cert.as_path()),
+        peer_key_path: peer_client_identity.as_ref().map(|(_, key)| key.as_path()),
     };
     let addresses = ControlPlaneAddresses {
         public_addr: &public_addr,
@@ -468,6 +516,7 @@ pub(crate) async fn run_daemon(
     let (control_plane_process_id, control_plane) =
         bootstrap_control_plane(&kernel, &registry, &work_dir, &args, &tls_paths, &addresses)
             .await?;
+    let access_policy = build_access_policy(&work_dir, &args)?;
 
     let state = Rc::new(DaemonState {
         node_id: args.cp_node_id.clone(),
@@ -475,6 +524,7 @@ pub(crate) async fn run_daemon(
         registry,
         work_dir,
         processes: Mutex::new(BTreeMap::new()),
+        instance_workloads: Mutex::new(BTreeMap::new()),
         source_bindings: Mutex::new(BTreeMap::new()),
         target_bindings: Mutex::new(BTreeMap::new()),
         service_response_bindings: Mutex::new(BTreeMap::new()),
@@ -484,9 +534,10 @@ pub(crate) async fn run_daemon(
         control_plane_process_id,
         tls_paths: ManagedEventTlsPaths {
             ca_cert: ca_path.clone(),
-            client_cert: peer_cert_path.clone(),
-            client_key: peer_key_path.clone(),
+            client_cert: peer_client_identity.as_ref().map(|(cert, _)| cert.clone()),
+            client_key: peer_client_identity.as_ref().map(|(_, key)| key.clone()),
         },
+        access_policy,
     });
 
     let endpoint = build_server_endpoint(&args.listen, &cert_path, &key_path, &ca_path)?;
@@ -572,8 +623,8 @@ async fn bootstrap_control_plane(
         parse_socket_addr(addresses.internal_addr)?,
         args.cp_server_name.clone(),
         tls_paths.ca_path,
-        tls_paths.peer_cert_path,
-        tls_paths.peer_key_path,
+        tls_paths.internal_client_cert_path,
+        tls_paths.internal_client_key_path,
     )?);
     info!(
         internal_addr = %addresses.internal_addr,
@@ -617,8 +668,8 @@ async fn register_control_plane_runtime_resources(
             interactions: vec![InteractionKind::Stream],
             allowed_authorities: allowed_authorities.into_iter().collect(),
             ca_cert_path: tls_paths.ca_path.to_path_buf(),
-            client_cert_path: Some(tls_paths.peer_cert_path.to_path_buf()),
-            client_key_path: Some(tls_paths.peer_key_path.to_path_buf()),
+            client_cert_path: tls_paths.peer_cert_path.map(Path::to_path_buf),
+            client_key_path: tls_paths.peer_key_path.map(Path::to_path_buf),
         })
         .await;
     network
@@ -765,13 +816,25 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 async fn handle_incoming(state: Rc<DaemonState>, incoming: Incoming) -> Result<()> {
     let connection = incoming.await.context("accept QUIC connection")?;
+    let principal = principal_from_connection(&connection).context("resolve peer principal")?;
+    let request_context = state
+        .access_policy
+        .resolve(principal, peer_fingerprint(&connection));
+    info!(
+        principal = %request_context.principal(),
+        fingerprint = %request_context.peer_fingerprint,
+        "accepted daemon connection"
+    );
 
     loop {
         match connection.accept_bi().await {
             Ok((mut send, mut recv)) => {
                 let state = Rc::clone(&state);
+                let request_context = request_context.clone();
                 spawn_local(async move {
-                    if let Err(err) = handle_stream(state, &mut send, &mut recv).await {
+                    if let Err(err) =
+                        handle_stream(state, request_context, &mut send, &mut recv).await
+                    {
                         tracing::warn!("stream request error: {err:#}");
                     }
                 });
@@ -787,6 +850,7 @@ async fn handle_incoming(state: Rc<DaemonState>, incoming: Incoming) -> Result<(
 
 async fn handle_stream(
     state: Rc<DaemonState>,
+    request_context: AuthenticatedRequestContext,
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
@@ -809,10 +873,13 @@ async fn handle_stream(
     }
 
     if envelope.method == Method::SubscribeGuestLogs {
-        return handle_guest_log_subscription_stream(state, send, envelope).await;
+        if !request_context.allows(envelope.method) {
+            return write_unauthorised_response(send, &request_context, envelope).await;
+        }
+        return handle_guest_log_subscription_stream(state, request_context, send, envelope).await;
     }
 
-    let response = handle_stream_request(state, &bytes, envelope).await?;
+    let response = handle_stream_request(state, request_context, &bytes, envelope).await?;
     write_framed(send, &response)
         .await
         .context("write response frame")?;
@@ -822,9 +889,26 @@ async fn handle_stream(
 
 async fn handle_stream_request(
     state: Rc<DaemonState>,
+    request_context: AuthenticatedRequestContext,
     bytes: &[u8],
     envelope: Envelope,
 ) -> Result<Vec<u8>> {
+    if !request_context.allows(envelope.method) {
+        warn!(
+            principal = %request_context.principal(),
+            fingerprint = %request_context.peer_fingerprint,
+            method = ?envelope.method,
+            "daemon request denied"
+        );
+        return encode_error_response(
+            envelope.method,
+            envelope.request_id,
+            403,
+            "unauthorised",
+            false,
+        );
+    }
+
     match envelope.method {
         Method::ControlMutate
         | Method::ControlQuery
@@ -832,16 +916,14 @@ async fn handle_stream_request(
         | Method::ControlMetrics
         | Method::ControlReplay
         | Method::RaftRequestVote
-        | Method::RaftAppendEntries => match state.control_plane.request_raw(bytes).await {
-            Ok(response) => Ok(response),
-            Err(err) => encode_error_response(
-                envelope.method,
-                envelope.request_id,
-                502,
-                err.to_string(),
-                true,
-            ),
-        },
+        | Method::RaftAppendEntries => {
+            match forward_control_plane_request(&state, &request_context, bytes, &envelope).await {
+                Ok(response) => Ok(response),
+                Err(err) => {
+                    encode_forward_control_plane_error(envelope.method, envelope.request_id, err)
+                }
+            }
+        }
         Method::StartInstance => {
             let payload: StartRequest = match decode_payload(&envelope) {
                 Ok(payload) => payload,
@@ -865,21 +947,72 @@ async fn handle_stream_request(
                     false,
                 );
             }
+            if let Err(err) = ensure_workload_authorised(
+                &request_context,
+                Method::StartInstance,
+                &payload.workload_key,
+                "instance start",
+            ) {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
 
-            {
-                let processes = state.processes.lock().await;
-                if let Some(existing) = processes.get(&payload.instance_id) {
-                    return encode_response(
+            let existing = {
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .get(&payload.instance_id)
+                    .copied()
+            };
+            if let Some(existing) = existing {
+                let Some(existing_workload) = state
+                    .instance_workloads
+                    .lock()
+                    .await
+                    .get(&payload.instance_id)
+                    .cloned()
+                else {
+                    return encode_error_response(
                         envelope.method,
                         envelope.request_id,
-                        &StartResponse {
-                            status: "ok".to_string(),
-                            instance_id: payload.instance_id,
-                            process_id: *existing,
-                            already_running: true,
-                        },
+                        500,
+                        format!(
+                            "instance `{}` missing workload attribution",
+                            payload.instance_id
+                        ),
+                        false,
+                    );
+                };
+                if let Err(err) = ensure_workload_authorised(
+                    &request_context,
+                    Method::StartInstance,
+                    &existing_workload,
+                    "instance start",
+                ) {
+                    return encode_error_response(
+                        envelope.method,
+                        envelope.request_id,
+                        403,
+                        err.to_string(),
+                        false,
                     );
                 }
+                return encode_response(
+                    envelope.method,
+                    envelope.request_id,
+                    &StartResponse {
+                        status: "ok".to_string(),
+                        instance_id: payload.instance_id,
+                        process_id: existing,
+                        already_running: true,
+                    },
+                );
             }
 
             let managed_endpoint_bindings = match ensure_managed_endpoint_bindings(
@@ -915,6 +1048,7 @@ async fn handle_stream_request(
                     workload_key: Some(&payload.workload_key),
                     instance_id: Some(&payload.instance_id),
                     external_account_ref: payload.external_account_ref.as_deref(),
+                    principal: Some(request_context.principal()),
                 },
             )
             .await
@@ -949,6 +1083,11 @@ async fn handle_stream_request(
                 .lock()
                 .await
                 .insert(payload.instance_id.clone(), process_id);
+            state
+                .instance_workloads
+                .lock()
+                .await
+                .insert(payload.instance_id.clone(), payload.workload_key.clone());
 
             encode_response(
                 envelope.method,
@@ -976,7 +1115,14 @@ async fn handle_stream_request(
                 );
             }
 
-            let process_id = state.processes.lock().await.remove(&payload.instance_id);
+            let process_id = {
+                state
+                    .processes
+                    .lock()
+                    .await
+                    .get(&payload.instance_id)
+                    .copied()
+            };
             let Some(process_id) = process_id else {
                 return encode_response(
                     envelope.method,
@@ -988,6 +1134,44 @@ async fn handle_stream_request(
                     },
                 );
             };
+            let Some(workload_key) = state
+                .instance_workloads
+                .lock()
+                .await
+                .get(&payload.instance_id)
+                .cloned()
+            else {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    500,
+                    format!(
+                        "instance `{}` missing workload attribution",
+                        payload.instance_id
+                    ),
+                    false,
+                );
+            };
+            if let Err(err) = ensure_workload_authorised(
+                &request_context,
+                Method::StopInstance,
+                &workload_key,
+                "instance stop",
+            ) {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
+            state.processes.lock().await.remove(&payload.instance_id);
+            state
+                .instance_workloads
+                .lock()
+                .await
+                .remove(&payload.instance_id);
 
             state.active_bridges.lock().await.retain(|_, route| {
                 let remove = route.spec.source_instance_id() == payload.instance_id
@@ -1039,11 +1223,31 @@ async fn handle_stream_request(
                 );
             }
             let processes = state.processes.lock().await;
+            let workloads = state.instance_workloads.lock().await;
             let entries = processes
                 .iter()
+                .filter(|(instance, _)| {
+                    instance_visible_for_list_instances(&request_context, &workloads, instance)
+                })
                 .map(|(instance, process)| (instance.clone(), *process))
                 .collect::<BTreeMap<_, _>>();
-            let active_bridges = state.active_bridges.lock().await.keys().cloned().collect();
+            let visible_instances = entries.keys().cloned().collect::<BTreeSet<_>>();
+            let local_instances = processes.keys().cloned().collect::<BTreeSet<_>>();
+            let active_bridges = state
+                .active_bridges
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, route)| {
+                    bridge_visible_for_list_instances(
+                        &request_context,
+                        &visible_instances,
+                        &local_instances,
+                        &route.spec,
+                    )
+                })
+                .map(|(bridge_id, _)| bridge_id.clone())
+                .collect();
             encode_response(
                 envelope.method,
                 envelope.request_id,
@@ -1058,6 +1262,42 @@ async fn handle_stream_request(
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
+            if let Err(err) = ensure_instance_endpoint_authorised(
+                &state,
+                &request_context,
+                Method::ActivateEndpointBridge,
+                &payload.source_instance_id,
+                &payload.source_endpoint,
+                "bridge source endpoint",
+            )
+            .await
+            {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
+            if let Err(err) = ensure_instance_endpoint_authorised(
+                &state,
+                &request_context,
+                Method::ActivateEndpointBridge,
+                &payload.target_instance_id,
+                &payload.target_endpoint,
+                "bridge target endpoint",
+            )
+            .await
+            {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
             if payload.node_id != state.node_id {
                 return encode_error_response(
                     envelope.method,
@@ -1077,6 +1317,42 @@ async fn handle_stream_request(
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
+            let bridge_spec = state
+                .active_bridges
+                .lock()
+                .await
+                .get(&payload.bridge_id)
+                .map(|bridge| bridge.spec.clone());
+            if let Some(spec) = bridge_spec {
+                if let Err(err) = ensure_endpoint_authorised(
+                    &request_context,
+                    Method::DeactivateEndpointBridge,
+                    spec.source_endpoint(),
+                    "bridge source endpoint",
+                ) {
+                    return encode_error_response(
+                        envelope.method,
+                        envelope.request_id,
+                        403,
+                        err.to_string(),
+                        false,
+                    );
+                }
+                if let Err(err) = ensure_endpoint_authorised(
+                    &request_context,
+                    Method::DeactivateEndpointBridge,
+                    spec.target_endpoint(),
+                    "bridge target endpoint",
+                ) {
+                    return encode_error_response(
+                        envelope.method,
+                        envelope.request_id,
+                        403,
+                        err.to_string(),
+                        false,
+                    );
+                }
+            }
             if payload.node_id != state.node_id {
                 return encode_error_response(
                     envelope.method,
@@ -1096,6 +1372,24 @@ async fn handle_stream_request(
                 Ok(payload) => payload,
                 Err(err) => return rpc_decode_error(envelope.method, envelope.request_id, err),
             };
+            if let Err(err) = ensure_instance_endpoint_authorised(
+                &state,
+                &request_context,
+                Method::DeliverBridgeMessage,
+                &payload.target_instance_id,
+                &payload.target_endpoint,
+                "bridge target endpoint",
+            )
+            .await
+            {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
             let message = payload.message;
             let delivered = match deliver_bridge_message_local(
                 &state,
@@ -1137,6 +1431,20 @@ async fn handle_stream_request(
                     false,
                 );
             }
+            if let Err(err) = ensure_workload_filter_authorised(
+                &request_context,
+                Method::RuntimeUsageQuery,
+                payload.query.workload.as_deref(),
+                "runtime usage query",
+            ) {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    403,
+                    err.to_string(),
+                    false,
+                );
+            }
             match query_runtime_usage(&state, &payload).await {
                 Ok(response) => encode_response(envelope.method, envelope.request_id, &response),
                 Err(err) => rpc_server_error(envelope.method, envelope.request_id, err),
@@ -1144,6 +1452,334 @@ async fn handle_stream_request(
         }
         Method::SubscribeGuestLogs => unreachable!("subscription streams are handled separately"),
     }
+}
+
+fn build_access_policy(work_dir: &Path, args: &DaemonArgs) -> Result<AccessPolicy> {
+    let mut specs = args.access_grants.clone();
+    if specs.is_empty() {
+        specs.push(default_access_grant_spec(
+            &resolve_default_client_principal(work_dir)?,
+        ));
+    }
+    specs.push(default_peer_access_grant_spec());
+    AccessPolicy::from_specs(&specs)
+}
+
+fn default_access_grant_spec(principal: &selium_abi::PrincipalRef) -> String {
+    format!(
+        "principal={};methods=control_read,control_read_global,control_write,node_manage,bridge_manage;workloads=*;endpoints=*;allow-operational-processes=true",
+        principal
+    )
+}
+
+fn default_peer_access_grant_spec() -> String {
+    format!(
+        "principal={}:*;methods=peer;workloads=*;endpoints=*",
+        selium_abi::PrincipalKind::RuntimePeer
+    )
+}
+
+async fn forward_control_plane_request(
+    state: &DaemonState,
+    request_context: &AuthenticatedRequestContext,
+    bytes: &[u8],
+    envelope: &Envelope,
+) -> std::result::Result<Vec<u8>, ForwardControlPlaneError> {
+    match envelope.method {
+        Method::ControlMutate => {
+            let mut request: MutateApiRequest =
+                decode_payload(envelope).map_err(ForwardControlPlaneError::bad_request)?;
+            request.mutation =
+                rewrite_mutation_for_authorisation(request.mutation, request_context)
+                    .map_err(ForwardControlPlaneError::forbidden)?;
+            let frame = encode_request(envelope.method, envelope.request_id, &request)
+                .context("encode control mutate request")
+                .map_err(ForwardControlPlaneError::internal)?;
+            state
+                .control_plane
+                .request_raw(&frame)
+                .await
+                .map_err(ForwardControlPlaneError::upstream)
+        }
+        Method::ControlQuery => {
+            let mut request: QueryApiRequest =
+                decode_payload(envelope).map_err(ForwardControlPlaneError::bad_request)?;
+            request.query =
+                rewrite_query_for_authorisation(request.query, request_context, envelope.method)
+                    .map_err(ForwardControlPlaneError::forbidden)?;
+            let frame = encode_request(envelope.method, envelope.request_id, &request)
+                .context("encode control query request")
+                .map_err(ForwardControlPlaneError::internal)?;
+            state
+                .control_plane
+                .request_raw(&frame)
+                .await
+                .map_err(ForwardControlPlaneError::upstream)
+        }
+        Method::ControlReplay => {
+            let request: ReplayApiRequest =
+                decode_payload(envelope).map_err(ForwardControlPlaneError::bad_request)?;
+            ensure_workload_filter_authorised(
+                request_context,
+                envelope.method,
+                request.workload.as_deref(),
+                "control replay",
+            )
+            .map_err(ForwardControlPlaneError::forbidden)?;
+            state
+                .control_plane
+                .request_raw(bytes)
+                .await
+                .map_err(ForwardControlPlaneError::upstream)
+        }
+        _ => state
+            .control_plane
+            .request_raw(bytes)
+            .await
+            .map_err(ForwardControlPlaneError::upstream),
+    }
+}
+
+#[derive(Debug)]
+enum ForwardControlPlaneError {
+    Local {
+        status: u16,
+        message: String,
+        retryable: bool,
+    },
+    Upstream(anyhow::Error),
+}
+
+impl ForwardControlPlaneError {
+    fn bad_request(error: anyhow::Error) -> Self {
+        Self::Local {
+            status: 400,
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn forbidden(error: anyhow::Error) -> Self {
+        Self::Local {
+            status: 403,
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn internal(error: anyhow::Error) -> Self {
+        Self::Local {
+            status: 500,
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn upstream(error: anyhow::Error) -> Self {
+        Self::Upstream(error)
+    }
+}
+
+fn encode_forward_control_plane_error(
+    method: Method,
+    request_id: u64,
+    error: ForwardControlPlaneError,
+) -> Result<Vec<u8>> {
+    match error {
+        ForwardControlPlaneError::Local {
+            status,
+            message,
+            retryable,
+        } => encode_error_response(method, request_id, status, message, retryable),
+        ForwardControlPlaneError::Upstream(error) => {
+            encode_error_response(method, request_id, 502, error.to_string(), true)
+        }
+    }
+}
+
+fn rewrite_mutation_for_authorisation(
+    mutation: Mutation,
+    request_context: &AuthenticatedRequestContext,
+) -> Result<Mutation> {
+    match mutation {
+        Mutation::UpsertDeployment { spec } => {
+            let workload = spec.workload.key();
+            ensure_workload_authorised(
+                request_context,
+                Method::ControlMutate,
+                &workload,
+                "deployment mutation",
+            )?;
+            Ok(Mutation::UpsertDeployment { spec })
+        }
+        Mutation::SetScale { workload, replicas } => {
+            let workload_key = workload.key();
+            ensure_workload_authorised(
+                request_context,
+                Method::ControlMutate,
+                &workload_key,
+                "scale mutation",
+            )?;
+            Ok(Mutation::SetScale { workload, replicas })
+        }
+        other if request_context.allows_all_workloads_for(Method::ControlMutate) => Ok(other),
+        _ => bail!("mutation requires full workload access"),
+    }
+}
+
+fn rewrite_query_for_authorisation(
+    query: Query,
+    request_context: &AuthenticatedRequestContext,
+    method: Method,
+) -> Result<Query> {
+    match query {
+        Query::DiscoveryState { .. } => Ok(Query::DiscoveryState {
+            scope: request_context.discovery_scope_for(method),
+        }),
+        Query::ResolveDiscovery { mut request } => {
+            request.scope = request_context.discovery_scope_for(method);
+            Ok(Query::ResolveDiscovery { request })
+        }
+        Query::AttributedInfrastructureInventory { filter } => {
+            ensure_workload_filter_authorised(
+                request_context,
+                method,
+                filter.workload.as_deref(),
+                "infrastructure inventory query",
+            )?;
+            Ok(Query::AttributedInfrastructureInventory { filter })
+        }
+        other
+            if request_context.allows_all_workloads_for(method)
+                && request_context.allows_all_endpoints_for(method) =>
+        {
+            Ok(other)
+        }
+        _ => bail!("query requires full workload and endpoint access"),
+    }
+}
+
+fn ensure_workload_filter_authorised(
+    request_context: &AuthenticatedRequestContext,
+    method: Method,
+    workload: Option<&str>,
+    subject: &str,
+) -> Result<()> {
+    match workload {
+        Some(workload) => ensure_workload_authorised(request_context, method, workload, subject),
+        None if request_context.allows_all_workloads_for(method) => Ok(()),
+        None => bail!("{subject} requires an explicit authorised workload filter"),
+    }
+}
+
+fn ensure_workload_authorised(
+    request_context: &AuthenticatedRequestContext,
+    method: Method,
+    workload: &str,
+    subject: &str,
+) -> Result<()> {
+    if request_context.allows_workload_for(method, workload) {
+        Ok(())
+    } else {
+        bail!("unauthorised workload `{workload}` for {subject}")
+    }
+}
+
+fn ensure_endpoint_authorised(
+    request_context: &AuthenticatedRequestContext,
+    method: Method,
+    endpoint: &PublicEndpointRef,
+    subject: &str,
+) -> Result<()> {
+    if request_context.allows_endpoint_for(method, endpoint) {
+        Ok(())
+    } else {
+        bail!("unauthorised endpoint `{}` for {subject}", endpoint.key())
+    }
+}
+
+fn instance_visible_for_list_instances(
+    request_context: &AuthenticatedRequestContext,
+    workloads: &BTreeMap<String, String>,
+    instance_id: &str,
+) -> bool {
+    workloads.get(instance_id).is_some_and(|workload| {
+        request_context.allows_workload_for(Method::ListInstances, workload)
+    }) || (request_context.allows_all_workloads_for(Method::ListInstances)
+        && !workloads.contains_key(instance_id))
+}
+
+fn bridge_visible_for_list_instances(
+    request_context: &AuthenticatedRequestContext,
+    visible_instances: &BTreeSet<String>,
+    local_instances: &BTreeSet<String>,
+    spec: &ActiveEndpointBridgeSpec,
+) -> bool {
+    visible_instances.contains(spec.source_instance_id())
+        && request_context.allows_workload_for(
+            Method::ListInstances,
+            &spec.source_endpoint().workload.key(),
+        )
+        && request_context.allows_workload_for(
+            Method::ListInstances,
+            &spec.target_endpoint().workload.key(),
+        )
+        && (!local_instances.contains(spec.target_instance_id())
+            || visible_instances.contains(spec.target_instance_id()))
+}
+
+async fn ensure_instance_endpoint_authorised(
+    state: &DaemonState,
+    request_context: &AuthenticatedRequestContext,
+    method: Method,
+    instance_id: &str,
+    endpoint: &PublicEndpointRef,
+    subject: &str,
+) -> Result<()> {
+    ensure_endpoint_authorised(request_context, method, endpoint, subject)?;
+
+    let workload = state
+        .instance_workloads
+        .lock()
+        .await
+        .get(instance_id)
+        .cloned();
+    if let Some(workload) = workload {
+        ensure_workload_authorised(request_context, method, &workload, subject)?;
+        if endpoint.workload.key() != workload {
+            bail!(
+                "endpoint `{}` does not match instance `{instance_id}` workload `{workload}`",
+                endpoint.key()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_unauthorised_response(
+    send: &mut quinn::SendStream,
+    request_context: &AuthenticatedRequestContext,
+    envelope: Envelope,
+) -> Result<()> {
+    warn!(
+        principal = %request_context.principal(),
+        fingerprint = %request_context.peer_fingerprint,
+        method = ?envelope.method,
+        "daemon request denied"
+    );
+    let response = encode_error_response(
+        envelope.method,
+        envelope.request_id,
+        403,
+        "unauthorised",
+        false,
+    )?;
+    write_framed(send, &response)
+        .await
+        .context("write unauthorised response")?;
+    let _ = send.finish();
+    Ok(())
 }
 
 async fn activate_endpoint_bridge_remote(
@@ -2337,11 +2973,12 @@ where
     for<'a> Resp::Archived: rkyv::Deserialize<Resp, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
         + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
 {
-    let endpoint = build_client_endpoint(
-        &tls_paths.ca_cert,
-        &tls_paths.client_cert,
-        &tls_paths.client_key,
-    )?;
+    let Some((client_cert, client_key)) = tls_paths.client_identity() else {
+        bail!(
+            "remote daemon access requires a peer certificate with a Selium principal URI; configure --quic-peer-cert/--quic-peer-key or provision certs/peer.crt and certs/peer.key"
+        );
+    };
+    let endpoint = build_client_endpoint(&tls_paths.ca_cert, Some(client_cert), Some(client_key))?;
     let connection = timeout(
         QUIC_CONNECT_TIMEOUT,
         endpoint.connect(
@@ -2449,8 +3086,8 @@ fn build_server_endpoint(
 
 fn build_client_endpoint(
     ca_path: &Path,
-    client_cert_path: &Path,
-    client_key_path: &Path,
+    client_cert_path: Option<&Path>,
+    client_key_path: Option<&Path>,
 ) -> Result<Endpoint> {
     let bind = if cfg!(target_family = "unix") {
         "0.0.0.0:0"
@@ -2462,8 +3099,8 @@ fn build_client_endpoint(
         bind,
         ClientTlsPaths {
             ca_cert: ca_path,
-            client_cert: Some(client_cert_path),
-            client_key: Some(client_key_path),
+            client_cert: client_cert_path,
+            client_key: client_key_path,
         },
     )
 }
@@ -2474,6 +3111,95 @@ fn make_abs(work_dir: &Path, path: &Path) -> PathBuf {
     } else {
         work_dir.join(path)
     }
+}
+
+fn resolve_internal_client_tls_paths(
+    work_dir: &Path,
+    peer_cert_override: Option<&Path>,
+    peer_key_override: Option<&Path>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let client_identity =
+        resolve_peer_client_tls_paths(work_dir, peer_cert_override, peer_key_override)?;
+    Ok(match client_identity {
+        Some((cert, key)) => (Some(cert), Some(key)),
+        None => (None, None),
+    })
+}
+
+fn resolve_peer_client_tls_paths(
+    work_dir: &Path,
+    peer_cert_override: Option<&Path>,
+    peer_key_override: Option<&Path>,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    match (peer_cert_override, peer_key_override) {
+        (Some(cert), Some(key)) => Ok(Some((make_abs(work_dir, cert), make_abs(work_dir, key)))),
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("--quic-peer-cert and --quic-peer-key must be provided together")
+        }
+        (None, None) => {
+            let default_peer_cert_path = default_peer_client_cert_path(work_dir);
+            let default_peer_key_path = default_peer_client_key_path(work_dir);
+            if default_peer_cert_path.exists() && default_peer_key_path.exists() {
+                Ok(Some((default_peer_cert_path, default_peer_key_path)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn default_peer_client_cert_path(work_dir: &Path) -> PathBuf {
+    work_dir.join("certs/peer.crt")
+}
+
+fn default_peer_client_key_path(work_dir: &Path) -> PathBuf {
+    work_dir.join("certs/peer.key")
+}
+
+fn default_client_cert_path(work_dir: &Path) -> PathBuf {
+    work_dir.join("certs/client.crt")
+}
+
+fn resolve_default_client_principal(work_dir: &Path) -> Result<selium_abi::PrincipalRef> {
+    resolve_cert_principal(
+        &default_client_cert_path(work_dir),
+        selium_abi::PrincipalRef::new(selium_abi::PrincipalKind::Machine, "client.localhost"),
+    )
+}
+
+fn resolve_cert_principal(
+    cert_path: &Path,
+    fallback: selium_abi::PrincipalRef,
+) -> Result<selium_abi::PrincipalRef> {
+    if !cert_path.exists() {
+        return Ok(fallback);
+    }
+    let cert_der = load_first_pem_certificate(cert_path)?;
+    principal_from_cert(cert_der.as_ref()).with_context(|| {
+        format!(
+            "resolve Selium principal from certificate {}; generated/client certificates must embed a Selium principal URI SAN, or the daemon must be configured with explicit `--access-grant` entries",
+            cert_path.display()
+        )
+    })
+}
+
+fn load_first_pem_certificate(
+    cert_path: &Path,
+) -> Result<rustls::pki_types::CertificateDer<'static>> {
+    let file = fs::File::open(cert_path)
+        .with_context(|| format!("open certificate {}", cert_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut certs = rustls_pemfile::certs(&mut reader);
+    certs
+        .next()
+        .transpose()
+        .with_context(|| format!("read certificate {}", cert_path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "certificate {} did not contain a PEM block",
+                cert_path.display()
+            )
+        })
 }
 
 #[cfg(test)]

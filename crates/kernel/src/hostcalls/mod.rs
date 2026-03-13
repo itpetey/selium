@@ -2,14 +2,15 @@
 
 use std::{convert::TryFrom, future::Future, sync::Arc};
 
-use selium_abi::{GuestUint, RkyvEncode, hostcalls::Hostcall};
+use selium_abi::{Capability, GuestResourceId, GuestUint, RkyvEncode, hostcalls::Hostcall};
 use tracing::{debug, trace};
 
 use crate::{
     KernelError,
     r#async::futures::FutureSharedState,
     guest_error::{GuestError, GuestResult},
-    registry::InstanceRegistry,
+    registry::{InstanceRegistry, ResourceId},
+    services::session_service::RootSession,
 };
 
 pub enum PollState {
@@ -25,6 +26,119 @@ pub mod session;
 pub mod shm;
 pub mod storage;
 pub mod time;
+
+pub(crate) fn ensure_capability_authorised(
+    registry: &InstanceRegistry,
+    capability: Capability,
+) -> GuestResult<()> {
+    let session = root_session(registry)?;
+    if session.0.allows_capability(capability) {
+        Ok(())
+    } else {
+        Err(GuestError::PermissionDenied)
+    }
+}
+
+pub(crate) fn ensure_resource_authorised(
+    registry: &InstanceRegistry,
+    capability: Capability,
+    resource_id: ResourceId,
+) -> GuestResult<()> {
+    let session = root_session(registry)?;
+    if session.0.authorise(capability, resource_id) {
+        Ok(())
+    } else {
+        Err(GuestError::PermissionDenied)
+    }
+}
+
+pub(crate) fn ensure_resource_authorised_any(
+    registry: &InstanceRegistry,
+    capabilities: &[Capability],
+    resource_id: ResourceId,
+) -> GuestResult<()> {
+    let session = root_session(registry)?;
+    if capabilities
+        .iter()
+        .any(|capability| session.0.authorise(*capability, resource_id))
+    {
+        Ok(())
+    } else {
+        Err(GuestError::PermissionDenied)
+    }
+}
+
+pub(crate) fn ensure_slot_authorised(
+    registry: &InstanceRegistry,
+    capability: Capability,
+    slot: usize,
+) -> GuestResult<ResourceId> {
+    let resource_id = registry.entry(slot).ok_or(GuestError::NotFound)?;
+    ensure_resource_authorised(registry, capability, resource_id)?;
+    Ok(resource_id)
+}
+
+pub(crate) fn ensure_slot_authorised_any(
+    registry: &InstanceRegistry,
+    capabilities: &[Capability],
+    slot: usize,
+) -> GuestResult<ResourceId> {
+    let resource_id = registry.entry(slot).ok_or(GuestError::NotFound)?;
+    ensure_resource_authorised_any(registry, capabilities, resource_id)?;
+    Ok(resource_id)
+}
+
+pub(crate) fn ensure_shared_resource_authorised(
+    registry: &InstanceRegistry,
+    capability: Capability,
+    shared_id: GuestResourceId,
+) -> GuestResult<ResourceId> {
+    let resource_id = registry
+        .registry()
+        .resolve_shared(shared_id)
+        .ok_or(GuestError::NotFound)?;
+    ensure_resource_authorised(registry, capability, resource_id)?;
+    Ok(resource_id)
+}
+
+pub(crate) fn ensure_shared_resource_authorised_any(
+    registry: &InstanceRegistry,
+    capabilities: &[Capability],
+    shared_id: GuestResourceId,
+) -> GuestResult<ResourceId> {
+    let resource_id = registry
+        .registry()
+        .resolve_shared(shared_id)
+        .ok_or(GuestError::NotFound)?;
+    ensure_resource_authorised_any(registry, capabilities, resource_id)?;
+    Ok(resource_id)
+}
+
+pub(crate) fn grant_registered_slot(
+    registry: &InstanceRegistry,
+    slot: usize,
+    capabilities: &[Capability],
+) -> GuestResult<()> {
+    let resource_id = registry.entry(slot).ok_or(GuestError::NotFound)?;
+    grant_registered_resource(registry, resource_id, capabilities)
+}
+
+pub(crate) fn grant_registered_resource(
+    registry: &InstanceRegistry,
+    resource_id: ResourceId,
+    capabilities: &[Capability],
+) -> GuestResult<()> {
+    registry
+        .registrar()
+        .grant_root_session_resources(capabilities, resource_id)
+        .map_err(GuestError::from)
+}
+
+fn root_session(registry: &InstanceRegistry) -> GuestResult<Arc<RootSession>> {
+    registry
+        .extension::<RootSession>()
+        .ok_or(GuestError::PermissionDenied)
+}
 
 /// Engine-neutral context required by hostcall operations.
 pub trait HostcallContext {

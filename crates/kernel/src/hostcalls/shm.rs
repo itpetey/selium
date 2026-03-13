@@ -3,8 +3,8 @@
 use std::{convert::TryFrom, future::ready, sync::Arc};
 
 use selium_abi::{
-    GuestResourceId, GuestUint, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead, ShmRegion,
-    ShmShare, ShmWrite,
+    Capability, GuestResourceId, GuestUint, ShmAlloc, ShmAttach, ShmDescriptor, ShmDetach, ShmRead,
+    ShmRegion, ShmShare, ShmWrite,
 };
 
 use crate::{
@@ -55,11 +55,13 @@ where
         let inner = self.0.clone();
 
         let result = (|| -> GuestResult<ShmDescriptor> {
+            super::ensure_capability_authorised(context.registry(), Capability::SharedMemory)?;
             let region = inner.alloc(input).map_err(Into::into)?;
             let slot = context
                 .registry_mut()
                 .insert(region, None, ResourceType::SharedMemory)
                 .map_err(GuestError::from)?;
+            super::grant_registered_slot(context.registry(), slot, &[Capability::SharedMemory])?;
             let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
             let shared_id = context
                 .registry()
@@ -95,7 +97,8 @@ impl Contract for ShmShareDriver {
         let result = (|| -> GuestResult<GuestResourceId> {
             let slot =
                 usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
-            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let resource_id =
+                super::ensure_slot_authorised(context.registry(), Capability::SharedMemory, slot)?;
             let meta = context
                 .registry()
                 .registry()
@@ -129,11 +132,11 @@ impl Contract for ShmAttachDriver {
         C: HostcallContext,
     {
         let result = (|| -> GuestResult<ShmDescriptor> {
-            let resource_id = context
-                .registry()
-                .registry()
-                .resolve_shared(input.shared_id)
-                .ok_or(GuestError::NotFound)?;
+            let resource_id = super::ensure_shared_resource_authorised(
+                context.registry(),
+                Capability::SharedMemory,
+                input.shared_id,
+            )?;
 
             let meta = context
                 .registry()
@@ -183,7 +186,8 @@ impl Contract for ShmDetachDriver {
         let result = (|| -> GuestResult<()> {
             let slot =
                 usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
-            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let resource_id =
+                super::ensure_slot_authorised(context.registry(), Capability::SharedMemory, slot)?;
             let meta = context
                 .registry()
                 .registry()
@@ -224,7 +228,8 @@ where
         let result = (|| -> GuestResult<Vec<u8>> {
             let slot =
                 usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
-            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let resource_id =
+                super::ensure_slot_authorised(context.registry(), Capability::SharedMemory, slot)?;
             let meta = context
                 .registry()
                 .registry()
@@ -271,7 +276,8 @@ where
         let result = (|| -> GuestResult<()> {
             let slot =
                 usize::try_from(input.resource_id).map_err(|_| GuestError::InvalidArgument)?;
-            let resource_id = context.registry().entry(slot).ok_or(GuestError::NotFound)?;
+            let resource_id =
+                super::ensure_slot_authorised(context.registry(), Capability::SharedMemory, slot)?;
             let meta = context
                 .registry()
                 .registry()
@@ -325,10 +331,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
+
+    use selium_abi::Capability;
 
     use crate::{
         registry::{InstanceRegistry, Registry, ResourceType},
+        services::session_service::{ResourceScope, RootSession, Session, SessionAuthnMethod},
         spi::shared_memory::SharedMemoryCapability,
     };
 
@@ -351,8 +363,31 @@ mod tests {
     }
 
     fn context() -> TestContext {
+        context_with_capabilities(Capability::ALL.to_vec())
+    }
+
+    fn context_with_capabilities(capabilities: Vec<Capability>) -> TestContext {
         let registry = Registry::new();
-        let instance = registry.instance().expect("instance");
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(Session::bootstrap(capabilities, [0; 32])))
+            .expect("root session");
+        TestContext { registry: instance }
+    }
+
+    fn context_with_scoped_entitlements(
+        entitlements: HashMap<Capability, ResourceScope>,
+    ) -> TestContext {
+        let registry = Registry::new();
+        let mut instance = registry.instance().expect("instance");
+        instance
+            .insert_extension(RootSession(Session::bootstrap_with_scoped_principal(
+                entitlements,
+                [0; 32],
+                selium_abi::PrincipalRef::new(selium_abi::PrincipalKind::Internal, "runtime"),
+                SessionAuthnMethod::Delegated,
+            )))
+            .expect("root session");
         TestContext { registry: instance }
     }
 
@@ -531,5 +566,57 @@ mod tests {
 
         assert_eq!(capability.reads.lock().expect("reads lock").len(), 1);
         assert_eq!(capability.writes.lock().expect("writes lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn alloc_requires_shared_memory_capability() {
+        let mut ctx = context_with_capabilities(Vec::new());
+        let capability = MemoryCapability::default();
+        let driver = ShmAllocDriver(capability);
+
+        let err = driver
+            .to_future(&mut ctx, ShmAlloc { size: 64, align: 8 })
+            .await
+            .expect_err("missing session entitlement should deny");
+        assert!(matches!(err, GuestError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn alloc_grants_scoped_shared_memory_to_returned_region() {
+        let capability = MemoryCapability::default();
+        let alloc_driver = ShmAllocDriver(capability.clone());
+        let write_driver = ShmWriteDriver(capability.clone());
+        let share_driver = ShmShareDriver;
+        let mut ctx = context_with_scoped_entitlements(HashMap::from([(
+            Capability::SharedMemory,
+            ResourceScope::Some(HashSet::new()),
+        )]));
+
+        let descriptor = alloc_driver
+            .to_future(&mut ctx, ShmAlloc { size: 64, align: 8 })
+            .await
+            .expect("alloc");
+
+        write_driver
+            .to_future(
+                &mut ctx,
+                ShmWrite {
+                    resource_id: descriptor.resource_id,
+                    offset: 4,
+                    bytes: vec![8, 9],
+                },
+            )
+            .await
+            .expect("write");
+
+        share_driver
+            .to_future(
+                &mut ctx,
+                ShmShare {
+                    resource_id: descriptor.resource_id,
+                },
+            )
+            .await
+            .expect("share");
     }
 }

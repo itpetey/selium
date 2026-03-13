@@ -31,8 +31,7 @@ use selium_control_plane_api::{
     OperationalProcessRecord, OperationalProcessSelector, PipelineEdge, PipelineEndpoint,
     PipelineSpec, PublicEndpointRef, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
     build_discovery_state, collect_contracts_for_workload, ensure_pipeline_consistency,
-    generate_rust_bindings,
-    parse_contract_ref, parse_idl,
+    generate_rust_bindings, parse_contract_ref, parse_idl,
 };
 use selium_control_plane_core::{AttributedInfrastructureFilter, Mutation, Query};
 use selium_control_plane_protocol::{
@@ -840,7 +839,10 @@ fn local_discovery_resolution(
                         .get(&instance.deployment)
                         .map(|deployment| deployment.workload.clone())
                         .ok_or_else(|| ApiError::UnknownDeployment(instance.deployment.clone()))?;
-                    if !request.scope.allows_operational_process_discovery(&workload) {
+                    if !request
+                        .scope
+                        .allows_operational_process_discovery(&workload)
+                    {
                         return Err(ApiError::Unauthorised {
                             operation: DiscoveryOperation::Discover.as_str().to_string(),
                             subject: workload.key(),
@@ -855,7 +857,10 @@ fn local_discovery_resolution(
                     }
                 }
                 OperationalProcessSelector::Workload(workload) => {
-                    if !request.scope.allows_operational_process_discovery(&workload) {
+                    if !request
+                        .scope
+                        .allows_operational_process_discovery(&workload)
+                    {
                         return Err(ApiError::Unauthorised {
                             operation: DiscoveryOperation::Discover.as_str().to_string(),
                             subject: workload.key(),

@@ -24,6 +24,7 @@ use thiserror::Error;
 
 mod contract_codec;
 pub mod hostcalls;
+mod identity;
 mod network;
 mod process;
 mod queue;
@@ -36,6 +37,7 @@ mod usage;
 // pub use external::*;
 pub use contract_codec::*;
 pub use hostcalls::*;
+pub use identity::*;
 pub use network::*;
 pub use process::*;
 pub use queue::*;

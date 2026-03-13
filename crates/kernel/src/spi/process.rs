@@ -1,12 +1,13 @@
 //! Process lifecycle SPI contracts.
 
-use std::{future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
-use selium_abi::{Capability, EntrypointInvocation, ProcessLogBindings};
+use selium_abi::{Capability, EntrypointInvocation, PrincipalRef, ProcessLogBindings};
 
 use crate::{
     guest_error::GuestError,
     registry::{Registry, ResourceId},
+    services::session_service::ResourceScope,
 };
 
 #[derive(Debug)]
@@ -20,6 +21,10 @@ pub struct ProcessStartRequest<'a> {
     pub instance_id: Option<&'a str>,
     /// Opaque external account reference supplied by Selium control-plane resources.
     pub external_account_ref: Option<&'a str>,
+    /// Authenticated principal that requested this process launch.
+    pub principal: Option<&'a PrincipalRef>,
+    /// Scoped entitlements granted to the child process.
+    pub entitlements: HashMap<Capability, ResourceScope>,
     pub capabilities: Vec<Capability>,
     pub guest_log_bindings: ProcessLogBindings,
     pub network_egress_profiles: Vec<String>,
@@ -132,6 +137,8 @@ mod tests {
                     workload_key: None,
                     instance_id: None,
                     external_account_ref: None,
+                    principal: None,
+                    entitlements: HashMap::from([(Capability::TimeRead, ResourceScope::Any)]),
                     capabilities: vec![Capability::TimeRead],
                     guest_log_bindings: ProcessLogBindings::default(),
                     network_egress_profiles: Vec::new(),

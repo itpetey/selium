@@ -48,7 +48,7 @@ pub(crate) struct ServerOptions {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ServerCommand {
-    /// Generate a local CA plus server and client certificate pairs.
+    /// Generate a local CA plus server, client, and peer certificate pairs.
     GenerateCerts(GenerateCertsArgs),
     /// Run long-lived runtime daemon with lifecycle API.
     Daemon(Box<DaemonArgs>),
@@ -68,6 +68,21 @@ pub(crate) struct GenerateCertsArgs {
     /// DNS name to embed in the client certificate.
     #[arg(long, default_value = "client.localhost")]
     pub(crate) client_name: String,
+    /// Selium principal kind embedded in the generated client certificate.
+    #[arg(long, default_value = "machine")]
+    pub(crate) client_principal_kind: String,
+    /// Opaque external subject identifier embedded in the generated client certificate.
+    #[arg(long, default_value = "client.localhost")]
+    pub(crate) client_principal_id: String,
+    /// DNS name to embed in the peer certificate.
+    #[arg(long, default_value = "peer.localhost")]
+    pub(crate) peer_name: String,
+    /// Selium principal kind embedded in the generated peer certificate.
+    #[arg(long, default_value = "runtime-peer")]
+    pub(crate) peer_principal_kind: String,
+    /// Opaque external subject identifier embedded in the generated peer certificate.
+    #[arg(long, default_value = "peer.localhost")]
+    pub(crate) peer_principal_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -96,10 +111,10 @@ pub(crate) struct DaemonArgs {
     /// Path to server key PEM used for daemon QUIC endpoint.
     #[arg(long, default_value = "certs/server.key")]
     pub(crate) quic_key: PathBuf,
-    /// Path to client cert PEM used for outbound peer RPCs (defaults to --quic-cert).
+    /// Path to client cert PEM used for outbound peer RPCs (defaults to `certs/peer.crt`).
     #[arg(long)]
     pub(crate) quic_peer_cert: Option<PathBuf>,
-    /// Path to client key PEM used for outbound peer RPCs (defaults to --quic-key).
+    /// Path to client key PEM used for outbound peer RPCs (defaults to `certs/peer.key`).
     #[arg(long)]
     pub(crate) quic_peer_key: Option<PathBuf>,
     /// Path to CA cert PEM used to validate mTLS clients and peers.
@@ -123,6 +138,9 @@ pub(crate) struct DaemonArgs {
     /// Heartbeat interval for node liveness updates (milliseconds).
     #[arg(long, default_value_t = 1000)]
     pub(crate) cp_heartbeat_interval_ms: u64,
+    /// Static access grant in `key=value;...` form. Repeatable.
+    #[arg(long = "access-grant")]
+    pub(crate) access_grants: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -228,6 +246,11 @@ struct GenerateCertsConfig {
     ca_common_name: Option<String>,
     server_name: Option<String>,
     client_name: Option<String>,
+    client_principal_kind: Option<String>,
+    client_principal_id: Option<String>,
+    peer_name: Option<String>,
+    peer_principal_kind: Option<String>,
+    peer_principal_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -250,6 +273,7 @@ struct DaemonConfig {
     cp_allocatable_cpu_millis: Option<u32>,
     cp_allocatable_memory_mib: Option<u32>,
     cp_heartbeat_interval_ms: Option<u64>,
+    access_grants: Option<Vec<String>>,
 }
 
 pub(crate) fn load_server_options() -> Result<ServerOptions> {
@@ -339,6 +363,31 @@ fn merge_generate_certs_config(
         value_source("client_name"),
         config.client_name,
     );
+    merge_value(
+        &mut args.client_principal_kind,
+        value_source("client_principal_kind"),
+        config.client_principal_kind,
+    );
+    merge_value(
+        &mut args.client_principal_id,
+        value_source("client_principal_id"),
+        config.client_principal_id,
+    );
+    merge_value(
+        &mut args.peer_name,
+        value_source("peer_name"),
+        config.peer_name,
+    );
+    merge_value(
+        &mut args.peer_principal_kind,
+        value_source("peer_principal_kind"),
+        config.peer_principal_kind,
+    );
+    merge_value(
+        &mut args.peer_principal_id,
+        value_source("peer_principal_id"),
+        config.peer_principal_id,
+    );
 }
 
 fn merge_daemon_config(
@@ -424,6 +473,11 @@ fn merge_daemon_config(
         &mut args.cp_heartbeat_interval_ms,
         value_source("cp_heartbeat_interval_ms"),
         config.cp_heartbeat_interval_ms,
+    );
+    merge_vec(
+        &mut args.access_grants,
+        value_source("access_grants"),
+        config.access_grants,
     );
 }
 

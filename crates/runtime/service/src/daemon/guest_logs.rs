@@ -47,6 +47,7 @@ pub(super) fn next_runtime_usage_sequence(
 
 pub(super) async fn handle_guest_log_subscription_stream(
     state: Rc<DaemonState>,
+    request_context: AuthenticatedRequestContext,
     send: &mut quinn::SendStream,
     envelope: Envelope,
 ) -> Result<()> {
@@ -62,13 +63,13 @@ pub(super) async fn handle_guest_log_subscription_stream(
         }
     };
 
-    let resolved = match resolve_guest_log_subscription(&state, &payload).await {
+    let resolved = match resolve_guest_log_subscription(&state, &request_context, &payload).await {
         Ok(resolved) => resolved,
         Err(err) => {
             let response = encode_error_response(
                 envelope.method,
                 envelope.request_id,
-                400,
+                classify_guest_log_resolution_error(&err),
                 err.to_string(),
                 false,
             )?;
@@ -123,17 +124,22 @@ pub(super) async fn handle_guest_log_subscription_stream(
 
 pub(super) async fn resolve_guest_log_subscription(
     state: &Rc<DaemonState>,
+    request_context: &AuthenticatedRequestContext,
     payload: &SubscribeGuestLogsRequest,
 ) -> Result<ResolvedGuestLogSubscription> {
-    resolve_guest_log_subscription_with(&state.node_id, payload, |query| {
-        state.control_plane.query_value(query, true)
-    })
+    resolve_guest_log_subscription_with(
+        &state.node_id,
+        payload,
+        request_context.discovery_scope_for(Method::SubscribeGuestLogs),
+        |query| state.control_plane.query_value(query, true),
+    )
     .await
 }
 
 pub(super) async fn resolve_guest_log_subscription_with<F, Fut>(
     local_node_id: &str,
     payload: &SubscribeGuestLogsRequest,
+    discovery_scope: DiscoveryCapabilityScope,
     query_value: F,
 ) -> Result<ResolvedGuestLogSubscription>
 where
@@ -145,7 +151,7 @@ where
             request: DiscoveryRequest {
                 operation: DiscoveryOperation::Discover,
                 target: DiscoveryTarget::RunningProcess(payload.target.clone()),
-                scope: DiscoveryCapabilityScope::allow_all(),
+                scope: discovery_scope.clone(),
             },
         })
         .await?,
@@ -198,7 +204,7 @@ where
                 request: DiscoveryRequest {
                     operation: DiscoveryOperation::Bind,
                     target: DiscoveryTarget::Endpoint(endpoint),
-                    scope: DiscoveryCapabilityScope::allow_all(),
+                    scope: discovery_scope.clone(),
                 },
             })
             .await?,
@@ -226,6 +232,37 @@ where
         local_node,
         streams,
     })
+}
+
+pub(super) fn classify_guest_log_resolution_error(err: &anyhow::Error) -> u16 {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<selium_control_plane_api::ApiError>()
+            .is_some_and(|api_err| {
+                matches!(
+                    api_err,
+                    selium_control_plane_api::ApiError::Unauthorised { .. }
+                )
+            })
+            || cause
+                .downcast_ref::<selium_control_plane_runtime::RuntimeError>()
+                .is_some_and(|runtime_err| {
+                    matches!(
+                        runtime_err,
+                        selium_control_plane_runtime::RuntimeError::Api(
+                            selium_control_plane_api::ApiError::Unauthorised { .. }
+                        )
+                    )
+                })
+            || cause
+                .to_string()
+                .starts_with("control-plane guest reported 403:")
+            || cause.to_string().contains("unauthorised to ")
+    }) {
+        403
+    } else {
+        400
+    }
 }
 
 pub(super) fn decode_query_bytes<T>(value: DataValue, subject: &str) -> Result<T>

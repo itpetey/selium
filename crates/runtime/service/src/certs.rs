@@ -6,8 +6,11 @@ use std::{
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
+use selium_abi::{PrincipalKind, PrincipalRef};
+
+use crate::auth::principal_uri;
 
 /// Generated certificate material.
 struct Generated {
@@ -21,12 +24,17 @@ struct CaMaterial {
     params: CertificateParams,
 }
 
-/// Create a new CA plus server/client certificates and write them to disk.
+/// Create a new CA plus server, client, and peer certificates and write them to disk.
 pub fn generate_certificates(
     output_dir: &Path,
     ca_common_name: &str,
     server_name: &str,
     client_name: &str,
+    client_principal_kind: &str,
+    client_principal_id: &str,
+    peer_name: &str,
+    peer_principal_kind: &str,
+    peer_principal_id: &str,
 ) -> Result<()> {
     fs::create_dir_all(output_dir).context("create certificate output directory")?;
 
@@ -36,8 +44,33 @@ pub fn generate_certificates(
     let server = generate_leaf(server_name, LeafUsage::Server, &ca)?;
     write_pair(output_dir, "server", &server.cert_pem, &server.key_pem)?;
 
-    let client = generate_leaf(client_name, LeafUsage::Client, &ca)?;
+    let client = generate_leaf(
+        client_name,
+        LeafUsage::Client {
+            principal: PrincipalRef::new(
+                client_principal_kind
+                    .parse::<PrincipalKind>()
+                    .map_err(|err| anyhow::anyhow!("parse client principal kind: {err}"))?,
+                client_principal_id,
+            ),
+        },
+        &ca,
+    )?;
     write_pair(output_dir, "client", &client.cert_pem, &client.key_pem)?;
+
+    let peer = generate_leaf(
+        peer_name,
+        LeafUsage::Client {
+            principal: PrincipalRef::new(
+                peer_principal_kind
+                    .parse::<PrincipalKind>()
+                    .map_err(|err| anyhow::anyhow!("parse peer principal kind: {err}"))?,
+                peer_principal_id,
+            ),
+        },
+        &ca,
+    )?;
+    write_pair(output_dir, "peer", &peer.cert_pem, &peer.key_pem)?;
 
     println!("Wrote certificates to {}", output_dir.display());
 
@@ -78,7 +111,7 @@ fn generate_ca(common_name: &str) -> Result<CaMaterial> {
 
 enum LeafUsage {
     Server,
-    Client,
+    Client { principal: PrincipalRef },
 }
 
 fn generate_leaf(name: &str, usage: LeafUsage, ca: &CaMaterial) -> Result<Generated> {
@@ -92,8 +125,13 @@ fn generate_leaf(name: &str, usage: LeafUsage, ca: &CaMaterial) -> Result<Genera
     ];
     params.extended_key_usages = match usage {
         LeafUsage::Server => vec![ExtendedKeyUsagePurpose::ServerAuth],
-        LeafUsage::Client => vec![ExtendedKeyUsagePurpose::ClientAuth],
+        LeafUsage::Client { .. } => vec![ExtendedKeyUsagePurpose::ClientAuth],
     };
+    if let LeafUsage::Client { principal } = &usage {
+        params
+            .subject_alt_names
+            .push(SanType::URI(principal_uri(principal).try_into()?));
+    }
 
     let key = KeyPair::generate().context("generate leaf key")?;
     let issuer = Issuer::from_params(&ca.params, &ca.key);
@@ -138,8 +176,18 @@ mod tests {
     #[test]
     fn generate_certificates_writes_all_expected_files() {
         let dir = temp_dir();
-        generate_certificates(&dir, "Test CA", "localhost", "client.localhost")
-            .expect("generate certs");
+        generate_certificates(
+            &dir,
+            "Test CA",
+            "localhost",
+            "client.localhost",
+            "machine",
+            "client.localhost",
+            "peer.localhost",
+            "machine",
+            "peer.localhost",
+        )
+        .expect("generate certs");
 
         for name in [
             "ca.crt",
@@ -148,6 +196,8 @@ mod tests {
             "server.key",
             "client.crt",
             "client.key",
+            "peer.crt",
+            "peer.key",
         ] {
             let path = dir.join(name);
             let contents = fs::read_to_string(&path).expect("read cert file");
