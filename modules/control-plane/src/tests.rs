@@ -1,10 +1,12 @@
 use super::*;
 use selium_control_plane_api::{
-    BandwidthProfile, ContractRef, DeploymentSpec, EventEndpointRef, ExternalAccountRef,
-    PipelineEdge, PipelineEndpoint, PipelineSpec, VolumeMount, WorkloadRef, parse_idl,
+    BandwidthProfile, ContractRef, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryOperation,
+    DiscoveryRequest, DiscoveryTarget, EventEndpointRef, ExternalAccountRef,
+    OperationalProcessSelector, PipelineEdge, PipelineEndpoint, PipelineSpec, PlacementMode,
+    VolumeMount, WorkloadRef, parse_idl,
 };
-use selium_control_plane_core::Query;
-use selium_control_plane_protocol::{ManagedEndpointBindingType, ReplayApiRequest};
+use selium_control_plane_core::{AttributedInfrastructureFilter, Query};
+use selium_control_plane_protocol::{ListResponse, ManagedEndpointBindingType, ReplayApiRequest};
 use selium_control_plane_scheduler::ScheduledEndpointBridgeIntent;
 
 const SAMPLE_IDL: &str = r#"
@@ -34,6 +36,7 @@ fn reconcile_generates_start_and_stop_actions() {
             replicas: 2,
             contracts: Vec::new(),
             isolation: IsolationProfile::Standard,
+            placement_mode: PlacementMode::ElasticPack,
             cpu_millis: 0,
             memory_mib: 0,
             ephemeral_storage_mib: 0,
@@ -99,6 +102,7 @@ fn reconcile_generates_endpoint_bridge_actions() {
                 replicas: 1,
                 contracts: vec![contract.clone()],
                 isolation: IsolationProfile::Standard,
+                placement_mode: PlacementMode::ElasticPack,
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
@@ -174,6 +178,7 @@ fn reconcile_orders_starts_before_endpoint_bridges() {
                 replicas: 1,
                 contracts: vec![contract.clone()],
                 isolation: IsolationProfile::Standard,
+                placement_mode: PlacementMode::ElasticPack,
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
@@ -355,6 +360,7 @@ fn replay_record_value_includes_structured_operator_audit_fields() {
             replicas: 1,
             contracts: Vec::new(),
             isolation: IsolationProfile::Standard,
+            placement_mode: PlacementMode::ElasticPack,
             cpu_millis: 0,
             memory_mib: 0,
             ephemeral_storage_mib: 0,
@@ -429,6 +435,7 @@ fn replay_record_value_includes_declared_resource_fields() {
                 replicas: 1,
                 contracts: Vec::new(),
                 isolation: IsolationProfile::Standard,
+                placement_mode: PlacementMode::ElasticPack,
                 cpu_millis: 600,
                 memory_mib: 512,
                 ephemeral_storage_mib: 128,
@@ -576,6 +583,14 @@ fn audit_headers_classify_node_upserts_as_system() {
                 capacity_slots: 64,
                 allocatable_cpu_millis: Some(2_000),
                 allocatable_memory_mib: Some(4_096),
+                reserve_cpu_utilisation_ppm: 800_000,
+                reserve_memory_utilisation_ppm: 800_000,
+                reserve_slots_utilisation_ppm: 800_000,
+                observed_running_instances: None,
+                observed_active_bridges: None,
+                observed_memory_mib: None,
+                observed_workloads: BTreeMap::new(),
+                observed_workload_memory_mib: BTreeMap::new(),
                 supported_isolation: vec![IsolationProfile::Standard],
                 daemon_addr: "127.0.0.1:7100".to_string(),
                 daemon_server_name: "localhost".to_string(),
@@ -590,6 +605,167 @@ fn audit_headers_classify_node_upserts_as_system() {
         Some(&"upsert_node".to_string())
     );
     assert_eq!(headers.get("node"), Some(&"node-a".to_string()));
+}
+
+#[test]
+fn merge_observed_node_load_preserves_previous_values_when_legacy_fields_are_missing() {
+    let previous = ObservedNodeLoad {
+        running_instances: 2,
+        active_bridges: 1,
+        memory_mib: 768,
+        observed_workloads: BTreeMap::from([("tenant-a/default/echo".to_string(), 2)]),
+        observed_workload_memory_mib: BTreeMap::from([("tenant-a/default/echo".to_string(), 768)]),
+    };
+
+    let merged = merge_observed_node_load(
+        previous,
+        ListResponse {
+            instances: BTreeMap::from([
+                ("tenant-a/default/echo/0".to_string(), 1usize),
+                ("tenant-a/default/echo/1".to_string(), 2usize),
+            ]),
+            active_bridges: vec!["bridge-1".to_string()],
+            observed_memory_bytes: None,
+            observed_workloads: BTreeMap::new(),
+            observed_workload_memory_bytes: BTreeMap::new(),
+        },
+    );
+
+    assert_eq!(merged.running_instances, 2);
+    assert_eq!(merged.active_bridges, 1);
+    assert_eq!(merged.memory_mib, 768);
+    assert_eq!(
+        merged.observed_workloads,
+        BTreeMap::from([("tenant-a/default/echo".to_string(), 2)])
+    );
+    assert_eq!(
+        merged.observed_workload_memory_mib,
+        BTreeMap::from([("tenant-a/default/echo".to_string(), 768)])
+    );
+}
+
+#[test]
+fn clear_stale_observed_node_load_keeps_recent_usage_and_drops_old_usage() {
+    let mut snapshot = ControlPlaneState::default();
+    snapshot
+        .upsert_node(NodeSpec {
+            name: "fresh-node".to_string(),
+            capacity_slots: 64,
+            allocatable_cpu_millis: Some(2_000),
+            allocatable_memory_mib: Some(4_096),
+            reserve_cpu_utilisation_ppm: 800_000,
+            reserve_memory_utilisation_ppm: 800_000,
+            reserve_slots_utilisation_ppm: 800_000,
+            observed_running_instances: Some(2),
+            observed_active_bridges: Some(1),
+            observed_memory_mib: Some(768),
+            observed_workloads: BTreeMap::from([("tenant-a/default/echo".to_string(), 2)]),
+            observed_workload_memory_mib: BTreeMap::from([(
+                "tenant-a/default/echo".to_string(),
+                768,
+            )]),
+            supported_isolation: vec![IsolationProfile::Standard],
+            daemon_addr: "127.0.0.1:7101".to_string(),
+            daemon_server_name: "fresh-node".to_string(),
+            last_heartbeat_ms: 900,
+        })
+        .expect("fresh node");
+    snapshot
+        .upsert_node(NodeSpec {
+            name: "stale-node".to_string(),
+            capacity_slots: 64,
+            allocatable_cpu_millis: Some(2_000),
+            allocatable_memory_mib: Some(4_096),
+            reserve_cpu_utilisation_ppm: 800_000,
+            reserve_memory_utilisation_ppm: 800_000,
+            reserve_slots_utilisation_ppm: 800_000,
+            observed_running_instances: Some(2),
+            observed_active_bridges: Some(1),
+            observed_memory_mib: Some(768),
+            observed_workloads: BTreeMap::from([("tenant-a/default/echo".to_string(), 2)]),
+            observed_workload_memory_mib: BTreeMap::from([(
+                "tenant-a/default/echo".to_string(),
+                768,
+            )]),
+            supported_isolation: vec![IsolationProfile::Standard],
+            daemon_addr: "127.0.0.1:7102".to_string(),
+            daemon_server_name: "stale-node".to_string(),
+            last_heartbeat_ms: 100,
+        })
+        .expect("stale node");
+
+    clear_stale_observed_node_load(&mut snapshot, 1_000, 300);
+
+    let fresh = snapshot.nodes.get("fresh-node").expect("fresh node");
+    assert_eq!(fresh.observed_running_instances, Some(2));
+    assert_eq!(fresh.observed_memory_mib, Some(768));
+    assert_eq!(
+        fresh.observed_workload_memory_mib,
+        BTreeMap::from([("tenant-a/default/echo".to_string(), 768)])
+    );
+
+    let stale = snapshot.nodes.get("stale-node").expect("stale node");
+    assert_eq!(stale.observed_running_instances, None);
+    assert_eq!(stale.observed_active_bridges, None);
+    assert_eq!(stale.observed_memory_mib, None);
+    assert!(stale.observed_workloads.is_empty());
+    assert!(stale.observed_workload_memory_mib.is_empty());
+}
+
+#[test]
+fn workload_bytes_to_mib_keeps_sum_within_total_mib() {
+    let observed = workload_bytes_to_mib(&BTreeMap::from([
+        ("tenant-a/default/alpha".to_string(), 1u64),
+        ("tenant-a/default/bravo".to_string(), 1u64),
+    ]));
+
+    assert_eq!(observed.values().copied().sum::<u32>(), 1);
+    assert_eq!(observed.len(), 2);
+}
+
+#[test]
+fn scheduling_query_detection_matches_schedule_sensitive_queries() {
+    assert!(query_uses_observed_load_for_scheduling(
+        &Query::ControlPlaneSummary
+    ));
+    assert!(query_uses_observed_load_for_scheduling(
+        &Query::AttributedInfrastructureInventory {
+            filter: AttributedInfrastructureFilter::default(),
+        }
+    ));
+    assert!(query_uses_observed_load_for_scheduling(
+        &Query::ResolveDiscovery {
+            request: DiscoveryRequest {
+                operation: DiscoveryOperation::Discover,
+                target: DiscoveryTarget::RunningProcess(OperationalProcessSelector::ReplicaKey(
+                    "replica-0".to_string()
+                ),),
+                scope: DiscoveryCapabilityScope::allow_all(),
+            },
+        }
+    ));
+    assert!(!query_uses_observed_load_for_scheduling(
+        &Query::ResolveDiscovery {
+            request: DiscoveryRequest {
+                operation: DiscoveryOperation::Discover,
+                target: DiscoveryTarget::Workload(WorkloadRef {
+                    tenant: "tenant-a".to_string(),
+                    namespace: "default".to_string(),
+                    name: "echo".to_string(),
+                }),
+                scope: DiscoveryCapabilityScope::allow_all(),
+            },
+        }
+    ));
+    assert!(!query_uses_observed_load_for_scheduling(
+        &Query::ControlPlaneState
+    ));
+    assert!(!query_uses_observed_load_for_scheduling(
+        &Query::NodesLive {
+            now_ms: 1,
+            max_staleness_ms: 1,
+        }
+    ));
 }
 
 #[test]
@@ -680,6 +856,7 @@ fn inventory_snapshot_marker_hands_off_to_replay_since_sequence() {
                     replicas: 1,
                     contracts: Vec::new(),
                     isolation: IsolationProfile::Standard,
+                    placement_mode: PlacementMode::ElasticPack,
                     cpu_millis: 250,
                     memory_mib: 128,
                     ephemeral_storage_mib: 0,

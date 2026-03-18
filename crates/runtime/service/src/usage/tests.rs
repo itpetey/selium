@@ -219,6 +219,71 @@ async fn usage_headers_include_instance_and_external_account_metadata() {
     );
 }
 
+#[tokio::test]
+async fn observed_load_tracks_only_active_processes() {
+    let collector = RuntimeUsageCollector::in_memory(Duration::from_secs(60));
+    let first = collector
+        .register_process(
+            "workload-a",
+            "process-a",
+            attribution("instance-a", "module-a", None),
+        )
+        .await
+        .expect("register first process");
+    first.set_memory_high_watermark_bytes(4 * 1024 * 1024);
+    let second = collector
+        .register_process(
+            "workload-b",
+            "process-b",
+            attribution("instance-b", "module-b", None),
+        )
+        .await
+        .expect("register second process");
+    second.set_memory_high_watermark_bytes(6 * 1024 * 1024);
+
+    let observed = collector.observed_load().await;
+    assert_eq!(observed.running_processes, 2);
+    assert_eq!(observed.memory_bytes, 10 * 1024 * 1024);
+
+    first.finish().await.expect("finish first process");
+
+    let visible = collector
+        .observed_load_for_processes(["process-a", "process-b"])
+        .await;
+    assert_eq!(visible.running_processes, 1);
+    assert_eq!(visible.memory_bytes, 6 * 1024 * 1024);
+
+    second.finish().await.expect("finish second process");
+    assert_eq!(
+        collector.observed_load().await,
+        ObservedRuntimeUsageLoad::default()
+    );
+}
+
+#[tokio::test]
+async fn observed_load_reports_current_memory_not_peak_memory() {
+    let collector = RuntimeUsageCollector::in_memory(Duration::from_secs(60));
+    let handle = collector
+        .register_process(
+            "workload-a",
+            "process-a",
+            attribution("instance-a", "module-a", None),
+        )
+        .await
+        .expect("register process");
+
+    handle.set_memory_high_watermark_bytes(8 * 1024 * 1024);
+    handle.set_memory_high_watermark_bytes(3 * 1024 * 1024);
+
+    let observed = collector.observed_load().await;
+    assert_eq!(observed.memory_bytes, 3 * 1024 * 1024);
+
+    sleep(Duration::from_millis(2)).await;
+    handle.finish().await.expect("finish process");
+    let samples = collector.read_samples().await;
+    assert_eq!(samples[0].memory_high_watermark_bytes, 8 * 1024 * 1024);
+}
+
 fn attribution(
     instance_id: &str,
     module_id: &str,

@@ -39,7 +39,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
     let agent_state_a = agent_state_a.to_string_lossy().into_owned();
     let agent_state_b = agent_state_b.to_string_lossy().into_owned();
 
-    let publish_out = harness.run_cli(
+    let publish_out = harness.run_cli_as_client(
         &daemon_a,
         &[
             "idl",
@@ -53,7 +53,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
         "unexpected publish output: {publish_out}"
     );
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -69,7 +69,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
             "analytics.topology/ingest.frames@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -87,7 +87,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
             "analytics.topology/process.enriched@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -103,7 +103,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
             "analytics.topology/process.enriched@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "connect",
@@ -123,7 +123,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
             "analytics.topology/ingest.frames@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "connect",
@@ -183,7 +183,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
         "leader observe output should reflect deployed topology:\n{leader_observe}"
     );
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_b,
         &[
             "agent",
@@ -207,7 +207,7 @@ async fn discovery_to_usage_cli_flow_stays_machine_consumable() -> Result<()> {
         "expected processor and sink replicas on node-b\nlist-b:\n{list_b}"
     );
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "agent",

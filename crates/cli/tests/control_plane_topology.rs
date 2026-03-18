@@ -37,7 +37,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
     let agent_state_a = agent_state_a.to_string_lossy().into_owned();
     let agent_state_b = agent_state_b.to_string_lossy().into_owned();
 
-    let publish_out = harness.run_cli(
+    let publish_out = harness.run_cli_as_client(
         &daemon_a,
         &[
             "idl",
@@ -51,7 +51,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
         "unexpected publish output: {publish_out}"
     );
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -67,7 +67,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             "analytics.topology/ingest.frames@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -85,7 +85,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             "analytics.topology/process.enriched@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "deploy",
@@ -102,7 +102,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
         ],
     )?;
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "connect",
@@ -122,7 +122,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
             "analytics.topology/ingest.frames@v1",
         ],
     )?;
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "connect",
@@ -169,7 +169,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
         })
         .await?;
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_b,
         &[
             "agent",
@@ -193,7 +193,7 @@ async fn control_plane_topology_delivers_remote_events_across_nodes() -> Result<
         "expected processor and sink replicas on node-b\nlist-b:\n{list_b}"
     );
 
-    harness.run_cli(
+    harness.run_cli_as_client(
         &daemon_a,
         &[
             "agent",

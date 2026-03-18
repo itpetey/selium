@@ -265,6 +265,25 @@ impl BandwidthProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum PlacementMode {
+    #[default]
+    ElasticPack,
+    Balanced,
+    Spread,
+}
+
+impl PlacementMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ElasticPack => "elastic_pack",
+            Self::Balanced => "balanced",
+            Self::Spread => "spread",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct VolumeMount {
@@ -305,6 +324,7 @@ pub struct DeploymentSpec {
     pub replicas: u32,
     pub contracts: Vec<ContractRef>,
     pub isolation: IsolationProfile,
+    pub placement_mode: PlacementMode,
     pub cpu_millis: u32,
     pub memory_mib: u32,
     pub ephemeral_storage_mib: u32,
@@ -352,6 +372,14 @@ pub struct NodeSpec {
     pub capacity_slots: u32,
     pub allocatable_cpu_millis: Option<u32>,
     pub allocatable_memory_mib: Option<u32>,
+    pub reserve_cpu_utilisation_ppm: u32,
+    pub reserve_memory_utilisation_ppm: u32,
+    pub reserve_slots_utilisation_ppm: u32,
+    pub observed_running_instances: Option<u32>,
+    pub observed_active_bridges: Option<u32>,
+    pub observed_memory_mib: Option<u32>,
+    pub observed_workloads: BTreeMap<String, u32>,
+    pub observed_workload_memory_mib: BTreeMap<String, u32>,
     pub supported_isolation: Vec<IsolationProfile>,
     pub daemon_addr: String,
     pub daemon_server_name: String,

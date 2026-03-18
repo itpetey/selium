@@ -39,6 +39,8 @@ const CONTROL_PLANE_MANIFEST: &str = "modules/control-plane/Cargo.toml";
 const CONTROL_PLANE_ARTIFACT: &str = "selium_module_control_plane.wasm";
 const STAGED_CONTROL_PLANE_ARTIFACT: &str = "control-plane.wasm";
 const DEFAULT_SERVER_NAME: &str = "localhost";
+const DEFAULT_CLIENT_ACCESS_GRANT: &str = "principal=machine:client.localhost;methods=control_read,control_read_global,control_write,node_manage,bridge_manage;workloads=*;endpoints=*;allow-operational-processes=true";
+const DEFAULT_RUNTIME_PEER_ACCESS_GRANT: &str = "principal=runtime-peer:peer.localhost;methods=control_read,control_read_global,control_write,node_manage,bridge_manage,peer;workloads=*;endpoints=*;allow-operational-processes=true";
 const CLI_CONNECT_TIMEOUT_RETRIES: usize = 5;
 const CLI_CONNECT_TIMEOUT_BACKOFF: Duration = Duration::from_millis(400);
 const DIRECT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -341,6 +343,10 @@ impl ClusterHarness {
         }
 
         unreachable!("retry loop should always return or bail")
+    }
+
+    pub fn run_cli_as_client(&self, daemon_addr: &str, args: &[&str]) -> Result<String> {
+        self.run_cli(daemon_addr, args)
     }
 
     pub async fn wait_for_cli_contains(
@@ -756,9 +762,13 @@ impl ClusterHarness {
             .arg("--quic-key")
             .arg(self.cert_dir.join("server.key"))
             .arg("--quic-peer-cert")
-            .arg(self.cert_dir.join("client.crt"))
+            .arg(self.cert_dir.join("peer.crt"))
             .arg("--quic-peer-key")
-            .arg(self.cert_dir.join("client.key"))
+            .arg(self.cert_dir.join("peer.key"))
+            .arg("--access-grant")
+            .arg(DEFAULT_CLIENT_ACCESS_GRANT)
+            .arg("--access-grant")
+            .arg(DEFAULT_RUNTIME_PEER_ACCESS_GRANT)
             .arg("--cp-heartbeat-interval-ms")
             .arg("500")
             .arg("--cp-capacity-slots")

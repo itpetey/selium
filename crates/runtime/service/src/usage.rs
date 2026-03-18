@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::Path,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -36,6 +36,7 @@ pub struct RuntimeUsageCollector {
 struct CollectorInner {
     sample_period: Duration,
     store: Arc<Mutex<DurableLogStore>>,
+    active_processes: Mutex<BTreeMap<String, Weak<ProcessUsageHandle>>>,
 }
 
 pub struct ProcessUsageHandle {
@@ -47,6 +48,7 @@ pub struct ProcessUsageHandle {
     started_at_ms: u64,
     stop_signal: Notify,
     finished: AtomicBool,
+    current_memory_bytes: AtomicU64,
     memory_high_watermark_bytes: AtomicU64,
     ingress_bytes: AtomicU64,
     egress_bytes: AtomicU64,
@@ -61,6 +63,12 @@ pub(crate) struct ProcessUsageAttribution {
     pub instance_id: Option<String>,
     pub external_account_ref: Option<String>,
     pub module_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObservedRuntimeUsageLoad {
+    pub running_processes: u32,
+    pub memory_bytes: u64,
 }
 
 struct EmissionState {
@@ -97,6 +105,7 @@ impl RuntimeUsageCollector {
             inner: Arc::new(CollectorInner {
                 sample_period,
                 store: Arc::new(Mutex::new(store)),
+                active_processes: Mutex::new(BTreeMap::new()),
             }),
         }))
     }
@@ -109,6 +118,7 @@ impl RuntimeUsageCollector {
                 store: Arc::new(Mutex::new(DurableLogStore::in_memory(
                     RetentionPolicy::default(),
                 ))),
+                active_processes: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -137,6 +147,7 @@ impl RuntimeUsageCollector {
             started_at_ms: now_ms(),
             stop_signal: Notify::new(),
             finished: AtomicBool::new(false),
+            current_memory_bytes: AtomicU64::new(0),
             memory_high_watermark_bytes: AtomicU64::new(0),
             ingress_bytes: AtomicU64::new(0),
             egress_bytes: AtomicU64::new(0),
@@ -151,8 +162,93 @@ impl RuntimeUsageCollector {
             }),
             interval_task: Mutex::new(None),
         });
+        self.inner
+            .active_processes
+            .lock()
+            .await
+            .insert(handle.process_id.clone(), Arc::downgrade(&handle));
         handle.spawn_interval_task().await;
         Ok(handle)
+    }
+
+    #[cfg(test)]
+    pub async fn observed_load(&self) -> ObservedRuntimeUsageLoad {
+        let process_ids = {
+            let active = self.inner.active_processes.lock().await;
+            active.keys().cloned().collect::<Vec<_>>()
+        };
+        self.observed_load_for_processes(process_ids).await
+    }
+
+    pub async fn observed_load_for_processes<I, S>(
+        &self,
+        process_ids: I,
+    ) -> ObservedRuntimeUsageLoad
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut active = self.inner.active_processes.lock().await;
+        let mut running_processes = 0u32;
+        let mut memory_bytes = 0u64;
+
+        active.retain(|_, weak| {
+            weak.upgrade()
+                .is_some_and(|handle| !handle.finished.load(Ordering::Acquire))
+        });
+
+        for process_id in process_ids {
+            let Some(handle) = active
+                .get(process_id.as_ref())
+                .and_then(|weak| weak.upgrade())
+            else {
+                continue;
+            };
+            if handle.finished.load(Ordering::Acquire) {
+                continue;
+            }
+            running_processes = running_processes.saturating_add(1);
+            memory_bytes =
+                memory_bytes.saturating_add(handle.current_memory_bytes.load(Ordering::Relaxed));
+        }
+
+        ObservedRuntimeUsageLoad {
+            running_processes,
+            memory_bytes,
+        }
+    }
+
+    pub async fn observed_memory_bytes_by_processes<I, S>(
+        &self,
+        process_ids: I,
+    ) -> BTreeMap<String, u64>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut active = self.inner.active_processes.lock().await;
+        let mut memory_bytes = BTreeMap::new();
+
+        active.retain(|_, weak| {
+            weak.upgrade()
+                .is_some_and(|handle| !handle.finished.load(Ordering::Acquire))
+        });
+
+        for process_id in process_ids {
+            let process_id = process_id.as_ref();
+            let Some(handle) = active.get(process_id).and_then(|weak| weak.upgrade()) else {
+                continue;
+            };
+            if handle.finished.load(Ordering::Acquire) {
+                continue;
+            }
+            memory_bytes.insert(
+                process_id.to_string(),
+                handle.current_memory_bytes.load(Ordering::Relaxed),
+            );
+        }
+
+        memory_bytes
     }
 
     pub async fn replay_usage(&self, query: &RuntimeUsageQuery) -> Result<RuntimeUsageQueryResult> {
@@ -324,10 +420,15 @@ impl RuntimeUsageCollector {
         emission.last_storage_write_bytes = storage_write_bytes;
         Ok(true)
     }
+
+    async fn deregister_process(&self, process_id: &str) {
+        self.inner.active_processes.lock().await.remove(process_id);
+    }
 }
 
 impl ProcessUsageHandle {
     pub fn set_memory_high_watermark_bytes(&self, bytes: u64) {
+        self.current_memory_bytes.store(bytes, Ordering::Relaxed);
         let _ = self.memory_high_watermark_bytes.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
@@ -344,6 +445,7 @@ impl ProcessUsageHandle {
             task.abort();
             let _ = task.await;
         }
+        self.collector.deregister_process(&self.process_id).await;
         self.collector
             .emit_sample(self, RuntimeUsageSampleTrigger::Termination)
             .await?;

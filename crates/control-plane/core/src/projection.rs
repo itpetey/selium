@@ -6,6 +6,10 @@ use selium_control_plane_api::{DeploymentSpec, ExternalAccountRef};
 /// Serialize deployment resource requirements into a stable `DataValue` projection.
 pub fn serialize_deployment_resources(spec: &DeploymentSpec) -> DataValue {
     DataValue::Map(BTreeMap::from([
+        (
+            "placement_mode".to_string(),
+            DataValue::from(spec.placement_mode.as_str()),
+        ),
         ("cpu_millis".to_string(), DataValue::from(spec.cpu_millis)),
         ("memory_mib".to_string(), DataValue::from(spec.memory_mib)),
         (

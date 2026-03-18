@@ -29,9 +29,9 @@ use crate::values::{
 
 #[cfg(test)]
 use selium_control_plane_api::{
-    DeploymentSpec, DiscoveryCapabilityScope, DiscoveryOperation, DiscoveryRequest,
-    DiscoveryResolution, DiscoveryState, DiscoveryTarget, NodeSpec, OperationalProcessSelector,
-    ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
+    ContractRegistry, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryOperation,
+    DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, NodeSpec,
+    OperationalProcessSelector, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
 };
 #[cfg(test)]
 use selium_control_plane_core::AttributedInfrastructureFilter;
@@ -56,6 +56,8 @@ pub enum RuntimeError {
     Scheduler(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("invalid snapshot payload: {0}")]
+    InvalidSnapshotPayload(String),
     #[error("invalid log payload: {0}")]
     InvalidLogPayload(String),
 }
@@ -107,8 +109,16 @@ impl ControlPlaneEngine {
         encode_rkyv(envelope).map_err(|err| RuntimeError::Serialization(err.to_string()))
     }
 
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<EngineSnapshot, RuntimeError> {
+        decode_rkyv(bytes).map_err(|err| RuntimeError::InvalidSnapshotPayload(err.to_string()))
+    }
+
     pub fn decode_mutation(bytes: &[u8]) -> Result<MutationEnvelope, RuntimeError> {
         decode_rkyv(bytes).map_err(|err| RuntimeError::InvalidLogPayload(err.to_string()))
+    }
+
+    pub fn decode_replayed_mutation(bytes: &[u8]) -> Result<MutationEnvelope, RuntimeError> {
+        Self::decode_mutation(bytes)
     }
 
     pub fn apply_committed_entry(
@@ -116,6 +126,18 @@ impl ControlPlaneEngine {
         entry: &LogEntry,
     ) -> Result<MutationResponse, RuntimeError> {
         let envelope = Self::decode_mutation(&entry.payload)?;
+        let result = self.apply_mutation(entry.index, envelope.mutation)?;
+        Ok(MutationResponse {
+            index: entry.index,
+            result,
+        })
+    }
+
+    pub fn apply_replayed_entry(
+        &mut self,
+        entry: &LogEntry,
+    ) -> Result<MutationResponse, RuntimeError> {
+        let envelope = Self::decode_replayed_mutation(&entry.payload)?;
         let result = self.apply_mutation(entry.index, envelope.mutation)?;
         Ok(MutationResponse {
             index: entry.index,
@@ -307,6 +329,18 @@ impl ControlPlaneEngine {
                                 serialize_optional_u32(node.allocatable_memory_mib),
                             ),
                             (
+                                "reserve_cpu_utilisation_ppm".to_string(),
+                                DataValue::from(node.reserve_cpu_utilisation_ppm),
+                            ),
+                            (
+                                "reserve_memory_utilisation_ppm".to_string(),
+                                DataValue::from(node.reserve_memory_utilisation_ppm),
+                            ),
+                            (
+                                "reserve_slots_utilisation_ppm".to_string(),
+                                DataValue::from(node.reserve_slots_utilisation_ppm),
+                            ),
+                            (
                                 "supported_isolation".to_string(),
                                 serialize_isolation_profiles(&node.supported_isolation),
                             ),
@@ -413,6 +447,7 @@ mod tests {
                     replicas,
                     contracts: vec![event_contract()],
                     isolation: IsolationProfile::Standard,
+                    placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                     cpu_millis: 0,
                     memory_mib: 0,
                     ephemeral_storage_mib: 0,
@@ -452,6 +487,7 @@ mod tests {
                 replicas: 2,
                 contracts: vec![event_contract(), service_contract(), stream_contract()],
                 isolation: IsolationProfile::Standard,
+                placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
@@ -494,6 +530,7 @@ mod tests {
                     shared_name_contract(ContractKind::Stream),
                 ],
                 isolation: IsolationProfile::Standard,
+                placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
@@ -563,6 +600,7 @@ mod tests {
                         replicas: 1,
                         contracts: vec![],
                         isolation: selium_control_plane_api::IsolationProfile::Standard,
+                        placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                         cpu_millis: 500,
                         memory_mib: 256,
                         ephemeral_storage_mib: 128,
@@ -589,6 +627,20 @@ mod tests {
                         capacity_slots: 0,
                         allocatable_cpu_millis: Some(2_000),
                         allocatable_memory_mib: Some(4_096),
+                        reserve_cpu_utilisation_ppm: 800_000,
+                        reserve_memory_utilisation_ppm: 800_000,
+                        reserve_slots_utilisation_ppm: 800_000,
+                        observed_running_instances: Some(1),
+                        observed_active_bridges: Some(0),
+                        observed_memory_mib: Some(512),
+                        observed_workloads: BTreeMap::from([(
+                            "tenant-a/default/echo".to_string(),
+                            1u32,
+                        )]),
+                        observed_workload_memory_mib: BTreeMap::from([(
+                            "tenant-a/default/echo".to_string(),
+                            512u32,
+                        )]),
                         supported_isolation: vec![IsolationProfile::Standard],
                         daemon_addr: "127.0.0.1:7100".to_string(),
                         daemon_server_name: "localhost".to_string(),
@@ -646,6 +698,14 @@ mod tests {
                         capacity_slots: 8,
                         allocatable_cpu_millis: Some(4_000),
                         allocatable_memory_mib: Some(8_192),
+                        reserve_cpu_utilisation_ppm: 800_000,
+                        reserve_memory_utilisation_ppm: 800_000,
+                        reserve_slots_utilisation_ppm: 800_000,
+                        observed_running_instances: Some(2),
+                        observed_active_bridges: Some(1),
+                        observed_memory_mib: Some(1_024),
+                        observed_workloads: BTreeMap::new(),
+                        observed_workload_memory_mib: BTreeMap::new(),
                         supported_isolation: vec![
                             IsolationProfile::Standard,
                             IsolationProfile::Hardened,
@@ -752,6 +812,7 @@ mod tests {
                             replicas: 1,
                             contracts: vec![event_contract()],
                             isolation: IsolationProfile::Standard,
+                            placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                             cpu_millis: 250,
                             memory_mib: 128,
                             ephemeral_storage_mib: 0,
@@ -777,6 +838,7 @@ mod tests {
                         replicas: 1,
                         contracts: vec![event_contract()],
                         isolation: IsolationProfile::Standard,
+                        placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                         cpu_millis: 100,
                         memory_mib: 64,
                         ephemeral_storage_mib: 0,
@@ -949,6 +1011,7 @@ mod tests {
                         replicas: 1,
                         contracts: vec![event_contract()],
                         isolation: IsolationProfile::Standard,
+                        placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
                         cpu_millis: 750,
                         memory_mib: 512,
                         ephemeral_storage_mib: 64,
@@ -1041,6 +1104,162 @@ mod tests {
         let bytes = ControlPlaneEngine::encode_mutation(&envelope).expect("encode");
         let decoded = ControlPlaneEngine::decode_mutation(&bytes).expect("decode");
         assert_eq!(decoded.idempotency_key, "id-1");
+    }
+
+    #[test]
+    fn decodes_current_mutation_preserves_live_observed_usage() {
+        let bytes = ControlPlaneEngine::encode_mutation(&MutationEnvelope {
+            idempotency_key: "id-3".to_string(),
+            mutation: Mutation::UpsertNode {
+                spec: NodeSpec {
+                    name: "node-a".to_string(),
+                    capacity_slots: 8,
+                    allocatable_cpu_millis: Some(4_000),
+                    allocatable_memory_mib: Some(8_192),
+                    reserve_cpu_utilisation_ppm: 800_000,
+                    reserve_memory_utilisation_ppm: 800_000,
+                    reserve_slots_utilisation_ppm: 800_000,
+                    observed_running_instances: Some(3),
+                    observed_active_bridges: Some(2),
+                    observed_memory_mib: Some(2_048),
+                    observed_workloads: BTreeMap::from([("tenant-a/default/echo".to_string(), 3)]),
+                    observed_workload_memory_mib: BTreeMap::from([(
+                        "tenant-a/default/echo".to_string(),
+                        2_048u32,
+                    )]),
+                    supported_isolation: vec![IsolationProfile::Standard],
+                    daemon_addr: "127.0.0.1:7100".to_string(),
+                    daemon_server_name: "localhost".to_string(),
+                    last_heartbeat_ms: 42,
+                },
+            },
+        })
+        .expect("encode current mutation");
+
+        let decoded = ControlPlaneEngine::decode_mutation(&bytes).expect("decode mutation");
+        let Mutation::UpsertNode { spec } = decoded.mutation else {
+            panic!("expected node mutation");
+        };
+
+        assert_eq!(decoded.idempotency_key, "id-3");
+        assert_eq!(spec.observed_running_instances, Some(3));
+        assert_eq!(spec.observed_active_bridges, Some(2));
+        assert_eq!(spec.observed_memory_mib, Some(2_048));
+        assert_eq!(
+            spec.observed_workloads,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 3)])
+        );
+        assert_eq!(
+            spec.observed_workload_memory_mib,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 2_048)])
+        );
+    }
+
+    #[test]
+    fn decodes_current_replayed_mutation_preserves_observed_usage() {
+        let bytes = ControlPlaneEngine::encode_mutation(&MutationEnvelope {
+            idempotency_key: "id-3".to_string(),
+            mutation: Mutation::UpsertNode {
+                spec: NodeSpec {
+                    name: "node-a".to_string(),
+                    capacity_slots: 8,
+                    allocatable_cpu_millis: Some(4_000),
+                    allocatable_memory_mib: Some(8_192),
+                    reserve_cpu_utilisation_ppm: 800_000,
+                    reserve_memory_utilisation_ppm: 800_000,
+                    reserve_slots_utilisation_ppm: 800_000,
+                    observed_running_instances: Some(3),
+                    observed_active_bridges: Some(2),
+                    observed_memory_mib: Some(2_048),
+                    observed_workloads: BTreeMap::from([("tenant-a/default/echo".to_string(), 3)]),
+                    observed_workload_memory_mib: BTreeMap::from([(
+                        "tenant-a/default/echo".to_string(),
+                        2_048u32,
+                    )]),
+                    supported_isolation: vec![IsolationProfile::Standard],
+                    daemon_addr: "127.0.0.1:7100".to_string(),
+                    daemon_server_name: "localhost".to_string(),
+                    last_heartbeat_ms: 42,
+                },
+            },
+        })
+        .expect("encode current mutation");
+
+        let decoded =
+            ControlPlaneEngine::decode_replayed_mutation(&bytes).expect("decode mutation");
+        let Mutation::UpsertNode { spec } = decoded.mutation else {
+            panic!("expected node mutation");
+        };
+
+        assert_eq!(decoded.idempotency_key, "id-3");
+        assert_eq!(spec.observed_running_instances, Some(3));
+        assert_eq!(spec.observed_active_bridges, Some(2));
+        assert_eq!(spec.observed_memory_mib, Some(2_048));
+        assert_eq!(
+            spec.observed_workloads,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 3)])
+        );
+        assert_eq!(
+            spec.observed_workload_memory_mib,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 2_048)])
+        );
+    }
+
+    #[test]
+    fn decodes_current_snapshot_preserves_observed_usage() {
+        let bytes = encode_rkyv(&EngineSnapshot {
+            control_plane: ControlPlaneState {
+                registry: ContractRegistry::default(),
+                deployments: BTreeMap::new(),
+                pipelines: BTreeMap::new(),
+                nodes: BTreeMap::from([(
+                    "node-a".to_string(),
+                    NodeSpec {
+                        name: "node-a".to_string(),
+                        capacity_slots: 8,
+                        allocatable_cpu_millis: Some(4_000),
+                        allocatable_memory_mib: Some(8_192),
+                        reserve_cpu_utilisation_ppm: 800_000,
+                        reserve_memory_utilisation_ppm: 800_000,
+                        reserve_slots_utilisation_ppm: 800_000,
+                        observed_running_instances: Some(3),
+                        observed_active_bridges: Some(2),
+                        observed_memory_mib: Some(2_048),
+                        observed_workloads: BTreeMap::from([(
+                            "tenant-a/default/echo".to_string(),
+                            3,
+                        )]),
+                        observed_workload_memory_mib: BTreeMap::from([(
+                            "tenant-a/default/echo".to_string(),
+                            2_048u32,
+                        )]),
+                        supported_isolation: vec![IsolationProfile::Standard],
+                        daemon_addr: "127.0.0.1:7100".to_string(),
+                        daemon_server_name: "localhost".to_string(),
+                        last_heartbeat_ms: 42,
+                    },
+                )]),
+            },
+            tables: TableStore::default(),
+            last_applied: 9,
+        })
+        .expect("encode current snapshot");
+
+        let snapshot = ControlPlaneEngine::decode_snapshot(&bytes).expect("decode snapshot");
+        let node = snapshot.control_plane.nodes.get("node-a").expect("node-a");
+
+        assert_eq!(snapshot.last_applied, 9);
+        assert_eq!(node.observed_running_instances, Some(3));
+        assert_eq!(node.observed_active_bridges, Some(2));
+        assert_eq!(node.observed_memory_mib, Some(2_048));
+        assert_eq!(
+            node.observed_workloads,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 3)])
+        );
+        assert_eq!(
+            node.observed_workload_memory_mib,
+            BTreeMap::from([("tenant-a/default/echo".to_string(), 2_048)])
+        );
     }
 
     #[test]

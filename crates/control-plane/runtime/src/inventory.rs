@@ -371,6 +371,48 @@ fn serialize_inventory_node(node: &NodeSpec, instances: &[InventoryInstance]) ->
             serialize_optional_u32(node.allocatable_memory_mib),
         ),
         (
+            "reserve_cpu_utilisation_ppm".to_string(),
+            DataValue::from(node.reserve_cpu_utilisation_ppm),
+        ),
+        (
+            "reserve_memory_utilisation_ppm".to_string(),
+            DataValue::from(node.reserve_memory_utilisation_ppm),
+        ),
+        (
+            "reserve_slots_utilisation_ppm".to_string(),
+            DataValue::from(node.reserve_slots_utilisation_ppm),
+        ),
+        (
+            "observed_running_instances".to_string(),
+            serialize_optional_u32(node.observed_running_instances),
+        ),
+        (
+            "observed_active_bridges".to_string(),
+            serialize_optional_u32(node.observed_active_bridges),
+        ),
+        (
+            "observed_memory_mib".to_string(),
+            serialize_optional_u32(node.observed_memory_mib),
+        ),
+        (
+            "observed_workloads".to_string(),
+            DataValue::Map(
+                node.observed_workloads
+                    .iter()
+                    .map(|(workload, count)| (workload.clone(), DataValue::from(*count)))
+                    .collect(),
+            ),
+        ),
+        (
+            "observed_workload_memory_mib".to_string(),
+            DataValue::Map(
+                node.observed_workload_memory_mib
+                    .iter()
+                    .map(|(workload, memory_mib)| (workload.clone(), DataValue::from(*memory_mib)))
+                    .collect(),
+            ),
+        ),
+        (
             "supported_isolation".to_string(),
             serialize_isolation_profiles(&node.supported_isolation),
         ),

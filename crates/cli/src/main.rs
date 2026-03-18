@@ -25,19 +25,19 @@ use selium_control_plane_agent::{
     deployment_module_spec as build_deployment_module_spec, endpoint_bridge_semantics, reconcile,
 };
 use selium_control_plane_api::{
-    ApiError, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec, DiscoverableEndpoint,
-    DiscoverableWorkload, DiscoveryCapabilityScope, DiscoveryOperation, DiscoveryPattern,
-    DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget, EventEndpointRef,
-    OperationalProcessRecord, OperationalProcessSelector, PipelineEdge, PipelineEndpoint,
-    PipelineSpec, PublicEndpointRef, ResolvedEndpoint, ResolvedWorkload, WorkloadRef,
-    build_discovery_state, collect_contracts_for_workload, ensure_pipeline_consistency,
-    generate_rust_bindings, parse_contract_ref, parse_idl,
+    ApiError, BandwidthProfile, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec,
+    DiscoverableEndpoint, DiscoverableWorkload, DiscoveryCapabilityScope, DiscoveryOperation,
+    DiscoveryPattern, DiscoveryRequest, DiscoveryResolution, DiscoveryState, DiscoveryTarget,
+    EventEndpointRef, ExternalAccountRef, OperationalProcessRecord, OperationalProcessSelector,
+    PipelineEdge, PipelineEndpoint, PipelineSpec, PublicEndpointRef, ResolvedEndpoint,
+    ResolvedWorkload, WorkloadRef, build_discovery_state, collect_contracts_for_workload,
+    ensure_pipeline_consistency, generate_rust_bindings, parse_contract_ref, parse_idl,
 };
 use selium_control_plane_core::{AttributedInfrastructureFilter, Mutation, Query};
 use selium_control_plane_protocol::{
-    Empty, ListRequest, ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType,
-    ManagedEndpointRole, Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse,
-    QueryApiRequest, QueryApiResponse, ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest,
+    Empty, ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole,
+    Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest,
+    QueryApiResponse, ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest,
     RuntimeUsageApiResponse, StartRequest, StartResponse, StatusApiResponse, StopRequest,
     StopResponse, SubscribeGuestLogsRequest,
 };
@@ -120,12 +120,15 @@ async fn cmd_deploy(daemon: Arc<DaemonQuicClient>, args: DeployArgs) -> Result<(
                 replicas: args.replicas,
                 contracts,
                 isolation: args.isolation.into(),
-                cpu_millis: 0,
-                memory_mib: 0,
-                ephemeral_storage_mib: 0,
-                bandwidth_profile: selium_control_plane_api::BandwidthProfile::Standard,
+                placement_mode: args.placement_mode.into(),
+                cpu_millis: args.cpu_millis,
+                memory_mib: args.memory_mib,
+                ephemeral_storage_mib: args.ephemeral_storage_mib,
+                bandwidth_profile: BandwidthProfile::from(args.bandwidth_profile),
                 volume_mounts: Vec::new(),
-                external_account_ref: None,
+                external_account_ref: args
+                    .external_account_ref
+                    .map(|key| ExternalAccountRef { key }),
             },
         },
     )
@@ -559,9 +562,7 @@ async fn cmd_list(
     args: ListArgs,
 ) -> Result<()> {
     if let Some(node) = args.node {
-        let list: ListResponse = daemon
-            .request(Method::ListInstances, &ListRequest { node_id: node })
-            .await?;
+        let list = daemon.list_instances(node).await?;
         print_instance_map(&list.instances);
         return Ok(());
     }
@@ -575,17 +576,15 @@ async fn cmd_list(
             &conn_args.client_cert,
             &conn_args.client_key,
         )?;
-        let list: ListResponse = client
-            .request(
-                Method::ListInstances,
-                &ListRequest {
-                    node_id: node.name.clone(),
-                },
-            )
+        let list = client
+            .list_instances(node.name.clone())
             .await
             .unwrap_or(ListResponse {
                 instances: BTreeMap::new(),
                 active_bridges: Vec::new(),
+                observed_memory_bytes: None,
+                observed_workloads: BTreeMap::new(),
+                observed_workload_memory_bytes: BTreeMap::new(),
             });
         println!("node={}", node.name);
         print_instance_map(&list.instances);

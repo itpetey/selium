@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use selium_control_plane_api::{
-    BandwidthProfile, DeploymentSpec, ExternalAccountRef, IsolationProfile, WorkloadRef,
+    BandwidthProfile, DeploymentSpec, ExternalAccountRef, IsolationProfile, PlacementMode,
+    WorkloadRef,
 };
 use selium_control_plane_core::Mutation;
 
@@ -42,6 +43,7 @@ async fn inventory_bootstrap_hands_off_to_replay_from_post_snapshot_cursor() -> 
                     workload: workload.clone(),
                     module: MODULE.to_string(),
                     replicas: 1,
+                    placement_mode: PlacementMode::ElasticPack,
                     contracts: Vec::new(),
                     isolation: IsolationProfile::Standard,
                     cpu_millis: 250,

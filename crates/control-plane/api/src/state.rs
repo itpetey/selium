@@ -17,6 +17,14 @@ impl ControlPlaneState {
                 capacity_slots: 64,
                 allocatable_cpu_millis: None,
                 allocatable_memory_mib: None,
+                reserve_cpu_utilisation_ppm: 800_000,
+                reserve_memory_utilisation_ppm: 800_000,
+                reserve_slots_utilisation_ppm: 800_000,
+                observed_running_instances: None,
+                observed_active_bridges: None,
+                observed_memory_mib: None,
+                observed_workloads: BTreeMap::new(),
+                observed_workload_memory_mib: BTreeMap::new(),
                 supported_isolation: vec![
                     IsolationProfile::Standard,
                     IsolationProfile::Hardened,
@@ -354,7 +362,7 @@ fn deployment_public_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContractRef, EventEndpointRef, PipelineEdge, parse_idl};
+    use crate::{ContractRef, EventEndpointRef, PipelineEdge, PlacementMode, parse_idl};
 
     fn event_contract() -> ContractRef {
         ContractRef {
@@ -449,6 +457,7 @@ mod tests {
                     bandwidth_profile: crate::BandwidthProfile::Standard,
                     volume_mounts: Vec::new(),
                     external_account_ref: None,
+                    placement_mode: PlacementMode::Balanced,
                 })
                 .expect("deployment");
         }
@@ -494,6 +503,7 @@ mod tests {
                 bandwidth_profile: crate::BandwidthProfile::Standard,
                 volume_mounts: Vec::new(),
                 external_account_ref: None,
+                placement_mode: PlacementMode::Balanced,
             })
             .expect("deployment");
 
@@ -546,6 +556,7 @@ mod tests {
                 bandwidth_profile: crate::BandwidthProfile::Standard,
                 volume_mounts: Vec::new(),
                 external_account_ref: None,
+                placement_mode: PlacementMode::Balanced,
             })
             .expect("deployment");
 
@@ -656,6 +667,7 @@ mod tests {
                 bandwidth_profile: crate::BandwidthProfile::Standard,
                 volume_mounts: Vec::new(),
                 external_account_ref: None,
+                placement_mode: PlacementMode::Balanced,
             })
             .expect("deployment");
 
@@ -713,6 +725,7 @@ mod tests {
                 bandwidth_profile: crate::BandwidthProfile::Standard,
                 volume_mounts: Vec::new(),
                 external_account_ref: None,
+                placement_mode: PlacementMode::Balanced,
             })
             .expect("deployment");
 
@@ -765,6 +778,7 @@ mod tests {
                 external_account_ref: Some(ExternalAccountRef {
                     key: "   ".to_string(),
                 }),
+                placement_mode: PlacementMode::Balanced,
             })
             .expect_err("blank external account reference rejected");
 
@@ -802,6 +816,7 @@ mod tests {
                     external_account_ref: Some(ExternalAccountRef {
                         key: account.to_string(),
                     }),
+                    placement_mode: PlacementMode::Balanced,
                 })
                 .expect("deployment");
         }

@@ -62,6 +62,48 @@ pub(super) fn serialize_node_spec(spec: &NodeSpec) -> DataValue {
             serialize_optional_u32(spec.allocatable_memory_mib),
         ),
         (
+            "reserve_cpu_utilisation_ppm".to_string(),
+            DataValue::from(spec.reserve_cpu_utilisation_ppm),
+        ),
+        (
+            "reserve_memory_utilisation_ppm".to_string(),
+            DataValue::from(spec.reserve_memory_utilisation_ppm),
+        ),
+        (
+            "reserve_slots_utilisation_ppm".to_string(),
+            DataValue::from(spec.reserve_slots_utilisation_ppm),
+        ),
+        (
+            "observed_running_instances".to_string(),
+            serialize_optional_u32(spec.observed_running_instances),
+        ),
+        (
+            "observed_active_bridges".to_string(),
+            serialize_optional_u32(spec.observed_active_bridges),
+        ),
+        (
+            "observed_memory_mib".to_string(),
+            serialize_optional_u32(spec.observed_memory_mib),
+        ),
+        (
+            "observed_workloads".to_string(),
+            DataValue::Map(
+                spec.observed_workloads
+                    .iter()
+                    .map(|(workload, count)| (workload.clone(), DataValue::from(*count)))
+                    .collect(),
+            ),
+        ),
+        (
+            "observed_workload_memory_mib".to_string(),
+            DataValue::Map(
+                spec.observed_workload_memory_mib
+                    .iter()
+                    .map(|(workload, memory_mib)| (workload.clone(), DataValue::from(*memory_mib)))
+                    .collect(),
+            ),
+        ),
+        (
             "supported_isolation".to_string(),
             serialize_isolation_profiles(&spec.supported_isolation),
         ),
@@ -118,6 +160,26 @@ pub(super) fn serialize_schedule_plan(plan: &SchedulePlan) -> DataValue {
         (
             "node_memory_mib".to_string(),
             serialize_string_u32_map(&plan.node_memory_mib),
+        ),
+        (
+            "idle_candidate_nodes".to_string(),
+            DataValue::List(
+                plan.idle_candidate_nodes
+                    .iter()
+                    .cloned()
+                    .map(DataValue::from)
+                    .collect(),
+            ),
+        ),
+        (
+            "bursting_nodes".to_string(),
+            DataValue::List(
+                plan.bursting_nodes
+                    .iter()
+                    .cloned()
+                    .map(DataValue::from)
+                    .collect(),
+            ),
         ),
     ]))
 }

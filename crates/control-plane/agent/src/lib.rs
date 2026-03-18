@@ -132,6 +132,12 @@ pub struct ControlPlaneModuleConfig {
     pub allocatable_cpu_millis: Option<u32>,
     /// Optional allocatable memory budget in MiB.
     pub allocatable_memory_mib: Option<u32>,
+    /// Soft CPU fullness boundary in ppm of allocatable capacity.
+    pub reserve_cpu_utilisation_ppm: u32,
+    /// Soft memory fullness boundary in ppm of allocatable capacity.
+    pub reserve_memory_utilisation_ppm: u32,
+    /// Soft slot fullness boundary in ppm of slot capacity.
+    pub reserve_slots_utilisation_ppm: u32,
     /// Heartbeat interval used when publishing node liveness.
     pub heartbeat_interval_ms: u64,
     /// Whether this node should bootstrap as leader when the cluster is empty.

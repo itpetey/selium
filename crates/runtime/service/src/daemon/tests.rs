@@ -184,6 +184,90 @@ fn build_access_policy_uses_custom_generated_cert_principals() {
     assert!(peer.allows(Method::RaftAppendEntries));
 }
 
+#[test]
+fn build_access_policy_keeps_default_access_grant_bound_to_client_cert() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-policy-override-{unique}"));
+    let cert_dir = work_dir.join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    crate::certs::generate_certificates(
+        &cert_dir,
+        "Test CA",
+        "localhost",
+        "client.localhost",
+        "machine",
+        "operator-123",
+        "peer.localhost",
+        "runtime-peer",
+        "raft-peer-456",
+    )
+    .expect("generate certs");
+
+    let opts = ServerOptions::try_parse_from([
+        "selium-runtime",
+        "daemon",
+        "--quic-peer-cert",
+        "certs/peer.crt",
+        "--quic-peer-key",
+        "certs/peer.key",
+    ])
+    .expect("parse opts");
+    let Some(ServerCommand::Daemon(args)) = opts.command else {
+        panic!("expected daemon command");
+    };
+    let policy = build_access_policy(&work_dir, &args).expect("policy");
+    let operator = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "operator-123"),
+        "fp".to_string(),
+    );
+    let peer = policy.resolve(
+        PrincipalRef::new(PrincipalKind::RuntimePeer, "raft-peer-456"),
+        "fp".to_string(),
+    );
+
+    assert!(operator.allows(Method::ControlQuery));
+    assert!(operator.allows(Method::StartInstance));
+    assert!(peer.allows(Method::RaftAppendEntries));
+    assert!(!peer.allows(Method::ControlQuery));
+}
+
+#[test]
+fn generated_certificates_use_runtime_peer_principal_for_peer_identity() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let work_dir = std::env::temp_dir().join(format!("selium-daemon-generated-peer-{unique}"));
+    let cert_dir = work_dir.join("certs");
+    fs::create_dir_all(&cert_dir).expect("create cert dir");
+    crate::certs::generate_certificates(
+        &cert_dir,
+        "Test CA",
+        "localhost",
+        "client.localhost",
+        "machine",
+        "client.localhost",
+        "peer.localhost",
+        "runtime-peer",
+        "peer.localhost",
+    )
+    .expect("generate certs");
+
+    let principal = resolve_cert_principal(
+        &cert_dir.join("peer.crt"),
+        PrincipalRef::new(PrincipalKind::Machine, "fallback"),
+    )
+    .expect("resolve peer principal");
+
+    assert_eq!(
+        principal,
+        PrincipalRef::new(PrincipalKind::RuntimePeer, "peer.localhost")
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn forward_control_plane_request_classifies_local_decode_and_auth_errors() {
     let state = sample_state("node-a");
@@ -299,6 +383,14 @@ fn rewrite_mutation_requires_full_access_for_unscoped_mutations() {
                 capacity_slots: 1,
                 allocatable_cpu_millis: None,
                 allocatable_memory_mib: None,
+                reserve_cpu_utilisation_ppm: 800_000,
+                reserve_memory_utilisation_ppm: 800_000,
+                reserve_slots_utilisation_ppm: 800_000,
+                observed_running_instances: None,
+                observed_active_bridges: None,
+                observed_memory_mib: None,
+                observed_workloads: BTreeMap::new(),
+                observed_workload_memory_mib: BTreeMap::new(),
                 supported_isolation: vec![IsolationProfile::Standard],
                 daemon_addr: "127.0.0.1:7100".to_string(),
                 daemon_server_name: "localhost".to_string(),
@@ -1689,7 +1781,7 @@ async fn runtime_usage_query_zero_limit_returns_watermark_without_advancing_curs
     let handle = collector
         .register_process(
             "tenant-a/media/ingest",
-            "process-a",
+            "123",
             ProcessUsageAttribution {
                 instance_id: Some("tenant-a/media/ingest/0".to_string()),
                 external_account_ref: Some("acct-a".to_string()),
@@ -1816,6 +1908,81 @@ async fn runtime_usage_query_can_save_and_resume_named_checkpoint() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn list_instances_reports_visible_runtime_memory_pressure() {
+    let state = sample_state("node-a");
+    let collector = state
+        .kernel
+        .get::<RuntimeUsageCollector>()
+        .expect("runtime usage collector")
+        .clone();
+    let handle = collector
+        .register_process(
+            "tenant-a/media/ingest",
+            "123",
+            ProcessUsageAttribution {
+                instance_id: Some("tenant-a/media/ingest/0".to_string()),
+                external_account_ref: Some("acct-a".to_string()),
+                module_id: "module-a".to_string(),
+            },
+        )
+        .await
+        .expect("register process");
+    handle.set_memory_high_watermark_bytes(5 * 1024 * 1024);
+    assert_eq!(
+        collector
+            .observed_load_for_processes(["123"])
+            .await
+            .memory_bytes,
+        5 * 1024 * 1024
+    );
+    state
+        .processes
+        .lock()
+        .await
+        .insert("tenant-a/media/ingest/0".to_string(), 123);
+    state.instance_workloads.lock().await.insert(
+        "tenant-a/media/ingest/0".to_string(),
+        "tenant-a/media/ingest".to_string(),
+    );
+
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=node_manage;workloads=tenant-a/*".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+    let frame = encode_request(
+        Method::ListInstances,
+        1,
+        &ListRequest {
+            node_id: "node-a".to_string(),
+        },
+    )
+    .expect("encode list request");
+    let envelope = decode_envelope(&frame).expect("decode envelope");
+
+    let response = handle_stream_request(state, request_context, &frame, envelope)
+        .await
+        .expect("list instances");
+    let list_envelope = decode_envelope(&response).expect("decode response envelope");
+    let list: ListResponse = decode_payload(&list_envelope).expect("decode list response");
+
+    assert_eq!(
+        list.instances,
+        BTreeMap::from([("tenant-a/media/ingest/0".to_string(), 123usize)])
+    );
+    assert_eq!(list.observed_memory_bytes, Some(5 * 1024 * 1024));
+    assert_eq!(
+        list.observed_workload_memory_bytes,
+        BTreeMap::from([("tenant-a/media/ingest".to_string(), 5 * 1024 * 1024)])
+    );
+
+    handle.finish().await.expect("finish process");
+}
+
 #[tokio::test]
 async fn runtime_usage_query_missing_checkpoint_fails_deterministically() {
     let state = sample_state("node-a");
@@ -1867,6 +2034,14 @@ fn sample_node(name: &str, daemon_addr: &str, daemon_server_name: &str) -> NodeS
         capacity_slots: 8,
         allocatable_cpu_millis: None,
         allocatable_memory_mib: None,
+        reserve_cpu_utilisation_ppm: 800_000,
+        reserve_memory_utilisation_ppm: 800_000,
+        reserve_slots_utilisation_ppm: 800_000,
+        observed_running_instances: None,
+        observed_active_bridges: None,
+        observed_memory_mib: None,
+        observed_workloads: BTreeMap::new(),
+        observed_workload_memory_mib: BTreeMap::new(),
         supported_isolation: vec![IsolationProfile::Standard],
         daemon_addr: daemon_addr.to_string(),
         daemon_server_name: daemon_server_name.to_string(),
@@ -1904,6 +2079,7 @@ fn guest_log_resolution_engine(replicas: usize) -> ControlPlaneEngine {
                 version: "v1".to_string(),
             }],
             isolation: IsolationProfile::Standard,
+            placement_mode: selium_control_plane_api::PlacementMode::ElasticPack,
             cpu_millis: 0,
             memory_mib: 0,
             ephemeral_storage_mib: 0,

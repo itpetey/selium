@@ -135,6 +135,15 @@ pub(crate) struct DaemonArgs {
     /// Allocatable memory advertised for this node in MiB.
     #[arg(long)]
     pub(crate) cp_allocatable_memory_mib: Option<u32>,
+    /// Soft CPU fullness boundary in ppm of allocatable capacity.
+    #[arg(long, default_value_t = 800_000)]
+    pub(crate) cp_reserve_cpu_utilisation_ppm: u32,
+    /// Soft memory fullness boundary in ppm of allocatable capacity.
+    #[arg(long, default_value_t = 800_000)]
+    pub(crate) cp_reserve_memory_utilisation_ppm: u32,
+    /// Soft slot fullness boundary in ppm of slot capacity.
+    #[arg(long, default_value_t = 800_000)]
+    pub(crate) cp_reserve_slots_utilisation_ppm: u32,
     /// Heartbeat interval for node liveness updates (milliseconds).
     #[arg(long, default_value_t = 1000)]
     pub(crate) cp_heartbeat_interval_ms: u64,
@@ -272,6 +281,9 @@ struct DaemonConfig {
     cp_capacity_slots: Option<u32>,
     cp_allocatable_cpu_millis: Option<u32>,
     cp_allocatable_memory_mib: Option<u32>,
+    cp_reserve_cpu_utilisation_ppm: Option<u32>,
+    cp_reserve_memory_utilisation_ppm: Option<u32>,
+    cp_reserve_slots_utilisation_ppm: Option<u32>,
     cp_heartbeat_interval_ms: Option<u64>,
     access_grants: Option<Vec<String>>,
 }
@@ -468,6 +480,21 @@ fn merge_daemon_config(
         &mut args.cp_allocatable_memory_mib,
         value_source("cp_allocatable_memory_mib"),
         config.cp_allocatable_memory_mib,
+    );
+    merge_value(
+        &mut args.cp_reserve_cpu_utilisation_ppm,
+        value_source("cp_reserve_cpu_utilisation_ppm"),
+        config.cp_reserve_cpu_utilisation_ppm,
+    );
+    merge_value(
+        &mut args.cp_reserve_memory_utilisation_ppm,
+        value_source("cp_reserve_memory_utilisation_ppm"),
+        config.cp_reserve_memory_utilisation_ppm,
+    );
+    merge_value(
+        &mut args.cp_reserve_slots_utilisation_ppm,
+        value_source("cp_reserve_slots_utilisation_ppm"),
+        config.cp_reserve_slots_utilisation_ppm,
     );
     merge_value(
         &mut args.cp_heartbeat_interval_ms,

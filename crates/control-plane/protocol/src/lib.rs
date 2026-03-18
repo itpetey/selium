@@ -288,6 +288,9 @@ pub struct StopResponse {
 pub struct ListResponse {
     pub instances: BTreeMap<String, usize>,
     pub active_bridges: Vec<String>,
+    pub observed_memory_bytes: Option<u64>,
+    pub observed_workloads: BTreeMap<String, u32>,
+    pub observed_workload_memory_bytes: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -565,6 +568,10 @@ where
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, rkyv::rancor::Error>>,
 {
     decode_rkyv(&envelope.payload).context("decode payload")
+}
+
+pub fn decode_list_response(envelope: &Envelope) -> Result<ListResponse> {
+    decode_rkyv(&envelope.payload).context("decode list response payload")
 }
 
 pub fn decode_error(envelope: &Envelope) -> Result<ErrorBody> {
@@ -888,5 +895,25 @@ mod tests {
         let bytes = encode_rkyv(&event).expect("encode event");
         let decoded: GuestLogEvent = decode_rkyv(&bytes).expect("decode event");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn list_response_decodes_current_payload() {
+        let response = ListResponse {
+            instances: BTreeMap::from([("tenant-a/media/ingest/0".to_string(), 42usize)]),
+            active_bridges: vec!["bridge-1".to_string()],
+            observed_memory_bytes: Some(5_242_880),
+            observed_workloads: BTreeMap::from([("tenant-a/media/ingest".to_string(), 1u32)]),
+            observed_workload_memory_bytes: BTreeMap::from([(
+                "tenant-a/media/ingest".to_string(),
+                5_242_880u64,
+            )]),
+        };
+        let bytes = encode_response(Method::ListInstances, 41, &response).expect("encode");
+        let envelope = decode_envelope(&bytes).expect("decode envelope");
+
+        let decoded = decode_list_response(&envelope).expect("decode list response");
+
+        assert_eq!(decoded, response);
     }
 }

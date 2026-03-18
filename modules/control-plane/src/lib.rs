@@ -13,19 +13,22 @@ use selium_control_plane_agent::{
     ReconcileAction, SNAPSHOT_BLOB_STORE_NAME, deployment_module_spec, endpoint_bridge_semantics,
     reconcile,
 };
-use selium_control_plane_api::{ControlPlaneState, IsolationProfile, NodeSpec};
+use selium_control_plane_api::{
+    ControlPlaneState, DiscoveryRequest, DiscoveryTarget, IsolationProfile, NodeSpec,
+};
 use selium_control_plane_core::{
-    Mutation, MutationEnvelope, MutationResponse, serialize_deployment_resources,
+    Mutation, MutationEnvelope, MutationResponse, Query, serialize_deployment_resources,
     serialize_external_account_ref, serialize_optional_u32,
 };
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, AppendEntriesApiRequest,
-    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, ListResponse, Method,
-    MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse,
-    ReplayApiResponse, RequestVoteApiRequest, StartRequest, StatusApiResponse, StopRequest,
-    decode_envelope, decode_payload, encode_error_response, encode_response, is_error, is_request,
+    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, ListRequest, ListResponse,
+    Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest,
+    QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest, StatusApiResponse,
+    StopRequest, decode_envelope, decode_list_response, decode_payload, encode_error_response,
+    encode_response, is_error, is_request,
 };
-use selium_control_plane_runtime::{ControlPlaneEngine, EngineSnapshot, RuntimeError};
+use selium_control_plane_runtime::{ControlPlaneEngine, RuntimeError};
 use selium_control_plane_scheduler::build_plan;
 use selium_guest::{network, spawn, storage, time};
 use selium_io_consensus::{
@@ -135,7 +138,7 @@ async fn recover_state(config: ControlPlaneModuleConfig) -> Result<ControlPlaneR
                 .await?
                 .ok_or_else(|| anyhow!("missing persisted engine snapshot"))?;
             let snapshot =
-                decode_rkyv::<EngineSnapshot>(&bytes).context("decode engine snapshot")?;
+                ControlPlaneEngine::decode_snapshot(&bytes).context("decode engine snapshot")?;
             ControlPlaneEngine::from_snapshot(snapshot)
         }
         None => ControlPlaneEngine::default(),
@@ -170,11 +173,11 @@ async fn replay_committed_events(state: &mut ControlPlaneRuntimeState) -> Result
         for record in records {
             let committed = decode_rkyv::<DurableCommittedEntry>(&record.payload)
                 .context("decode durable committed entry")?;
-            let envelope = ControlPlaneEngine::decode_mutation(&committed.payload)
+            let envelope = ControlPlaneEngine::decode_replayed_mutation(&committed.payload)
                 .map_err(anyhow_from_runtime)?;
             let response = state
                 .engine
-                .apply_committed_entry(&LogEntry {
+                .apply_replayed_entry(&LogEntry {
                     index: committed.index,
                     term: committed.term,
                     payload: committed.payload.clone(),
@@ -393,6 +396,7 @@ async fn forward_mutation_to_leader(
 }
 
 async fn handle_query(state: SharedState, request: QueryApiRequest) -> Result<QueryApiResponse> {
+    let query = request.query.clone();
     let (is_leader, leader_hint) = {
         let borrowed = state.borrow();
         (borrowed.raft.is_leader(), borrowed.raft.leader_hint())
@@ -418,13 +422,27 @@ async fn handle_query(state: SharedState, request: QueryApiRequest) -> Result<Qu
         });
     }
 
-    let borrowed = state.borrow();
-    let response = borrowed
-        .engine
-        .query(request.query)
-        .map_err(anyhow_from_runtime)?;
+    let (response, leader_hint) = if query_uses_observed_load_for_scheduling(&query) {
+        let now_ms = time::now().await?.unix_ms;
+        let borrowed = state.borrow();
+        let mut snapshot = borrowed.engine.snapshot();
+        clear_stale_observed_node_load(
+            &mut snapshot.control_plane,
+            now_ms,
+            max_observed_load_age_ms(&borrowed.config),
+        );
+        let response = ControlPlaneEngine::from_snapshot(snapshot)
+            .query(query)
+            .map_err(anyhow_from_runtime)?;
+        (response, borrowed.raft.leader_hint())
+    } else {
+        let borrowed = state.borrow();
+        let response = borrowed.engine.query(query).map_err(anyhow_from_runtime)?;
+        (response, borrowed.raft.leader_hint())
+    };
+
     Ok(QueryApiResponse {
-        leader_hint: borrowed.raft.leader_hint(),
+        leader_hint,
         result: Some(response.result),
         error: None,
     })
@@ -909,6 +927,39 @@ fn mutation_target_fields(mutation: &Mutation) -> BTreeMap<String, DataValue> {
                 "allocatable_memory_mib".to_string(),
                 serialize_optional_u32(spec.allocatable_memory_mib),
             ),
+            (
+                "reserve_cpu_utilisation_ppm".to_string(),
+                DataValue::from(spec.reserve_cpu_utilisation_ppm),
+            ),
+            (
+                "reserve_memory_utilisation_ppm".to_string(),
+                DataValue::from(spec.reserve_memory_utilisation_ppm),
+            ),
+            (
+                "reserve_slots_utilisation_ppm".to_string(),
+                DataValue::from(spec.reserve_slots_utilisation_ppm),
+            ),
+            (
+                "observed_running_instances".to_string(),
+                serialize_optional_u32(spec.observed_running_instances),
+            ),
+            (
+                "observed_active_bridges".to_string(),
+                serialize_optional_u32(spec.observed_active_bridges),
+            ),
+            (
+                "observed_memory_mib".to_string(),
+                serialize_optional_u32(spec.observed_memory_mib),
+            ),
+            (
+                "observed_workloads".to_string(),
+                DataValue::Map(
+                    spec.observed_workloads
+                        .iter()
+                        .map(|(workload, count)| (workload.clone(), DataValue::from(*count)))
+                        .collect(),
+                ),
+            ),
         ]),
         Mutation::SetScale { workload, replicas } => BTreeMap::from([
             (
@@ -1019,6 +1070,7 @@ async fn run_heartbeat_loop(state: SharedState) {
 
 async fn publish_heartbeat(state: SharedState) -> Result<()> {
     let now = time::now().await?.unix_ms;
+    let observed = local_observed_node_load(&state).await;
     let request = MutateApiRequest {
         idempotency_key: format!("node-heartbeat:{}:{now}", state.borrow().config.node_id),
         mutation: Mutation::UpsertNode {
@@ -1027,6 +1079,17 @@ async fn publish_heartbeat(state: SharedState) -> Result<()> {
                 capacity_slots: state.borrow().config.capacity_slots,
                 allocatable_cpu_millis: state.borrow().config.allocatable_cpu_millis,
                 allocatable_memory_mib: state.borrow().config.allocatable_memory_mib,
+                reserve_cpu_utilisation_ppm: state.borrow().config.reserve_cpu_utilisation_ppm,
+                reserve_memory_utilisation_ppm: state
+                    .borrow()
+                    .config
+                    .reserve_memory_utilisation_ppm,
+                reserve_slots_utilisation_ppm: state.borrow().config.reserve_slots_utilisation_ppm,
+                observed_running_instances: Some(observed.running_instances),
+                observed_active_bridges: Some(observed.active_bridges),
+                observed_memory_mib: Some(observed.memory_mib),
+                observed_workloads: observed.observed_workloads.clone(),
+                observed_workload_memory_mib: observed.observed_workload_memory_mib.clone(),
                 supported_isolation: vec![
                     IsolationProfile::Standard,
                     IsolationProfile::Hardened,
@@ -1040,6 +1103,134 @@ async fn publish_heartbeat(state: SharedState) -> Result<()> {
     };
     let _ = handle_mutate(state, request).await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservedNodeLoad {
+    running_instances: u32,
+    active_bridges: u32,
+    memory_mib: u32,
+    observed_workloads: BTreeMap<String, u32>,
+    observed_workload_memory_mib: BTreeMap<String, u32>,
+}
+
+async fn local_observed_node_load(state: &SharedState) -> ObservedNodeLoad {
+    let previous = current_observed_node_load(state);
+    let (authority, node_id) = {
+        let borrowed = state.borrow();
+        (
+            daemon_authority(
+                &borrowed.config.public_daemon_addr,
+                &borrowed.config.public_daemon_server_name,
+            ),
+            borrowed.config.node_id.clone(),
+        )
+    };
+
+    match send_daemon_list_request(state, &authority, ListRequest { node_id }).await {
+        Ok(Some(list)) => merge_observed_node_load(previous, list),
+        Ok(None) | Err(_) => previous,
+    }
+}
+
+fn current_observed_node_load(state: &SharedState) -> ObservedNodeLoad {
+    let node_id = state.borrow().config.node_id.clone();
+    state
+        .borrow()
+        .engine
+        .snapshot()
+        .control_plane
+        .nodes
+        .get(&node_id)
+        .map(|node| ObservedNodeLoad {
+            running_instances: node.observed_running_instances.unwrap_or(0),
+            active_bridges: node.observed_active_bridges.unwrap_or(0),
+            memory_mib: node.observed_memory_mib.unwrap_or(0),
+            observed_workloads: node.observed_workloads.clone(),
+            observed_workload_memory_mib: node.observed_workload_memory_mib.clone(),
+        })
+        .unwrap_or_default()
+}
+
+fn merge_observed_node_load(previous: ObservedNodeLoad, list: ListResponse) -> ObservedNodeLoad {
+    let has_instances = !list.instances.is_empty();
+    ObservedNodeLoad {
+        running_instances: list.instances.len().min(u32::MAX as usize) as u32,
+        active_bridges: list.active_bridges.len().min(u32::MAX as usize) as u32,
+        memory_mib: match list.observed_memory_bytes {
+            Some(bytes) => bytes_to_mib(bytes),
+            None if has_instances => previous.memory_mib,
+            None => 0,
+        },
+        observed_workloads: if list.observed_workloads.is_empty() && has_instances {
+            previous.observed_workloads
+        } else {
+            list.observed_workloads
+        },
+        observed_workload_memory_mib: if list.observed_workload_memory_bytes.is_empty()
+            && has_instances
+        {
+            previous.observed_workload_memory_mib
+        } else {
+            workload_bytes_to_mib(&list.observed_workload_memory_bytes)
+        },
+    }
+}
+
+fn bytes_to_mib(bytes: u64) -> u32 {
+    const MIB: u64 = 1024 * 1024;
+    if bytes == 0 {
+        return 0;
+    }
+    bytes
+        .saturating_add(MIB.saturating_sub(1))
+        .saturating_div(MIB)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn workload_bytes_to_mib(workload_bytes: &BTreeMap<String, u64>) -> BTreeMap<String, u32> {
+    let total_bytes = workload_bytes
+        .values()
+        .copied()
+        .fold(0u64, u64::saturating_add);
+    let total_mib = bytes_to_mib(total_bytes);
+    if workload_bytes.is_empty() {
+        return BTreeMap::new();
+    }
+    if total_bytes == 0 || total_mib == 0 {
+        return workload_bytes
+            .keys()
+            .cloned()
+            .map(|workload| (workload, 0))
+            .collect();
+    }
+
+    let total_bytes = u128::from(total_bytes);
+    let total_mib = u128::from(total_mib);
+    let mut assigned = BTreeMap::new();
+    let mut remainders = Vec::new();
+    let mut assigned_total = 0u32;
+
+    for (workload, bytes) in workload_bytes {
+        let weighted = total_mib.saturating_mul(u128::from(*bytes));
+        let mib = (weighted / total_bytes) as u32;
+        let remainder = weighted % total_bytes;
+        assigned_total = assigned_total.saturating_add(mib);
+        assigned.insert(workload.clone(), mib);
+        remainders.push((workload.clone(), remainder));
+    }
+
+    remainders.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
+    for (workload, _) in remainders
+        .into_iter()
+        .take(total_mib.saturating_sub(u128::from(assigned_total)) as usize)
+    {
+        if let Some(value) = assigned.get_mut(&workload) {
+            *value = value.saturating_add(1);
+        }
+    }
+
+    assigned
 }
 
 async fn run_reconcile_loop(state: SharedState) {
@@ -1056,21 +1247,31 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
         return Ok(());
     }
 
-    let snapshot = state.borrow().engine.snapshot().control_plane;
+    let max_observed_load_age_ms = {
+        let borrowed = state.borrow();
+        max_observed_load_age_ms(&borrowed.config)
+    };
+    let now_ms = time::now().await?.unix_ms;
+    let mut snapshot = state.borrow().engine.snapshot().control_plane;
+    clear_stale_observed_node_load(&mut snapshot, now_ms, max_observed_load_age_ms);
     let desired = build_plan(&snapshot).map_err(|err| anyhow!("build schedule plan: {err}"))?;
 
     for (node, spec) in &snapshot.nodes {
         let authority = daemon_authority(&spec.daemon_addr, &spec.daemon_server_name);
-        let list: ListResponse = send_daemon_rpc(
+        let list: ListResponse = send_daemon_list_request(
             &state,
             &authority,
-            Method::ListInstances,
-            &selium_control_plane_protocol::Empty {},
+            ListRequest {
+                node_id: node.clone(),
+            },
         )
         .await?
         .unwrap_or(ListResponse {
             instances: BTreeMap::new(),
             active_bridges: Vec::new(),
+            observed_memory_bytes: None,
+            observed_workloads: BTreeMap::new(),
+            observed_workload_memory_bytes: BTreeMap::new(),
         });
         let current = AgentState {
             running_instances: list
@@ -1085,6 +1286,49 @@ async fn reconcile_once(state: SharedState) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn query_uses_observed_load_for_scheduling(query: &Query) -> bool {
+    matches!(
+        query,
+        Query::ControlPlaneSummary
+            | Query::AttributedInfrastructureInventory { .. }
+            | Query::ResolveDiscovery {
+                request: DiscoveryRequest {
+                    target: DiscoveryTarget::RunningProcess(_),
+                    ..
+                },
+            }
+    )
+}
+
+fn max_observed_load_age_ms(config: &ControlPlaneModuleConfig) -> u64 {
+    config
+        .heartbeat_interval_ms
+        .saturating_mul(3)
+        .max(RECONCILE_INTERVAL_MS)
+}
+
+fn clear_stale_observed_node_load(
+    snapshot: &mut ControlPlaneState,
+    now_ms: u64,
+    max_observed_load_age_ms: u64,
+) {
+    for node in snapshot.nodes.values_mut() {
+        let heartbeat_age_ms = now_ms.saturating_sub(node.last_heartbeat_ms);
+        if node.last_heartbeat_ms > 0 && heartbeat_age_ms <= max_observed_load_age_ms {
+            continue;
+        }
+        clear_observed_node_load(node);
+    }
+}
+
+fn clear_observed_node_load(node: &mut NodeSpec) {
+    node.observed_running_instances = None;
+    node.observed_active_bridges = None;
+    node.observed_memory_mib = None;
+    node.observed_workloads.clear();
+    node.observed_workload_memory_mib.clear();
 }
 
 async fn execute_daemon_actions(
@@ -1361,6 +1605,46 @@ where
     }
     Ok(Some(
         decode_payload::<Resp>(&envelope).context("decode daemon payload")?,
+    ))
+}
+
+async fn send_daemon_list_request(
+    state: &SharedState,
+    authority: &str,
+    request: ListRequest,
+) -> Result<Option<ListResponse>> {
+    send_daemon_list_request_with_payload(state, authority, &request).await
+}
+
+async fn send_daemon_list_request_with_payload<Req>(
+    state: &SharedState,
+    authority: &str,
+    request: &Req,
+) -> Result<Option<ListResponse>>
+where
+    Req: selium_abi::RkyvEncode,
+{
+    let request_id = {
+        let mut borrowed = state.borrow_mut();
+        let request_id = borrowed.next_request_id;
+        borrowed.next_request_id = borrowed.next_request_id.saturating_add(1);
+        request_id
+    };
+    let frame =
+        selium_control_plane_protocol::encode_request(Method::ListInstances, request_id, request)
+            .context("encode daemon request")?;
+    let response = send_raw_frame(authority, frame).await?;
+    let envelope = decode_envelope(&response).context("decode daemon response")?;
+    if envelope.method != Method::ListInstances || envelope.request_id != request_id {
+        return Err(anyhow!("daemon response mismatch"));
+    }
+    if is_error(&envelope) {
+        let error = selium_control_plane_protocol::decode_error(&envelope)
+            .context("decode daemon error")?;
+        return Err(anyhow!("daemon error {}: {}", error.code, error.message));
+    }
+    Ok(Some(
+        decode_list_response(&envelope).context("decode daemon payload")?,
     ))
 }
 

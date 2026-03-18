@@ -189,6 +189,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
             bandwidth_profile: BandwidthProfile::Standard,
             volume_mounts: Vec::new(),
             external_account_ref: None,
+            placement_mode: PlacementMode::Balanced,
         })
         .expect("deployment");
     state
@@ -213,6 +214,7 @@ fn pipeline_consistency_checks_registry_and_deployments() {
             bandwidth_profile: BandwidthProfile::Standard,
             volume_mounts: Vec::new(),
             external_account_ref: None,
+            placement_mode: PlacementMode::Balanced,
         })
         .expect("deployment");
 
@@ -288,6 +290,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
             bandwidth_profile: BandwidthProfile::Standard,
             volume_mounts: Vec::new(),
             external_account_ref: None,
+            placement_mode: PlacementMode::Balanced,
         })
         .expect("deployment");
     state
@@ -312,6 +315,7 @@ fn pipeline_consistency_rejects_cross_tenant_endpoint() {
             bandwidth_profile: BandwidthProfile::Standard,
             volume_mounts: Vec::new(),
             external_account_ref: None,
+            placement_mode: PlacementMode::Balanced,
         })
         .expect("deployment");
 

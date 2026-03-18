@@ -174,8 +174,8 @@ fn resolve_operational_process(
 #[cfg(test)]
 pub(super) fn discovery_engine() -> ControlPlaneEngine {
     use selium_control_plane_api::{
-        BandwidthProfile, ContractKind, ContractRef, DeploymentSpec, IsolationProfile, WorkloadRef,
-        parse_idl,
+        BandwidthProfile, ContractKind, ContractRef, DeploymentSpec, IsolationProfile,
+        PlacementMode, WorkloadRef, parse_idl,
     };
 
     fn event_contract() -> ContractRef {
@@ -216,6 +216,7 @@ pub(super) fn discovery_engine() -> ControlPlaneEngine {
                 replicas,
                 contracts: vec![event_contract()],
                 isolation: IsolationProfile::Standard,
+                placement_mode: PlacementMode::ElasticPack,
                 cpu_millis: 0,
                 memory_mib: 0,
                 ephemeral_storage_mib: 0,
@@ -233,8 +234,8 @@ pub(super) fn discovery_engine() -> ControlPlaneEngine {
 #[cfg(test)]
 pub(super) fn multi_kind_discovery_engine() -> ControlPlaneEngine {
     use selium_control_plane_api::{
-        BandwidthProfile, ContractKind, ContractRef, DeploymentSpec, IsolationProfile, WorkloadRef,
-        parse_idl,
+        BandwidthProfile, ContractKind, ContractRef, DeploymentSpec, IsolationProfile,
+        PlacementMode, WorkloadRef, parse_idl,
     };
 
     fn event_contract() -> ContractRef {
@@ -289,6 +290,7 @@ pub(super) fn multi_kind_discovery_engine() -> ControlPlaneEngine {
             replicas: 2,
             contracts: vec![event_contract(), service_contract(), stream_contract()],
             isolation: IsolationProfile::Standard,
+            placement_mode: PlacementMode::ElasticPack,
             cpu_millis: 0,
             memory_mib: 0,
             ephemeral_storage_mib: 0,

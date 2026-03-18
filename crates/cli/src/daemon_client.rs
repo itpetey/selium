@@ -12,8 +12,9 @@ use rkyv::{
 };
 use selium_abi::{RkyvEncode, decode_rkyv};
 use selium_control_plane_protocol::{
-    GuestLogEvent, Method, SubscribeGuestLogsRequest, SubscribeGuestLogsResponse, decode_envelope,
-    decode_error, decode_payload, encode_request, is_error,
+    GuestLogEvent, ListRequest, ListResponse, Method, SubscribeGuestLogsRequest,
+    SubscribeGuestLogsResponse, decode_envelope, decode_error, decode_list_response,
+    decode_payload, encode_request, is_error,
 };
 use selium_runtime_support::{
     ClientTlsPaths, build_quic_client_endpoint, parse_socket_addr, read_framed, write_framed,
@@ -92,6 +93,25 @@ impl DaemonQuicClient {
         for<'a> Resp::Archived: rkyv::Deserialize<Resp, HighDeserializer<rkyv::rancor::Error>>
             + rkyv::bytecheck::CheckBytes<HighValidator<'a, rkyv::rancor::Error>>,
     {
+        let envelope = self.request_envelope(method, payload).await?;
+        decode_payload::<Resp>(&envelope).context("decode daemon payload")
+    }
+
+    pub(crate) async fn list_instances(&self, node_id: String) -> Result<ListResponse> {
+        let envelope = self
+            .request_envelope(Method::ListInstances, &ListRequest { node_id })
+            .await?;
+        decode_list_response(&envelope).context("decode daemon payload")
+    }
+
+    async fn request_envelope<Req>(
+        &self,
+        method: Method,
+        payload: &Req,
+    ) -> Result<selium_control_plane_protocol::Envelope>
+    where
+        Req: RkyvEncode,
+    {
         let connection = self.connection().await?;
         let request_timeout = request_timeout(method);
         let (mut send, mut recv) = timeout(request_timeout, connection.open_bi())
@@ -121,7 +141,7 @@ impl DaemonQuicClient {
             return Err(anyhow!("daemon error {}: {}", error.code, error.message));
         }
 
-        decode_payload::<Resp>(&envelope).context("decode daemon payload")
+        Ok(envelope)
     }
 
     #[allow(dead_code)]

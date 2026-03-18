@@ -184,7 +184,7 @@ mod tests {
             "machine",
             "client.localhost",
             "peer.localhost",
-            "machine",
+            "runtime-peer",
             "peer.localhost",
         )
         .expect("generate certs");

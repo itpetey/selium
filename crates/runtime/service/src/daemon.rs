@@ -82,6 +82,7 @@ use crate::{
     },
     config::DaemonArgs,
     modules,
+    usage::RuntimeUsageCollector,
 };
 
 const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -613,6 +614,9 @@ async fn bootstrap_control_plane(
         capacity_slots: args.cp_capacity_slots,
         allocatable_cpu_millis: args.cp_allocatable_cpu_millis,
         allocatable_memory_mib: args.cp_allocatable_memory_mib,
+        reserve_cpu_utilisation_ppm: args.cp_reserve_cpu_utilisation_ppm,
+        reserve_memory_utilisation_ppm: args.cp_reserve_memory_utilisation_ppm,
+        reserve_slots_utilisation_ppm: args.cp_reserve_slots_utilisation_ppm,
         heartbeat_interval_ms: args.cp_heartbeat_interval_ms,
         bootstrap_leader: args.cp_bootstrap_leader,
         peers,
@@ -1231,6 +1235,13 @@ async fn handle_stream_request(
                 })
                 .map(|(instance, process)| (instance.clone(), *process))
                 .collect::<BTreeMap<_, _>>();
+            let mut observed_workloads = BTreeMap::new();
+            for instance in entries.keys() {
+                let Some(workload) = workloads.get(instance) else {
+                    continue;
+                };
+                *observed_workloads.entry(workload.clone()).or_insert(0) += 1;
+            }
             let visible_instances = entries.keys().cloned().collect::<BTreeSet<_>>();
             let local_instances = processes.keys().cloned().collect::<BTreeSet<_>>();
             let active_bridges = state
@@ -1248,12 +1259,48 @@ async fn handle_stream_request(
                 })
                 .map(|(bridge_id, _)| bridge_id.clone())
                 .collect();
+            let (observed_memory_bytes, observed_workload_memory_bytes) =
+                match state.kernel.get::<RuntimeUsageCollector>() {
+                    Some(collector) => {
+                        let visible_process_ids = entries
+                            .values()
+                            .map(|process| process.to_string())
+                            .collect::<Vec<_>>();
+                        let observed_memory_bytes = Some(
+                            collector
+                                .observed_load_for_processes(visible_process_ids.iter())
+                                .await
+                                .memory_bytes,
+                        );
+                        let process_memory = collector
+                            .observed_memory_bytes_by_processes(visible_process_ids.iter())
+                            .await;
+                        let mut observed_workload_memory_bytes = BTreeMap::new();
+                        for (instance, process_id) in &entries {
+                            let Some(workload) = workloads.get(instance) else {
+                                continue;
+                            };
+                            let Some(memory_bytes) = process_memory.get(&process_id.to_string())
+                            else {
+                                continue;
+                            };
+                            *observed_workload_memory_bytes
+                                .entry(workload.clone())
+                                .or_insert(0) += *memory_bytes;
+                        }
+                        (observed_memory_bytes, observed_workload_memory_bytes)
+                    }
+                    None => (None, BTreeMap::new()),
+                };
             encode_response(
                 envelope.method,
                 envelope.request_id,
                 &ListResponse {
                     instances: entries,
                     active_bridges,
+                    observed_memory_bytes,
+                    observed_workloads,
+                    observed_workload_memory_bytes,
                 },
             )
         }

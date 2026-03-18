@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{
     Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource,
 };
-use selium_control_plane_api::IsolationProfile;
+use selium_control_plane_api::{BandwidthProfile, IsolationProfile, PlacementMode};
 use selium_runtime_support::load_toml_config;
 use serde::Deserialize;
 
@@ -67,6 +67,18 @@ pub(crate) struct DeployArgs {
     pub(crate) replicas: u32,
     #[arg(long, value_enum, default_value_t = IsolationArg::Standard)]
     pub(crate) isolation: IsolationArg,
+    #[arg(long, value_enum, default_value_t = PlacementArg::ElasticPack)]
+    pub(crate) placement_mode: PlacementArg,
+    #[arg(long, default_value_t = 0)]
+    pub(crate) cpu_millis: u32,
+    #[arg(long, default_value_t = 0)]
+    pub(crate) memory_mib: u32,
+    #[arg(long, default_value_t = 0)]
+    pub(crate) ephemeral_storage_mib: u32,
+    #[arg(long, value_enum, default_value_t = BandwidthArg::Standard)]
+    pub(crate) bandwidth_profile: BandwidthArg,
+    #[arg(long)]
+    pub(crate) external_account_ref: Option<String>,
     #[arg(long = "contract")]
     pub(crate) contracts: Vec<String>,
 }
@@ -302,6 +314,28 @@ pub(crate) enum AdaptorArg {
     Microvm,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BandwidthArg {
+    /// Use the low bandwidth profile.
+    Low,
+    /// Use the standard bandwidth profile.
+    Standard,
+    /// Use the high bandwidth profile.
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlacementArg {
+    /// Fill active nodes up to their reserve thresholds before spilling.
+    ElasticPack,
+    /// Place replicas onto the least loaded nodes.
+    Balanced,
+    /// Spread replicas across nodes before packing them together.
+    Spread,
+}
+
 /// Manage Selium control-plane resources and node instances.
 ///
 /// Most command options can be loaded from a TOML file with `--config` and then
@@ -400,6 +434,24 @@ struct RawDeployArgs {
     /// Isolation profile to apply to new replicas.
     #[arg(long, value_enum, value_name = "PROFILE")]
     isolation: Option<IsolationArg>,
+    /// Placement mode used by the scheduler for this deployment.
+    #[arg(long, value_enum, value_name = "MODE")]
+    placement_mode: Option<PlacementArg>,
+    /// Requested CPU budget in millicores per replica.
+    #[arg(long, value_name = "MILLIS")]
+    cpu_millis: Option<u32>,
+    /// Requested memory budget in MiB per replica.
+    #[arg(long, value_name = "MIB")]
+    memory_mib: Option<u32>,
+    /// Requested ephemeral storage budget in MiB per replica.
+    #[arg(long, value_name = "MIB")]
+    ephemeral_storage_mib: Option<u32>,
+    /// Named bandwidth profile for the deployment.
+    #[arg(long, value_enum, value_name = "PROFILE")]
+    bandwidth_profile: Option<BandwidthArg>,
+    /// Opaque external account reference for attribution.
+    #[arg(long, value_name = "EXTERNAL_ACCOUNT_REF")]
+    external_account_ref: Option<String>,
     /// Contract to attach, formatted as `namespace/kind:name@version`.
     #[arg(long = "contract", value_name = "CONTRACT")]
     contracts: Vec<String>,
@@ -774,6 +826,26 @@ impl From<IsolationArg> for IsolationProfile {
     }
 }
 
+impl From<BandwidthArg> for BandwidthProfile {
+    fn from(value: BandwidthArg) -> Self {
+        match value {
+            BandwidthArg::Low => BandwidthProfile::Low,
+            BandwidthArg::Standard => BandwidthProfile::Standard,
+            BandwidthArg::High => BandwidthProfile::High,
+        }
+    }
+}
+
+impl From<PlacementArg> for PlacementMode {
+    fn from(value: PlacementArg) -> Self {
+        match value {
+            PlacementArg::ElasticPack => PlacementMode::ElasticPack,
+            PlacementArg::Balanced => PlacementMode::Balanced,
+            PlacementArg::Spread => PlacementMode::Spread,
+        }
+    }
+}
+
 pub(crate) fn load_cli() -> Result<Cli> {
     let matches = RawCli::command().get_matches_from(std::env::args_os());
     resolve_cli_from_matches(matches)
@@ -866,6 +938,12 @@ impl RawDeployArgs {
             module: required_arg("deploy.module", self.module)?,
             replicas: self.replicas.unwrap_or(1),
             isolation: self.isolation.unwrap_or(IsolationArg::Standard),
+            placement_mode: self.placement_mode.unwrap_or(PlacementArg::ElasticPack),
+            cpu_millis: self.cpu_millis.unwrap_or(0),
+            memory_mib: self.memory_mib.unwrap_or(0),
+            ephemeral_storage_mib: self.ephemeral_storage_mib.unwrap_or(0),
+            bandwidth_profile: self.bandwidth_profile.unwrap_or(BandwidthArg::Standard),
+            external_account_ref: self.external_account_ref,
             contracts: self.contracts,
         })
     }
@@ -1236,6 +1314,36 @@ fn merge_deploy_config(
         &mut args.isolation,
         value_source("isolation"),
         config.isolation,
+    );
+    merge_option(
+        &mut args.placement_mode,
+        value_source("placement_mode"),
+        config.placement_mode,
+    );
+    merge_option(
+        &mut args.cpu_millis,
+        value_source("cpu_millis"),
+        config.cpu_millis,
+    );
+    merge_option(
+        &mut args.memory_mib,
+        value_source("memory_mib"),
+        config.memory_mib,
+    );
+    merge_option(
+        &mut args.ephemeral_storage_mib,
+        value_source("ephemeral_storage_mib"),
+        config.ephemeral_storage_mib,
+    );
+    merge_option(
+        &mut args.bandwidth_profile,
+        value_source("bandwidth_profile"),
+        config.bandwidth_profile,
+    );
+    merge_option(
+        &mut args.external_account_ref,
+        value_source("external_account_ref"),
+        config.external_account_ref,
     );
     merge_vec(
         &mut args.contracts,
@@ -1693,6 +1801,11 @@ namespace = "payments"
 workload = "from-config"
 module = "module.wasm"
 replicas = 3
+cpu-millis = 250
+memory-mib = 512
+ephemeral-storage-mib = 1024
+bandwidth-profile = "high"
+external-account-ref = "acct-123"
 "#,
         );
 
@@ -1713,6 +1826,11 @@ replicas = 3
         assert_eq!(args.workload, "from-config");
         assert_eq!(args.module, "module.wasm");
         assert_eq!(args.replicas, 3);
+        assert_eq!(args.cpu_millis, 250);
+        assert_eq!(args.memory_mib, 512);
+        assert_eq!(args.ephemeral_storage_mib, 1024);
+        assert!(matches!(args.bandwidth_profile, BandwidthArg::High));
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-123"));
     }
 
     #[test]
@@ -1725,6 +1843,11 @@ namespace = "payments"
 workload = "from-config"
 module = "module.wasm"
 replicas = 3
+cpu-millis = 250
+memory-mib = 512
+ephemeral-storage-mib = 1024
+bandwidth-profile = "high"
+external-account-ref = "acct-123"
 "#,
         );
 
@@ -1739,6 +1862,16 @@ replicas = 3
             "search",
             "--workload",
             "from-cli",
+            "--cpu-millis",
+            "600",
+            "--memory-mib",
+            "768",
+            "--ephemeral-storage-mib",
+            "2048",
+            "--bandwidth-profile",
+            "low",
+            "--external-account-ref",
+            "acct-override",
         ])
         .expect("parse cli");
 
@@ -1750,6 +1883,52 @@ replicas = 3
         assert_eq!(args.workload, "from-cli");
         assert_eq!(args.module, "module.wasm");
         assert_eq!(args.replicas, 3);
+        assert_eq!(args.cpu_millis, 600);
+        assert_eq!(args.memory_mib, 768);
+        assert_eq!(args.ephemeral_storage_mib, 2048);
+        assert!(matches!(args.bandwidth_profile, BandwidthArg::Low));
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-override"));
+    }
+
+    #[test]
+    fn deploy_command_parses_resource_and_attribution_flags() {
+        let cli = load_cli_from([
+            "selium",
+            "deploy",
+            "--tenant",
+            "tenant-a",
+            "--namespace",
+            "payments",
+            "--workload",
+            "api",
+            "--module",
+            "api.wasm",
+            "--replicas",
+            "2",
+            "--cpu-millis",
+            "500",
+            "--memory-mib",
+            "256",
+            "--ephemeral-storage-mib",
+            "128",
+            "--placement-mode",
+            "spread",
+            "--bandwidth-profile",
+            "high",
+            "--external-account-ref",
+            "acct-123",
+        ])
+        .expect("parse cli");
+
+        let Command::Deploy(args) = cli.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(args.cpu_millis, 500);
+        assert_eq!(args.memory_mib, 256);
+        assert_eq!(args.ephemeral_storage_mib, 128);
+        assert!(matches!(args.placement_mode, PlacementArg::Spread));
+        assert!(matches!(args.bandwidth_profile, BandwidthArg::High));
+        assert_eq!(args.external_account_ref.as_deref(), Some("acct-123"));
     }
 
     #[test]
