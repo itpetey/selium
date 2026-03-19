@@ -51,10 +51,16 @@ When daemon mode starts, Selium boots its control-plane guest through the system
 
 That split is intentional:
 
-- the host keeps trusted substrate concerns such as execution, capability enforcement, storage, networking, and authenticated transport
-- first-party system modules keep evolving policy such as desired-state interpretation and reconciliation
+- the host keeps permanent substrate responsibilities: execution, isolation, transport termination, authentication and authorisation enforcement, capability grants, and runtime-managed bridge or process realization
+- first-party system modules keep guest-owned policy: control API meaning, desired-state interpretation, bridge topology and lifecycle policy, and workload orchestration intent
 
-The current control-plane module remains the proving ground for this model, so some bridge delivery mechanics still live in the host while the shared lifecycle path settles.
+The current control-plane module remains the proving ground for this model. The daemon is expected to behave like a trusted gateway and realization engine, not a second semantic control plane.
+
+That means three concrete boundaries:
+
+- control queries and mutations arrive at the daemon with mTLS identity, but the daemon forwards guest-facing authorisation scope to the control-plane guest instead of rewriting desired-state meaning locally
+- endpoint bridges are realized from guest-authored bridge intent that names topology, classification, and lifecycle policy; the daemon keeps only the worker and transport state needed to execute that intent
+- process lifecycle calls are realized from guest-authored orchestration intent that names the desired transition, reason, and runtime resource posture; the daemon turns that into generic process and capability operations
 
 ## Direct module startup
 

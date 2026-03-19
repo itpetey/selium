@@ -28,16 +28,17 @@ use selium_control_plane_api::{
     DiscoveryRequest, DiscoveryResolution, DiscoveryTarget, NodeSpec, OperationalProcessRecord,
     PublicEndpointRef,
 };
-use selium_control_plane_core::{Mutation, Query};
+use selium_control_plane_core::Query;
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, BridgeMessage,
     DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, DeliverBridgeMessageRequest,
-    DeliverBridgeMessageResponse, Empty, EndpointBridgeMode, EndpointBridgeSemantics, Envelope,
-    EventBridgeMessage, GuestLogEvent, ListRequest, ListResponse, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, Method, MutateApiRequest, QueryApiRequest,
-    QueryApiResponse, ReplayApiRequest, RuntimeUsageApiRequest, RuntimeUsageApiResponse,
-    ServiceBridgeMessage, ServiceMessagePhase, StartRequest, StartResponse, StatusApiResponse,
-    StopRequest, StopResponse, StreamBridgeMessage, SubscribeGuestLogsRequest,
+    DeliverBridgeMessageResponse, DesiredWorkloadTransition, Empty, EndpointBridgeMode,
+    EndpointBridgeSemantics, Envelope, EventBridgeMessage, GuestLogEvent, ListRequest,
+    ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole, Method,
+    MutateApiRequest, QueryApiRequest, QueryApiResponse, ReplayApiRequest,
+    RuntimeUsageApiRequest, RuntimeUsageApiResponse, ServiceBridgeMessage, ServiceMessagePhase,
+    StartRequest, StartResponse, StatusApiResponse, StopRequest, StopResponse,
+    StreamBridgeMessage, SubscribeGuestLogsRequest,
     SubscribeGuestLogsResponse, decode_envelope, decode_error, decode_payload,
     encode_error_response, encode_request, encode_response, is_error, is_request,
 };
@@ -350,7 +351,11 @@ impl LocalControlPlaneClient {
         let frame = encode_request(
             Method::ControlQuery,
             request_id,
-            &QueryApiRequest { query, allow_stale },
+            &QueryApiRequest {
+                query,
+                allow_stale,
+                authorisation: None,
+            },
         )
         .context("encode control-plane query")?;
         let response = self.request_raw(&frame).await?;
@@ -868,7 +873,7 @@ async fn handle_stream_request(
                     false,
                 );
             }
-            if payload.instance_id.trim().is_empty() {
+            if payload.intent.instance_id.trim().is_empty() {
                 return encode_error_response(
                     envelope.method,
                     envelope.request_id,
@@ -877,10 +882,19 @@ async fn handle_stream_request(
                     false,
                 );
             }
+            if payload.intent.transition != DesiredWorkloadTransition::Start {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    400,
+                    "start request requires start orchestration intent",
+                    false,
+                );
+            }
             if let Err(err) = ensure_workload_authorised(
                 &request_context,
                 Method::StartInstance,
-                &payload.workload_key,
+                &payload.intent.workload_key,
                 "instance start",
             ) {
                 return encode_error_response(
@@ -897,7 +911,7 @@ async fn handle_stream_request(
                     .processes
                     .lock()
                     .await
-                    .get(&payload.instance_id)
+                    .get(&payload.intent.instance_id)
                     .copied()
             };
             if let Some(existing) = existing {
@@ -905,7 +919,7 @@ async fn handle_stream_request(
                     .instance_workloads
                     .lock()
                     .await
-                    .get(&payload.instance_id)
+                    .get(&payload.intent.instance_id)
                     .cloned()
                 else {
                     return encode_error_response(
@@ -914,7 +928,7 @@ async fn handle_stream_request(
                         500,
                         format!(
                             "instance `{}` missing workload attribution",
-                            payload.instance_id
+                            payload.intent.instance_id
                         ),
                         false,
                     );
@@ -938,7 +952,7 @@ async fn handle_stream_request(
                     envelope.request_id,
                     &StartResponse {
                         status: "ok".to_string(),
-                        instance_id: payload.instance_id,
+                        instance_id: payload.intent.instance_id,
                         process_id: existing,
                         already_running: true,
                     },
@@ -947,7 +961,7 @@ async fn handle_stream_request(
 
             let managed_endpoint_bindings = match ensure_managed_endpoint_bindings(
                 &state,
-                &payload.instance_id,
+                &payload.intent.instance_id,
                 &payload.managed_endpoint_bindings,
             )
             .await
@@ -956,7 +970,7 @@ async fn handle_stream_request(
                 Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
             };
             let guest_log_bindings =
-                match ensure_guest_log_bindings(&state, &payload.instance_id).await {
+                match ensure_guest_log_bindings(&state, &payload.intent.instance_id).await {
                     Ok(bindings) => bindings,
                     Err(err) => return rpc_server_error(envelope.method, envelope.request_id, err),
                 };
@@ -975,8 +989,8 @@ async fn handle_stream_request(
                 &state.work_dir,
                 &specs,
                 modules::ProcessLaunchContext {
-                    workload_key: Some(&payload.workload_key),
-                    instance_id: Some(&payload.instance_id),
+                    workload_key: Some(&payload.intent.workload_key),
+                    instance_id: Some(&payload.intent.instance_id),
                     external_account_ref: payload.external_account_ref.as_deref(),
                     principal: Some(request_context.principal()),
                 },
@@ -1012,19 +1026,22 @@ async fn handle_stream_request(
                 .processes
                 .lock()
                 .await
-                .insert(payload.instance_id.clone(), process_id);
+                .insert(payload.intent.instance_id.clone(), process_id);
             state
                 .instance_workloads
                 .lock()
                 .await
-                .insert(payload.instance_id.clone(), payload.workload_key.clone());
+                .insert(
+                    payload.intent.instance_id.clone(),
+                    payload.intent.workload_key.clone(),
+                );
 
             encode_response(
                 envelope.method,
                 envelope.request_id,
                 &StartResponse {
                     status: "ok".to_string(),
-                    instance_id: payload.instance_id,
+                    instance_id: payload.intent.instance_id,
                     process_id,
                     already_running: false,
                 },
@@ -1044,13 +1061,22 @@ async fn handle_stream_request(
                     false,
                 );
             }
+            if payload.intent.transition != DesiredWorkloadTransition::Stop {
+                return encode_error_response(
+                    envelope.method,
+                    envelope.request_id,
+                    400,
+                    "stop request requires stop orchestration intent",
+                    false,
+                );
+            }
 
             let process_id = {
                 state
                     .processes
                     .lock()
                     .await
-                    .get(&payload.instance_id)
+                    .get(&payload.intent.instance_id)
                     .copied()
             };
             let Some(process_id) = process_id else {
@@ -1059,17 +1085,17 @@ async fn handle_stream_request(
                     envelope.request_id,
                     &StopResponse {
                         status: "not_found".to_string(),
-                        instance_id: payload.instance_id,
+                        instance_id: payload.intent.instance_id,
                         process_id: None,
                     },
                 );
             };
             let Some(workload_key) = state
-                .instance_workloads
-                .lock()
-                .await
-                .get(&payload.instance_id)
-                .cloned()
+                    .instance_workloads
+                    .lock()
+                    .await
+                    .get(&payload.intent.instance_id)
+                    .cloned()
             else {
                 return encode_error_response(
                     envelope.method,
@@ -1077,8 +1103,8 @@ async fn handle_stream_request(
                     500,
                     format!(
                         "instance `{}` missing workload attribution",
-                        payload.instance_id
-                    ),
+                            payload.intent.instance_id
+                        ),
                     false,
                 );
             };
@@ -1096,16 +1122,16 @@ async fn handle_stream_request(
                     false,
                 );
             }
-            state.processes.lock().await.remove(&payload.instance_id);
+            state.processes.lock().await.remove(&payload.intent.instance_id);
             state
                 .instance_workloads
                 .lock()
                 .await
-                .remove(&payload.instance_id);
+                .remove(&payload.intent.instance_id);
 
             state.active_bridges.lock().await.retain(|_, route| {
-                let remove = route.spec.source_instance_id() == payload.instance_id
-                    || route.spec.target_instance_id() == payload.instance_id;
+                let remove = route.spec.source_instance_id() == payload.intent.instance_id
+                    || route.spec.target_instance_id() == payload.intent.instance_id;
                 if remove {
                     route.bridge_task.abort();
                 }
@@ -1115,12 +1141,12 @@ async fn handle_stream_request(
                 .source_bindings
                 .lock()
                 .await
-                .retain(|(instance_id, _, _), _| instance_id != &payload.instance_id);
+                .retain(|(instance_id, _, _), _| instance_id != &payload.intent.instance_id);
             state
                 .target_bindings
                 .lock()
                 .await
-                .retain(|(instance_id, _, _), _| instance_id != &payload.instance_id);
+                .retain(|(instance_id, _, _), _| instance_id != &payload.intent.instance_id);
 
             if let Err(err) =
                 modules::stop_process(&state.kernel, &state.registry, process_id).await
@@ -1133,7 +1159,7 @@ async fn handle_stream_request(
                 envelope.request_id,
                 &StopResponse {
                     status: "ok".to_string(),
-                    instance_id: payload.instance_id,
+                    instance_id: payload.intent.instance_id,
                     process_id: Some(process_id),
                 },
             )
@@ -1239,8 +1265,8 @@ async fn handle_stream_request(
                 &state,
                 &request_context,
                 Method::ActivateEndpointBridge,
-                &payload.source_instance_id,
-                &payload.source_endpoint,
+                &payload.intent.source_instance_id,
+                &payload.intent.source_endpoint,
                 "bridge source endpoint",
             )
             .await
@@ -1257,8 +1283,8 @@ async fn handle_stream_request(
                 &state,
                 &request_context,
                 Method::ActivateEndpointBridge,
-                &payload.target_instance_id,
-                &payload.target_endpoint,
+                &payload.intent.target_instance_id,
+                &payload.intent.target_endpoint,
                 "bridge target endpoint",
             )
             .await
@@ -1462,9 +1488,10 @@ async fn forward_control_plane_request(
         Method::ControlMutate => {
             let mut request: MutateApiRequest =
                 decode_payload(envelope).map_err(ForwardControlPlaneError::bad_request)?;
-            request.mutation =
-                rewrite_mutation_for_authorisation(request.mutation, request_context)
-                    .map_err(ForwardControlPlaneError::forbidden)?;
+            request.authorisation = Some(
+                forwarded_control_plane_scope(request.authorisation, request_context, envelope.method)
+                    .map_err(ForwardControlPlaneError::forbidden)?,
+            );
             let frame = encode_request(envelope.method, envelope.request_id, &request)
                 .context("encode control mutate request")
                 .map_err(ForwardControlPlaneError::internal)?;
@@ -1477,9 +1504,10 @@ async fn forward_control_plane_request(
         Method::ControlQuery => {
             let mut request: QueryApiRequest =
                 decode_payload(envelope).map_err(ForwardControlPlaneError::bad_request)?;
-            request.query =
-                rewrite_query_for_authorisation(request.query, request_context, envelope.method)
-                    .map_err(ForwardControlPlaneError::forbidden)?;
+            request.authorisation = Some(
+                forwarded_control_plane_scope(request.authorisation, request_context, envelope.method)
+                    .map_err(ForwardControlPlaneError::forbidden)?,
+            );
             let frame = encode_request(envelope.method, envelope.request_id, &request)
                 .context("encode control query request")
                 .map_err(ForwardControlPlaneError::internal)?;
@@ -1570,65 +1598,17 @@ fn encode_forward_control_plane_error(
     }
 }
 
-fn rewrite_mutation_for_authorisation(
-    mutation: Mutation,
-    request_context: &AuthenticatedRequestContext,
-) -> Result<Mutation> {
-    match mutation {
-        Mutation::UpsertDeployment { spec } => {
-            let workload = spec.workload.key();
-            ensure_workload_authorised(
-                request_context,
-                Method::ControlMutate,
-                &workload,
-                "deployment mutation",
-            )?;
-            Ok(Mutation::UpsertDeployment { spec })
-        }
-        Mutation::SetScale { workload, replicas } => {
-            let workload_key = workload.key();
-            ensure_workload_authorised(
-                request_context,
-                Method::ControlMutate,
-                &workload_key,
-                "scale mutation",
-            )?;
-            Ok(Mutation::SetScale { workload, replicas })
-        }
-        other if request_context.allows_all_workloads_for(Method::ControlMutate) => Ok(other),
-        _ => bail!("mutation requires full workload access"),
-    }
-}
-
-fn rewrite_query_for_authorisation(
-    query: Query,
+fn forwarded_control_plane_scope(
+    forwarded: Option<DiscoveryCapabilityScope>,
     request_context: &AuthenticatedRequestContext,
     method: Method,
-) -> Result<Query> {
-    match query {
-        Query::DiscoveryState { .. } => Ok(Query::DiscoveryState {
-            scope: request_context.discovery_scope_for(method),
-        }),
-        Query::ResolveDiscovery { mut request } => {
-            request.scope = request_context.discovery_scope_for(method);
-            Ok(Query::ResolveDiscovery { request })
+) -> Result<DiscoveryCapabilityScope> {
+    match forwarded {
+        Some(scope) if request_context.principal.kind == selium_abi::PrincipalKind::RuntimePeer => {
+            Ok(scope)
         }
-        Query::AttributedInfrastructureInventory { filter } => {
-            ensure_workload_filter_authorised(
-                request_context,
-                method,
-                filter.workload.as_deref(),
-                "infrastructure inventory query",
-            )?;
-            Ok(Query::AttributedInfrastructureInventory { filter })
-        }
-        other
-            if request_context.allows_all_workloads_for(method)
-                && request_context.allows_all_endpoints_for(method) =>
-        {
-            Ok(other)
-        }
-        _ => bail!("query requires full workload and endpoint access"),
+        Some(_) => bail!("caller cannot supply control-plane authorisation scope"),
+        None => Ok(request_context.discovery_scope_for(method)),
     }
 }
 
@@ -1789,53 +1769,54 @@ async fn activate_endpoint_bridge(
     state: &Rc<DaemonState>,
     payload: &ActivateEndpointBridgeRequest,
 ) -> Result<ActivateEndpointBridgeResponse> {
-    let source_key = endpoint_key(&payload.source_instance_id, &payload.source_endpoint);
+    let intent = &payload.intent;
+    let source_key = endpoint_key(&intent.source_instance_id, &intent.source_endpoint);
     if !state.source_bindings.lock().await.contains_key(&source_key) {
         bail!(
             "source endpoint `{}` is not registered for instance `{}`",
-            payload.source_endpoint.name,
-            payload.source_instance_id
+            intent.source_endpoint.name,
+            intent.source_instance_id
         );
     }
     if !state
         .processes
         .lock()
         .await
-        .contains_key(&payload.source_instance_id)
+        .contains_key(&intent.source_instance_id)
     {
         bail!(
             "source instance `{}` is not running",
-            payload.source_instance_id
+            intent.source_instance_id
         );
     }
 
-    let mode = if payload.target_node == state.node_id {
+    let mode = if intent.target_node == state.node_id {
         EndpointBridgeMode::Local
     } else {
         EndpointBridgeMode::Remote
     };
 
-    let spec = build_active_endpoint_bridge_spec(payload, mode)?;
+    let spec = build_active_endpoint_bridge_spec(intent, mode)?;
 
     let mut bridges = state.active_bridges.lock().await;
-    if let Some(existing) = bridges.get(&payload.bridge_id)
+    if let Some(existing) = bridges.get(&intent.bridge_id)
         && existing.spec == spec
     {
         return Ok(ActivateEndpointBridgeResponse {
             status: "ok".to_string(),
-            bridge_id: payload.bridge_id.clone(),
+            bridge_id: intent.bridge_id.clone(),
             mode: spec.mode(),
             target_node: spec.target_node().to_string(),
             target_instance_id: spec.target_instance_id().to_string(),
             already_active: true,
         });
     }
-    if let Some(existing) = bridges.remove(&payload.bridge_id) {
+    if let Some(existing) = bridges.remove(&intent.bridge_id) {
         existing.bridge_task.abort();
     }
 
     let state_for_task = Rc::clone(state);
-    let bridge_id = payload.bridge_id.clone();
+    let bridge_id = intent.bridge_id.clone();
     let spec_for_task = spec.clone();
     let bridge_task = spawn_local(async move {
         if let Err(err) = forward_endpoint_bridge(state_for_task, spec_for_task).await {
@@ -1843,7 +1824,7 @@ async fn activate_endpoint_bridge(
         }
     });
     bridges.insert(
-        payload.bridge_id.clone(),
+        intent.bridge_id.clone(),
         ActiveEndpointBridge {
             spec: spec.clone(),
             bridge_task,
@@ -1852,7 +1833,7 @@ async fn activate_endpoint_bridge(
 
     Ok(ActivateEndpointBridgeResponse {
         status: "ok".to_string(),
-        bridge_id: payload.bridge_id.clone(),
+        bridge_id: intent.bridge_id.clone(),
         mode: spec.mode(),
         target_node: spec.target_node().to_string(),
         target_instance_id: spec.target_instance_id().to_string(),
@@ -1880,55 +1861,55 @@ async fn deactivate_endpoint_bridge(
 }
 
 fn build_active_endpoint_bridge_spec(
-    payload: &ActivateEndpointBridgeRequest,
+    intent: &selium_control_plane_protocol::EndpointBridgeIntent,
     mode: EndpointBridgeMode,
 ) -> Result<ActiveEndpointBridgeSpec> {
-    match &payload.semantics {
+    match &intent.semantics {
         EndpointBridgeSemantics::Event(_) => {
-            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Event)?;
-            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Event)?;
+            ensure_endpoint_kind("source", &intent.source_endpoint, ContractKind::Event)?;
+            ensure_endpoint_kind("target", &intent.target_endpoint, ContractKind::Event)?;
             Ok(ActiveEndpointBridgeSpec::Event(
                 ActiveEventEndpointBridgeSpec {
-                    source_instance_id: payload.source_instance_id.clone(),
-                    source_endpoint: payload.source_endpoint.clone(),
-                    target_instance_id: payload.target_instance_id.clone(),
-                    target_endpoint: payload.target_endpoint.clone(),
+                    source_instance_id: intent.source_instance_id.clone(),
+                    source_endpoint: intent.source_endpoint.clone(),
+                    target_instance_id: intent.target_instance_id.clone(),
+                    target_endpoint: intent.target_endpoint.clone(),
                     mode,
-                    target_node: payload.target_node.clone(),
-                    target_daemon_addr: payload.target_daemon_addr.clone(),
-                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                    target_node: intent.target_node.clone(),
+                    target_daemon_addr: intent.target_daemon_addr.clone(),
+                    target_daemon_server_name: intent.target_daemon_server_name.clone(),
                 },
             ))
         }
         EndpointBridgeSemantics::Service(_) => {
-            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Service)?;
-            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Service)?;
+            ensure_endpoint_kind("source", &intent.source_endpoint, ContractKind::Service)?;
+            ensure_endpoint_kind("target", &intent.target_endpoint, ContractKind::Service)?;
             Ok(ActiveEndpointBridgeSpec::Service(
                 ActiveServiceEndpointBridgeSpec {
-                    source_instance_id: payload.source_instance_id.clone(),
-                    source_endpoint: payload.source_endpoint.clone(),
-                    target_instance_id: payload.target_instance_id.clone(),
-                    target_endpoint: payload.target_endpoint.clone(),
+                    source_instance_id: intent.source_instance_id.clone(),
+                    source_endpoint: intent.source_endpoint.clone(),
+                    target_instance_id: intent.target_instance_id.clone(),
+                    target_endpoint: intent.target_endpoint.clone(),
                     mode,
-                    target_node: payload.target_node.clone(),
-                    target_daemon_addr: payload.target_daemon_addr.clone(),
-                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                    target_node: intent.target_node.clone(),
+                    target_daemon_addr: intent.target_daemon_addr.clone(),
+                    target_daemon_server_name: intent.target_daemon_server_name.clone(),
                 },
             ))
         }
         EndpointBridgeSemantics::Stream(_) => {
-            ensure_endpoint_kind("source", &payload.source_endpoint, ContractKind::Stream)?;
-            ensure_endpoint_kind("target", &payload.target_endpoint, ContractKind::Stream)?;
+            ensure_endpoint_kind("source", &intent.source_endpoint, ContractKind::Stream)?;
+            ensure_endpoint_kind("target", &intent.target_endpoint, ContractKind::Stream)?;
             Ok(ActiveEndpointBridgeSpec::Stream(
                 ActiveStreamEndpointBridgeSpec {
-                    source_instance_id: payload.source_instance_id.clone(),
-                    source_endpoint: payload.source_endpoint.clone(),
-                    target_instance_id: payload.target_instance_id.clone(),
-                    target_endpoint: payload.target_endpoint.clone(),
+                    source_instance_id: intent.source_instance_id.clone(),
+                    source_endpoint: intent.source_endpoint.clone(),
+                    target_instance_id: intent.target_instance_id.clone(),
+                    target_endpoint: intent.target_endpoint.clone(),
                     mode,
-                    target_node: payload.target_node.clone(),
-                    target_daemon_addr: payload.target_daemon_addr.clone(),
-                    target_daemon_server_name: payload.target_daemon_server_name.clone(),
+                    target_node: intent.target_node.clone(),
+                    target_daemon_addr: intent.target_daemon_addr.clone(),
+                    target_daemon_server_name: intent.target_daemon_server_name.clone(),
                 },
             ))
         }

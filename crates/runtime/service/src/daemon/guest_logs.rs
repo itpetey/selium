@@ -301,19 +301,26 @@ pub(super) async fn activate_guest_log_subscription(
         let bridge_id = format!("{instance_id}:{}", endpoint.name);
         let request = ActivateEndpointBridgeRequest {
             node_id: resolved.target.node.clone(),
-            bridge_id: bridge_id.clone(),
-            source_instance_id: resolved.target.replica_key.clone(),
-            source_endpoint: endpoint.clone(),
-            target_instance_id: instance_id.clone(),
-            target_node: state.node_id.clone(),
-            target_daemon_addr: resolved.local_node.daemon_addr.clone(),
-            target_daemon_server_name: resolved.local_node.daemon_server_name.clone(),
-            target_endpoint: endpoint.clone(),
-            semantics: EndpointBridgeSemantics::Event(
-                selium_control_plane_protocol::EventBridgeSemantics {
-                    delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+            intent: selium_control_plane_protocol::EndpointBridgeIntent {
+                bridge_id: bridge_id.clone(),
+                source_instance_id: resolved.target.replica_key.clone(),
+                source_endpoint: endpoint.clone(),
+                target_instance_id: instance_id.clone(),
+                target_node: state.node_id.clone(),
+                target_daemon_addr: resolved.local_node.daemon_addr.clone(),
+                target_daemon_server_name: resolved.local_node.daemon_server_name.clone(),
+                target_endpoint: endpoint.clone(),
+                classification: selium_control_plane_protocol::EndpointBridgeClassification::OperationalLogs,
+                lifecycle: selium_control_plane_protocol::EndpointBridgeLifecyclePolicy {
+                    keep_attached_when_healthy: true,
+                    health: selium_control_plane_protocol::EndpointBridgeHealthPolicy::GuestControlled,
                 },
-            ),
+                semantics: EndpointBridgeSemantics::Event(
+                    selium_control_plane_protocol::EventBridgeSemantics {
+                        delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+                    },
+                ),
+            },
         };
         let activation = if resolved.target.node == state.node_id {
             activate_endpoint_bridge(state, &request).await

@@ -430,6 +430,7 @@ impl ClusterHarness {
             &MutateApiRequest {
                 idempotency_key: idempotency_key.to_string(),
                 mutation,
+                authorisation: None,
             },
         )
         .context("encode control mutation")?;
@@ -490,7 +491,11 @@ impl ClusterHarness {
         let frame = encode_request(
             Method::ControlQuery,
             1,
-            &QueryApiRequest { query, allow_stale },
+            &QueryApiRequest {
+                query,
+                allow_stale,
+                authorisation: None,
+            },
         )
         .context("encode control query")?;
         timeout(DIRECT_QUERY_TIMEOUT, write_framed(&mut send, &frame))

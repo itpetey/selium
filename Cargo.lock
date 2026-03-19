@@ -1666,6 +1666,7 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "rkyv",
  "selium-control-plane-api",
+ "selium-control-plane-protocol",
  "thiserror 2.0.18",
 ]
 

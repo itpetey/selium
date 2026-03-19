@@ -161,17 +161,6 @@ impl AuthenticatedRequestContext {
         })
     }
 
-    pub fn allows_all_endpoints_for(&self, method: Method) -> bool {
-        self.grants_for_method(method).any(|grant| {
-            grant.discovery_scope.endpoints.is_empty()
-                || grant
-                    .discovery_scope
-                    .endpoints
-                    .iter()
-                    .any(|pattern| matches!(pattern, DiscoveryPattern::Prefix(prefix) if prefix.is_empty()))
-        })
-    }
-
     pub fn allows_workload_for(&self, method: Method, workload_key: &str) -> bool {
         self.grants_for_method(method).any(|grant| {
             grant.discovery_scope.workloads.is_empty()

@@ -1,12 +1,18 @@
 use super::*;
 use selium_control_plane_api::{
-    BandwidthProfile, ContractRef, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryOperation,
-    DiscoveryRequest, DiscoveryTarget, EventEndpointRef, ExternalAccountRef,
+    parse_idl, BandwidthProfile, ContractRef, DeploymentSpec, DiscoveryCapabilityScope,
+    DiscoveryOperation, DiscoveryRequest, DiscoveryTarget, EventEndpointRef, ExternalAccountRef,
     OperationalProcessSelector, PipelineEdge, PipelineEndpoint, PipelineSpec, PlacementMode,
-    VolumeMount, WorkloadRef, parse_idl,
+    VolumeMount, WorkloadRef,
 };
 use selium_control_plane_core::{AttributedInfrastructureFilter, Query};
-use selium_control_plane_protocol::{ListResponse, ManagedEndpointBindingType, ReplayApiRequest};
+use selium_control_plane_protocol::{
+    EndpointBridgeClassification, EndpointBridgeHealthPolicy, EndpointBridgeIntent,
+    EndpointBridgeLifecyclePolicy, EndpointBridgeSemantics, EventBridgeSemantics,
+    EventDeliveryMode, ListResponse, ManagedEndpointBindingType, MutateApiRequest, QueryApiRequest,
+    ReplayApiRequest, ServiceBridgeSemantics, ServiceCorrelationMode, StreamBridgeSemantics,
+    StreamLifecycleMode,
+};
 use selium_control_plane_scheduler::ScheduledEndpointBridgeIntent;
 
 const SAMPLE_IDL: &str = r#"
@@ -58,16 +64,12 @@ fn reconcile_generates_start_and_stop_actions() {
     apply(&mut current, &actions);
     assert_eq!(current.running_instances.len(), 2);
     assert!(current.active_bridges.is_empty());
-    assert!(
-        current
-            .running_instances
-            .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=0")
-    );
-    assert!(
-        current
-            .running_instances
-            .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=1")
-    );
+    assert!(current
+        .running_instances
+        .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=0"));
+    assert!(current
+        .running_instances
+        .contains_key("tenant=tenant-a;namespace=default;workload=echo;replica=1"));
 }
 
 #[test]
@@ -139,11 +141,23 @@ fn reconcile_generates_endpoint_bridge_actions() {
     let current = AgentState::default();
     let actions = reconcile("local-node", &state, &desired, &current);
 
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, ReconcileAction::EnsureEndpointBridge(_)))
+    let ensure = actions
+        .iter()
+        .find_map(|action| match action {
+            ReconcileAction::EnsureEndpointBridge(action) => Some(action),
+            _ => None,
+        })
+        .expect("ensure endpoint bridge action");
+    assert_eq!(
+        ensure.intent.classification,
+        EndpointBridgeClassification::WorkloadDataPlane
     );
+    assert!(ensure.intent.lifecycle.keep_attached_when_healthy);
+    assert_eq!(
+        ensure.intent.lifecycle.health,
+        EndpointBridgeHealthPolicy::GuestControlled
+    );
+    assert_eq!(ensure.intent.target_daemon_addr, "127.0.0.1:7100");
 }
 
 #[test]
@@ -234,29 +248,16 @@ fn managed_endpoint_bindings_keep_same_name_cross_kind_entries_distinct() {
         "instance-a",
         &[
             ScheduledEndpointBridgeIntent {
-                bridge_id: "bridge-event".to_string(),
-                source_instance_id: "instance-a".to_string(),
                 source_node: "local-node".to_string(),
-                source_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "ingest".to_string(),
-                    },
-                    kind: ContractKind::Event,
-                    name: "shared".to_string(),
-                },
-                target_instance_id: "instance-b".to_string(),
-                target_node: "local-node".to_string(),
-                target_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "detector".to_string(),
-                    },
-                    kind: ContractKind::Event,
-                    name: "shared".to_string(),
-                },
+                intent: sample_bridge_intent(
+                    "bridge-event",
+                    "instance-a",
+                    ContractKind::Event,
+                    "shared",
+                    "instance-b",
+                    "local-node",
+                    "detector",
+                ),
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
                     kind: ContractKind::Event,
@@ -265,29 +266,16 @@ fn managed_endpoint_bindings_keep_same_name_cross_kind_entries_distinct() {
                 },
             },
             ScheduledEndpointBridgeIntent {
-                bridge_id: "bridge-service".to_string(),
-                source_instance_id: "instance-a".to_string(),
                 source_node: "local-node".to_string(),
-                source_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "ingest".to_string(),
-                    },
-                    kind: ContractKind::Service,
-                    name: "shared".to_string(),
-                },
-                target_instance_id: "instance-c".to_string(),
-                target_node: "remote-node".to_string(),
-                target_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "uploader".to_string(),
-                    },
-                    kind: ContractKind::Service,
-                    name: "shared".to_string(),
-                },
+                intent: sample_bridge_intent(
+                    "bridge-service",
+                    "instance-a",
+                    ContractKind::Service,
+                    "shared",
+                    "instance-c",
+                    "remote-node",
+                    "uploader",
+                ),
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
                     kind: ContractKind::Service,
@@ -296,29 +284,16 @@ fn managed_endpoint_bindings_keep_same_name_cross_kind_entries_distinct() {
                 },
             },
             ScheduledEndpointBridgeIntent {
-                bridge_id: "bridge-stream".to_string(),
-                source_instance_id: "instance-a".to_string(),
                 source_node: "local-node".to_string(),
-                source_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "ingest".to_string(),
-                    },
-                    kind: ContractKind::Stream,
-                    name: "shared".to_string(),
-                },
-                target_instance_id: "instance-d".to_string(),
-                target_node: "local-node".to_string(),
-                target_endpoint: PublicEndpointRef {
-                    workload: WorkloadRef {
-                        tenant: "tenant-a".to_string(),
-                        namespace: "media".to_string(),
-                        name: "streamer".to_string(),
-                    },
-                    kind: ContractKind::Stream,
-                    name: "shared".to_string(),
-                },
+                intent: sample_bridge_intent(
+                    "bridge-stream",
+                    "instance-a",
+                    ContractKind::Stream,
+                    "shared",
+                    "instance-d",
+                    "local-node",
+                    "streamer",
+                ),
                 contract: ContractRef {
                     namespace: "media.pipeline".to_string(),
                     kind: ContractKind::Stream,
@@ -342,6 +317,63 @@ fn managed_endpoint_bindings_keep_same_name_cross_kind_entries_distinct() {
         binding.endpoint_kind == ContractKind::Stream
             && binding.binding_type == ManagedEndpointBindingType::Session
     }));
+}
+
+fn sample_bridge_intent(
+    bridge_id: &str,
+    source_instance_id: &str,
+    kind: ContractKind,
+    endpoint: &str,
+    target_instance_id: &str,
+    target_node: &str,
+    target_workload: &str,
+) -> EndpointBridgeIntent {
+    EndpointBridgeIntent {
+        bridge_id: bridge_id.to_string(),
+        source_instance_id: source_instance_id.to_string(),
+        source_endpoint: PublicEndpointRef {
+            workload: WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: "ingest".to_string(),
+            },
+            kind,
+            name: endpoint.to_string(),
+        },
+        target_instance_id: target_instance_id.to_string(),
+        target_node: target_node.to_string(),
+        target_daemon_addr: if target_node == "local-node" {
+            "127.0.0.1:7100".to_string()
+        } else {
+            "127.0.0.1:7200".to_string()
+        },
+        target_daemon_server_name: target_node.to_string(),
+        target_endpoint: PublicEndpointRef {
+            workload: WorkloadRef {
+                tenant: "tenant-a".to_string(),
+                namespace: "media".to_string(),
+                name: target_workload.to_string(),
+            },
+            kind,
+            name: endpoint.to_string(),
+        },
+        classification: EndpointBridgeClassification::WorkloadDataPlane,
+        lifecycle: EndpointBridgeLifecyclePolicy {
+            keep_attached_when_healthy: true,
+            health: EndpointBridgeHealthPolicy::GuestControlled,
+        },
+        semantics: match kind {
+            ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
+                delivery: EventDeliveryMode::Frame,
+            }),
+            ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
+                correlation: ServiceCorrelationMode::RequestId,
+            }),
+            ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
+                lifecycle: StreamLifecycleMode::SessionFrames,
+            }),
+        },
+    }
 }
 
 #[test]
@@ -766,6 +798,82 @@ fn scheduling_query_detection_matches_schedule_sensitive_queries() {
             max_staleness_ms: 1,
         }
     ));
+}
+
+#[test]
+fn authorise_query_request_rewrites_discovery_scope_in_guest() {
+    let request = QueryApiRequest {
+        query: Query::DiscoveryState {
+            scope: DiscoveryCapabilityScope::default(),
+        },
+        allow_stale: false,
+        authorisation: Some(DiscoveryCapabilityScope {
+            operations: vec![DiscoveryOperation::Discover],
+            workloads: vec![selium_control_plane_api::DiscoveryPattern::Exact(
+                "tenant-a/default/echo".to_string(),
+            )],
+            endpoints: Vec::new(),
+            allow_operational_processes: false,
+        }),
+    };
+
+    let authorised = authorise_query_request(request).expect("query should be authorised");
+    let Query::DiscoveryState { scope } = authorised.query else {
+        panic!("expected discovery state query");
+    };
+    assert!(scope
+        .workloads
+        .iter()
+        .any(|pattern| pattern.matches("tenant-a/default/echo")));
+}
+
+#[test]
+fn authorise_query_request_rejects_raw_state_without_global_scope() {
+    let err = authorise_query_request(QueryApiRequest {
+        query: Query::ControlPlaneState,
+        allow_stale: false,
+        authorisation: Some(DiscoveryCapabilityScope {
+            operations: vec![DiscoveryOperation::Discover],
+            workloads: vec![selium_control_plane_api::DiscoveryPattern::Prefix(
+                "tenant-a/".to_string(),
+            )],
+            endpoints: Vec::new(),
+            allow_operational_processes: false,
+        }),
+    })
+    .expect_err("raw state query should require full scope");
+
+    assert!(err
+        .to_string()
+        .contains("query requires full workload and endpoint access"));
+}
+
+#[test]
+fn authorise_mutation_request_rejects_workload_outside_scope() {
+    let err = authorise_mutation_request(MutateApiRequest {
+        idempotency_key: "test-1".to_string(),
+        mutation: Mutation::SetScale {
+            workload: WorkloadRef {
+                tenant: "tenant-b".to_string(),
+                namespace: "default".to_string(),
+                name: "api".to_string(),
+            },
+            replicas: 3,
+        },
+        authorisation: Some(DiscoveryCapabilityScope {
+            operations: vec![DiscoveryOperation::Bind],
+            workloads: vec![selium_control_plane_api::DiscoveryPattern::Prefix(
+                "tenant-a/".to_string(),
+            )],
+            endpoints: Vec::new(),
+            allow_operational_processes: false,
+        }),
+    })
+    .expect_err("mutation should be rejected");
+
+    assert!(err
+        .to_string()
+        .contains("unauthorised workload `tenant-b/default/api` for scale mutation"));
 }
 
 #[test]

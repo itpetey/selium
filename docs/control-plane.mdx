@@ -5,7 +5,7 @@ description: "Contracts, workloads, pipelines, and reconciliation in the current
 
 The control plane is Selium's desired-state layer. It gives workloads stable names, tracks published contract packages, records how workloads should connect, and turns that intent into running processes and endpoint bridges.
 
-In the current architecture, the control plane runs as a first-party system module. The runtime host provides trusted substrate services such as execution, capability enforcement, transport, and runtime-managed resources, while the control-plane guest owns durable state, reconcile loops, and higher-level orchestration policy.
+In the current architecture, the control plane runs as a first-party system module. The runtime host keeps the permanent substrate: execution, isolation, transport termination, authentication and authorisation enforcement, capability grants, and runtime-managed bridge or process realization. The control-plane guest owns the semantic layer: durable state, control API meaning, reconcile loops, bridge topology and lifecycle policy, and workload orchestration intent.
 
 ## The identities that matter
 
@@ -47,7 +47,13 @@ Publishing and deploying do not start workloads by themselves. Reconciliation is
 - `selium agent --once` applies the current desired state once
 - `selium agent` without `--once` keeps reconciling on an interval
 
-During reconciliation, the control-plane guest decides which instances should run on which node and whether it needs endpoint bridges between nodes. The runtime host still executes the trusted data-plane mechanics needed to realise those decisions. That is how workload wiring stays stable even when placement changes.
+During reconciliation, the control-plane guest decides which instances should run on which node, why they should transition, and whether it needs endpoint bridges between nodes. The runtime host still executes the trusted data-plane mechanics needed to realise those decisions. That is how workload wiring stays stable even when placement changes without making the daemon the semantic owner of topology or lifecycle policy.
+
+The daemon-facing contracts now follow the same rule:
+
+- **control API gateway**: the host authenticates, authorises, and forwards a scoped semantic request to the guest
+- **bridge intent**: the guest declares bridge topology, classification, and lifecycle policy; the host realizes workers and transport sessions
+- **workload orchestration intent**: the guest declares start or stop transitions plus resource posture; the host realizes process launch, stop, capability grant, and managed-resource attachment
 
 ## Control plane vs direct operations
 

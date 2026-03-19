@@ -18,7 +18,10 @@ use selium_control_plane_api::{
     ContractRef, ControlPlaneState, DeploymentSpec, DiscoveryCapabilityScope, DiscoveryPattern,
     IsolationProfile, NodeSpec, OperationalProcessSelector, WorkloadRef, parse_idl,
 };
-use selium_control_plane_core::{Mutation, Query};
+use selium_control_plane_core::Query;
+use selium_control_plane_protocol::{
+    DesiredWorkloadTransition, WorkloadLifecycleReason, WorkloadOrchestrationIntent,
+};
 use selium_control_plane_runtime::ControlPlaneEngine;
 use tokio::io::duplex;
 
@@ -353,11 +356,9 @@ async fn forward_control_plane_request_classifies_local_decode_and_auth_errors()
         Method::ControlQuery,
         2,
         &QueryApiRequest {
-            query: Query::TableGet {
-                table: "deployments".to_string(),
-                key: "tenant-b/media/api".to_string(),
-            },
+            query: Query::ControlPlaneState,
             allow_stale: false,
+            authorisation: Some(DiscoveryCapabilityScope::allow_all()),
         },
     )
     .expect("encode forbidden frame");
@@ -369,7 +370,7 @@ async fn forward_control_plane_request_classifies_local_decode_and_auth_errors()
         &forbidden_envelope,
     )
     .await
-    .expect_err("query should be forbidden locally");
+    .expect_err("client-supplied authorisation scope should be forbidden locally");
     assert!(matches!(
         forbidden_err,
         ForwardControlPlaneError::Local {
@@ -420,7 +421,7 @@ fn bridge_visibility_follows_visible_instance_scope() {
 }
 
 #[test]
-fn rewrite_mutation_requires_full_access_for_unscoped_mutations() {
+fn forwarded_control_plane_scope_rejects_client_supplied_scope() {
     let policy = AccessPolicy::from_specs(&[
         "principal=machine:client.localhost;methods=control_write;workloads=tenant-a/*".to_string(),
     ])
@@ -430,38 +431,20 @@ fn rewrite_mutation_requires_full_access_for_unscoped_mutations() {
         "fp".to_string(),
     );
 
-    let err = rewrite_mutation_for_authorisation(
-        Mutation::UpsertNode {
-            spec: NodeSpec {
-                name: "node-a".to_string(),
-                capacity_slots: 1,
-                allocatable_cpu_millis: None,
-                allocatable_memory_mib: None,
-                reserve_cpu_utilisation_ppm: 800_000,
-                reserve_memory_utilisation_ppm: 800_000,
-                reserve_slots_utilisation_ppm: 800_000,
-                observed_running_instances: None,
-                observed_active_bridges: None,
-                observed_memory_mib: None,
-                observed_workloads: BTreeMap::new(),
-                observed_workload_memory_mib: BTreeMap::new(),
-                supported_isolation: vec![IsolationProfile::Standard],
-                daemon_addr: "127.0.0.1:7100".to_string(),
-                daemon_server_name: "localhost".to_string(),
-                last_heartbeat_ms: 0,
-            },
-        },
+    let err = forwarded_control_plane_scope(
+        Some(DiscoveryCapabilityScope::allow_all()),
         &request_context,
+        Method::ControlMutate,
     )
-    .expect_err("node mutation should require full access");
+    .expect_err("client scope should be rejected");
     assert!(
         err.to_string()
-            .contains("mutation requires full workload access")
+            .contains("caller cannot supply control-plane authorisation scope")
     );
 }
 
 #[test]
-fn rewrite_query_rejects_raw_queries_without_full_access() {
+fn forwarded_control_plane_scope_injects_query_scope_from_client_grants() {
     let policy = AccessPolicy::from_specs(&[
         "principal=machine:client.localhost;methods=control_read;workloads=tenant-a/*".to_string(),
     ])
@@ -471,42 +454,42 @@ fn rewrite_query_rejects_raw_queries_without_full_access() {
         "fp".to_string(),
     );
 
-    let err = rewrite_query_for_authorisation(
-        Query::TableGet {
-            table: "deployments".to_string(),
-            key: "tenant-b/media/api".to_string(),
-        },
+    let scope = forwarded_control_plane_scope(
+        None,
         &request_context,
         Method::ControlQuery,
     )
-    .expect_err("raw table query should require full access");
-    assert!(
-        err.to_string()
-            .contains("query requires full workload and endpoint access")
-    );
+    .expect("daemon should derive scope from grants");
+    assert!(scope.workloads.iter().any(|pattern| pattern.matches("tenant-a/media/api")));
+    assert!(!scope.workloads.iter().any(|pattern| pattern.matches("tenant-b/media/api")));
 }
 
 #[test]
-fn rewrite_query_rejects_raw_queries_without_full_endpoint_access() {
+fn forwarded_control_plane_scope_preserves_runtime_peer_scope() {
     let policy = AccessPolicy::from_specs(&[
-        "principal=machine:client.localhost;methods=control_read;workloads=*;endpoints=tenant-a/media/router#service:*".to_string(),
+        "principal=runtime-peer:*;methods=peer;workloads=*;endpoints=*".to_string(),
     ])
     .expect("policy");
     let request_context = policy.resolve(
-        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        PrincipalRef::new(PrincipalKind::RuntimePeer, "node-b"),
         "fp".to_string(),
     );
+    let forwarded = DiscoveryCapabilityScope {
+        operations: vec![DiscoveryOperation::Discover],
+        workloads: vec![DiscoveryPattern::Exact("tenant-a/media/api".to_string())],
+        endpoints: vec![DiscoveryPattern::Exact(
+            "tenant-a/media/api#event:frames".to_string(),
+        )],
+        allow_operational_processes: false,
+    };
 
-    let err = rewrite_query_for_authorisation(
-        Query::ControlPlaneState,
+    let scope = forwarded_control_plane_scope(
+        Some(forwarded.clone()),
         &request_context,
         Method::ControlQuery,
     )
-    .expect_err("raw state query should require full endpoint access");
-    assert!(
-        err.to_string()
-            .contains("query requires full workload and endpoint access")
-    );
+    .expect("runtime peer scope should be preserved");
+    assert_eq!(scope, forwarded);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -617,18 +600,13 @@ async fn activate_endpoint_bridge_forwards_local_event_frames() {
                 &state,
                 &ActivateEndpointBridgeRequest {
                     node_id: "local-node".to_string(),
-                    bridge_id: "bridge-1".to_string(),
-                    source_instance_id: "source-1".to_string(),
-                    source_endpoint: sample_endpoint("ingress", "camera.frames"),
-                    target_instance_id: "target-1".to_string(),
-                    target_node: "local-node".to_string(),
-                    target_daemon_addr: "127.0.0.1:7100".to_string(),
-                    target_daemon_server_name: "localhost".to_string(),
-                    target_endpoint: sample_endpoint("detector", "camera.frames"),
-                    semantics: selium_control_plane_protocol::EndpointBridgeSemantics::Event(
-                        selium_control_plane_protocol::EventBridgeSemantics {
-                            delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
-                        },
+                    intent: sample_bridge_intent(
+                        "bridge-1",
+                        "source-1",
+                        sample_endpoint("ingress", "camera.frames"),
+                        "target-1",
+                        "local-node",
+                        sample_endpoint("detector", "camera.frames"),
                     ),
                 },
             )
@@ -778,18 +756,13 @@ async fn activate_endpoint_bridge_forwards_local_guest_log_event_frames() {
                 &state,
                 &ActivateEndpointBridgeRequest {
                     node_id: "local-node".to_string(),
-                    bridge_id: "bridge-guest-log".to_string(),
-                    source_instance_id: "source-1".to_string(),
-                    source_endpoint: sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
-                    target_instance_id: "target-1".to_string(),
-                    target_node: "local-node".to_string(),
-                    target_daemon_addr: "127.0.0.1:7100".to_string(),
-                    target_daemon_server_name: "localhost".to_string(),
-                    target_endpoint: sample_endpoint("attach", GUEST_LOG_STDOUT_ENDPOINT),
-                    semantics: selium_control_plane_protocol::EndpointBridgeSemantics::Event(
-                        selium_control_plane_protocol::EventBridgeSemantics {
-                            delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
-                        },
+                    intent: sample_bridge_intent(
+                        "bridge-guest-log",
+                        "source-1",
+                        sample_endpoint("ingest", GUEST_LOG_STDOUT_ENDPOINT),
+                        "target-1",
+                        "local-node",
+                        sample_endpoint("attach", GUEST_LOG_STDOUT_ENDPOINT),
                     ),
                 },
             )
@@ -1083,27 +1056,13 @@ async fn activate_endpoint_bridge_forwards_local_service_request_response() {
                 &state,
                 &ActivateEndpointBridgeRequest {
                     node_id: "local-node".to_string(),
-                    bridge_id: "bridge-service".to_string(),
-                    source_instance_id: "source-1".to_string(),
-                    source_endpoint: sample_endpoint_kind(
-                        ContractKind::Service,
-                        "ingest",
-                        "shared",
-                    ),
-                    target_instance_id: "target-1".to_string(),
-                    target_node: "local-node".to_string(),
-                    target_daemon_addr: "127.0.0.1:7100".to_string(),
-                    target_daemon_server_name: "localhost".to_string(),
-                    target_endpoint: sample_endpoint_kind(
-                        ContractKind::Service,
-                        "detector",
-                        "shared",
-                    ),
-                    semantics: EndpointBridgeSemantics::Service(
-                        selium_control_plane_protocol::ServiceBridgeSemantics {
-                            correlation:
-                                selium_control_plane_protocol::ServiceCorrelationMode::RequestId,
-                        },
+                    intent: sample_bridge_intent(
+                        "bridge-service",
+                        "source-1",
+                        sample_endpoint_kind(ContractKind::Service, "ingest", "shared"),
+                        "target-1",
+                        "local-node",
+                        sample_endpoint_kind(ContractKind::Service, "detector", "shared"),
                     ),
                 },
             )
@@ -1282,23 +1241,13 @@ async fn activate_endpoint_bridge_forwards_local_stream_lifecycle_frames() {
                 &state,
                 &ActivateEndpointBridgeRequest {
                     node_id: "local-node".to_string(),
-                    bridge_id: "bridge-stream".to_string(),
-                    source_instance_id: "source-1".to_string(),
-                    source_endpoint: sample_endpoint_kind(ContractKind::Stream, "ingest", "shared"),
-                    target_instance_id: "target-1".to_string(),
-                    target_node: "local-node".to_string(),
-                    target_daemon_addr: "127.0.0.1:7100".to_string(),
-                    target_daemon_server_name: "localhost".to_string(),
-                    target_endpoint: sample_endpoint_kind(
-                        ContractKind::Stream,
-                        "detector",
-                        "shared",
-                    ),
-                    semantics: EndpointBridgeSemantics::Stream(
-                        selium_control_plane_protocol::StreamBridgeSemantics {
-                            lifecycle:
-                                selium_control_plane_protocol::StreamLifecycleMode::SessionFrames,
-                        },
+                    intent: sample_bridge_intent(
+                        "bridge-stream",
+                        "source-1",
+                        sample_endpoint_kind(ContractKind::Stream, "ingest", "shared"),
+                        "target-1",
+                        "local-node",
+                        sample_endpoint_kind(ContractKind::Stream, "detector", "shared"),
                     ),
                 },
             )
@@ -2082,6 +2031,71 @@ fn append_guest_log_bindings_adds_hidden_queue_ids() {
     );
 }
 
+#[tokio::test]
+async fn start_instance_rejects_stop_transition_intent() {
+    let state = sample_state("node-a");
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=node_manage,control_write;workloads=*;endpoints=*;allow-operational-processes=true".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+    let frame = encode_request(
+        Method::StartInstance,
+        9,
+        &StartRequest {
+            node_id: "node-a".to_string(),
+            intent: sample_workload_intent("tenant-a/media/ingest/0", DesiredWorkloadTransition::Stop),
+            module_spec: "path=demo.wasm;capabilities=time_read".to_string(),
+            external_account_ref: None,
+            managed_endpoint_bindings: Vec::new(),
+        },
+    )
+    .expect("encode start request");
+    let envelope = decode_envelope(&frame).expect("decode envelope");
+
+    let response = handle_stream_request(state, request_context, &frame, envelope)
+        .await
+        .expect("start response");
+    let envelope = decode_envelope(&response).expect("decode response envelope");
+    let err = decode_error(&envelope).expect("decode error body");
+    assert_eq!(err.code, 400);
+    assert!(err.message.contains("start request requires start orchestration intent"));
+}
+
+#[tokio::test]
+async fn stop_instance_rejects_start_transition_intent() {
+    let state = sample_state("node-a");
+    let policy = AccessPolicy::from_specs(&[
+        "principal=machine:client.localhost;methods=node_manage,control_write;workloads=*;endpoints=*;allow-operational-processes=true".to_string(),
+    ])
+    .expect("policy");
+    let request_context = policy.resolve(
+        PrincipalRef::new(PrincipalKind::Machine, "client.localhost"),
+        "fp".to_string(),
+    );
+    let frame = encode_request(
+        Method::StopInstance,
+        10,
+        &StopRequest {
+            node_id: "node-a".to_string(),
+            intent: sample_workload_intent("tenant-a/media/ingest/0", DesiredWorkloadTransition::Start),
+        },
+    )
+    .expect("encode stop request");
+    let envelope = decode_envelope(&frame).expect("decode envelope");
+
+    let response = handle_stream_request(state, request_context, &frame, envelope)
+        .await
+        .expect("stop response");
+    let envelope = decode_envelope(&response).expect("decode response envelope");
+    let err = decode_error(&envelope).expect("decode error body");
+    assert_eq!(err.code, 400);
+    assert!(err.message.contains("stop request requires stop orchestration intent"));
+}
+
 fn sample_node(name: &str, daemon_addr: &str, daemon_server_name: &str) -> NodeSpec {
     NodeSpec {
         name: name.to_string(),
@@ -2213,5 +2227,60 @@ fn sample_endpoint_kind(kind: ContractKind, workload: &str, endpoint: &str) -> P
         },
         kind,
         name: endpoint.to_string(),
+    }
+}
+
+fn sample_bridge_intent(
+    bridge_id: &str,
+    source_instance_id: &str,
+    source_endpoint: PublicEndpointRef,
+    target_instance_id: &str,
+    target_node: &str,
+    target_endpoint: PublicEndpointRef,
+) -> selium_control_plane_protocol::EndpointBridgeIntent {
+    selium_control_plane_protocol::EndpointBridgeIntent {
+        bridge_id: bridge_id.to_string(),
+        source_instance_id: source_instance_id.to_string(),
+        source_endpoint: source_endpoint.clone(),
+        target_instance_id: target_instance_id.to_string(),
+        target_node: target_node.to_string(),
+        target_daemon_addr: "127.0.0.1:7100".to_string(),
+        target_daemon_server_name: "localhost".to_string(),
+        target_endpoint,
+        classification: selium_control_plane_protocol::EndpointBridgeClassification::WorkloadDataPlane,
+        lifecycle: selium_control_plane_protocol::EndpointBridgeLifecyclePolicy {
+            keep_attached_when_healthy: true,
+            health: selium_control_plane_protocol::EndpointBridgeHealthPolicy::GuestControlled,
+        },
+        semantics: match source_endpoint.kind {
+            ContractKind::Event => EndpointBridgeSemantics::Event(
+                selium_control_plane_protocol::EventBridgeSemantics {
+                    delivery: selium_control_plane_protocol::EventDeliveryMode::Frame,
+                },
+            ),
+            ContractKind::Service => EndpointBridgeSemantics::Service(
+                selium_control_plane_protocol::ServiceBridgeSemantics {
+                    correlation: selium_control_plane_protocol::ServiceCorrelationMode::RequestId,
+                },
+            ),
+            ContractKind::Stream => EndpointBridgeSemantics::Stream(
+                selium_control_plane_protocol::StreamBridgeSemantics {
+                    lifecycle: selium_control_plane_protocol::StreamLifecycleMode::SessionFrames,
+                },
+            ),
+        },
+    }
+}
+
+fn sample_workload_intent(
+    instance_id: &str,
+    transition: DesiredWorkloadTransition,
+) -> WorkloadOrchestrationIntent {
+    WorkloadOrchestrationIntent {
+        workload_key: "tenant-a/media/ingest".to_string(),
+        instance_id: instance_id.to_string(),
+        transition,
+        reason: WorkloadLifecycleReason::Reconcile,
+        resource_posture: None,
     }
 }

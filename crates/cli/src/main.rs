@@ -22,7 +22,7 @@ use selium_abi::{
 use selium_control_plane_agent::{
     AgentState, ReconcileAction, apply, build_module_spec as build_runtime_module_spec,
     default_capabilities as default_runtime_capabilities,
-    deployment_module_spec as build_deployment_module_spec, endpoint_bridge_semantics, reconcile,
+    deployment_module_spec as build_deployment_module_spec, reconcile,
 };
 use selium_control_plane_api::{
     ApiError, BandwidthProfile, ContractKind, ContractRef, ControlPlaneState, DeploymentSpec,
@@ -35,11 +35,12 @@ use selium_control_plane_api::{
 };
 use selium_control_plane_core::{AttributedInfrastructureFilter, Mutation, Query};
 use selium_control_plane_protocol::{
-    Empty, ListResponse, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole,
-    Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest,
-    QueryApiResponse, ReplayApiRequest, ReplayApiResponse, RuntimeUsageApiRequest,
-    RuntimeUsageApiResponse, StartRequest, StartResponse, StatusApiResponse, StopRequest,
-    StopResponse, SubscribeGuestLogsRequest,
+    DesiredWorkloadTransition, Empty, ListResponse, ManagedEndpointBinding,
+    ManagedEndpointBindingType, ManagedEndpointRole, Method, MetricsApiResponse,
+    MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse, ReplayApiRequest,
+    ReplayApiResponse, RuntimeUsageApiRequest, RuntimeUsageApiResponse, StartRequest,
+    StartResponse, StatusApiResponse, StopRequest, StopResponse, SubscribeGuestLogsRequest,
+    WorkloadLifecycleReason, WorkloadOrchestrationIntent, WorkloadResourcePosture,
 };
 use selium_control_plane_scheduler::build_plan;
 use tokio::{signal, time::sleep};
@@ -517,8 +518,13 @@ async fn cmd_start(daemon: Arc<DaemonQuicClient>, args: StartArgs) -> Result<()>
             Method::StartInstance,
             &StartRequest {
                 node_id: args.node,
-                workload_key: args.replica_key.clone(),
-                instance_id: args.replica_key,
+                intent: WorkloadOrchestrationIntent {
+                    workload_key: args.replica_key.clone(),
+                    instance_id: args.replica_key,
+                    transition: DesiredWorkloadTransition::Start,
+                    reason: WorkloadLifecycleReason::OperatorRequest,
+                    resource_posture: None,
+                },
                 module_spec,
                 external_account_ref: None,
                 managed_endpoint_bindings,
@@ -539,7 +545,13 @@ async fn cmd_stop(daemon: Arc<DaemonQuicClient>, args: StopArgs) -> Result<()> {
             Method::StopInstance,
             &StopRequest {
                 node_id: args.node,
-                instance_id: args.replica_key,
+                intent: WorkloadOrchestrationIntent {
+                    workload_key: args.replica_key.clone(),
+                    instance_id: args.replica_key,
+                    transition: DesiredWorkloadTransition::Stop,
+                    reason: WorkloadLifecycleReason::OperatorRequest,
+                    resource_posture: None,
+                },
             },
         )
         .await?;
@@ -683,6 +695,7 @@ async fn cp_mutate(daemon: &DaemonQuicClient, mutation: Mutation) -> Result<Data
             &MutateApiRequest {
                 idempotency_key: key,
                 mutation,
+                authorisation: None,
             },
         )
         .await?;
@@ -709,7 +722,11 @@ async fn cp_query_value(
     let response: QueryApiResponse = daemon
         .request(
             Method::ControlQuery,
-            &QueryApiRequest { query, allow_stale },
+            &QueryApiRequest {
+                query,
+                allow_stale,
+                authorisation: None,
+            },
         )
         .await?;
 
@@ -950,8 +967,19 @@ async fn execute_daemon_actions(
                         Method::StartInstance,
                         &StartRequest {
                             node_id: node.to_string(),
-                            workload_key: deployment.clone(),
-                            instance_id: instance_id.clone(),
+                            intent: WorkloadOrchestrationIntent {
+                                workload_key: deployment.clone(),
+                                instance_id: instance_id.clone(),
+                                transition: DesiredWorkloadTransition::Start,
+                                reason: WorkloadLifecycleReason::Reconcile,
+                                resource_posture: Some(WorkloadResourcePosture {
+                                    isolation: spec.isolation.clone(),
+                                    cpu_millis: spec.cpu_millis,
+                                    memory_mib: spec.memory_mib,
+                                    ephemeral_storage_mib: spec.ephemeral_storage_mib,
+                                    bandwidth_profile: spec.bandwidth_profile,
+                                }),
+                            },
                             module_spec,
                             external_account_ref: spec
                                 .external_account_ref
@@ -968,30 +996,25 @@ async fn execute_daemon_actions(
                         Method::StopInstance,
                         &StopRequest {
                             node_id: node.to_string(),
-                            instance_id: instance_id.clone(),
+                            intent: WorkloadOrchestrationIntent {
+                                workload_key: deployment_for_instance(state, instance_id)
+                                    .unwrap_or_default(),
+                                instance_id: instance_id.clone(),
+                                transition: DesiredWorkloadTransition::Stop,
+                                reason: WorkloadLifecycleReason::Reconcile,
+                                resource_posture: None,
+                            },
                         },
                     )
                     .await?;
             }
             ReconcileAction::EnsureEndpointBridge(action) => {
-                let target_spec = state
-                    .nodes
-                    .get(&action.target_node)
-                    .ok_or_else(|| anyhow!("unknown target node `{}`", action.target_node))?;
                 let _ = node_client
                     .request::<_, selium_control_plane_protocol::ActivateEndpointBridgeResponse>(
                         Method::ActivateEndpointBridge,
                         &selium_control_plane_protocol::ActivateEndpointBridgeRequest {
                             node_id: node.to_string(),
-                            bridge_id: action.bridge_id.clone(),
-                            source_instance_id: action.source_instance_id.clone(),
-                            source_endpoint: action.source_endpoint.clone(),
-                            target_instance_id: action.target_instance_id.clone(),
-                            target_node: action.target_node.clone(),
-                            target_daemon_addr: target_spec.daemon_addr.clone(),
-                            target_daemon_server_name: target_spec.daemon_server_name.clone(),
-                            target_endpoint: action.target_endpoint.clone(),
-                            semantics: endpoint_bridge_semantics(action.source_endpoint.kind),
+                            intent: action.intent.clone(),
                         },
                     )
                     .await?;
@@ -1011,6 +1034,19 @@ async fn execute_daemon_actions(
     }
 
     Ok(())
+}
+
+fn deployment_for_instance(state: &ControlPlaneState, instance_id: &str) -> Option<String> {
+    state.deployments.keys().find_map(|workload_key| {
+        let mut parts = workload_key.split('/');
+        let prefix = format!(
+            "tenant={};namespace={};workload={};",
+            parts.next()?,
+            parts.next()?,
+            parts.next()?
+        );
+        instance_id.starts_with(&prefix).then(|| workload_key.clone())
+    })
 }
 
 fn build_module_spec(

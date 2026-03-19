@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Define the shared governance contract for first-party system modules, including declarative lifecycle handling and a strict host substrate boundary.
+
+## Requirements
 
 ### Requirement: Runtime SHALL define system modules declaratively
 The runtime SHALL represent each first-party system module through a declarative definition that identifies its module artifact, entrypoint, granted capabilities, runtime-managed resources, bootstrap inputs, and lifecycle policy.
@@ -22,16 +25,16 @@ The runtime SHALL use a standard readiness contract for first-party system modul
 - **WHEN** a system module does not become ready within its declared readiness policy
 - **THEN** the runtime MUST surface the failure as a lifecycle error instead of silently continuing with a partially initialized module
 
-### Requirement: Host and guest SHALL have a substrate-versus-policy boundary
-Selium SHALL classify system behavior so trusted substrate responsibilities remain host-side, while orchestration and control policy that can evolve independently belong to guest system modules.
+### Requirement: Host substrate boundaries SHALL remain explicit for system modules
+Selium SHALL preserve explicit host ownership of trusted substrate concerns for first-party system modules, including execution, isolation, authenticated transport termination, and capability enforcement.
 
-#### Scenario: Evaluating host-side logic during migration
-- **WHEN** an existing daemon behavior related to a system module is reviewed
-- **THEN** the implementation MUST classify it as substrate, guest-owned policy, or intentionally host-resident with explicit rationale
+#### Scenario: Reviewing a system-module responsibility
+- **WHEN** a first-party system-module behavior is classified during roadmap implementation
+- **THEN** the host SHALL retain ownership only if the behavior is required for execution, isolation, authenticated transport, or capability enforcement
 
-#### Scenario: Preventing policy leakage into the host
-- **WHEN** new first-party system behavior is introduced
-- **THEN** the design MUST place policy logic behind the system-module contract unless it is required for enforcement, isolation, or trusted transport
+#### Scenario: Rejecting host-side policy expansion
+- **WHEN** a new system-module feature is introduced
+- **THEN** the design SHALL forbid adding daemon-owned semantic policy unless the feature is required to uphold a trusted substrate concern
 
 ### Requirement: Runtime SHALL supervise system modules through generic lifecycle handling
 The runtime SHALL supervise first-party system modules using generic lifecycle mechanics for start, stop, restart, and diagnostics, without embedding module-specific supervision flows in the daemon.

@@ -2,19 +2,22 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use rkyv::{
-    Archive, Deserialize, Serialize,
     api::high::{HighDeserializer, HighValidator},
+    Archive, Deserialize, Serialize,
 };
 use selium_abi::{
-    DataValue, RkyvEncode, RuntimeUsageQuery, RuntimeUsageRecord, decode_rkyv, encode_rkyv,
+    decode_rkyv, encode_rkyv, DataValue, RkyvEncode, RuntimeUsageQuery, RuntimeUsageRecord,
 };
-use selium_control_plane_api::{ContractKind, OperationalProcessSelector, PublicEndpointRef};
+use selium_control_plane_api::{
+    BandwidthProfile, ContractKind, DiscoveryCapabilityScope, IsolationProfile,
+    OperationalProcessSelector, PublicEndpointRef,
+};
 use selium_control_plane_core::{Mutation, Query};
 use selium_io_consensus::{AppendEntries, RequestVote};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const FLAG_REQUEST: u16 = 0x01;
 pub const FLAG_RESPONSE: u16 = 0x02;
 pub const FLAG_ERROR: u16 = 0x04;
@@ -91,15 +94,23 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct MutateApiRequest {
+    /// Client-supplied idempotency key for the semantic mutation.
     pub idempotency_key: String,
+    /// Guest-owned semantic mutation to apply.
     pub mutation: Mutation,
+    /// Host-authenticated discovery and binding scope forwarded to the guest.
+    pub authorisation: Option<DiscoveryCapabilityScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct QueryApiRequest {
+    /// Guest-owned semantic query to execute.
     pub query: Query,
+    /// Whether followers may answer without forwarding to the leader.
     pub allow_stale: bool,
+    /// Host-authenticated discovery and binding scope forwarded to the guest.
+    pub authorisation: Option<DiscoveryCapabilityScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -244,10 +255,58 @@ pub struct ManagedEndpointBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
+/// Guest-owned reason for a workload lifecycle transition.
+pub enum WorkloadLifecycleReason {
+    Reconcile,
+    OperatorRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Desired workload lifecycle transition requested by the control plane.
+pub enum DesiredWorkloadTransition {
+    Start,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Guest-authored runtime posture the host should realize for a workload instance.
+pub struct WorkloadResourcePosture {
+    /// Isolation profile to enforce for the instance.
+    pub isolation: IsolationProfile,
+    /// CPU budget in millis requested for the instance.
+    pub cpu_millis: u32,
+    /// Memory budget in MiB requested for the instance.
+    pub memory_mib: u32,
+    /// Ephemeral storage budget in MiB requested for the instance.
+    pub ephemeral_storage_mib: u32,
+    /// Bandwidth profile requested for the instance.
+    pub bandwidth_profile: BandwidthProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Guest-owned orchestration intent forwarded to the host daemon.
+pub struct WorkloadOrchestrationIntent {
+    /// Workload identity that owns the transition.
+    pub workload_key: String,
+    /// Instance identity to start or stop.
+    pub instance_id: String,
+    /// Desired lifecycle transition.
+    pub transition: DesiredWorkloadTransition,
+    /// Why the transition should happen.
+    pub reason: WorkloadLifecycleReason,
+    /// Requested runtime posture for start-like transitions.
+    pub resource_posture: Option<WorkloadResourcePosture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
 pub struct StartRequest {
     pub node_id: String,
-    pub workload_key: String,
-    pub instance_id: String,
+    /// Guest-owned orchestration intent for the new instance.
+    pub intent: WorkloadOrchestrationIntent,
     pub module_spec: String,
     pub external_account_ref: Option<String>,
     pub managed_endpoint_bindings: Vec<ManagedEndpointBinding>,
@@ -266,7 +325,8 @@ pub struct StartResponse {
 #[rkyv(bytecheck())]
 pub struct StopRequest {
     pub node_id: String,
-    pub instance_id: String,
+    /// Guest-owned orchestration intent for the running instance.
+    pub intent: WorkloadOrchestrationIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -369,17 +429,63 @@ pub enum EndpointBridgeSemantics {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
+/// Guest-owned classification for a realized endpoint bridge.
+pub enum EndpointBridgeClassification {
+    WorkloadDataPlane,
+    OperationalLogs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Health ownership policy for a bridge intent.
+pub enum EndpointBridgeHealthPolicy {
+    GuestControlled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Guest-owned lifecycle policy for a bridge intent.
+pub struct EndpointBridgeLifecyclePolicy {
+    /// Whether the host should keep the bridge attached while it remains healthy.
+    pub keep_attached_when_healthy: bool,
+    /// Which side owns health policy decisions.
+    pub health: EndpointBridgeHealthPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+/// Guest-authored bridge intent forwarded to the host daemon.
+pub struct EndpointBridgeIntent {
+    /// Stable bridge identifier.
+    pub bridge_id: String,
+    /// Source instance identity.
+    pub source_instance_id: String,
+    /// Source public endpoint.
+    pub source_endpoint: PublicEndpointRef,
+    /// Target instance identity.
+    pub target_instance_id: String,
+    /// Target node identity.
+    pub target_node: String,
+    /// Target daemon address.
+    pub target_daemon_addr: String,
+    /// Target daemon TLS server name.
+    pub target_daemon_server_name: String,
+    /// Target public endpoint.
+    pub target_endpoint: PublicEndpointRef,
+    /// Guest-owned bridge classification.
+    pub classification: EndpointBridgeClassification,
+    /// Guest-owned lifecycle and health policy.
+    pub lifecycle: EndpointBridgeLifecyclePolicy,
+    /// Bridge message semantics the host should realize.
+    pub semantics: EndpointBridgeSemantics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
 pub struct ActivateEndpointBridgeRequest {
     pub node_id: String,
-    pub bridge_id: String,
-    pub source_instance_id: String,
-    pub source_endpoint: PublicEndpointRef,
-    pub target_instance_id: String,
-    pub target_node: String,
-    pub target_daemon_addr: String,
-    pub target_daemon_server_name: String,
-    pub target_endpoint: PublicEndpointRef,
-    pub semantics: EndpointBridgeSemantics,
+    /// Guest-authored bridge intent to realize on this node.
+    pub intent: EndpointBridgeIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -619,6 +725,54 @@ mod tests {
         }
     }
 
+    fn sample_bridge_intent(kind: ContractKind, name: &str) -> EndpointBridgeIntent {
+        EndpointBridgeIntent {
+            bridge_id: format!("bridge-{name}"),
+            source_instance_id: "source-1".to_string(),
+            source_endpoint: sample_endpoint(kind, name),
+            target_instance_id: "target-1".to_string(),
+            target_node: "node-b".to_string(),
+            target_daemon_addr: "127.0.0.1:7100".to_string(),
+            target_daemon_server_name: "node-b.local".to_string(),
+            target_endpoint: sample_endpoint(kind, name),
+            classification: EndpointBridgeClassification::WorkloadDataPlane,
+            lifecycle: EndpointBridgeLifecyclePolicy {
+                keep_attached_when_healthy: true,
+                health: EndpointBridgeHealthPolicy::GuestControlled,
+            },
+            semantics: match kind {
+                ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
+                    delivery: EventDeliveryMode::Frame,
+                }),
+                ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
+                    correlation: ServiceCorrelationMode::RequestId,
+                }),
+                ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
+                    lifecycle: StreamLifecycleMode::SessionFrames,
+                }),
+            },
+        }
+    }
+
+    fn sample_workload_intent(
+        instance_id: &str,
+        transition: DesiredWorkloadTransition,
+    ) -> WorkloadOrchestrationIntent {
+        WorkloadOrchestrationIntent {
+            workload_key: "tenant-a/media/ingest".to_string(),
+            instance_id: instance_id.to_string(),
+            transition,
+            reason: WorkloadLifecycleReason::Reconcile,
+            resource_posture: Some(WorkloadResourcePosture {
+                isolation: IsolationProfile::Standard,
+                cpu_millis: 250,
+                memory_mib: 128,
+                ephemeral_storage_mib: 64,
+                bandwidth_profile: BandwidthProfile::Standard,
+            }),
+        }
+    }
+
     #[test]
     fn managed_endpoint_bindings_preserve_kind_role_and_type() {
         let binding = ManagedEndpointBinding {
@@ -632,8 +786,7 @@ mod tests {
             7,
             &StartRequest {
                 node_id: "node-a".to_string(),
-                workload_key: "tenant-a/media/ingest".to_string(),
-                instance_id: "inst-1".to_string(),
+                intent: sample_workload_intent("inst-1", DesiredWorkloadTransition::Start),
                 module_spec: "path=demo.wasm".to_string(),
                 external_account_ref: Some("acct-42".to_string()),
                 managed_endpoint_bindings: vec![binding.clone()],
@@ -642,7 +795,7 @@ mod tests {
         .expect("encode");
         let envelope = decode_envelope(&bytes).expect("decode envelope");
         let decoded: StartRequest = decode_payload(&envelope).expect("decode payload");
-        assert_eq!(decoded.workload_key, "tenant-a/media/ingest");
+        assert_eq!(decoded.intent.workload_key, "tenant-a/media/ingest");
         assert_eq!(decoded.external_account_ref.as_deref(), Some("acct-42"));
         assert_eq!(decoded.managed_endpoint_bindings, vec![binding]);
     }
@@ -651,17 +804,7 @@ mod tests {
     fn endpoint_bridge_activation_round_trips_event_semantics() {
         let request = ActivateEndpointBridgeRequest {
             node_id: "node-a".to_string(),
-            bridge_id: "bridge-1".to_string(),
-            source_instance_id: "source-1".to_string(),
-            source_endpoint: sample_endpoint(ContractKind::Event, "camera.frames"),
-            target_instance_id: "target-1".to_string(),
-            target_node: "node-b".to_string(),
-            target_daemon_addr: "127.0.0.1:7100".to_string(),
-            target_daemon_server_name: "node-b.local".to_string(),
-            target_endpoint: sample_endpoint(ContractKind::Event, "camera.frames"),
-            semantics: EndpointBridgeSemantics::Event(EventBridgeSemantics {
-                delivery: EventDeliveryMode::Frame,
-            }),
+            intent: sample_bridge_intent(ContractKind::Event, "camera.frames"),
         };
         let bytes = encode_request(Method::ActivateEndpointBridge, 11, &request).expect("encode");
         let envelope = decode_envelope(&bytes).expect("decode envelope");
@@ -674,17 +817,7 @@ mod tests {
     fn endpoint_bridge_activation_round_trips_stream_session_semantics() {
         let request = ActivateEndpointBridgeRequest {
             node_id: "node-a".to_string(),
-            bridge_id: "bridge-stream".to_string(),
-            source_instance_id: "source-1".to_string(),
-            source_endpoint: sample_endpoint(ContractKind::Stream, "camera.raw"),
-            target_instance_id: "target-1".to_string(),
-            target_node: "node-b".to_string(),
-            target_daemon_addr: "127.0.0.1:7100".to_string(),
-            target_daemon_server_name: "node-b.local".to_string(),
-            target_endpoint: sample_endpoint(ContractKind::Stream, "camera.raw"),
-            semantics: EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
-                lifecycle: StreamLifecycleMode::SessionFrames,
-            }),
+            intent: sample_bridge_intent(ContractKind::Stream, "camera.raw"),
         };
         let bytes = encode_request(Method::ActivateEndpointBridge, 12, &request).expect("encode");
         let envelope = decode_envelope(&bytes).expect("decode envelope");

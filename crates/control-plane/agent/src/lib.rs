@@ -3,16 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rkyv::{Archive, Deserialize, Serialize};
-use selium_control_plane_api::{
-    ContractKind, ControlPlaneState, DeploymentSpec, PublicEndpointRef,
-};
+use selium_control_plane_api::{ContractKind, ControlPlaneState, DeploymentSpec};
 use selium_control_plane_protocol::{
-    EndpointBridgeSemantics, EventBridgeSemantics, EventDeliveryMode, ManagedEndpointBinding,
-    ManagedEndpointBindingType, ManagedEndpointRole, ServiceBridgeSemantics,
-    ServiceCorrelationMode, StreamBridgeSemantics, StreamLifecycleMode,
+    EndpointBridgeIntent, ManagedEndpointBinding, ManagedEndpointBindingType, ManagedEndpointRole,
 };
 use selium_control_plane_scheduler::{
-    SchedulePlan, ScheduledEndpointBridgeIntent, ScheduledInstance, build_endpoint_bridge_intents,
+    build_endpoint_bridge_intents, SchedulePlan, ScheduledEndpointBridgeIntent, ScheduledInstance,
 };
 
 /// Well-known module identifier used by the host when wiring system workloads.
@@ -90,18 +86,8 @@ pub enum ReconcileAction {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct EnsureEndpointBridgeAction {
-    /// Bridge identifier.
-    pub bridge_id: String,
-    /// Source instance id.
-    pub source_instance_id: String,
-    /// Source public endpoint reference.
-    pub source_endpoint: PublicEndpointRef,
-    /// Target instance id.
-    pub target_instance_id: String,
-    /// Target node id.
-    pub target_node: String,
-    /// Target public endpoint reference.
-    pub target_endpoint: PublicEndpointRef,
+    /// Guest-authored bridge intent.
+    pub intent: EndpointBridgeIntent,
 }
 
 /// Remote peer metadata required to connect to another control-plane daemon.
@@ -232,20 +218,20 @@ pub fn reconcile(
         .collect::<Vec<_>>();
     let desired_bridge_ids = desired_bridges
         .iter()
-        .map(|bridge| bridge.bridge_id.clone())
+        .map(|bridge| bridge.intent.bridge_id.clone())
         .collect::<BTreeSet<_>>();
 
     for bridge in desired_bridges {
-        if !current.active_bridges.contains(&bridge.bridge_id) {
+        if !current.active_bridges.contains(&bridge.intent.bridge_id) {
+            let target_spec = state
+                .nodes
+                .get(&bridge.intent.target_node)
+                .expect("scheduled bridge target node should exist");
+            let mut intent = bridge.intent;
+            intent.target_daemon_addr = target_spec.daemon_addr.clone();
+            intent.target_daemon_server_name = target_spec.daemon_server_name.clone();
             actions.push(ReconcileAction::EnsureEndpointBridge(Box::new(
-                EnsureEndpointBridgeAction {
-                    bridge_id: bridge.bridge_id,
-                    source_instance_id: bridge.source_instance_id,
-                    source_endpoint: bridge.source_endpoint,
-                    target_instance_id: bridge.target_instance_id,
-                    target_node: bridge.target_node,
-                    target_endpoint: bridge.target_endpoint,
-                },
+                EnsureEndpointBridgeAction { intent },
             )));
         }
     }
@@ -283,27 +269,14 @@ pub fn apply(current: &mut AgentState, actions: &[ReconcileAction]) {
                 current.running_instances.remove(instance_id);
             }
             ReconcileAction::EnsureEndpointBridge(action) => {
-                current.active_bridges.insert(action.bridge_id.clone());
+                current
+                    .active_bridges
+                    .insert(action.intent.bridge_id.clone());
             }
             ReconcileAction::RemoveEndpointBridge { bridge_id } => {
                 current.active_bridges.remove(bridge_id);
             }
         }
-    }
-}
-
-/// Return the managed bridge semantics for a contract kind.
-pub fn endpoint_bridge_semantics(kind: ContractKind) -> EndpointBridgeSemantics {
-    match kind {
-        ContractKind::Event => EndpointBridgeSemantics::Event(EventBridgeSemantics {
-            delivery: EventDeliveryMode::Frame,
-        }),
-        ContractKind::Service => EndpointBridgeSemantics::Service(ServiceBridgeSemantics {
-            correlation: ServiceCorrelationMode::RequestId,
-        }),
-        ContractKind::Stream => EndpointBridgeSemantics::Stream(StreamBridgeSemantics {
-            lifecycle: StreamLifecycleMode::SessionFrames,
-        }),
     }
 }
 
@@ -323,32 +296,26 @@ pub fn managed_endpoint_bindings_for_instance(
 ) -> Vec<ManagedEndpointBinding> {
     let mut bindings = BTreeMap::<(u8, ContractKind, String), ManagedEndpointBinding>::new();
     for bridge in bridges {
-        if bridge.source_instance_id == instance_id {
+        if bridge.intent.source_instance_id == instance_id {
+            let source_endpoint = &bridge.intent.source_endpoint;
             bindings
-                .entry((
-                    0,
-                    bridge.source_endpoint.kind,
-                    bridge.source_endpoint.name.clone(),
-                ))
+                .entry((0, source_endpoint.kind, source_endpoint.name.clone()))
                 .or_insert_with(|| ManagedEndpointBinding {
-                    endpoint_name: bridge.source_endpoint.name.clone(),
-                    endpoint_kind: bridge.source_endpoint.kind,
+                    endpoint_name: source_endpoint.name.clone(),
+                    endpoint_kind: source_endpoint.kind,
                     role: ManagedEndpointRole::Egress,
-                    binding_type: binding_type_for_kind(bridge.source_endpoint.kind),
+                    binding_type: binding_type_for_kind(source_endpoint.kind),
                 });
         }
-        if bridge.target_instance_id == instance_id {
+        if bridge.intent.target_instance_id == instance_id {
+            let target_endpoint = &bridge.intent.target_endpoint;
             bindings
-                .entry((
-                    1,
-                    bridge.target_endpoint.kind,
-                    bridge.target_endpoint.name.clone(),
-                ))
+                .entry((1, target_endpoint.kind, target_endpoint.name.clone()))
                 .or_insert_with(|| ManagedEndpointBinding {
-                    endpoint_name: bridge.target_endpoint.name.clone(),
-                    endpoint_kind: bridge.target_endpoint.kind,
+                    endpoint_name: target_endpoint.name.clone(),
+                    endpoint_kind: target_endpoint.kind,
                     role: ManagedEndpointRole::Ingress,
-                    binding_type: binding_type_for_kind(bridge.target_endpoint.kind),
+                    binding_type: binding_type_for_kind(target_endpoint.kind),
                 });
         }
     }

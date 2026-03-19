@@ -31,19 +31,24 @@ const CONTROL_PLANE_CAPABILITIES: &[&str] = &[
 
 const CONTROL_PLANE_RESPONSIBILITIES: &[SystemModuleResponsibility] = &[
     SystemModuleResponsibility {
-        area: "execution, transport, and capability enforcement",
+        area: "execution, isolation, transport termination, and capability enforcement",
         classification: SystemModuleResponsibilityClassification::HostSubstrate,
-        rationale: "Trusted execution, isolation, and authenticated transport remain host responsibilities.",
+        rationale: "Trusted execution, isolation, authenticated transport termination, and capability grants remain permanent host substrate responsibilities.",
     },
     SystemModuleResponsibility {
-        area: "desired-state interpretation and reconcile decisions",
+        area: "authentication, authorisation, and gateway enforcement",
+        classification: SystemModuleResponsibilityClassification::HostSubstrate,
+        rationale: "The daemon stays responsible for verifying callers and enforcing access before any guest-owned control semantics run.",
+    },
+    SystemModuleResponsibility {
+        area: "bridge worker and process realization",
+        classification: SystemModuleResponsibilityClassification::HostSubstrate,
+        rationale: "Process launches, capability grants, runtime-managed bindings, and bridge worker execution remain trusted host mechanisms.",
+    },
+    SystemModuleResponsibility {
+        area: "control API meaning, bridge topology and lifecycle, and workload orchestration intent",
         classification: SystemModuleResponsibilityClassification::GuestOwnedPolicy,
-        rationale: "Control policy evolves inside the control-plane guest so it can change without bespoke daemon logic.",
-    },
-    SystemModuleResponsibility {
-        area: "endpoint bridge data-plane delivery",
-        classification: SystemModuleResponsibilityClassification::HostSubstrate,
-        rationale: "Cross-node delivery still depends on trusted host networking primitives and runtime-managed bindings.",
+        rationale: "Desired-state interpretation stays in the control-plane guest so roadmap phases can move product semantics out of the daemon without changing host enforcement primitives.",
     },
 ];
 
@@ -327,11 +332,25 @@ mod tests {
 
     #[test]
     fn control_plane_responsibility_report_covers_host_and_guest_roles() {
+        assert_eq!(
+            CONTROL_PLANE_RESPONSIBILITIES
+                .iter()
+                .filter(|entry| {
+                    entry.classification
+                        == SystemModuleResponsibilityClassification::HostSubstrate
+                })
+                .count(),
+            3
+        );
         assert!(CONTROL_PLANE_RESPONSIBILITIES.iter().any(|entry| {
             entry.classification == SystemModuleResponsibilityClassification::HostSubstrate
         }));
         assert!(CONTROL_PLANE_RESPONSIBILITIES.iter().any(|entry| {
             entry.classification == SystemModuleResponsibilityClassification::GuestOwnedPolicy
+        }));
+        assert!(CONTROL_PLANE_RESPONSIBILITIES.iter().any(|entry| {
+            entry.area
+                == "control API meaning, bridge topology and lifecycle, and workload orchestration intent"
         }));
     }
 }

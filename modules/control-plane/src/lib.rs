@@ -10,11 +10,11 @@ use selium_abi::{
 };
 use selium_control_plane_agent::{
     AgentState, ControlPlaneModuleConfig, EVENT_LOG_NAME, INTERNAL_BINDING_NAME, PEER_PROFILE_NAME,
-    ReconcileAction, SNAPSHOT_BLOB_STORE_NAME, deployment_module_spec, endpoint_bridge_semantics,
-    reconcile,
+    ReconcileAction, SNAPSHOT_BLOB_STORE_NAME, deployment_module_spec, reconcile,
 };
 use selium_control_plane_api::{
-    ControlPlaneState, DiscoveryRequest, DiscoveryTarget, IsolationProfile, NodeSpec,
+    ControlPlaneState, DiscoveryCapabilityScope, DiscoveryPattern, DiscoveryRequest,
+    DiscoveryTarget, IsolationProfile, NodeSpec,
 };
 use selium_control_plane_core::{
     Mutation, MutationEnvelope, MutationResponse, Query, serialize_deployment_resources,
@@ -22,10 +22,12 @@ use selium_control_plane_core::{
 };
 use selium_control_plane_protocol::{
     ActivateEndpointBridgeRequest, ActivateEndpointBridgeResponse, AppendEntriesApiRequest,
-    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse, ListRequest, ListResponse,
-    Method, MetricsApiResponse, MutateApiRequest, MutateApiResponse, QueryApiRequest,
-    QueryApiResponse, ReplayApiResponse, RequestVoteApiRequest, StartRequest, StatusApiResponse,
-    StopRequest, decode_envelope, decode_list_response, decode_payload, encode_error_response,
+    DeactivateEndpointBridgeRequest, DeactivateEndpointBridgeResponse,
+    DesiredWorkloadTransition, ListRequest, ListResponse, Method, MetricsApiResponse,
+    MutateApiRequest, MutateApiResponse, QueryApiRequest, QueryApiResponse, ReplayApiResponse,
+    RequestVoteApiRequest, StartRequest, StatusApiResponse, StopRequest,
+    WorkloadLifecycleReason, WorkloadOrchestrationIntent, WorkloadResourcePosture,
+    decode_envelope, decode_list_response, decode_payload, encode_error_response,
     encode_response, is_error, is_request,
 };
 use selium_control_plane_runtime::{ControlPlaneEngine, RuntimeError};
@@ -296,6 +298,7 @@ async fn handle_request_frame(frame: Vec<u8>, state: SharedState) -> Result<Vec<
 }
 
 async fn handle_mutate(state: SharedState, request: MutateApiRequest) -> Result<MutateApiResponse> {
+    let request = authorise_mutation_request(request)?;
     {
         let borrowed = state.borrow();
         if let Some(existing) = borrowed.dedupe.get(&request.idempotency_key) {
@@ -396,6 +399,7 @@ async fn forward_mutation_to_leader(
 }
 
 async fn handle_query(state: SharedState, request: QueryApiRequest) -> Result<QueryApiResponse> {
+    let request = authorise_query_request(request)?;
     let query = request.query.clone();
     let (is_leader, leader_hint) = {
         let borrowed = state.borrow();
@@ -1100,6 +1104,7 @@ async fn publish_heartbeat(state: SharedState) -> Result<()> {
                 last_heartbeat_ms: now,
             },
         },
+        authorisation: None,
     };
     let _ = handle_mutate(state, request).await?;
     Ok(())
@@ -1302,6 +1307,91 @@ fn query_uses_observed_load_for_scheduling(query: &Query) -> bool {
     )
 }
 
+fn authorise_mutation_request(mut request: MutateApiRequest) -> Result<MutateApiRequest> {
+    let scope = request_scope(request.authorisation.as_ref());
+    match &request.mutation {
+        Mutation::UpsertDeployment { spec } => {
+            ensure_scope_allows_workload(&scope, &spec.workload.key(), "deployment mutation")?;
+        }
+        Mutation::SetScale { workload, .. } => {
+            ensure_scope_allows_workload(&scope, &workload.key(), "scale mutation")?;
+        }
+        _ if scope_allows_all_workloads(&scope) => {}
+        _ => bail!("mutation requires full workload access"),
+    }
+    request.authorisation = Some(scope);
+    Ok(request)
+}
+
+fn authorise_query_request(mut request: QueryApiRequest) -> Result<QueryApiRequest> {
+    let scope = request_scope(request.authorisation.as_ref());
+    request.query = match request.query {
+        Query::DiscoveryState { .. } => Query::DiscoveryState {
+            scope: scope.clone(),
+        },
+        Query::ResolveDiscovery { mut request } => {
+            request.scope = scope.clone();
+            Query::ResolveDiscovery { request }
+        }
+        Query::AttributedInfrastructureInventory { filter } => {
+            ensure_scope_allows_workload_filter(
+                &scope,
+                filter.workload.as_deref(),
+                "infrastructure inventory query",
+            )?;
+            Query::AttributedInfrastructureInventory { filter }
+        }
+        other if scope_allows_all_workloads(&scope) && scope_allows_all_endpoints(&scope) => other,
+        _ => bail!("query requires full workload and endpoint access"),
+    };
+    request.authorisation = Some(scope);
+    Ok(request)
+}
+
+fn request_scope(scope: Option<&DiscoveryCapabilityScope>) -> DiscoveryCapabilityScope {
+    scope.cloned().unwrap_or_else(DiscoveryCapabilityScope::allow_all)
+}
+
+fn ensure_scope_allows_workload(
+    scope: &DiscoveryCapabilityScope,
+    workload: &str,
+    subject: &str,
+) -> Result<()> {
+    if scope_allows_all_workloads(scope)
+        || scope.workloads.iter().any(|pattern| pattern.matches(workload))
+    {
+        Ok(())
+    } else {
+        bail!("unauthorised workload `{workload}` for {subject}")
+    }
+}
+
+fn ensure_scope_allows_workload_filter(
+    scope: &DiscoveryCapabilityScope,
+    workload: Option<&str>,
+    subject: &str,
+) -> Result<()> {
+    match workload {
+        Some(workload) => ensure_scope_allows_workload(scope, workload, subject),
+        None if scope_allows_all_workloads(scope) => Ok(()),
+        None => bail!("{subject} requires an explicit authorised workload filter"),
+    }
+}
+
+fn scope_allows_all_workloads(scope: &DiscoveryCapabilityScope) -> bool {
+    scope
+        .workloads
+        .iter()
+        .any(|pattern| matches!(pattern, DiscoveryPattern::Prefix(prefix) if prefix.is_empty()))
+}
+
+fn scope_allows_all_endpoints(scope: &DiscoveryCapabilityScope) -> bool {
+    scope
+        .endpoints
+        .iter()
+        .any(|pattern| matches!(pattern, DiscoveryPattern::Prefix(prefix) if prefix.is_empty()))
+}
+
 fn max_observed_load_age_ms(config: &ControlPlaneModuleConfig) -> u64 {
     config
         .heartbeat_interval_ms
@@ -1361,8 +1451,19 @@ async fn execute_daemon_actions(
                     Method::StartInstance,
                     &StartRequest {
                         node_id: node.to_string(),
-                        workload_key: deployment.clone(),
-                        instance_id: instance_id.clone(),
+                        intent: WorkloadOrchestrationIntent {
+                            workload_key: deployment.clone(),
+                            instance_id: instance_id.clone(),
+                            transition: DesiredWorkloadTransition::Start,
+                            reason: WorkloadLifecycleReason::Reconcile,
+                            resource_posture: Some(WorkloadResourcePosture {
+                                isolation: spec.isolation.clone(),
+                                cpu_millis: spec.cpu_millis,
+                                memory_mib: spec.memory_mib,
+                                ephemeral_storage_mib: spec.ephemeral_storage_mib,
+                                bandwidth_profile: spec.bandwidth_profile,
+                            }),
+                        },
                         module_spec,
                         external_account_ref: spec
                             .external_account_ref
@@ -1381,33 +1482,26 @@ async fn execute_daemon_actions(
                     Method::StopInstance,
                     &StopRequest {
                         node_id: node.to_string(),
-                        instance_id: instance_id.clone(),
+                        intent: WorkloadOrchestrationIntent {
+                            workload_key: instance_workload_key(cp_state, instance_id).unwrap_or_default(),
+                            instance_id: instance_id.clone(),
+                            transition: DesiredWorkloadTransition::Stop,
+                            reason: WorkloadLifecycleReason::Reconcile,
+                            resource_posture: None,
+                        },
                     },
                 )
                 .await?
                 .ok_or_else(|| anyhow!("missing stop response"))?;
             }
             ReconcileAction::EnsureEndpointBridge(action) => {
-                let target_spec = cp_state
-                    .nodes
-                    .get(&action.target_node)
-                    .ok_or_else(|| anyhow!("unknown target node `{}`", action.target_node))?
-                    .clone();
                 let _: ActivateEndpointBridgeResponse = send_daemon_rpc(
                     state,
                     &authority,
                     Method::ActivateEndpointBridge,
                     &ActivateEndpointBridgeRequest {
                         node_id: node.to_string(),
-                        bridge_id: action.bridge_id.clone(),
-                        source_instance_id: action.source_instance_id.clone(),
-                        source_endpoint: action.source_endpoint.clone(),
-                        target_instance_id: action.target_instance_id.clone(),
-                        target_node: action.target_node.clone(),
-                        target_daemon_addr: target_spec.daemon_addr,
-                        target_daemon_server_name: target_spec.daemon_server_name,
-                        target_endpoint: action.target_endpoint.clone(),
-                        semantics: endpoint_bridge_semantics(action.source_endpoint.kind),
+                        intent: action.intent.clone(),
                     },
                 )
                 .await?
@@ -1430,6 +1524,19 @@ async fn execute_daemon_actions(
     }
 
     Ok(())
+}
+
+fn instance_workload_key(cp_state: &ControlPlaneState, instance_id: &str) -> Option<String> {
+    cp_state.deployments.keys().find_map(|workload_key| {
+        let mut parts = workload_key.split('/');
+        let prefix = format!(
+            "tenant={};namespace={};workload={};",
+            parts.next()?,
+            parts.next()?,
+            parts.next()?
+        );
+        instance_id.starts_with(&prefix).then(|| workload_key.clone())
+    })
 }
 
 async fn apply_committed(state: SharedState) -> Result<BTreeMap<u64, MutationResponse>> {
