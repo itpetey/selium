@@ -1,4 +1,5 @@
 mod guest_logs;
+mod system_modules;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,14 +18,11 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::{Connection, Endpoint, Incoming};
 use selium_abi::{
-    Capability, DataValue, InteractionKind, NetworkProtocol, ProcessLogBindings, QueueAck,
-    QueueAttach, QueueCommit, QueueCreate, QueueDelivery, QueueOverflow, QueueReserve, QueueRole,
-    QueueStatusCode, ShmAlloc, decode_rkyv, encode_rkyv,
+    Capability, DataValue, ProcessLogBindings, QueueAck, QueueAttach, QueueCommit, QueueCreate,
+    QueueDelivery, QueueOverflow, QueueReserve, QueueRole, QueueStatusCode, ShmAlloc, decode_rkyv,
+    encode_rkyv,
 };
-use selium_control_plane_agent::{
-    ControlPlaneModuleConfig, ENTRYPOINT, EVENT_LOG_NAME, INTERNAL_BINDING_NAME, MODULE_ID,
-    PEER_PROFILE_NAME, PeerTarget, SNAPSHOT_BLOB_STORE_NAME,
-};
+use selium_control_plane_agent::PeerTarget;
 use selium_control_plane_api::{
     ContractKind, ControlPlaneState, DiscoveryCapabilityScope, DiscoveryOperation,
     DiscoveryRequest, DiscoveryResolution, DiscoveryTarget, NodeSpec, OperationalProcessRecord,
@@ -43,7 +41,6 @@ use selium_control_plane_protocol::{
     SubscribeGuestLogsResponse, decode_envelope, decode_error, decode_payload,
     encode_error_response, encode_request, encode_response, is_error, is_request,
 };
-use selium_io_durability::RetentionPolicy;
 use selium_kernel::{
     Kernel,
     registry::{Registry, ResourceHandle, ResourceType},
@@ -53,8 +50,6 @@ use selium_kernel::{
     },
     spi::{queue::QueueCapability, shared_memory::SharedMemoryCapability},
 };
-use selium_runtime_network::{NetworkEgressProfile, NetworkIngressBinding, NetworkService};
-use selium_runtime_storage::{StorageBlobStoreDefinition, StorageLogDefinition, StorageService};
 use selium_runtime_support::{
     ClientTlsPaths, ServerTlsPaths, build_quic_client_endpoint, build_quic_server_endpoint,
     parse_socket_addr, read_framed, write_framed,
@@ -75,6 +70,10 @@ use self::guest_logs::{
     stream_guest_log_events,
 };
 use self::guest_logs::{handle_guest_log_subscription_stream, query_runtime_usage};
+use self::system_modules::{
+    SystemModuleInstance, SystemModuleReadinessPolicy, bootstrap_system_module,
+    build_control_plane_system_module,
+};
 use crate::{
     auth::{
         AccessPolicy, AuthenticatedRequestContext, peer_fingerprint, principal_from_cert,
@@ -108,7 +107,7 @@ struct DaemonState {
     active_bridges: Mutex<BTreeMap<String, ActiveEndpointBridge>>,
     host_subscription_id: AtomicU64,
     control_plane: Arc<LocalControlPlaneClient>,
-    control_plane_process_id: usize,
+    control_plane_module: SystemModuleInstance,
     tls_paths: ManagedEventTlsPaths,
     access_policy: AccessPolicy,
 }
@@ -325,38 +324,25 @@ impl LocalControlPlaneClient {
             .context("read proxy response")?
     }
 
-    async fn wait_until_ready(&self) -> Result<()> {
-        for _ in 0..50 {
-            let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
-            let frame = encode_request(Method::ControlStatus, request_id, &Empty {})
-                .context("encode probe")?;
-            match self.request_raw(&frame).await {
-                Ok(response) => {
-                    let envelope = decode_envelope(&response).context("decode probe response")?;
-                    if envelope.method != Method::ControlStatus || envelope.request_id != request_id
-                    {
-                        bail!("control-plane readiness probe returned mismatched envelope");
-                    }
-                    if is_error(&envelope) {
-                        let err = decode_error(&envelope).context("decode probe error")?;
-                        return Err(anyhow!(
-                            "control-plane guest reported {}: {}",
-                            err.code,
-                            err.message
-                        ));
-                    }
-                    let _: StatusApiResponse =
-                        decode_payload(&envelope).context("decode probe payload")?;
-                    return Ok(());
-                }
-                Err(_) => {
-                    self.reset_connection().await;
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
+    async fn probe_status(&self) -> Result<()> {
+        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
+        let frame =
+            encode_request(Method::ControlStatus, request_id, &Empty {}).context("encode probe")?;
+        let response = self.request_raw(&frame).await?;
+        let envelope = decode_envelope(&response).context("decode probe response")?;
+        if envelope.method != Method::ControlStatus || envelope.request_id != request_id {
+            bail!("control-plane readiness probe returned mismatched envelope");
         }
-
-        Err(anyhow!("timed out waiting for guest control-plane module"))
+        if is_error(&envelope) {
+            let err = decode_error(&envelope).context("decode probe error")?;
+            return Err(anyhow!(
+                "control-plane guest reported {}: {}",
+                err.code,
+                err.message
+            ));
+        }
+        let _: StatusApiResponse = decode_payload(&envelope).context("decode probe payload")?;
+        Ok(())
     }
 
     async fn query_value(&self, query: Query, allow_stale: bool) -> Result<DataValue> {
@@ -419,6 +405,28 @@ impl LocalControlPlaneClient {
         *guard = Some(connection.clone());
         Ok(connection)
     }
+}
+
+async fn wait_for_system_module_readiness<F, Fut>(
+    module_name: &str,
+    policy: &SystemModuleReadinessPolicy,
+    mut probe: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    for _ in 0..policy.max_attempts {
+        match probe().await {
+            Ok(()) => return Ok(()),
+            Err(_) => sleep(policy.retry_delay).await,
+        }
+    }
+
+    Err(anyhow!(
+        "timed out waiting for system module `{module_name}` readiness: {}",
+        policy.description
+    ))
 }
 
 fn bootstrap_runtime_session() {
@@ -514,7 +522,7 @@ pub(crate) async fn run_daemon(
         public_addr: &public_addr,
         internal_addr: &internal_addr,
     };
-    let (control_plane_process_id, control_plane) =
+    let (control_plane_module, control_plane) =
         bootstrap_control_plane(&kernel, &registry, &work_dir, &args, &tls_paths, &addresses)
             .await?;
     let access_policy = build_access_policy(&work_dir, &args)?;
@@ -532,7 +540,7 @@ pub(crate) async fn run_daemon(
         active_bridges: Mutex::new(BTreeMap::new()),
         host_subscription_id: AtomicU64::new(1),
         control_plane,
-        control_plane_process_id,
+        control_plane_module,
         tls_paths: ManagedEventTlsPaths {
             ca_cert: ca_path.clone(),
             client_cert: peer_client_identity.as_ref().map(|(cert, _)| cert.clone()),
@@ -581,13 +589,14 @@ pub(crate) async fn run_daemon(
     if let Err(err) = modules::stop_process(
         &state.kernel,
         &state.registry,
-        state.control_plane_process_id,
+        state.control_plane_module.process_id,
     )
     .await
     {
         tracing::warn!(
-            process_id = state.control_plane_process_id,
-            "failed to stop control-plane module on shutdown: {err:#}"
+            process_id = state.control_plane_module.process_id,
+            module = state.control_plane_module.name,
+            "failed to stop system module on shutdown: {err:#}"
         );
     }
 
@@ -602,27 +611,22 @@ async fn bootstrap_control_plane(
     args: &DaemonArgs,
     tls_paths: &ControlPlaneTlsPaths<'_>,
     addresses: &ControlPlaneAddresses<'_>,
-) -> Result<(usize, Arc<LocalControlPlaneClient>)> {
+) -> Result<(SystemModuleInstance, Arc<LocalControlPlaneClient>)> {
     let peers = parse_peer_targets(&args.cp_peers)?;
-    register_control_plane_runtime_resources(kernel, work_dir, args, tls_paths, addresses, &peers)
-        .await?;
-
-    let module_config = ControlPlaneModuleConfig {
-        node_id: args.cp_node_id.clone(),
-        public_daemon_addr: addresses.public_addr.to_string(),
-        public_daemon_server_name: args.cp_server_name.clone(),
-        capacity_slots: args.cp_capacity_slots,
-        allocatable_cpu_millis: args.cp_allocatable_cpu_millis,
-        allocatable_memory_mib: args.cp_allocatable_memory_mib,
-        reserve_cpu_utilisation_ppm: args.cp_reserve_cpu_utilisation_ppm,
-        reserve_memory_utilisation_ppm: args.cp_reserve_memory_utilisation_ppm,
-        reserve_slots_utilisation_ppm: args.cp_reserve_slots_utilisation_ppm,
-        heartbeat_interval_ms: args.cp_heartbeat_interval_ms,
-        bootstrap_leader: args.cp_bootstrap_leader,
-        peers,
-    };
-
-    let process_id = spawn_control_plane_module(kernel, registry, work_dir, &module_config).await?;
+    let definition =
+        build_control_plane_system_module(work_dir, args, tls_paths, addresses, peers)?;
+    for responsibility in definition.responsibilities {
+        info!(
+            module = definition.name,
+            area = responsibility.area,
+            classification = ?responsibility.classification,
+            rationale = responsibility.rationale,
+            "system-module responsibility boundary"
+        );
+    }
+    let control_plane_module = bootstrap_system_module(kernel, registry, work_dir, &definition)
+        .await
+        .context("bootstrap control-plane system module")?;
     let client = Arc::new(LocalControlPlaneClient::new(
         parse_socket_addr(addresses.internal_addr)?,
         args.cp_server_name.clone(),
@@ -632,113 +636,35 @@ async fn bootstrap_control_plane(
     )?);
     info!(
         internal_addr = %addresses.internal_addr,
-        process_id,
-        "waiting for control-plane guest readiness"
+        process_id = control_plane_module.process_id,
+        module = control_plane_module.name,
+        "waiting for system-module readiness"
     );
-    client.wait_until_ready().await?;
+    let readiness_client = Arc::clone(&client);
+    wait_for_system_module_readiness(
+        control_plane_module.name,
+        &control_plane_module.readiness,
+        move || {
+            let readiness_client = Arc::clone(&readiness_client);
+            async move {
+                match readiness_client.probe_status().await {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        readiness_client.reset_connection().await;
+                        Err(err)
+                    }
+                }
+            }
+        },
+    )
+    .await?;
     info!(
         internal_addr = %addresses.internal_addr,
-        process_id,
-        "control-plane guest reported ready"
+        process_id = control_plane_module.process_id,
+        module = control_plane_module.name,
+        "system module reported ready"
     );
-    Ok((process_id, client))
-}
-
-async fn register_control_plane_runtime_resources(
-    kernel: &Kernel,
-    work_dir: &Path,
-    args: &DaemonArgs,
-    tls_paths: &ControlPlaneTlsPaths<'_>,
-    addresses: &ControlPlaneAddresses<'_>,
-    peers: &[PeerTarget],
-) -> Result<()> {
-    let network = kernel
-        .get::<NetworkService>()
-        .ok_or_else(|| anyhow!("missing NetworkService in kernel"))?;
-    let storage = kernel
-        .get::<StorageService>()
-        .ok_or_else(|| anyhow!("missing StorageService in kernel"))?;
-
-    let mut allowed_authorities = BTreeSet::new();
-    allowed_authorities.insert(addresses.public_addr.to_string());
-    for peer in peers {
-        allowed_authorities.insert(peer.daemon_addr.clone());
-    }
-
-    network
-        .register_egress_profile(NetworkEgressProfile {
-            name: PEER_PROFILE_NAME.to_string(),
-            protocol: NetworkProtocol::Quic,
-            interactions: vec![InteractionKind::Stream],
-            allowed_authorities: allowed_authorities.into_iter().collect(),
-            ca_cert_path: tls_paths.ca_path.to_path_buf(),
-            client_cert_path: tls_paths.peer_cert_path.map(Path::to_path_buf),
-            client_key_path: tls_paths.peer_key_path.map(Path::to_path_buf),
-        })
-        .await;
-    network
-        .register_ingress_binding(NetworkIngressBinding {
-            name: INTERNAL_BINDING_NAME.to_string(),
-            protocol: NetworkProtocol::Quic,
-            interactions: vec![InteractionKind::Stream],
-            listen_addr: addresses.internal_addr.to_string(),
-            cert_path: tls_paths.cert_path.to_path_buf(),
-            key_path: tls_paths.key_path.to_path_buf(),
-        })
-        .await;
-
-    let state_dir = make_abs(work_dir, &args.cp_state_dir);
-    storage
-        .register_log(StorageLogDefinition {
-            name: EVENT_LOG_NAME.to_string(),
-            path: state_dir.join("events.rkyv"),
-            retention: RetentionPolicy::default(),
-        })
-        .await;
-    storage
-        .register_blob_store(StorageBlobStoreDefinition {
-            name: SNAPSHOT_BLOB_STORE_NAME.to_string(),
-            path: state_dir.join("snapshots"),
-        })
-        .await;
-
-    Ok(())
-}
-
-async fn spawn_control_plane_module(
-    kernel: &Kernel,
-    registry: &Arc<Registry>,
-    work_dir: &Path,
-    config: &ControlPlaneModuleConfig,
-) -> Result<usize> {
-    let config_bytes = encode_rkyv(config).context("encode control-plane module config")?;
-    let module_spec = format!(
-        "path={MODULE_ID};entrypoint={ENTRYPOINT};capabilities={capabilities};network-egress-profiles={PEER_PROFILE_NAME};network-ingress-bindings={INTERNAL_BINDING_NAME};storage-logs={EVENT_LOG_NAME};storage-blobs={SNAPSHOT_BLOB_STORE_NAME};params=buffer;args=buffer:hex:{config_hex}",
-        capabilities = control_plane_capabilities().join(","),
-        config_hex = encode_hex(&config_bytes),
-    );
-
-    let spawned = modules::spawn_from_cli(kernel, registry, work_dir, &[module_spec]).await?;
-    spawned
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("control-plane spawn returned no process id"))
-}
-
-fn control_plane_capabilities() -> Vec<&'static str> {
-    vec![
-        "time_read",
-        "network_lifecycle",
-        "network_connect",
-        "network_accept",
-        "network_stream_read",
-        "network_stream_write",
-        "storage_lifecycle",
-        "storage_log_read",
-        "storage_log_write",
-        "storage_blob_read",
-        "storage_blob_write",
-    ]
+    Ok((control_plane_module, client))
 }
 
 fn parse_peer_targets(peer_specs: &[String]) -> Result<Vec<PeerTarget>> {

@@ -3,7 +3,7 @@ title: "Runtime"
 description: "The Selium runtime daemon, work directory, and module-spec surface."
 ---
 
-The Selium runtime (`selium-runtime`) is the host process behind everything else in the platform. It owns the work directory, hosts the kernel services, terminates mTLS for the CLI and peer traffic, and in daemon mode boots the control-plane guest that powers workload, pipeline, and node operations.
+The Selium runtime (`selium-runtime`) is the host process behind everything else in the platform. It owns the work directory, hosts the kernel services, terminates mTLS for the CLI and peer traffic, and in daemon mode boots first-party system modules through a shared lifecycle contract. Today the control-plane guest is the first module on that path and powers workload, pipeline, and node operations.
 
 ## Work directory
 
@@ -47,7 +47,14 @@ The important daemon flags are:
 - `--cp-state-dir` for raft state, snapshots, and durable control-plane events
 - `--quic-ca`, `--quic-cert`, `--quic-key`, `--quic-peer-cert`, and `--quic-peer-key` for mTLS material
 
-When daemon mode starts, Selium also boots its control-plane guest and exposes the lifecycle/control API that the `selium` CLI uses.
+When daemon mode starts, Selium boots its control-plane guest through the system-module governance path and exposes the lifecycle/control API that the `selium` CLI uses.
+
+That split is intentional:
+
+- the host keeps trusted substrate concerns such as execution, capability enforcement, storage, networking, and authenticated transport
+- first-party system modules keep evolving policy such as desired-state interpretation and reconciliation
+
+The current control-plane module remains the proving ground for this model, so some bridge delivery mechanics still live in the host while the shared lifecycle path settles.
 
 ## Direct module startup
 

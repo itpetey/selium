@@ -5,6 +5,8 @@ description: "Contracts, workloads, pipelines, and reconciliation in the current
 
 The control plane is Selium's desired-state layer. It gives workloads stable names, tracks published contract packages, records how workloads should connect, and turns that intent into running processes and endpoint bridges.
 
+In the current architecture, the control plane runs as a first-party system module. The runtime host provides trusted substrate services such as execution, capability enforcement, transport, and runtime-managed resources, while the control-plane guest owns durable state, reconcile loops, and higher-level orchestration policy.
+
 ## The identities that matter
 
 The current public model is built around a few core types:
@@ -45,7 +47,7 @@ Publishing and deploying do not start workloads by themselves. Reconciliation is
 - `selium agent --once` applies the current desired state once
 - `selium agent` without `--once` keeps reconciling on an interval
 
-During reconciliation, Selium decides which instances should run on which node and whether it needs endpoint bridges between nodes. That is how workload wiring stays stable even when placement changes.
+During reconciliation, the control-plane guest decides which instances should run on which node and whether it needs endpoint bridges between nodes. The runtime host still executes the trusted data-plane mechanics needed to realise those decisions. That is how workload wiring stays stable even when placement changes.
 
 ## Control plane vs direct operations
 

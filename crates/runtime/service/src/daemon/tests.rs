@@ -2,9 +2,14 @@ use super::*;
 use std::{
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::anyhow;
 use clap::Parser;
 use selium_abi::{
     PrincipalKind, PrincipalRef, RuntimeUsageQuery, RuntimeUsageReplayStart, decode_rkyv,
@@ -20,6 +25,55 @@ use tokio::io::duplex;
 use crate::auth::AccessPolicy;
 use crate::config::{ServerCommand, ServerOptions};
 use crate::usage::{ProcessUsageAttribution, RuntimeUsageCollector};
+
+#[tokio::test]
+async fn wait_for_system_module_readiness_retries_until_probe_succeeds() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = Arc::clone(&attempts);
+
+    wait_for_system_module_readiness(
+        "control-plane",
+        &SystemModuleReadinessPolicy {
+            max_attempts: 3,
+            retry_delay: Duration::from_millis(0),
+            description: "probe succeeds",
+        },
+        move || {
+            let probe_attempts = Arc::clone(&probe_attempts);
+            async move {
+                if probe_attempts.fetch_add(1, Ordering::Relaxed) >= 1 {
+                    Ok(())
+                } else {
+                    Err(anyhow!("not ready"))
+                }
+            }
+        },
+    )
+    .await
+    .expect("module becomes ready");
+
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn wait_for_system_module_readiness_reports_timeout() {
+    let err = wait_for_system_module_readiness(
+        "control-plane",
+        &SystemModuleReadinessPolicy {
+            max_attempts: 2,
+            retry_delay: Duration::from_millis(0),
+            description: "probe succeeds",
+        },
+        || async { Err(anyhow!("still starting")) },
+    )
+    .await
+    .expect_err("readiness should time out");
+
+    assert!(
+        err.to_string()
+            .contains("timed out waiting for system module `control-plane`")
+    );
+}
 
 #[test]
 fn resolve_internal_tls_paths_fall_back_to_server_identity_when_client_identity_missing() {
@@ -2128,7 +2182,15 @@ fn sample_state(node_id: &str) -> Rc<DaemonState> {
             connection: Mutex::new(None),
             request_id: AtomicU64::new(1),
         }),
-        control_plane_process_id: 0,
+        control_plane_module: SystemModuleInstance {
+            name: "control-plane",
+            process_id: 0,
+            readiness: SystemModuleReadinessPolicy {
+                max_attempts: 1,
+                retry_delay: Duration::from_millis(0),
+                description: "test readiness",
+            },
+        },
         tls_paths: ManagedEventTlsPaths {
             ca_cert: PathBuf::new(),
             client_cert: None,
