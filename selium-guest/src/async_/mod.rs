@@ -7,13 +7,16 @@
 //! - `yield_now()` cooperatively yields to allow other tasks to run
 //! - `wait()` blocks until the host enqueues a wake signal
 //! - `shutdown()` blocks until the host signals shutdown
+//! - `FutureSharedState` bridges host async operations to guest futures
 
 pub mod background;
+pub mod future;
 pub mod yield_;
 pub mod shutdown;
 pub mod wait;
 
 pub use background::{spawn, JoinHandle, block_on};
+pub use future::{FutureSharedState, SharedFuture};
 pub use yield_::yield_now;
 pub use shutdown::shutdown;
 pub use wait::wait;

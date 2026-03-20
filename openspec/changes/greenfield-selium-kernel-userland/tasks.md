@@ -27,14 +27,14 @@
 
 ## 3. Async Host Extension
 
-- [ ] 3.1 Define hostcall signatures for async operations (network, storage)
-- [ ] 3.2 Implement async hostcall wrapper that spawns tokio tasks
-- [ ] 3.3 Implement FutureSharedState resolution from tokio tasks
-- [ ] 3.4 Implement mailbox enqueue on async completion
-- [ ] 3.5 Implement storage async operations (read, write, scan)
-- [ ] 3.6 Implement network async operations (connect, accept, read, write)
-- [ ] 3.7 Implement queue async operations (send, recv)
-- [ ] 3.8 Write integration tests for async host extension
+- [x] 3.1 Define hostcall signatures for async operations (network, storage)
+- [x] 3.2 Implement async hostcall wrapper that spawns tokio tasks
+- [x] 3.3 Implement FutureSharedState resolution from tokio tasks
+- [x] 3.4 Implement mailbox enqueue on async completion
+- [x] 3.5 Implement storage async operations (read, write, scan)
+- [x] 3.6 Implement network async operations (connect, accept, read, write)
+- [x] 3.7 Implement queue async operations (send, recv)
+- [x] 3.8 Write integration tests for async host extension
 
 ## 4. Capability Delegation
 

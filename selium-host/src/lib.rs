@@ -8,6 +8,7 @@
 //! - Memory management for guests
 //! - Hostcall dispatch with versioning
 //! - Usage metering
+//! - Async I/O (storage, network, queue)
 
 pub mod error;
 pub mod guest;
@@ -16,6 +17,10 @@ pub mod kernel;
 pub mod metering;
 pub mod process;
 pub mod time;
+pub mod async_host;
+pub mod storage;
+pub mod network;
+pub mod queue;
 
 pub use error::{Error, GuestExitStatus, Result};
 pub use guest::{Guest, GuestId};
@@ -24,3 +29,7 @@ pub use kernel::{Capability, Kernel};
 pub use metering::UsageMeter;
 pub use process::{ProcessHandle, ProcessId};
 pub use time::TimeSource;
+pub use async_host::{AsyncHostExtension, next_task_id, TaskId};
+pub use storage::{StorageCapability, StorageError, StorageResult};
+pub use network::{NetworkCapability, NetworkError, NetworkResult};
+pub use queue::{QueueCapability, QueueError, QueueResult, QueueHandle};
