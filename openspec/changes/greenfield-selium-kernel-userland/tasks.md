@@ -38,11 +38,11 @@
 
 ## 4. Capability Delegation
 
-- [ ] 4.1 Define handle types (StorageHandle, NetworkHandle, QueueHandle, ProcessHandle)
-- [ ] 4.2 Implement handle validation in spawn()
-- [ ] 4.3 Implement handle isolation per guest namespace
-- [ ] 4.4 Implement capability revocation on guest exit
-- [ ] 4.5 Write tests for capability delegation
+- [x] 4.1 Define handle types (StorageHandle, NetworkHandle, QueueHandle, ProcessHandle)
+- [x] 4.2 Implement handle validation in spawn()
+- [x] 4.3 Implement handle isolation per guest namespace
+- [x] 4.4 Implement capability revocation on guest exit
+- [x] 4.5 Write tests for capability delegation
 
 ## 5. Queue and RPC Framework
 

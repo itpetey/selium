@@ -9,6 +9,7 @@
 //! - Hostcall dispatch with versioning
 //! - Usage metering
 //! - Async I/O (storage, network, queue)
+//! - Capability delegation and isolation
 
 pub mod error;
 pub mod guest;
@@ -21,6 +22,8 @@ pub mod async_host;
 pub mod storage;
 pub mod network;
 pub mod queue;
+pub mod handles;
+pub mod capabilities;
 
 pub use error::{Error, GuestExitStatus, Result};
 pub use guest::{Guest, GuestId};
@@ -33,3 +36,7 @@ pub use async_host::{AsyncHostExtension, next_task_id, TaskId};
 pub use storage::{StorageCapability, StorageError, StorageResult};
 pub use network::{NetworkCapability, NetworkError, NetworkResult};
 pub use queue::{QueueCapability, QueueError, QueueResult, QueueHandle};
+pub use handles::{StorageHandle, NetworkHandle, AnyHandle, HandleId, next_handle_id};
+pub use capabilities::{
+    CapabilityRegistry, GuestNamespace, CapabilityGrant,
+};
