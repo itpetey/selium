@@ -79,9 +79,10 @@ impl HostcallDispatcher {
     pub fn is_removed(&self, name: &str) -> bool {
         let hc = self.hostcalls.read();
         if let Some(version) = hc.get(name)
-            && let Some(removed_in) = version.removed_in {
-                return removed_in <= HOST_VERSION;
-            }
+            && let Some(removed_in) = version.removed_in
+        {
+            return removed_in <= HOST_VERSION;
+        }
         false
     }
 

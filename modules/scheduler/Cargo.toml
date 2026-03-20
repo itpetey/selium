@@ -1,0 +1,19 @@
+[package]
+name = "scheduler"
+version = "1.0.0-alpha.7"
+edition = "2024"
+description = "Scheduler guest module for Selium"
+readme = "README.md"
+homepage = "https://selium.com"
+repository = "https://github.com/seliumlabs/selium"
+license = "MPL-2.0"
+keywords = ["runtime", "selium", "wasm", "guest", "scheduler"]
+categories = ["development-tools", "virtualization", "wasm"]
+
+[dependencies]
+selium-guest-runtime = { path = "../selium-guest-runtime" }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]

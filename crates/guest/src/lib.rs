@@ -1,23 +1,26 @@
 //! Selium Guest - Guest-side utilities for WASM modules.
 //!
-//! Provides:
-//! - Cooperative multitasking (spawn, yield_now)
-//! - Mailbox ring buffer for host → guest wake
-//! - FutureSharedState for bridging host async to guest
-//! - Shutdown signaling
-//! - RPC framework
-//! - Guest modules: init, consensus, scheduler, discovery, supervisor, routing
+//! This crate re-exports from selium-guest-runtime for backward compatibility.
+//! New code should use selium-guest-runtime directly.
 
-pub mod async_;
-pub mod consensus;
-pub mod discovery;
-pub mod error;
-pub mod init;
 pub mod mailbox;
-pub mod routing;
-pub mod rpc;
-pub mod scheduler;
-pub mod supervisor;
 
-pub use async_::{JoinHandle, block_on, shutdown, spawn, yield_now};
-pub use error::{GuestError, GuestResult};
+pub use selium_guest_runtime::Attribution;
+pub use selium_guest_runtime::FutureSharedState;
+pub use selium_guest_runtime::GuestError;
+pub use selium_guest_runtime::GuestResult;
+pub use selium_guest_runtime::JoinHandle;
+pub use selium_guest_runtime::RpcCall;
+pub use selium_guest_runtime::RpcCallFuture;
+pub use selium_guest_runtime::RpcClient;
+pub use selium_guest_runtime::RpcEnvelope;
+pub use selium_guest_runtime::RpcResponse;
+pub use selium_guest_runtime::RpcServer;
+pub use selium_guest_runtime::async_;
+pub use selium_guest_runtime::block_on;
+pub use selium_guest_runtime::error;
+pub use selium_guest_runtime::next_call_id;
+pub use selium_guest_runtime::rpc;
+pub use selium_guest_runtime::shutdown;
+pub use selium_guest_runtime::spawn;
+pub use selium_guest_runtime::yield_now;

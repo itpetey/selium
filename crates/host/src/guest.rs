@@ -86,9 +86,10 @@ impl Guest {
     /// Signal the guest to shut down.
     pub fn signal_shutdown(&mut self) {
         if let Some(instance) = &self.instance
-            && let Ok(func) = instance.get_typed_func::<(), ()>(&mut self.store, "shutdown") {
-                let _ = func.call(&mut self.store, ());
-            }
+            && let Ok(func) = instance.get_typed_func::<(), ()>(&mut self.store, "shutdown")
+        {
+            let _ = func.call(&mut self.store, ());
+        }
     }
 
     /// Set the guest's exit status.

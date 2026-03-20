@@ -37,8 +37,13 @@ async fn main() -> anyhow::Result<()> {
         .init_module
         .unwrap_or_else(|| PathBuf::from("init.wasm"));
     let engine = wasmtime::Engine::default();
-    let module = wasmtime::Module::from_file(&engine, &init_module_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load init module {}: {}", init_module_path.display(), e))?;
+    let module = wasmtime::Module::from_file(&engine, &init_module_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load init module {}: {}",
+            init_module_path.display(),
+            e
+        )
+    })?;
 
     info!("Loaded init module: {}", init_module_path.display());
 
