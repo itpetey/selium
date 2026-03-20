@@ -7,10 +7,12 @@
 //! - Usage metering
 
 use parking_lot::RwLock;
+use selium_abi::{Capability, GuestContext};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Instance, Linker, Memory, Module, Store};
 
+use crate::abi_hostcalls;
 use crate::async_host_functions;
 use crate::{GuestExitStatus, error::Result};
 
@@ -36,25 +38,34 @@ pub struct Guest {
     id: GuestId,
     instance: Option<Instance>,
     memory: Memory,
-    store: Store<()>,
+    store: Store<GuestContext>,
     exit_status: Arc<RwLock<Option<GuestExitStatus>>>,
 }
 
 impl Guest {
-    /// Spawn a new guest from a WASM module.
-    pub fn spawn(engine: &Engine, module: &Module, id: GuestId) -> Result<Self> {
-        let mut store = Store::new(engine, ());
+    /// Spawn a new guest from a WASM module with given capabilities.
+    pub fn spawn(
+        engine: &Engine,
+        module: &Module,
+        id: GuestId,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) -> Result<Self> {
+        let guest_ctx = GuestContext::with_capabilities(id.0, capabilities);
+        let mut store = Store::new(engine, guest_ctx);
 
         // Allocate memory for the guest
         let memory = Memory::new(&mut store, wasmtime::MemoryType::new(1, None))
             .map_err(|e| crate::Error::Wasm(e.to_string()))?;
 
-        // Create a linker with async hostcall imports
-        let mut linker: Linker<()> = Linker::new(engine);
+        // Create a linker with hostcall imports
+        let mut linker: Linker<GuestContext> = Linker::new(engine);
 
         // Add selium::async host functions (park, yield_now, wait_for_shutdown)
         async_host_functions::add_to_linker(&mut linker)
             .map_err(|e| crate::Error::Wasm(e.to_string()))?;
+
+        // Add abi hostcalls (time, storage, queue, network, caps)
+        abi_hostcalls::add_to_linker(&mut linker).map_err(|e| crate::Error::Wasm(e.to_string()))?;
 
         // Instantiate the module
         let instance = linker.instantiate(&mut store, module).map_err(|e| {

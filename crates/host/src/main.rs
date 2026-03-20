@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use selium_abi::Capability;
 use selium_host::{Guest, GuestExitStatus, Kernel, guest};
 
 #[tokio::main]
@@ -47,8 +48,23 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Loaded init module: {}", init_module_path.display());
 
-    // Spawn the init guest
-    let init_guest = Guest::spawn(&engine, &module, guest::next_guest_id())
+    // Spawn the init guest with all capabilities
+    let capabilities = [
+        Capability::TimeRead,
+        Capability::StorageLifecycle,
+        Capability::StorageLogRead,
+        Capability::StorageLogWrite,
+        Capability::StorageBlobRead,
+        Capability::StorageBlobWrite,
+        Capability::QueueLifecycle,
+        Capability::QueueWriter,
+        Capability::QueueReader,
+        Capability::NetworkLifecycle,
+        Capability::NetworkConnect,
+        Capability::NetworkStreamRead,
+        Capability::NetworkStreamWrite,
+    ];
+    let init_guest = Guest::spawn(&engine, &module, guest::next_guest_id(), capabilities)
         .map_err(|e| anyhow::anyhow!("Failed to spawn init guest: {}", e))?;
 
     info!("Spawned init guest: {:?}", init_guest.id());

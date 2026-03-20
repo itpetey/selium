@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/abi",
   "crates/guest",
   "crates/host",
   "modules/init",
@@ -26,6 +27,7 @@ categories = ["development-tools", "virtualization", "wasm"]
 anyhow = { version = "1", default-features = false }
 futures = { version = "0.3", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
+rkyv = { version = "0.8", default-features = false }
 serde = { version = "1", default-features = false }
 serde_json = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }

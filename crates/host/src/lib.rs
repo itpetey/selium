@@ -11,6 +11,7 @@
 //! - Async I/O (storage, network, queue)
 //! - Capability delegation and isolation
 
+pub mod abi_hostcalls;
 pub mod async_host;
 pub mod async_host_functions;
 pub mod capabilities;
@@ -32,7 +33,8 @@ pub use error::{Error, GuestExitStatus, Result};
 pub use guest::{Guest, GuestId};
 pub use handles::{AnyHandle, HandleId, NetworkHandle, StorageHandle, next_handle_id};
 pub use hostcalls::{DeprecatedHostcall, HOST_VERSION, HostcallDispatcher, HostcallVersion};
-pub use kernel::{Capability, Kernel};
+pub use kernel::Capability as KernelCapability;
+pub use kernel::Kernel;
 pub use metering::UsageMeter;
 pub use network::{NetworkCapability, NetworkError, NetworkResult};
 pub use process::{ProcessHandle, ProcessId};

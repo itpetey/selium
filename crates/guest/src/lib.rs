@@ -6,12 +6,15 @@
 //! - Shutdown signaling
 //! - RPC framework for inter-guest communication
 //! - Error types (GuestError, GuestResult)
+//! - Hostcall ABI (selium::time, selium::storage, etc.)
 
+pub mod abi;
 pub mod r#async;
 pub mod error;
 pub mod mailbox;
 pub mod rpc;
 
+pub use abi::{time_monotonic, time_now};
 pub use r#async::{FutureSharedState, JoinHandle, block_on, shutdown, spawn, yield_now};
 pub use error::{GuestError, GuestResult};
 pub use rpc::{
