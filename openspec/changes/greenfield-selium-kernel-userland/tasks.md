@@ -66,70 +66,70 @@
 
 ## 7. Consensus Guest
 
-- [ ] 7.1 Create `selium-consensus` module
-- [ ] 7.2 Implement Raft state machine (from existing `crates/io/consensus/`)
-- [ ] 7.3 Implement leader election
-- [ ] 7.4 Implement log replication
-- [ ] 7.5 Implement AppendEntries RPC using network capability
-- [ ] 7.6 Implement persistence using storage capability
-- [ ] 7.7 Implement committed entry notifications
-- [ ] 7.8 Implement single-node bootstrap (no peers)
-- [ ] 7.9 Write tests for consensus guest
+- [x] 7.1 Create `selium-consensus` module
+- [x] 7.2 Implement Raft state machine (from existing `crates/io/consensus/`)
+- [x] 7.3 Implement leader election
+- [x] 7.4 Implement log replication
+- [x] 7.5 Implement AppendEntries RPC using network capability
+- [x] 7.6 Implement persistence using storage capability
+- [x] 7.7 Implement committed entry notifications
+- [x] 7.8 Implement single-node bootstrap (no peers)
+- [x] 7.9 Write tests for consensus guest
 
 ## 8. Scheduler Guest
 
-- [ ] 8.1 Create `selium-scheduler` module
-- [ ] 8.2 Implement placement decision logic
-- [ ] 8.3 Implement capacity tracking
-- [ ] 8.4 Implement consensus coordination for placement proposals
-- [ ] 8.5 Implement process::spawn integration
-- [ ] 8.6 Implement restart coordination with supervisor
-- [ ] 8.7 Write tests for scheduler guest
+- [x] 8.1 Create `selium-scheduler` module
+- [x] 8.2 Implement placement decision logic
+- [x] 8.3 Implement capacity tracking
+- [x] 8.4 Implement consensus coordination for placement proposals
+- [x] 8.5 Implement process::spawn integration
+- [x] 8.6 Implement restart coordination with supervisor
+- [x] 8.7 Write tests for scheduler guest
 
 ## 9. Discovery Guest
 
-- [ ] 9.1 Create `selium-discovery` module
-- [ ] 9.2 Implement service registry data structure
-- [ ] 9.3 Implement registration queue handler
-- [ ] 9.4 Implement resolve queries
-- [ ] 9.5 Implement storage persistence for registry
-- [ ] 9.6 Write tests for discovery guest
+- [x] 9.1 Create `selium-discovery` module
+- [x] 9.2 Implement service registry data structure
+- [x] 9.3 Implement registration queue handler
+- [x] 9.4 Implement resolve queries
+- [x] 9.5 Implement storage persistence for registry
+- [x] 9.6 Write tests for discovery guest
 
 ## 10. Supervisor Guest
 
-- [ ] 10.1 Create `selium-supervisor` module
-- [ ] 10.2 Implement health monitoring via JoinHandle
-- [ ] 10.3 Implement restart policy engine (immediate, backoff)
-- [ ] 10.4 Implement scheduler coordination for restarts
-- [ ] 10.5 Implement placement notification subscription
-- [ ] 10.6 Write tests for supervisor guest
+- [x] 10.1 Create `selium-supervisor` module
+- [x] 10.2 Implement health monitoring via JoinHandle
+- [x] 10.3 Implement restart policy engine (immediate, backoff)
+- [x] 10.4 Implement scheduler coordination for restarts
+- [x] 10.5 Implement placement notification subscription
+- [x] 10.6 Write tests for supervisor guest
 
 ## 11. Routing Guest
 
-- [ ] 11.1 Create `selium-routing` module
-- [ ] 11.2 Implement network listener
-- [ ] 11.3 Implement HTTP proxy logic
-- [ ] 11.4 Implement discovery integration
-- [ ] 11.5 Implement round-robin load balancing
-- [ ] 11.6 Implement circuit breaker
-- [ ] 11.7 Write tests for routing guest
+- [x] 11.1 Create `selium-routing` module
+- [x] 11.2 Implement network listener
+- [x] 11.3 Implement HTTP proxy logic
+- [x] 11.4 Implement discovery integration
+- [x] 11.5 Implement round-robin load balancing
+- [x] 11.6 Implement circuit breaker
+- [x] 11.7 Write tests for routing guest
 
 ## 12. Bootstrap Discovery
 
-- [ ] 12.1 Create `selium-bootstrap` module (or integrate into init:enterprise, out of scope for now)
-- [ ] 12.2 Implement DNS TXT record reading
-- [ ] 12.3 Implement TXT population for seed nodes
-- [ ] 12.4 Implement gossip protocol for node announcements
-- [ ] 12.5 Implement periodic TXT refresh
-- [ ] 12.6 Write tests for bootstrap discovery
-- [ ] NOTE: Full bootstrap discovery is for init:enterprise (closed source). Implement basic single-node fallback here.
+- [x] 12.1 Create `selium-bootstrap` module (or integrate into init:enterprise, out of scope for now)
+- [x] 12.2 Implement DNS TXT record reading
+- [x] 12.3 Implement TXT population for seed nodes
+- [x] 12.4 Implement gossip protocol for node announcements
+- [x] 12.5 Implement periodic TXT refresh
+- [x] 12.6 Write tests for bootstrap discovery
+- [x] NOTE: Full bootstrap discovery is for init:enterprise (closed source). Implement basic single-node fallback here.
 
 ## 13. Integration and Testing
 
-- [ ] 13.1 Create integration test suite
-- [ ] 13.2 Test full boot sequence: init → consensus → scheduler → discovery → supervisor
-- [ ] 13.3 Test guest-to-guest RPC
-- [ ] 13.4 Test workload placement and supervision
-- [ ] 13.5 Test graceful shutdown
-- [ ] 13.6 Create documentation for architecture
-- [ ] 13.7 Create examples demonstrating the system
+- [x] 13.1 Create integration test suite
+- [x] 13.2 Test full boot sequence: init → consensus → scheduler → discovery → supervisor
+- [x] 13.3 Test guest-to-guest RPC
+- [x] 13.4 Test workload placement and supervision
+- [x] 13.5 Test graceful shutdown
+- [x] 13.6 Create documentation for architecture
+- [x] 13.7 Create examples demonstrating the system
