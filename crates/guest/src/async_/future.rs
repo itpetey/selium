@@ -123,7 +123,7 @@ mod tests {
 
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        
+
         // Complete the future
         state.complete(Ok(100));
 

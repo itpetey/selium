@@ -9,15 +9,15 @@
 //! - Guest modules: init, consensus, scheduler, discovery, supervisor, routing
 
 pub mod async_;
-pub mod error;
-pub mod mailbox;
-pub mod rpc;
-pub mod init;
 pub mod consensus;
-pub mod scheduler;
 pub mod discovery;
-pub mod supervisor;
+pub mod error;
+pub mod init;
+pub mod mailbox;
 pub mod routing;
+pub mod rpc;
+pub mod scheduler;
+pub mod supervisor;
 
-pub use async_::{block_on, spawn, yield_now, shutdown, JoinHandle};
+pub use async_::{JoinHandle, block_on, shutdown, spawn, yield_now};
 pub use error::{GuestError, GuestResult};

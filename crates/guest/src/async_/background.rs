@@ -21,7 +21,10 @@ struct JoinState<T> {
 
 impl<T> JoinState<T> {
     fn new() -> Self {
-        Self { result: None, waker: None }
+        Self {
+            result: None,
+            waker: None,
+        }
     }
 }
 
@@ -129,8 +132,8 @@ fn merge_spawn_queue() -> bool {
 
 /// Block on a future to completion using the guest executor.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
-    use futures::task::{waker_ref as make_waker, ArcWake};
     use futures::pin_mut;
+    use futures::task::{ArcWake, waker_ref as make_waker};
 
     pin_mut!(fut);
 

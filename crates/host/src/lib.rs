@@ -11,33 +11,31 @@
 //! - Async I/O (storage, network, queue)
 //! - Capability delegation and isolation
 
+pub mod async_host;
+pub mod async_host_functions;
+pub mod capabilities;
 pub mod error;
 pub mod guest;
+pub mod handles;
 pub mod hostcalls;
 pub mod kernel;
 pub mod metering;
-pub mod process;
-pub mod time;
-pub mod async_host;
-pub mod async_host_functions;
-pub mod storage;
 pub mod network;
+pub mod process;
 pub mod queue;
-pub mod handles;
-pub mod capabilities;
+pub mod storage;
+pub mod time;
 
+pub use async_host::{AsyncHostExtension, TaskId, next_task_id};
+pub use capabilities::{CapabilityGrant, CapabilityRegistry, GuestNamespace};
 pub use error::{Error, GuestExitStatus, Result};
 pub use guest::{Guest, GuestId};
-pub use hostcalls::{DeprecatedHostcall, HostcallDispatcher, HostcallVersion, HOST_VERSION};
+pub use handles::{AnyHandle, HandleId, NetworkHandle, StorageHandle, next_handle_id};
+pub use hostcalls::{DeprecatedHostcall, HOST_VERSION, HostcallDispatcher, HostcallVersion};
 pub use kernel::{Capability, Kernel};
 pub use metering::UsageMeter;
-pub use process::{ProcessHandle, ProcessId};
-pub use time::TimeSource;
-pub use async_host::{AsyncHostExtension, next_task_id, TaskId};
-pub use storage::{StorageCapability, StorageError, StorageResult};
 pub use network::{NetworkCapability, NetworkError, NetworkResult};
-pub use queue::{QueueCapability, QueueError, QueueResult, QueueHandle};
-pub use handles::{StorageHandle, NetworkHandle, AnyHandle, HandleId, next_handle_id};
-pub use capabilities::{
-    CapabilityRegistry, GuestNamespace, CapabilityGrant,
-};
+pub use process::{ProcessHandle, ProcessId};
+pub use queue::{QueueCapability, QueueError, QueueHandle, QueueResult};
+pub use storage::{StorageCapability, StorageError, StorageResult};
+pub use time::TimeSource;

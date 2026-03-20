@@ -56,11 +56,12 @@ impl QueueInner {
         if capacity == 0 {
             return Err(QueueError::InvalidCapacity);
         }
-        
+
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel(capacity);
+        let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
+            mpsc::channel(capacity);
 
         Ok((
             Self {
@@ -128,14 +129,13 @@ impl QueueCapability {
 
         match receiver {
             Some(receiver) => {
-                let mut guard: tokio::sync::RwLockWriteGuard<Option<mpsc::Receiver<Vec<u8>>>> = receiver.write().await;
+                let mut guard: tokio::sync::RwLockWriteGuard<Option<mpsc::Receiver<Vec<u8>>>> =
+                    receiver.write().await;
                 match guard.as_mut() {
-                    Some(rx) => {
-                        match rx.recv().await {
-                            Some(v) => Ok(v),
-                            None => Err(QueueError::Closed),
-                        }
-                    }
+                    Some(rx) => match rx.recv().await {
+                        Some(v) => Ok(v),
+                        None => Err(QueueError::Closed),
+                    },
                     None => Err(QueueError::Closed),
                 }
             }
@@ -145,8 +145,7 @@ impl QueueCapability {
 
     pub async fn close(&self, handle: &QueueHandle) -> QueueResult<()> {
         let mut queues = self.queues.write().await;
-        if let Some(_queue) = queues.remove(&handle.id) {
-        }
+        if let Some(_queue) = queues.remove(&handle.id) {}
         let mut senders = self.senders.write().await;
         senders.remove(&handle.id);
         Ok(())

@@ -2,11 +2,11 @@
 //!
 //! Provides async network operations that yield to the host.
 
-use std::net::SocketAddr;
 use parking_lot::RwLock;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::kernel::Capability;
 
@@ -47,7 +47,8 @@ impl NetworkCapability {
     }
 
     pub async fn connect(&self, addr: &str) -> NetworkResult<TcpStream> {
-        let addr = addr.parse::<SocketAddr>()
+        let addr = addr
+            .parse::<SocketAddr>()
             .map_err(|_| NetworkError::InvalidAddress)?;
 
         TcpStream::connect(addr).await.map_err(|e| {
@@ -60,13 +61,16 @@ impl NetworkCapability {
     }
 
     pub async fn bind(&self, addr: &str) -> NetworkResult<SocketAddr> {
-        let addr = addr.parse::<SocketAddr>()
+        let addr = addr
+            .parse::<SocketAddr>()
             .map_err(|_| NetworkError::InvalidAddress)?;
 
-        let listener = TcpListener::bind(addr).await
+        let listener = TcpListener::bind(addr)
+            .await
             .map_err(|e| NetworkError::IoError(e.to_string()))?;
 
-        let local_addr = listener.local_addr()
+        let local_addr = listener
+            .local_addr()
             .map_err(|e| NetworkError::IoError(e.to_string()))?;
 
         *self.listener.write() = Some(listener);
@@ -79,13 +83,14 @@ impl NetworkCapability {
         let listener = {
             let mut guard = self.listener.write();
             guard.take()
-        }.ok_or(NetworkError::IoError("Not bound".to_string()))?;
+        }
+        .ok_or(NetworkError::IoError("Not bound".to_string()))?;
 
         let result = listener.accept().await;
-        
+
         // Put the listener back
         *self.listener.write() = Some(listener);
-        
+
         result.map_err(|e| NetworkError::IoError(e.to_string()))
     }
 
@@ -94,15 +99,17 @@ impl NetworkCapability {
     }
 
     pub async fn read(&self, stream: &mut TcpStream, buf: &mut [u8]) -> NetworkResult<usize> {
-        stream.read(buf).await.map_err(|e| {
-            NetworkError::IoError(e.to_string())
-        })
+        stream
+            .read(buf)
+            .await
+            .map_err(|e| NetworkError::IoError(e.to_string()))
     }
 
     pub async fn write(&self, stream: &mut TcpStream, buf: &[u8]) -> NetworkResult<usize> {
-        stream.write(buf).await.map_err(|e| {
-            NetworkError::IoError(e.to_string())
-        })
+        stream
+            .write(buf)
+            .await
+            .map_err(|e| NetworkError::IoError(e.to_string()))
     }
 }
 
@@ -125,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn test_network_connect_invalid_address() {
         let network = NetworkCapability::new();
-        
+
         let result = network.connect("not-an-address").await;
         assert!(matches!(result, Err(NetworkError::InvalidAddress)));
     }
@@ -133,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn test_network_bind_and_accept() {
         let network = NetworkCapability::new();
-        
+
         let addr = network.bind("127.0.0.1:0").await.unwrap();
         assert!(addr.port() > 0);
 
@@ -147,7 +154,7 @@ mod tests {
 
         let (stream, _peer_addr) = network.accept().await.unwrap();
         let _connected = connect_handle.await.unwrap().unwrap();
-        
+
         assert!(stream.peer_addr().is_ok());
     }
 }

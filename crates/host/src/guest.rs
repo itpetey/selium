@@ -7,12 +7,12 @@
 //! - Usage metering
 
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Instance, Linker, Memory, Module, Store};
 
 use crate::async_host_functions;
-use crate::{error::Result, GuestExitStatus};
+use crate::{GuestExitStatus, error::Result};
 
 /// Unique identifier for a guest instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,11 +85,10 @@ impl Guest {
 
     /// Signal the guest to shut down.
     pub fn signal_shutdown(&mut self) {
-        if let Some(instance) = &self.instance {
-            if let Ok(func) = instance.get_typed_func::<(), ()>(&mut self.store, "shutdown") {
+        if let Some(instance) = &self.instance
+            && let Ok(func) = instance.get_typed_func::<(), ()>(&mut self.store, "shutdown") {
                 let _ = func.call(&mut self.store, ());
             }
-        }
     }
 
     /// Set the guest's exit status.

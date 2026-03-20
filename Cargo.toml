@@ -1,14 +1,29 @@
 [workspace]
 resolver = "2"
 members = [
-    "selium-host",
-    "selium-guest",
+  "crates/guest",
+  "crates/host",
 ]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
-authors = ["Selium Labs"]
-license = "MIT OR Apache-2.0"
+version = "1.0.0-alpha.7"
+edition = "2024"
+description = "Next-generation hypervisor"
+readme = "README.md"
+homepage = "https://selium.com"
 repository = "https://github.com/seliumlabs/selium"
-rust-version = "1.75"
+license = "MPL-2.0"
+keywords = ["runtime", "selium", "wasm"]
+categories = ["development-tools", "virtualization", "wasm"]
+
+[workspace.dependencies]
+anyhow = { version = "1", default-features = false }
+futures = { version = "0.3", default-features = false }
+parking_lot = { version = "0.12", default-features = false }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false }
+wasmtime = { version = "42", default-features = false }

@@ -5,12 +5,11 @@
 //! - Drives the guest executor
 //! - Exits when the init guest terminates
 
-use anyhow::Context;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use selium_host::{guest, Guest, GuestExitStatus, Kernel};
+use selium_host::{Guest, GuestExitStatus, Kernel, guest};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,13 +38,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("init.wasm"));
     let engine = wasmtime::Engine::default();
     let module = wasmtime::Module::from_file(&engine, &init_module_path)
-        .with_context(|| format!("Failed to load init module: {}", init_module_path.display()))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load init module {}: {}", init_module_path.display(), e))?;
 
     info!("Loaded init module: {}", init_module_path.display());
 
     // Spawn the init guest
     let init_guest = Guest::spawn(&engine, &module, guest::next_guest_id())
-        .context("Failed to spawn init guest")?;
+        .map_err(|e| anyhow::anyhow!("Failed to spawn init guest: {}", e))?;
 
     info!("Spawned init guest: {:?}", init_guest.id());
 

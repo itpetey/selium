@@ -11,15 +11,15 @@
 
 pub mod background;
 pub mod future;
-pub mod yield_;
 pub mod shutdown;
 pub mod wait;
+pub mod yield_;
 
-pub use background::{spawn, JoinHandle, block_on};
+pub use background::{JoinHandle, block_on, spawn};
 pub use future::{FutureSharedState, SharedFuture};
-pub use yield_::yield_now;
 pub use shutdown::shutdown;
 pub use wait::wait;
+pub use yield_::yield_now;
 
 use std::task::Context;
 
@@ -30,13 +30,21 @@ pub trait TaskId: Copy + Eq + std::hash::Hash + 'static {
 }
 
 impl TaskId for usize {
-    fn into_usize(self) -> usize { self }
-    fn from_usize(id: usize) -> Self { id }
+    fn into_usize(self) -> usize {
+        self
+    }
+    fn from_usize(id: usize) -> Self {
+        id
+    }
 }
 
 impl TaskId for u64 {
-    fn into_usize(self) -> usize { self as usize }
-    fn from_usize(id: usize) -> Self { id as u64 }
+    fn into_usize(self) -> usize {
+        self as usize
+    }
+    fn from_usize(id: usize) -> Self {
+        id as u64
+    }
 }
 
 /// Register the current waker and return a task identifier.
@@ -66,7 +74,10 @@ mod native_waker_registry {
 
     impl Registry {
         pub fn new() -> Self {
-            Self { next: 1, wakers: HashMap::new() }
+            Self {
+                next: 1,
+                wakers: HashMap::new(),
+            }
         }
     }
 
@@ -77,13 +88,13 @@ mod native_waker_registry {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native_waker_registry::{registry, Registry};
+pub use native_waker_registry::{Registry, registry};
 
 /// Register the current waker (non-WASM implementation for testing).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_waker(cx: &mut Context<'_>) -> usize {
     use crate::async_::native_waker_registry::registry;
-    
+
     let mut guard = registry().lock().unwrap();
     let id = guard.next;
     guard.next += 1;
@@ -103,10 +114,9 @@ pub fn wake_task(id: usize) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn wake_task(id: usize) {
     use crate::async_::native_waker_registry::registry;
-    
-    if let Ok(mut guard) = registry().lock() {
-        if let Some(waker) = guard.wakers.remove(&id) {
+
+    if let Ok(mut guard) = registry().lock()
+        && let Some(waker) = guard.wakers.remove(&id) {
             waker.wake();
         }
-    }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::guest::GuestId;
-use crate::handles::{next_handle_id, AnyHandle, HandleId};
+use crate::handles::{AnyHandle, HandleId, next_handle_id};
 use crate::kernel::Capability;
 
 pub use crate::handles::{NetworkHandle, QueueHandle, StorageHandle};

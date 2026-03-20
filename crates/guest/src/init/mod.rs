@@ -6,8 +6,8 @@
 //! - Wait for services to become ready
 //! - Provide inter-service handles
 
-use crate::error::GuestResult;
 use crate::async_::{spawn, yield_now};
+use crate::error::GuestResult;
 
 #[derive(Debug, Clone)]
 pub struct ServiceHandle {
@@ -117,13 +117,14 @@ impl InitGuest {
 
 pub async fn run_init() -> GuestResult {
     let init = InitGuest::new();
-    
-    let enabled_services: Vec<_> = init.config()
+
+    let enabled_services: Vec<_> = init
+        .config()
         .services
         .iter()
         .filter(|s| s.enabled)
         .collect();
-    
+
     for service_config in enabled_services {
         let name = service_config.name.clone();
         spawn(async move {
@@ -131,10 +132,10 @@ pub async fn run_init() -> GuestResult {
             let _ = name;
             GuestResult::Ok(())
         });
-        
+
         yield_now().await;
     }
-    
+
     GuestResult::Ok(())
 }
 
@@ -155,13 +156,11 @@ mod tests {
     #[test]
     fn test_init_guest_with_config() {
         let config = InitConfig {
-            services: vec![
-                ServiceConfig {
-                    name: "test".to_string(),
-                    module: "test.wasm".to_string(),
-                    enabled: true,
-                },
-            ],
+            services: vec![ServiceConfig {
+                name: "test".to_string(),
+                module: "test.wasm".to_string(),
+                enabled: true,
+            }],
         };
         let init = InitGuest::with_config(config);
         assert!(init.services().is_empty());
@@ -173,7 +172,7 @@ mod tests {
         let mut init = InitGuest::new();
         init.register_service(ServiceHandle::new("consensus", 1));
         init.register_service(ServiceHandle::new("scheduler", 2));
-        
+
         assert_eq!(init.services().len(), 2);
     }
 
@@ -182,11 +181,11 @@ mod tests {
         let mut init = InitGuest::new();
         init.register_service(ServiceHandle::new("consensus", 1));
         init.register_service(ServiceHandle::new("scheduler", 2));
-        
+
         let consensus = init.get_service("consensus");
         assert!(consensus.is_some());
         assert_eq!(consensus.unwrap().guest_id, 1);
-        
+
         let unknown = init.get_service("unknown");
         assert!(unknown.is_none());
     }

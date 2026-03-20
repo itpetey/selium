@@ -117,7 +117,6 @@ mod tests {
     fn test_default() {
         let ts = TimeSource::default();
         // default() should work same as new()
-        assert!(ts.now_nanos() >= 0);
         assert!(ts.elapsed() >= std::time::Duration::ZERO);
     }
 }

@@ -3,9 +3,9 @@
 //! Provides async storage operations that yield to the host,
 //! allowing other guests to make progress.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use crate::kernel::Capability;
 
@@ -48,12 +48,10 @@ impl StorageCapability {
 
     pub async fn get(&self, key: Key) -> StorageResult<Value> {
         let data = self.data.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let data = data.read();
-            data.get(&key)
-                .cloned()
-                .ok_or(StorageError::NotFound)
+            data.get(&key).cloned().ok_or(StorageError::NotFound)
         })
         .await
         .map_err(|_| StorageError::IoError("Task cancelled".to_string()))?
@@ -61,7 +59,7 @@ impl StorageCapability {
 
     pub async fn put(&self, key: Key, value: Value) -> StorageResult<()> {
         let data = self.data.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let mut data = data.write();
             data.insert(key, value);
@@ -73,7 +71,7 @@ impl StorageCapability {
 
     pub async fn delete(&self, key: Key) -> StorageResult<()> {
         let data = self.data.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let mut data = data.write();
             data.remove(&key);
@@ -85,14 +83,11 @@ impl StorageCapability {
 
     pub async fn list_keys(&self, prefix: Option<Key>) -> StorageResult<Vec<Key>> {
         let data = self.data.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let data = data.read();
             let keys: Vec<Key> = match prefix {
-                Some(ref p) => data.keys()
-                    .filter(|k| k.starts_with(p))
-                    .cloned()
-                    .collect(),
+                Some(ref p) => data.keys().filter(|k| k.starts_with(p)).cloned().collect(),
                 None => data.keys().cloned().collect(),
             };
             Ok(keys)
@@ -121,9 +116,12 @@ mod tests {
     #[tokio::test]
     async fn test_storage_put_and_get() {
         let storage = StorageCapability::new();
-        
-        storage.put(b"key1".to_vec(), b"value1".to_vec()).await.unwrap();
-        
+
+        storage
+            .put(b"key1".to_vec(), b"value1".to_vec())
+            .await
+            .unwrap();
+
         let result = storage.get(b"key1".to_vec()).await.unwrap();
         assert_eq!(result, b"value1");
     }
@@ -131,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_get_not_found() {
         let storage = StorageCapability::new();
-        
+
         let result = storage.get(b"nonexistent".to_vec()).await;
         assert!(matches!(result, Err(StorageError::NotFound)));
     }
@@ -139,10 +137,13 @@ mod tests {
     #[tokio::test]
     async fn test_storage_delete() {
         let storage = StorageCapability::new();
-        
-        storage.put(b"key1".to_vec(), b"value1".to_vec()).await.unwrap();
+
+        storage
+            .put(b"key1".to_vec(), b"value1".to_vec())
+            .await
+            .unwrap();
         storage.delete(b"key1".to_vec()).await.unwrap();
-        
+
         let result = storage.get(b"key1".to_vec()).await;
         assert!(matches!(result, Err(StorageError::NotFound)));
     }
@@ -150,11 +151,11 @@ mod tests {
     #[tokio::test]
     async fn test_storage_list_keys() {
         let storage = StorageCapability::new();
-        
+
         storage.put(b"a:1".to_vec(), b"v1".to_vec()).await.unwrap();
         storage.put(b"a:2".to_vec(), b"v2".to_vec()).await.unwrap();
         storage.put(b"b:1".to_vec(), b"v3".to_vec()).await.unwrap();
-        
+
         let keys = storage.list_keys(Some(b"a:".to_vec())).await.unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&b"a:1".to_vec()));
