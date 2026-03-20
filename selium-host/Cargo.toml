@@ -1,0 +1,23 @@
+[package]
+name = "selium-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wasmtime = "20"
+wasmtime-wasi = "20"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

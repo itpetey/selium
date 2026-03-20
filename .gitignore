@@ -1,2 +1,16 @@
-**/target/
+# Build artifacts
+/target/
+
+# Selium data directory
 .selium/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# old/ directory (preserved for reference only)
+/old/
