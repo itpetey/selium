@@ -6,7 +6,7 @@
 //! - Round-robin load balancing
 //! - Circuit breaker
 
-use selium_guest_runtime::{Attribution, GuestResult, RpcCall, RpcServer};
+use selium_guest::{Attribution, GuestResult, RpcCall, RpcServer};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]

@@ -5,7 +5,7 @@
 //! - Capacity tracking
 //! - Consensus coordination
 
-use selium_guest_runtime::{Attribution, GuestResult, RpcCall, RpcServer};
+use selium_guest::{Attribution, GuestResult, RpcCall, RpcServer};
 
 #[derive(Debug, Clone)]
 pub struct NodeCapacity {

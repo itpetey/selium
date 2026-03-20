@@ -6,7 +6,7 @@
 //! - Wait for services to become ready
 //! - Provide inter-service handles
 
-use selium_guest_runtime::{GuestResult, spawn, yield_now};
+use selium_guest::{GuestResult, spawn, yield_now};
 
 #[derive(Debug, Clone)]
 pub struct ServiceHandle {

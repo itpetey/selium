@@ -3,7 +3,6 @@ resolver = "2"
 members = [
   "crates/guest",
   "crates/host",
-  "modules/selium-guest-runtime",
   "modules/init",
   "modules/consensus",
   "modules/scheduler",

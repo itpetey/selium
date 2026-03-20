@@ -5,7 +5,7 @@
 //! - Registration handling
 //! - Resolve queries
 
-use selium_guest_runtime::{Attribution, GuestResult, RpcCall, RpcServer};
+use selium_guest::{Attribution, GuestResult, RpcCall, RpcServer};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]

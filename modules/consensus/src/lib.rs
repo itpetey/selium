@@ -5,7 +5,7 @@
 //! - Log replication
 //! - Single-node bootstrap
 
-use selium_guest_runtime::{Attribution, GuestResult, RpcCall, RpcServer};
+use selium_guest::{Attribution, GuestResult, RpcCall, RpcServer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftRole {

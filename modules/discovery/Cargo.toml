@@ -11,7 +11,7 @@ keywords = ["runtime", "selium", "wasm", "guest", "discovery"]
 categories = ["development-tools", "virtualization", "wasm"]
 
 [dependencies]
-selium-guest-runtime = { path = "../selium-guest-runtime" }
+selium-guest = { path = "../../crates/guest" }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 

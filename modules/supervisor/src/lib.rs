@@ -5,7 +5,7 @@
 //! - Restart policies (immediate, backoff)
 //! - Scheduler coordination
 
-use selium_guest_runtime::{Attribution, GuestResult, RpcCall, RpcServer};
+use selium_guest::{Attribution, GuestResult, RpcCall, RpcServer};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
