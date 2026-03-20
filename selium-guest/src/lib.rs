@@ -6,11 +6,13 @@
 //! - FutureSharedState for bridging host async to guest
 //! - Shutdown signaling
 //! - RPC framework
+//! - Init guest scaffolding
 
 pub mod async_;
 pub mod error;
 pub mod mailbox;
 pub mod rpc;
+pub mod init;
 
 pub use async_::{block_on, spawn, yield_now, shutdown, JoinHandle};
 pub use error::{GuestError, GuestResult};

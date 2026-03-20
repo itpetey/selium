@@ -57,12 +57,12 @@
 
 ## 6. Init Guest (Public)
 
-- [ ] 6.1 Create `selium-init-public` module
-- [ ] 6.2 Implement static config loading
-- [ ] 6.3 Implement service spawn orchestration
-- [ ] 6.4 Implement readiness waiting
-- [ ] 6.5 Implement handle registry for spawned services
-- [ ] 6.6 Write integration tests for init guest
+- [x] 6.1 Create `selium-init-public` module
+- [x] 6.2 Implement static config loading
+- [x] 6.3 Implement service spawn orchestration
+- [x] 6.4 Implement readiness waiting
+- [x] 6.5 Implement handle registry for spawned services
+- [x] 6.6 Write integration tests for init guest
 
 ## 7. Consensus Guest
 
