@@ -21,7 +21,7 @@ pub use yield_::yield_now;
 pub use shutdown::shutdown;
 pub use wait::wait;
 
-use std::task::{Context, Waker};
+use std::task::Context;
 
 /// Trait for types that can be used as task identifiers.
 pub trait TaskId: Copy + Eq + std::hash::Hash + 'static {
@@ -47,27 +47,42 @@ pub fn register_waker(cx: &mut Context<'_>) -> usize {
     Box::into_raw(boxed) as usize
 }
 
-/// Register the current waker (non-WASM implementation for testing).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn register_waker(cx: &mut Context<'_>) -> usize {
+mod native_waker_registry {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    
-    struct Registry {
-        next: usize,
-        wakers: HashMap<usize, Waker>,
+    use std::task::Waker;
+
+    pub struct Registry {
+        pub next: usize,
+        pub wakers: HashMap<usize, Waker>,
     }
-    
+
+    impl Default for Registry {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Registry {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self { next: 1, wakers: HashMap::new() }
         }
     }
-    
-    fn registry() -> &'static Mutex<Registry> {
+
+    pub fn registry() -> &'static Mutex<Registry> {
         static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
         REGISTRY.get_or_init(|| Mutex::new(Registry::new()))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_waker_registry::{registry, Registry};
+
+/// Register the current waker (non-WASM implementation for testing).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn register_waker(cx: &mut Context<'_>) -> usize {
+    use crate::async_::native_waker_registry::registry;
     
     let mut guard = registry().lock().unwrap();
     let id = guard.next;
@@ -77,27 +92,20 @@ pub fn register_waker(cx: &mut Context<'_>) -> usize {
 }
 
 /// Wake a registered task by ID.
+#[cfg(target_arch = "wasm32")]
 pub fn wake_task(id: usize) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let waker = unsafe { Box::from_raw(id as *mut Waker) };
-        waker.wake();
-    }
+    let waker = unsafe { Box::from_raw(id as *mut Waker) };
+    waker.wake();
+}
+
+/// Wake a registered task by ID (non-WASM implementation).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wake_task(id: usize) {
+    use crate::async_::native_waker_registry::registry;
     
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        
-        fn registry() -> &'static Mutex<HashMap<usize, Waker>> {
-            static REGISTRY: OnceLock<Mutex<HashMap<usize, Waker>>> = OnceLock::new();
-            REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-        }
-        
-        if let Ok(mut guard) = registry().lock() {
-            if let Some(waker) = guard.remove(&id) {
-                waker.wake();
-            }
+    if let Ok(mut guard) = registry().lock() {
+        if let Some(waker) = guard.wakers.remove(&id) {
+            waker.wake();
         }
     }
 }

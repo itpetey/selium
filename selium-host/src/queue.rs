@@ -13,6 +13,7 @@ pub enum QueueError {
     Closed,
     Disconnected,
     IoError(String),
+    InvalidCapacity,
 }
 
 impl std::fmt::Display for QueueError {
@@ -21,6 +22,7 @@ impl std::fmt::Display for QueueError {
             QueueError::Closed => write!(f, "Queue is closed"),
             QueueError::Disconnected => write!(f, "Queue disconnected"),
             QueueError::IoError(msg) => write!(f, "IO error: {}", msg),
+            QueueError::InvalidCapacity => write!(f, "Queue capacity must be greater than 0"),
         }
     }
 }
@@ -50,19 +52,23 @@ struct QueueInner {
 }
 
 impl QueueInner {
-    fn new(capacity: usize) -> (Self, QueueHandle) {
+    fn new(capacity: usize) -> QueueResult<(Self, QueueHandle)> {
+        if capacity == 0 {
+            return Err(QueueError::InvalidCapacity);
+        }
+        
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let (sender, receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel(capacity);
 
-        (
+        Ok((
             Self {
                 sender,
                 receiver: Arc::new(tokio::sync::RwLock::new(Some(receiver))),
             },
             QueueHandle::new(id),
-        )
+        ))
     }
 }
 
@@ -80,7 +86,7 @@ impl QueueCapability {
     }
 
     pub async fn create(&self, capacity: usize) -> QueueResult<QueueHandle> {
-        let (queue, handle) = QueueInner::new(capacity);
+        let (queue, handle) = QueueInner::new(capacity)?;
         let sender = queue.sender.clone();
         let queue_arc = Arc::new(queue);
 

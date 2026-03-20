@@ -55,13 +55,16 @@ impl Future for ShutdownFuture {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn shutdown() {
+mod wasm_shutdown {
+    #[link(wasm_import_module = "selium::async")]
     extern "C" {
-        #[link_name = "wait_for_shutdown"]
-        fn raw_wait_for_shutdown();
+        pub fn wait_for_shutdown();
     }
+}
 
-    unsafe { raw_wait_for_shutdown() }
+#[cfg(target_arch = "wasm32")]
+pub async fn shutdown() {
+    unsafe { wasm_shutdown::wait_for_shutdown() }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
