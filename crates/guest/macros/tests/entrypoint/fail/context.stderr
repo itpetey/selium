@@ -1,5 +1,0 @@
-error: #[entrypoint] Context parameters are not supported in this ABI
- --> tests/entrypoint/fail/context.rs:8:21
-  |
-8 | async fn guest(ctx: Context) -> Result<(), ()> {
-  |                     ^^^^^^^

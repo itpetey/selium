@@ -1,7 +1,0 @@
-package network.quic.echo.v1;
-
-schema EchoChunk {
-  payload: bytes;
-}
-
-stream quic.echo(EchoChunk);
