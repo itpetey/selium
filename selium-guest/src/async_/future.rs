@@ -46,6 +46,14 @@ impl<T, E> FutureSharedState<T, E> {
     pub fn take_result(&self) -> Option<std::result::Result<T, E>> {
         self.result.lock().unwrap().take()
     }
+
+    /// Register a waker to be notified when the future completes.
+    pub fn register_waker(&self, waker: std::task::Waker) {
+        let mut wakers = self.wakers.lock().unwrap();
+        if !wakers.iter().any(|w| w.will_wake(&waker)) {
+            wakers.push(waker);
+        }
+    }
 }
 
 impl<T, E> Default for FutureSharedState<T, E> {

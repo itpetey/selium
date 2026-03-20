@@ -46,14 +46,14 @@
 
 ## 5. Queue and RPC Framework
 
-- [ ] 5.1 Implement queue primitives (create, send, recv, close)
-- [ ] 5.2 Implement queue handle passing between guests
-- [ ] 5.3 Define RPC envelope format (call_id, method, params)
-- [ ] 5.4 Implement `#[selium_rpc]` proc macro for client stubs
-- [ ] 5.5 Implement `#[selium_interface]` proc macro for server traits
-- [ ] 5.6 Implement server dispatch loop with attribution
-- [ ] 5.7 Implement call_id based response routing
-- [ ] 5.8 Write tests for RPC framework
+- [x] 5.1 Implement queue primitives (create, send, recv, close)
+- [x] 5.2 Implement queue handle passing between guests
+- [x] 5.3 Define RPC envelope format (call_id, method, params)
+- [x] 5.4 Implement `#[selium_rpc]` proc macro for client stubs
+- [x] 5.5 Implement `#[selium_interface]` proc macro for server traits
+- [x] 5.6 Implement server dispatch loop with attribution
+- [x] 5.7 Implement call_id based response routing
+- [x] 5.8 Write tests for RPC framework
 
 ## 6. Init Guest (Public)
 
