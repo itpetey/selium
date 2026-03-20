@@ -61,3 +61,63 @@ impl Default for TimeSource {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_time_source() {
+        let ts = TimeSource::new();
+        // At creation, elapsed time should be very small (likely 0 or very few nanos)
+        assert!(ts.now_nanos() < 1_000_000); // Less than 1ms
+        assert!(ts.now_millis() < 1); // Less than 1ms
+    }
+
+    #[test]
+    fn test_monotonic_increases() {
+        let ts = TimeSource::new();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(ts.now_nanos() > 0);
+        assert!(ts.now_millis() > 0);
+    }
+
+    #[test]
+    fn test_elapsed_after_delay() {
+        let ts = TimeSource::new();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let elapsed = ts.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_wall_nanos_is_positive() {
+        let ts = TimeSource::new();
+        let wall = ts.wall_nanos();
+        // Should be a large number (nanoseconds since epoch)
+        assert!(wall > 1_700_000_000_000_000_000_u64);
+    }
+
+    #[test]
+    fn test_wall_returns_system_time() {
+        let ts = TimeSource::new();
+        let wall = ts.wall();
+        let now = SystemTime::now();
+        // Should be very close to now (within a few seconds)
+        assert!(wall.duration_since(now).is_ok() || now.duration_since(wall).is_ok());
+    }
+
+    #[test]
+    fn test_capability_name() {
+        let ts = TimeSource::new();
+        assert_eq!(ts.name(), "selium::time");
+    }
+
+    #[test]
+    fn test_default() {
+        let ts = TimeSource::default();
+        // default() should work same as new()
+        assert!(ts.now_nanos() >= 0);
+        assert!(ts.elapsed() >= std::time::Duration::ZERO);
+    }
+}

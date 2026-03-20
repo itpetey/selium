@@ -1,3 +1,4 @@
+use core::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -26,6 +27,7 @@ impl ShutdownState {
         self.wakers.push(waker.clone());
     }
 
+    #[allow(dead_code)]
     fn signal(&mut self) {
         self.signalled = true;
         for waker in self.wakers.drain(..) {
@@ -34,7 +36,6 @@ impl ShutdownState {
     }
 }
 
-/// Future that resolves when the host signals shutdown.
 struct ShutdownFuture;
 
 impl Future for ShutdownFuture {
@@ -53,17 +54,13 @@ impl Future for ShutdownFuture {
     }
 }
 
-/// Wait until the runtime begins shutting the current guest down.
-///
-/// This is typically called at the end of a service's main loop
-/// to gracefully shut down when the host requests it.
 #[cfg(target_arch = "wasm32")]
 pub async fn shutdown() {
     extern "C" {
         #[link_name = "wait_for_shutdown"]
         fn raw_wait_for_shutdown();
     }
-    
+
     unsafe { raw_wait_for_shutdown() }
 }
 
@@ -72,11 +69,51 @@ pub async fn shutdown() {
     ShutdownFuture.await;
 }
 
-/// Signal shutdown (for testing).
 #[cfg(test)]
 pub fn __signal_shutdown_for_tests() {
     SHUTDOWN.with(|state| {
         let mut state = state.borrow_mut();
         state.signal();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::task::{RawWaker, RawWakerVTable};
+
+    #[test]
+    fn test_shutdown_state_new() {
+        let state = ShutdownState::new();
+        assert!(!state.signalled);
+        assert!(state.wakers.is_empty());
+    }
+
+    #[test]
+    fn test_shutdown_state_register() {
+        fn clone(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VTABLE) }
+        fn wake(_: *const ()) {}
+        fn wake_by_ref(_: *const ()) {}
+        fn drop(_: *const ()) {}
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+        let state = &mut ShutdownState::new();
+        let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { std::task::Waker::from_raw(raw) };
+
+        state.register(&waker);
+        assert_eq!(state.wakers.len(), 1);
+
+        state.register(&waker);
+        assert_eq!(state.wakers.len(), 1);
+    }
+
+    #[test]
+    fn test_shutdown_state_signal() {
+        let mut state = ShutdownState::new();
+
+        state.signal();
+        assert!(state.signalled);
+    }
 }

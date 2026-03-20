@@ -5,12 +5,12 @@
 //! - Drives the guest executor
 //! - Exits when the init guest terminates
 
-use std::path::PathBuf;
 use anyhow::Context;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::path::PathBuf;
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use selium_host::{Kernel, Guest, GuestExitStatus, guest};
+use selium_host::{guest, Guest, GuestExitStatus, Kernel};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,14 +27,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Create the kernel with built-in capabilities
     let kernel = Kernel::new();
-    
+
     // Register built-in capabilities
     kernel.register(selium_host::TimeSource::new());
     kernel.register(selium_host::HostcallDispatcher::new());
     kernel.register(selium_host::metering::UsageMeter::new());
 
     // Load the init module
-    let init_module_path = args.init_module.unwrap_or_else(|| PathBuf::from("init.wasm"));
+    let init_module_path = args
+        .init_module
+        .unwrap_or_else(|| PathBuf::from("init.wasm"));
     let engine = wasmtime::Engine::default();
     let module = wasmtime::Module::from_file(&engine, &init_module_path)
         .with_context(|| format!("Failed to load init module: {}", init_module_path.display()))?;
@@ -42,11 +44,8 @@ async fn main() -> anyhow::Result<()> {
     info!("Loaded init module: {}", init_module_path.display());
 
     // Spawn the init guest
-    let init_guest = Guest::spawn(
-        &engine,
-        &module,
-        guest::next_guest_id(),
-    ).context("Failed to spawn init guest")?;
+    let init_guest = Guest::spawn(&engine, &module, guest::next_guest_id())
+        .context("Failed to spawn init guest")?;
 
     info!("Spawned init guest: {:?}", init_guest.id());
 
@@ -79,13 +78,14 @@ async fn run_guest(mut guest: Guest) -> GuestExitStatus {
 /// Command line arguments.
 struct Args {
     init_module: Option<PathBuf>,
+    #[allow(dead_code)]
     config: Option<PathBuf>,
 }
 
 impl Args {
     fn parse() -> Self {
         let mut args = std::env::args_os().skip(1);
-        
+
         let mut init_module = None;
         let mut config = None;
 
@@ -106,6 +106,9 @@ impl Args {
             }
         }
 
-        Self { init_module, config }
+        Self {
+            init_module,
+            config,
+        }
     }
 }

@@ -11,19 +11,19 @@
 - [x] 1.9 Implement hostcall versioning and deprecation warnings
 - [x] 1.10 Define GuestResult and GuestError types (Error, HotSwap, Restart)
 - [x] 1.11 Propagate guest exit status to host exit status
-- [ ] 1.12 Write unit tests for kernel foundation
+- [x] 1.12 Write unit tests for kernel foundation
 
 ## 2. Guest Async Foundation
 
-- [ ] 2.1 Create `selium-guest` crate with proc macros
-- [ ] 2.2 Implement mailbox ring buffer in guest linear memory
-- [ ] 2.3 Implement FutureSharedState (from existing `crates/kernel/src/async/futures.rs`)
-- [ ] 2.4 Implement spawn() and background task queue
-- [ ] 2.5 Implement yield_now()
-- [ ] 2.6 Implement shutdown() with host signal
-- [ ] 2.7 Implement guest executor drive loop (wait/drain/poll)
-- [ ] 2.8 Implement host→guest wake via mailbox
-- [ ] 2.9 Write unit tests for guest async
+- [x] 2.1 Create `selium-guest` crate with proc macros
+- [x] 2.2 Implement mailbox ring buffer in guest linear memory
+- [x] 2.3 Implement FutureSharedState (from existing `crates/kernel/src/async/futures.rs`)
+- [x] 2.4 Implement spawn() and background task queue
+- [x] 2.5 Implement yield_now()
+- [x] 2.6 Implement shutdown() with host signal
+- [x] 2.7 Implement guest executor drive loop (wait/drain/poll)
+- [x] 2.8 Implement host→guest wake via mailbox
+- [x] 2.9 Write unit tests for guest async
 
 ## 3. Async Host Extension
 

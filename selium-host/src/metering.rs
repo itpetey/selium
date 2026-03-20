@@ -107,3 +107,108 @@ impl Capability for UsageMeter {
         "selium::metering"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_meter_has_zero_usage() {
+        let meter = UsageMeter::new();
+        let usage = meter.snapshot();
+
+        assert_eq!(usage.memory_bytes, 0);
+        assert_eq!(usage.memory_high_watermark, 0);
+        assert_eq!(usage.cpu_nanos, 0);
+        assert_eq!(usage.ingress_bytes, 0);
+        assert_eq!(usage.egress_bytes, 0);
+        assert_eq!(usage.storage_read_bytes, 0);
+        assert_eq!(usage.storage_write_bytes, 0);
+    }
+
+    #[test]
+    fn test_add_memory() {
+        let meter = UsageMeter::new();
+        meter.add_memory(100);
+        meter.add_memory(200);
+
+        let usage = meter.snapshot();
+        assert_eq!(usage.memory_bytes, 300);
+    }
+
+    #[test]
+    fn test_memory_high_watermark() {
+        let meter = UsageMeter::new();
+
+        meter.add_memory(100);
+        let after_100 = meter.snapshot().memory_high_watermark;
+        assert!(after_100 >= 100);
+
+        meter.add_memory(50);
+        let after_50 = meter.snapshot().memory_high_watermark;
+        assert!(after_50 >= after_100);
+
+        meter.add_memory(100);
+        let after_200 = meter.snapshot().memory_high_watermark;
+        assert!(after_200 >= after_50);
+        assert!(after_200 >= 200);
+    }
+
+    #[test]
+    fn test_add_cpu() {
+        let meter = UsageMeter::new();
+        meter.add_cpu(1_000_000_000); // 1 second in nanos
+
+        let usage = meter.snapshot();
+        assert_eq!(usage.cpu_nanos, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_add_ingress_egress() {
+        let meter = UsageMeter::new();
+        meter.add_ingress(1024);
+        meter.add_egress(512);
+
+        let usage = meter.snapshot();
+        assert_eq!(usage.ingress_bytes, 1024);
+        assert_eq!(usage.egress_bytes, 512);
+    }
+
+    #[test]
+    fn test_add_storage_read_write() {
+        let meter = UsageMeter::new();
+        meter.add_storage_read(4096);
+        meter.add_storage_write(2048);
+
+        let usage = meter.snapshot();
+        assert_eq!(usage.storage_read_bytes, 4096);
+        assert_eq!(usage.storage_write_bytes, 2048);
+    }
+
+    #[test]
+    fn test_snapshot_is_independent() {
+        let meter = UsageMeter::new();
+        let snapshot1 = meter.snapshot();
+
+        meter.add_memory(100);
+
+        let snapshot2 = meter.snapshot();
+        assert_eq!(snapshot1.memory_bytes, 0);
+        assert_eq!(snapshot2.memory_bytes, 100);
+    }
+
+    #[test]
+    fn test_default() {
+        let meter = UsageMeter::default();
+        let usage = meter.snapshot();
+
+        assert_eq!(usage.memory_bytes, 0);
+        assert_eq!(usage.cpu_nanos, 0);
+    }
+
+    #[test]
+    fn test_capability_name() {
+        let meter = UsageMeter::new();
+        assert_eq!(meter.name(), "selium::metering");
+    }
+}

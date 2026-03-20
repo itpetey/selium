@@ -23,7 +23,7 @@ pub struct RpcResponse {
 }
 
 /// A pending RPC call waiting for a response.
+#[derive(Debug)]
 pub struct PendingCall {
     pub call_id: u64,
-    pub response: tokio::sync::oneshot::Receiver<RpcResponse>,
 }

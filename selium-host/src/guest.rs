@@ -31,6 +31,7 @@ pub fn next_guest_id() -> GuestId {
 }
 
 /// A handle to a spawned guest process.
+#[allow(dead_code)]
 pub struct Guest {
     id: GuestId,
     instance: Option<Instance>,
@@ -98,5 +99,88 @@ impl Guest {
     /// Poll the guest's executor.
     pub fn poll(&mut self) {
         // TODO: Poll the guest's async executor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ProcessId;
+
+    #[test]
+    fn test_guest_id_new() {
+        let id = GuestId::new(42);
+        assert_eq!(id.0, 42);
+    }
+
+    #[test]
+    fn test_guest_id_clone() {
+        let id1 = GuestId::new(1);
+        let id2 = id1.clone();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_guest_id_eq() {
+        let id1 = GuestId::new(1);
+        let id2 = GuestId::new(1);
+        let id3 = GuestId::new(2);
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_guest_id_debug() {
+        let id = GuestId::new(42);
+        assert_eq!(format!("{:?}", id), "GuestId(42)");
+    }
+
+    #[test]
+    fn test_guest_id_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+
+        set.insert(GuestId::new(1));
+        set.insert(GuestId::new(2));
+        set.insert(GuestId::new(1)); // Duplicate
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_next_guest_id_increments() {
+        let id1 = next_guest_id();
+        let id2 = next_guest_id();
+        let id3 = next_guest_id();
+
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_process_id_new() {
+        let pid = ProcessId::new(99);
+        assert_eq!(pid.0, 99);
+    }
+
+    #[test]
+    fn test_process_id_eq() {
+        assert_eq!(ProcessId::new(1), ProcessId::new(1));
+        assert_ne!(ProcessId::new(1), ProcessId::new(2));
+    }
+
+    #[test]
+    fn test_process_id_debug() {
+        let pid = ProcessId::new(42);
+        assert_eq!(format!("{:?}", pid), "ProcessId(42)");
+    }
+
+    #[test]
+    fn test_process_id_clone() {
+        let pid1 = ProcessId::new(1);
+        let pid2 = pid1.clone();
+        assert_eq!(pid1, pid2);
     }
 }

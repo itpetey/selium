@@ -1,4 +1,26 @@
-pub use selium_guest_macros::yield_now as yield_now;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_yield_now_completes() {
+        yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn test_yield_now_allows_progress() {
+        let mut counter = 0;
+        for _ in 0..10 {
+            yield_now().await;
+            counter += 1;
+        }
+        assert_eq!(counter, 10);
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_yield {
@@ -6,7 +28,7 @@ mod wasm_yield {
     unsafe extern "C" {
         pub fn yield_now();
     }
-    
+
     pub unsafe fn do_yield() {
         unsafe { yield_now() }
     }
@@ -14,9 +36,8 @@ mod wasm_yield {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod host_yield {
-    pub fn do_yield() {
-        // On host, yield is a no-op (future will be polled)
-    }
+    #[allow(dead_code)]
+    pub fn do_yield() {}
 }
 
 /// Cooperatively yield once so other guest tasks can make progress.
@@ -41,9 +62,8 @@ pub async fn yield_now() {
 
     #[cfg(target_arch = "wasm32")]
     {
-        // On WASM, we also call the host yield
         unsafe { wasm_yield::do_yield() }
     }
-    
+
     YieldNow { yielded: false }.await;
 }

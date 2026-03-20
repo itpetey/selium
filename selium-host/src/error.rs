@@ -57,3 +57,91 @@ impl From<GuestExitStatus> for i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exit_status_ok_to_i32() {
+        let status = GuestExitStatus::Ok;
+        assert_eq!(i32::from(status), 0);
+    }
+
+    #[test]
+    fn test_exit_status_error_to_i32() {
+        let status = GuestExitStatus::Error("test error".to_string());
+        assert_eq!(i32::from(status), 1);
+    }
+
+    #[test]
+    fn test_exit_status_hotswap_to_i32() {
+        let status = GuestExitStatus::HotSwap;
+        assert_eq!(i32::from(status), 42);
+    }
+
+    #[test]
+    fn test_exit_status_restart_to_i32() {
+        let status = GuestExitStatus::Restart;
+        assert_eq!(i32::from(status), 43);
+    }
+
+    #[test]
+    fn test_exit_status_debug() {
+        let status = GuestExitStatus::Ok;
+        assert_eq!(format!("{:?}", status), "Ok");
+    }
+
+    #[test]
+    fn test_exit_status_error_debug() {
+        let status = GuestExitStatus::Error("something went wrong".to_string());
+        assert_eq!(format!("{:?}", status), r#"Error("something went wrong")"#);
+    }
+
+    #[test]
+    fn test_exit_status_eq() {
+        assert_eq!(GuestExitStatus::Ok, GuestExitStatus::Ok);
+        assert_eq!(
+            GuestExitStatus::Error("msg".to_string()),
+            GuestExitStatus::Error("msg".to_string())
+        );
+        assert_ne!(GuestExitStatus::Ok, GuestExitStatus::Error("".to_string()));
+    }
+
+    #[test]
+    fn test_exit_status_clone() {
+        let status = GuestExitStatus::Error("clone me".to_string());
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_error_display() {
+        let err = Error::Guest("test".to_string());
+        assert_eq!(format!("{}", err), "Guest error: test");
+
+        let err = Error::CapabilityNotFound("Storage".to_string());
+        assert_eq!(format!("{}", err), "Capability not found: Storage");
+
+        let err = Error::InvalidHandle("dead".to_string());
+        assert_eq!(format!("{}", err), "Invalid handle: dead");
+
+        let err = Error::GuestExited(GuestExitStatus::Ok);
+        assert_eq!(format!("{}", err), "Guest exited with: Ok");
+
+        let err = Error::Hostcall("timeout".to_string());
+        assert_eq!(format!("{}", err), "Hostcall error: timeout");
+
+        let err = Error::DeprecatedHostcall {
+            name: "old_api".to_string(),
+            removed_version: 2,
+        };
+        assert_eq!(
+            format!("{}", err),
+            "Deprecated hostcall: old_api (removed in v2)"
+        );
+
+        let err = Error::Wasm("link error".to_string());
+        assert_eq!(format!("{}", err), "WASM error: link error");
+    }
+}

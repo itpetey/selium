@@ -44,3 +44,89 @@ impl From<&str> for GuestError {
         Self::Error(s.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_guest_error_error() {
+        let err = GuestError::Error("test".to_string());
+        assert_eq!(format!("{}", err), "Error: test");
+    }
+
+    #[test]
+    fn test_guest_error_hotswap() {
+        let err = GuestError::HotSwap;
+        assert_eq!(format!("{}", err), "HotSwap");
+    }
+
+    #[test]
+    fn test_guest_error_restart() {
+        let err = GuestError::Restart;
+        assert_eq!(format!("{}", err), "Restart");
+    }
+
+    #[test]
+    fn test_guest_error_eq() {
+        assert_eq!(
+            GuestError::Error("msg".to_string()),
+            GuestError::Error("msg".to_string())
+        );
+        assert_eq!(GuestError::HotSwap, GuestError::HotSwap);
+        assert_eq!(GuestError::Restart, GuestError::Restart);
+        assert_ne!(
+            GuestError::Error("a".to_string()),
+            GuestError::Error("b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_guest_error_clone() {
+        let err = GuestError::Error("clone".to_string());
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn test_guest_error_debug() {
+        assert_eq!(format!("{:?}", GuestError::HotSwap), "HotSwap");
+    }
+
+    #[test]
+    fn test_guest_error_error_helper() {
+        let err = GuestError::error("helper");
+        assert_eq!(format!("{}", err), "Error: helper");
+    }
+
+    #[test]
+    fn test_guest_result_ok() {
+        let result: GuestResult<i32> = Ok(42);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_guest_result_err() {
+        let result: GuestResult<i32> = Err(GuestError::Error("failed".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_string() {
+        let err: GuestError = String::from("from string").into();
+        assert_eq!(format!("{}", err), "Error: from string");
+    }
+
+    #[test]
+    fn test_from_str() {
+        let err: GuestError = "from str".into();
+        assert_eq!(format!("{}", err), "Error: from str");
+    }
+
+    #[test]
+    fn test_error_implements_std_error() {
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<GuestError>();
+    }
+}

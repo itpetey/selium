@@ -2,12 +2,12 @@
 //!
 //! Provides spawn, stop, and JoinHandle for guest processes.
 
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use crate::guest::GuestId;
 use crate::error::GuestExitStatus;
+use crate::guest::GuestId;
 
 /// A handle to a spawned guest process.
 pub struct ProcessHandle {
@@ -16,6 +16,7 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
+    #[allow(dead_code)]
     pub(crate) fn new(id: GuestId, exit_receiver: oneshot::Receiver<GuestExitStatus>) -> Self {
         Self {
             id,
@@ -30,9 +31,15 @@ impl ProcessHandle {
 
     /// Wait for the process to exit and get its status.
     pub async fn wait(&mut self) -> GuestExitStatus {
-        let mut receiver_guard = self.exit_receiver.write();
-        if let Some(receiver) = receiver_guard.take() {
-            receiver.await.unwrap_or(GuestExitStatus::Error("Channel closed".to_string()))
+        let receiver = {
+            let mut receiver_guard = self.exit_receiver.write();
+            receiver_guard.take()
+        };
+
+        if let Some(receiver) = receiver {
+            receiver
+                .await
+                .unwrap_or(GuestExitStatus::Error("Channel closed".to_string()))
         } else {
             GuestExitStatus::Error("Already waited".to_string())
         }

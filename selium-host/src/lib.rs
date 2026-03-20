@@ -10,17 +10,17 @@
 //! - Usage metering
 
 pub mod error;
-pub mod kernel;
 pub mod guest;
 pub mod hostcalls;
-pub mod time;
+pub mod kernel;
 pub mod metering;
 pub mod process;
+pub mod time;
 
-pub use error::{Error, Result, GuestExitStatus};
-pub use kernel::{Kernel, Capability};
+pub use error::{Error, GuestExitStatus, Result};
 pub use guest::{Guest, GuestId};
-pub use hostcalls::{HostcallDispatcher, HostcallVersion, DeprecatedHostcall, HOST_VERSION};
-pub use time::TimeSource;
+pub use hostcalls::{DeprecatedHostcall, HostcallDispatcher, HostcallVersion, HOST_VERSION};
+pub use kernel::{Capability, Kernel};
 pub use metering::UsageMeter;
 pub use process::{ProcessHandle, ProcessId};
+pub use time::TimeSource;

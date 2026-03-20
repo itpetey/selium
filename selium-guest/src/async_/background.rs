@@ -5,9 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
-
-use super::TaskId;
 
 /// A background task in the executor.
 struct BackgroundTask {
@@ -130,31 +129,31 @@ fn merge_spawn_queue() -> bool {
 
 /// Block on a future to completion using the guest executor.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
-    use futures::task::waker_ref;
-    use futures::ArcWake;
+    use futures::task::{waker_ref as make_waker, ArcWake};
+    use futures::pin_mut;
 
     pin_mut!(fut);
-    
+
     struct LocalWake {
-        notified: std::sync::atomic::AtomicBool,
+        notified: AtomicBool,
     }
 
     impl LocalWake {
         fn new() -> Self {
             Self {
-                notified: std::sync::atomic::AtomicBool::new(false),
+                notified: AtomicBool::new(false),
             }
         }
     }
 
     impl ArcWake for LocalWake {
         fn wake_by_ref(arc_self: &Arc<Self>) {
-            arc_self.notified.store(true, std::sync::atomic::Ordering::Release);
+            arc_self.notified.store(true, Ordering::Release);
         }
     }
 
     let wake_state = Arc::new(LocalWake::new());
-    let waker = waker_ref(&Arc::clone(&wake_state));
+    let waker = make_waker(&wake_state);
     let mut cx = Context::from_waker(&waker);
 
     loop {
@@ -163,10 +162,10 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
         }
 
         let progressed = poll_backgrounds(&mut cx);
-        if progressed || wake_state.notified.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        if progressed || wake_state.notified.swap(false, Ordering::AcqRel) {
             continue;
         }
-        
+
         // Wait for host to enqueue a wake
         super::wait();
     }
