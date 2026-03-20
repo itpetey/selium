@@ -19,6 +19,7 @@ pub mod metering;
 pub mod process;
 pub mod time;
 pub mod async_host;
+pub mod async_host_functions;
 pub mod storage;
 pub mod network;
 pub mod queue;

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use wasmtime::{Engine, Instance, Linker, Memory, Module, Store};
 
+use crate::async_host_functions;
 use crate::{error::Result, GuestExitStatus};
 
 /// Unique identifier for a guest instance.
@@ -49,10 +50,11 @@ impl Guest {
             .map_err(|e| crate::Error::Wasm(e.to_string()))?;
 
         // Create a linker with async hostcall imports
-        let linker: Linker<()> = Linker::new(engine);
+        let mut linker: Linker<()> = Linker::new(engine);
 
-        // Note: Host function imports are added via AsyncHostExtension
-        // The linker provides the mechanism, but host functions are registered separately
+        // Add selium::async host functions (park, yield_now, wait_for_shutdown)
+        async_host_functions::add_to_linker(&mut linker)
+            .map_err(|e| crate::Error::Wasm(e.to_string()))?;
 
         // Instantiate the module
         let instance = linker.instantiate(&mut store, module).map_err(|e| {
