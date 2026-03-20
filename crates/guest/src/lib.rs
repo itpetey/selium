@@ -7,12 +7,12 @@
 //! - RPC framework for inter-guest communication
 //! - Error types (GuestError, GuestResult)
 
-pub mod async_;
+pub mod r#async;
 pub mod error;
 pub mod mailbox;
 pub mod rpc;
 
-pub use async_::{FutureSharedState, JoinHandle, block_on, shutdown, spawn, yield_now};
+pub use r#async::{FutureSharedState, JoinHandle, block_on, shutdown, spawn, yield_now};
 pub use error::{GuestError, GuestResult};
 pub use rpc::{
     Attribution, RpcCall, RpcCallFuture, RpcClient, RpcEnvelope, RpcResponse, RpcServer,

@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::async_::future::FutureSharedState;
+use crate::r#async::future::FutureSharedState;
 use crate::error::{GuestError, GuestResult};
 
 static NEXT_CALL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

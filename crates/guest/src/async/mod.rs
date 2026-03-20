@@ -13,13 +13,13 @@ pub mod background;
 pub mod future;
 pub mod shutdown;
 pub mod wait;
-pub mod yield_;
+pub mod r#yield;
 
 pub use background::{JoinHandle, block_on, spawn};
 pub use future::{FutureSharedState, SharedFuture};
 pub use shutdown::shutdown;
 pub use wait::wait;
-pub use yield_::yield_now;
+pub use r#yield::yield_now;
 
 use std::task::Context;
 
