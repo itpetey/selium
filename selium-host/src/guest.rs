@@ -54,21 +54,17 @@ impl Guest {
         // Note: Host function imports are added via AsyncHostExtension
         // The linker provides the mechanism, but host functions are registered separately
 
-        // Try to instantiate the module
-        let instance = match linker.instantiate(&mut store, module) {
-            Ok(instance) => Some(instance),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to instantiate guest (expected for scaffolding): {}",
-                    e
-                );
-                None
-            }
-        };
+        // Instantiate the module
+        let instance = linker.instantiate(&mut store, module).map_err(|e| {
+            crate::Error::Wasm(format!(
+                "Failed to instantiate guest module: {}. Ensure all imports are linked.",
+                e
+            ))
+        })?;
 
         Ok(Self {
             id,
-            instance,
+            instance: Some(instance),
             memory,
             store,
             exit_status: Arc::new(RwLock::new(None)),

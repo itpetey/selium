@@ -94,6 +94,7 @@ pub fn register_waker(cx: &mut Context<'_>) -> usize {
 /// Wake a registered task by ID.
 #[cfg(target_arch = "wasm32")]
 pub fn wake_task(id: usize) {
+    use std::task::Waker;
     let waker = unsafe { Box::from_raw(id as *mut Waker) };
     waker.wake();
 }
