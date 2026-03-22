@@ -53,6 +53,7 @@ cargo test -- --nocapture
   2. `cargo clippy --workspace --all-targets -- -D warnings`
   3. `cargo test --workspace --all-targets`
 - **Workspace dependencies** - Use `[workspace.dependencies]` in root `Cargo.toml`. Do not pin different versions.
+- **International English only** - Do not use American English anywhere in the project unless required for calling third party APIs.
 
 ## Code Style
 
@@ -112,6 +113,7 @@ pub enum GuestError {
 - Propagate with `?` operator
 - Avoid `unwrap()`/`expect()` in production code
 - Suppress unused results with `let _ =` only when intentional
+- When creating stubs for new functions, do not return fake values. Use the `todo!()` macro.
 
 ### Module Structure
 - Public modules: `pub mod module_name;`
