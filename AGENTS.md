@@ -1,103 +1,157 @@
 # AGENTS.md
 
-> **Guidelines for AI coding agents contributing to Selium**
+Agentic coding guidelines for this Rust workspace.
 
-Selium is a channel‑native compute fabric. Guests are WASM services with typed ports; all I/O is via channels; no ambient authority; Flatbuffers only.
+## Build Commands
 
-This document defines what agents may change, how to do it, and what "done" means.
+```bash
+# Build all crates
+cargo build --workspace
 
----
+# Build specific crate
+cargo build -p selium-host
+cargo build -p selium-guest --target wasm32-unknown-unknown
 
-## Prime directives (do not break these)
- - **Channels‑only I/O.** No sockets, no WASI/POSIX.
- - **Flatbuffers on wires.** Public wires and persisted artefacts use Flatbuffers; internal code uses idiomatic Rust types.
- - **No use of WASI toolchain.** Code and docs should never reference `wasm(32|64)-wasi-*`.
- - **Strict capabilities.** Guests may only do what their capability bundle allows. No ambient lookups.
- - **Stable Rust only.** Annotate public items with Rustdoc. Log via tracing.
- - **Small, reviewable patches (unless specifically required by a human developer).** Never push or commit; output patches and file diffs only.
-
----
-
-## Coding standards
-
- - **Edition:** Rust 2024.
- - **Lint gate:** `cargo clippy -- -D warnings` must be clean.
- - **Fmt:** `cargo fmt` required.
- - **Tests:** `cargo test --all-targets` must pass.
- - **Logging:** `tracing` only.
- - **Async:** `tokio` (multi‑thread runtime).
- - **Error handling:** `anyhow` for binaries. `thiserror` for libraries.
- - **Error handling (strict):**
-   - Do not suppress `Result` values. Never write `let _ = some_result;` or otherwise drop errors. Propagate with `?` and map with `map_err`/`context` as appropriate.
-   - Do not use `unwrap`/`expect` in host code. Handle errors gracefully and return typed errors; panics in host paths create denial‑of‑service risk. Exception: permitted inside `#[test]` scopes. Explicit human permission required for any other exceptions.
- - **Unsafe:** avoid; if necessary, encapsulate and document reasoning.
- - **Human language:** all documentation, comments, binding names etc. should use International English.
- - **Order of code:** each Rust code file should be laid out in the following order:
-    1. Module/library doc comments
-    2. `use` statements
-    3. `type` definitions
-    4. `const` and `static` definitions
-    5. `trait` definitions
-    6. `struct` and `enum` definitions
-    7. `impl` blocks
-    8. Free functions
-    9. Tests (in a `#[cfg(test)] mod tests` block at the end of the file)
- - **Documentation:** all public items must have `///` Rustdoc comments
-
----
-
-## Flatbuffers policy
-
- - Public wires and cross‑process/persisted artefacts are Flatbuffers. No JSON for runtime wires.
- - Keep generated Rust modules checked in (build must not require network).
- - Schema ids: compute a 16‑byte BLAKE3 of the .fbs file content. The `#[schema]` macro must emit a const with this id for use in port metadata.
-
----
-
-## Security invariants
-
- - **Capabilities:** every I/O handle the guest uses must be backed by a capability entry minted by the authoriser; host validates on each call.
- - **No ambient authority:** forbid any API that opens Catalogue paths or channels by string unless explicitly authorised.
- - **Isolation:** one wasmtime store per instance; configure memory caps; pooling; fuel/epoch interruption to bound CPU.
-
----
-
-## Pre‑finish checklist (every patch)
- - `cargo fmt` (after every changeset)
- - `cargo clippy -- -D warnings` clean
- - `cargo test --all-targets` passes
- - No flexbuffers, no bincode, no ambient I/O
- - Public items have /// Rustdoc
- - Flatbuffers root/file ids intact (SDIC/SCAT/STOP/SBND/SCAP)
- - If schemas changed: generated code updated and checked in
- - If bindings/rules changed: tests updated or added
- - No suppressed `Result`s; no `unwrap`/`expect` in host code (tests are exempt)
-
----
-
-## What NOT to do
- - ❌ Push commits or rewrite git history
- - ❌ Introduce network, filesystem, or POSIX/WASI dependencies for guests
- - ❌ Add heavy dependencies casually
- - ❌ Bypass capability checks or create "debug backdoors"
- - ❌ Hide transforms/rules in opaque “network” layers; transforms must be explicit services
- - ❌ Use American English
- - ❌ Suppress `Result`s (e.g., `let _ = some_result;`). Propagate with `?` and map errors.
- - ❌ Use `unwrap`/`expect` in host code (except inside `#[test]` scopes). Convert to fallible flows and surface errors.
- - X Use `thiserror` in binary crates. Use `anyhow`.
- - X Use `anyhow` in library crates. Use `thiserror`.
-
----
-
-## Contact the humans
-
-When trade‑offs are non‑obvious, prefer a TODO with a short rationale:
-
-```rust
-// TODO(@maintainer): We could adopt the channel's schema on first write.
-// Leaving strict-equality for now to avoid accidental schema drift.
+# Release build
+cargo build --release --workspace
+cargo build --release --target wasm32-unknown-unknown -p selium-guest
 ```
 
----
+## Lint Commands
 
-Thank you! Following these rules keeps Selium simple, safe, and pleasant to work in.
+```bash
+# Format code
+cargo fmt --all
+
+# Run clippy with strict warnings
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+## Test Commands
+
+```bash
+# Run all tests (workspace, all targets including doc tests)
+cargo test --workspace --all-targets
+
+# Run single test by name
+cargo test test_name_here -- --nocapture
+
+# Run tests for specific crate
+cargo test -p selium-host
+cargo test -p selium-guest
+
+# Run tests with output visible
+cargo test -- --nocapture
+```
+
+## CRITICAL IMPERATIVES
+
+- **Rust Edition 2024 only** - Use 2024 edition features. Do not use 2021 edition patterns.
+- **NO WASI** - Never use `wasm32-wasi` target. Use `wasm32-unknown-unknown` exclusively.
+- **Pre-commit checks** - Before creating a commit/PR, you MUST run:
+  1. `cargo fmt --all`
+  2. `cargo clippy --workspace --all-targets -- -D warnings`
+  3. `cargo test --workspace --all-targets`
+- **Workspace dependencies** - Use `[workspace.dependencies]` in root `Cargo.toml`. Do not pin different versions.
+- **International English only** - Do not use American English anywhere in the project unless required for calling third party APIs.
+
+## Code Style
+
+### Formatting
+- Run `cargo fmt --all` before committing
+- `rustfmt.toml` enforces `reorder_imports = true`
+- Imports are ordered deterministically (no special grouping)
+
+### Imports
+```rust
+// External crates first, then crate modules
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::error::{Error, Result};
+```
+
+### Naming Conventions
+- **Types/Enums**: `CamelCase` (e.g., `GuestId`, `CapabilityRegistry`, `StorageHandle`)
+- **Functions/Methods**: `snake_case` (e.g., `next_guest_id()`, `register_capability()`)
+- **Modules**: `snake_case` (e.g., `async_host`, `capabilities`)
+- **Constants**: `SCREAMING_SNAKE_CASE` (e.g., `HOST_VERSION`)
+- **Handle types**: `XxxHandle` pattern (e.g., `StorageHandle`, `NetworkHandle`)
+- **ID types**: `XxxId` pattern (e.g., `GuestId`, `HandleId`, `TaskId`, `ProcessId`)
+- **Private fields**: `snake_case` with no underscore prefix (e.g., `id: u64`)
+- **Crate directories**: omit the "selium-" prefix (e.g. "selium-guest" becomes "guest/")
+
+### Error Handling
+
+**Library crates** (selium-host, selium-guest): Use `thiserror`
+```rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Capability not found: {0}")]
+    CapabilityNotFound(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+```
+
+**Generic errors**: Implement `Display`, `Debug`, `std::error::Error`
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestError {
+    Error(String),
+    HotSwap,
+    Restart,
+}
+```
+
+- Use `#[from]` for automatic error conversion
+- Propagate with `?` operator
+- Avoid `unwrap()`/`expect()` in production code
+- Suppress unused results with `let _ =` only when intentional
+- When creating stubs for new functions, do not return fake values. Use the `todo!()` macro.
+
+### Module Structure
+- Public modules: `pub mod module_name;`
+- Re-export frequently used items at crate root
+- Group related functionality in submodules
+- Place tests in `#[cfg(test)] mod tests` at end of file
+
+### Documentation
+- Crate-level doc comment: `//! Description`
+- Module doc comments for public APIs
+- No doc comments on private/internal functions
+- Use inline `//` comments for complex logic only
+
+### Async Code
+- Use `#[tokio::test]` for async tests
+- Prefer explicit error types over `Box<dyn Error>`
+- Use `parking_lot` primitives (`RwLock`, `Mutex`) over std equivalents
+
+### Conditional Compilation
+- Use `#[cfg(target_arch = "wasm32")]` for WASM-specific code
+- Use `#[cfg(not(target_arch = "wasm32"))]` for native test fallbacks
+- Document why conditional compilation is needed
+
+## Architecture Notes
+
+### selium-host
+- Runs on native target (x86_64/aarch64)
+- Provides WASM runtime via wasmtime
+- Handles capability enforcement, process lifecycle, async I/O
+
+### selium-guest
+- Targets `wasm32-unknown-unknown`
+- Provides utilities for WASM guests
+- Contains scheduler, consensus, routing, discovery modules
+
+## Linting Allowances
+Some lints are intentionally allowed:
+- `#[allow(clippy::type_complexity)]` - Complex types are sometimes necessary
+- `#[allow(dead_code)]` - Public items may be unused initially
+- `#[allow(unused_variables)]` - Callback parameters sometimes unused
