@@ -42,23 +42,32 @@ Core technologies and design choices:
 
 ### Crates
 
-`selium-host` binary (crates/host/) is responsible for:
-- WASM runtime execution
-- Resource (e.g. process, channel, etc.) tracking and capability-driven sharing of resources with WASM processes
-- Exposing low-level primitives, e.g. sockets, shared memory, blob storage, append-only log storage, time, async, etc.
-- Defining the ABI for host-guest interaction
-- Bridging external network protocols
-- TLS offload
-- Keeping a structured activity log that is both machine and human parseable, and accessible to guests given valid Capability.
-- Guest process CPU, memory, storage, and bandwidth metering
+`selium-abi` library (crates/abi/) is responsible for:
+- Defining the canonical host-guest ABI
+- Defining capability grants, compound scopes, and resource identity classes
+- Defining hostcall payloads, completion states, and canonical framing rules
+
+`selium-kernel` library (crates/kernel/) is responsible for:
+- Exposing low-level primitives, e.g. shared memory, signalling, network, blob storage, append-only log storage, time, and process lifecycle
+- Resource tracking and capability-driven sharing of resources with WASM processes
+- Keeping a structured activity log that is both machine and human parseable, and accessible to guests given valid Capability
+- Guest process CPU, memory, storage, and bandwidth metering hooks
+
+`selium-runtime` library (crates/runtime/) is responsible for:
+- Wasmtiny-backed WASM runtime execution
+- Config-driven bootstrap of system guests
+- Capability and session enforcement at spawn time
+- Bridging external network protocols and TLS offload where required
 
 `selium-guest` library (crates/guest/) is responsible for:
-- Wrapping the host ABI
+- Wrapping the ABI and kernel primitives
 - Providing ergonomic handles for guests to consume host resources
-- Re-export tracing macros: `info!()`, `warn!()`, etc.
+- Providing the messaging-pattern layer, e.g. pub/sub, fanout, request/reply, streams, and live tables
+- Re-exporting tracing macros: `info!()`, `warn!()`, etc.
 
 `selium-guest-macros` library (crates/guest/macros/) is responsible for:
 - Defining procedural macros to assist with guest entrypoint function boilerplate
+- Generating guest-facing messaging metadata for discovery and runtime bootstrap
 
 `selium` CLI binary (crates/cli/) is responsible for:
 - Orchestrating hosts
@@ -104,10 +113,10 @@ NOTE: Other crates can exist outside these core crates. This is just a starting 
 
 ### I/O subsystem
 
-Channel-based byte streaming.
+Shared-memory-first primitive substrate with signalling, network, and durability primitives.
 
 Composable features:
-- Messaging pattern overlays
+- Messaging pattern overlays, e.g. pub/sub, fanout, request/reply, streams, and live tables
 - Consensus algorithm overlay (Raft impl)
 - Network bridging
 - Codecs for typed read/write handles and protocols (e.g. HTTP, QUIC etc.)

@@ -1,0 +1,23 @@
+[package]
+name = "selium-guest"
+version.workspace = true
+edition.workspace = true
+description = "Selium guest SDK"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+futures.workspace = true
+parking_lot.workspace = true
+rkyv.workspace = true
+selium-abi = { path = "../abi" }
+selium-guest-macros = { path = "macros" }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

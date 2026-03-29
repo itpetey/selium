@@ -1,0 +1,19 @@
+[package]
+name = "selium-kernel"
+version.workspace = true
+edition.workspace = true
+description = "Selium host primitives"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+selium-abi = { path = "../abi" }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wasmtiny.workspace = true

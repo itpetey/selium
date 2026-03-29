@@ -49,6 +49,8 @@ We'd love your help! Check out the issue log or join in a discussion to get star
 
 See `AGENTS.md` for contribution rules, including: stable Rust only, `tracing` logging, and International English.
 
+For the current foundation split between ABI, kernel, runtime, guest SDK, and macros, see `docs/foundation-boundaries.md`.
+
 ---
 
 ## Licence

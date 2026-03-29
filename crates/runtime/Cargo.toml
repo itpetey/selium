@@ -1,0 +1,26 @@
+[package]
+name = "selium-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Selium Wasmtiny-backed runtime"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+selium-abi = { path = "../abi" }
+selium-kernel = { path = "../kernel" }
+thiserror.workspace = true
+tracing.workspace = true
+wasmtiny.workspace = true
+
+[dev-dependencies]
+rkyv.workspace = true
+selium-guest = { path = "../guest" }
+selium-kernel = { path = "../kernel" }
+tokio.workspace = true
+wat.workspace = true
