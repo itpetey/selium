@@ -113,7 +113,7 @@ pub enum GuestError {
 - Use `#[from]` for automatic error conversion
 - Propagate with `?` operator
 - Avoid `unwrap()`/`expect()` in production code
-- Suppress unused results with `let _ =` only when intentional
+- DO NOT suppress unused results unless explicitly authorised by a human, e.g. `let _ =`
 - When creating stubs for new functions, do not return fake values. Use the `todo!()` macro.
 
 ### Module Structure
