@@ -16,6 +16,12 @@ use tokio::time::{Duration, timeout};
 
 use crate::CapabilityGrant;
 
+#[derive(Clone)]
+pub struct NativeHost {
+    inner: Arc<NativeHostInner>,
+    grants: Arc<Vec<CapabilityGrant>>,
+}
+
 struct NativeHostInner {
     next_local_id: AtomicU64,
     next_shared_id: AtomicU64,
@@ -36,12 +42,6 @@ struct NativeHostInner {
     activity_log: Mutex<Vec<ActivityEvent>>,
     metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
     guest_logs: Mutex<Vec<GuestLogEntry>>,
-}
-
-#[derive(Clone)]
-pub struct NativeHost {
-    inner: Arc<NativeHostInner>,
-    grants: Arc<Vec<CapabilityGrant>>,
 }
 
 struct SharedMappingState {

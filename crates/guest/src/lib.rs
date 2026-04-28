@@ -6,13 +6,6 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub use selium_abi::{
-    Capability, CapabilityGrant, GuestHost, HostError, HostFuture, LocalityScope, ResourceClass,
-    ResourceIdentity, ResourceSelector, ScopeContext,
-};
-pub use selium_abi::{EntrypointMetadata, InterfaceMetadata};
-pub use selium_guest_macros::{entrypoint, pattern_interface};
-pub use tracing::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor::Error as RancorError;
@@ -30,6 +23,14 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
+
+pub use selium_abi::{
+    Capability, CapabilityGrant, GuestHost, HostError, HostFuture, LocalityScope, ResourceClass,
+    ResourceIdentity, ResourceSelector, ScopeContext,
+};
+pub use selium_abi::{EntrypointMetadata, InterfaceMetadata};
+pub use selium_guest_macros::{entrypoint, pattern_interface};
+pub use tracing::{debug, error, info, trace, warn};
 
 pub mod native;
 
@@ -90,6 +91,13 @@ pub struct PatternFabric {
     inner: Arc<PatternFabricInner>,
 }
 
+#[derive(Clone)]
+pub struct ByteStream {
+    context: GuestContext,
+    descriptor: NetworkStreamDescriptor,
+    session_shared_id: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum GuestError {
     #[error("host error: {0}")]
@@ -106,20 +114,6 @@ pub enum GuestError {
 pub struct GuestContext {
     host: Arc<dyn GuestHost>,
     scope_context: ScopeContext,
-}
-
-#[derive(Clone)]
-pub struct ByteStream {
-    context: GuestContext,
-    descriptor: NetworkStreamDescriptor,
-    session_shared_id: u64,
-}
-
-#[derive(Default)]
-struct PatternFabricInner {
-    topics: RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>,
-    request_handlers: RwLock<HashMap<String, BoxedRequestHandler>>,
-    live_tables: RwLock<HashMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
 pub struct Subscription<T> {
@@ -151,6 +145,13 @@ pub struct GuestLogResource {
 
 struct GuestLogLayer {
     resource: GuestLogResource,
+}
+
+#[derive(Default)]
+struct PatternFabricInner {
+    topics: RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>,
+    request_handlers: RwLock<HashMap<String, BoxedRequestHandler>>,
+    live_tables: RwLock<HashMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
 #[derive(Default)]

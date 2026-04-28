@@ -19,6 +19,25 @@ use wasmtiny::runtime::{SharedMemoryMapping, SharedRegionId, Store, WasmError};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone)]
+pub struct Kernel {
+    inner: Arc<KernelInner>,
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("resource not found: {0}")]
+    NotFound(String),
+    #[error("signal wait timed out")]
+    Timeout,
+    #[error("request exchange already has a response")]
+    AlreadyCompleted,
+    #[error("process already stopped: {0}")]
+    ProcessStopped(ProcessId),
+    #[error("wasmtiny runtime error: {0}")]
+    Wasm(String),
+}
+
 struct KernelInner {
     store: Mutex<Store>,
     next_local_id: AtomicU64,
@@ -46,28 +65,9 @@ struct KernelInner {
     metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
 }
 
-#[derive(Clone)]
-pub struct Kernel {
-    inner: Arc<KernelInner>,
-}
-
 struct RequestExchangeState {
     data: Mutex<RequestExchangeData>,
     notify: Notify,
-}
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("resource not found: {0}")]
-    NotFound(String),
-    #[error("signal wait timed out")]
-    Timeout,
-    #[error("request exchange already has a response")]
-    AlreadyCompleted,
-    #[error("process already stopped: {0}")]
-    ProcessStopped(ProcessId),
-    #[error("wasmtiny runtime error: {0}")]
-    Wasm(String),
 }
 
 struct SharedRegionRecord {

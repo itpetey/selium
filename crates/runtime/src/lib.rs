@@ -62,11 +62,6 @@ pub struct BootstrapReport {
     pub guests: Vec<BootstrappedGuest>,
 }
 
-struct MarkReadyHostFunc {
-    runtime: Runtime,
-    process_id: ProcessId,
-}
-
 #[derive(Clone)]
 pub struct RuntimeGuestHost {
     runtime: Runtime,
@@ -120,6 +115,11 @@ pub struct BootstrappedGuest {
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub grants: Vec<CapabilityGrant>,
+}
+
+struct MarkReadyHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
 }
 
 struct LoadedGuest {
