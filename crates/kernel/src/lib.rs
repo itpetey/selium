@@ -1,5 +1,9 @@
 //! Selium kernel primitives.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use parking_lot::{Condvar, Mutex};
 use selium_abi::{
     ActivityEvent, ActivityKind, BlobStoreDescriptor, CapabilityGrant, DurableLogDescriptor,
@@ -8,34 +12,12 @@ use selium_abi::{
     SharedRegionDescriptor, SharedResourceId, SignalDescriptor, StorageRecord,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 use wasmtiny::runtime::{SharedMemoryMapping, SharedRegionId, Store, WasmError};
 
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("resource not found: {0}")]
-    NotFound(String),
-    #[error("signal wait timed out")]
-    Timeout,
-    #[error("request exchange already has a response")]
-    AlreadyCompleted,
-    #[error("process already stopped: {0}")]
-    ProcessStopped(ProcessId),
-    #[error("wasmtiny runtime error: {0}")]
-    Wasm(String),
-}
-
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Clone)]
-pub struct Kernel {
-    inner: Arc<KernelInner>,
-}
 
 struct KernelInner {
     store: Mutex<Store>,
@@ -64,43 +46,28 @@ struct KernelInner {
     metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
 }
 
-impl Default for Kernel {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(KernelInner::default()),
-        }
-    }
+#[derive(Clone)]
+pub struct Kernel {
+    inner: Arc<KernelInner>,
 }
 
-impl Default for KernelInner {
-    fn default() -> Self {
-        Self {
-            store: Mutex::new(Store::new()),
-            next_local_id: AtomicU64::new(0),
-            next_shared_id: AtomicU64::new(0),
-            next_process_id: AtomicU64::new(0),
-            next_exchange_id: AtomicU64::new(0),
-            shared_regions: Mutex::new(HashMap::new()),
-            shared_mappings: Mutex::new(HashMap::new()),
-            signals_by_shared: Mutex::new(HashMap::new()),
-            local_signals: Mutex::new(HashMap::new()),
-            listeners_by_shared: Mutex::new(HashMap::new()),
-            local_listeners: Mutex::new(HashMap::new()),
-            sessions_by_shared: Mutex::new(HashMap::new()),
-            local_sessions: Mutex::new(HashMap::new()),
-            streams: Mutex::new(HashMap::new()),
-            request_exchanges: Mutex::new(HashMap::new()),
-            durable_logs_by_shared: Mutex::new(HashMap::new()),
-            local_logs: Mutex::new(HashMap::new()),
-            blob_stores_by_shared: Mutex::new(HashMap::new()),
-            local_blob_stores: Mutex::new(HashMap::new()),
-            processes: Mutex::new(HashMap::new()),
-            activity_log: Mutex::new(Vec::new()),
-            activity_log_changed: Condvar::new(),
-            guest_logs: Mutex::new(Vec::new()),
-            metering: Mutex::new(HashMap::new()),
-        }
-    }
+struct RequestExchangeState {
+    data: Mutex<RequestExchangeData>,
+    notify: Notify,
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("resource not found: {0}")]
+    NotFound(String),
+    #[error("signal wait timed out")]
+    Timeout,
+    #[error("request exchange already has a response")]
+    AlreadyCompleted,
+    #[error("process already stopped: {0}")]
+    ProcessStopped(ProcessId),
+    #[error("wasmtiny runtime error: {0}")]
+    Wasm(String),
 }
 
 struct SharedRegionRecord {
@@ -139,11 +106,6 @@ struct RequestExchangeData {
     response_body: Option<Vec<u8>>,
 }
 
-struct RequestExchangeState {
-    data: Mutex<RequestExchangeData>,
-    notify: Notify,
-}
-
 #[derive(Default)]
 struct DurableLogState {
     name: String,
@@ -164,6 +126,45 @@ struct ProcessState {
     entrypoint: String,
     running: bool,
     grants: Vec<CapabilityGrant>,
+}
+
+impl Default for KernelInner {
+    fn default() -> Self {
+        Self {
+            store: Mutex::new(Store::new()),
+            next_local_id: AtomicU64::new(0),
+            next_shared_id: AtomicU64::new(0),
+            next_process_id: AtomicU64::new(0),
+            next_exchange_id: AtomicU64::new(0),
+            shared_regions: Mutex::new(HashMap::new()),
+            shared_mappings: Mutex::new(HashMap::new()),
+            signals_by_shared: Mutex::new(HashMap::new()),
+            local_signals: Mutex::new(HashMap::new()),
+            listeners_by_shared: Mutex::new(HashMap::new()),
+            local_listeners: Mutex::new(HashMap::new()),
+            sessions_by_shared: Mutex::new(HashMap::new()),
+            local_sessions: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            request_exchanges: Mutex::new(HashMap::new()),
+            durable_logs_by_shared: Mutex::new(HashMap::new()),
+            local_logs: Mutex::new(HashMap::new()),
+            blob_stores_by_shared: Mutex::new(HashMap::new()),
+            local_blob_stores: Mutex::new(HashMap::new()),
+            processes: Mutex::new(HashMap::new()),
+            activity_log: Mutex::new(Vec::new()),
+            activity_log_changed: Condvar::new(),
+            guest_logs: Mutex::new(Vec::new()),
+            metering: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(KernelInner::default()),
+        }
+    }
 }
 
 impl Kernel {

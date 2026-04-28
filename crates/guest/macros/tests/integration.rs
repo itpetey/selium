@@ -5,20 +5,10 @@ use selium_guest::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!(
-        "(module
-            (import \"selium\" \"session_id\" (func $session_id (result i64)))
-            (import \"selium\" \"process_id\" (func $process_id (result i64)))
-            (import \"selium\" \"mark_ready\" (func $mark_ready))
-            (func (export \"{entrypoint}\")
-                call $mark_ready
-                call $session_id
-                drop
-                call $process_id
-                drop))"
-    ))
-    .expect("compile wat")
+#[pattern_interface]
+#[allow(dead_code)]
+trait Echo {
+    fn echo(&self);
 }
 
 #[entrypoint]
@@ -27,10 +17,24 @@ async fn demo_entrypoint() {
     tracing::info!("macro entrypoint invoked");
 }
 
-#[pattern_interface]
-#[allow(dead_code)]
-trait Echo {
-    fn echo(&self);
+#[test]
+fn descriptors_can_override_readiness_after_macro_generation() {
+    let mut descriptor = SystemGuestDescriptor::from_entrypoint_metadata(
+        "demo",
+        "demo-module",
+        module_with_entrypoint("demo_entrypoint"),
+        demo_entrypoint_entrypoint_metadata(),
+        vec![CapabilityGrant::new(
+            Capability::ProcessLifecycle,
+            vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+        )],
+    );
+    descriptor.readiness = ReadinessCondition::ActivityLogContains("bootstrapped".to_string());
+
+    assert!(matches!(
+        descriptor.readiness,
+        ReadinessCondition::ActivityLogContains(_)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -83,22 +87,18 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
     assert_eq!(runtime.loaded_guest_count(), 1);
 }
 
-#[test]
-fn descriptors_can_override_readiness_after_macro_generation() {
-    let mut descriptor = SystemGuestDescriptor::from_entrypoint_metadata(
-        "demo",
-        "demo-module",
-        module_with_entrypoint("demo_entrypoint"),
-        demo_entrypoint_entrypoint_metadata(),
-        vec![CapabilityGrant::new(
-            Capability::ProcessLifecycle,
-            vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-        )],
-    );
-    descriptor.readiness = ReadinessCondition::ActivityLogContains("bootstrapped".to_string());
-
-    assert!(matches!(
-        descriptor.readiness,
-        ReadinessCondition::ActivityLogContains(_)
-    ));
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!(
+        "(module
+            (import \"selium\" \"session_id\" (func $session_id (result i64)))
+            (import \"selium\" \"process_id\" (func $process_id (result i64)))
+            (import \"selium\" \"mark_ready\" (func $mark_ready))
+            (func (export \"{entrypoint}\")
+                call $mark_ready
+                call $session_id
+                drop
+                call $process_id
+                drop))"
+    ))
+    .expect("compile wat")
 }

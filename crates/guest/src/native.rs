@@ -1,4 +1,7 @@
-use crate::CapabilityGrant;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use parking_lot::Mutex;
 use selium_abi::{
     ActivityEvent, ActivityKind, BlobStoreDescriptor, DurableLogDescriptor, GuestHost,
@@ -8,17 +11,10 @@ use selium_abi::{
     SignalDescriptor, StorageRecord,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
-#[derive(Clone)]
-pub struct NativeHost {
-    inner: Arc<NativeHostInner>,
-    grants: Arc<Vec<CapabilityGrant>>,
-}
+use crate::CapabilityGrant;
 
 struct NativeHostInner {
     next_local_id: AtomicU64,
@@ -40,6 +36,12 @@ struct NativeHostInner {
     activity_log: Mutex<Vec<ActivityEvent>>,
     metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
     guest_logs: Mutex<Vec<GuestLogEntry>>,
+}
+
+#[derive(Clone)]
+pub struct NativeHost {
+    inner: Arc<NativeHostInner>,
+    grants: Arc<Vec<CapabilityGrant>>,
 }
 
 struct SharedMappingState {

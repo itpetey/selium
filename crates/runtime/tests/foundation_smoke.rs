@@ -4,9 +4,9 @@ use selium_guest::{
 };
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
-}
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(bytecheck())]
+struct StringPayload(String);
 
 #[tokio::test(flavor = "current_thread")]
 async fn foundation_crates_work_together() {
@@ -101,6 +101,10 @@ async fn foundation_crates_work_together() {
         .await
         .expect("echo request");
     assert_eq!(echoed.0, "ready");
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -270,7 +274,3 @@ async fn runtime_guest_host_rejects_cross_session_local_handle_use() {
         ))
     ));
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(bytecheck())]
-struct StringPayload(String);

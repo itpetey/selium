@@ -1,5 +1,10 @@
 //! Selium runtime built on top of Wasmtiny and the Selium kernel.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
 use parking_lot::Mutex;
 use selium_abi::{
     ActivityEvent, BlobStoreDescriptor, Capability, CapabilityGrant, DurableLogDescriptor,
@@ -10,14 +15,64 @@ use selium_abi::{
     SignalDescriptor, StorageRecord,
 };
 use selium_kernel::Kernel;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::info;
 use wasmtiny::runtime::{HostFunc, Store};
 use wasmtiny::{FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue};
+
+pub type Result<T> = std::result::Result<T, Error>;
+type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
+type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
+
+const DEFAULT_READINESS_POLL_MS: u64 = 10;
+const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
+
+pub struct Runtime {
+    kernel: Kernel,
+    sessions: Arc<Mutex<HashMap<SessionId, SessionRecord>>>,
+    loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
+    process_sessions: Arc<Mutex<HashMap<ProcessId, SessionId>>>,
+    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
+    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
+    pending_shared_region_reclaims: Arc<Mutex<BTreeSet<u64>>>,
+    exchange_owners: Arc<Mutex<HashMap<u64, SessionId>>>,
+    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    next_session_id: Arc<Mutex<SessionId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemGuestDescriptor {
+    pub name: String,
+    pub module_id: String,
+    pub module_bytes: Vec<u8>,
+    pub entrypoint: String,
+    pub arguments: Vec<Vec<u8>>,
+    pub grants: Vec<CapabilityGrant>,
+    pub dependencies: Vec<String>,
+    pub readiness: ReadinessCondition,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeConfig {
+    pub system_guests: Vec<SystemGuestDescriptor>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapReport {
+    pub guests: Vec<BootstrappedGuest>,
+}
+
+struct MarkReadyHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
+}
+
+#[derive(Clone)]
+pub struct RuntimeGuestHost {
+    runtime: Runtime,
+    session_id: SessionId,
+    scope_context: ScopeContext,
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -49,18 +104,59 @@ pub enum Error {
     Wasm(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadinessCondition {
+    Immediate,
+    ActivityLogContains(String),
+}
 
 #[derive(Debug, Clone)]
-pub struct SystemGuestDescriptor {
+pub struct BootstrappedGuest {
     pub name: String,
-    pub module_id: String,
-    pub module_bytes: Vec<u8>,
-    pub entrypoint: String,
-    pub arguments: Vec<Vec<u8>>,
+    pub process_id: ProcessId,
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
     pub grants: Vec<CapabilityGrant>,
-    pub dependencies: Vec<String>,
-    pub readiness: ReadinessCondition,
+}
+
+struct LoadedGuest {
+    app: WasmApplication,
+    module_index: u32,
+    entrypoint_results: Vec<WasmValue>,
+}
+
+struct SessionIdHostFunc {
+    session_id: SessionId,
+}
+
+struct ProcessIdHostFunc {
+    process_id: ProcessId,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new(Kernel::default())
+    }
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        Self {
+            kernel: self.kernel.clone(),
+            sessions: self.sessions.clone(),
+            loaded_guests: self.loaded_guests.clone(),
+            process_sessions: self.process_sessions.clone(),
+            local_handle_owners: self.local_handle_owners.clone(),
+            shared_resource_owners: self.shared_resource_owners.clone(),
+            pending_shared_region_reclaims: self.pending_shared_region_reclaims.clone(),
+            exchange_owners: self.exchange_owners.clone(),
+            module_registry: self.module_registry.clone(),
+            next_session_id: self.next_session_id.clone(),
+        }
+    }
 }
 
 impl SystemGuestDescriptor {
@@ -84,47 +180,6 @@ impl SystemGuestDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeConfig {
-    pub system_guests: Vec<SystemGuestDescriptor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadinessCondition {
-    Immediate,
-    ActivityLogContains(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct BootstrappedGuest {
-    pub name: String,
-    pub process_id: ProcessId,
-    pub session_id: SessionId,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BootstrapReport {
-    pub guests: Vec<BootstrappedGuest>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionRecord {
-    pub grants: Vec<CapabilityGrant>,
-}
-
-struct LoadedGuest {
-    app: WasmApplication,
-    module_index: u32,
-    entrypoint_results: Vec<WasmValue>,
-}
-
-type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
-type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
-
-struct SessionIdHostFunc {
-    session_id: SessionId,
-}
-
 impl HostFunc for SessionIdHostFunc {
     fn call(
         &self,
@@ -139,10 +194,6 @@ impl HostFunc for SessionIdHostFunc {
     }
 }
 
-struct ProcessIdHostFunc {
-    process_id: ProcessId,
-}
-
 impl HostFunc for ProcessIdHostFunc {
     fn call(
         &self,
@@ -155,11 +206,6 @@ impl HostFunc for ProcessIdHostFunc {
     fn function_type(&self) -> Option<&FunctionType> {
         None
     }
-}
-
-struct MarkReadyHostFunc {
-    runtime: Runtime,
-    process_id: ProcessId,
 }
 
 impl HostFunc for MarkReadyHostFunc {
@@ -178,52 +224,6 @@ impl HostFunc for MarkReadyHostFunc {
 
     fn function_type(&self) -> Option<&FunctionType> {
         None
-    }
-}
-
-pub struct Runtime {
-    kernel: Kernel,
-    sessions: Arc<Mutex<HashMap<SessionId, SessionRecord>>>,
-    loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
-    process_sessions: Arc<Mutex<HashMap<ProcessId, SessionId>>>,
-    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
-    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
-    pending_shared_region_reclaims: Arc<Mutex<BTreeSet<u64>>>,
-    exchange_owners: Arc<Mutex<HashMap<u64, SessionId>>>,
-    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    next_session_id: Arc<Mutex<SessionId>>,
-}
-
-#[derive(Clone)]
-pub struct RuntimeGuestHost {
-    runtime: Runtime,
-    session_id: SessionId,
-    scope_context: ScopeContext,
-}
-
-const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
-const DEFAULT_READINESS_POLL_MS: u64 = 10;
-
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new(Kernel::default())
-    }
-}
-
-impl Clone for Runtime {
-    fn clone(&self) -> Self {
-        Self {
-            kernel: self.kernel.clone(),
-            sessions: self.sessions.clone(),
-            loaded_guests: self.loaded_guests.clone(),
-            process_sessions: self.process_sessions.clone(),
-            local_handle_owners: self.local_handle_owners.clone(),
-            shared_resource_owners: self.shared_resource_owners.clone(),
-            pending_shared_region_reclaims: self.pending_shared_region_reclaims.clone(),
-            exchange_owners: self.exchange_owners.clone(),
-            module_registry: self.module_registry.clone(),
-            next_session_id: self.next_session_id.clone(),
-        }
     }
 }
 
@@ -784,68 +784,6 @@ impl Runtime {
             .map_err(map_wasm_error)?;
         loaded_guest.entrypoint_results = results;
         Ok(loaded_guest)
-    }
-}
-
-fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmValue>> {
-    arguments
-        .iter()
-        .map(|argument| {
-            let Some((value, used)) = WasmValue::from_bytes(argument) else {
-                return Err(Error::InvalidEntrypointArgument);
-            };
-            if used != argument.len() {
-                return Err(Error::InvalidEntrypointArgument);
-            }
-            Ok(value)
-        })
-        .collect()
-}
-
-fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
-    if parent.capability != child.capability {
-        return false;
-    }
-
-    parent.selectors.iter().all(|parent_selector| match parent_selector {
-        ResourceSelector::Tenant(parent_tenant) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::Tenant(child_tenant) if child_tenant == parent_tenant)
-        }),
-        ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
-        }),
-        ResourceSelector::Locality(parent_locality) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::Locality(child_locality) if parent_locality.matches(child_locality))
-        }),
-        ResourceSelector::ResourceClass(parent_class) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::ResourceClass(child_class) if child_class == parent_class)
-        }),
-        ResourceSelector::ExplicitResource(parent_identity) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::ExplicitResource(child_identity) if child_identity == parent_identity)
-        }),
-    })
-}
-
-fn map_wasm_error(error: WasmError) -> Error {
-    Error::Wasm(error.to_string())
-}
-
-fn register_optional_host_function(
-    app: &mut WasmApplication,
-    module_index: u32,
-    import_module: &str,
-    name: &str,
-    func: Box<dyn HostFunc>,
-    func_type: FunctionType,
-) -> Result<()> {
-    match app.register_host_function(module_index, import_module, name, func, func_type) {
-        Ok(()) => Ok(()),
-        Err(WasmError::Instantiate(message))
-            if message == format!("import {import_module}.{name} not found") =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(map_wasm_error(error)),
     }
 }
 
@@ -1766,6 +1704,68 @@ impl GuestHost for RuntimeGuestHost {
             .into_iter()
             .filter(|entry| process_id.is_none() || entry.process_id == process_id)
             .collect())
+    }
+}
+
+fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmValue>> {
+    arguments
+        .iter()
+        .map(|argument| {
+            let Some((value, used)) = WasmValue::from_bytes(argument) else {
+                return Err(Error::InvalidEntrypointArgument);
+            };
+            if used != argument.len() {
+                return Err(Error::InvalidEntrypointArgument);
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn map_wasm_error(error: WasmError) -> Error {
+    Error::Wasm(error.to_string())
+}
+
+fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
+    if parent.capability != child.capability {
+        return false;
+    }
+
+    parent.selectors.iter().all(|parent_selector| match parent_selector {
+        ResourceSelector::Tenant(parent_tenant) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::Tenant(child_tenant) if child_tenant == parent_tenant)
+        }),
+        ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
+        }),
+        ResourceSelector::Locality(parent_locality) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::Locality(child_locality) if parent_locality.matches(child_locality))
+        }),
+        ResourceSelector::ResourceClass(parent_class) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::ResourceClass(child_class) if child_class == parent_class)
+        }),
+        ResourceSelector::ExplicitResource(parent_identity) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::ExplicitResource(child_identity) if child_identity == parent_identity)
+        }),
+    })
+}
+
+fn register_optional_host_function(
+    app: &mut WasmApplication,
+    module_index: u32,
+    import_module: &str,
+    name: &str,
+    func: Box<dyn HostFunc>,
+    func_type: FunctionType,
+) -> Result<()> {
+    match app.register_host_function(module_index, import_module, name, func, func_type) {
+        Ok(()) => Ok(()),
+        Err(WasmError::Instantiate(message))
+            if message == format!("import {import_module}.{name} not found") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(map_wasm_error(error)),
     }
 }
 

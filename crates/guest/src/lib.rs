@@ -1,5 +1,18 @@
 //! Selium guest SDK.
 
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
+
+pub use selium_abi::{
+    Capability, CapabilityGrant, GuestHost, HostError, HostFuture, LocalityScope, ResourceClass,
+    ResourceIdentity, ResourceSelector, ScopeContext,
+};
+pub use selium_abi::{EntrypointMetadata, InterfaceMetadata};
+pub use selium_guest_macros::{entrypoint, pattern_interface};
+pub use tracing::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor::Error as RancorError;
@@ -10,11 +23,6 @@ use selium_abi::{
     SharedRegionDescriptor, SignalDescriptor, StorageRecord, decode_rkyv, deframe_bytes,
     encode_rkyv, frame_bytes,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
 use tracing::field::{Field, Visit};
@@ -23,15 +31,64 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
-pub use selium_abi::{
-    Capability, CapabilityGrant, GuestHost, HostError, HostFuture, LocalityScope, ResourceClass,
-    ResourceIdentity, ResourceSelector, ScopeContext,
-};
-pub use selium_abi::{EntrypointMetadata, InterfaceMetadata};
-pub use selium_guest_macros::{entrypoint, pattern_interface};
-pub use tracing::{debug, error, info, trace, warn};
-
 pub mod native;
+
+pub type GuestLogRecord = GuestLogEntry;
+pub type Result<T> = std::result::Result<T, GuestError>;
+type BoxedPatternFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
+type BoxedRequestHandler = Arc<dyn Fn(Vec<u8>) -> BoxedPatternFuture + Send + Sync>;
+
+pub struct SharedMemoryHandle {
+    context: GuestContext,
+    descriptor: SharedMappingDescriptor,
+    owns_region: bool,
+}
+
+#[derive(Clone)]
+pub struct SignalHandle {
+    context: GuestContext,
+    descriptor: SignalDescriptor,
+}
+
+#[derive(Clone)]
+pub struct DurableLogHandle {
+    context: GuestContext,
+    descriptor: DurableLogDescriptor,
+}
+
+#[derive(Clone)]
+pub struct BlobStoreHandle {
+    context: GuestContext,
+    descriptor: BlobStoreDescriptor,
+}
+
+#[derive(Clone)]
+pub struct NetworkListenerHandle {
+    context: GuestContext,
+    descriptor: NetworkListenerDescriptor,
+}
+
+#[derive(Clone)]
+pub struct NetworkSessionHandle {
+    context: GuestContext,
+    descriptor: NetworkSessionDescriptor,
+}
+
+#[derive(Clone)]
+pub struct ProcessHandle {
+    context: GuestContext,
+    descriptor: ProcessDescriptor,
+}
+
+#[derive(Clone)]
+pub struct ActivityLogHandle {
+    context: GuestContext,
+}
+
+#[derive(Clone, Default)]
+pub struct PatternFabric {
+    inner: Arc<PatternFabricInner>,
+}
 
 #[derive(Debug, Error)]
 pub enum GuestError {
@@ -45,7 +102,117 @@ pub enum GuestError {
     Pattern(String),
 }
 
-pub type Result<T> = std::result::Result<T, GuestError>;
+#[derive(Clone)]
+pub struct GuestContext {
+    host: Arc<dyn GuestHost>,
+    scope_context: ScopeContext,
+}
+
+#[derive(Clone)]
+pub struct ByteStream {
+    context: GuestContext,
+    descriptor: NetworkStreamDescriptor,
+    session_shared_id: u64,
+}
+
+#[derive(Default)]
+struct PatternFabricInner {
+    topics: RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>,
+    request_handlers: RwLock<HashMap<String, BoxedRequestHandler>>,
+    live_tables: RwLock<HashMap<String, BTreeMap<String, Vec<u8>>>>,
+}
+
+pub struct Subscription<T> {
+    receiver: broadcast::Receiver<Vec<u8>>,
+    _marker: PhantomData<T>,
+}
+
+pub struct PatternStreamWriter {
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+pub struct PatternStreamReader {
+    receiver: mpsc::Receiver<Vec<u8>>,
+}
+
+pub struct LiveTable<T> {
+    fabric: PatternFabric,
+    name: String,
+    _marker: PhantomData<T>,
+}
+
+#[derive(Clone)]
+pub struct GuestLogResource {
+    host: Arc<dyn GuestHost>,
+    process_id: Option<ProcessId>,
+    can_write: bool,
+    can_read: bool,
+}
+
+struct GuestLogLayer {
+    resource: GuestLogResource,
+}
+
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+}
+
+impl Drop for SharedMemoryHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .context
+            .host()
+            .detach_shared_region(self.descriptor.local_id);
+    }
+}
+
+impl Drop for SignalHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_signal(self.descriptor.local_id);
+    }
+}
+
+impl Drop for DurableLogHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_log(self.descriptor.local_id);
+    }
+}
+
+impl Drop for BlobStoreHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .context
+            .host()
+            .close_blob_store(self.descriptor.local_id);
+    }
+}
+
+impl Drop for NetworkListenerHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_listener(self.descriptor.local_id);
+    }
+}
+
+impl Drop for NetworkSessionHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_session(self.descriptor.local_id);
+    }
+}
+
+impl Drop for ByteStream {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_stream(self.descriptor.local_id);
+    }
+}
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}").trim_matches('"').to_string();
+        }
+    }
+}
 
 impl From<HostError> for GuestError {
     fn from(value: HostError) -> Self {
@@ -54,12 +221,6 @@ impl From<HostError> for GuestError {
             HostError::PermissionDenied(capability) => Self::PermissionDenied(capability),
         }
     }
-}
-
-#[derive(Clone)]
-pub struct GuestContext {
-    host: Arc<dyn GuestHost>,
-    scope_context: ScopeContext,
 }
 
 impl GuestContext {
@@ -106,51 +267,6 @@ impl GuestContext {
             Err(GuestError::PermissionDenied(capability))
         }
     }
-}
-
-pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>>
-where
-    T: selium_abi::RkyvEncode,
-{
-    frame_bytes(&encode_rkyv(value)?).map_err(abi_error_to_guest_error)
-}
-
-pub fn decode_typed<T>(bytes: &[u8]) -> Result<T>
-where
-    T: rkyv::Archive + Sized,
-    for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-{
-    let payload = deframe_bytes(bytes).map_err(abi_error_to_guest_error)?;
-    Ok(decode_rkyv(payload)?)
-}
-
-fn abi_error_to_guest_error(error: AbiError) -> GuestError {
-    GuestError::Host(format!("{:?}: {}", error.code, error.message))
-}
-
-pub fn block_on_entrypoint<F>(future: F)
-where
-    F: Future<Output = ()>,
-{
-    futures::executor::block_on(future)
-}
-
-pub fn run_entrypoint_safely<F>(future: F)
-where
-    F: Future<Output = ()>,
-{
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on_entrypoint(future)));
-    if result.is_err() {
-        std::process::abort();
-    }
-}
-
-pub struct SharedMemoryHandle {
-    context: GuestContext,
-    descriptor: SharedMappingDescriptor,
-    owns_region: bool,
 }
 
 impl SharedMemoryHandle {
@@ -224,15 +340,6 @@ impl SharedMemoryHandle {
     }
 }
 
-impl Drop for SharedMemoryHandle {
-    fn drop(&mut self) {
-        let _ = self
-            .context
-            .host()
-            .detach_shared_region(self.descriptor.local_id);
-    }
-}
-
 impl SharedMemoryHandle {
     pub fn destroy_region(self) -> Result<()> {
         if !self.owns_region {
@@ -252,12 +359,6 @@ impl SharedMemoryHandle {
         std::mem::forget(self);
         Ok(())
     }
-}
-
-#[derive(Clone)]
-pub struct SignalHandle {
-    context: GuestContext,
-    descriptor: SignalDescriptor,
 }
 
 impl SignalHandle {
@@ -317,18 +418,6 @@ impl SignalHandle {
         std::mem::forget(self);
         Ok(())
     }
-}
-
-impl Drop for SignalHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_signal(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct DurableLogHandle {
-    context: GuestContext,
-    descriptor: DurableLogDescriptor,
 }
 
 impl DurableLogHandle {
@@ -403,18 +492,6 @@ impl DurableLogHandle {
     }
 }
 
-impl Drop for DurableLogHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_log(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct BlobStoreHandle {
-    context: GuestContext,
-    descriptor: BlobStoreDescriptor,
-}
-
 impl BlobStoreHandle {
     pub fn open(context: GuestContext, name: impl Into<String>) -> Result<Self> {
         context.require(Capability::Storage, Some(ResourceClass::BlobStore), None)?;
@@ -483,21 +560,6 @@ impl BlobStoreHandle {
     }
 }
 
-impl Drop for BlobStoreHandle {
-    fn drop(&mut self) {
-        let _ = self
-            .context
-            .host()
-            .close_blob_store(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct NetworkListenerHandle {
-    context: GuestContext,
-    descriptor: NetworkListenerDescriptor,
-}
-
 impl NetworkListenerHandle {
     pub fn listen(context: GuestContext, address: impl Into<String>) -> Result<Self> {
         context.require(Capability::Network, Some(ResourceClass::Listener), None)?;
@@ -524,18 +586,6 @@ impl NetworkListenerHandle {
         std::mem::forget(self);
         Ok(())
     }
-}
-
-impl Drop for NetworkListenerHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_listener(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct NetworkSessionHandle {
-    context: GuestContext,
-    descriptor: NetworkSessionDescriptor,
 }
 
 impl NetworkSessionHandle {
@@ -603,19 +653,6 @@ impl NetworkSessionHandle {
     }
 }
 
-impl Drop for NetworkSessionHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_session(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct ByteStream {
-    context: GuestContext,
-    descriptor: NetworkStreamDescriptor,
-    session_shared_id: u64,
-}
-
 impl ByteStream {
     pub fn send(&self, bytes: Vec<u8>) -> Result<()> {
         self.context.require(
@@ -646,18 +683,6 @@ impl ByteStream {
         std::mem::forget(self);
         Ok(())
     }
-}
-
-impl Drop for ByteStream {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_stream(self.descriptor.local_id);
-    }
-}
-
-#[derive(Clone)]
-pub struct ProcessHandle {
-    context: GuestContext,
-    descriptor: ProcessDescriptor,
 }
 
 impl ProcessHandle {
@@ -714,11 +739,6 @@ impl ProcessHandle {
     }
 }
 
-#[derive(Clone)]
-pub struct ActivityLogHandle {
-    context: GuestContext,
-}
-
 impl ActivityLogHandle {
     pub fn open(context: GuestContext) -> Result<Self> {
         context.require(
@@ -737,21 +757,6 @@ impl ActivityLogHandle {
         )?;
         Ok(self.context.host().read_activity_from(cursor)?)
     }
-}
-
-type BoxedPatternFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
-type BoxedRequestHandler = Arc<dyn Fn(Vec<u8>) -> BoxedPatternFuture + Send + Sync>;
-
-#[derive(Clone, Default)]
-pub struct PatternFabric {
-    inner: Arc<PatternFabricInner>,
-}
-
-#[derive(Default)]
-struct PatternFabricInner {
-    topics: RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>,
-    request_handlers: RwLock<HashMap<String, BoxedRequestHandler>>,
-    live_tables: RwLock<HashMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
 impl PatternFabric {
@@ -861,11 +866,6 @@ impl PatternFabric {
     }
 }
 
-pub struct Subscription<T> {
-    receiver: broadcast::Receiver<Vec<u8>>,
-    _marker: PhantomData<T>,
-}
-
 impl<T> Subscription<T> {
     pub async fn recv(&mut self) -> Result<T>
     where
@@ -882,10 +882,6 @@ impl<T> Subscription<T> {
     }
 }
 
-pub struct PatternStreamWriter {
-    sender: mpsc::Sender<Vec<u8>>,
-}
-
 impl PatternStreamWriter {
     pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
         self.sender
@@ -895,20 +891,10 @@ impl PatternStreamWriter {
     }
 }
 
-pub struct PatternStreamReader {
-    receiver: mpsc::Receiver<Vec<u8>>,
-}
-
 impl PatternStreamReader {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         self.receiver.recv().await
     }
-}
-
-pub struct LiveTable<T> {
-    fabric: PatternFabric,
-    name: String,
-    _marker: PhantomData<T>,
 }
 
 impl<T> LiveTable<T> {
@@ -963,16 +949,6 @@ impl<T> LiveTable<T> {
     }
 }
 
-pub type GuestLogRecord = GuestLogEntry;
-
-#[derive(Clone)]
-pub struct GuestLogResource {
-    host: Arc<dyn GuestHost>,
-    process_id: Option<ProcessId>,
-    can_write: bool,
-    can_read: bool,
-}
-
 impl GuestLogResource {
     pub fn new(context: &GuestContext, process_id: Option<ProcessId>) -> Result<Self> {
         let can_write = context
@@ -1023,10 +999,6 @@ impl GuestLogResource {
     }
 }
 
-struct GuestLogLayer {
-    resource: GuestLogResource,
-}
-
 impl<S> Layer<S> for GuestLogLayer
 where
     S: Subscriber,
@@ -1043,17 +1015,43 @@ where
     }
 }
 
-#[derive(Default)]
-struct MessageVisitor {
-    message: String,
+pub fn block_on_entrypoint<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    futures::executor::block_on(future)
 }
 
-impl Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}").trim_matches('"').to_string();
-        }
+pub fn decode_typed<T>(bytes: &[u8]) -> Result<T>
+where
+    T: rkyv::Archive + Sized,
+    for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
+        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+{
+    let payload = deframe_bytes(bytes).map_err(abi_error_to_guest_error)?;
+    Ok(decode_rkyv(payload)?)
+}
+
+pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: selium_abi::RkyvEncode,
+{
+    frame_bytes(&encode_rkyv(value)?).map_err(abi_error_to_guest_error)
+}
+
+pub fn run_entrypoint_safely<F>(future: F)
+where
+    F: Future<Output = ()>,
+{
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block_on_entrypoint(future)));
+    if result.is_err() {
+        std::process::abort();
     }
+}
+
+fn abi_error_to_guest_error(error: AbiError) -> GuestError {
+    GuestError::Host(format!("{:?}: {}", error.code, error.message))
 }
 
 #[cfg(test)]
