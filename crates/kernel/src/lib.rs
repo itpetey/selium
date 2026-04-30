@@ -19,11 +19,6 @@ use wasmtiny::runtime::{SharedMemoryMapping, SharedRegionId, Store, WasmError};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone)]
-pub struct Kernel {
-    inner: Arc<KernelInner>,
-}
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("resource not found: {0}")]
@@ -36,38 +31,6 @@ pub enum Error {
     ProcessStopped(ProcessId),
     #[error("wasmtiny runtime error: {0}")]
     Wasm(String),
-}
-
-struct KernelInner {
-    store: Mutex<Store>,
-    next_local_id: AtomicU64,
-    next_shared_id: AtomicU64,
-    next_process_id: AtomicU64,
-    next_exchange_id: AtomicU64,
-    shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
-    shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
-    signals_by_shared: Mutex<HashMap<SharedResourceId, Arc<SignalState>>>,
-    local_signals: Mutex<HashMap<u64, SharedResourceId>>,
-    listeners_by_shared: Mutex<HashMap<SharedResourceId, ListenerState>>,
-    local_listeners: Mutex<HashMap<u64, SharedResourceId>>,
-    sessions_by_shared: Mutex<HashMap<SharedResourceId, SessionState>>,
-    local_sessions: Mutex<HashMap<u64, SharedResourceId>>,
-    streams: Mutex<HashMap<u64, StreamState>>,
-    request_exchanges: Mutex<HashMap<u64, Arc<RequestExchangeState>>>,
-    durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
-    local_logs: Mutex<HashMap<u64, SharedResourceId>>,
-    blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
-    local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
-    processes: Mutex<HashMap<ProcessId, ProcessState>>,
-    activity_log: Mutex<Vec<ActivityEvent>>,
-    activity_log_changed: Condvar,
-    guest_logs: Mutex<Vec<GuestLogEntry>>,
-    metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
-}
-
-struct RequestExchangeState {
-    data: Mutex<RequestExchangeData>,
-    notify: Notify,
 }
 
 struct SharedRegionRecord {
@@ -106,6 +69,11 @@ struct RequestExchangeData {
     response_body: Option<Vec<u8>>,
 }
 
+struct RequestExchangeState {
+    data: Mutex<RequestExchangeData>,
+    notify: Notify,
+}
+
 #[derive(Default)]
 struct DurableLogState {
     name: String,
@@ -126,6 +94,38 @@ struct ProcessState {
     entrypoint: String,
     running: bool,
     grants: Vec<CapabilityGrant>,
+}
+
+struct KernelInner {
+    store: Mutex<Store>,
+    next_local_id: AtomicU64,
+    next_shared_id: AtomicU64,
+    next_process_id: AtomicU64,
+    next_exchange_id: AtomicU64,
+    shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
+    shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
+    signals_by_shared: Mutex<HashMap<SharedResourceId, Arc<SignalState>>>,
+    local_signals: Mutex<HashMap<u64, SharedResourceId>>,
+    listeners_by_shared: Mutex<HashMap<SharedResourceId, ListenerState>>,
+    local_listeners: Mutex<HashMap<u64, SharedResourceId>>,
+    sessions_by_shared: Mutex<HashMap<SharedResourceId, SessionState>>,
+    local_sessions: Mutex<HashMap<u64, SharedResourceId>>,
+    streams: Mutex<HashMap<u64, StreamState>>,
+    request_exchanges: Mutex<HashMap<u64, Arc<RequestExchangeState>>>,
+    durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
+    local_logs: Mutex<HashMap<u64, SharedResourceId>>,
+    blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
+    local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
+    processes: Mutex<HashMap<ProcessId, ProcessState>>,
+    activity_log: Mutex<Vec<ActivityEvent>>,
+    activity_log_changed: Condvar,
+    guest_logs: Mutex<Vec<GuestLogEntry>>,
+    metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
+}
+
+#[derive(Clone)]
+pub struct Kernel {
+    inner: Arc<KernelInner>,
 }
 
 impl Default for KernelInner {
@@ -155,14 +155,6 @@ impl Default for KernelInner {
             activity_log_changed: Condvar::new(),
             guest_logs: Mutex::new(Vec::new()),
             metering: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl Default for Kernel {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(KernelInner::default()),
         }
     }
 }
@@ -987,6 +979,14 @@ impl Kernel {
     fn response_from_exchange(exchange: &RequestExchangeState) -> Option<(u16, Vec<u8>)> {
         let data = exchange.data.lock();
         data.response_status.zip(data.response_body.clone())
+    }
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(KernelInner::default()),
+        }
     }
 }
 

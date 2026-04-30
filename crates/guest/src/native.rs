@@ -16,34 +16,6 @@ use tokio::time::{Duration, timeout};
 
 use crate::CapabilityGrant;
 
-#[derive(Clone)]
-pub struct NativeHost {
-    inner: Arc<NativeHostInner>,
-    grants: Arc<Vec<CapabilityGrant>>,
-}
-
-struct NativeHostInner {
-    next_local_id: AtomicU64,
-    next_shared_id: AtomicU64,
-    next_process_id: AtomicU64,
-    next_exchange_id: AtomicU64,
-    shared_regions: Mutex<HashMap<u64, Vec<u8>>>,
-    shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
-    signals: Mutex<HashMap<u64, Arc<SignalState>>>,
-    listeners: Mutex<HashMap<u64, ListenerState>>,
-    logs_by_shared: Mutex<HashMap<u64, DurableLogState>>,
-    log_locals: Mutex<HashMap<u64, u64>>,
-    blob_stores_by_shared: Mutex<HashMap<u64, BlobStoreState>>,
-    blob_store_locals: Mutex<HashMap<u64, u64>>,
-    sessions: Mutex<HashMap<u64, SessionState>>,
-    streams: Mutex<HashMap<u64, StreamState>>,
-    exchanges: Mutex<HashMap<u64, Arc<RequestExchangeState>>>,
-    processes: Mutex<HashMap<ProcessId, ProcessState>>,
-    activity_log: Mutex<Vec<ActivityEvent>>,
-    metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
-    guest_logs: Mutex<Vec<GuestLogEntry>>,
-}
-
 struct SharedMappingState {
     shared_id: u64,
     offset: u32,
@@ -95,10 +67,32 @@ struct ProcessState {
     grants: Vec<CapabilityGrant>,
 }
 
-impl Default for NativeHost {
-    fn default() -> Self {
-        Self::with_grants(Vec::new())
-    }
+struct NativeHostInner {
+    next_local_id: AtomicU64,
+    next_shared_id: AtomicU64,
+    next_process_id: AtomicU64,
+    next_exchange_id: AtomicU64,
+    shared_regions: Mutex<HashMap<u64, Vec<u8>>>,
+    shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
+    signals: Mutex<HashMap<u64, Arc<SignalState>>>,
+    listeners: Mutex<HashMap<u64, ListenerState>>,
+    logs_by_shared: Mutex<HashMap<u64, DurableLogState>>,
+    log_locals: Mutex<HashMap<u64, u64>>,
+    blob_stores_by_shared: Mutex<HashMap<u64, BlobStoreState>>,
+    blob_store_locals: Mutex<HashMap<u64, u64>>,
+    sessions: Mutex<HashMap<u64, SessionState>>,
+    streams: Mutex<HashMap<u64, StreamState>>,
+    exchanges: Mutex<HashMap<u64, Arc<RequestExchangeState>>>,
+    processes: Mutex<HashMap<ProcessId, ProcessState>>,
+    activity_log: Mutex<Vec<ActivityEvent>>,
+    metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
+    guest_logs: Mutex<Vec<GuestLogEntry>>,
+}
+
+#[derive(Clone)]
+pub struct NativeHost {
+    inner: Arc<NativeHostInner>,
+    grants: Arc<Vec<CapabilityGrant>>,
 }
 
 impl NativeHost {
@@ -817,5 +811,11 @@ impl GuestHost for NativeHost {
             .filter(|entry| process_id.is_none() || entry.process_id == process_id)
             .cloned()
             .collect())
+    }
+}
+
+impl Default for NativeHost {
+    fn default() -> Self {
+        Self::with_grants(Vec::new())
     }
 }

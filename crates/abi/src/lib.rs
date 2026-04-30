@@ -123,29 +123,62 @@ pub trait RkyvEncode:
 {
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
+)]
 #[rkyv(bytecheck())]
-pub enum HostcallOutput {
-    Empty,
-    SharedRegion(SharedRegionDescriptor),
-    SharedMapping(SharedMappingDescriptor),
-    Signal(SignalDescriptor),
-    Listener(NetworkListenerDescriptor),
-    Session(NetworkSessionDescriptor),
-    Stream(NetworkStreamDescriptor),
-    DurableLog(DurableLogDescriptor),
-    BlobStore(BlobStoreDescriptor),
-    Process(ProcessDescriptor),
-    Bytes(Vec<u8>),
-    BlobId(String),
-    Response { status: u16, body: Vec<u8> },
-    Sequence(Option<u64>),
-    SharedId(SharedResourceId),
-    StorageRecords(Vec<StorageRecord>),
-    ActivityEvents(Vec<ActivityEvent>),
-    GuestLogEntries(Vec<GuestLogEntry>),
-    Metering(MeteringObservation),
-    SignalGeneration(u64),
+pub enum ResourceIdentity {
+    Local(LocalResourceId),
+    Shared(SharedResourceId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum Capability {
+    ProcessLifecycle,
+    SharedMemory,
+    Signal,
+    Network,
+    Storage,
+    SessionLifecycle,
+    ActivityRead,
+    MeteringRead,
+    GuestLogRead,
+    GuestLogWrite,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum HostError {
+    #[error("host error: {0}")]
+    Host(String),
+    #[error("permission denied for capability {0:?}")]
+    PermissionDenied(Capability),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum LocalityScope {
+    Any,
+    Cluster,
+    Host(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ResourceClass {
+    SharedRegion,
+    SharedMapping,
+    Signal,
+    Listener,
+    Session,
+    Stream,
+    RequestExchange,
+    DurableLog,
+    BlobStore,
+    Process,
+    ActivityLog,
+    MeteringStream,
+    GuestLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -175,19 +208,187 @@ pub struct CapabilityGrant {
     pub selectors: Vec<ResourceSelector>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct HostcallRequest {
-    pub hostcall: Hostcall,
-    pub payload: HostcallPayload,
+pub struct SharedRegionDescriptor {
+    pub shared_id: SharedResourceId,
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct SharedMappingDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct SignalDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub enum CompletionState {
-    Ready(HostcallOutput),
-    Pending { operation_id: OperationId },
-    Failed(AbiError),
+pub struct NetworkListenerDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct NetworkSessionDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
+    pub authority: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct NetworkStreamDescriptor {
+    pub local_id: LocalResourceId,
+    pub session_id: LocalResourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DurableLogDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct BlobStoreDescriptor {
+    pub local_id: LocalResourceId,
+    pub shared_id: SharedResourceId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ProcessDescriptor {
+    pub local_id: ProcessId,
+    pub module_id: String,
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct EntrypointMetadata {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct InterfaceMetadata {
+    pub name: String,
+    pub methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum AbiErrorCode {
+    InvalidHandle,
+    DetachedResource,
+    PermissionDenied,
+    MalformedPayload,
+    NotFound,
+    Timeout,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct AbiError {
+    pub code: AbiErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum Hostcall {
+    SharedMemoryAllocate,
+    SharedMemoryDestroy,
+    SharedMemoryAttach,
+    SharedMemoryDetach,
+    SharedMemoryRead,
+    SharedMemoryWrite,
+    SignalCreate,
+    SignalAttach,
+    SignalClose,
+    SignalNotify,
+    SignalWait,
+    NetworkListen,
+    NetworkListenerClose,
+    NetworkConnect,
+    NetworkSessionClose,
+    NetworkOpenStream,
+    NetworkStreamClose,
+    NetworkStreamSessionSharedId,
+    NetworkStreamSend,
+    NetworkStreamRecv,
+    NetworkSendRequest,
+    NetworkWaitRequestResponse,
+    StorageOpenLog,
+    StorageLogClose,
+    StorageLogAppend,
+    StorageLogReplay,
+    StorageLogCheckpoint,
+    StorageLogCheckpointRead,
+    StorageOpenBlobStore,
+    StorageBlobStoreClose,
+    StorageBlobPut,
+    StorageBlobGet,
+    StorageBlobSetManifest,
+    StorageBlobGetManifest,
+    ProcessStart,
+    ProcessStop,
+    ActivityRead,
+    MeteringRead,
+    GuestLogWrite,
+    GuestLogRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct StorageRecord {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub headers: Vec<(String, String)>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ActivityKind {
+    ProcessStarted,
+    GuestReady,
+    GuestBootstrapped,
+    ProcessStopped,
+    ProcessExited,
+    MeteringObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ActivityEvent {
+    pub kind: ActivityKind,
+    pub process_id: Option<ProcessId>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct GuestLogEntry {
+    pub process_id: Option<ProcessId>,
+    pub level: String,
+    pub target: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -346,243 +547,9 @@ pub enum HostcallPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct AbiError {
-    pub code: AbiErrorCode,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct ActivityEvent {
-    pub kind: ActivityKind,
-    pub process_id: Option<ProcessId>,
-    pub message: String,
-}
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum HostError {
-    #[error("host error: {0}")]
-    Host(String),
-    #[error("permission denied for capability {0:?}")]
-    PermissionDenied(Capability),
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
-)]
-#[rkyv(bytecheck())]
-pub enum ResourceIdentity {
-    Local(LocalResourceId),
-    Shared(SharedResourceId),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum Capability {
-    ProcessLifecycle,
-    SharedMemory,
-    Signal,
-    Network,
-    Storage,
-    SessionLifecycle,
-    ActivityRead,
-    MeteringRead,
-    GuestLogRead,
-    GuestLogWrite,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum LocalityScope {
-    Any,
-    Cluster,
-    Host(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum ResourceClass {
-    SharedRegion,
-    SharedMapping,
-    Signal,
-    Listener,
-    Session,
-    Stream,
-    RequestExchange,
-    DurableLog,
-    BlobStore,
-    Process,
-    ActivityLog,
-    MeteringStream,
-    GuestLog,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct SharedRegionDescriptor {
-    pub shared_id: SharedResourceId,
-    pub len: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct SharedMappingDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-    pub len: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct SignalDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkListenerDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-    pub address: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkSessionDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-    pub authority: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkStreamDescriptor {
-    pub local_id: LocalResourceId,
-    pub session_id: LocalResourceId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct DurableLogDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct BlobStoreDescriptor {
-    pub local_id: LocalResourceId,
-    pub shared_id: SharedResourceId,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct ProcessDescriptor {
-    pub local_id: ProcessId,
-    pub module_id: String,
-    pub entrypoint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct EntrypointMetadata {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct InterfaceMetadata {
-    pub name: String,
-    pub methods: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum AbiErrorCode {
-    InvalidHandle,
-    DetachedResource,
-    PermissionDenied,
-    MalformedPayload,
-    NotFound,
-    Timeout,
-    Internal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum Hostcall {
-    SharedMemoryAllocate,
-    SharedMemoryDestroy,
-    SharedMemoryAttach,
-    SharedMemoryDetach,
-    SharedMemoryRead,
-    SharedMemoryWrite,
-    SignalCreate,
-    SignalAttach,
-    SignalClose,
-    SignalNotify,
-    SignalWait,
-    NetworkListen,
-    NetworkListenerClose,
-    NetworkConnect,
-    NetworkSessionClose,
-    NetworkOpenStream,
-    NetworkStreamClose,
-    NetworkStreamSessionSharedId,
-    NetworkStreamSend,
-    NetworkStreamRecv,
-    NetworkSendRequest,
-    NetworkWaitRequestResponse,
-    StorageOpenLog,
-    StorageLogClose,
-    StorageLogAppend,
-    StorageLogReplay,
-    StorageLogCheckpoint,
-    StorageLogCheckpointRead,
-    StorageOpenBlobStore,
-    StorageBlobStoreClose,
-    StorageBlobPut,
-    StorageBlobGet,
-    StorageBlobSetManifest,
-    StorageBlobGetManifest,
-    ProcessStart,
-    ProcessStop,
-    ActivityRead,
-    MeteringRead,
-    GuestLogWrite,
-    GuestLogRead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct StorageRecord {
-    pub sequence: u64,
-    pub timestamp_ms: u64,
-    pub headers: Vec<(String, String)>,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum ActivityKind {
-    ProcessStarted,
-    GuestReady,
-    GuestBootstrapped,
-    ProcessStopped,
-    ProcessExited,
-    MeteringObserved,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct GuestLogEntry {
-    pub process_id: Option<ProcessId>,
-    pub level: String,
-    pub target: String,
-    pub message: String,
+pub struct HostcallRequest {
+    pub hostcall: Hostcall,
+    pub payload: HostcallPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
@@ -594,12 +561,57 @@ pub struct MeteringObservation {
     pub bandwidth_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum HostcallOutput {
+    Empty,
+    SharedRegion(SharedRegionDescriptor),
+    SharedMapping(SharedMappingDescriptor),
+    Signal(SignalDescriptor),
+    Listener(NetworkListenerDescriptor),
+    Session(NetworkSessionDescriptor),
+    Stream(NetworkStreamDescriptor),
+    DurableLog(DurableLogDescriptor),
+    BlobStore(BlobStoreDescriptor),
+    Process(ProcessDescriptor),
+    Bytes(Vec<u8>),
+    BlobId(String),
+    Response { status: u16, body: Vec<u8> },
+    Sequence(Option<u64>),
+    SharedId(SharedResourceId),
+    StorageRecords(Vec<StorageRecord>),
+    ActivityEvents(Vec<ActivityEvent>),
+    GuestLogEntries(Vec<GuestLogEntry>),
+    Metering(MeteringObservation),
+    SignalGeneration(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum CompletionState {
+    Ready(HostcallOutput),
+    Pending { operation_id: OperationId },
+    Failed(AbiError),
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RkyvError {
     #[error("encode error: {0}")]
     Encode(String),
     #[error("decode error: {0}")]
     Decode(String),
+}
+
+impl LocalityScope {
+    pub fn matches(&self, actual: &LocalityScope) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Cluster => matches!(actual, LocalityScope::Cluster | LocalityScope::Host(_)),
+            Self::Host(expected) => {
+                matches!(actual, LocalityScope::Host(actual) if actual == expected)
+            }
+        }
+    }
 }
 
 impl ResourceSelector {
@@ -625,18 +637,6 @@ impl Default for ScopeContext {
             locality: LocalityScope::Any,
             resource_class: None,
             resource_id: None,
-        }
-    }
-}
-
-impl LocalityScope {
-    pub fn matches(&self, actual: &LocalityScope) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Cluster => matches!(actual, LocalityScope::Cluster | LocalityScope::Host(_)),
-            Self::Host(expected) => {
-                matches!(actual, LocalityScope::Host(actual) if actual == expected)
-            }
         }
     }
 }

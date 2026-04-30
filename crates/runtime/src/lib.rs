@@ -27,48 +27,6 @@ type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
 const DEFAULT_READINESS_POLL_MS: u64 = 10;
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 
-pub struct Runtime {
-    kernel: Kernel,
-    sessions: Arc<Mutex<HashMap<SessionId, SessionRecord>>>,
-    loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
-    process_sessions: Arc<Mutex<HashMap<ProcessId, SessionId>>>,
-    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
-    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
-    pending_shared_region_reclaims: Arc<Mutex<BTreeSet<u64>>>,
-    exchange_owners: Arc<Mutex<HashMap<u64, SessionId>>>,
-    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    next_session_id: Arc<Mutex<SessionId>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SystemGuestDescriptor {
-    pub name: String,
-    pub module_id: String,
-    pub module_bytes: Vec<u8>,
-    pub entrypoint: String,
-    pub arguments: Vec<Vec<u8>>,
-    pub grants: Vec<CapabilityGrant>,
-    pub dependencies: Vec<String>,
-    pub readiness: ReadinessCondition,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeConfig {
-    pub system_guests: Vec<SystemGuestDescriptor>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BootstrapReport {
-    pub guests: Vec<BootstrappedGuest>,
-}
-
-#[derive(Clone)]
-pub struct RuntimeGuestHost {
-    runtime: Runtime,
-    session_id: SessionId,
-    scope_context: ScopeContext,
-}
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("system guest descriptor not found: {0}")]
@@ -106,20 +64,37 @@ pub enum ReadinessCondition {
 }
 
 #[derive(Debug, Clone)]
+pub struct SystemGuestDescriptor {
+    pub name: String,
+    pub module_id: String,
+    pub module_bytes: Vec<u8>,
+    pub entrypoint: String,
+    pub arguments: Vec<Vec<u8>>,
+    pub grants: Vec<CapabilityGrant>,
+    pub dependencies: Vec<String>,
+    pub readiness: ReadinessCondition,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeConfig {
+    pub system_guests: Vec<SystemGuestDescriptor>,
+}
+
+#[derive(Debug, Clone)]
 pub struct BootstrappedGuest {
     pub name: String,
     pub process_id: ProcessId,
     pub session_id: SessionId,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapReport {
+    pub guests: Vec<BootstrappedGuest>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub grants: Vec<CapabilityGrant>,
-}
-
-struct MarkReadyHostFunc {
-    runtime: Runtime,
-    process_id: ProcessId,
 }
 
 struct LoadedGuest {
@@ -128,35 +103,37 @@ struct LoadedGuest {
     entrypoint_results: Vec<WasmValue>,
 }
 
+pub struct Runtime {
+    kernel: Kernel,
+    sessions: Arc<Mutex<HashMap<SessionId, SessionRecord>>>,
+    loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
+    process_sessions: Arc<Mutex<HashMap<ProcessId, SessionId>>>,
+    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
+    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
+    pending_shared_region_reclaims: Arc<Mutex<BTreeSet<u64>>>,
+    exchange_owners: Arc<Mutex<HashMap<u64, SessionId>>>,
+    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    next_session_id: Arc<Mutex<SessionId>>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeGuestHost {
+    runtime: Runtime,
+    session_id: SessionId,
+    scope_context: ScopeContext,
+}
+
+struct MarkReadyHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
+}
+
 struct SessionIdHostFunc {
     session_id: SessionId,
 }
 
 struct ProcessIdHostFunc {
     process_id: ProcessId,
-}
-
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new(Kernel::default())
-    }
-}
-
-impl Clone for Runtime {
-    fn clone(&self) -> Self {
-        Self {
-            kernel: self.kernel.clone(),
-            sessions: self.sessions.clone(),
-            loaded_guests: self.loaded_guests.clone(),
-            process_sessions: self.process_sessions.clone(),
-            local_handle_owners: self.local_handle_owners.clone(),
-            shared_resource_owners: self.shared_resource_owners.clone(),
-            pending_shared_region_reclaims: self.pending_shared_region_reclaims.clone(),
-            exchange_owners: self.exchange_owners.clone(),
-            module_registry: self.module_registry.clone(),
-            next_session_id: self.next_session_id.clone(),
-        }
-    }
 }
 
 impl SystemGuestDescriptor {
@@ -177,53 +154,6 @@ impl SystemGuestDescriptor {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
         }
-    }
-}
-
-impl HostFunc for SessionIdHostFunc {
-    fn call(
-        &self,
-        _store: &mut Store,
-        _args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        Ok(vec![WasmValue::I64(self.session_id as i64)])
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        None
-    }
-}
-
-impl HostFunc for ProcessIdHostFunc {
-    fn call(
-        &self,
-        _store: &mut Store,
-        _args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        Ok(vec![WasmValue::I64(self.process_id as i64)])
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        None
-    }
-}
-
-impl HostFunc for MarkReadyHostFunc {
-    fn call(
-        &self,
-        _store: &mut Store,
-        _args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        self.runtime.kernel.record_activity(ActivityEvent {
-            kind: selium_abi::ActivityKind::GuestReady,
-            process_id: Some(self.process_id),
-            message: "guest ready".to_string(),
-        });
-        Ok(Vec::new())
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        None
     }
 }
 
@@ -784,6 +714,29 @@ impl Runtime {
             .map_err(map_wasm_error)?;
         loaded_guest.entrypoint_results = results;
         Ok(loaded_guest)
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new(Kernel::default())
+    }
+}
+
+impl Clone for Runtime {
+    fn clone(&self) -> Self {
+        Self {
+            kernel: self.kernel.clone(),
+            sessions: self.sessions.clone(),
+            loaded_guests: self.loaded_guests.clone(),
+            process_sessions: self.process_sessions.clone(),
+            local_handle_owners: self.local_handle_owners.clone(),
+            shared_resource_owners: self.shared_resource_owners.clone(),
+            pending_shared_region_reclaims: self.pending_shared_region_reclaims.clone(),
+            exchange_owners: self.exchange_owners.clone(),
+            module_registry: self.module_registry.clone(),
+            next_session_id: self.next_session_id.clone(),
+        }
     }
 }
 
@@ -1704,6 +1657,53 @@ impl GuestHost for RuntimeGuestHost {
             .into_iter()
             .filter(|entry| process_id.is_none() || entry.process_id == process_id)
             .collect())
+    }
+}
+
+impl HostFunc for MarkReadyHostFunc {
+    fn call(
+        &self,
+        _store: &mut Store,
+        _args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        self.runtime.kernel.record_activity(ActivityEvent {
+            kind: selium_abi::ActivityKind::GuestReady,
+            process_id: Some(self.process_id),
+            message: "guest ready".to_string(),
+        });
+        Ok(Vec::new())
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for SessionIdHostFunc {
+    fn call(
+        &self,
+        _store: &mut Store,
+        _args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        Ok(vec![WasmValue::I64(self.session_id as i64)])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for ProcessIdHostFunc {
+    fn call(
+        &self,
+        _store: &mut Store,
+        _args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        Ok(vec![WasmValue::I64(self.process_id as i64)])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
     }
 }
 

@@ -39,6 +39,24 @@ pub type Result<T> = std::result::Result<T, GuestError>;
 type BoxedPatternFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
 type BoxedRequestHandler = Arc<dyn Fn(Vec<u8>) -> BoxedPatternFuture + Send + Sync>;
 
+#[derive(Debug, Error)]
+pub enum GuestError {
+    #[error("host error: {0}")]
+    Host(String),
+    #[error("codec error: {0}")]
+    Codec(#[from] selium_abi::RkyvError),
+    #[error("permission denied for capability {0:?}")]
+    PermissionDenied(Capability),
+    #[error("pattern error: {0}")]
+    Pattern(String),
+}
+
+#[derive(Clone)]
+pub struct GuestContext {
+    host: Arc<dyn GuestHost>,
+    scope_context: ScopeContext,
+}
+
 pub struct SharedMemoryHandle {
     context: GuestContext,
     descriptor: SharedMappingDescriptor,
@@ -86,34 +104,11 @@ pub struct ActivityLogHandle {
     context: GuestContext,
 }
 
-#[derive(Clone, Default)]
-pub struct PatternFabric {
-    inner: Arc<PatternFabricInner>,
-}
-
 #[derive(Clone)]
 pub struct ByteStream {
     context: GuestContext,
     descriptor: NetworkStreamDescriptor,
     session_shared_id: u64,
-}
-
-#[derive(Debug, Error)]
-pub enum GuestError {
-    #[error("host error: {0}")]
-    Host(String),
-    #[error("codec error: {0}")]
-    Codec(#[from] selium_abi::RkyvError),
-    #[error("permission denied for capability {0:?}")]
-    PermissionDenied(Capability),
-    #[error("pattern error: {0}")]
-    Pattern(String),
-}
-
-#[derive(Clone)]
-pub struct GuestContext {
-    host: Arc<dyn GuestHost>,
-    scope_context: ScopeContext,
 }
 
 pub struct Subscription<T> {
@@ -127,12 +122,6 @@ pub struct PatternStreamWriter {
 
 pub struct PatternStreamReader {
     receiver: mpsc::Receiver<Vec<u8>>,
-}
-
-pub struct LiveTable<T> {
-    fabric: PatternFabric,
-    name: String,
-    _marker: PhantomData<T>,
 }
 
 #[derive(Clone)]
@@ -154,65 +143,20 @@ struct PatternFabricInner {
     live_tables: RwLock<HashMap<String, BTreeMap<String, Vec<u8>>>>,
 }
 
+#[derive(Clone, Default)]
+pub struct PatternFabric {
+    inner: Arc<PatternFabricInner>,
+}
+
+pub struct LiveTable<T> {
+    fabric: PatternFabric,
+    name: String,
+    _marker: PhantomData<T>,
+}
+
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
-}
-
-impl Drop for SharedMemoryHandle {
-    fn drop(&mut self) {
-        let _ = self
-            .context
-            .host()
-            .detach_shared_region(self.descriptor.local_id);
-    }
-}
-
-impl Drop for SignalHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_signal(self.descriptor.local_id);
-    }
-}
-
-impl Drop for DurableLogHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_log(self.descriptor.local_id);
-    }
-}
-
-impl Drop for BlobStoreHandle {
-    fn drop(&mut self) {
-        let _ = self
-            .context
-            .host()
-            .close_blob_store(self.descriptor.local_id);
-    }
-}
-
-impl Drop for NetworkListenerHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_listener(self.descriptor.local_id);
-    }
-}
-
-impl Drop for NetworkSessionHandle {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_session(self.descriptor.local_id);
-    }
-}
-
-impl Drop for ByteStream {
-    fn drop(&mut self) {
-        let _ = self.context.host().close_stream(self.descriptor.local_id);
-    }
-}
-
-impl Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}").trim_matches('"').to_string();
-        }
-    }
 }
 
 impl From<HostError> for GuestError {
@@ -267,6 +211,27 @@ impl GuestContext {
         } else {
             Err(GuestError::PermissionDenied(capability))
         }
+    }
+}
+
+impl SharedMemoryHandle {
+    pub fn destroy_region(self) -> Result<()> {
+        if !self.owns_region {
+            return Err(GuestError::Pattern(
+                "only allocated shared memory can destroy its backing region".to_string(),
+            ));
+        }
+        self.context.require(
+            Capability::SharedMemory,
+            Some(ResourceClass::SharedRegion),
+            Some(ResourceIdentity::Shared(self.descriptor.shared_id)),
+        )?;
+        let local_id = self.descriptor.local_id;
+        let shared_id = self.descriptor.shared_id;
+        self.context.host().detach_shared_region(local_id)?;
+        self.context.host().destroy_shared_region(shared_id)?;
+        std::mem::forget(self);
+        Ok(())
     }
 }
 
@@ -341,24 +306,12 @@ impl SharedMemoryHandle {
     }
 }
 
-impl SharedMemoryHandle {
-    pub fn destroy_region(self) -> Result<()> {
-        if !self.owns_region {
-            return Err(GuestError::Pattern(
-                "only allocated shared memory can destroy its backing region".to_string(),
-            ));
-        }
-        self.context.require(
-            Capability::SharedMemory,
-            Some(ResourceClass::SharedRegion),
-            Some(ResourceIdentity::Shared(self.descriptor.shared_id)),
-        )?;
-        let local_id = self.descriptor.local_id;
-        let shared_id = self.descriptor.shared_id;
-        self.context.host().detach_shared_region(local_id)?;
-        self.context.host().destroy_shared_region(shared_id)?;
-        std::mem::forget(self);
-        Ok(())
+impl Drop for SharedMemoryHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .context
+            .host()
+            .detach_shared_region(self.descriptor.local_id);
     }
 }
 
@@ -418,6 +371,12 @@ impl SignalHandle {
         self.context.host().close_signal(self.descriptor.local_id)?;
         std::mem::forget(self);
         Ok(())
+    }
+}
+
+impl Drop for SignalHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_signal(self.descriptor.local_id);
     }
 }
 
@@ -493,6 +452,12 @@ impl DurableLogHandle {
     }
 }
 
+impl Drop for DurableLogHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_log(self.descriptor.local_id);
+    }
+}
+
 impl BlobStoreHandle {
     pub fn open(context: GuestContext, name: impl Into<String>) -> Result<Self> {
         context.require(Capability::Storage, Some(ResourceClass::BlobStore), None)?;
@@ -561,6 +526,15 @@ impl BlobStoreHandle {
     }
 }
 
+impl Drop for BlobStoreHandle {
+    fn drop(&mut self) {
+        let _ = self
+            .context
+            .host()
+            .close_blob_store(self.descriptor.local_id);
+    }
+}
+
 impl NetworkListenerHandle {
     pub fn listen(context: GuestContext, address: impl Into<String>) -> Result<Self> {
         context.require(Capability::Network, Some(ResourceClass::Listener), None)?;
@@ -586,6 +560,12 @@ impl NetworkListenerHandle {
             .close_listener(self.descriptor.local_id)?;
         std::mem::forget(self);
         Ok(())
+    }
+}
+
+impl Drop for NetworkListenerHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_listener(self.descriptor.local_id);
     }
 }
 
@@ -654,35 +634,9 @@ impl NetworkSessionHandle {
     }
 }
 
-impl ByteStream {
-    pub fn send(&self, bytes: Vec<u8>) -> Result<()> {
-        self.context.require(
-            Capability::Network,
-            Some(ResourceClass::Stream),
-            Some(ResourceIdentity::Shared(self.session_shared_id)),
-        )?;
-        Ok(self
-            .context
-            .host()
-            .send_stream_chunk(self.descriptor.local_id, bytes)?)
-    }
-
-    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
-        self.context.require(
-            Capability::Network,
-            Some(ResourceClass::Stream),
-            Some(ResourceIdentity::Shared(self.session_shared_id)),
-        )?;
-        Ok(self
-            .context
-            .host()
-            .recv_stream_chunk(self.descriptor.local_id)?)
-    }
-
-    pub fn close(self) -> Result<()> {
-        self.context.host().close_stream(self.descriptor.local_id)?;
-        std::mem::forget(self);
-        Ok(())
+impl Drop for NetworkSessionHandle {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_session(self.descriptor.local_id);
     }
 }
 
@@ -757,6 +711,141 @@ impl ActivityLogHandle {
             None,
         )?;
         Ok(self.context.host().read_activity_from(cursor)?)
+    }
+}
+
+impl ByteStream {
+    pub fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        self.context.require(
+            Capability::Network,
+            Some(ResourceClass::Stream),
+            Some(ResourceIdentity::Shared(self.session_shared_id)),
+        )?;
+        Ok(self
+            .context
+            .host()
+            .send_stream_chunk(self.descriptor.local_id, bytes)?)
+    }
+
+    pub fn recv(&self) -> Result<Option<Vec<u8>>> {
+        self.context.require(
+            Capability::Network,
+            Some(ResourceClass::Stream),
+            Some(ResourceIdentity::Shared(self.session_shared_id)),
+        )?;
+        Ok(self
+            .context
+            .host()
+            .recv_stream_chunk(self.descriptor.local_id)?)
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.context.host().close_stream(self.descriptor.local_id)?;
+        std::mem::forget(self);
+        Ok(())
+    }
+}
+
+impl Drop for ByteStream {
+    fn drop(&mut self) {
+        let _ = self.context.host().close_stream(self.descriptor.local_id);
+    }
+}
+
+impl<T> Subscription<T> {
+    pub async fn recv(&mut self) -> Result<T>
+    where
+        T: rkyv::Archive + Sized,
+        for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
+            + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    {
+        let payload = self
+            .receiver
+            .recv()
+            .await
+            .map_err(|error| GuestError::Pattern(error.to_string()))?;
+        decode_typed::<T>(&payload)
+    }
+}
+
+impl PatternStreamWriter {
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        self.sender
+            .send(bytes)
+            .await
+            .map_err(|error| GuestError::Pattern(error.to_string()))
+    }
+}
+
+impl PatternStreamReader {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.receiver.recv().await
+    }
+}
+
+impl GuestLogResource {
+    pub fn new(context: &GuestContext, process_id: Option<ProcessId>) -> Result<Self> {
+        let can_write = context
+            .require(
+                Capability::GuestLogWrite,
+                Some(ResourceClass::GuestLog),
+                process_id.map(ResourceIdentity::Local),
+            )
+            .is_ok();
+        let can_read = context
+            .require(
+                Capability::GuestLogRead,
+                Some(ResourceClass::GuestLog),
+                process_id.map(ResourceIdentity::Local),
+            )
+            .is_ok();
+        if !can_write && !can_read {
+            return Err(GuestError::PermissionDenied(Capability::GuestLogRead));
+        }
+        Ok(Self {
+            host: context.host(),
+            process_id,
+            can_write,
+            can_read,
+        })
+    }
+
+    pub fn records(&self) -> Result<Vec<GuestLogRecord>> {
+        if !self.can_read {
+            return Err(GuestError::PermissionDenied(Capability::GuestLogRead));
+        }
+        Ok(self
+            .host
+            .read_guest_logs_from(0, self.process_id)?
+            .into_iter()
+            .filter(|record| self.process_id.is_none() || record.process_id == self.process_id)
+            .collect::<Vec<_>>())
+    }
+
+    pub fn install(&self) -> Result<tracing::subscriber::DefaultGuard> {
+        if !self.can_write {
+            return Err(GuestError::PermissionDenied(Capability::GuestLogWrite));
+        }
+        let subscriber = tracing_subscriber::registry().with(GuestLogLayer {
+            resource: self.clone(),
+        });
+        Ok(tracing::subscriber::set_default(subscriber))
+    }
+}
+
+impl<S> Layer<S> for GuestLogLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        let _ = self.resource.host.write_guest_log(GuestLogEntry {
+            process_id: self.resource.process_id,
+            level: event.metadata().level().to_string(),
+            target: event.metadata().target().to_string(),
+            message: visitor.message,
+        });
     }
 }
 
@@ -867,37 +956,6 @@ impl PatternFabric {
     }
 }
 
-impl<T> Subscription<T> {
-    pub async fn recv(&mut self) -> Result<T>
-    where
-        T: rkyv::Archive + Sized,
-        for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
-            + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    {
-        let payload = self
-            .receiver
-            .recv()
-            .await
-            .map_err(|error| GuestError::Pattern(error.to_string()))?;
-        decode_typed::<T>(&payload)
-    }
-}
-
-impl PatternStreamWriter {
-    pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
-        self.sender
-            .send(bytes)
-            .await
-            .map_err(|error| GuestError::Pattern(error.to_string()))
-    }
-}
-
-impl PatternStreamReader {
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.receiver.recv().await
-    }
-}
-
 impl<T> LiveTable<T> {
     pub fn insert(&self, key: impl Into<String>, value: &T) -> Result<()>
     where
@@ -950,69 +1008,11 @@ impl<T> LiveTable<T> {
     }
 }
 
-impl GuestLogResource {
-    pub fn new(context: &GuestContext, process_id: Option<ProcessId>) -> Result<Self> {
-        let can_write = context
-            .require(
-                Capability::GuestLogWrite,
-                Some(ResourceClass::GuestLog),
-                process_id.map(ResourceIdentity::Local),
-            )
-            .is_ok();
-        let can_read = context
-            .require(
-                Capability::GuestLogRead,
-                Some(ResourceClass::GuestLog),
-                process_id.map(ResourceIdentity::Local),
-            )
-            .is_ok();
-        if !can_write && !can_read {
-            return Err(GuestError::PermissionDenied(Capability::GuestLogRead));
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}").trim_matches('"').to_string();
         }
-        Ok(Self {
-            host: context.host(),
-            process_id,
-            can_write,
-            can_read,
-        })
-    }
-
-    pub fn records(&self) -> Result<Vec<GuestLogRecord>> {
-        if !self.can_read {
-            return Err(GuestError::PermissionDenied(Capability::GuestLogRead));
-        }
-        Ok(self
-            .host
-            .read_guest_logs_from(0, self.process_id)?
-            .into_iter()
-            .filter(|record| self.process_id.is_none() || record.process_id == self.process_id)
-            .collect::<Vec<_>>())
-    }
-
-    pub fn install(&self) -> Result<tracing::subscriber::DefaultGuard> {
-        if !self.can_write {
-            return Err(GuestError::PermissionDenied(Capability::GuestLogWrite));
-        }
-        let subscriber = tracing_subscriber::registry().with(GuestLogLayer {
-            resource: self.clone(),
-        });
-        Ok(tracing::subscriber::set_default(subscriber))
-    }
-}
-
-impl<S> Layer<S> for GuestLogLayer
-where
-    S: Subscriber,
-{
-    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-        let mut visitor = MessageVisitor::default();
-        event.record(&mut visitor);
-        let _ = self.resource.host.write_guest_log(GuestLogEntry {
-            process_id: self.resource.process_id,
-            level: event.metadata().level().to_string(),
-            target: event.metadata().target().to_string(),
-            message: visitor.message,
-        });
     }
 }
 
