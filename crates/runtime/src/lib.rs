@@ -1,28 +1,29 @@
 //! Selium runtime built on top of Wasmtiny and the Selium kernel.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 use selium_abi::{
-    ActivityEvent, BlobStoreDescriptor, Capability, CapabilityGrant, DurableLogDescriptor,
-    EntrypointMetadata, GuestHost, GuestLogEntry, HostError, HostFuture, HostResult, LocalityScope,
-    MeteringObservation, NetworkListenerDescriptor, NetworkSessionDescriptor,
-    NetworkStreamDescriptor, ProcessDescriptor, ProcessId, ResourceClass, ResourceIdentity,
-    ResourceSelector, ScopeContext, SessionId, SharedMappingDescriptor, SharedRegionDescriptor,
-    SignalDescriptor, StorageRecord,
+    AbiError, AbiErrorCode, ActivityEvent, Capability, CapabilityGrant, CompletionState,
+    EntrypointMetadata, HostcallOutput, HostcallRequest, LocalityScope, OperationId, ProcessId,
+    ResourceClass, ResourceIdentity, ScopeContext, SignalDescriptor, pack_hostcall_status,
 };
 use selium_kernel::Kernel;
 use thiserror::Error;
 use tracing::info;
-use wasmtiny::runtime::{HostFunc, Store};
-use wasmtiny::{FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue};
+use wasmtiny::{
+    FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue,
+    runtime::{HostFunc, Store},
+};
 
+type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
+type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 pub type Result<T> = std::result::Result<T, Error>;
-type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
-type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<SessionId>>;
 
 const DEFAULT_READINESS_POLL_MS: u64 = 10;
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
@@ -31,16 +32,14 @@ const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 pub enum Error {
     #[error("system guest descriptor not found: {0}")]
     DescriptorNotFound(String),
-    #[error("unknown session: {0}")]
-    UnknownSession(SessionId),
+    #[error("unknown process authority: {0}")]
+    UnknownProcessAuthority(ProcessId),
     #[error("unknown dependency: {0}")]
     UnknownDependency(String),
     #[error("dependency cycle or unresolved dependency detected")]
     DependencyCycle,
     #[error("invalid grant for capability {0:?}")]
     InvalidGrant(Capability),
-    #[error("child grant exceeds parent authority for capability {0:?}")]
-    GrantEscalation(Capability),
     #[error("duplicate system guest descriptor: {0}")]
     DuplicateDescriptor(String),
     #[error("module id already registered with different bytes: {0}")]
@@ -84,7 +83,6 @@ pub struct RuntimeConfig {
 pub struct BootstrappedGuest {
     pub name: String,
     pub process_id: ProcessId,
-    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,8 +91,20 @@ pub struct BootstrapReport {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionRecord {
+pub struct ProcessAuthority {
     pub grants: Vec<CapabilityGrant>,
+}
+
+#[derive(Clone)]
+pub struct Runtime {
+    kernel: Kernel,
+    process_authorities: Arc<Mutex<HashMap<ProcessId, ProcessAuthority>>>,
+    loaded_guests: Arc<Mutex<HashMap<selium_abi::ProcessId, LoadedGuest>>>,
+    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
+    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
+    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    next_operation_id: Arc<Mutex<OperationId>>,
+    operations: Arc<Mutex<HashMap<OperationId, HostOperation>>>,
 }
 
 struct LoadedGuest {
@@ -103,36 +113,44 @@ struct LoadedGuest {
     entrypoint_results: Vec<WasmValue>,
 }
 
-pub struct Runtime {
-    kernel: Kernel,
-    sessions: Arc<Mutex<HashMap<SessionId, SessionRecord>>>,
-    loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
-    process_sessions: Arc<Mutex<HashMap<ProcessId, SessionId>>>,
-    local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
-    shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
-    pending_shared_region_reclaims: Arc<Mutex<BTreeSet<u64>>>,
-    exchange_owners: Arc<Mutex<HashMap<u64, SessionId>>>,
-    module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    next_session_id: Arc<Mutex<SessionId>>,
+#[derive(Debug, Clone)]
+enum HostOperationState {
+    Ready(HostcallOutput),
+    Failed(AbiError),
+    SignalWait {
+        local_id: u64,
+        observed_generation: u64,
+        deadline: Instant,
+    },
 }
 
-#[derive(Clone)]
-pub struct RuntimeGuestHost {
-    runtime: Runtime,
-    session_id: SessionId,
-    scope_context: ScopeContext,
+#[derive(Debug, Clone)]
+struct HostOperation {
+    process_id: ProcessId,
+    state: HostOperationState,
 }
 
 struct MarkReadyHostFunc {
     runtime: Runtime,
-    process_id: ProcessId,
-}
-
-struct SessionIdHostFunc {
-    session_id: SessionId,
+    process_id: selium_abi::ProcessId,
 }
 
 struct ProcessIdHostFunc {
+    process_id: selium_abi::ProcessId,
+}
+
+struct HostcallCreateHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
+}
+
+struct HostcallPollHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
+}
+
+struct HostcallDropHostFunc {
+    runtime: Runtime,
     process_id: ProcessId,
 }
 
@@ -161,137 +179,18 @@ impl Runtime {
     pub fn new(kernel: Kernel) -> Self {
         Self {
             kernel,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            process_authorities: Arc::new(Mutex::new(HashMap::new())),
             loaded_guests: Arc::new(Mutex::new(HashMap::new())),
-            process_sessions: Arc::new(Mutex::new(HashMap::new())),
             local_handle_owners: Arc::new(Mutex::new(HashMap::new())),
             shared_resource_owners: Arc::new(Mutex::new(HashMap::new())),
-            pending_shared_region_reclaims: Arc::new(Mutex::new(BTreeSet::new())),
-            exchange_owners: Arc::new(Mutex::new(HashMap::new())),
             module_registry: Arc::new(Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(Mutex::new(1)),
+            next_operation_id: Arc::new(Mutex::new(1)),
+            operations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn kernel(&self) -> Kernel {
         self.kernel.clone()
-    }
-
-    fn claim_local_handle(
-        &self,
-        session_id: SessionId,
-        resource_class: ResourceClass,
-        local_id: u64,
-    ) {
-        self.local_handle_owners
-            .lock()
-            .entry((resource_class, local_id))
-            .or_default()
-            .insert(session_id);
-    }
-
-    fn claim_shared_resource(
-        &self,
-        session_id: SessionId,
-        resource_class: ResourceClass,
-        shared_id: u64,
-    ) {
-        self.shared_resource_owners
-            .lock()
-            .entry((resource_class, shared_id))
-            .or_default()
-            .insert(session_id);
-    }
-
-    fn local_handle_owned_by(
-        &self,
-        session_id: SessionId,
-        resource_class: ResourceClass,
-        local_id: u64,
-    ) -> bool {
-        self.local_handle_owners
-            .lock()
-            .get(&(resource_class, local_id))
-            .is_some_and(|owners| owners.contains(&session_id))
-    }
-
-    fn shared_resource_owned_by(
-        &self,
-        session_id: SessionId,
-        resource_class: ResourceClass,
-        shared_id: u64,
-    ) -> bool {
-        self.shared_resource_owners
-            .lock()
-            .get(&(resource_class, shared_id))
-            .is_some_and(|owners| owners.contains(&session_id))
-    }
-
-    fn release_local_handle(
-        &self,
-        session_id: SessionId,
-        resource_class: &ResourceClass,
-        local_id: u64,
-    ) -> bool {
-        let mut local_handle_owners = self.local_handle_owners.lock();
-        let Some(owners) = local_handle_owners.get_mut(&(resource_class.clone(), local_id)) else {
-            return false;
-        };
-        owners.remove(&session_id);
-        let should_reclaim = owners.is_empty();
-        if should_reclaim {
-            local_handle_owners.remove(&(resource_class.clone(), local_id));
-        }
-        should_reclaim
-    }
-
-    fn release_shared_resource(
-        &self,
-        session_id: SessionId,
-        resource_class: &ResourceClass,
-        shared_id: u64,
-    ) -> bool {
-        let mut shared_resource_owners = self.shared_resource_owners.lock();
-        let Some(owners) = shared_resource_owners.get_mut(&(resource_class.clone(), shared_id))
-        else {
-            return false;
-        };
-        owners.remove(&session_id);
-        let should_reclaim = owners.is_empty();
-        if should_reclaim {
-            shared_resource_owners.remove(&(resource_class.clone(), shared_id));
-        }
-        should_reclaim
-    }
-
-    fn schedule_shared_region_reclaim(&self, shared_id: u64) {
-        self.pending_shared_region_reclaims.lock().insert(shared_id);
-    }
-
-    fn try_reclaim_shared_region(&self, shared_id: u64) -> Result<()> {
-        if self.kernel.shared_region_mapping_count(shared_id) > 0 {
-            self.schedule_shared_region_reclaim(shared_id);
-            return Ok(());
-        }
-        self.pending_shared_region_reclaims
-            .lock()
-            .remove(&shared_id);
-        Ok(self.kernel.destroy_shared_region(shared_id)?)
-    }
-
-    pub fn guest_host(&self, session_id: SessionId) -> Result<RuntimeGuestHost> {
-        if self.sessions.lock().contains_key(&session_id) {
-            Ok(RuntimeGuestHost {
-                runtime: self.clone(),
-                session_id,
-                scope_context: ScopeContext {
-                    locality: LocalityScope::Cluster,
-                    ..ScopeContext::default()
-                },
-            })
-        } else {
-            Err(Error::UnknownSession(session_id))
-        }
     }
 
     pub fn bootstrap_system_guests(&self, config: RuntimeConfig) -> Result<BootstrapReport> {
@@ -302,20 +201,17 @@ impl Runtime {
                 return Err(Error::DuplicateDescriptor(name));
             }
         }
+
         let mut ready = BTreeSet::new();
         let mut report = BootstrapReport::default();
 
         while !pending.is_empty() {
             let ready_name = pending.iter().find_map(|(name, descriptor)| {
-                if descriptor
+                descriptor
                     .dependencies
                     .iter()
                     .all(|dependency| ready.contains(dependency))
-                {
-                    Some(name.clone())
-                } else {
-                    None
-                }
+                    .then_some(name.clone())
             });
             let Some(name) = ready_name else {
                 if let Some(missing_dependency) = pending
@@ -359,18 +255,18 @@ impl Runtime {
         descriptor: SystemGuestDescriptor,
     ) -> Result<BootstrappedGuest> {
         self.validate_grants(&descriptor.grants)?;
-        let session_id = self.persist_session(descriptor.grants.clone());
         let process = self.kernel.start_process(
             descriptor.module_id.clone(),
             descriptor.entrypoint.clone(),
             descriptor.grants.clone(),
         );
-        let loaded_guest =
-            self.load_guest_module(&descriptor.module_bytes, session_id, process.local_id);
-        let loaded_guest = match loaded_guest {
+        self.persist_process_authority(process.local_id, descriptor.grants.clone());
+
+        let loaded_guest = match self.load_guest_module(&descriptor.module_bytes, process.local_id)
+        {
             Ok(loaded_guest) => loaded_guest,
             Err(error) => {
-                self.cleanup_failed_process(process.local_id, session_id)?;
+                self.cleanup_failed_process(process.local_id)?;
                 return Err(error);
             }
         };
@@ -382,24 +278,19 @@ impl Runtime {
                     process_id: Some(process.local_id),
                     message: format!("guest {} trapped: {error}", descriptor.name),
                 });
-                self.cleanup_failed_process(process.local_id, session_id)?;
+                self.cleanup_failed_process(process.local_id)?;
                 return Err(error);
             }
         };
+
         self.loaded_guests
             .lock()
             .insert(process.local_id, loaded_guest);
-        self.process_sessions
-            .lock()
-            .insert(process.local_id, session_id);
-        self.claim_local_handle(session_id, ResourceClass::Process, process.local_id);
-        if let Err(error) = self.register_module_bytes(
+        self.claim_local_handle(process.local_id, ResourceClass::Process, process.local_id);
+        self.register_module_bytes(
             descriptor.module_id.clone(),
             descriptor.module_bytes.clone(),
-        ) {
-            self.cleanup_failed_process(process.local_id, session_id)?;
-            return Err(error);
-        }
+        )?;
         self.kernel.record_activity(ActivityEvent {
             kind: selium_abi::ActivityKind::GuestBootstrapped,
             process_id: Some(process.local_id),
@@ -414,19 +305,22 @@ impl Runtime {
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,
-            session_id,
         })
     }
 
-    pub fn stop_process(&self, process_id: ProcessId) -> Result<()> {
+    pub fn stop_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
         self.kernel.stop_process(process_id)?;
         self.loaded_guests.lock().remove(&process_id);
-        if let Some(session_id) = self.process_sessions.lock().remove(&process_id) {
-            self.sessions.lock().remove(&session_id);
-            self.exchange_owners
+        if self
+            .process_authorities
+            .lock()
+            .remove(&process_id)
+            .is_some()
+        {
+            self.operations
                 .lock()
-                .retain(|_, owner_session_id| *owner_session_id != session_id);
-            self.cleanup_session_resources(session_id)?;
+                .retain(|_, operation| operation.process_id != process_id);
+            self.cleanup_process_resources(process_id)?;
         }
         self.local_handle_owners
             .lock()
@@ -435,19 +329,19 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn restore_session(&self, session_id: SessionId) -> Option<SessionRecord> {
-        self.sessions.lock().get(&session_id).cloned()
+    pub fn restore_process_authority(&self, process_id: ProcessId) -> Option<ProcessAuthority> {
+        self.process_authorities.lock().get(&process_id).cloned()
     }
 
     pub fn authorises(
         &self,
-        session_id: SessionId,
+        process_id: ProcessId,
         capability: Capability,
         context: &ScopeContext,
     ) -> bool {
-        self.sessions
+        self.process_authorities
             .lock()
-            .get(&session_id)
+            .get(&process_id)
             .map(|record| {
                 record
                     .grants
@@ -457,7 +351,11 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    pub fn project_metering(&self, process_id: ProcessId, observation: MeteringObservation) {
+    pub fn project_metering(
+        &self,
+        process_id: selium_abi::ProcessId,
+        observation: selium_abi::MeteringObservation,
+    ) {
         self.kernel.observe_metering(process_id, observation);
     }
 
@@ -465,14 +363,14 @@ impl Runtime {
         self.kernel.read_activity_from(0)
     }
 
-    pub fn loaded_entrypoint(&self, process_id: ProcessId) -> Option<u32> {
+    pub fn loaded_entrypoint(&self, process_id: selium_abi::ProcessId) -> Option<u32> {
         self.loaded_guests
             .lock()
             .get(&process_id)
             .map(|guest| guest.module_index)
     }
 
-    pub fn entrypoint_results(&self, process_id: ProcessId) -> Option<Vec<WasmValue>> {
+    pub fn entrypoint_results(&self, process_id: selium_abi::ProcessId) -> Option<Vec<WasmValue>> {
         self.loaded_guests
             .lock()
             .get(&process_id)
@@ -483,7 +381,213 @@ impl Runtime {
         self.loaded_guests.lock().len()
     }
 
-    fn wait_for_readiness(&self, process_id: ProcessId, condition: &ReadinessCondition) -> bool {
+    pub fn register_module_bytes(&self, module_id: String, module_bytes: Vec<u8>) -> Result<()> {
+        let mut registry = self.module_registry.lock();
+        match registry.get(&module_id) {
+            Some(existing) if existing == &module_bytes => Ok(()),
+            Some(_) => Err(Error::ModuleConflict(module_id)),
+            None => {
+                registry.insert(module_id, module_bytes);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn begin_hostcall(
+        &self,
+        process_id: ProcessId,
+        request: HostcallRequest,
+    ) -> (u32, OperationId) {
+        let state = match self.dispatch_hostcall(process_id, request) {
+            Ok(state) => state,
+            Err(error) => HostOperationState::Failed(error),
+        };
+        let status = match state {
+            HostOperationState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
+            HostOperationState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
+            HostOperationState::SignalWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
+        };
+        let mut operations = self.operations.lock();
+        let operation_id = self.next_operation_id(&operations);
+        operations.insert(operation_id, HostOperation { process_id, state });
+        (status, operation_id)
+    }
+
+    pub fn poll_hostcall(
+        &self,
+        process_id: ProcessId,
+        operation_id: OperationId,
+    ) -> CompletionState {
+        let mut operations = self.operations.lock();
+        let Some(operation) = operations.get_mut(&operation_id) else {
+            return CompletionState::Failed(AbiError::new(
+                AbiErrorCode::InvalidHandle,
+                format!("unknown operation {operation_id}"),
+            ));
+        };
+        if operation.process_id != process_id {
+            return CompletionState::Failed(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                "operation belongs to another process",
+            ));
+        }
+
+        match &operation.state {
+            HostOperationState::Ready(output) => CompletionState::Ready(output.clone()),
+            HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
+            HostOperationState::SignalWait {
+                local_id,
+                observed_generation,
+                deadline,
+            } => match self.kernel.signal_generation(*local_id) {
+                Ok(generation) if generation > *observed_generation => {
+                    operation.state =
+                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation));
+                    CompletionState::Ready(HostcallOutput::SignalGeneration(generation))
+                }
+                Ok(_) if Instant::now() >= *deadline => {
+                    let error = AbiError::new(AbiErrorCode::Timeout, "signal wait timed out");
+                    operation.state = HostOperationState::Failed(error.clone());
+                    CompletionState::Failed(error)
+                }
+                Ok(_) => CompletionState::Pending { operation_id },
+                Err(error) => CompletionState::Failed(kernel_error(error)),
+            },
+        }
+    }
+
+    pub fn drop_hostcall(&self, process_id: ProcessId, operation_id: OperationId) -> bool {
+        let mut operations = self.operations.lock();
+        if operations
+            .get(&operation_id)
+            .is_some_and(|operation| operation.process_id == process_id)
+        {
+            operations.remove(&operation_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn dispatch_hostcall(
+        &self,
+        process_id: ProcessId,
+        request: HostcallRequest,
+    ) -> std::result::Result<HostOperationState, AbiError> {
+        if !self.process_authorities.lock().contains_key(&process_id) {
+            return Err(AbiError::new(
+                AbiErrorCode::InvalidHandle,
+                format!("unknown process authority {process_id}"),
+            ));
+        }
+
+        match request {
+            HostcallRequest::SignalCreate => {
+                self.require(process_id, Capability::Signal, ResourceClass::Signal, None)?;
+                let descriptor = self.kernel.create_signal();
+                self.claim_signal(process_id, descriptor);
+                Ok(HostOperationState::Ready(HostcallOutput::Signal(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::SignalAttach { shared_id } => {
+                self.require(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let descriptor = self.kernel.attach_signal(shared_id).map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::Signal, descriptor.local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Signal(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::SignalClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .signal_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.kernel.close_signal(local_id).map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::Signal, local_id);
+                if self.kernel.signal_handle_count(shared_id) == 0 {
+                    self.release_shared_resource(process_id, &ResourceClass::Signal, shared_id);
+                }
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::SignalNotify { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .signal_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let generation = self.kernel.notify_signal(local_id).map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
+                    generation,
+                )))
+            }
+            HostcallRequest::SignalWait {
+                local_id,
+                observed_generation,
+                timeout_ms,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .signal_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::Signal,
+                    ResourceClass::Signal,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let generation = self
+                    .kernel
+                    .signal_generation(local_id)
+                    .map_err(kernel_error)?;
+                if generation > observed_generation {
+                    Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
+                        generation,
+                    )))
+                } else {
+                    Ok(HostOperationState::SignalWait {
+                        local_id,
+                        observed_generation,
+                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
+                    })
+                }
+            }
+        }
+    }
+
+    fn wait_for_readiness(
+        &self,
+        process_id: selium_abi::ProcessId,
+        condition: &ReadinessCondition,
+    ) -> bool {
         match condition {
             ReadinessCondition::Immediate => true,
             ReadinessCondition::ActivityLogContains(fragment) => {
@@ -509,115 +613,10 @@ impl Runtime {
         }
     }
 
-    fn persist_session(&self, grants: Vec<CapabilityGrant>) -> SessionId {
-        let mut next_session_id = self.next_session_id.lock();
-        let session_id = *next_session_id;
-        *next_session_id += 1;
-        self.sessions
+    fn persist_process_authority(&self, process_id: ProcessId, grants: Vec<CapabilityGrant>) {
+        self.process_authorities
             .lock()
-            .insert(session_id, SessionRecord { grants });
-        session_id
-    }
-
-    pub fn register_module_bytes(&self, module_id: String, module_bytes: Vec<u8>) -> Result<()> {
-        let mut registry = self.module_registry.lock();
-        match registry.get(&module_id) {
-            Some(existing) if existing == &module_bytes => Ok(()),
-            Some(_) => Err(Error::ModuleConflict(module_id)),
-            None => {
-                registry.insert(module_id, module_bytes);
-                Ok(())
-            }
-        }
-    }
-
-    fn module_bytes(&self, module_id: &str) -> Result<Vec<u8>> {
-        self.module_registry
-            .lock()
-            .get(module_id)
-            .cloned()
-            .ok_or_else(|| Error::UnknownModule(module_id.to_string()))
-    }
-
-    fn rollback_bootstrapped(&self, report: &BootstrapReport) {
-        for guest in report.guests.iter().rev() {
-            let _ = self.stop_process(guest.process_id);
-        }
-    }
-
-    fn cleanup_failed_process(&self, process_id: ProcessId, session_id: SessionId) -> Result<()> {
-        let _ = self.kernel.stop_process(process_id);
-        self.exchange_owners
-            .lock()
-            .retain(|_, owner_session_id| *owner_session_id != session_id);
-        let _ = self.cleanup_session_resources(session_id);
-        let _ = self.kernel.reap_process(process_id);
-        self.sessions.lock().remove(&session_id);
-        self.process_sessions.lock().remove(&process_id);
-        self.local_handle_owners
-            .lock()
-            .remove(&(ResourceClass::Process, process_id));
-        self.shared_resource_owners
-            .lock()
-            .retain(|_, owners| !owners.contains(&session_id));
-        Ok(())
-    }
-
-    fn cleanup_session_resources(&self, session_id: SessionId) -> Result<()> {
-        let owned_handles = self
-            .local_handle_owners
-            .lock()
-            .iter()
-            .filter_map(|((resource_class, local_id), owners)| {
-                owners
-                    .contains(&session_id)
-                    .then_some((resource_class.clone(), *local_id))
-            })
-            .collect::<Vec<_>>();
-
-        for (resource_class, local_id) in owned_handles {
-            let should_reclaim = self.release_local_handle(session_id, &resource_class, local_id);
-            if !should_reclaim {
-                continue;
-            }
-            match resource_class {
-                ResourceClass::SharedMapping => self.kernel.detach_shared_region(local_id)?,
-                ResourceClass::Signal => self.kernel.close_signal(local_id)?,
-                ResourceClass::Listener => self.kernel.close_listener(local_id)?,
-                ResourceClass::Session => self.kernel.close_session(local_id)?,
-                ResourceClass::Stream => self.kernel.close_stream(local_id)?,
-                ResourceClass::DurableLog => self.kernel.close_log(local_id)?,
-                ResourceClass::BlobStore => self.kernel.close_blob_store(local_id)?,
-                ResourceClass::Process => {}
-                _ => {}
-            }
-        }
-
-        let owned_shared_resources = self
-            .shared_resource_owners
-            .lock()
-            .iter()
-            .filter_map(|((resource_class, shared_id), owners)| {
-                owners
-                    .contains(&session_id)
-                    .then_some((resource_class.clone(), *shared_id))
-            })
-            .collect::<Vec<_>>();
-
-        for (resource_class, shared_id) in owned_shared_resources {
-            let should_reclaim =
-                self.release_shared_resource(session_id, &resource_class, shared_id);
-            if !should_reclaim {
-                continue;
-            }
-            match resource_class {
-                ResourceClass::SharedRegion => self.try_reclaim_shared_region(shared_id)?,
-                ResourceClass::Signal => {}
-                _ => {}
-            }
-        }
-
-        Ok(())
+            .insert(process_id, ProcessAuthority { grants });
     }
 
     fn validate_grants(&self, grants: &[CapabilityGrant]) -> Result<()> {
@@ -629,25 +628,63 @@ impl Runtime {
         Ok(())
     }
 
-    fn session_grants(&self, session_id: SessionId) -> Result<Vec<CapabilityGrant>> {
-        self.sessions
+    fn rollback_bootstrapped(&self, report: &BootstrapReport) {
+        for guest in report.guests.iter().rev() {
+            let _ = self.stop_process(guest.process_id);
+        }
+    }
+
+    fn cleanup_failed_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
+        let _ = self.kernel.stop_process(process_id);
+        self.operations
             .lock()
-            .get(&session_id)
-            .map(|record| record.grants.clone())
-            .ok_or(Error::UnknownSession(session_id))
+            .retain(|_, operation| operation.process_id != process_id);
+        let _ = self.cleanup_process_resources(process_id);
+        let _ = self.kernel.reap_process(process_id);
+        self.process_authorities.lock().remove(&process_id);
+        self.local_handle_owners
+            .lock()
+            .remove(&(ResourceClass::Process, process_id));
+        self.shared_resource_owners
+            .lock()
+            .retain(|_, owners| !owners.contains(&process_id));
+        Ok(())
+    }
+
+    fn cleanup_process_resources(&self, process_id: ProcessId) -> Result<()> {
+        let owned_handles = self
+            .local_handle_owners
+            .lock()
+            .iter()
+            .filter_map(|((resource_class, local_id), owners)| {
+                owners
+                    .contains(&process_id)
+                    .then_some((resource_class.clone(), *local_id))
+            })
+            .collect::<Vec<_>>();
+
+        for (resource_class, local_id) in owned_handles {
+            let should_reclaim = self.release_local_handle(process_id, &resource_class, local_id);
+            if !should_reclaim {
+                continue;
+            }
+            if resource_class == ResourceClass::Signal {
+                let _ = self.kernel.close_signal(local_id);
+            }
+        }
+        Ok(())
     }
 
     fn load_guest_module(
         &self,
         module_bytes: &[u8],
-        session_id: SessionId,
-        process_id: ProcessId,
+        process_id: selium_abi::ProcessId,
     ) -> Result<LoadedGuest> {
         let mut app = WasmApplication::new();
         let module_index = app
             .load_module_from_memory(module_bytes)
             .map_err(map_wasm_error)?;
-        self.register_runtime_host_functions(&mut app, module_index, session_id, process_id)?;
+        self.register_runtime_host_functions(&mut app, module_index, process_id)?;
         app.instantiate(module_index).map_err(map_wasm_error)?;
         app.execute_start(module_index).map_err(map_wasm_error)?;
         Ok(LoadedGuest {
@@ -661,19 +698,8 @@ impl Runtime {
         &self,
         app: &mut WasmApplication,
         module_index: u32,
-        session_id: SessionId,
-        process_id: ProcessId,
+        process_id: selium_abi::ProcessId,
     ) -> Result<()> {
-        let runtime = self.clone();
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "session_id",
-            Box::new(SessionIdHostFunc { session_id }),
-            FunctionType::new(vec![], vec![ValType::Num(NumType::I64)]),
-        )?;
-
         register_optional_host_function(
             app,
             module_index,
@@ -682,19 +708,63 @@ impl Runtime {
             Box::new(ProcessIdHostFunc { process_id }),
             FunctionType::new(vec![], vec![ValType::Num(NumType::I64)]),
         )?;
-
         register_optional_host_function(
             app,
             module_index,
             "selium",
             "mark_ready",
             Box::new(MarkReadyHostFunc {
-                runtime,
+                runtime: self.clone(),
                 process_id,
             }),
             FunctionType::empty(),
         )?;
-
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_create",
+            Box::new(HostcallCreateHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
+                vec![ValType::Num(NumType::I64)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_poll",
+            Box::new(HostcallPollHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![
+                    ValType::Num(NumType::I64),
+                    ValType::Num(NumType::I32),
+                    ValType::Num(NumType::I32),
+                ],
+                vec![ValType::Num(NumType::I64)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_drop",
+            Box::new(HostcallDropHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I64)],
+                vec![ValType::Num(NumType::I32)],
+            ),
+        )?;
         Ok(())
     }
 
@@ -715,948 +785,143 @@ impl Runtime {
         loaded_guest.entrypoint_results = results;
         Ok(loaded_guest)
     }
-}
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new(Kernel::default())
+    fn claim_signal(&self, process_id: ProcessId, descriptor: SignalDescriptor) {
+        self.claim_shared_resource(process_id, ResourceClass::Signal, descriptor.shared_id);
+        self.claim_local_handle(process_id, ResourceClass::Signal, descriptor.local_id);
     }
-}
 
-impl Clone for Runtime {
-    fn clone(&self) -> Self {
-        Self {
-            kernel: self.kernel.clone(),
-            sessions: self.sessions.clone(),
-            loaded_guests: self.loaded_guests.clone(),
-            process_sessions: self.process_sessions.clone(),
-            local_handle_owners: self.local_handle_owners.clone(),
-            shared_resource_owners: self.shared_resource_owners.clone(),
-            pending_shared_region_reclaims: self.pending_shared_region_reclaims.clone(),
-            exchange_owners: self.exchange_owners.clone(),
-            module_registry: self.module_registry.clone(),
-            next_session_id: self.next_session_id.clone(),
+    fn claim_local_handle(
+        &self,
+        process_id: ProcessId,
+        resource_class: ResourceClass,
+        local_id: u64,
+    ) {
+        self.local_handle_owners
+            .lock()
+            .entry((resource_class, local_id))
+            .or_default()
+            .insert(process_id);
+    }
+
+    fn claim_shared_resource(
+        &self,
+        process_id: ProcessId,
+        resource_class: ResourceClass,
+        shared_id: u64,
+    ) {
+        self.shared_resource_owners
+            .lock()
+            .entry((resource_class, shared_id))
+            .or_default()
+            .insert(process_id);
+    }
+
+    fn release_local_handle(
+        &self,
+        process_id: ProcessId,
+        resource_class: &ResourceClass,
+        local_id: u64,
+    ) -> bool {
+        let mut local_handle_owners = self.local_handle_owners.lock();
+        let Some(owners) = local_handle_owners.get_mut(&(resource_class.clone(), local_id)) else {
+            return false;
+        };
+        owners.remove(&process_id);
+        let should_reclaim = owners.is_empty();
+        if should_reclaim {
+            local_handle_owners.remove(&(resource_class.clone(), local_id));
+        }
+        should_reclaim
+    }
+
+    fn release_shared_resource(
+        &self,
+        process_id: ProcessId,
+        resource_class: &ResourceClass,
+        shared_id: u64,
+    ) -> bool {
+        let mut shared_resource_owners = self.shared_resource_owners.lock();
+        let Some(owners) = shared_resource_owners.get_mut(&(resource_class.clone(), shared_id))
+        else {
+            return false;
+        };
+        owners.remove(&process_id);
+        let should_reclaim = owners.is_empty();
+        if should_reclaim {
+            shared_resource_owners.remove(&(resource_class.clone(), shared_id));
+        }
+        should_reclaim
+    }
+
+    fn ensure_local_handle_owner(
+        &self,
+        process_id: ProcessId,
+        capability: Capability,
+        resource_class: ResourceClass,
+        local_id: u64,
+    ) -> std::result::Result<(), AbiError> {
+        if self
+            .local_handle_owners
+            .lock()
+            .get(&(resource_class, local_id))
+            .is_some_and(|owners| owners.contains(&process_id))
+        {
+            Ok(())
+        } else {
+            Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                format!("permission denied for capability {capability:?}"),
+            ))
         }
     }
-}
 
-impl RuntimeGuestHost {
     fn require(
         &self,
+        process_id: ProcessId,
         capability: Capability,
         resource_class: ResourceClass,
         resource_id: Option<ResourceIdentity>,
-    ) -> HostResult<()> {
-        let allowed = self.runtime.authorises(
-            self.session_id,
+    ) -> std::result::Result<(), AbiError> {
+        let allowed = self.authorises(
+            process_id,
             capability.clone(),
             &ScopeContext {
-                tenant: self.scope_context.tenant.clone(),
-                uri: self.scope_context.uri.clone(),
-                locality: self.scope_context.locality.clone(),
+                locality: LocalityScope::Cluster,
                 resource_class: Some(resource_class),
                 resource_id,
+                ..ScopeContext::default()
             },
         );
         if allowed {
             Ok(())
         } else {
-            Err(HostError::PermissionDenied(capability))
+            Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                format!("permission denied for capability {capability:?}"),
+            ))
         }
     }
 
-    fn host_error(error: selium_kernel::Error) -> HostError {
-        HostError::Host(error.to_string())
-    }
-
-    fn ensure_local_handle_owner(
-        &self,
-        capability: Capability,
-        resource_class: ResourceClass,
-        local_id: u64,
-    ) -> HostResult<()> {
-        if self
-            .runtime
-            .local_handle_owned_by(self.session_id, resource_class, local_id)
-        {
-            Ok(())
-        } else {
-            Err(HostError::PermissionDenied(capability))
+    fn next_operation_id(&self, operations: &HashMap<OperationId, HostOperation>) -> OperationId {
+        let mut next_operation_id = self.next_operation_id.lock();
+        let first_candidate = *next_operation_id;
+        loop {
+            let operation_id = *next_operation_id;
+            *next_operation_id = operation_id.checked_add(1).unwrap_or(1);
+            if operation_id != 0 && !operations.contains_key(&operation_id) {
+                return operation_id;
+            }
+            if *next_operation_id == first_candidate {
+                panic!("operation id space exhausted");
+            }
         }
-    }
-
-    fn ensure_shared_resource_owner(
-        &self,
-        capability: Capability,
-        resource_class: ResourceClass,
-        shared_id: u64,
-    ) -> HostResult<()> {
-        if self
-            .runtime
-            .shared_resource_owned_by(self.session_id, resource_class, shared_id)
-        {
-            Ok(())
-        } else {
-            Err(HostError::PermissionDenied(capability))
-        }
-    }
-
-    fn namespaced_name(&self, name: &str) -> String {
-        let tenant = self.scope_context.tenant.as_deref().unwrap_or("_");
-        let uri = self.scope_context.uri.as_deref().unwrap_or("_");
-        let locality = match &self.scope_context.locality {
-            LocalityScope::Any => "any".to_string(),
-            LocalityScope::Cluster => "cluster".to_string(),
-            LocalityScope::Host(host) => format!("host:{host}"),
-        };
-        format!("{tenant}|{uri}|{locality}|{name}")
     }
 }
 
-impl GuestHost for RuntimeGuestHost {
-    fn scoped(&self, scope_context: ScopeContext) -> Arc<dyn GuestHost> {
-        Arc::new(Self {
-            runtime: self.runtime.clone(),
-            session_id: self.session_id,
-            scope_context: ScopeContext {
-                tenant: scope_context
-                    .tenant
-                    .or_else(|| self.scope_context.tenant.clone()),
-                uri: scope_context.uri.or_else(|| self.scope_context.uri.clone()),
-                locality: scope_context.locality,
-                resource_class: scope_context.resource_class,
-                resource_id: scope_context.resource_id,
-            },
-        })
-    }
-
-    fn authorises(&self, capability: Capability, scope_context: &ScopeContext) -> HostResult<bool> {
-        Ok(self
-            .runtime
-            .authorises(self.session_id, capability, scope_context))
-    }
-
-    fn allocate_shared_region(
-        &self,
-        size: u32,
-        alignment: u32,
-    ) -> HostResult<SharedRegionDescriptor> {
-        self.require(Capability::SharedMemory, ResourceClass::SharedRegion, None)?;
-        let descriptor = self
-            .runtime
-            .kernel
-            .allocate_shared_region(size, alignment)
-            .map_err(Self::host_error)?;
-        self.runtime.claim_shared_resource(
-            self.session_id,
-            ResourceClass::SharedRegion,
-            descriptor.shared_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn destroy_shared_region(&self, shared_id: u64) -> HostResult<()> {
-        self.ensure_shared_resource_owner(
-            Capability::SharedMemory,
-            ResourceClass::SharedRegion,
-            shared_id,
-        )?;
-        if self.runtime.kernel.shared_region_mapping_count(shared_id) > 0 {
-            return Err(HostError::Host(
-                "shared region still has attached mappings".to_string(),
-            ));
-        }
-        self.runtime
-            .kernel
-            .destroy_shared_region(shared_id)
-            .map_err(Self::host_error)?;
-        self.runtime.release_shared_resource(
-            self.session_id,
-            &ResourceClass::SharedRegion,
-            shared_id,
-        );
-        Ok(())
-    }
-
-    fn attach_shared_region(
-        &self,
-        shared_id: u64,
-        offset: u32,
-        len: u32,
-    ) -> HostResult<SharedMappingDescriptor> {
-        self.require(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        let descriptor = self
-            .runtime
-            .kernel
-            .attach_shared_region(shared_id, offset, len)
-            .map_err(Self::host_error)?;
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::SharedMapping,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn detach_shared_region(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            local_id,
-        )?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .shared_mapping_shared_id(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .detach_shared_region(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::SharedMapping, local_id);
-        if self
-            .runtime
-            .pending_shared_region_reclaims
-            .lock()
-            .contains(&shared_id)
-        {
-            self.runtime
-                .try_reclaim_shared_region(shared_id)
-                .map_err(|error| HostError::Host(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    fn read_shared_memory(&self, local_id: u64, offset: u32, len: usize) -> HostResult<Vec<u8>> {
-        self.ensure_local_handle_owner(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            local_id,
-        )?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .shared_mapping_shared_id(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .read_shared_memory(local_id, offset, len)
-            .map_err(Self::host_error)
-    }
-
-    fn write_shared_memory(&self, local_id: u64, offset: u32, bytes: &[u8]) -> HostResult<()> {
-        self.ensure_local_handle_owner(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            local_id,
-        )?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .shared_mapping_shared_id(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::SharedMemory,
-            ResourceClass::SharedMapping,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .write_shared_memory(local_id, offset, bytes)
-            .map_err(Self::host_error)
-    }
-
-    fn create_signal(&self) -> HostResult<SignalDescriptor> {
-        self.require(Capability::Signal, ResourceClass::Signal, None)?;
-        let descriptor = self.runtime.kernel.create_signal();
-        self.runtime.claim_shared_resource(
-            self.session_id,
-            ResourceClass::Signal,
-            descriptor.shared_id,
-        );
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::Signal,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn attach_signal(&self, shared_id: u64) -> HostResult<SignalDescriptor> {
-        self.require(
-            Capability::Signal,
-            ResourceClass::Signal,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        let descriptor = self
-            .runtime
-            .kernel
-            .attach_signal(shared_id)
-            .map_err(Self::host_error)?;
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::Signal,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn close_signal(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Signal, ResourceClass::Signal, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .signal_shared_id(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .kernel
-            .close_signal(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::Signal, local_id);
-        if self.runtime.kernel.signal_handle_count(shared_id) == 0 {
-            self.runtime.release_shared_resource(
-                self.session_id,
-                &ResourceClass::Signal,
-                shared_id,
-            );
-        }
-        Ok(())
-    }
-
-    fn notify_signal(&self, local_id: u64) -> HostResult<u64> {
-        self.ensure_local_handle_owner(Capability::Signal, ResourceClass::Signal, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .signal_shared_id(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Signal,
-            ResourceClass::Signal,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .notify_signal(local_id)
-            .map_err(Self::host_error)
-    }
-
-    fn wait_signal(
-        &self,
-        local_id: u64,
-        observed_generation: u64,
-        timeout_ms: u64,
-    ) -> HostFuture<u64> {
-        if let Err(error) =
-            self.ensure_local_handle_owner(Capability::Signal, ResourceClass::Signal, local_id)
-        {
-            return Box::pin(async move { Err(error) });
-        }
-        let runtime = self.runtime.clone();
-        let session_id = self.session_id;
-        let scope_context = self.scope_context.clone();
-        Box::pin(async move {
-            let shared_id = runtime
-                .kernel
-                .signal_shared_id(local_id)
-                .map_err(RuntimeGuestHost::host_error)?;
-            RuntimeGuestHost {
-                runtime: runtime.clone(),
-                session_id,
-                scope_context,
-            }
-            .require(
-                Capability::Signal,
-                ResourceClass::Signal,
-                Some(ResourceIdentity::Shared(shared_id)),
-            )?;
-            runtime
-                .kernel
-                .wait_signal(local_id, observed_generation, timeout_ms)
-                .await
-                .map_err(RuntimeGuestHost::host_error)
-        })
-    }
-
-    fn open_log(&self, name: String) -> HostResult<DurableLogDescriptor> {
-        self.require(Capability::Storage, ResourceClass::DurableLog, None)?;
-        let descriptor = self.runtime.kernel.open_log(self.namespaced_name(&name));
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::DurableLog,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn close_log(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::DurableLog, local_id)?;
-        self.runtime
-            .kernel
-            .close_log(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::DurableLog, local_id);
-        Ok(())
-    }
-
-    fn append_log(
-        &self,
-        local_id: u64,
-        timestamp_ms: u64,
-        headers: Vec<(String, String)>,
-        payload: Vec<u8>,
-    ) -> HostResult<u64> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::DurableLog, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .log_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::DurableLog,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .append_log(local_id, timestamp_ms, headers, payload)
-            .map_err(Self::host_error)
-    }
-
-    fn replay_log(
-        &self,
-        local_id: u64,
-        from_sequence: Option<u64>,
-        limit: usize,
-    ) -> HostResult<Vec<StorageRecord>> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::DurableLog, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .log_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::DurableLog,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .replay_log(local_id, from_sequence, limit)
-            .map_err(Self::host_error)
-    }
-
-    fn checkpoint_log(&self, local_id: u64, name: String, sequence: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::DurableLog, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .log_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::DurableLog,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .checkpoint_log(local_id, name, sequence)
-            .map_err(Self::host_error)
-    }
-
-    fn checkpoint_sequence(&self, local_id: u64, name: &str) -> HostResult<Option<u64>> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::DurableLog, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .log_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::DurableLog,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .checkpoint_sequence(local_id, name)
-            .map_err(Self::host_error)
-    }
-
-    fn open_blob_store(&self, name: String) -> HostResult<BlobStoreDescriptor> {
-        self.require(Capability::Storage, ResourceClass::BlobStore, None)?;
-        let descriptor = self
-            .runtime
-            .kernel
-            .open_blob_store(self.namespaced_name(&name));
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::BlobStore,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn close_blob_store(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::BlobStore, local_id)?;
-        self.runtime
-            .kernel
-            .close_blob_store(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::BlobStore, local_id);
-        Ok(())
-    }
-
-    fn put_blob(&self, local_id: u64, bytes: Vec<u8>) -> HostResult<String> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::BlobStore, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .blob_store_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::BlobStore,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .put_blob(local_id, bytes)
-            .map_err(Self::host_error)
-    }
-
-    fn get_blob(&self, local_id: u64, blob_id: &str) -> HostResult<Option<Vec<u8>>> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::BlobStore, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .blob_store_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::BlobStore,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .get_blob(local_id, blob_id)
-            .map_err(Self::host_error)
-    }
-
-    fn set_manifest(&self, local_id: u64, name: String, blob_id: String) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::BlobStore, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .blob_store_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::BlobStore,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .set_manifest(local_id, name, blob_id)
-            .map_err(Self::host_error)
-    }
-
-    fn get_manifest(&self, local_id: u64, name: &str) -> HostResult<Option<String>> {
-        self.ensure_local_handle_owner(Capability::Storage, ResourceClass::BlobStore, local_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .blob_store_shared_id_public(local_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Storage,
-            ResourceClass::BlobStore,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .get_manifest(local_id, name)
-            .map_err(Self::host_error)
-    }
-
-    fn connect(&self, authority: String) -> HostResult<NetworkSessionDescriptor> {
-        self.require(Capability::Network, ResourceClass::Session, None)?;
-        let descriptor = self.runtime.kernel.connect(authority);
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::Session,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn listen(&self, address: String) -> HostResult<NetworkListenerDescriptor> {
-        self.require(Capability::Network, ResourceClass::Listener, None)?;
-        let descriptor = self.runtime.kernel.listen(address);
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::Listener,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn close_listener(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Listener, local_id)?;
-        self.runtime
-            .kernel
-            .close_listener(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::Listener, local_id);
-        Ok(())
-    }
-
-    fn close_session(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Session, local_id)?;
-        self.runtime
-            .kernel
-            .close_session(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::Session, local_id);
-        Ok(())
-    }
-
-    fn open_stream(&self, session_id: u64) -> HostResult<NetworkStreamDescriptor> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Session, session_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .session_shared_id_public(session_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Network,
-            ResourceClass::Session,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        let descriptor = self
-            .runtime
-            .kernel
-            .open_stream(session_id)
-            .map_err(Self::host_error)?;
-        self.runtime.claim_local_handle(
-            self.session_id,
-            ResourceClass::Stream,
-            descriptor.local_id,
-        );
-        Ok(descriptor)
-    }
-
-    fn close_stream(&self, local_id: u64) -> HostResult<()> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Stream, local_id)?;
-        self.runtime
-            .kernel
-            .close_stream(local_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .release_local_handle(self.session_id, &ResourceClass::Stream, local_id);
-        Ok(())
-    }
-
-    fn stream_session_shared_id(&self, stream_id: u64) -> HostResult<u64> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Stream, stream_id)?;
-        let session_id = self
-            .runtime
-            .kernel
-            .stream_session_id(stream_id)
-            .map_err(Self::host_error)?;
-        self.runtime
-            .kernel
-            .session_shared_id_public(session_id)
-            .map_err(Self::host_error)
-    }
-
-    fn send_stream_chunk(&self, stream_id: u64, bytes: Vec<u8>) -> HostResult<()> {
-        let session_shared_id = self.stream_session_shared_id(stream_id)?;
-        self.require(
-            Capability::Network,
-            ResourceClass::Stream,
-            Some(ResourceIdentity::Shared(session_shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .send_stream_chunk(stream_id, bytes)
-            .map_err(Self::host_error)
-    }
-
-    fn recv_stream_chunk(&self, stream_id: u64) -> HostResult<Option<Vec<u8>>> {
-        let session_shared_id = self.stream_session_shared_id(stream_id)?;
-        self.require(
-            Capability::Network,
-            ResourceClass::Stream,
-            Some(ResourceIdentity::Shared(session_shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .recv_stream_chunk(stream_id)
-            .map_err(Self::host_error)
-    }
-
-    fn send_request(
-        &self,
-        session_id: u64,
-        method: String,
-        path: String,
-        request_body: Vec<u8>,
-    ) -> HostResult<u64> {
-        self.ensure_local_handle_owner(Capability::Network, ResourceClass::Session, session_id)?;
-        let shared_id = self
-            .runtime
-            .kernel
-            .session_shared_id_public(session_id)
-            .map_err(Self::host_error)?;
-        self.require(
-            Capability::Network,
-            ResourceClass::RequestExchange,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        self.runtime
-            .kernel
-            .send_request(session_id, method, path, request_body)
-            .inspect(|exchange_id| {
-                self.runtime
-                    .exchange_owners
-                    .lock()
-                    .insert(*exchange_id, self.session_id);
-            })
-            .map_err(Self::host_error)
-    }
-
-    fn wait_request_response(
-        &self,
-        exchange_id: u64,
-        timeout_ms: u64,
-    ) -> HostFuture<(u16, Vec<u8>)> {
-        let runtime = self.runtime.clone();
-        let session_id = self.session_id;
-        let scope_context = self.scope_context.clone();
-        Box::pin(async move {
-            let owner = runtime.exchange_owners.lock().get(&exchange_id).copied();
-            if owner != Some(session_id) {
-                return Err(HostError::PermissionDenied(Capability::Network));
-            }
-            let (request_session_id, _, _, _) = runtime
-                .kernel
-                .request_summary(exchange_id)
-                .map_err(RuntimeGuestHost::host_error)?;
-            let shared_id = runtime
-                .kernel
-                .session_shared_id_public(request_session_id)
-                .map_err(RuntimeGuestHost::host_error)?;
-            RuntimeGuestHost {
-                runtime: runtime.clone(),
-                session_id,
-                scope_context,
-            }
-            .require(
-                Capability::Network,
-                ResourceClass::RequestExchange,
-                Some(ResourceIdentity::Shared(shared_id)),
-            )?;
-            let result = runtime
-                .kernel
-                .wait_request_response(exchange_id, timeout_ms)
-                .await
-                .map_err(RuntimeGuestHost::host_error);
-            runtime.exchange_owners.lock().remove(&exchange_id);
-            result
-        })
-    }
-
-    fn start_process(
-        &self,
-        module_id: String,
-        entrypoint: String,
-        arguments: Vec<Vec<u8>>,
-        grants: Vec<CapabilityGrant>,
-    ) -> HostResult<ProcessDescriptor> {
-        self.require(Capability::ProcessLifecycle, ResourceClass::Process, None)?;
-        self.runtime
-            .validate_grants(&grants)
-            .map_err(|error| HostError::Host(error.to_string()))?;
-        let parent_grants = self
-            .runtime
-            .session_grants(self.session_id)
-            .map_err(|error| HostError::Host(error.to_string()))?;
-        for grant in &grants {
-            if !parent_grants
-                .iter()
-                .any(|parent| parent_grant_covers_child(parent, grant))
-            {
-                return Err(HostError::Host(
-                    Error::GrantEscalation(grant.capability.clone()).to_string(),
-                ));
-            }
-        }
-        let module_bytes = self
-            .runtime
-            .module_bytes(&module_id)
-            .map_err(|error| HostError::Host(error.to_string()))?;
-        let session_id = self.runtime.persist_session(grants.clone());
-        let process = self.runtime.kernel.start_process(
-            module_id.clone(),
-            entrypoint.clone(),
-            grants.clone(),
-        );
-        let loaded_guest =
-            match self
-                .runtime
-                .load_guest_module(&module_bytes, session_id, process.local_id)
-            {
-                Ok(loaded_guest) => loaded_guest,
-                Err(error) => {
-                    self.runtime.kernel.record_activity(ActivityEvent {
-                        kind: selium_abi::ActivityKind::ProcessExited,
-                        process_id: Some(process.local_id),
-                        message: format!("guest {module_id} trapped during load: {error}"),
-                    });
-                    let _ = self
-                        .runtime
-                        .cleanup_failed_process(process.local_id, session_id);
-                    return Err(HostError::Host(error.to_string()));
-                }
-            };
-        let descriptor = SystemGuestDescriptor {
-            name: module_id.clone(),
-            module_id: module_id.clone(),
-            module_bytes,
-            entrypoint: entrypoint.clone(),
-            arguments,
-            grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
-        };
-        let loaded_guest = match self.runtime.execute_entrypoint(loaded_guest, &descriptor) {
-            Ok(loaded_guest) => loaded_guest,
-            Err(error) => {
-                self.runtime.kernel.record_activity(ActivityEvent {
-                    kind: selium_abi::ActivityKind::ProcessExited,
-                    process_id: Some(process.local_id),
-                    message: format!("guest {module_id} trapped: {error}"),
-                });
-                let _ = self
-                    .runtime
-                    .cleanup_failed_process(process.local_id, session_id);
-                return Err(HostError::Host(error.to_string()));
-            }
-        };
-        self.runtime
-            .loaded_guests
-            .lock()
-            .insert(process.local_id, loaded_guest);
-        self.runtime
-            .process_sessions
-            .lock()
-            .insert(process.local_id, session_id);
-        self.runtime
-            .claim_local_handle(self.session_id, ResourceClass::Process, process.local_id);
-        self.runtime
-            .claim_local_handle(session_id, ResourceClass::Process, process.local_id);
-        Ok(process)
-    }
-
-    fn stop_process(&self, process_id: ProcessId) -> HostResult<()> {
-        self.ensure_local_handle_owner(
-            Capability::ProcessLifecycle,
-            ResourceClass::Process,
-            process_id,
-        )?;
-        self.require(
-            Capability::ProcessLifecycle,
-            ResourceClass::Process,
-            Some(ResourceIdentity::Local(process_id)),
-        )?;
-        self.runtime
-            .stop_process(process_id)
-            .map_err(|error| HostError::Host(error.to_string()))
-    }
-
-    fn metering_observation(
-        &self,
-        process_id: ProcessId,
-    ) -> HostResult<Option<MeteringObservation>> {
-        self.ensure_local_handle_owner(
-            Capability::MeteringRead,
-            ResourceClass::Process,
-            process_id,
-        )?;
-        self.require(
-            Capability::MeteringRead,
-            ResourceClass::MeteringStream,
-            Some(ResourceIdentity::Local(process_id)),
-        )?;
-        Ok(self.runtime.kernel.metering_observation(process_id))
-    }
-
-    fn read_activity_from(&self, cursor: usize) -> HostResult<Vec<ActivityEvent>> {
-        self.require(Capability::ActivityRead, ResourceClass::ActivityLog, None)?;
-        Ok(self.runtime.kernel.read_activity_from(cursor))
-    }
-
-    fn write_guest_log(&self, entry: GuestLogEntry) -> HostResult<()> {
-        if let Some(process_id) = entry.process_id {
-            self.ensure_local_handle_owner(
-                Capability::GuestLogWrite,
-                ResourceClass::Process,
-                process_id,
-            )?;
-        }
-        self.require(
-            Capability::GuestLogWrite,
-            ResourceClass::GuestLog,
-            entry.process_id.map(ResourceIdentity::Local),
-        )?;
-        self.runtime.kernel.write_guest_log(entry);
-        Ok(())
-    }
-
-    fn read_guest_logs_from(
-        &self,
-        cursor: usize,
-        process_id: Option<ProcessId>,
-    ) -> HostResult<Vec<GuestLogEntry>> {
-        if let Some(process_id) = process_id {
-            self.ensure_local_handle_owner(
-                Capability::GuestLogRead,
-                ResourceClass::Process,
-                process_id,
-            )?;
-        }
-        self.require(
-            Capability::GuestLogRead,
-            ResourceClass::GuestLog,
-            process_id.map(ResourceIdentity::Local),
-        )?;
-        Ok(self
-            .runtime
-            .kernel
-            .read_guest_logs_from(cursor)
-            .into_iter()
-            .filter(|entry| process_id.is_none() || entry.process_id == process_id)
-            .collect())
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new(Kernel::default())
     }
 }
 
@@ -1679,20 +944,6 @@ impl HostFunc for MarkReadyHostFunc {
     }
 }
 
-impl HostFunc for SessionIdHostFunc {
-    fn call(
-        &self,
-        _store: &mut Store,
-        _args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        Ok(vec![WasmValue::I64(self.session_id as i64)])
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        None
-    }
-}
-
 impl HostFunc for ProcessIdHostFunc {
     fn call(
         &self,
@@ -1700,6 +951,83 @@ impl HostFunc for ProcessIdHostFunc {
         _args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         Ok(vec![WasmValue::I64(self.process_id as i64)])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for HostcallCreateHostFunc {
+    fn call(
+        &self,
+        store: &mut Store,
+        args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        let ptr = wasm_i32_arg(args, 0)? as u32;
+        let len = wasm_i32_arg(args, 1)? as usize;
+        let request_bytes = read_guest_memory(store, ptr, len)?;
+        let request = match selium_abi::decode_rkyv::<HostcallRequest>(&request_bytes) {
+            Ok(request) => request,
+            Err(_) => {
+                let status = pack_hostcall_status(selium_abi::HOSTCALL_STATUS_FAILED, 0);
+                return Ok(vec![WasmValue::I64(status as i64)]);
+            }
+        };
+        let (status, operation_id) = self.runtime.begin_hostcall(self.process_id, request);
+        Ok(vec![WasmValue::I64(
+            pack_hostcall_status(status, operation_id as u32) as i64,
+        )])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for HostcallPollHostFunc {
+    fn call(
+        &self,
+        store: &mut Store,
+        args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        let operation_id = wasm_i64_arg(args, 0)? as OperationId;
+        let out_ptr = wasm_i32_arg(args, 1)? as u32;
+        let out_capacity = wasm_i32_arg(args, 2)? as usize;
+        let state = self.runtime.poll_hostcall(self.process_id, operation_id);
+        let status = match state {
+            CompletionState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
+            CompletionState::Pending { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
+            CompletionState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
+        };
+        let encoded = selium_abi::encode_rkyv(&state)
+            .map_err(|error| WasmError::Runtime(error.to_string()))?;
+        if encoded.len() > out_capacity {
+            return Ok(vec![WasmValue::I64(pack_hostcall_status(
+                selium_abi::HOSTCALL_STATUS_OUTPUT_TOO_SMALL,
+                encoded.len() as u32,
+            ) as i64)]);
+        }
+        write_guest_memory(store, out_ptr, &encoded)?;
+        Ok(vec![WasmValue::I64(
+            pack_hostcall_status(status, encoded.len() as u32) as i64,
+        )])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for HostcallDropHostFunc {
+    fn call(
+        &self,
+        _store: &mut Store,
+        args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        let operation_id = wasm_i64_arg(args, 0)? as OperationId;
+        let dropped = self.runtime.drop_hostcall(self.process_id, operation_id);
+        Ok(vec![WasmValue::I32(u32::from(dropped) as i32)])
     }
 
     fn function_type(&self) -> Option<&FunctionType> {
@@ -1722,34 +1050,6 @@ fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmValue>> {
         .collect()
 }
 
-fn map_wasm_error(error: WasmError) -> Error {
-    Error::Wasm(error.to_string())
-}
-
-fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
-    if parent.capability != child.capability {
-        return false;
-    }
-
-    parent.selectors.iter().all(|parent_selector| match parent_selector {
-        ResourceSelector::Tenant(parent_tenant) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::Tenant(child_tenant) if child_tenant == parent_tenant)
-        }),
-        ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
-        }),
-        ResourceSelector::Locality(parent_locality) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::Locality(child_locality) if parent_locality.matches(child_locality))
-        }),
-        ResourceSelector::ResourceClass(parent_class) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::ResourceClass(child_class) if child_class == parent_class)
-        }),
-        ResourceSelector::ExplicitResource(parent_identity) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::ExplicitResource(child_identity) if child_identity == parent_identity)
-        }),
-    })
-}
-
 fn register_optional_host_function(
     app: &mut WasmApplication,
     module_index: u32,
@@ -1769,10 +1069,65 @@ fn register_optional_host_function(
     }
 }
 
+fn read_guest_memory(store: &Store, ptr: u32, len: usize) -> wasmtiny::runtime::Result<Vec<u8>> {
+    let memory = store
+        .instances
+        .first()
+        .and_then(|instance| instance.memory(0))
+        .cloned()
+        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))?;
+    let mut bytes = vec![0; len];
+    memory
+        .lock()
+        .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .read(ptr, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_guest_memory(store: &Store, ptr: u32, bytes: &[u8]) -> wasmtiny::runtime::Result<()> {
+    let memory = store
+        .instances
+        .first()
+        .and_then(|instance| instance.memory(0))
+        .cloned()
+        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))?;
+    memory
+        .lock()
+        .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .write(ptr, bytes)
+}
+
+fn wasm_i32_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i32> {
+    args.get(index)
+        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
+        .i32()
+}
+
+fn wasm_i64_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i64> {
+    args.get(index)
+        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
+        .i64()
+}
+
+fn map_wasm_error(error: WasmError) -> Error {
+    Error::Wasm(error.to_string())
+}
+
+fn kernel_error(error: selium_kernel::Error) -> AbiError {
+    let code = match error {
+        selium_kernel::Error::NotFound(_) => AbiErrorCode::NotFound,
+        selium_kernel::Error::Timeout => AbiErrorCode::Timeout,
+        selium_kernel::Error::AlreadyCompleted
+        | selium_kernel::Error::ProcessStopped(_)
+        | selium_kernel::Error::Wasm(_) => AbiErrorCode::Internal,
+    };
+    AbiError::new(code, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_abi::{LocalityScope, ResourceSelector};
+    use selium_abi::{MeteringObservation, ResourceSelector};
 
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (export \"{entrypoint}\") {body}))"))
@@ -1782,12 +1137,10 @@ mod tests {
     fn module_with_runtime_bridge(entrypoint: &str) -> Vec<u8> {
         wat::parse_str(format!(
             "(module
-                (import \"selium\" \"session_id\" (func $session_id (result i64)))
                 (import \"selium\" \"process_id\" (func $process_id (result i64)))
                 (import \"selium\" \"mark_ready\" (func $mark_ready))
-                (func (export \"{entrypoint}\") (result i64 i64)
+                (func (export \"{entrypoint}\") (result i64)
                     call $mark_ready
-                    call $session_id
                     call $process_id))"
         ))
         .expect("compile runtime bridge wat")
@@ -1826,50 +1179,116 @@ mod tests {
     }
 
     #[test]
-    fn grants_are_restored_and_checked_by_scope() {
+    fn runtime_registers_host_import_bridge_for_guest_modules() {
         let runtime = Runtime::default();
         let bootstrapped = runtime
             .spawn_system_guest(SystemGuestDescriptor {
-                name: "scheduler".to_string(),
-                module_id: "scheduler-module".to_string(),
-                module_bytes: module_with_entrypoint("main", ""),
-                entrypoint: "main".to_string(),
+                name: "bridged".to_string(),
+                module_id: "bridged-module".to_string(),
+                module_bytes: module_with_runtime_bridge("boot"),
+                entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(
-                    Capability::ProcessLifecycle,
-                    vec![
-                        ResourceSelector::Tenant("acme".to_string()),
-                        ResourceSelector::UriPrefix("sel://acme/workloads/".to_string()),
-                    ],
+                    Capability::ActivityRead,
+                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+            })
+            .expect("spawn bridged guest");
+
+        let results = runtime
+            .entrypoint_results(bootstrapped.process_id)
+            .expect("entrypoint results");
+        assert_eq!(
+            results,
+            vec![WasmValue::I64(bootstrapped.process_id as i64)]
+        );
+    }
+
+    #[test]
+    fn hostcall_signal_vertical_slice_uses_operation_table() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "signals".to_string(),
+                module_id: "signals-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Signal,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
             })
-            .expect("spawn guest");
+            .expect("spawn signals guest");
 
-        let session = runtime
-            .restore_session(bootstrapped.session_id)
-            .expect("restore session");
-        assert_eq!(session.grants.len(), 1);
-        assert_eq!(
-            runtime
-                .kernel()
-                .process_grants(bootstrapped.process_id)
-                .expect("process grants")
-                .len(),
-            1
+        let (status, create_id) =
+            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::Signal(signal)) =
+            runtime.poll_hostcall(bootstrapped.process_id, create_id)
+        else {
+            panic!("expected created signal");
+        };
+
+        let (status, wait_id) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SignalWait {
+                local_id: signal.local_id,
+                observed_generation: 0,
+                timeout_ms: 1_000,
+            },
         );
-        assert!(runtime.authorises(
-            bootstrapped.session_id,
-            Capability::ProcessLifecycle,
-            &ScopeContext {
-                tenant: Some("acme".to_string()),
-                uri: Some("sel://acme/workloads/a".to_string()),
-                locality: LocalityScope::Cluster,
-                resource_class: None,
-                resource_id: None,
-            }
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_PENDING);
+        assert!(matches!(
+            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
+            CompletionState::Pending { .. }
         ));
+
+        runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SignalNotify {
+                local_id: signal.local_id,
+            },
+        );
+        assert_eq!(
+            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
+            CompletionState::Ready(HostcallOutput::SignalGeneration(1))
+        );
+    }
+
+    #[test]
+    fn operation_ids_roll_over_without_saturating() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "rollover".to_string(),
+                module_id: "rollover-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Signal,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+            })
+            .expect("spawn rollover guest");
+        *runtime.next_operation_id.lock() = OperationId::MAX;
+
+        let (first_status, first_id) =
+            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
+        let (second_status, second_id) =
+            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
+
+        assert_eq!(first_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert_eq!(second_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert_eq!(first_id, OperationId::MAX);
+        assert_eq!(second_id, 1);
     }
 
     #[test]
@@ -1914,326 +1333,5 @@ mod tests {
                 .cpu_micros,
             11
         );
-    }
-
-    #[test]
-    fn duplicate_guest_names_are_rejected() {
-        let runtime = Runtime::default();
-        let result = runtime.bootstrap_system_guests(RuntimeConfig {
-            system_guests: vec![
-                SystemGuestDescriptor {
-                    name: "dup".to_string(),
-                    module_id: "one".to_string(),
-                    module_bytes: module_with_entrypoint("boot", ""),
-                    entrypoint: "boot".to_string(),
-                    arguments: Vec::new(),
-                    grants: vec![CapabilityGrant::new(
-                        Capability::ProcessLifecycle,
-                        vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                    )],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
-                },
-                SystemGuestDescriptor {
-                    name: "dup".to_string(),
-                    module_id: "two".to_string(),
-                    module_bytes: module_with_entrypoint("boot", ""),
-                    entrypoint: "boot".to_string(),
-                    arguments: Vec::new(),
-                    grants: vec![CapabilityGrant::new(
-                        Capability::ProcessLifecycle,
-                        vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                    )],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
-                },
-            ],
-        });
-
-        assert!(matches!(result, Err(Error::DuplicateDescriptor(name)) if name == "dup"));
-    }
-
-    #[test]
-    fn duplicate_module_ids_with_different_bytes_are_rejected() {
-        let runtime = Runtime::default();
-        runtime
-            .register_module_bytes("module".to_string(), module_with_entrypoint("boot", ""))
-            .expect("register first module bytes");
-
-        let result = runtime.register_module_bytes(
-            "module".to_string(),
-            module_with_entrypoint("boot", "(result i32) i32.const 1"),
-        );
-
-        assert!(matches!(result, Err(Error::ModuleConflict(name)) if name == "module"));
-    }
-
-    #[test]
-    fn readiness_waits_for_later_activity() {
-        let runtime = Runtime::default();
-        let process = runtime.kernel().start_process(
-            "module",
-            "main",
-            vec![CapabilityGrant::new(
-                Capability::ActivityRead,
-                vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-            )],
-        );
-        let runtime_clone = runtime.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            runtime_clone.kernel().record_activity(ActivityEvent {
-                kind: selium_abi::ActivityKind::ProcessStarted,
-                process_id: Some(process.local_id),
-                message: "guest ready".to_string(),
-            });
-        });
-
-        assert!(runtime.wait_for_readiness(
-            process.local_id,
-            &ReadinessCondition::ActivityLogContains("ready".to_string())
-        ));
-    }
-
-    #[test]
-    fn runtime_registers_host_import_bridge_for_guest_modules() {
-        let runtime = Runtime::default();
-        let bootstrapped = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "bridged".to_string(),
-                module_id: "bridged-module".to_string(),
-                module_bytes: module_with_runtime_bridge("boot"),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::ActivityRead,
-                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-            })
-            .expect("spawn bridged guest");
-
-        let results = runtime
-            .entrypoint_results(bootstrapped.process_id)
-            .expect("entrypoint results");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0], WasmValue::I64(bootstrapped.session_id as i64));
-        assert_eq!(results[1], WasmValue::I64(bootstrapped.process_id as i64));
-        assert!(runtime.activity_log().iter().any(|event| {
-            event.process_id == Some(bootstrapped.process_id) && event.message == "guest ready"
-        }));
-    }
-
-    #[test]
-    fn child_process_grants_cannot_exceed_parent_authority() {
-        let runtime = Runtime::default();
-        let bootstrapped = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "parent".to_string(),
-                module_id: "parent-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::ProcessLifecycle,
-                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn parent guest");
-        let host = runtime
-            .guest_host(bootstrapped.session_id)
-            .expect("guest host");
-
-        let result = host.start_process(
-            "child".to_string(),
-            "main".to_string(),
-            Vec::new(),
-            vec![CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
-            )],
-        );
-
-        assert!(
-            matches!(result, Err(HostError::Host(message)) if message.contains("GrantEscalation") || message.contains("child grant exceeds"))
-        );
-    }
-
-    #[test]
-    fn stopping_process_revokes_session_authority() {
-        let runtime = Runtime::default();
-        let bootstrapped = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "revoked".to_string(),
-                module_id: "revoked-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn guest");
-        let host = runtime
-            .guest_host(bootstrapped.session_id)
-            .expect("guest host");
-
-        runtime
-            .stop_process(bootstrapped.process_id)
-            .expect("stop process");
-
-        assert!(matches!(
-            host.allocate_shared_region(64, 8),
-            Err(HostError::PermissionDenied(Capability::SharedMemory))
-        ));
-    }
-
-    #[test]
-    fn guest_log_writes_cannot_spoof_other_processes() {
-        let runtime = Runtime::default();
-        let grants = vec![
-            CapabilityGrant::new(
-                Capability::GuestLogWrite,
-                vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
-            ),
-            CapabilityGrant::new(
-                Capability::ProcessLifecycle,
-                vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-            ),
-        ];
-        let first = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "one".to_string(),
-                module_id: "one-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: grants.clone(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn first guest");
-        let second = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "two".to_string(),
-                module_id: "two-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants,
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn second guest");
-        let second_host = runtime
-            .guest_host(second.session_id)
-            .expect("guest host two");
-
-        let result = second_host.write_guest_log(GuestLogEntry {
-            process_id: Some(first.process_id),
-            level: "INFO".to_string(),
-            target: "test".to_string(),
-            message: "spoof".to_string(),
-        });
-
-        assert!(matches!(
-            result,
-            Err(HostError::PermissionDenied(Capability::GuestLogWrite))
-        ));
-    }
-
-    #[test]
-    fn bootstrap_rolls_back_when_guest_spawn_fails() {
-        let runtime = Runtime::default();
-        let result = runtime.bootstrap_system_guests(RuntimeConfig {
-            system_guests: vec![
-                SystemGuestDescriptor {
-                    name: "ok".to_string(),
-                    module_id: "ok-module".to_string(),
-                    module_bytes: module_with_entrypoint("boot", ""),
-                    entrypoint: "boot".to_string(),
-                    arguments: Vec::new(),
-                    grants: vec![CapabilityGrant::new(
-                        Capability::ProcessLifecycle,
-                        vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                    )],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
-                },
-                SystemGuestDescriptor {
-                    name: "bad".to_string(),
-                    module_id: "bad-module".to_string(),
-                    module_bytes: module_with_entrypoint("other", ""),
-                    entrypoint: "boot".to_string(),
-                    arguments: Vec::new(),
-                    grants: vec![CapabilityGrant::new(
-                        Capability::ProcessLifecycle,
-                        vec![ResourceSelector::Locality(LocalityScope::Cluster)],
-                    )],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
-                },
-            ],
-        });
-
-        assert!(matches!(result, Err(Error::Wasm(_))));
-        assert_eq!(runtime.loaded_guest_count(), 0);
-    }
-
-    #[test]
-    fn explicit_shared_region_grant_allows_attach() {
-        let runtime = Runtime::default();
-        let owner = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "owner".to_string(),
-                module_id: "owner-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn owner guest");
-        let owner_host = runtime.guest_host(owner.session_id).expect("owner host");
-        let region = owner_host
-            .allocate_shared_region(64, 8)
-            .expect("allocate shared region");
-
-        let child = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "child".to_string(),
-                module_id: "child-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![
-                        ResourceSelector::ResourceClass(ResourceClass::SharedMapping),
-                        ResourceSelector::ExplicitResource(ResourceIdentity::Shared(
-                            region.shared_id,
-                        )),
-                    ],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn child guest");
-        let child_host = runtime.guest_host(child.session_id).expect("child host");
-
-        let mapping = child_host
-            .attach_shared_region(region.shared_id, 0, region.len)
-            .expect("attach shared region");
-        assert_eq!(mapping.shared_id, region.shared_id);
     }
 }

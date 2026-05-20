@@ -1,7 +1,6 @@
 use selium_guest::{
-    Capability, CapabilityGrant, EntrypointMetadata, GuestContext, GuestLogResource,
-    InterfaceMetadata, LocalityScope, ResourceClass, ResourceSelector, entrypoint,
-    native::NativeHost, pattern_interface,
+    Capability, CapabilityGrant, EntrypointMetadata, InterfaceMetadata, LocalityScope,
+    ResourceSelector, entrypoint, pattern_interface,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
@@ -46,25 +45,7 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
     assert_eq!(interface_metadata.name, "Echo");
     assert_eq!(interface_metadata.methods, vec!["echo".to_string()]);
 
-    let log_context = GuestContext::new(NativeHost::with_grants(vec![
-        CapabilityGrant::new(
-            Capability::GuestLogRead,
-            vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
-        ),
-        CapabilityGrant::new(
-            Capability::GuestLogWrite,
-            vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
-        ),
-    ]));
-    let logs = GuestLogResource::new(&log_context, None).expect("create guest log resource");
-    let _guard = logs.install().expect("install guest log resource");
     __selium_guest_entrypoint_demo_entrypoint();
-    assert!(
-        logs.records()
-            .expect("read guest logs")
-            .iter()
-            .any(|record| record.message == "macro entrypoint invoked")
-    );
 
     let runtime = Runtime::default();
     let config = RuntimeConfig {
@@ -90,13 +71,10 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
 fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
     wat::parse_str(format!(
         "(module
-            (import \"selium\" \"session_id\" (func $session_id (result i64)))
             (import \"selium\" \"process_id\" (func $process_id (result i64)))
             (import \"selium\" \"mark_ready\" (func $mark_ready))
             (func (export \"{entrypoint}\")
                 call $mark_ready
-                call $session_id
-                drop
                 call $process_id
                 drop))"
     ))
