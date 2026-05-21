@@ -5,21 +5,26 @@ use selium_abi::{
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
+/// Guest handle for a process started through the host.
 #[derive(Clone, Debug)]
 pub struct Process {
     descriptor: ProcessDescriptor,
 }
 
+/// Accessor for host activity log entries.
 #[derive(Clone, Copy, Debug)]
 pub struct ActivityLog;
 
+/// Accessor for process metering observations.
 #[derive(Clone, Copy, Debug)]
 pub struct Metering;
 
+/// Accessor for guest log entries.
 #[derive(Clone, Copy, Debug)]
 pub struct GuestLog;
 
 impl Process {
+    /// Starts a process from a module, entrypoint, arguments, and grants.
     pub fn start(
         module_id: impl Into<String>,
         entrypoint: impl Into<String>,
@@ -37,10 +42,12 @@ impl Process {
         }
     }
 
+    /// Returns the process descriptor.
     pub fn descriptor(&self) -> &ProcessDescriptor {
         &self.descriptor
     }
 
+    /// Stops the process.
     pub fn stop(self) -> Result<()> {
         match hostcall_ready(HostcallRequest::ProcessStop {
             process_id: self.descriptor.local_id,
@@ -52,6 +59,7 @@ impl Process {
 }
 
 impl ActivityLog {
+    /// Reads activity events starting at the cursor offset.
     pub fn read_from(cursor: usize) -> Result<Vec<ActivityEvent>> {
         match hostcall_ready(HostcallRequest::ActivityRead { cursor })? {
             HostcallOutput::ActivityEvents(events) => Ok(events),
@@ -61,6 +69,7 @@ impl ActivityLog {
 }
 
 impl Metering {
+    /// Reads the latest metering observation for a process, if available.
     pub fn read(process_id: u64) -> Result<Option<MeteringObservation>> {
         match hostcall_ready(HostcallRequest::MeteringRead { process_id })? {
             HostcallOutput::Metering(observation) => Ok(Some(observation)),
@@ -71,6 +80,7 @@ impl Metering {
 }
 
 impl GuestLog {
+    /// Writes a guest log entry.
     pub fn write(entry: GuestLogEntry) -> Result<()> {
         match hostcall_ready(HostcallRequest::GuestLogWrite { entry })? {
             HostcallOutput::Empty => Ok(()),
@@ -78,6 +88,7 @@ impl GuestLog {
         }
     }
 
+    /// Reads guest log entries from a cursor, optionally filtering by process.
     pub fn read_from(cursor: usize, process_id: Option<u64>) -> Result<Vec<GuestLogEntry>> {
         match hostcall_ready(HostcallRequest::GuestLogRead { cursor, process_id })? {
             HostcallOutput::GuestLogEntries(entries) => Ok(entries),

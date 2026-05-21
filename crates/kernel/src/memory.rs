@@ -9,6 +9,7 @@ use crate::{
 };
 
 impl Kernel {
+    /// Allocates a shared memory region and returns its descriptor.
     pub fn allocate_shared_region(
         &self,
         size: u32,
@@ -35,6 +36,7 @@ impl Kernel {
         Ok(SharedRegionDescriptor { shared_id, len })
     }
 
+    /// Attaches a local mapping to a shared memory region.
     pub fn attach_shared_region(
         &self,
         shared_id: SharedResourceId,
@@ -67,6 +69,7 @@ impl Kernel {
         })
     }
 
+    /// Destroys a shared memory region when no mappings remain.
     pub fn destroy_shared_region(&self, shared_id: SharedResourceId) -> Result<()> {
         if self.shared_region_mapping_count(shared_id) > 0 {
             return Err(Error::Wasm(
@@ -89,6 +92,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Detaches a local shared memory mapping.
     pub fn detach_shared_region(&self, local_id: u64) -> Result<()> {
         let mapping = self
             .inner
@@ -103,6 +107,7 @@ impl Kernel {
             .map_err(map_wasm_error)
     }
 
+    /// Reads bytes from a local shared memory mapping.
     pub fn read_shared_memory(&self, local_id: u64, offset: u32, len: usize) -> Result<Vec<u8>> {
         let mapping = self.shared_mapping(local_id)?;
         let mut bytes = vec![0_u8; len];
@@ -114,6 +119,7 @@ impl Kernel {
         Ok(bytes)
     }
 
+    /// Writes bytes to a local shared memory mapping.
     pub fn write_shared_memory(&self, local_id: u64, offset: u32, bytes: &[u8]) -> Result<()> {
         let mapping = self.shared_mapping(local_id)?;
         self.inner
@@ -123,10 +129,12 @@ impl Kernel {
             .map_err(map_wasm_error)
     }
 
+    /// Returns the shared region id backing a local mapping.
     pub fn shared_mapping_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
         Ok(self.shared_mapping(local_id)?.shared_id)
     }
 
+    /// Returns the number of local mappings attached to a shared region.
     pub fn shared_region_mapping_count(&self, shared_id: SharedResourceId) -> usize {
         self.inner
             .shared_mappings

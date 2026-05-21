@@ -14,8 +14,8 @@ categories.workspace = true
 proc-macro = true
 
 [dependencies]
-quote.workspace = true
-syn.workspace = true
+quote = { workspace = true, features = ["proc-macro"] }
+syn = { workspace = true, features = ["full", "parsing", "printing", "proc-macro"] }
 
 [dev-dependencies]
 selium-guest = { path = ".." }

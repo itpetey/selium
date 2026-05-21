@@ -15,6 +15,7 @@ use crate::{
 };
 
 impl Kernel {
+    /// Creates a new signal and returns its first local descriptor.
     pub fn create_signal(&self) -> SignalDescriptor {
         let local_id = self.next_local_id();
         let shared_id = self.next_shared_id();
@@ -32,6 +33,7 @@ impl Kernel {
         }
     }
 
+    /// Attaches a local signal handle to an existing shared signal.
     pub fn attach_signal(&self, shared_id: SharedResourceId) -> Result<SignalDescriptor> {
         let signals_by_shared = self.inner.signals_by_shared.lock();
         if !signals_by_shared.contains_key(&shared_id) {
@@ -46,6 +48,7 @@ impl Kernel {
         })
     }
 
+    /// Notifies waiters on a signal and returns the new generation.
     pub fn notify_signal(&self, local_id: u64) -> Result<u64> {
         let state = self.signal_state(local_id)?;
         let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -53,6 +56,7 @@ impl Kernel {
         Ok(generation)
     }
 
+    /// Waits for a signal generation to advance beyond the observed value.
     pub async fn wait_signal(
         &self,
         local_id: u64,
@@ -71,6 +75,7 @@ impl Kernel {
         Ok(state.generation.load(Ordering::SeqCst))
     }
 
+    /// Closes a local signal handle.
     pub fn close_signal(&self, local_id: u64) -> Result<()> {
         let mut signals_by_shared = self.inner.signals_by_shared.lock();
         let mut local_signals = self.inner.local_signals.lock();
@@ -83,6 +88,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Returns the shared signal id for a local signal handle.
     pub fn signal_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
         let shared_id = self
             .inner
@@ -94,6 +100,7 @@ impl Kernel {
         Ok(shared_id)
     }
 
+    /// Returns the number of local handles attached to a shared signal.
     pub fn signal_handle_count(&self, shared_id: SharedResourceId) -> usize {
         self.inner
             .local_signals
@@ -103,6 +110,7 @@ impl Kernel {
             .count()
     }
 
+    /// Returns the current signal generation.
     pub fn signal_generation(&self, local_id: u64) -> Result<u64> {
         Ok(self
             .signal_state(local_id)?

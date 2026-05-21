@@ -9,6 +9,7 @@ use crate::{
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 impl Kernel {
+    /// Opens or creates a named durable log.
     pub fn open_log(&self, name: impl Into<String>) -> DurableLogDescriptor {
         let name = name.into();
         let mut logs = self.inner.durable_logs_by_shared.lock();
@@ -37,6 +38,7 @@ impl Kernel {
         }
     }
 
+    /// Appends a record to a durable log and returns its sequence number.
     pub fn append_log(
         &self,
         local_id: u64,
@@ -60,6 +62,7 @@ impl Kernel {
         Ok(sequence)
     }
 
+    /// Replays records from a durable log.
     pub fn replay_log(
         &self,
         local_id: u64,
@@ -80,6 +83,7 @@ impl Kernel {
             .collect())
     }
 
+    /// Stores a named checkpoint for a durable log.
     pub fn checkpoint_log(
         &self,
         local_id: u64,
@@ -98,6 +102,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Reads a named checkpoint sequence from a durable log.
     pub fn checkpoint_sequence(&self, local_id: u64, name: &str) -> Result<Option<u64>> {
         let shared_id = self.log_shared_id(local_id)?;
         let logs = self.inner.durable_logs_by_shared.lock();
@@ -107,6 +112,7 @@ impl Kernel {
         Ok(log.checkpoints.get(name).copied())
     }
 
+    /// Opens or creates a named blob store.
     pub fn open_blob_store(&self, name: impl Into<String>) -> BlobStoreDescriptor {
         let name = name.into();
         let mut stores = self.inner.blob_stores_by_shared.lock();
@@ -134,6 +140,7 @@ impl Kernel {
         }
     }
 
+    /// Stores bytes in a blob store and returns the blob id.
     pub fn put_blob(&self, local_id: u64, bytes: Vec<u8>) -> Result<String> {
         let shared_id = self.blob_store_shared_id(local_id)?;
         let mut stores = self.inner.blob_stores_by_shared.lock();
@@ -150,6 +157,7 @@ impl Kernel {
         Ok(blob_id)
     }
 
+    /// Reads a blob from a blob store by id.
     pub fn get_blob(&self, local_id: u64, blob_id: &str) -> Result<Option<Vec<u8>>> {
         let shared_id = self.blob_store_shared_id(local_id)?;
         let stores = self.inner.blob_stores_by_shared.lock();
@@ -159,6 +167,7 @@ impl Kernel {
         Ok(store.blobs.get(blob_id).cloned())
     }
 
+    /// Sets a named manifest to reference an existing blob id.
     pub fn set_manifest(
         &self,
         local_id: u64,
@@ -178,6 +187,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Reads the blob id associated with a named manifest.
     pub fn get_manifest(&self, local_id: u64, name: &str) -> Result<Option<String>> {
         let shared_id = self.blob_store_shared_id(local_id)?;
         let stores = self.inner.blob_stores_by_shared.lock();
@@ -187,6 +197,7 @@ impl Kernel {
         Ok(store.manifests.get(name).cloned())
     }
 
+    /// Closes a local durable log handle.
     pub fn close_log(&self, local_id: u64) -> Result<()> {
         let mut local_logs = self.inner.local_logs.lock();
         local_logs
@@ -195,6 +206,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Closes a local blob store handle.
     pub fn close_blob_store(&self, local_id: u64) -> Result<()> {
         let mut local_blob_stores = self.inner.local_blob_stores.lock();
         local_blob_stores
@@ -203,10 +215,12 @@ impl Kernel {
         Ok(())
     }
 
+    /// Returns the shared log id associated with a local log handle.
     pub fn log_shared_id_public(&self, local_id: u64) -> Result<SharedResourceId> {
         self.log_shared_id(local_id)
     }
 
+    /// Returns the shared blob store id associated with a local blob store handle.
     pub fn blob_store_shared_id_public(&self, local_id: u64) -> Result<SharedResourceId> {
         self.blob_store_shared_id(local_id)
     }

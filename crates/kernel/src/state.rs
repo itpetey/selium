@@ -12,6 +12,7 @@ use selium_abi::{
 use tokio::sync::Notify;
 use wasmtiny::runtime::{SharedMemoryMapping, SharedRegionId, Store};
 
+/// In-memory kernel state and primitives used by the runtime.
 #[derive(Clone)]
 pub struct Kernel {
     pub(crate) inner: Arc<KernelInner>,

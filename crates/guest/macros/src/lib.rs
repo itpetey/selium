@@ -1,7 +1,10 @@
+//! Procedural macros for Selium guest entrypoints and pattern metadata.
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, ItemTrait, ReturnType, parse_macro_input};
 
+/// Marks an async zero-argument function as an exported Selium guest entrypoint.
 #[proc_macro_attribute]
 pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
@@ -62,6 +65,7 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Generates Selium pattern metadata for a trait interface.
 #[proc_macro_attribute]
 pub fn pattern_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let interface = parse_macro_input!(item as ItemTrait);

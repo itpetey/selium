@@ -22,6 +22,7 @@ struct JoinState<T> {
     waker: Option<Waker>,
 }
 
+/// Handle returned by a spawned guest task.
 pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
 }
@@ -92,6 +93,7 @@ impl futures::task::ArcWake for TaskWake {
     }
 }
 
+/// Spawns a future onto the cooperative guest task runner.
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -119,10 +121,12 @@ where
     JoinHandle { state }
 }
 
+/// Yields execution back to the guest task runner once.
 pub async fn yield_now() {
     YieldNow { yielded: false }.await;
 }
 
+/// Polls mailbox wakeups and runnable background tasks until no work remains.
 pub fn poll_reactor() {
     register_mailbox();
 
@@ -135,6 +139,7 @@ pub fn poll_reactor() {
     }
 }
 
+/// Starts an entrypoint future and aborts the process if polling panics.
 pub fn run_entrypoint_safely<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
@@ -148,6 +153,7 @@ where
     }
 }
 
+/// Polls the guest reactor and aborts the process if polling panics.
 pub fn poll_safely() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_reactor));
     if result.is_err() {

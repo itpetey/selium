@@ -1,10 +1,12 @@
 #[cfg(target_arch = "wasm32")]
 use crate::async_runtime::wake_task;
 
+/// Returns the current guest process id assigned by the host.
 pub fn process_id() -> u64 {
     unsafe { selium_process_id() }
 }
 
+/// Marks the current guest as ready for runtime readiness checks.
 pub fn mark_ready() {
     unsafe { selium_mark_ready() }
 }

@@ -23,6 +23,7 @@ const DEFAULT_READINESS_POLL_MS: u64 = 10;
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 
 impl Runtime {
+    /// Boots all configured system guests in dependency order.
     pub fn bootstrap_system_guests(&self, config: RuntimeConfig) -> Result<BootstrapReport> {
         let mut pending = BTreeMap::new();
         for descriptor in config.system_guests {
@@ -80,6 +81,7 @@ impl Runtime {
         Ok(report)
     }
 
+    /// Starts and records a single system guest.
     pub fn spawn_system_guest(
         &self,
         descriptor: SystemGuestDescriptor,

@@ -15,6 +15,7 @@ use crate::mailbox::GuestMailbox;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 
+/// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
 pub struct Runtime {
     pub(crate) kernel: Kernel,
@@ -58,6 +59,7 @@ pub(crate) struct HostOperation {
 }
 
 impl Runtime {
+    /// Creates a runtime backed by the supplied kernel.
     pub fn new(kernel: Kernel) -> Self {
         Self {
             kernel,
@@ -72,6 +74,7 @@ impl Runtime {
         }
     }
 
+    /// Returns a clone of the runtime kernel handle.
     pub fn kernel(&self) -> Kernel {
         self.kernel.clone()
     }

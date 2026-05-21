@@ -16,6 +16,7 @@ use crate::{
 };
 
 impl Kernel {
+    /// Opens a network listener descriptor for an address.
     pub fn listen(&self, address: impl Into<String>) -> NetworkListenerDescriptor {
         let local_id = self.next_local_id();
         let shared_id = self.next_shared_id();
@@ -31,6 +32,7 @@ impl Kernel {
         }
     }
 
+    /// Opens a network session descriptor for an authority.
     pub fn connect(&self, authority: impl Into<String>) -> NetworkSessionDescriptor {
         let local_id = self.next_local_id();
         let shared_id = self.next_shared_id();
@@ -51,6 +53,7 @@ impl Kernel {
         }
     }
 
+    /// Opens a stream on a local network session.
     pub fn open_stream(&self, network_session_id: u64) -> Result<NetworkStreamDescriptor> {
         self.network_session_shared_id(network_session_id)?;
         let local_id = self.next_local_id();
@@ -67,6 +70,7 @@ impl Kernel {
         })
     }
 
+    /// Queues a stream chunk for a local stream.
     pub fn send_stream_chunk(&self, stream_id: u64, bytes: Vec<u8>) -> Result<()> {
         let mut streams = self.inner.streams.lock();
         let stream = streams
@@ -76,6 +80,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Receives the next queued stream chunk, if one exists.
     pub fn recv_stream_chunk(&self, stream_id: u64) -> Result<Option<Vec<u8>>> {
         let mut streams = self.inner.streams.lock();
         let stream = streams
@@ -84,6 +89,7 @@ impl Kernel {
         Ok(stream.chunks.pop_front())
     }
 
+    /// Creates a request exchange on a network session.
     pub fn send_request(
         &self,
         network_session_id: u64,
@@ -110,6 +116,7 @@ impl Kernel {
         Ok(exchange_id)
     }
 
+    /// Waits asynchronously for a request exchange response.
     pub async fn wait_request_response(
         &self,
         exchange_id: u64,
@@ -136,6 +143,7 @@ impl Kernel {
         }
     }
 
+    /// Completes a request exchange with a response.
     pub fn respond_request(&self, exchange_id: u64, status: u16, body: Vec<u8>) -> Result<()> {
         let exchange = self.request_exchange(exchange_id)?;
         let mut data = exchange.data.lock();
@@ -149,6 +157,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Reads a completed request response without waiting.
     pub fn read_request_response(&self, exchange_id: u64) -> Result<Option<(u16, Vec<u8>)>> {
         let exchange = self.request_exchange(exchange_id)?;
         let response = Self::response_from_exchange(&exchange);
@@ -158,6 +167,7 @@ impl Kernel {
         Ok(response)
     }
 
+    /// Returns the session id, method, path, and body for a request exchange.
     pub fn request_summary(&self, exchange_id: u64) -> Result<(u64, String, String, Vec<u8>)> {
         let exchange = self.request_exchange(exchange_id)?;
         let data = exchange.data.lock();
@@ -169,6 +179,7 @@ impl Kernel {
         ))
     }
 
+    /// Closes a local network listener handle.
     pub fn close_listener(&self, local_id: u64) -> Result<()> {
         let mut listeners_by_shared = self.inner.listeners_by_shared.lock();
         let mut local_listeners = self.inner.local_listeners.lock();
@@ -181,6 +192,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Closes a local network session handle.
     pub fn close_session(&self, local_id: u64) -> Result<()> {
         let mut sessions_by_shared = self.inner.sessions_by_shared.lock();
         let mut local_sessions = self.inner.local_sessions.lock();
@@ -193,6 +205,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Closes a local network stream handle.
     pub fn close_stream(&self, local_id: u64) -> Result<()> {
         self.inner
             .streams
@@ -202,6 +215,7 @@ impl Kernel {
             .ok_or_else(|| Error::NotFound(format!("stream {local_id}")))
     }
 
+    /// Returns the local network session id associated with a stream.
     pub fn stream_network_session_id(&self, stream_id: u64) -> Result<u64> {
         self.inner
             .streams
@@ -211,10 +225,12 @@ impl Kernel {
             .ok_or_else(|| Error::NotFound(format!("stream {stream_id}")))
     }
 
+    /// Returns the shared session id associated with a local session handle.
     pub fn network_session_shared_id_public(&self, local_id: u64) -> Result<SharedResourceId> {
         self.network_session_shared_id(local_id)
     }
 
+    /// Returns the shared listener id associated with a local listener handle.
     pub fn listener_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
         self.inner
             .local_listeners

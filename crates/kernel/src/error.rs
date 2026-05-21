@@ -2,19 +2,26 @@ use selium_abi::ProcessId;
 use thiserror::Error;
 use wasmtiny::runtime::WasmError;
 
+/// Result type used by the Selium kernel.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Error returned by kernel operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("resource not found: {0}")]
+    /// Requested resource was not found.
     NotFound(String),
     #[error("signal wait timed out")]
+    /// Operation timed out.
     Timeout,
     #[error("request exchange already has a response")]
+    /// Request exchange was already completed.
     AlreadyCompleted,
     #[error("process already stopped: {0}")]
+    /// Process is already stopped.
     ProcessStopped(ProcessId),
     #[error("wasmtiny runtime error: {0}")]
+    /// Underlying Wasmtiny operation failed.
     Wasm(String),
 }
 

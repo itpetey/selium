@@ -8,6 +8,7 @@ use wasmtiny::WasmValue;
 use crate::{Error, Result, config::ProcessAuthority, state::Runtime};
 
 impl Runtime {
+    /// Stops a process and releases runtime-owned state for it.
     pub fn stop_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
         self.kernel.stop_process(process_id)?;
         self.loaded_guests.lock().remove(&process_id);
@@ -30,10 +31,12 @@ impl Runtime {
         Ok(())
     }
 
+    /// Returns the persisted authority for a process, if present.
     pub fn restore_process_authority(&self, process_id: ProcessId) -> Option<ProcessAuthority> {
         self.process_authorities.lock().get(&process_id).cloned()
     }
 
+    /// Returns whether a process has a grant matching the capability and context.
     pub fn authorises(
         &self,
         process_id: ProcessId,
@@ -52,6 +55,7 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Projects a metering observation into the kernel.
     pub fn project_metering(
         &self,
         process_id: selium_abi::ProcessId,
@@ -60,10 +64,12 @@ impl Runtime {
         self.kernel.observe_metering(process_id, observation);
     }
 
+    /// Returns all activity log events currently held by the kernel.
     pub fn activity_log(&self) -> Vec<ActivityEvent> {
         self.kernel.read_activity_from(0)
     }
 
+    /// Returns the loaded module index for a process entrypoint, if loaded.
     pub fn loaded_entrypoint(&self, process_id: selium_abi::ProcessId) -> Option<u32> {
         self.loaded_guests
             .lock()
@@ -71,6 +77,7 @@ impl Runtime {
             .map(|guest| guest.module_index)
     }
 
+    /// Returns entrypoint execution results for a loaded guest, if available.
     pub fn entrypoint_results(&self, process_id: selium_abi::ProcessId) -> Option<Vec<WasmValue>> {
         self.loaded_guests
             .lock()
@@ -78,10 +85,12 @@ impl Runtime {
             .map(|guest| guest.entrypoint_results.clone())
     }
 
+    /// Returns the number of currently loaded guests.
     pub fn loaded_guest_count(&self) -> usize {
         self.loaded_guests.lock().len()
     }
 
+    /// Registers module bytes under an id, rejecting conflicting bytes.
     pub fn register_module_bytes(&self, module_id: String, module_bytes: Vec<u8>) -> Result<()> {
         let mut registry = self.module_registry.lock();
         match registry.get(&module_id) {

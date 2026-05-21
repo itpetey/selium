@@ -16,6 +16,7 @@ use crate::{
 };
 
 impl Runtime {
+    /// Begins a hostcall for a process and returns its initial status and operation id.
     pub fn begin_hostcall(
         &self,
         process_id: ProcessId,
@@ -53,6 +54,7 @@ impl Runtime {
         (status, operation_id)
     }
 
+    /// Polls a hostcall operation for completion.
     pub fn poll_hostcall(
         &self,
         process_id: ProcessId,
@@ -119,6 +121,7 @@ impl Runtime {
         }
     }
 
+    /// Drops a hostcall operation if it belongs to the supplied process.
     pub fn drop_hostcall(&self, process_id: ProcessId, operation_id: OperationId) -> bool {
         let mut operations = self.operations.lock();
         if operations

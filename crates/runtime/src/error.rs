@@ -2,33 +2,47 @@ use selium_abi::{AbiError, AbiErrorCode, Capability, ProcessId};
 use thiserror::Error;
 use wasmtiny::WasmError;
 
+/// Result type used by the Selium runtime.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Error returned by runtime operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("system guest descriptor not found: {0}")]
+    /// System guest descriptor was not found.
     DescriptorNotFound(String),
     #[error("unknown process authority: {0}")]
+    /// Process authority was not registered.
     UnknownProcessAuthority(ProcessId),
     #[error("unknown dependency: {0}")]
+    /// System guest dependency is not present in the configuration.
     UnknownDependency(String),
     #[error("dependency cycle or unresolved dependency detected")]
+    /// System guest dependencies cannot be resolved.
     DependencyCycle,
     #[error("invalid grant for capability {0:?}")]
+    /// Capability grant is invalid.
     InvalidGrant(Capability),
     #[error("duplicate system guest descriptor: {0}")]
+    /// Duplicate system guest name was supplied.
     DuplicateDescriptor(String),
     #[error("module id already registered with different bytes: {0}")]
+    /// Module id was already registered with different bytes.
     ModuleConflict(String),
     #[error("module not registered: {0}")]
+    /// Module id is not registered.
     UnknownModule(String),
     #[error("invalid entrypoint argument encoding")]
+    /// Entrypoint argument bytes are invalid.
     InvalidEntrypointArgument,
     #[error("readiness condition not satisfied for guest `{0}`")]
+    /// System guest did not satisfy its readiness condition.
     ReadinessUnsatisfied(String),
     #[error("kernel error: {0}")]
+    /// Kernel operation failed.
     Kernel(#[from] selium_kernel::Error),
     #[error("wasmtiny runtime error: {0}")]
+    /// Underlying Wasmtiny operation failed.
     Wasm(String),
 }
 

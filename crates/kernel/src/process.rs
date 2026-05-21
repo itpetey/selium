@@ -11,6 +11,7 @@ use crate::{
 };
 
 impl Kernel {
+    /// Starts a process record with the supplied module, entrypoint, and grants.
     pub fn start_process(
         &self,
         module_id: impl Into<String>,
@@ -40,6 +41,7 @@ impl Kernel {
         descriptor
     }
 
+    /// Stops a running process record.
     pub fn stop_process(&self, process_id: ProcessId) -> Result<()> {
         let mut processes = self.inner.processes.lock();
         let process = processes
@@ -57,6 +59,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Removes a process record and associated metering.
     pub fn reap_process(&self, process_id: ProcessId) -> Result<()> {
         let removed = self.inner.processes.lock().remove(&process_id);
         if removed.is_none() {
@@ -66,6 +69,7 @@ impl Kernel {
         Ok(())
     }
 
+    /// Returns the descriptor for a process.
     pub fn inspect_process(&self, process_id: ProcessId) -> Result<ProcessDescriptor> {
         let processes = self.inner.processes.lock();
         let process = processes
@@ -78,17 +82,20 @@ impl Kernel {
         })
     }
 
+    /// Records an activity event and wakes activity waiters.
     pub fn record_activity(&self, event: ActivityEvent) {
         self.inner.activity_log.lock().push(event);
         self.inner.activity_log_changed.notify_all();
     }
 
+    /// Reads activity events starting at a cursor offset.
     pub fn read_activity_from(&self, cursor: usize) -> Vec<ActivityEvent> {
         let activity_log = self.inner.activity_log.lock();
         let cursor = cursor.min(activity_log.len());
         activity_log[cursor..].to_vec()
     }
 
+    /// Waits for activity past a cursor, then returns available events.
     pub fn wait_for_activity_from(&self, cursor: usize, timeout_ms: u64) -> Vec<ActivityEvent> {
         let mut activity_log = self.inner.activity_log.lock();
         if activity_log.len() <= cursor {
@@ -100,16 +107,19 @@ impl Kernel {
         activity_log[cursor..].to_vec()
     }
 
+    /// Appends a guest log entry.
     pub fn write_guest_log(&self, entry: GuestLogEntry) {
         self.inner.guest_logs.lock().push(entry);
     }
 
+    /// Reads guest log entries starting at a cursor offset.
     pub fn read_guest_logs_from(&self, cursor: usize) -> Vec<GuestLogEntry> {
         let guest_logs = self.inner.guest_logs.lock();
         let cursor = cursor.min(guest_logs.len());
         guest_logs[cursor..].to_vec()
     }
 
+    /// Returns the capability grants assigned to a process.
     pub fn process_grants(&self, process_id: ProcessId) -> Result<Vec<CapabilityGrant>> {
         let processes = self.inner.processes.lock();
         let process = processes
@@ -118,6 +128,7 @@ impl Kernel {
         Ok(process.grants.clone())
     }
 
+    /// Stores a metering observation for a process.
     pub fn observe_metering(&self, process_id: ProcessId, observation: MeteringObservation) {
         self.inner
             .metering
@@ -136,6 +147,7 @@ impl Kernel {
         });
     }
 
+    /// Returns the latest metering observation for a process, if present.
     pub fn metering_observation(&self, process_id: ProcessId) -> Option<MeteringObservation> {
         self.inner.metering.lock().get(&process_id).cloned()
     }

@@ -4,17 +4,20 @@ use selium_abi::{
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
+/// Guest handle for a durable log.
 #[derive(Clone, Debug)]
 pub struct DurableLog {
     descriptor: DurableLogDescriptor,
 }
 
+/// Guest handle for a blob store.
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     descriptor: BlobStoreDescriptor,
 }
 
 impl DurableLog {
+    /// Opens a durable log by name.
     pub fn open(name: impl Into<String>) -> Result<Self> {
         match hostcall_ready(HostcallRequest::StorageOpenLog { name: name.into() })? {
             HostcallOutput::DurableLog(descriptor) => Ok(Self { descriptor }),
@@ -22,10 +25,12 @@ impl DurableLog {
         }
     }
 
+    /// Returns the durable log descriptor.
     pub fn descriptor(&self) -> &DurableLogDescriptor {
         &self.descriptor
     }
 
+    /// Appends a record and returns its sequence number.
     pub fn append(
         &self,
         timestamp_ms: u64,
@@ -43,6 +48,7 @@ impl DurableLog {
         }
     }
 
+    /// Replays records from an optional sequence with a maximum record count.
     pub fn replay(&self, from_sequence: Option<u64>, limit: u32) -> Result<Vec<StorageRecord>> {
         match hostcall_ready(HostcallRequest::StorageLogReplay {
             local_id: self.descriptor.local_id,
@@ -54,6 +60,7 @@ impl DurableLog {
         }
     }
 
+    /// Stores a named checkpoint at a sequence number.
     pub fn checkpoint(&self, name: impl Into<String>, sequence: u64) -> Result<()> {
         match hostcall_ready(HostcallRequest::StorageLogCheckpoint {
             local_id: self.descriptor.local_id,
@@ -65,6 +72,7 @@ impl DurableLog {
         }
     }
 
+    /// Reads the sequence number for a named checkpoint.
     pub fn checkpoint_sequence(&self, name: impl Into<String>) -> Result<Option<u64>> {
         match hostcall_ready(HostcallRequest::StorageLogCheckpointRead {
             local_id: self.descriptor.local_id,
@@ -75,6 +83,7 @@ impl DurableLog {
         }
     }
 
+    /// Closes the durable log handle.
     pub fn close(self) -> Result<()> {
         match hostcall_ready(HostcallRequest::StorageLogClose {
             local_id: self.descriptor.local_id,
@@ -86,6 +95,7 @@ impl DurableLog {
 }
 
 impl BlobStore {
+    /// Opens a blob store by name.
     pub fn open(name: impl Into<String>) -> Result<Self> {
         match hostcall_ready(HostcallRequest::StorageOpenBlobStore { name: name.into() })? {
             HostcallOutput::BlobStore(descriptor) => Ok(Self { descriptor }),
@@ -93,10 +103,12 @@ impl BlobStore {
         }
     }
 
+    /// Returns the blob store descriptor.
     pub fn descriptor(&self) -> &BlobStoreDescriptor {
         &self.descriptor
     }
 
+    /// Stores bytes and returns the content-derived blob id.
     pub fn put(&self, bytes: Vec<u8>) -> Result<String> {
         match hostcall_ready(HostcallRequest::StorageBlobPut {
             local_id: self.descriptor.local_id,
@@ -107,6 +119,7 @@ impl BlobStore {
         }
     }
 
+    /// Reads bytes for a blob id, if present.
     pub fn get(&self, blob_id: impl Into<String>) -> Result<Option<Vec<u8>>> {
         match hostcall_ready(HostcallRequest::StorageBlobGet {
             local_id: self.descriptor.local_id,
@@ -118,6 +131,7 @@ impl BlobStore {
         }
     }
 
+    /// Associates a manifest name with a blob id.
     pub fn set_manifest(&self, name: impl Into<String>, blob_id: impl Into<String>) -> Result<()> {
         match hostcall_ready(HostcallRequest::StorageBlobSetManifest {
             local_id: self.descriptor.local_id,
@@ -129,6 +143,7 @@ impl BlobStore {
         }
     }
 
+    /// Reads the blob id associated with a manifest name.
     pub fn manifest(&self, name: impl Into<String>) -> Result<Option<String>> {
         match hostcall_ready(HostcallRequest::StorageBlobGetManifest {
             local_id: self.descriptor.local_id,
@@ -140,6 +155,7 @@ impl BlobStore {
         }
     }
 
+    /// Closes the blob store handle.
     pub fn close(self) -> Result<()> {
         match hostcall_ready(HostcallRequest::StorageBlobStoreClose {
             local_id: self.descriptor.local_id,

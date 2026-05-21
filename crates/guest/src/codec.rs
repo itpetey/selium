@@ -6,6 +6,7 @@ use selium_abi::{decode_rkyv, deframe_bytes, encode_rkyv, frame_bytes};
 
 use crate::{Result, error::abi_error_to_guest_error};
 
+/// Decodes a framed rkyv value received by a guest interface.
 pub fn decode_typed<T>(bytes: &[u8]) -> Result<T>
 where
     T: rkyv::Archive + Sized,
@@ -16,6 +17,7 @@ where
     Ok(decode_rkyv(payload)?)
 }
 
+/// Encodes a value as framed rkyv bytes for a guest interface.
 pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>>
 where
     T: selium_abi::RkyvEncode,
