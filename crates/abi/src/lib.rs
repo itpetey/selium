@@ -13,6 +13,18 @@ pub type LocalResourceId = u64;
 pub type OperationId = u64;
 pub type ProcessId = u64;
 pub type SharedResourceId = u64;
+pub type TaskId = u32;
+
+pub mod mailbox {
+    pub const HEAD_OFFSET: usize = 0;
+    pub const FLAG_OFFSET: usize = 4;
+    pub const TAIL_OFFSET: usize = 8;
+    pub const CAPACITY_OFFSET: usize = 12;
+    pub const RING_OFFSET: usize = 16;
+    pub const CAPACITY: usize = 32;
+    pub const SLOT_SIZE: usize = 4;
+    pub const BYTE_LEN: usize = RING_OFFSET + CAPACITY * SLOT_SIZE;
+}
 
 pub trait RkyvEncode:
     Archive + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RancorError>>
@@ -254,6 +266,13 @@ pub enum HostcallRequest {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct HostcallEnvelope {
+    pub request: HostcallRequest,
+    pub task_id: Option<TaskId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct MeteringObservation {
@@ -490,14 +509,17 @@ mod tests {
 
     #[test]
     fn encode_and_decode_round_trip() {
-        let request = HostcallRequest::SignalWait {
-            local_id: 7,
-            observed_generation: 2,
-            timeout_ms: 1_000,
+        let request = HostcallEnvelope {
+            request: HostcallRequest::SignalWait {
+                local_id: 7,
+                observed_generation: 2,
+                timeout_ms: 1_000,
+            },
+            task_id: Some(42),
         };
 
         let encoded = encode_rkyv(&request).expect("encode request");
-        let decoded: HostcallRequest = decode_rkyv(&encoded).expect("decode request");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode request");
         assert_eq!(decoded, request);
     }
 

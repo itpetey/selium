@@ -10,15 +10,16 @@ use std::{
 use parking_lot::Mutex;
 use selium_abi::{
     AbiError, AbiErrorCode, ActivityEvent, Capability, CapabilityGrant, CompletionState,
-    EntrypointMetadata, HostcallOutput, HostcallRequest, LocalityScope, OperationId, ProcessId,
-    ResourceClass, ResourceIdentity, ScopeContext, SignalDescriptor, pack_hostcall_status,
+    EntrypointMetadata, HostcallEnvelope, HostcallOutput, HostcallRequest, LocalityScope,
+    OperationId, ProcessId, ResourceClass, ResourceIdentity, ScopeContext, SignalDescriptor,
+    TaskId, pack_hostcall_status,
 };
 use selium_kernel::Kernel;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
 use wasmtiny::{
     FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue,
-    runtime::{HostFunc, Store},
+    runtime::{HostCaller, HostFunc, SharedMemory},
 };
 
 type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
@@ -105,6 +106,12 @@ pub struct Runtime {
     module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     next_operation_id: Arc<Mutex<OperationId>>,
     operations: Arc<Mutex<HashMap<OperationId, HostOperation>>>,
+    mailboxes: Arc<Mutex<HashMap<ProcessId, Arc<GuestMailbox>>>>,
+}
+
+struct GuestMailbox {
+    memory: SharedMemory,
+    base: u32,
 }
 
 struct LoadedGuest {
@@ -119,6 +126,7 @@ enum HostOperationState {
     Failed(AbiError),
     SignalWait {
         local_id: u64,
+        shared_id: u64,
         observed_generation: u64,
         deadline: Instant,
     },
@@ -127,6 +135,7 @@ enum HostOperationState {
 #[derive(Debug, Clone)]
 struct HostOperation {
     process_id: ProcessId,
+    task_id: Option<TaskId>,
     state: HostOperationState,
 }
 
@@ -152,6 +161,42 @@ struct HostcallPollHostFunc {
 struct HostcallDropHostFunc {
     runtime: Runtime,
     process_id: ProcessId,
+}
+
+struct MailboxRegisterHostFunc {
+    runtime: Runtime,
+    process_id: ProcessId,
+}
+
+impl GuestMailbox {
+    fn new(memory: SharedMemory, base: u32) -> Self {
+        Self { memory, base }
+    }
+
+    fn enqueue(&self, task_id: TaskId) -> wasmtiny::runtime::Result<()> {
+        let mut memory = self
+            .memory
+            .lock()
+            .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?;
+        let tail_offset = self.offset(selium_abi::mailbox::TAIL_OFFSET)?;
+        let ring_offset = self.offset(selium_abi::mailbox::RING_OFFSET)?;
+        let flag_offset = self.offset(selium_abi::mailbox::FLAG_OFFSET)?;
+        let tail = memory.read_u32(tail_offset)?;
+        let slot = (tail as usize % selium_abi::mailbox::CAPACITY) * selium_abi::mailbox::SLOT_SIZE;
+        let slot_offset = ring_offset
+            .checked_add(slot as u32)
+            .ok_or_else(|| WasmError::Runtime("mailbox slot offset overflow".to_string()))?;
+        memory.write_u32(slot_offset, task_id)?;
+        memory.write_u32(tail_offset, tail.wrapping_add(1))?;
+        memory.write_u32(flag_offset, 1)?;
+        Ok(())
+    }
+
+    fn offset(&self, offset: usize) -> wasmtiny::runtime::Result<u32> {
+        self.base
+            .checked_add(offset as u32)
+            .ok_or_else(|| WasmError::Runtime("mailbox offset overflow".to_string()))
+    }
 }
 
 impl SystemGuestDescriptor {
@@ -186,6 +231,7 @@ impl Runtime {
             module_registry: Arc::new(Mutex::new(HashMap::new())),
             next_operation_id: Arc::new(Mutex::new(1)),
             operations: Arc::new(Mutex::new(HashMap::new())),
+            mailboxes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -282,7 +328,6 @@ impl Runtime {
                 return Err(error);
             }
         };
-
         self.loaded_guests
             .lock()
             .insert(process.local_id, loaded_guest);
@@ -320,6 +365,7 @@ impl Runtime {
             self.operations
                 .lock()
                 .retain(|_, operation| operation.process_id != process_id);
+            self.mailboxes.lock().remove(&process_id);
             self.cleanup_process_resources(process_id)?;
         }
         self.local_handle_owners
@@ -398,6 +444,15 @@ impl Runtime {
         process_id: ProcessId,
         request: HostcallRequest,
     ) -> (u32, OperationId) {
+        self.begin_hostcall_with_task(process_id, request, None)
+    }
+
+    fn begin_hostcall_with_task(
+        &self,
+        process_id: ProcessId,
+        request: HostcallRequest,
+        task_id: Option<TaskId>,
+    ) -> (u32, OperationId) {
         let state = match self.dispatch_hostcall(process_id, request) {
             Ok(state) => state,
             Err(error) => HostOperationState::Failed(error),
@@ -409,7 +464,14 @@ impl Runtime {
         };
         let mut operations = self.operations.lock();
         let operation_id = self.next_operation_id(&operations);
-        operations.insert(operation_id, HostOperation { process_id, state });
+        operations.insert(
+            operation_id,
+            HostOperation {
+                process_id,
+                task_id,
+                state,
+            },
+        );
         (status, operation_id)
     }
 
@@ -437,6 +499,7 @@ impl Runtime {
             HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
             HostOperationState::SignalWait {
                 local_id,
+                shared_id: _,
                 observed_generation,
                 deadline,
             } => match self.kernel.signal_generation(*local_id) {
@@ -539,6 +602,7 @@ impl Runtime {
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
                 let generation = self.kernel.notify_signal(local_id).map_err(kernel_error)?;
+                self.wake_signal_waiters(shared_id, generation);
                 Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
                     generation,
                 )))
@@ -575,6 +639,7 @@ impl Runtime {
                 } else {
                     Ok(HostOperationState::SignalWait {
                         local_id,
+                        shared_id,
                         observed_generation,
                         deadline: Instant::now() + Duration::from_millis(timeout_ms),
                     })
@@ -642,6 +707,7 @@ impl Runtime {
         let _ = self.cleanup_process_resources(process_id);
         let _ = self.kernel.reap_process(process_id);
         self.process_authorities.lock().remove(&process_id);
+        self.mailboxes.lock().remove(&process_id);
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
@@ -763,6 +829,20 @@ impl Runtime {
             FunctionType::new(
                 vec![ValType::Num(NumType::I64)],
                 vec![ValType::Num(NumType::I32)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "mailbox_register",
+            Box::new(MailboxRegisterHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
+                vec![],
             ),
         )?;
         Ok(())
@@ -903,6 +983,70 @@ impl Runtime {
         }
     }
 
+    fn register_mailbox(&self, process_id: ProcessId, mailbox: Arc<GuestMailbox>) {
+        self.mailboxes.lock().insert(process_id, mailbox);
+    }
+
+    fn wake_process_task(&self, process_id: ProcessId, task_id: TaskId) {
+        if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned()
+            && let Err(error) = mailbox.enqueue(task_id)
+        {
+            debug!(
+                process_id,
+                task_id,
+                error = %error,
+                "failed to enqueue guest task wake"
+            );
+            return;
+        }
+        self.poll_guest_until_stalled(process_id);
+    }
+
+    fn poll_guest_until_stalled(&self, process_id: ProcessId) {
+        let Some(mut loaded_guest) = self.loaded_guests.lock().remove(&process_id) else {
+            return;
+        };
+        let result =
+            loaded_guest
+                .app
+                .call_function(loaded_guest.module_index, "__selium_guest_poll", &[]);
+        self.loaded_guests.lock().insert(process_id, loaded_guest);
+        if let Err(error) = result {
+            debug!(
+                process_id,
+                error = %error,
+                "guest poll after mailbox wake failed"
+            );
+        }
+    }
+
+    fn wake_signal_waiters(&self, shared_id: u64, generation: u64) {
+        let mut wakeups = Vec::new();
+        {
+            let mut operations = self.operations.lock();
+            for operation in operations.values_mut() {
+                let should_wake = matches!(
+                    &operation.state,
+                    HostOperationState::SignalWait {
+                        shared_id: wait_shared_id,
+                        observed_generation,
+                        ..
+                    } if *wait_shared_id == shared_id && generation > *observed_generation
+                );
+                if should_wake {
+                    operation.state =
+                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation));
+                    if let Some(task_id) = operation.task_id {
+                        wakeups.push((operation.process_id, task_id));
+                    }
+                }
+            }
+        }
+        for (process_id, task_id) in wakeups {
+            self.wake_process_task(process_id, task_id);
+        }
+    }
+
     fn next_operation_id(&self, operations: &HashMap<OperationId, HostOperation>) -> OperationId {
         let mut next_operation_id = self.next_operation_id.lock();
         let first_candidate = *next_operation_id;
@@ -928,7 +1072,7 @@ impl Default for Runtime {
 impl HostFunc for MarkReadyHostFunc {
     fn call(
         &self,
-        _store: &mut Store,
+        _caller: &mut HostCaller<'_>,
         _args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         self.runtime.kernel.record_activity(ActivityEvent {
@@ -947,7 +1091,7 @@ impl HostFunc for MarkReadyHostFunc {
 impl HostFunc for ProcessIdHostFunc {
     fn call(
         &self,
-        _store: &mut Store,
+        _caller: &mut HostCaller<'_>,
         _args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         Ok(vec![WasmValue::I64(self.process_id as i64)])
@@ -961,20 +1105,24 @@ impl HostFunc for ProcessIdHostFunc {
 impl HostFunc for HostcallCreateHostFunc {
     fn call(
         &self,
-        store: &mut Store,
+        caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         let ptr = wasm_i32_arg(args, 0)? as u32;
         let len = wasm_i32_arg(args, 1)? as usize;
-        let request_bytes = read_guest_memory(store, ptr, len)?;
-        let request = match selium_abi::decode_rkyv::<HostcallRequest>(&request_bytes) {
-            Ok(request) => request,
+        let request_bytes = read_guest_memory(caller, ptr, len)?;
+        let envelope = match selium_abi::decode_rkyv::<HostcallEnvelope>(&request_bytes) {
+            Ok(envelope) => envelope,
             Err(_) => {
                 let status = pack_hostcall_status(selium_abi::HOSTCALL_STATUS_FAILED, 0);
                 return Ok(vec![WasmValue::I64(status as i64)]);
             }
         };
-        let (status, operation_id) = self.runtime.begin_hostcall(self.process_id, request);
+        let (status, operation_id) = self.runtime.begin_hostcall_with_task(
+            self.process_id,
+            envelope.request,
+            envelope.task_id,
+        );
         Ok(vec![WasmValue::I64(
             pack_hostcall_status(status, operation_id as u32) as i64,
         )])
@@ -988,7 +1136,7 @@ impl HostFunc for HostcallCreateHostFunc {
 impl HostFunc for HostcallPollHostFunc {
     fn call(
         &self,
-        store: &mut Store,
+        caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         let operation_id = wasm_i64_arg(args, 0)? as OperationId;
@@ -1008,7 +1156,7 @@ impl HostFunc for HostcallPollHostFunc {
                 encoded.len() as u32,
             ) as i64)]);
         }
-        write_guest_memory(store, out_ptr, &encoded)?;
+        write_guest_memory(caller, out_ptr, &encoded)?;
         Ok(vec![WasmValue::I64(
             pack_hostcall_status(status, encoded.len() as u32) as i64,
         )])
@@ -1022,12 +1170,41 @@ impl HostFunc for HostcallPollHostFunc {
 impl HostFunc for HostcallDropHostFunc {
     fn call(
         &self,
-        _store: &mut Store,
+        _caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         let operation_id = wasm_i64_arg(args, 0)? as OperationId;
         let dropped = self.runtime.drop_hostcall(self.process_id, operation_id);
         Ok(vec![WasmValue::I32(u32::from(dropped) as i32)])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        None
+    }
+}
+
+impl HostFunc for MailboxRegisterHostFunc {
+    fn call(
+        &self,
+        caller: &mut HostCaller<'_>,
+        args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        let base = wasm_i32_arg(args, 0)? as u32;
+        let len = wasm_i32_arg(args, 1)? as usize;
+        if len < selium_abi::mailbox::BYTE_LEN {
+            return Err(WasmError::Runtime("guest mailbox is too small".to_string()));
+        }
+        let memory = guest_memory(caller)?;
+        memory
+            .lock()
+            .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+            .write_u32(
+                base + selium_abi::mailbox::CAPACITY_OFFSET as u32,
+                selium_abi::mailbox::CAPACITY as u32,
+            )?;
+        self.runtime
+            .register_mailbox(self.process_id, Arc::new(GuestMailbox::new(memory, base)));
+        Ok(Vec::new())
     }
 
     fn function_type(&self) -> Option<&FunctionType> {
@@ -1069,13 +1246,12 @@ fn register_optional_host_function(
     }
 }
 
-fn read_guest_memory(store: &Store, ptr: u32, len: usize) -> wasmtiny::runtime::Result<Vec<u8>> {
-    let memory = store
-        .instances
-        .first()
-        .and_then(|instance| instance.memory(0))
-        .cloned()
-        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))?;
+fn read_guest_memory(
+    caller: &HostCaller<'_>,
+    ptr: u32,
+    len: usize,
+) -> wasmtiny::runtime::Result<Vec<u8>> {
+    let memory = guest_memory(caller)?;
     let mut bytes = vec![0; len];
     memory
         .lock()
@@ -1084,17 +1260,22 @@ fn read_guest_memory(store: &Store, ptr: u32, len: usize) -> wasmtiny::runtime::
     Ok(bytes)
 }
 
-fn write_guest_memory(store: &Store, ptr: u32, bytes: &[u8]) -> wasmtiny::runtime::Result<()> {
-    let memory = store
-        .instances
-        .first()
-        .and_then(|instance| instance.memory(0))
-        .cloned()
-        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))?;
+fn write_guest_memory(
+    caller: &HostCaller<'_>,
+    ptr: u32,
+    bytes: &[u8],
+) -> wasmtiny::runtime::Result<()> {
+    let memory = guest_memory(caller)?;
     memory
         .lock()
         .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
         .write(ptr, bytes)
+}
+
+fn guest_memory(caller: &HostCaller<'_>) -> wasmtiny::runtime::Result<SharedMemory> {
+    caller
+        .memory(0)
+        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))
 }
 
 fn wasm_i32_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i32> {
@@ -1144,6 +1325,20 @@ mod tests {
                     call $process_id))"
         ))
         .expect("compile runtime bridge wat")
+    }
+
+    fn module_with_mailbox(entrypoint: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            "(module
+                (import \"selium\" \"mailbox_register\" (func $mailbox_register (param i32 i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"{entrypoint}\")
+                    i32.const 0
+                    i32.const {}
+                    call $mailbox_register))",
+            selium_abi::mailbox::BYTE_LEN,
+        ))
+        .expect("compile mailbox wat")
     }
 
     #[test]
@@ -1289,6 +1484,83 @@ mod tests {
         assert_eq!(second_status, selium_abi::HOSTCALL_STATUS_READY);
         assert_eq!(first_id, OperationId::MAX);
         assert_eq!(second_id, 1);
+    }
+
+    #[test]
+    fn signal_notify_wakes_registered_mailbox_task() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "mailbox".to_string(),
+                module_id: "mailbox-module".to_string(),
+                module_bytes: module_with_mailbox("boot"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Signal,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+            })
+            .expect("spawn mailbox guest");
+        let (status, create_id) =
+            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::Signal(signal)) =
+            runtime.poll_hostcall(bootstrapped.process_id, create_id)
+        else {
+            panic!("expected created signal");
+        };
+        let task_id = 77;
+        let (status, wait_id) = runtime.begin_hostcall_with_task(
+            bootstrapped.process_id,
+            HostcallRequest::SignalWait {
+                local_id: signal.local_id,
+                observed_generation: 0,
+                timeout_ms: 1_000,
+            },
+            Some(task_id),
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_PENDING);
+
+        let (notify_status, _) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SignalNotify {
+                local_id: signal.local_id,
+            },
+        );
+        assert_eq!(notify_status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let mailbox = runtime
+            .mailboxes
+            .lock()
+            .get(&bootstrapped.process_id)
+            .cloned()
+            .expect("registered mailbox");
+        let memory = mailbox.memory.lock().expect("mailbox memory");
+        assert_eq!(
+            memory
+                .read_u32(selium_abi::mailbox::FLAG_OFFSET as u32)
+                .expect("read flag"),
+            1
+        );
+        assert_eq!(
+            memory
+                .read_u32(selium_abi::mailbox::TAIL_OFFSET as u32)
+                .expect("read tail"),
+            1
+        );
+        assert_eq!(
+            memory
+                .read_u32(selium_abi::mailbox::RING_OFFSET as u32)
+                .expect("read ring"),
+            task_id
+        );
+        assert_eq!(
+            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
+            CompletionState::Ready(HostcallOutput::SignalGeneration(1))
+        );
     }
 
     #[test]

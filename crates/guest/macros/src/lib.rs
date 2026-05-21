@@ -50,6 +50,11 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ::selium_guest::run_entrypoint_safely(#ident());
         }
 
+        #[unsafe(export_name = "__selium_guest_poll")]
+        pub extern "C" fn __selium_guest_poll() {
+            ::selium_guest::poll_safely();
+        }
+
         pub fn #metadata_fn() -> ::selium_guest::EntrypointMetadata {
             ::selium_guest::EntrypointMetadata::new(stringify!(#ident))
         }
