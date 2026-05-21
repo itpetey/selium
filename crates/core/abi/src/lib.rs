@@ -437,6 +437,26 @@ pub enum HostcallRequest {
         /// Bytes to write.
         bytes: Vec<u8>,
     },
+    /// Atomically add to a little-endian `u64` in a local shared memory mapping.
+    SharedMemoryFetchAddU64 {
+        /// Local mapping id to update.
+        local_id: LocalResourceId,
+        /// Offset into the mapping.
+        offset: u32,
+        /// Value to add, wrapping on overflow.
+        value: u64,
+    },
+    /// Atomically compare and exchange a little-endian `u64` in a local shared memory mapping.
+    SharedMemoryCompareExchangeU64 {
+        /// Local mapping id to update.
+        local_id: LocalResourceId,
+        /// Offset into the mapping.
+        offset: u32,
+        /// Expected current value.
+        current: u64,
+        /// Replacement value when `current` matches.
+        new: u64,
+    },
     /// Create a new signal.
     SignalCreate,
     /// Attach to an existing signal.
@@ -452,6 +472,11 @@ pub enum HostcallRequest {
     /// Notify waiters on a signal.
     SignalNotify {
         /// Local signal handle id to notify.
+        local_id: LocalResourceId,
+    },
+    /// Read the current signal generation.
+    SignalGeneration {
+        /// Local signal handle id to inspect.
         local_id: LocalResourceId,
     },
     /// Wait for a signal generation to advance.
@@ -724,6 +749,8 @@ pub enum HostcallOutput {
     Metering(MeteringObservation),
     /// Signal generation value.
     SignalGeneration(u64),
+    /// Raw `u64` value.
+    U64(u64),
 }
 
 /// Current completion state of a hostcall operation.

@@ -53,6 +53,16 @@ impl Signal {
         }
     }
 
+    /// Returns the current signal generation without waiting.
+    pub fn generation(&self) -> Result<u64> {
+        match hostcall_ready(HostcallRequest::SignalGeneration {
+            local_id: self.descriptor.local_id,
+        })? {
+            HostcallOutput::SignalGeneration(generation) => Ok(generation),
+            _ => Err(GuestError::UnexpectedHostcallOutput),
+        }
+    }
+
     /// Waits for the signal generation to advance beyond the observed value.
     pub async fn wait(&self, observed_generation: u64, timeout_ms: u64) -> Result<u64> {
         match hostcall_async(HostcallRequest::SignalWait {

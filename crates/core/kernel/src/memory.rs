@@ -129,6 +129,50 @@ impl Kernel {
             .map_err(map_wasm_error)
     }
 
+    /// Atomically adds to a little-endian `u64` in a local shared memory mapping.
+    pub fn fetch_add_shared_memory_u64(
+        &self,
+        local_id: u64,
+        offset: u32,
+        value: u64,
+    ) -> Result<u64> {
+        let mapping = self.shared_mapping(local_id)?;
+        let store = self.inner.store.lock();
+        let mut bytes = [0_u8; 8];
+        store
+            .read_shared_region(mapping.mapping, offset, &mut bytes)
+            .map_err(map_wasm_error)?;
+        let previous = u64::from_le_bytes(bytes);
+        let next = previous.wrapping_add(value);
+        store
+            .write_shared_region(mapping.mapping, offset, &next.to_le_bytes())
+            .map_err(map_wasm_error)?;
+        Ok(previous)
+    }
+
+    /// Atomically compares and exchanges a little-endian `u64` in a local shared memory mapping.
+    pub fn compare_exchange_shared_memory_u64(
+        &self,
+        local_id: u64,
+        offset: u32,
+        current: u64,
+        new: u64,
+    ) -> Result<u64> {
+        let mapping = self.shared_mapping(local_id)?;
+        let store = self.inner.store.lock();
+        let mut bytes = [0_u8; 8];
+        store
+            .read_shared_region(mapping.mapping, offset, &mut bytes)
+            .map_err(map_wasm_error)?;
+        let previous = u64::from_le_bytes(bytes);
+        if previous == current {
+            store
+                .write_shared_region(mapping.mapping, offset, &new.to_le_bytes())
+                .map_err(map_wasm_error)?;
+        }
+        Ok(previous)
+    }
+
     /// Returns the shared region id backing a local mapping.
     pub fn shared_mapping_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
         Ok(self.shared_mapping(local_id)?.shared_id)
@@ -190,5 +234,38 @@ mod tests {
             kernel.destroy_shared_region(region.shared_id),
             Err(Error::Wasm(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_memory_u64_atomics_are_visible_between_attachments() {
+        let kernel = Kernel::default();
+        let region = kernel
+            .allocate_shared_region(64, 8)
+            .expect("allocate region");
+        let left = kernel
+            .attach_shared_region(region.shared_id, 0, 64)
+            .expect("attach left");
+        let right = kernel
+            .attach_shared_region(region.shared_id, 0, 64)
+            .expect("attach right");
+
+        assert_eq!(
+            kernel
+                .fetch_add_shared_memory_u64(left.local_id, 8, 3)
+                .expect("fetch add"),
+            0
+        );
+        assert_eq!(
+            kernel
+                .compare_exchange_shared_memory_u64(right.local_id, 8, 3, 7)
+                .expect("compare exchange"),
+            3
+        );
+        assert_eq!(
+            kernel
+                .read_shared_memory(left.local_id, 8, 8)
+                .expect("read value"),
+            7_u64.to_le_bytes()
+        );
     }
 }

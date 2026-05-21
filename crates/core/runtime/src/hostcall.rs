@@ -31,6 +31,21 @@ impl Runtime {
         request: HostcallRequest,
         task_id: Option<TaskId>,
     ) -> (u32, OperationId) {
+        if let HostcallRequest::SignalWait {
+            local_id,
+            observed_generation,
+            timeout_ms,
+        } = request
+        {
+            return self.begin_signal_wait_hostcall(
+                process_id,
+                task_id,
+                local_id,
+                observed_generation,
+                timeout_ms,
+            );
+        }
+
         let state = match self.dispatch_hostcall(process_id, request) {
             Ok(state) => state,
             Err(error) => HostOperationState::Failed(error),
@@ -52,6 +67,78 @@ impl Runtime {
             },
         );
         (status, operation_id)
+    }
+
+    fn begin_signal_wait_hostcall(
+        &self,
+        process_id: ProcessId,
+        task_id: Option<TaskId>,
+        local_id: u64,
+        observed_generation: u64,
+        timeout_ms: u64,
+    ) -> (u32, OperationId) {
+        let state =
+            match self.prepare_signal_wait(local_id, observed_generation, timeout_ms, process_id) {
+                Ok(state) => state,
+                Err(error) => HostOperationState::Failed(error),
+            };
+        let mut operations = self.operations.lock();
+        let operation_id = self.next_operation_id(&operations);
+        operations.insert(
+            operation_id,
+            HostOperation {
+                process_id,
+                task_id,
+                state: state.clone(),
+            },
+        );
+        drop(operations);
+
+        match state {
+            HostOperationState::SignalWait {
+                local_id,
+                observed_generation,
+                deadline,
+                ..
+            } => match self.kernel.signal_generation(local_id) {
+                Ok(generation) if generation > observed_generation => {
+                    self.complete_hostcall_operation(
+                        operation_id,
+                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation)),
+                    );
+                    (selium_abi::HOSTCALL_STATUS_READY, operation_id)
+                }
+                Ok(_) if Instant::now() >= deadline => {
+                    self.complete_hostcall_operation(
+                        operation_id,
+                        HostOperationState::Failed(AbiError::new(
+                            AbiErrorCode::Timeout,
+                            "signal wait timed out",
+                        )),
+                    );
+                    (selium_abi::HOSTCALL_STATUS_FAILED, operation_id)
+                }
+                Ok(_) => (selium_abi::HOSTCALL_STATUS_PENDING, operation_id),
+                Err(error) => {
+                    self.complete_hostcall_operation(
+                        operation_id,
+                        HostOperationState::Failed(kernel_error(error)),
+                    );
+                    (selium_abi::HOSTCALL_STATUS_FAILED, operation_id)
+                }
+            },
+            HostOperationState::Ready(_) => (selium_abi::HOSTCALL_STATUS_READY, operation_id),
+            HostOperationState::Failed(_) => (selium_abi::HOSTCALL_STATUS_FAILED, operation_id),
+            HostOperationState::RequestResponseWait { .. } => {
+                (selium_abi::HOSTCALL_STATUS_PENDING, operation_id)
+            }
+        }
+    }
+
+    fn complete_hostcall_operation(&self, operation_id: OperationId, state: HostOperationState) {
+        if let Some(operation) = self.operations.lock().get_mut(&operation_id) {
+            operation.state = state;
+        }
     }
 
     /// Polls a hostcall operation for completion.
@@ -287,6 +374,61 @@ impl Runtime {
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
+            HostcallRequest::SharedMemoryFetchAddU64 {
+                local_id,
+                offset,
+                value,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .shared_mapping_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let previous = self
+                    .kernel
+                    .fetch_add_shared_memory_u64(local_id, offset, value)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(previous)))
+            }
+            HostcallRequest::SharedMemoryCompareExchangeU64 {
+                local_id,
+                offset,
+                current,
+                new,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .shared_mapping_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let previous = self
+                    .kernel
+                    .compare_exchange_shared_memory_u64(local_id, offset, current, new)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(previous)))
+            }
             HostcallRequest::SignalCreate => {
                 self.require(process_id, Capability::Signal, ResourceClass::Signal, None)?;
                 let descriptor = self.kernel.create_signal();
@@ -349,11 +491,7 @@ impl Runtime {
                     generation,
                 )))
             }
-            HostcallRequest::SignalWait {
-                local_id,
-                observed_generation,
-                timeout_ms,
-            } => {
+            HostcallRequest::SignalGeneration { local_id } => {
                 self.ensure_local_handle_owner(
                     process_id,
                     Capability::Signal,
@@ -374,19 +512,15 @@ impl Runtime {
                     .kernel
                     .signal_generation(local_id)
                     .map_err(kernel_error)?;
-                if generation > observed_generation {
-                    Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
-                        generation,
-                    )))
-                } else {
-                    Ok(HostOperationState::SignalWait {
-                        local_id,
-                        shared_id,
-                        observed_generation,
-                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                    })
-                }
+                Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
+                    generation,
+                )))
             }
+            HostcallRequest::SignalWait {
+                local_id,
+                observed_generation,
+                timeout_ms,
+            } => self.prepare_signal_wait(local_id, observed_generation, timeout_ms, process_id),
             HostcallRequest::NetworkListen { address } => {
                 self.require(
                     process_id,
@@ -934,6 +1068,47 @@ impl Runtime {
         }
         for (process_id, task_id) in wakeups {
             self.wake_process_task(process_id, task_id);
+        }
+    }
+
+    fn prepare_signal_wait(
+        &self,
+        local_id: u64,
+        observed_generation: u64,
+        timeout_ms: u64,
+        process_id: ProcessId,
+    ) -> Result<HostOperationState, AbiError> {
+        self.ensure_local_handle_owner(
+            process_id,
+            Capability::Signal,
+            ResourceClass::Signal,
+            local_id,
+        )?;
+        let shared_id = self
+            .kernel
+            .signal_shared_id(local_id)
+            .map_err(kernel_error)?;
+        self.require(
+            process_id,
+            Capability::Signal,
+            ResourceClass::Signal,
+            Some(ResourceIdentity::Shared(shared_id)),
+        )?;
+        let generation = self
+            .kernel
+            .signal_generation(local_id)
+            .map_err(kernel_error)?;
+        if generation > observed_generation {
+            Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
+                generation,
+            )))
+        } else {
+            Ok(HostOperationState::SignalWait {
+                local_id,
+                shared_id,
+                observed_generation,
+                deadline: Instant::now() + Duration::from_millis(timeout_ms),
+            })
         }
     }
 

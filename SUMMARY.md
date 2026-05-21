@@ -17,10 +17,11 @@ selium-kernel  selium-runtime
                wasmtiny
 
 ## Crates
-- `selium-abi`: Shared host/guest contract. Defines `GuestHost`, capabilities, scopes, resource descriptors, hostcall payload types, activity events, guest logs, metering, and `rkyv` framing/codec helpers.
+- `selium-abi`: Shared host/guest contract. Defines capabilities, scopes, resource descriptors, hostcall payload types, activity events, guest logs, metering, and `rkyv` framing/codec helpers.
 - `selium-kernel`: Primitive host resource layer. Owns shared memory, signals, network listener/session/stream state, request exchanges, durable logs, blob stores, process records, activity logs, guest logs, and metering observations.
-- `selium-runtime`: Wasmtiny-backed orchestration layer. Loads guest modules, creates sessions, enforces grants, tracks resource ownership, bootstraps system guests from descriptors, registers runtime host imports, and exposes `RuntimeGuestHost`.
-- `selium-guest`: Ergonomic guest SDK. Provides typed handles for shared memory, signals, storage, network, process lifecycle, activity logs, guest logs, plus `PatternFabric` for pub/sub, fanout, request/reply, streams, and live tables.
+- `selium-runtime`: Wasmtiny-backed orchestration layer. Loads guest modules, enforces grants, tracks resource ownership, bootstraps system guests, registers Wasm imports, and coordinates hostcalls.
+- `selium-guest`: Ergonomic guest SDK. Provides typed handles for shared memory, signals, storage, network, process lifecycle, activity logs, guest logs.
+- `selium-io`: Guest-side I/O pattern library. Provides shared-memory-backed ring buffers, typed channels with strong/weak readers and writers, versioned live tables with CAS, and pub/sub fanout.
 - `selium-guest-macros`: Proc macro layer. Generates guest entrypoint exports and metadata via `#[entrypoint]`, and pattern metadata via `#[pattern_interface]`.
 
 ## Execution Flow
@@ -40,13 +41,11 @@ Runtime enforces:
 - Child process grant containment.
 - Cleanup of local and shared resources when a process/session stops.
 
-## Important Current-State Detail
-`selium-abi` defines a broader hostcall wire model, but the current runtime implementation does not yet use a general `HostcallRequest` bridge. The Wasmtiny integration currently registers only optional imports for `session_id`, `process_id`, and `mark_ready`; most richer interactions are represented through the in-process `GuestHost` trait and tested through runtime/native host paths.
-
 ## Design Intent
 The architecture is deliberately "primitive host, smart guest":
 - Kernel stays low-level and generic.
 - Runtime owns execution, bootstrap, sessions, and enforcement.
-- Guest SDK owns higher-level communication patterns.
+- Guest SDK owns primitive handles for host resources.
+- I/O patterns live in guest-side libraries (`selium-io`), not in host or SDK.
 - ABI remains the stable seam between host and guest.
 - System guests should depend on `selium-guest`/macros, not bespoke host APIs.

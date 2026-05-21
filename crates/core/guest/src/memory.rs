@@ -113,6 +113,31 @@ impl SharedMemory {
         }
     }
 
+    /// Atomically adds to a little-endian `u64` at the supplied mapping offset.
+    pub fn fetch_add_u64(&self, offset: u32, value: u64) -> Result<u64> {
+        match hostcall_ready(HostcallRequest::SharedMemoryFetchAddU64 {
+            local_id: self.descriptor.local_id,
+            offset,
+            value,
+        })? {
+            HostcallOutput::U64(previous) => Ok(previous),
+            _ => Err(GuestError::UnexpectedHostcallOutput),
+        }
+    }
+
+    /// Atomically compares and exchanges a little-endian `u64` at the supplied mapping offset.
+    pub fn compare_exchange_u64(&self, offset: u32, current: u64, new: u64) -> Result<u64> {
+        match hostcall_ready(HostcallRequest::SharedMemoryCompareExchangeU64 {
+            local_id: self.descriptor.local_id,
+            offset,
+            current,
+            new,
+        })? {
+            HostcallOutput::U64(previous) => Ok(previous),
+            _ => Err(GuestError::UnexpectedHostcallOutput),
+        }
+    }
+
     /// Detaches the local mapping.
     pub fn detach(self) -> Result<()> {
         match hostcall_ready(HostcallRequest::SharedMemoryDetach {
