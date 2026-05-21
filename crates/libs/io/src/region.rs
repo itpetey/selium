@@ -34,32 +34,29 @@ pub struct ChannelRegion {
 impl RegionBuilder {
     /// Creates a new shared memory region for a ring buffer of the given capacity.
     pub fn create(capacity: u32) -> Result<ChannelRegion> {
-        let total = REGION_HEADER_BYTES + capacity as u64;
-        let total_aligned = total.next_power_of_two().max(MIN_REGION_BYTES);
-        let region = selium_guest::SharedRegion::allocate(total_aligned as u32, 8)
+        let total_aligned = aligned_region_size(capacity as u64)?;
+        let region = selium_guest::SharedRegion::allocate(total_aligned, 8)
             .map_err(|e| Error::Guest(e.to_string()))?;
-        let mapping =
-            selium_guest::SharedMemory::attach(region.descriptor(), 0, total_aligned as u32)
-                .map_err(|e| Error::Guest(e.to_string()))?;
+        let mapping = selium_guest::SharedMemory::attach(region.descriptor(), 0, total_aligned)
+            .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(ChannelRegion {
             shared_id: region.shared_id(),
             mapping,
             capacity: capacity as u64,
-            size: total_aligned,
+            size: total_aligned as u64,
         })
     }
 
     /// Attaches to an existing shared memory region by its shared id.
     pub fn attach(shared_id: u64, capacity: u64) -> Result<ChannelRegion> {
-        let total = REGION_HEADER_BYTES + capacity;
-        let total_aligned = total.next_power_of_two().max(MIN_REGION_BYTES);
-        let mapping = selium_guest::SharedMemory::attach_shared(shared_id, 0, total_aligned as u32)
+        let total_aligned = aligned_region_size(capacity)?;
+        let mapping = selium_guest::SharedMemory::attach_shared(shared_id, 0, total_aligned)
             .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(ChannelRegion {
             shared_id,
             mapping,
             capacity,
-            size: total_aligned,
+            size: total_aligned as u64,
         })
     }
 }
@@ -176,22 +173,25 @@ impl ChannelRegion {
 
         for _ in 0..RESERVE_SPIN_LIMIT {
             let tail = self.read_next_tail()?;
-            let Some(next) = tail.checked_add(len).filter(|next| *next < u64::MAX) else {
-                return Err(Error::CapacityExceeded);
+            let minimum_reader_position = if protect_readers {
+                self.minimum_reader_position()?
+            } else {
+                None
             };
-            if protect_readers {
-                let head = self.minimum_reader_position()?.unwrap_or(tail);
-                if next.saturating_sub(head) > self.capacity {
-                    return Err(Error::BufferFull);
-                }
-            }
+            let next = reserve_tail_next(
+                tail,
+                len,
+                self.capacity,
+                minimum_reader_position,
+                protect_readers,
+            )?;
 
             if self.compare_exchange_header_u64(NEXT_TAIL_OFFSET, tail, next)? == tail {
                 return Ok(tail);
             }
         }
 
-        Err(Error::BufferFull)
+        Err(Error::ReservationContended)
     }
 
     /// Reads the tail_cache (minimum writer position).
@@ -217,8 +217,15 @@ impl ChannelRegion {
 
     /// Allocates a stable writer id.
     pub fn allocate_writer_id(&self) -> Result<u16> {
-        let id = self.fetch_add_header_u64(NEXT_WRITER_ID_OFFSET, 1)?;
-        Ok(id as u16)
+        for _ in 0..RESERVE_SPIN_LIMIT {
+            let id = self.read_header_u64(NEXT_WRITER_ID_OFFSET)?;
+            let (writer_id, next) = next_writer_id(id)?;
+            if self.compare_exchange_header_u64(NEXT_WRITER_ID_OFFSET, id, next)? == id {
+                return Ok(writer_id);
+            }
+        }
+
+        Err(Error::ReservationContended)
     }
 
     /// Allocates a globally unique mutation id for stream-level acknowledgements.
@@ -294,6 +301,47 @@ fn encode_reader_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
 }
 
+fn aligned_region_size(capacity: u64) -> Result<u32> {
+    let total = REGION_HEADER_BYTES
+        .checked_add(capacity)
+        .ok_or(Error::CapacityExceeded)?;
+    let total_aligned = total
+        .checked_next_power_of_two()
+        .ok_or(Error::CapacityExceeded)?
+        .max(MIN_REGION_BYTES);
+    u32::try_from(total_aligned).map_err(|_error| Error::CapacityExceeded)
+}
+
+fn reserve_tail_next(
+    tail: u64,
+    len: u64,
+    capacity: u64,
+    minimum_reader_position: Option<u64>,
+    protect_readers: bool,
+) -> Result<u64> {
+    if len == 0 || len > capacity {
+        return Err(Error::CapacityExceeded);
+    }
+    let next = tail
+        .checked_add(len)
+        .filter(|next| *next < u64::MAX)
+        .ok_or(Error::CapacityExceeded)?;
+    if protect_readers {
+        let head = minimum_reader_position.unwrap_or(tail);
+        if next.saturating_sub(head) > capacity {
+            return Err(Error::BufferFull);
+        }
+    }
+    Ok(next)
+}
+
+fn next_writer_id(id: u64) -> Result<(u16, u64)> {
+    if id > u64::from(u16::MAX) {
+        return Err(Error::CapacityExceeded);
+    }
+    Ok((id as u16, id + 1))
+}
+
 fn reader_slot_offset(slot: u16, field_offset: u64) -> u64 {
     READER_SLOTS_OFFSET + u64::from(slot) * READER_SLOT_BYTES + field_offset
 }
@@ -309,5 +357,41 @@ mod tests {
             encode_reader_position(u64::MAX),
             Err(Error::CapacityExceeded)
         );
+    }
+
+    #[test]
+    fn aligned_region_size_accounts_for_header_and_limits() {
+        assert_eq!(aligned_region_size(1), Ok(MIN_REGION_BYTES as u32));
+        assert_eq!(aligned_region_size(4096), Ok(8192));
+        assert_eq!(aligned_region_size(u64::MAX), Err(Error::CapacityExceeded));
+        assert_eq!(
+            aligned_region_size(u32::MAX as u64),
+            Err(Error::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn reserve_tail_next_checks_capacity_and_overflow() {
+        assert_eq!(reserve_tail_next(10, 8, 64, None, false), Ok(18));
+        assert_eq!(
+            reserve_tail_next(10, 0, 64, None, false),
+            Err(Error::CapacityExceeded)
+        );
+        assert_eq!(
+            reserve_tail_next(u64::MAX - 4, 4, 64, None, false),
+            Err(Error::CapacityExceeded)
+        );
+        assert_eq!(
+            reserve_tail_next(100, 20, 64, Some(40), true),
+            Err(Error::BufferFull)
+        );
+        assert_eq!(reserve_tail_next(100, 20, 64, Some(60), true), Ok(120));
+    }
+
+    #[test]
+    fn next_writer_id_rejects_u16_wraparound() {
+        assert_eq!(next_writer_id(0), Ok((0, 1)));
+        assert_eq!(next_writer_id(u64::from(u16::MAX)), Ok((u16::MAX, 65536)));
+        assert_eq!(next_writer_id(65536), Err(Error::CapacityExceeded));
     }
 }

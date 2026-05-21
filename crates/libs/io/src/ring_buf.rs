@@ -200,8 +200,11 @@ impl RingBuf {
 }
 
 /// Rounds a byte capacity to the next power of two for use as a ring buffer.
-pub fn round_capacity(capacity: u32) -> u32 {
-    (capacity as u64).next_power_of_two().max(64) as u32
+pub fn round_capacity(capacity: u32) -> Result<u32> {
+    capacity
+        .checked_next_power_of_two()
+        .map(|rounded| rounded.max(64))
+        .ok_or(Error::CapacityExceeded)
 }
 
 #[cfg(test)]
@@ -211,9 +214,10 @@ mod tests {
 
     #[test]
     fn capacity_rounds_to_power_of_two() {
-        assert_eq!(round_capacity(64), 64);
-        assert_eq!(round_capacity(100), 128);
-        assert_eq!(round_capacity(1), 64);
+        assert_eq!(round_capacity(64), Ok(64));
+        assert_eq!(round_capacity(100), Ok(128));
+        assert_eq!(round_capacity(1), Ok(64));
+        assert_eq!(round_capacity(u32::MAX), Err(Error::CapacityExceeded));
     }
 
     #[test]

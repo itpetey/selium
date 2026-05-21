@@ -10,6 +10,7 @@ pub enum Error {
     BufferFull,
     BufferEmpty,
     ReaderBehind,
+    ReservationContended,
     InvalidFrame,
     CapacityExceeded,
     CasConflict { expected: u64, actual: Option<u64> },
@@ -25,6 +26,7 @@ impl fmt::Display for Error {
             Self::BufferFull => write!(f, "ring buffer full"),
             Self::BufferEmpty => write!(f, "ring buffer empty"),
             Self::ReaderBehind => write!(f, "reader was overtaken by writers"),
+            Self::ReservationContended => write!(f, "ring buffer reservation contended"),
             Self::InvalidFrame => write!(f, "invalid frame header"),
             Self::CapacityExceeded => write!(f, "capacity exceeded"),
             Self::CasConflict { expected, actual } => {
@@ -41,3 +43,33 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_covers_core_error_variants() {
+        assert_eq!(
+            Error::InvalidLayout.to_string(),
+            "invalid ring buffer layout"
+        );
+        assert_eq!(Error::BufferFull.to_string(), "ring buffer full");
+        assert_eq!(Error::BufferEmpty.to_string(), "ring buffer empty");
+        assert_eq!(
+            Error::ReaderBehind.to_string(),
+            "reader was overtaken by writers"
+        );
+        assert_eq!(
+            Error::ReservationContended.to_string(),
+            "ring buffer reservation contended"
+        );
+        assert_eq!(Error::InvalidFrame.to_string(), "invalid frame header");
+        assert_eq!(Error::CapacityExceeded.to_string(), "capacity exceeded");
+        assert_eq!(Error::InvalidSignal.to_string(), "invalid signal");
+        assert_eq!(
+            Error::Guest("failed".to_string()).to_string(),
+            "guest error: failed"
+        );
+    }
+}

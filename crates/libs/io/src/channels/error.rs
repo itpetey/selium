@@ -12,6 +12,8 @@ pub enum Error {
     ChannelEmpty,
     /// Reader fell behind and lost data.
     ReaderBehind,
+    /// Writers contended for the reservation cursor.
+    ReservationContended,
     /// Invalid frame header encountered.
     InvalidFrame,
     /// Channel has been terminated.
@@ -28,6 +30,7 @@ impl fmt::Display for Error {
             Self::ChannelFull => write!(f, "channel buffer full"),
             Self::ChannelEmpty => write!(f, "channel buffer empty"),
             Self::ReaderBehind => write!(f, "reader fell behind writer"),
+            Self::ReservationContended => write!(f, "channel reservation contended"),
             Self::InvalidFrame => write!(f, "invalid frame"),
             Self::Terminated => write!(f, "channel terminated"),
             Self::Closed => write!(f, "channel closed"),
@@ -52,6 +55,10 @@ mod tests {
     fn error_implements_display() {
         assert_eq!(Error::ChannelFull.to_string(), "channel buffer full");
         assert_eq!(Error::ChannelEmpty.to_string(), "channel buffer empty");
+        assert_eq!(
+            Error::ReservationContended.to_string(),
+            "channel reservation contended"
+        );
     }
 
     #[test]

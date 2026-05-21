@@ -156,6 +156,7 @@ impl Writer {
 fn map_core_error(error: crate::Error) -> Error {
     match error {
         crate::Error::BufferFull | crate::Error::CapacityExceeded => Error::ChannelFull,
+        crate::Error::ReservationContended => Error::ReservationContended,
         other => Error::Core(other),
     }
 }
@@ -217,4 +218,26 @@ fn write_aborted_frame(
         writer_id,
     };
     write_raw(region, pos, &header.encode(), mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_reservation_contention_maps_to_channel_contention() {
+        assert_eq!(
+            map_core_error(crate::Error::ReservationContended),
+            Error::ReservationContended
+        );
+    }
+
+    #[test]
+    fn core_capacity_errors_map_to_channel_full() {
+        assert_eq!(map_core_error(crate::Error::BufferFull), Error::ChannelFull);
+        assert_eq!(
+            map_core_error(crate::Error::CapacityExceeded),
+            Error::ChannelFull
+        );
+    }
 }

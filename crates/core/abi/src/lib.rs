@@ -887,7 +887,7 @@ pub fn deframe_bytes(payload: &[u8]) -> Result<&[u8], AbiError> {
             "missing frame length prefix",
         )
     })?;
-    let len = u32::from_le_bytes(prefix.try_into().map_err(|_| {
+    let len = u32::from_le_bytes(prefix.try_into().map_err(|_error| {
         AbiError::new(
             AbiErrorCode::MalformedPayload,
             "invalid frame length prefix",
@@ -920,7 +920,7 @@ where
 
 /// Prefixes a payload with its little-endian `u32` length.
 pub fn frame_bytes(payload: &[u8]) -> Result<Vec<u8>, AbiError> {
-    let len = u32::try_from(payload.len()).map_err(|_| {
+    let len = u32::try_from(payload.len()).map_err(|_error| {
         AbiError::new(
             AbiErrorCode::MalformedPayload,
             "frame payload length exceeds u32",

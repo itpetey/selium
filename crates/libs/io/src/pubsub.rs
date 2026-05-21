@@ -96,6 +96,7 @@ impl Publisher {
             .write(payload)
             .map_err(|e| match e {
                 channels::Error::ChannelFull => Error::BufferFull,
+                channels::Error::ReservationContended => Error::ReservationContended,
                 channels::Error::Core(e) => e,
                 other => Error::Guest(other.to_string()),
             })?;
@@ -207,6 +208,7 @@ fn map_channel_error(error: channels::Error) -> Error {
     match error {
         channels::Error::ChannelEmpty => Error::BufferEmpty,
         channels::Error::ReaderBehind => Error::ReaderBehind,
+        channels::Error::ReservationContended => Error::ReservationContended,
         channels::Error::InvalidFrame => Error::InvalidFrame,
         channels::Error::Core(error) => error,
         other => Error::Guest(other.to_string()),
@@ -351,7 +353,7 @@ fn attach_topic(shared_id: u64, capacity: u64) -> Result<(RingBuf, Signal)> {
 }
 
 fn create_topic(capacity: u32) -> Result<(RingBuf, Signal)> {
-    let capacity = round_capacity(capacity);
+    let capacity = round_capacity(capacity)?;
     RingBuf::create(capacity)
 }
 

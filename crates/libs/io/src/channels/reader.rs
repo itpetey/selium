@@ -14,7 +14,12 @@ pub struct StrongReader {
     terminated: bool,
 }
 
-/// Reader that does not prevent buffer overwrite. May lose data.
+/// Reader that does not prevent buffer overwrite.
+///
+/// If writers overtake this reader, it reports [`Error::ReaderBehind`] and
+/// resumes at the live tail. The ring does not store frame-boundary metadata
+/// for the retained suffix, so weak readers cannot safely recover partial
+/// backlog after an overrun.
 pub struct WeakReader {
     region: ChannelRegion,
     pos: u64,

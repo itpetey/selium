@@ -27,7 +27,7 @@ impl Channel {
     ///
     /// Returns the channel and its notification signal.
     pub fn create(capacity: u32) -> Result<(Self, Signal)> {
-        let capacity = round_capacity(capacity);
+        let capacity = round_capacity(capacity).map_err(Error::Core)?;
         let (ring, signal) = RingBuf::create(capacity).map_err(Error::Core)?;
         Ok((Self { ring }, signal))
     }
