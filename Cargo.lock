@@ -596,6 +596,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-io"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
 name = "selium-kernel"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -613,6 +621,7 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "parking_lot",
  "selium-abi",
+ "selium-io",
  "selium-kernel",
  "thiserror",
  "tracing",

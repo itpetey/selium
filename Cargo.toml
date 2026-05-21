@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/abi",
-  "crates/guest",
-  "crates/guest/macros",
-  "crates/kernel",
-  "crates/runtime",
+  "crates/core/abi",
+  "crates/core/guest",
+  "crates/core/guest/macros",
+  "crates/core/kernel",
+  "crates/core/runtime",
+  "crates/libs/io",
 ]
 
 [workspace.package]
@@ -24,9 +25,9 @@ futures = { version = "0.3", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
-selium-abi = { path = "crates/abi" }
-selium-guest = { path = "crates/guest" }
-selium-kernel = { path = "crates/kernel" }
+selium-abi = { path = "crates/core/abi" }
+selium-guest = { path = "crates/core/guest" }
+selium-kernel = { path = "crates/core/kernel" }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "2.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
