@@ -46,10 +46,6 @@ pub enum Error {
     Wasm(String),
 }
 
-pub(crate) fn map_wasm_error(error: WasmError) -> Error {
-    Error::Wasm(error.to_string())
-}
-
 pub(crate) fn kernel_error(error: selium_kernel::Error) -> AbiError {
     let code = match error {
         selium_kernel::Error::NotFound(_) => AbiErrorCode::NotFound,
@@ -59,4 +55,8 @@ pub(crate) fn kernel_error(error: selium_kernel::Error) -> AbiError {
         | selium_kernel::Error::Wasm(_) => AbiErrorCode::Internal,
     };
     AbiError::new(code, error.to_string())
+}
+
+pub(crate) fn map_wasm_error(error: WasmError) -> Error {
+    Error::Wasm(error.to_string())
 }

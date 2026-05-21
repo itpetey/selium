@@ -47,100 +47,6 @@ struct MailboxRegisterHostFunc {
     process_id: ProcessId,
 }
 
-impl Runtime {
-    pub(crate) fn register_runtime_host_functions(
-        &self,
-        app: &mut WasmApplication,
-        module_index: u32,
-        process_id: selium_abi::ProcessId,
-    ) -> Result<()> {
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "process_id",
-            Box::new(ProcessIdHostFunc { process_id }),
-            FunctionType::new(vec![], vec![ValType::Num(NumType::I64)]),
-        )?;
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "mark_ready",
-            Box::new(MarkReadyHostFunc {
-                runtime: self.clone(),
-                process_id,
-            }),
-            FunctionType::empty(),
-        )?;
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "hostcall_create",
-            Box::new(HostcallCreateHostFunc {
-                runtime: self.clone(),
-                process_id,
-            }),
-            FunctionType::new(
-                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
-                vec![ValType::Num(NumType::I64)],
-            ),
-        )?;
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "hostcall_poll",
-            Box::new(HostcallPollHostFunc {
-                runtime: self.clone(),
-                process_id,
-            }),
-            FunctionType::new(
-                vec![
-                    ValType::Num(NumType::I64),
-                    ValType::Num(NumType::I32),
-                    ValType::Num(NumType::I32),
-                ],
-                vec![ValType::Num(NumType::I64)],
-            ),
-        )?;
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "hostcall_drop",
-            Box::new(HostcallDropHostFunc {
-                runtime: self.clone(),
-                process_id,
-            }),
-            FunctionType::new(
-                vec![ValType::Num(NumType::I64)],
-                vec![ValType::Num(NumType::I32)],
-            ),
-        )?;
-        register_optional_host_function(
-            app,
-            module_index,
-            "selium",
-            "mailbox_register",
-            Box::new(MailboxRegisterHostFunc {
-                runtime: self.clone(),
-                process_id,
-            }),
-            FunctionType::new(
-                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
-                vec![],
-            ),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn register_mailbox(&self, process_id: ProcessId, mailbox: Arc<GuestMailbox>) {
-        self.mailboxes.lock().insert(process_id, mailbox);
-    }
-}
-
 impl HostFunc for MarkReadyHostFunc {
     fn call(
         &self,
@@ -281,5 +187,99 @@ impl HostFunc for MailboxRegisterHostFunc {
 
     fn function_type(&self) -> Option<&FunctionType> {
         None
+    }
+}
+
+impl Runtime {
+    pub(crate) fn register_runtime_host_functions(
+        &self,
+        app: &mut WasmApplication,
+        module_index: u32,
+        process_id: selium_abi::ProcessId,
+    ) -> Result<()> {
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "process_id",
+            Box::new(ProcessIdHostFunc { process_id }),
+            FunctionType::new(vec![], vec![ValType::Num(NumType::I64)]),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "mark_ready",
+            Box::new(MarkReadyHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::empty(),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_create",
+            Box::new(HostcallCreateHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
+                vec![ValType::Num(NumType::I64)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_poll",
+            Box::new(HostcallPollHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![
+                    ValType::Num(NumType::I64),
+                    ValType::Num(NumType::I32),
+                    ValType::Num(NumType::I32),
+                ],
+                vec![ValType::Num(NumType::I64)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "hostcall_drop",
+            Box::new(HostcallDropHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I64)],
+                vec![ValType::Num(NumType::I32)],
+            ),
+        )?;
+        register_optional_host_function(
+            app,
+            module_index,
+            "selium",
+            "mailbox_register",
+            Box::new(MailboxRegisterHostFunc {
+                runtime: self.clone(),
+                process_id,
+            }),
+            FunctionType::new(
+                vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
+                vec![],
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn register_mailbox(&self, process_id: ProcessId, mailbox: Arc<GuestMailbox>) {
+        self.mailboxes.lock().insert(process_id, mailbox);
     }
 }

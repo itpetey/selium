@@ -17,14 +17,14 @@ struct BackgroundTask {
     runnable: bool,
 }
 
-struct JoinState<T> {
-    result: Option<T>,
-    waker: Option<Waker>,
-}
-
 /// Handle returned by a spawned guest task.
 pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
+}
+
+struct JoinState<T> {
+    result: Option<T>,
+    waker: Option<Waker>,
 }
 
 struct YieldNow {
@@ -35,12 +35,18 @@ struct TaskWake {
     task_id: TaskId,
 }
 
-thread_local! {
-    static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
-    static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
-    static WAKE_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
-    static CURRENT_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
-    static NEXT_TASK_ID: RefCell<TaskId> = const { RefCell::new(1) };
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.state.borrow_mut();
+        if let Some(value) = state.result.take() {
+            Poll::Ready(value)
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
 impl<T> JoinState<T> {
@@ -55,20 +61,6 @@ impl<T> JoinState<T> {
         self.result = Some(value);
         if let Some(waker) = self.waker.take() {
             waker.wake();
-        }
-    }
-}
-
-impl<T> Future for JoinHandle<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.state.borrow_mut();
-        if let Some(value) = state.result.take() {
-            Poll::Ready(value)
-        } else {
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
         }
     }
 }
@@ -90,6 +82,49 @@ impl Future for YieldNow {
 impl futures::task::ArcWake for TaskWake {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         wake_task(arc_self.task_id);
+    }
+}
+
+thread_local! {
+    static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
+    static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
+    static WAKE_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
+    static NEXT_TASK_ID: RefCell<TaskId> = const { RefCell::new(1) };
+}
+
+/// Polls mailbox wakeups and runnable background tasks until no work remains.
+pub fn poll_reactor() {
+    register_mailbox();
+
+    loop {
+        drain_mailbox();
+        if poll_backgrounds() {
+            continue;
+        }
+        break;
+    }
+}
+
+/// Polls the guest reactor and aborts the process if polling panics.
+pub fn poll_safely() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_reactor));
+    if result.is_err() {
+        std::process::abort();
+    }
+}
+
+/// Starts an entrypoint future and aborts the process if polling panics.
+pub fn run_entrypoint_safely<F>(future: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        spawn(future);
+        poll_safely();
+    }));
+    if result.is_err() {
+        std::process::abort();
     }
 }
 
@@ -126,39 +161,60 @@ pub async fn yield_now() {
     YieldNow { yielded: false }.await;
 }
 
-/// Polls mailbox wakeups and runnable background tasks until no work remains.
-pub fn poll_reactor() {
-    register_mailbox();
+pub(crate) fn current_task_id() -> Option<TaskId> {
+    CURRENT_TASK.with(|current| *current.borrow())
+}
 
-    loop {
-        drain_mailbox();
-        if poll_backgrounds() {
-            continue;
+pub(crate) fn wake_task(task_id: TaskId) {
+    if task_id != 0 {
+        WAKE_QUEUE.with(|queue| queue.borrow_mut().push(task_id));
+    }
+}
+
+fn apply_wake_queue() -> bool {
+    let wakeups = WAKE_QUEUE.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
+    if wakeups.is_empty() {
+        return false;
+    }
+
+    BACKGROUND.with(|tasks| {
+        if let Ok(mut tasks) = tasks.try_borrow_mut() {
+            for task_id in &wakeups {
+                if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
+                    task.runnable = true;
+                }
+            }
         }
-        break;
-    }
+    });
+    SPAWN_QUEUE.with(|tasks| {
+        let mut tasks = tasks.borrow_mut();
+        for task_id in &wakeups {
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
+                task.runnable = true;
+            }
+        }
+    });
+    true
 }
 
-/// Starts an entrypoint future and aborts the process if polling panics.
-pub fn run_entrypoint_safely<F>(future: F)
-where
-    F: Future<Output = ()> + 'static,
-{
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        spawn(future);
-        poll_safely();
-    }));
-    if result.is_err() {
-        std::process::abort();
-    }
+fn merge_spawn_queue() -> bool {
+    SPAWN_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.is_empty() {
+            return false;
+        }
+        BACKGROUND.with(|tasks| tasks.borrow_mut().extend(queue.drain(..)));
+        true
+    })
 }
 
-/// Polls the guest reactor and aborts the process if polling panics.
-pub fn poll_safely() {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_reactor));
-    if result.is_err() {
-        std::process::abort();
-    }
+fn next_task_id() -> TaskId {
+    NEXT_TASK_ID.with(|next| {
+        let mut next = next.borrow_mut();
+        let id = (*next).max(1);
+        *next = id.checked_add(1).unwrap_or(1).max(1);
+        id
+    })
 }
 
 fn poll_backgrounds() -> bool {
@@ -192,62 +248,6 @@ fn poll_backgrounds() -> bool {
         }
     });
     progressed | apply_wake_queue() | merge_spawn_queue()
-}
-
-fn merge_spawn_queue() -> bool {
-    SPAWN_QUEUE.with(|queue| {
-        let mut queue = queue.borrow_mut();
-        if queue.is_empty() {
-            return false;
-        }
-        BACKGROUND.with(|tasks| tasks.borrow_mut().extend(queue.drain(..)));
-        true
-    })
-}
-
-fn apply_wake_queue() -> bool {
-    let wakeups = WAKE_QUEUE.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
-    if wakeups.is_empty() {
-        return false;
-    }
-
-    BACKGROUND.with(|tasks| {
-        if let Ok(mut tasks) = tasks.try_borrow_mut() {
-            for task_id in &wakeups {
-                if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
-                    task.runnable = true;
-                }
-            }
-        }
-    });
-    SPAWN_QUEUE.with(|tasks| {
-        let mut tasks = tasks.borrow_mut();
-        for task_id in &wakeups {
-            if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
-                task.runnable = true;
-            }
-        }
-    });
-    true
-}
-
-fn next_task_id() -> TaskId {
-    NEXT_TASK_ID.with(|next| {
-        let mut next = next.borrow_mut();
-        let id = (*next).max(1);
-        *next = id.checked_add(1).unwrap_or(1).max(1);
-        id
-    })
-}
-
-pub(crate) fn current_task_id() -> Option<TaskId> {
-    CURRENT_TASK.with(|current| *current.borrow())
-}
-
-pub(crate) fn wake_task(task_id: TaskId) {
-    if task_id != 0 {
-        WAKE_QUEUE.with(|queue| queue.borrow_mut().push(task_id));
-    }
 }
 
 #[cfg(test)]

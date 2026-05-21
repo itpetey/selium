@@ -9,17 +9,6 @@ use rkyv::{
 };
 use thiserror::Error;
 
-/// Identifier for a resource handle that is local to one process or host context.
-pub type LocalResourceId = u64;
-/// Identifier for an asynchronous hostcall operation.
-pub type OperationId = u64;
-/// Identifier for a Selium process.
-pub type ProcessId = u64;
-/// Identifier for a resource that may be shared across local handles.
-pub type SharedResourceId = u64;
-/// Identifier for a guest task waiting on host progress.
-pub type TaskId = u32;
-
 /// Layout constants for the guest wake mailbox shared with the host.
 pub mod mailbox {
     /// Byte offset of the ring head word.
@@ -39,6 +28,28 @@ pub mod mailbox {
     /// Total mailbox byte length.
     pub const BYTE_LEN: usize = RING_OFFSET + CAPACITY * SLOT_SIZE;
 }
+
+/// Identifier for a resource handle that is local to one process or host context.
+pub type LocalResourceId = u64;
+/// Identifier for an asynchronous hostcall operation.
+pub type OperationId = u64;
+/// Identifier for a Selium process.
+pub type ProcessId = u64;
+/// Identifier for a resource that may be shared across local handles.
+pub type SharedResourceId = u64;
+/// Identifier for a guest task waiting on host progress.
+pub type TaskId = u32;
+
+/// Packed status code for a dropped hostcall.
+pub const HOSTCALL_STATUS_DROPPED: u32 = 4;
+/// Packed status code for a failed hostcall.
+pub const HOSTCALL_STATUS_FAILED: u32 = 2;
+/// Packed status code for an output buffer that is too small.
+pub const HOSTCALL_STATUS_OUTPUT_TOO_SMALL: u32 = 3;
+/// Packed status code for a pending hostcall.
+pub const HOSTCALL_STATUS_PENDING: u32 = 1;
+/// Packed status code for a ready hostcall.
+pub const HOSTCALL_STATUS_READY: u32 = 0;
 
 /// Marker trait for values that can be encoded with Selium's rkyv codec.
 pub trait RkyvEncode:
@@ -730,27 +741,6 @@ pub enum CompletionState {
     Failed(AbiError),
 }
 
-/// Packed status code for a ready hostcall.
-pub const HOSTCALL_STATUS_READY: u32 = 0;
-/// Packed status code for a pending hostcall.
-pub const HOSTCALL_STATUS_PENDING: u32 = 1;
-/// Packed status code for a failed hostcall.
-pub const HOSTCALL_STATUS_FAILED: u32 = 2;
-/// Packed status code for an output buffer that is too small.
-pub const HOSTCALL_STATUS_OUTPUT_TOO_SMALL: u32 = 3;
-/// Packed status code for a dropped hostcall.
-pub const HOSTCALL_STATUS_DROPPED: u32 = 4;
-
-/// Packs a hostcall status and value into one `u64` ABI return value.
-pub fn pack_hostcall_status(status: u32, value: u32) -> u64 {
-    ((status as u64) << 32) | value as u64
-}
-
-/// Unpacks a hostcall status and value from one `u64` ABI return value.
-pub fn unpack_hostcall_status(encoded: u64) -> (u32, u32) {
-    ((encoded >> 32) as u32, encoded as u32)
-}
-
 /// Error returned by rkyv encoding or decoding helpers.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RkyvError {
@@ -913,6 +903,16 @@ pub fn frame_bytes(payload: &[u8]) -> Result<Vec<u8>, AbiError> {
     framed.extend_from_slice(&len.to_le_bytes());
     framed.extend_from_slice(payload);
     Ok(framed)
+}
+
+/// Packs a hostcall status and value into one `u64` ABI return value.
+pub fn pack_hostcall_status(status: u32, value: u32) -> u64 {
+    ((status as u64) << 32) | value as u64
+}
+
+/// Unpacks a hostcall status and value from one `u64` ABI return value.
+pub fn unpack_hostcall_status(encoded: u64) -> (u32, u32) {
+    ((encoded >> 32) as u32, encoded as u32)
 }
 
 #[cfg(test)]

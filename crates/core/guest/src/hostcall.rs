@@ -72,6 +72,13 @@ impl Drop for HostcallFuture {
     }
 }
 
+pub(crate) fn hostcall_async(request: HostcallRequest) -> HostcallFuture {
+    HostcallFuture {
+        request: Some(request),
+        operation_id: None,
+    }
+}
+
 pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput> {
     let envelope = HostcallEnvelope {
         request,
@@ -99,13 +106,6 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
             unsafe { selium_hostcall_drop(operation_id as OperationId) };
             Err(error)
         }
-    }
-}
-
-pub(crate) fn hostcall_async(request: HostcallRequest) -> HostcallFuture {
-    HostcallFuture {
-        request: Some(request),
-        operation_id: None,
     }
 }
 

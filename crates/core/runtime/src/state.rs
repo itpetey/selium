@@ -9,8 +9,7 @@ use selium_abi::{AbiError, HostcallOutput, OperationId, ProcessId, ResourceClass
 use selium_kernel::Kernel;
 use wasmtiny::{WasmApplication, WasmValue};
 
-use crate::config::ProcessAuthority;
-use crate::mailbox::GuestMailbox;
+use crate::{config::ProcessAuthority, mailbox::GuestMailbox};
 
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
