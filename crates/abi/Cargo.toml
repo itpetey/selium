@@ -11,5 +11,5 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rkyv.workspace = true
+rkyv = { workspace = true, features = ["bytecheck", "std"] }
 thiserror.workspace = true

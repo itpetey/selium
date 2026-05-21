@@ -12,8 +12,13 @@ categories.workspace = true
 
 [dependencies]
 parking_lot.workspace = true
-selium-abi = { path = "../abi" }
+selium-abi.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time"
+] }
 wasmtiny.workspace = true

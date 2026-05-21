@@ -12,15 +12,11 @@ categories.workspace = true
 
 [dependencies]
 parking_lot.workspace = true
-selium-abi = { path = "../abi" }
-selium-kernel = { path = "../kernel" }
+selium-abi.workspace = true
+selium-kernel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmtiny.workspace = true
 
 [dev-dependencies]
-rkyv.workspace = true
-selium-guest = { path = "../guest" }
-selium-kernel = { path = "../kernel" }
-tokio.workspace = true
 wat.workspace = true

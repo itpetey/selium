@@ -11,9 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-futures.workspace = true
+futures = { workspace = true, features = ["std"] }
 rkyv.workspace = true
-selium-abi = { path = "../abi" }
+selium-abi.workspace = true
 selium-guest-macros = { path = "macros" }
 thiserror.workspace = true
 tracing.workspace = true
