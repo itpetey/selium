@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Expose Selium's low-level host primitives for shared memory, signalling, network, storage, process lifecycle, activity, and metering.
+
+## Requirements
 
 ### Requirement: Shared Memory Regions
 `selium-kernel` SHALL expose shared memory regions as first-class primitive resources that can be allocated, attached, detached, and accessed independently of a guest's private linear memory.

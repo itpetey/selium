@@ -1,7 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: Discovery Guest Crate
+The system SHALL provide a `selium-discovery` guest crate that can be built as a `wasm32-unknown-unknown` system guest and bootstrapped through `selium-runtime` configuration.
+
+#### Scenario: Discovery guest bootstraps from descriptor
+- **WHEN** `selium-runtime` receives a `SystemGuestDescriptor` for `selium-discovery`
+- **THEN** it SHALL start the discovery guest using the descriptor's module, zero-argument entrypoint, grants, dependencies, and readiness condition
+
 ### Requirement: URI Registration Store
-The discovery guest SHALL maintain a persistent mapping from Selium URIs to the host-visible resources and interfaces they represent.
+The discovery guest SHALL maintain a durable mapping from Selium URIs to the host-visible resources and interfaces they represent.
 
 #### Scenario: Resource registered
 - **WHEN** a platform resource or guest interface is registered with a Selium URI
@@ -21,12 +28,12 @@ The discovery guest SHALL support prefix-based discovery for URI hierarchies.
 - **WHEN** a guest requests discovery for a URI prefix
 - **THEN** the discovery guest SHALL return the matching registered resources or interfaces for that prefix
 
-### Requirement: Guest-Facing Discovery Interface
-The discovery guest SHALL expose its registration and resolution behaviour through the guest messaging-pattern layer.
+### Requirement: Explicit Discovery Interfaces
+The discovery guest SHALL expose registration and resolution behaviour through explicitly defined `selium-io` state/topics or network request exchanges.
 
-#### Scenario: Request-reply discovery query
-- **WHEN** another guest performs a request/reply discovery query
-- **THEN** the discovery guest SHALL return the matching discovery result through that interface
+#### Scenario: Guest performs discovery query
+- **WHEN** another guest performs a discovery query through a supported interface
+- **THEN** the discovery guest SHALL return the matching discovery result through that interface without relying on an unspecified messaging layer
 
 ### Requirement: Interface Metadata Visibility
 The discovery guest SHALL retain and return guest-facing interface metadata needed for callers to discover how to interact with registered resources.

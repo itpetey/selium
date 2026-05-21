@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Execute Selium guests on Wasmtiny, enforce scoped capability grants, and bootstrap system guests from declarative runtime configuration.
+
+## Requirements
 
 ### Requirement: Wasmtiny-Backed Guest Execution
 `selium-runtime` SHALL execute Selium guests using Wasmtiny as the WebAssembly runtime substrate.

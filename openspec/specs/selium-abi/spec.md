@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the canonical Selium host/guest ABI for capabilities, scopes, resource identities, hostcalls, framing, and error semantics.
+
+## Requirements
 
 ### Requirement: Compound Capability Scopes
 The `selium-abi` capability model SHALL represent authority as a capability plus one or more selectors, where selectors MAY target tenant, URI prefix, locality, resource class, or explicit resource identity, and effective authority SHALL be the intersection of all selectors present on the grant.

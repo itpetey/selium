@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Provide the ergonomic guest SDK over Selium ABI primitives, including safe handles, typed codecs, tracing/log integration, and native-test support.
+
+## Requirements
 
 ### Requirement: Safe Guest Handles
 `selium-guest` SHALL provide safe, ergonomic handle types over ABI primitives so guest code does not manipulate raw hostcall payloads directly for common operations.

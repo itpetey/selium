@@ -1,7 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: Supervisor Guest Crate
+The system SHALL provide a `selium-supervisor` guest crate that can be built as a `wasm32-unknown-unknown` system guest and bootstrapped through `selium-runtime` configuration.
+
+#### Scenario: Supervisor guest bootstraps from descriptor
+- **WHEN** `selium-runtime` receives a `SystemGuestDescriptor` for `selium-supervisor`
+- **THEN** it SHALL start the supervisor guest using the descriptor's module, zero-argument entrypoint, grants, dependencies, and readiness condition
+
 ### Requirement: Runtime Activity Subscription
-The supervisor guest SHALL subscribe to runtime activity and lifecycle signals for the processes it manages.
+The supervisor guest SHALL subscribe to or poll runtime activity and lifecycle signals for the processes it manages using the current activity-log interface.
 
 #### Scenario: Process lifecycle event observed
 - **WHEN** the runtime publishes a lifecycle event for a managed process
@@ -22,7 +29,7 @@ The supervisor guest SHALL evaluate configured restart policies, including immed
 - **THEN** the supervisor SHALL delay recovery according to the configured backoff rules before emitting restart intent
 
 ### Requirement: Recovery Intent Emission
-The supervisor guest SHALL emit recovery or rescheduling intent through the guest messaging-pattern layer rather than through host-specific recovery logic.
+The supervisor guest SHALL emit recovery or rescheduling intent through an explicit scheduler-facing state, topic, or request-exchange interface rather than through host-specific recovery logic.
 
 #### Scenario: Restart requested
 - **WHEN** the supervisor determines that a process should be restarted or rescheduled

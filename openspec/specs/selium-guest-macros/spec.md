@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Provide procedural macros for Selium guest entrypoints and generated guest interface metadata.
+
+## Requirements
 
 ### Requirement: Guest Entrypoint Macro
 `selium-guest-macros` SHALL provide a macro that generates the ABI glue needed to expose a guest entrypoint through `selium-abi` and `selium-guest`.
