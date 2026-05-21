@@ -215,6 +215,15 @@ impl Kernel {
         self.network_session_shared_id(local_id)
     }
 
+    pub fn listener_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
+        self.inner
+            .local_listeners
+            .lock()
+            .get(&local_id)
+            .copied()
+            .ok_or_else(|| Error::NotFound(format!("listener {local_id}")))
+    }
+
     pub(crate) fn network_session_shared_id(&self, local_id: u64) -> Result<SharedResourceId> {
         let shared_id = self
             .inner

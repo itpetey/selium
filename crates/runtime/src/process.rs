@@ -148,8 +148,31 @@ impl Runtime {
             if !should_reclaim {
                 continue;
             }
-            if resource_class == ResourceClass::Signal {
-                let _ = self.kernel.close_signal(local_id);
+            match resource_class {
+                ResourceClass::SharedMapping => {
+                    let _ = self.kernel.detach_shared_region(local_id);
+                }
+                ResourceClass::Signal => {
+                    let _ = self.kernel.close_signal(local_id);
+                }
+                ResourceClass::Listener => {
+                    let _ = self.kernel.close_listener(local_id);
+                }
+                ResourceClass::Session => {
+                    let _ = self.kernel.close_session(local_id);
+                }
+                ResourceClass::Stream => {
+                    let _ = self.kernel.close_stream(local_id);
+                }
+                ResourceClass::RequestExchange => {}
+                ResourceClass::DurableLog => {
+                    let _ = self.kernel.close_log(local_id);
+                }
+                ResourceClass::BlobStore => {
+                    let _ = self.kernel.close_blob_store(local_id);
+                }
+                ResourceClass::Process => {}
+                _ => {}
             }
         }
         Ok(())
@@ -289,6 +312,14 @@ impl Runtime {
             return;
         }
         self.poll_guest_until_stalled(process_id);
+    }
+
+    pub(crate) fn module_bytes(&self, module_id: &str) -> Result<Vec<u8>> {
+        self.module_registry
+            .lock()
+            .get(module_id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownModule(module_id.to_string()))
     }
 
     fn poll_guest_until_stalled(&self, process_id: ProcessId) {

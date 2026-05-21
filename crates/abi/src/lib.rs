@@ -249,6 +249,31 @@ pub struct GuestLogEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum HostcallRequest {
+    SharedMemoryAllocate {
+        size: u32,
+        alignment: u32,
+    },
+    SharedMemoryDestroy {
+        shared_id: SharedResourceId,
+    },
+    SharedMemoryAttach {
+        shared_id: SharedResourceId,
+        offset: u32,
+        len: u32,
+    },
+    SharedMemoryDetach {
+        local_id: LocalResourceId,
+    },
+    SharedMemoryRead {
+        local_id: LocalResourceId,
+        offset: u32,
+        len: u32,
+    },
+    SharedMemoryWrite {
+        local_id: LocalResourceId,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
     SignalCreate,
     SignalAttach {
         shared_id: SharedResourceId,
@@ -263,6 +288,112 @@ pub enum HostcallRequest {
         local_id: LocalResourceId,
         observed_generation: u64,
         timeout_ms: u64,
+    },
+    NetworkListen {
+        address: String,
+    },
+    NetworkListenerClose {
+        local_id: LocalResourceId,
+    },
+    NetworkConnect {
+        authority: String,
+    },
+    NetworkSessionClose {
+        local_id: LocalResourceId,
+    },
+    NetworkOpenStream {
+        network_session_id: LocalResourceId,
+    },
+    NetworkStreamClose {
+        local_id: LocalResourceId,
+    },
+    NetworkStreamSend {
+        local_id: LocalResourceId,
+        bytes: Vec<u8>,
+    },
+    NetworkStreamRecv {
+        local_id: LocalResourceId,
+    },
+    NetworkSendRequest {
+        network_session_id: LocalResourceId,
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    },
+    NetworkWaitRequestResponse {
+        exchange_id: LocalResourceId,
+        timeout_ms: u64,
+    },
+    StorageOpenLog {
+        name: String,
+    },
+    StorageLogClose {
+        local_id: LocalResourceId,
+    },
+    StorageLogAppend {
+        local_id: LocalResourceId,
+        timestamp_ms: u64,
+        headers: Vec<(String, String)>,
+        payload: Vec<u8>,
+    },
+    StorageLogReplay {
+        local_id: LocalResourceId,
+        from_sequence: Option<u64>,
+        limit: u32,
+    },
+    StorageLogCheckpoint {
+        local_id: LocalResourceId,
+        name: String,
+        sequence: u64,
+    },
+    StorageLogCheckpointRead {
+        local_id: LocalResourceId,
+        name: String,
+    },
+    StorageOpenBlobStore {
+        name: String,
+    },
+    StorageBlobStoreClose {
+        local_id: LocalResourceId,
+    },
+    StorageBlobPut {
+        local_id: LocalResourceId,
+        bytes: Vec<u8>,
+    },
+    StorageBlobGet {
+        local_id: LocalResourceId,
+        blob_id: String,
+    },
+    StorageBlobSetManifest {
+        local_id: LocalResourceId,
+        name: String,
+        blob_id: String,
+    },
+    StorageBlobGetManifest {
+        local_id: LocalResourceId,
+        name: String,
+    },
+    ProcessStart {
+        module_id: String,
+        entrypoint: String,
+        arguments: Vec<Vec<u8>>,
+        grants: Vec<CapabilityGrant>,
+    },
+    ProcessStop {
+        process_id: ProcessId,
+    },
+    ActivityRead {
+        cursor: usize,
+    },
+    MeteringRead {
+        process_id: ProcessId,
+    },
+    GuestLogWrite {
+        entry: GuestLogEntry,
+    },
+    GuestLogRead {
+        cursor: usize,
+        process_id: Option<ProcessId>,
     },
 }
 
@@ -286,6 +417,7 @@ pub struct MeteringObservation {
 #[rkyv(bytecheck())]
 pub enum HostcallOutput {
     Empty,
+    LocalId(LocalResourceId),
     SharedRegion(SharedRegionDescriptor),
     SharedMapping(SharedMappingDescriptor),
     Signal(SignalDescriptor),

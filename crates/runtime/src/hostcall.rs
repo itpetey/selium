@@ -4,11 +4,13 @@ use std::{
 };
 
 use selium_abi::{
-    AbiError, AbiErrorCode, Capability, CompletionState, HostcallOutput, HostcallRequest,
-    OperationId, ProcessId, ResourceClass, ResourceIdentity, TaskId,
+    AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, GuestLogEntry,
+    HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass, ResourceIdentity,
+    ResourceSelector, TaskId,
 };
 
 use crate::{
+    ReadinessCondition, SystemGuestDescriptor,
     error::kernel_error,
     state::{HostOperation, HostOperationState, Runtime},
 };
@@ -35,7 +37,8 @@ impl Runtime {
         let status = match state {
             HostOperationState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
             HostOperationState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
-            HostOperationState::SignalWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
+            HostOperationState::SignalWait { .. }
+            | HostOperationState::RequestResponseWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
         };
         let mut operations = self.operations.lock();
         let operation_id = self.next_operation_id(&operations);
@@ -69,7 +72,7 @@ impl Runtime {
             ));
         }
 
-        match &operation.state {
+        match operation.state.clone() {
             HostOperationState::Ready(output) => CompletionState::Ready(output.clone()),
             HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
             HostOperationState::SignalWait {
@@ -77,18 +80,40 @@ impl Runtime {
                 shared_id: _,
                 observed_generation,
                 deadline,
-            } => match self.kernel.signal_generation(*local_id) {
-                Ok(generation) if generation > *observed_generation => {
+            } => match self.kernel.signal_generation(local_id) {
+                Ok(generation) if generation > observed_generation => {
                     operation.state =
                         HostOperationState::Ready(HostcallOutput::SignalGeneration(generation));
                     CompletionState::Ready(HostcallOutput::SignalGeneration(generation))
                 }
-                Ok(_) if Instant::now() >= *deadline => {
+                Ok(_) if Instant::now() >= deadline => {
                     let error = AbiError::new(AbiErrorCode::Timeout, "signal wait timed out");
                     operation.state = HostOperationState::Failed(error.clone());
                     CompletionState::Failed(error)
                 }
                 Ok(_) => CompletionState::Pending { operation_id },
+                Err(error) => CompletionState::Failed(kernel_error(error)),
+            },
+            HostOperationState::RequestResponseWait {
+                exchange_id,
+                deadline,
+            } => match self.kernel.read_request_response(exchange_id) {
+                Ok(Some((status, body))) => {
+                    let output = HostcallOutput::Response { status, body };
+                    operation.state = HostOperationState::Ready(output.clone());
+                    self.release_local_handle(
+                        operation.process_id,
+                        &ResourceClass::RequestExchange,
+                        exchange_id,
+                    );
+                    CompletionState::Ready(output)
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let error = AbiError::new(AbiErrorCode::Timeout, "request response timed out");
+                    operation.state = HostOperationState::Failed(error.clone());
+                    CompletionState::Failed(error)
+                }
+                Ok(None) => CompletionState::Pending { operation_id },
                 Err(error) => CompletionState::Failed(kernel_error(error)),
             },
         }
@@ -120,6 +145,145 @@ impl Runtime {
         }
 
         match request {
+            HostcallRequest::SharedMemoryAllocate { size, alignment } => {
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedRegion,
+                    None,
+                )?;
+                let descriptor = self
+                    .kernel
+                    .allocate_shared_region(size, alignment)
+                    .map_err(kernel_error)?;
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::SharedRegion,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::SharedMemoryDestroy { shared_id } => {
+                self.ensure_shared_resource_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedRegion,
+                    shared_id,
+                )?;
+                if self.kernel.shared_region_mapping_count(shared_id) > 0 {
+                    return Err(AbiError::new(
+                        AbiErrorCode::DetachedResource,
+                        "shared region still has attached mappings",
+                    ));
+                }
+                self.kernel
+                    .destroy_shared_region(shared_id)
+                    .map_err(kernel_error)?;
+                self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::SharedMemoryAttach {
+                shared_id,
+                offset,
+                len,
+            } => {
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let descriptor = self
+                    .kernel
+                    .attach_shared_region(shared_id, offset, len)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(
+                    process_id,
+                    ResourceClass::SharedMapping,
+                    descriptor.local_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::SharedMapping(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::SharedMemoryDetach { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .shared_mapping_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                self.kernel
+                    .detach_shared_region(local_id)
+                    .map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::SharedMapping, local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::SharedMemoryRead {
+                local_id,
+                offset,
+                len,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .shared_mapping_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let bytes = self
+                    .kernel
+                    .read_shared_memory(local_id, offset, len as usize)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes)))
+            }
+            HostcallRequest::SharedMemoryWrite {
+                local_id,
+                offset,
+                bytes,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .shared_mapping_shared_id(local_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::SharedMemory,
+                    ResourceClass::SharedMapping,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                self.kernel
+                    .write_shared_memory(local_id, offset, &bytes)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
             HostcallRequest::SignalCreate => {
                 self.require(process_id, Capability::Signal, ResourceClass::Signal, None)?;
                 let descriptor = self.kernel.create_signal();
@@ -220,6 +384,526 @@ impl Runtime {
                     })
                 }
             }
+            HostcallRequest::NetworkListen { address } => {
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Listener,
+                    None,
+                )?;
+                let descriptor = self.kernel.listen(address);
+                self.claim_local_handle(process_id, ResourceClass::Listener, descriptor.local_id);
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::Listener,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::Listener(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::NetworkListenerClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Listener,
+                    local_id,
+                )?;
+                let shared_id = self.listener_shared_id(local_id)?;
+                self.kernel.close_listener(local_id).map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::Listener, local_id);
+                self.release_shared_resource(process_id, &ResourceClass::Listener, shared_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::NetworkConnect { authority } => {
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Session,
+                    None,
+                )?;
+                let descriptor = self.kernel.connect(authority);
+                self.claim_local_handle(process_id, ResourceClass::Session, descriptor.local_id);
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::Session,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::Session(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::NetworkSessionClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Session,
+                    local_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .network_session_shared_id_public(local_id)
+                    .map_err(kernel_error)?;
+                self.kernel.close_session(local_id).map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::Session, local_id);
+                self.release_shared_resource(process_id, &ResourceClass::Session, shared_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::NetworkOpenStream { network_session_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Session,
+                    network_session_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .network_session_shared_id_public(network_session_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Session,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let descriptor = self
+                    .kernel
+                    .open_stream(network_session_id)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::Stream, descriptor.local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Stream(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::NetworkStreamClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Stream,
+                    local_id,
+                )?;
+                self.kernel.close_stream(local_id).map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::Stream, local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::NetworkStreamSend { local_id, bytes } => {
+                let session_shared_id = self.stream_session_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Stream,
+                    Some(ResourceIdentity::Shared(session_shared_id)),
+                )?;
+                self.kernel
+                    .send_stream_chunk(local_id, bytes)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::NetworkStreamRecv { local_id } => {
+                let session_shared_id = self.stream_session_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Stream,
+                    Some(ResourceIdentity::Shared(session_shared_id)),
+                )?;
+                match self
+                    .kernel
+                    .recv_stream_chunk(local_id)
+                    .map_err(kernel_error)?
+                {
+                    Some(bytes) => Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes))),
+                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
+                }
+            }
+            HostcallRequest::NetworkSendRequest {
+                network_session_id,
+                method,
+                path,
+                body,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::Session,
+                    network_session_id,
+                )?;
+                let shared_id = self
+                    .kernel
+                    .network_session_shared_id_public(network_session_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::RequestExchange,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let exchange_id = self
+                    .kernel
+                    .send_request(network_session_id, method, path, body)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::RequestExchange, exchange_id);
+                Ok(HostOperationState::Ready(HostcallOutput::LocalId(
+                    exchange_id,
+                )))
+            }
+            HostcallRequest::NetworkWaitRequestResponse {
+                exchange_id,
+                timeout_ms,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::RequestExchange,
+                    exchange_id,
+                )?;
+                let (network_session_id, _, _, _) = self
+                    .kernel
+                    .request_summary(exchange_id)
+                    .map_err(kernel_error)?;
+                let shared_id = self
+                    .kernel
+                    .network_session_shared_id_public(network_session_id)
+                    .map_err(kernel_error)?;
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::RequestExchange,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                if let Some((status, body)) = self
+                    .kernel
+                    .read_request_response(exchange_id)
+                    .map_err(kernel_error)?
+                {
+                    self.release_local_handle(
+                        process_id,
+                        &ResourceClass::RequestExchange,
+                        exchange_id,
+                    );
+                    Ok(HostOperationState::Ready(HostcallOutput::Response {
+                        status,
+                        body,
+                    }))
+                } else {
+                    Ok(HostOperationState::RequestResponseWait {
+                        exchange_id,
+                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
+                    })
+                }
+            }
+            HostcallRequest::StorageOpenLog { name } => {
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    None,
+                )?;
+                let descriptor = self.kernel.open_log(name);
+                self.claim_local_handle(process_id, ResourceClass::DurableLog, descriptor.local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::DurableLog(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::StorageLogClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    local_id,
+                )?;
+                self.kernel.close_log(local_id).map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::DurableLog, local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::StorageLogAppend {
+                local_id,
+                timestamp_ms,
+                headers,
+                payload,
+            } => {
+                let shared_id = self.log_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let sequence = self
+                    .kernel
+                    .append_log(local_id, timestamp_ms, headers, payload)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Sequence(Some(
+                    sequence,
+                ))))
+            }
+            HostcallRequest::StorageLogReplay {
+                local_id,
+                from_sequence,
+                limit,
+            } => {
+                let shared_id = self.log_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let records = self
+                    .kernel
+                    .replay_log(local_id, from_sequence, limit as usize)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::StorageRecords(
+                    records,
+                )))
+            }
+            HostcallRequest::StorageLogCheckpoint {
+                local_id,
+                name,
+                sequence,
+            } => {
+                let shared_id = self.log_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                self.kernel
+                    .checkpoint_log(local_id, name, sequence)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::StorageLogCheckpointRead { local_id, name } => {
+                let shared_id = self.log_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::DurableLog,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let sequence = self
+                    .kernel
+                    .checkpoint_sequence(local_id, &name)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Sequence(
+                    sequence,
+                )))
+            }
+            HostcallRequest::StorageOpenBlobStore { name } => {
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    None,
+                )?;
+                let descriptor = self.kernel.open_blob_store(name);
+                self.claim_local_handle(process_id, ResourceClass::BlobStore, descriptor.local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::BlobStore(
+                    descriptor,
+                )))
+            }
+            HostcallRequest::StorageBlobStoreClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    local_id,
+                )?;
+                self.kernel
+                    .close_blob_store(local_id)
+                    .map_err(kernel_error)?;
+                self.release_local_handle(process_id, &ResourceClass::BlobStore, local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::StorageBlobPut { local_id, bytes } => {
+                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                let blob_id = self
+                    .kernel
+                    .put_blob(local_id, bytes)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id)))
+            }
+            HostcallRequest::StorageBlobGet { local_id, blob_id } => {
+                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                match self
+                    .kernel
+                    .get_blob(local_id, &blob_id)
+                    .map_err(kernel_error)?
+                {
+                    Some(bytes) => Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes))),
+                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
+                }
+            }
+            HostcallRequest::StorageBlobSetManifest {
+                local_id,
+                name,
+                blob_id,
+            } => {
+                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                self.kernel
+                    .set_manifest(local_id, name, blob_id)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::StorageBlobGetManifest { local_id, name } => {
+                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
+                self.require(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::BlobStore,
+                    Some(ResourceIdentity::Shared(shared_id)),
+                )?;
+                match self
+                    .kernel
+                    .get_manifest(local_id, &name)
+                    .map_err(kernel_error)?
+                {
+                    Some(blob_id) => Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id))),
+                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
+                }
+            }
+            HostcallRequest::ProcessStart {
+                module_id,
+                entrypoint,
+                arguments,
+                grants,
+            } => {
+                self.require(
+                    process_id,
+                    Capability::ProcessLifecycle,
+                    ResourceClass::Process,
+                    None,
+                )?;
+                self.validate_child_grants(process_id, &grants)?;
+                let module_bytes = self
+                    .module_bytes(&module_id)
+                    .map_err(|error| AbiError::new(AbiErrorCode::NotFound, error.to_string()))?;
+                let descriptor = SystemGuestDescriptor {
+                    name: module_id.clone(),
+                    module_id: module_id.clone(),
+                    module_bytes,
+                    entrypoint,
+                    arguments,
+                    grants,
+                    dependencies: Vec::new(),
+                    readiness: ReadinessCondition::Immediate,
+                };
+                let child = self
+                    .spawn_system_guest(descriptor)
+                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                self.claim_local_handle(process_id, ResourceClass::Process, child.process_id);
+                let process = self
+                    .kernel
+                    .inspect_process(child.process_id)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Process(process)))
+            }
+            HostcallRequest::ProcessStop {
+                process_id: target_process_id,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::ProcessLifecycle,
+                    ResourceClass::Process,
+                    target_process_id,
+                )?;
+                self.require(
+                    process_id,
+                    Capability::ProcessLifecycle,
+                    ResourceClass::Process,
+                    Some(ResourceIdentity::Local(target_process_id)),
+                )?;
+                self.stop_process(target_process_id)
+                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::ActivityRead { cursor } => {
+                self.require(
+                    process_id,
+                    Capability::ActivityRead,
+                    ResourceClass::ActivityLog,
+                    None,
+                )?;
+                Ok(HostOperationState::Ready(HostcallOutput::ActivityEvents(
+                    self.kernel.read_activity_from(cursor),
+                )))
+            }
+            HostcallRequest::MeteringRead {
+                process_id: target_process_id,
+            } => {
+                self.require(
+                    process_id,
+                    Capability::MeteringRead,
+                    ResourceClass::MeteringStream,
+                    Some(ResourceIdentity::Local(target_process_id)),
+                )?;
+                match self.kernel.metering_observation(target_process_id) {
+                    Some(observation) => Ok(HostOperationState::Ready(HostcallOutput::Metering(
+                        observation,
+                    ))),
+                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
+                }
+            }
+            HostcallRequest::GuestLogWrite { entry } => {
+                self.authorise_guest_log_process(process_id, Capability::GuestLogWrite, &entry)?;
+                self.require(
+                    process_id,
+                    Capability::GuestLogWrite,
+                    ResourceClass::GuestLog,
+                    entry.process_id.map(ResourceIdentity::Local),
+                )?;
+                self.kernel.write_guest_log(entry);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::GuestLogRead {
+                cursor,
+                process_id: target_process_id,
+            } => {
+                if let Some(target_process_id) = target_process_id {
+                    self.ensure_local_handle_owner(
+                        process_id,
+                        Capability::GuestLogRead,
+                        ResourceClass::Process,
+                        target_process_id,
+                    )?;
+                }
+                self.require(
+                    process_id,
+                    Capability::GuestLogRead,
+                    ResourceClass::GuestLog,
+                    target_process_id.map(ResourceIdentity::Local),
+                )?;
+                let logs = self
+                    .kernel
+                    .read_guest_logs_from(cursor)
+                    .into_iter()
+                    .filter(|entry| {
+                        target_process_id.is_none() || entry.process_id == target_process_id
+                    })
+                    .collect();
+                Ok(HostOperationState::Ready(HostcallOutput::GuestLogEntries(
+                    logs,
+                )))
+            }
         }
     }
 
@@ -267,13 +951,169 @@ impl Runtime {
             }
         }
     }
+
+    fn ensure_shared_resource_owner(
+        &self,
+        process_id: ProcessId,
+        capability: Capability,
+        resource_class: ResourceClass,
+        shared_id: u64,
+    ) -> std::result::Result<(), AbiError> {
+        if self
+            .shared_resource_owners
+            .lock()
+            .get(&(resource_class, shared_id))
+            .is_some_and(|owners| owners.contains(&process_id))
+        {
+            Ok(())
+        } else {
+            Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                format!("permission denied for capability {capability:?}"),
+            ))
+        }
+    }
+
+    fn listener_shared_id(&self, local_id: u64) -> std::result::Result<u64, AbiError> {
+        self.kernel
+            .listener_shared_id(local_id)
+            .map_err(kernel_error)
+    }
+
+    fn stream_session_shared_id(
+        &self,
+        process_id: ProcessId,
+        stream_id: u64,
+    ) -> std::result::Result<u64, AbiError> {
+        self.ensure_local_handle_owner(
+            process_id,
+            Capability::Network,
+            ResourceClass::Stream,
+            stream_id,
+        )?;
+        let network_session_id = self
+            .kernel
+            .stream_network_session_id(stream_id)
+            .map_err(kernel_error)?;
+        self.kernel
+            .network_session_shared_id_public(network_session_id)
+            .map_err(kernel_error)
+    }
+
+    fn log_shared_id(
+        &self,
+        process_id: ProcessId,
+        local_id: u64,
+    ) -> std::result::Result<u64, AbiError> {
+        self.ensure_local_handle_owner(
+            process_id,
+            Capability::Storage,
+            ResourceClass::DurableLog,
+            local_id,
+        )?;
+        self.kernel
+            .log_shared_id_public(local_id)
+            .map_err(kernel_error)
+    }
+
+    fn blob_store_shared_id(
+        &self,
+        process_id: ProcessId,
+        local_id: u64,
+    ) -> std::result::Result<u64, AbiError> {
+        self.ensure_local_handle_owner(
+            process_id,
+            Capability::Storage,
+            ResourceClass::BlobStore,
+            local_id,
+        )?;
+        self.kernel
+            .blob_store_shared_id_public(local_id)
+            .map_err(kernel_error)
+    }
+
+    fn validate_child_grants(
+        &self,
+        process_id: ProcessId,
+        grants: &[CapabilityGrant],
+    ) -> std::result::Result<(), AbiError> {
+        self.validate_grants(grants)
+            .map_err(|error| AbiError::new(AbiErrorCode::MalformedPayload, error.to_string()))?;
+        let parent_grants = self
+            .restore_process_authority(process_id)
+            .map(|authority| authority.grants)
+            .ok_or_else(|| {
+                AbiError::new(
+                    AbiErrorCode::InvalidHandle,
+                    format!("unknown process authority {process_id}"),
+                )
+            })?;
+        for grant in grants {
+            if !parent_grants
+                .iter()
+                .any(|parent| parent_grant_covers_child(parent, grant))
+            {
+                return Err(AbiError::new(
+                    AbiErrorCode::PermissionDenied,
+                    format!(
+                        "child grant exceeds parent authority for {:?}",
+                        grant.capability
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn authorise_guest_log_process(
+        &self,
+        process_id: ProcessId,
+        capability: Capability,
+        entry: &GuestLogEntry,
+    ) -> std::result::Result<(), AbiError> {
+        if let Some(entry_process_id) = entry.process_id {
+            self.ensure_local_handle_owner(
+                process_id,
+                capability,
+                ResourceClass::Process,
+                entry_process_id,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
+    if parent.capability != child.capability {
+        return false;
+    }
+
+    parent.selectors.iter().all(|parent_selector| match parent_selector {
+        ResourceSelector::Tenant(parent_tenant) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::Tenant(child_tenant) if child_tenant == parent_tenant)
+        }),
+        ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
+        }),
+        ResourceSelector::Locality(parent_locality) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::Locality(child_locality) if parent_locality.matches(child_locality))
+        }),
+        ResourceSelector::ResourceClass(parent_class) => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::ResourceClass(child_class) if child_class == parent_class)
+        }),
+        ResourceSelector::ExplicitResource(parent_identity) => {
+            child.selectors.iter().any(|selector| {
+                matches!(selector, ResourceSelector::ExplicitResource(child_identity) if child_identity == parent_identity)
+            })
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
-    use selium_abi::{CapabilityGrant, ResourceSelector};
+    use selium_abi::{GuestLogEntry, MeteringObservation, ResourceSelector};
 
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (export \"{entrypoint}\") {body}))"))
@@ -292,6 +1132,35 @@ mod tests {
             selium_abi::mailbox::BYTE_LEN,
         ))
         .expect("compile mailbox wat")
+    }
+
+    fn spawn_with_grants(
+        runtime: &Runtime,
+        grants: Vec<CapabilityGrant>,
+    ) -> crate::BootstrappedGuest {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "hostcall-test".to_string(),
+                module_id: "hostcall-test-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants,
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+            })
+            .expect("spawn hostcall test guest")
+    }
+
+    fn ready(
+        runtime: &Runtime,
+        process_id: ProcessId,
+        operation_id: OperationId,
+    ) -> HostcallOutput {
+        match runtime.poll_hostcall(process_id, operation_id) {
+            CompletionState::Ready(output) => output,
+            other => panic!("expected ready hostcall, got {other:?}"),
+        }
     }
 
     #[test]
@@ -321,6 +1190,17 @@ mod tests {
         else {
             panic!("expected created signal");
         };
+        let (_, attach_id) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SignalAttach {
+                shared_id: signal.shared_id,
+            },
+        );
+        let CompletionState::Ready(HostcallOutput::Signal(attached)) =
+            runtime.poll_hostcall(bootstrapped.process_id, attach_id)
+        else {
+            panic!("expected attached signal");
+        };
 
         let (status, wait_id) = runtime.begin_hostcall(
             bootstrapped.process_id,
@@ -345,6 +1225,16 @@ mod tests {
         assert_eq!(
             runtime.poll_hostcall(bootstrapped.process_id, wait_id),
             CompletionState::Ready(HostcallOutput::SignalGeneration(1))
+        );
+        let (_, close_id) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SignalClose {
+                local_id: attached.local_id,
+            },
+        );
+        assert_eq!(
+            runtime.poll_hostcall(bootstrapped.process_id, close_id),
+            CompletionState::Ready(HostcallOutput::Empty)
         );
     }
 
@@ -453,6 +1343,521 @@ mod tests {
         assert_eq!(
             runtime.poll_hostcall(bootstrapped.process_id, wait_id),
             CompletionState::Ready(HostcallOutput::SignalGeneration(1))
+        );
+    }
+
+    #[test]
+    fn shared_memory_hostcalls_cover_region_lifecycle() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                ),
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(
+                        ResourceClass::SharedMapping,
+                    )],
+                ),
+            ],
+        );
+
+        let (_, region_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryAllocate {
+                size: 64,
+                alignment: 8,
+            },
+        );
+        let HostcallOutput::SharedRegion(region) =
+            ready(&runtime, bootstrapped.process_id, region_op)
+        else {
+            panic!("expected shared region");
+        };
+        let (_, mapping_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryAttach {
+                shared_id: region.shared_id,
+                offset: 0,
+                len: region.len,
+            },
+        );
+        let HostcallOutput::SharedMapping(mapping) =
+            ready(&runtime, bootstrapped.process_id, mapping_op)
+        else {
+            panic!("expected shared mapping");
+        };
+
+        let (_, write_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryWrite {
+                local_id: mapping.local_id,
+                offset: 0,
+                bytes: b"hostcalls".to_vec(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, write_op),
+            HostcallOutput::Empty
+        );
+        let (_, read_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryRead {
+                local_id: mapping.local_id,
+                offset: 0,
+                len: 9,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, read_op),
+            HostcallOutput::Bytes(b"hostcalls".to_vec())
+        );
+        let (_, detach_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryDetach {
+                local_id: mapping.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, detach_op),
+            HostcallOutput::Empty
+        );
+        let (_, destroy_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::SharedMemoryDestroy {
+                shared_id: region.shared_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, destroy_op),
+            HostcallOutput::Empty
+        );
+    }
+
+    #[test]
+    fn storage_hostcalls_cover_logs_and_blobs() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::Storage,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
+                ),
+                CapabilityGrant::new(
+                    Capability::Storage,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                ),
+            ],
+        );
+
+        let (_, open_log_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageOpenLog {
+                name: "audit".to_string(),
+            },
+        );
+        let HostcallOutput::DurableLog(log) = ready(&runtime, bootstrapped.process_id, open_log_op)
+        else {
+            panic!("expected durable log");
+        };
+        let (_, append_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageLogAppend {
+                local_id: log.local_id,
+                timestamp_ms: 42,
+                headers: Vec::new(),
+                payload: b"entry".to_vec(),
+            },
+        );
+        let HostcallOutput::Sequence(Some(sequence)) =
+            ready(&runtime, bootstrapped.process_id, append_op)
+        else {
+            panic!("expected appended sequence");
+        };
+        let (_, checkpoint_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageLogCheckpoint {
+                local_id: log.local_id,
+                name: "boot".to_string(),
+                sequence,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, checkpoint_op),
+            HostcallOutput::Empty
+        );
+        let (_, checkpoint_read_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageLogCheckpointRead {
+                local_id: log.local_id,
+                name: "boot".to_string(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, checkpoint_read_op),
+            HostcallOutput::Sequence(Some(sequence))
+        );
+        let (_, replay_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageLogReplay {
+                local_id: log.local_id,
+                from_sequence: Some(sequence),
+                limit: 1,
+            },
+        );
+        let HostcallOutput::StorageRecords(records) =
+            ready(&runtime, bootstrapped.process_id, replay_op)
+        else {
+            panic!("expected log records");
+        };
+        assert_eq!(records[0].payload, b"entry".to_vec());
+
+        let (_, open_blob_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageOpenBlobStore {
+                name: "assets".to_string(),
+            },
+        );
+        let HostcallOutput::BlobStore(store) =
+            ready(&runtime, bootstrapped.process_id, open_blob_op)
+        else {
+            panic!("expected blob store");
+        };
+        let (_, put_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageBlobPut {
+                local_id: store.local_id,
+                bytes: b"blob".to_vec(),
+            },
+        );
+        let HostcallOutput::BlobId(blob_id) = ready(&runtime, bootstrapped.process_id, put_op)
+        else {
+            panic!("expected blob id");
+        };
+        let (_, manifest_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageBlobSetManifest {
+                local_id: store.local_id,
+                name: "latest".to_string(),
+                blob_id: blob_id.clone(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, manifest_op),
+            HostcallOutput::Empty
+        );
+        let (_, get_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageBlobGet {
+                local_id: store.local_id,
+                blob_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, get_op),
+            HostcallOutput::Bytes(b"blob".to_vec())
+        );
+        let (_, manifest_read_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageBlobGetManifest {
+                local_id: store.local_id,
+                name: "latest".to_string(),
+            },
+        );
+        assert!(matches!(
+            ready(&runtime, bootstrapped.process_id, manifest_read_op),
+            HostcallOutput::BlobId(_)
+        ));
+        let (_, close_log_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageLogClose {
+                local_id: log.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_log_op),
+            HostcallOutput::Empty
+        );
+        let (_, close_blob_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::StorageBlobStoreClose {
+                local_id: store.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_blob_op),
+            HostcallOutput::Empty
+        );
+    }
+
+    #[test]
+    fn network_hostcalls_cover_sessions_streams_and_exchanges() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::Network,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Listener)],
+                ),
+                CapabilityGrant::new(
+                    Capability::Network,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Session)],
+                ),
+                CapabilityGrant::new(
+                    Capability::Network,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Stream)],
+                ),
+                CapabilityGrant::new(
+                    Capability::Network,
+                    vec![ResourceSelector::ResourceClass(
+                        ResourceClass::RequestExchange,
+                    )],
+                ),
+            ],
+        );
+
+        let (_, listen_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkListen {
+                address: "127.0.0.1:9000".to_string(),
+            },
+        );
+        let HostcallOutput::Listener(listener) =
+            ready(&runtime, bootstrapped.process_id, listen_op)
+        else {
+            panic!("expected listener");
+        };
+        let (_, connect_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkConnect {
+                authority: "selium.test".to_string(),
+            },
+        );
+        let HostcallOutput::Session(session) = ready(&runtime, bootstrapped.process_id, connect_op)
+        else {
+            panic!("expected network session");
+        };
+        let (_, stream_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkOpenStream {
+                network_session_id: session.local_id,
+            },
+        );
+        let HostcallOutput::Stream(stream) = ready(&runtime, bootstrapped.process_id, stream_op)
+        else {
+            panic!("expected stream");
+        };
+        let (_, send_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkStreamSend {
+                local_id: stream.local_id,
+                bytes: b"chunk".to_vec(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, send_op),
+            HostcallOutput::Empty
+        );
+        let (_, recv_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkStreamRecv {
+                local_id: stream.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, recv_op),
+            HostcallOutput::Bytes(b"chunk".to_vec())
+        );
+        let (_, request_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkSendRequest {
+                network_session_id: session.local_id,
+                method: "GET".to_string(),
+                path: "/health".to_string(),
+                body: b"ping".to_vec(),
+            },
+        );
+        let HostcallOutput::LocalId(exchange_id) =
+            ready(&runtime, bootstrapped.process_id, request_op)
+        else {
+            panic!("expected exchange id");
+        };
+        runtime
+            .kernel()
+            .respond_request(exchange_id, 200, b"pong".to_vec())
+            .expect("respond request");
+        let (_, response_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkWaitRequestResponse {
+                exchange_id,
+                timeout_ms: 1_000,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, response_op),
+            HostcallOutput::Response {
+                status: 200,
+                body: b"pong".to_vec(),
+            }
+        );
+        let (_, close_stream_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkStreamClose {
+                local_id: stream.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_stream_op),
+            HostcallOutput::Empty
+        );
+        let (_, close_session_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkSessionClose {
+                local_id: session.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_session_op),
+            HostcallOutput::Empty
+        );
+        let (_, close_listener_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::NetworkListenerClose {
+                local_id: listener.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_listener_op),
+            HostcallOutput::Empty
+        );
+    }
+
+    #[test]
+    fn process_activity_metering_and_guest_log_hostcalls_work() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::Locality(
+                        selium_abi::LocalityScope::Cluster,
+                    )],
+                ),
+                CapabilityGrant::new(
+                    Capability::ActivityRead,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::ActivityLog)],
+                ),
+                CapabilityGrant::new(
+                    Capability::MeteringRead,
+                    vec![ResourceSelector::ResourceClass(
+                        ResourceClass::MeteringStream,
+                    )],
+                ),
+                CapabilityGrant::new(
+                    Capability::GuestLogWrite,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
+                ),
+                CapabilityGrant::new(
+                    Capability::GuestLogRead,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
+                ),
+            ],
+        );
+
+        let child_grants = vec![CapabilityGrant::new(
+            Capability::ProcessLifecycle,
+            vec![ResourceSelector::Locality(
+                selium_abi::LocalityScope::Cluster,
+            )],
+        )];
+        let (_, start_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: child_grants,
+            },
+        );
+        let HostcallOutput::Process(child) = ready(&runtime, bootstrapped.process_id, start_op)
+        else {
+            panic!("expected child process");
+        };
+        runtime.project_metering(
+            child.local_id,
+            MeteringObservation {
+                cpu_micros: 1,
+                memory_bytes: 2,
+                storage_bytes: 3,
+                bandwidth_bytes: 4,
+            },
+        );
+        let (_, meter_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::MeteringRead {
+                process_id: child.local_id,
+            },
+        );
+        assert!(matches!(
+            ready(&runtime, bootstrapped.process_id, meter_op),
+            HostcallOutput::Metering(_)
+        ));
+        let entry = GuestLogEntry {
+            process_id: Some(child.local_id),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "hello".to_string(),
+        };
+        let (_, write_log_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::GuestLogWrite { entry },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, write_log_op),
+            HostcallOutput::Empty
+        );
+        let (_, read_log_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::GuestLogRead {
+                cursor: 0,
+                process_id: Some(child.local_id),
+            },
+        );
+        let HostcallOutput::GuestLogEntries(entries) =
+            ready(&runtime, bootstrapped.process_id, read_log_op)
+        else {
+            panic!("expected guest log entries");
+        };
+        assert_eq!(entries[0].message, "hello");
+        let (_, activity_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::ActivityRead { cursor: 0 },
+        );
+        assert!(matches!(
+            ready(&runtime, bootstrapped.process_id, activity_op),
+            HostcallOutput::ActivityEvents(_)
+        ));
+        let (_, stop_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::ProcessStop {
+                process_id: child.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, stop_op),
+            HostcallOutput::Empty
         );
     }
 }

@@ -19,7 +19,7 @@ pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<Pr
 pub struct Runtime {
     pub(crate) kernel: Kernel,
     pub(crate) process_authorities: Arc<Mutex<HashMap<ProcessId, ProcessAuthority>>>,
-    pub(crate) loaded_guests: Arc<Mutex<HashMap<selium_abi::ProcessId, LoadedGuest>>>,
+    pub(crate) loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
     pub(crate) local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
     pub(crate) shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
     pub(crate) module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -42,6 +42,10 @@ pub(crate) enum HostOperationState {
         local_id: u64,
         shared_id: u64,
         observed_generation: u64,
+        deadline: Instant,
+    },
+    RequestResponseWait {
+        exchange_id: u64,
         deadline: Instant,
     },
 }
