@@ -347,7 +347,7 @@ fn attach_topic(shared_id: u64, capacity: u64) -> Result<(RingBuf, Signal)> {
     let signal_shared_id = ring
         .region()
         .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
-        .map_err(|_| Error::InvalidLayout)?;
+        .map_err(|_invalid_layout| Error::InvalidLayout)?;
     let signal = Signal::attach(signal_shared_id).map_err(|e| Error::Guest(e.to_string()))?;
     Ok((ring, signal))
 }

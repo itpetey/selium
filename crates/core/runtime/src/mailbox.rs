@@ -15,7 +15,7 @@ impl GuestMailbox {
         let mut memory = self
             .memory
             .lock()
-            .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?;
+            .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?;
         let tail_offset = self.offset(selium_abi::mailbox::TAIL_OFFSET)?;
         let ring_offset = self.offset(selium_abi::mailbox::RING_OFFSET)?;
         let flag_offset = self.offset(selium_abi::mailbox::FLAG_OFFSET)?;

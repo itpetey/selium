@@ -9,7 +9,6 @@ use crate::{
 pub struct StrongReader {
     region: ChannelRegion,
     pos: u64,
-    #[allow(dead_code)]
     reader_id: u16,
     terminated: bool,
 }
@@ -56,7 +55,7 @@ impl StrongReader {
             let tail = self
                 .region
                 .read_next_tail()
-                .map_err(|_| Error::ChannelEmpty)?;
+                .map_err(|_channel_empty| Error::ChannelEmpty)?;
 
             if self.pos >= tail {
                 return Err(Error::ChannelEmpty);
@@ -106,7 +105,7 @@ impl StrongReader {
             let tail = self
                 .region
                 .read_next_tail()
-                .map_err(|_| Error::ChannelEmpty)?;
+                .map_err(|_channel_empty| Error::ChannelEmpty)?;
 
             if self.pos >= tail {
                 return Ok(false);
@@ -174,7 +173,7 @@ impl WeakReader {
             let tail = self
                 .region
                 .read_next_tail()
-                .map_err(|_| Error::ChannelEmpty)?;
+                .map_err(|_channel_empty| Error::ChannelEmpty)?;
 
             if self.pos >= tail {
                 return Err(Error::ChannelEmpty);
@@ -274,7 +273,7 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
         return region
             .data_slice()
             .read(raw_pos as u32, len as u32)
-            .map_err(|_| Error::InvalidFrame);
+            .map_err(|_invalid_frame| Error::InvalidFrame);
     }
 
     let tail_len = ring_end.saturating_sub(raw_pos);
@@ -284,14 +283,14 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
         let part = region
             .data_slice()
             .read(raw_pos as u32, tail_len as u32)
-            .map_err(|_| Error::InvalidFrame)?;
+            .map_err(|_invalid_frame| Error::InvalidFrame)?;
         buf.extend_from_slice(&part);
     }
     if head_len > 0 {
         let part = region
             .data_slice()
             .read(region.data_offset() as u32, head_len as u32)
-            .map_err(|_| Error::InvalidFrame)?;
+            .map_err(|_invalid_frame| Error::InvalidFrame)?;
         buf.extend_from_slice(&part);
     }
     Ok(buf)
@@ -299,5 +298,5 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
 
 fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
     let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
-    FrameHeader::decode(&header_bytes).map_err(|_| Error::InvalidFrame)
+    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
 }

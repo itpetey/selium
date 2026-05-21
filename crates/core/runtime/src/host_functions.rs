@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use selium_abi::{
-    ActivityEvent, CompletionState, HostcallEnvelope, OperationId, ProcessId, pack_hostcall_status,
+    ActivityEvent, CompletionState, HostcallEnvelope, ProcessId, pack_hostcall_status,
 };
 use wasmtiny::{
     FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue,
@@ -86,8 +86,8 @@ impl HostFunc for HostcallCreateHostFunc {
         caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        let ptr = wasm_i32_arg(args, 0)? as u32;
-        let len = wasm_i32_arg(args, 1)? as usize;
+        let ptr = wasm_i32_arg(args, 0)?.cast_unsigned();
+        let len = wasm_i32_arg(args, 1)?.cast_unsigned() as usize;
         let request_bytes = read_guest_memory(caller, ptr, len)?;
         let envelope = match selium_abi::decode_rkyv::<HostcallEnvelope>(&request_bytes) {
             Ok(envelope) => envelope,
@@ -117,9 +117,9 @@ impl HostFunc for HostcallPollHostFunc {
         caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        let operation_id = wasm_i64_arg(args, 0)? as OperationId;
-        let out_ptr = wasm_i32_arg(args, 1)? as u32;
-        let out_capacity = wasm_i32_arg(args, 2)? as usize;
+        let operation_id = wasm_i64_arg(args, 0)?.cast_unsigned();
+        let out_ptr = wasm_i32_arg(args, 1)?.cast_unsigned();
+        let out_capacity = wasm_i32_arg(args, 2)?.cast_unsigned() as usize;
         let state = self.runtime.poll_hostcall(self.process_id, operation_id);
         let status = match state {
             CompletionState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
@@ -151,7 +151,7 @@ impl HostFunc for HostcallDropHostFunc {
         _caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        let operation_id = wasm_i64_arg(args, 0)? as OperationId;
+        let operation_id = wasm_i64_arg(args, 0)?.cast_unsigned();
         let dropped = self.runtime.drop_hostcall(self.process_id, operation_id);
         Ok(vec![WasmValue::I32(u32::from(dropped) as i32)])
     }
@@ -167,15 +167,15 @@ impl HostFunc for MailboxRegisterHostFunc {
         caller: &mut HostCaller<'_>,
         args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        let base = wasm_i32_arg(args, 0)? as u32;
-        let len = wasm_i32_arg(args, 1)? as usize;
+        let base = wasm_i32_arg(args, 0)?.cast_unsigned();
+        let len = wasm_i32_arg(args, 1)?.cast_unsigned() as usize;
         if len < selium_abi::mailbox::BYTE_LEN {
             return Err(WasmError::Runtime("guest mailbox is too small".to_string()));
         }
         let memory = guest_memory(caller)?;
         memory
             .lock()
-            .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+            .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
             .write_u32(
                 base + selium_abi::mailbox::CAPACITY_OFFSET as u32,
                 selium_abi::mailbox::CAPACITY as u32,

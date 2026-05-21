@@ -92,7 +92,7 @@ impl Kernel {
     pub fn read_activity_from(&self, cursor: usize) -> Vec<ActivityEvent> {
         let activity_log = self.inner.activity_log.lock();
         let cursor = cursor.min(activity_log.len());
-        activity_log[cursor..].to_vec()
+        activity_log.get(cursor..).unwrap_or_default().to_vec()
     }
 
     /// Waits for activity past a cursor, then returns available events.
@@ -104,7 +104,7 @@ impl Kernel {
                 .wait_for(&mut activity_log, Duration::from_millis(timeout_ms));
         }
         let cursor = cursor.min(activity_log.len());
-        activity_log[cursor..].to_vec()
+        activity_log.get(cursor..).unwrap_or_default().to_vec()
     }
 
     /// Appends a guest log entry.
@@ -116,7 +116,7 @@ impl Kernel {
     pub fn read_guest_logs_from(&self, cursor: usize) -> Vec<GuestLogEntry> {
         let guest_logs = self.inner.guest_logs.lock();
         let cursor = cursor.min(guest_logs.len());
-        guest_logs[cursor..].to_vec()
+        guest_logs.get(cursor..).unwrap_or_default().to_vec()
     }
 
     /// Returns the capability grants assigned to a process.

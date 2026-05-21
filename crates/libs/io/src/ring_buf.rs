@@ -128,10 +128,11 @@ impl RingBuf {
         let raw_pos = cursor.masked(self.mask);
         if tail_len > 0 {
             self.region
-                .write_data(raw_pos, &data[..tail_len as usize])?;
+                .write_data(raw_pos, data.get(..tail_len as usize).unwrap_or_default())?;
         }
         if head_len > 0 {
-            self.region.write_data(0, &data[tail_len as usize..])?;
+            self.region
+                .write_data(0, data.get(tail_len as usize..).unwrap_or_default())?;
         }
         Ok(())
     }
@@ -221,6 +222,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::assertions_on_result_states,
+        reason = "unwrap_used lint conflicts with clippy's suggested fix"
+    )]
     fn mask_for_power_of_two_is_correct() {
         assert!(mask_for_capacity(512).is_ok());
         assert!(mask_for_capacity(3).is_err());

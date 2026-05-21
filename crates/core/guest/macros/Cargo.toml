@@ -15,7 +15,12 @@ proc-macro = true
 
 [dependencies]
 quote = { workspace = true, features = ["proc-macro"] }
-syn = { workspace = true, features = ["full", "parsing", "printing", "proc-macro"] }
+syn = { workspace = true, features = [
+  "full",
+  "parsing",
+  "printing",
+  "proc-macro"
+] }
 
 [dev-dependencies]
 selium-guest = { path = ".." }
@@ -23,3 +28,6 @@ selium-runtime = { path = "../../runtime" }
 tokio.workspace = true
 tracing.workspace = true
 wat.workspace = true
+
+[lints]
+workspace = true

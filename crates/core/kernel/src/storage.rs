@@ -6,7 +6,13 @@ use crate::{
     state::{BlobStoreState, DurableLogState, Kernel},
 };
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
+fn hex_char(value: u8) -> char {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    // SAFETY: `value & 0x0f` is always in 0..=15, within bounds of `HEX`.
+    unsafe { *HEX.get_unchecked((value & 0x0f) as usize) }
+}
 
 impl Kernel {
     /// Opens or creates a named durable log.
@@ -150,8 +156,8 @@ impl Kernel {
         let digest = Sha256::digest(&bytes);
         let mut blob_id = String::with_capacity(digest.len() * 2);
         for byte in digest {
-            blob_id.push(char::from(HEX[(byte >> 4) as usize]));
-            blob_id.push(char::from(HEX[(byte & 0x0f) as usize]));
+            blob_id.push(hex_char(byte >> 4));
+            blob_id.push(hex_char(byte & 0x0f));
         }
         store.blobs.insert(blob_id.clone(), bytes);
         Ok(blob_id)

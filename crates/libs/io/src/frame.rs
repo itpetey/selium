@@ -35,9 +35,27 @@ impl FrameHeader {
         if bytes.len() < Self::ENCODED_SIZE {
             return Err(Error::InvalidFrame);
         }
-        let len = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let flags = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let writer_id = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let len = u32::from_le_bytes(
+            bytes
+                .get(..4)
+                .ok_or(Error::InvalidFrame)?
+                .try_into()
+                .map_err(|_invalid_layout| Error::InvalidFrame)?,
+        );
+        let flags = u16::from_le_bytes(
+            bytes
+                .get(4..6)
+                .ok_or(Error::InvalidFrame)?
+                .try_into()
+                .map_err(|_invalid_layout| Error::InvalidFrame)?,
+        );
+        let writer_id = u16::from_le_bytes(
+            bytes
+                .get(6..8)
+                .ok_or(Error::InvalidFrame)?
+                .try_into()
+                .map_err(|_invalid_layout| Error::InvalidFrame)?,
+        );
         Ok(Self {
             len,
             flags,
@@ -78,6 +96,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::assertions_on_result_states,
+        reason = "unwrap_used lint conflicts with clippy's suggested fix"
+    )]
     fn header_requires_eight_bytes() {
         assert!(FrameHeader::decode(&[0; 7]).is_err());
         assert!(FrameHeader::decode(&[0; 8]).is_ok());

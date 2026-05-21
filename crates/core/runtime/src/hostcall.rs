@@ -1112,6 +1112,10 @@ impl Runtime {
         }
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "running out of operation ids cripples the system"
+    )]
     pub(crate) fn next_operation_id(
         &self,
         operations: &HashMap<OperationId, HostOperation>,

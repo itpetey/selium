@@ -39,6 +39,7 @@ impl Future for HostcallFuture {
                 Ok(encoded) => encoded,
                 Err(error) => return Poll::Ready(Err(error.into())),
             };
+            // SAFETY: `encoded` is a valid byte buffer; the host validates the request.
             let create_status = unsafe { selium_hostcall_create(encoded.as_ptr(), encoded.len()) };
             let (status, operation_id) = unpack_hostcall_status(create_status);
             if status == selium_abi::HOSTCALL_STATUS_FAILED {
@@ -50,12 +51,14 @@ impl Future for HostcallFuture {
         let operation_id = self.operation_id.expect("operation id set above");
         match poll_operation(operation_id) {
             Ok(Some(output)) => {
+                // SAFETY: `operation_id` is valid and was returned by `selium_hostcall_create`.
                 unsafe { selium_hostcall_drop(operation_id) };
                 self.operation_id = None;
                 Poll::Ready(Ok(output))
             }
             Ok(None) => Poll::Pending,
             Err(error) => {
+                // SAFETY: `operation_id` is valid and was returned by `selium_hostcall_create`.
                 unsafe { selium_hostcall_drop(operation_id) };
                 self.operation_id = None;
                 Poll::Ready(Err(error))
@@ -67,6 +70,7 @@ impl Future for HostcallFuture {
 impl Drop for HostcallFuture {
     fn drop(&mut self) {
         if let Some(operation_id) = self.operation_id {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
             unsafe { selium_hostcall_drop(operation_id) };
         }
     }
@@ -85,6 +89,7 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
         task_id: None,
     };
     let request = encode_rkyv(&envelope)?;
+    // SAFETY: `request` is a valid byte buffer; the host validates the contents.
     let create_status = unsafe { selium_hostcall_create(request.as_ptr(), request.len()) };
     let (status, operation_id) = unpack_hostcall_status(create_status);
     if status == selium_abi::HOSTCALL_STATUS_FAILED {
@@ -93,16 +98,19 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
 
     match poll_operation(operation_id as OperationId) {
         Ok(Some(output)) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
             unsafe { selium_hostcall_drop(operation_id as OperationId) };
             Ok(output)
         }
         Ok(None) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
             unsafe { selium_hostcall_drop(operation_id as OperationId) };
             Err(GuestError::Host(
                 "hostcall returned pending; await the async API instead".to_string(),
             ))
         }
         Err(error) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
             unsafe { selium_hostcall_drop(operation_id as OperationId) };
             Err(error)
         }
@@ -112,6 +120,8 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
 fn poll_operation(operation_id: OperationId) -> Result<Option<HostcallOutput>> {
     let mut output = vec![0_u8; 4096];
     loop {
+        // SAFETY: `output` is a valid mutable buffer; `operation_id` was returned by
+        // `selium_hostcall_create`.
         let poll_status =
             unsafe { selium_hostcall_poll(operation_id, output.as_mut_ptr(), output.len()) };
         let (status, len) = unpack_hostcall_status(poll_status);
@@ -119,7 +129,11 @@ fn poll_operation(operation_id: OperationId) -> Result<Option<HostcallOutput>> {
             output.resize(len as usize, 0);
             continue;
         }
-        let state: CompletionState = decode_rkyv(&output[..len as usize])?;
+        let state: CompletionState = decode_rkyv(
+            output
+                .get(..len as usize)
+                .ok_or_else(|| GuestError::Host("invalid hostcall output length".to_string()))?,
+        )?;
         return match state {
             CompletionState::Ready(output) => Ok(Some(output)),
             CompletionState::Pending { .. } => Ok(None),

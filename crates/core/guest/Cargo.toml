@@ -17,3 +17,6 @@ selium-abi.workspace = true
 selium-guest-macros = { path = "macros" }
 thiserror.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

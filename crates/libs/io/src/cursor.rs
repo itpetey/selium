@@ -96,7 +96,10 @@ mod tests {
     fn mask_rounds_down_capacity() {
         assert_eq!(mask_for_capacity(64).unwrap(), 63);
         assert_eq!(mask_for_capacity(1).unwrap(), 0);
-        assert!(mask_for_capacity(3).is_err());
+        assert_eq!(
+            mask_for_capacity(3).unwrap_err(),
+            crate::Error::InvalidLayout
+        );
     }
 
     #[test]

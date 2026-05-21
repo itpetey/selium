@@ -4,6 +4,7 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn alloc_shared_region(
     runtime: &Runtime,
     process_id: u64,
@@ -21,6 +22,7 @@ fn alloc_shared_region(
     }
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn attach_shared_region(
     runtime: &Runtime,
     process_id: u64,
@@ -43,6 +45,7 @@ fn attach_shared_region(
     }
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn create_signal(runtime: &Runtime, process_id: u64) -> selium_abi::SignalDescriptor {
     let (status, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::SignalCreate);
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -56,6 +59,7 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
     wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn read_shared_memory(
     runtime: &Runtime,
     process_id: u64,
@@ -263,6 +267,10 @@ fn signal_create_notify_through_hostcalls() {
     );
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test helper always bootstraps one guest"
+)]
 fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
     let report = runtime
         .bootstrap_system_guests(selium_runtime::RuntimeConfig {
@@ -296,6 +304,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
     report.guests[0].process_id
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn write_shared_memory(
     runtime: &Runtime,
     process_id: u64,
@@ -318,6 +327,7 @@ fn write_shared_memory(
     }
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn fetch_add_shared_memory_u64(
     runtime: &Runtime,
     process_id: u64,
@@ -340,6 +350,7 @@ fn fetch_add_shared_memory_u64(
     }
 }
 
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn compare_exchange_shared_memory_u64(
     runtime: &Runtime,
     process_id: u64,

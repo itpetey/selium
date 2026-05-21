@@ -70,7 +70,7 @@ impl Runtime {
                 }
             };
             if !self.wait_for_readiness(bootstrapped.process_id, &descriptor.readiness) {
-                let _ = self.stop_process(bootstrapped.process_id);
+                drop(self.stop_process(bootstrapped.process_id));
                 self.rollback_bootstrapped(&report);
                 return Err(Error::ReadinessUnsatisfied(descriptor.name));
             }
@@ -212,7 +212,7 @@ impl Runtime {
 
     pub(crate) fn rollback_bootstrapped(&self, report: &BootstrapReport) {
         for guest in report.guests.iter().rev() {
-            let _ = self.stop_process(guest.process_id);
+            drop(self.stop_process(guest.process_id));
         }
     }
 }

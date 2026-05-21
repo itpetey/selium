@@ -35,7 +35,7 @@ pub(crate) fn read_guest_memory(
     let mut bytes = vec![0; len];
     memory
         .lock()
-        .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
         .read(ptr, &mut bytes)?;
     Ok(bytes)
 }
@@ -79,6 +79,6 @@ pub(crate) fn write_guest_memory(
     let memory = guest_memory(caller)?;
     memory
         .lock()
-        .map_err(|_| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
         .write(ptr, bytes)
 }

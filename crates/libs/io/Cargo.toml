@@ -14,3 +14,6 @@ categories.workspace = true
 rkyv.workspace = true
 selium-abi.workspace = true
 selium-guest.workspace = true
+
+[lints]
+workspace = true

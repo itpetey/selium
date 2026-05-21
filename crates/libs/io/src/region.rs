@@ -89,7 +89,9 @@ impl ChannelRegion {
             .read(offset as u32, 8)
             .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(u64::from_le_bytes(
-            bytes.try_into().map_err(|_| Error::InvalidLayout)?,
+            bytes
+                .try_into()
+                .map_err(|_invalid_layout| Error::InvalidLayout)?,
         ))
     }
 

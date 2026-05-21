@@ -123,12 +123,12 @@ impl Runtime {
     }
 
     pub(crate) fn cleanup_failed_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
-        let _ = self.kernel.stop_process(process_id);
+        drop(self.kernel.stop_process(process_id));
         self.operations
             .lock()
             .retain(|_, operation| operation.process_id != process_id);
-        let _ = self.cleanup_process_resources(process_id);
-        let _ = self.kernel.reap_process(process_id);
+        drop(self.cleanup_process_resources(process_id));
+        drop(self.kernel.reap_process(process_id));
         self.process_authorities.lock().remove(&process_id);
         self.mailboxes.lock().remove(&process_id);
         self.local_handle_owners
@@ -159,26 +159,26 @@ impl Runtime {
             }
             match resource_class {
                 ResourceClass::SharedMapping => {
-                    let _ = self.kernel.detach_shared_region(local_id);
+                    drop(self.kernel.detach_shared_region(local_id));
                 }
                 ResourceClass::Signal => {
-                    let _ = self.kernel.close_signal(local_id);
+                    drop(self.kernel.close_signal(local_id));
                 }
                 ResourceClass::Listener => {
-                    let _ = self.kernel.close_listener(local_id);
+                    drop(self.kernel.close_listener(local_id));
                 }
                 ResourceClass::Session => {
-                    let _ = self.kernel.close_session(local_id);
+                    drop(self.kernel.close_session(local_id));
                 }
                 ResourceClass::Stream => {
-                    let _ = self.kernel.close_stream(local_id);
+                    drop(self.kernel.close_stream(local_id));
                 }
                 ResourceClass::RequestExchange => {}
                 ResourceClass::DurableLog => {
-                    let _ = self.kernel.close_log(local_id);
+                    drop(self.kernel.close_log(local_id));
                 }
                 ResourceClass::BlobStore => {
-                    let _ = self.kernel.close_blob_store(local_id);
+                    drop(self.kernel.close_blob_store(local_id));
                 }
                 ResourceClass::Process => {}
                 _ => {}

@@ -29,11 +29,13 @@ unsafe extern "C" {
 
 /// Marks the current guest as ready for runtime readiness checks.
 pub fn mark_ready() {
+    // SAFETY: `selium_mark_ready` is a host import with no safety invariants.
     unsafe { selium_mark_ready() }
 }
 
 /// Returns the current guest process id assigned by the host.
 pub fn process_id() -> u64 {
+    // SAFETY: `selium_process_id` is a host import with no safety invariants.
     unsafe { selium_process_id() }
 }
 

@@ -71,7 +71,7 @@ impl Kernel {
         }
         timeout(Duration::from_millis(timeout_ms), notified)
             .await
-            .map_err(|_| Error::Timeout)?;
+            .map_err(|_elapsed| Error::Timeout)?;
         Ok(state.generation.load(Ordering::SeqCst))
     }
 

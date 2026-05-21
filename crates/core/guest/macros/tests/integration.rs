@@ -5,13 +5,12 @@ use selium_guest::{
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 #[pattern_interface]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "macro-generated interface used at build time")]
 trait Echo {
     fn echo(&self);
 }
 
 #[entrypoint]
-#[allow(dead_code)]
 async fn demo_entrypoint() {
     tracing::info!("macro entrypoint invoked");
 }

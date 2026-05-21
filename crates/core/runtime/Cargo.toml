@@ -21,3 +21,6 @@ wasmtiny.workspace = true
 [dev-dependencies]
 selium-io = { path = "../../libs/io" }
 wat.workspace = true
+
+[lints]
+workspace = true

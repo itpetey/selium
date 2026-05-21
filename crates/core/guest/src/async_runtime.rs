@@ -224,17 +224,24 @@ fn poll_backgrounds() -> bool {
         if let Ok(mut tasks) = tasks.try_borrow_mut() {
             let mut index = 0;
             while index < tasks.len() {
-                if !tasks[index].runnable {
+                let Some(task) = tasks.get(index) else {
+                    index += 1;
+                    continue;
+                };
+                if !task.runnable {
                     index += 1;
                     continue;
                 }
 
-                tasks[index].runnable = false;
-                let task_id = tasks[index].id;
+                let task_id = task.id;
+                let Some(task) = tasks.get_mut(index) else {
+                    continue;
+                };
+                task.runnable = false;
                 let waker = futures::task::waker(Arc::new(TaskWake { task_id }));
                 let mut context = Context::from_waker(&waker);
                 CURRENT_TASK.with(|current| *current.borrow_mut() = Some(task_id));
-                let poll = tasks[index].future.as_mut().poll(&mut context);
+                let poll = task.future.as_mut().poll(&mut context);
                 CURRENT_TASK.with(|current| *current.borrow_mut() = None);
 
                 match poll {
@@ -247,6 +254,7 @@ fn poll_backgrounds() -> bool {
             }
         }
     });
+    // Apply any wakeups or spawns that tasks queued while being polled above.
     progressed | apply_wake_queue() | merge_spawn_queue()
 }
 
