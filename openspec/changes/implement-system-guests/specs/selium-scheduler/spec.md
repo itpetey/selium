@@ -14,6 +14,11 @@ The scheduler guest SHALL own scheduler placement state and SHALL reconcile loca
 - **WHEN** a placement intent is accepted by the scheduler
 - **THEN** the scheduler SHALL write the resulting desired state into scheduler-owned durable or live state before reconciling host-local actions
 
+#### Scenario: Running scheduler persists desired state
+- **WHEN** the scheduler guest entrypoint accepts placement intent through its configured interface
+- **THEN** it SHALL persist desired state through a durable log or live table resource before reporting the placement as accepted
+- **AND** native-only `SchedulerState` updates SHALL NOT satisfy this requirement
+
 ### Requirement: State-Machine Placement Flow
 The scheduler guest SHALL operate as a state machine that reads current placement state, computes changes, writes desired state, and reconciles observed host state.
 
@@ -34,6 +39,10 @@ The scheduler guest SHALL expose a request-exchange or equivalent typed interfac
 #### Scenario: Placement reply returned
 - **WHEN** an external caller submits a placement intent through a synchronous interface
 - **THEN** the scheduler SHALL return a success or failure result describing the accepted scheduling outcome
+
+#### Scenario: Placement interface is concrete
+- **WHEN** scheduler exposes placement or scaling intent handling
+- **THEN** it SHALL use a named request-exchange or typed channel resource rather than only generated metadata
 
 ### Requirement: Status Publication
 The scheduler guest SHALL publish workload status transitions for subscribers that need to observe scheduling progress.

@@ -14,6 +14,11 @@ The supervisor guest SHALL subscribe to or poll runtime activity and lifecycle s
 - **WHEN** the runtime publishes a lifecycle event for a managed process
 - **THEN** the supervisor SHALL receive and process that event
 
+#### Scenario: Running supervisor reads activity
+- **WHEN** the supervisor guest entrypoint starts with activity authority
+- **THEN** it SHALL read or subscribe to the runtime activity-log resource before reporting readiness or before entering its observation loop
+- **AND** native-only health helpers SHALL NOT satisfy runtime activity subscription
+
 ### Requirement: Managed Health State
 The supervisor guest SHALL maintain health and failure state for managed processes.
 
@@ -34,6 +39,10 @@ The supervisor guest SHALL emit recovery or rescheduling intent through an expli
 #### Scenario: Restart requested
 - **WHEN** the supervisor determines that a process should be restarted or rescheduled
 - **THEN** it SHALL emit that intent through the appropriate guest-facing interface
+
+#### Scenario: Recovery intent is concrete
+- **WHEN** supervisor emits restart or rescheduling intent
+- **THEN** it SHALL write to a named scheduler-facing topic, live table, durable log, or request exchange
 
 ### Requirement: Rules-Based Failure Handling
 The supervisor guest SHALL apply configured rules when handling unplanned process termination.

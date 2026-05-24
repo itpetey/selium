@@ -6,6 +6,11 @@ members = [
   "crates/core/guest/macros",
   "crates/core/kernel",
   "crates/core/runtime",
+  "crates/guests/cluster",
+  "crates/guests/discovery",
+  "crates/guests/external-api",
+  "crates/guests/scheduler",
+  "crates/guests/supervisor",
   "crates/libs/io",
 ]
 
@@ -27,6 +32,7 @@ quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 selium-abi = { path = "crates/core/abi" }
 selium-guest = { path = "crates/core/guest" }
+selium-io = { path = "crates/libs/io" }
 selium-kernel = { path = "crates/core/kernel" }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "2.0", default-features = false }

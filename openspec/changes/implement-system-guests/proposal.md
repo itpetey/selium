@@ -12,7 +12,7 @@ The Selium architecture described in `ARCHITECTURE.md` requires five system gues
 
 Without these, the platform has a host/guest foundation but no guest-owned control plane for accepting user intent, deciding placement, exposing discovery, monitoring workloads, or coordinating host state.
 
-The foundation work from `specify-host-guest-foundation` has landed and is archived. This change must therefore build on the current workspace, not the older proposal assumptions: core crates now live under `crates/core/...`, guest-side I/O patterns live in `selium-io`, runtime bootstrap is descriptor driven, and no `modules/` system guest crates exist yet.
+The foundation work from `specify-host-guest-foundation` has landed and is archived. This change must therefore build on the current workspace, not the older proposal assumptions: core crates now live under `crates/core/...`, guest-side libraries live under `crates/libs/...`, and system guests live under `crates/guests/...`.
 
 ## What Changes
 
@@ -81,11 +81,11 @@ Exact grants should be expressed as `CapabilityGrant` values using tenant, URI-p
 
 ### New Workspace Crates
 
-- `modules/external-api/` - External API guest
-- `modules/supervisor/` - Supervisor guest
-- `modules/scheduler/` - Scheduler guest
-- `modules/discovery/` - Discovery guest
-- `modules/cluster/` - Cluster guest
+- `crates/guests/external-api/` - External API guest
+- `crates/guests/supervisor/` - Supervisor guest
+- `crates/guests/scheduler/` - Scheduler guest
+- `crates/guests/discovery/` - Discovery guest
+- `crates/guests/cluster/` - Cluster guest
 
 Each crate should use the package name `selium-<guest-name>` while keeping the directory name unprefixed.
 

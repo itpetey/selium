@@ -571,6 +571,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-cluster"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-io",
+]
+
+[[package]]
+name = "selium-discovery"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-io",
+]
+
+[[package]]
+name = "selium-external-api"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-io",
+]
+
+[[package]]
 name = "selium-guest"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -628,6 +652,22 @@ dependencies = [
  "tracing",
  "wasmtiny",
  "wat",
+]
+
+[[package]]
+name = "selium-scheduler"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-io",
+]
+
+[[package]]
+name = "selium-supervisor"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-io",
 ]
 
 [[package]]

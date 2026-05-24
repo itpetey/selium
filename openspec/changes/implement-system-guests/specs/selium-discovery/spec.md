@@ -14,6 +14,11 @@ The discovery guest SHALL maintain a durable mapping from Selium URIs to the hos
 - **WHEN** a platform resource or guest interface is registered with a Selium URI
 - **THEN** the discovery guest SHALL persist the mapping in its registration store
 
+#### Scenario: Running guest persists registration
+- **WHEN** a registration request reaches discovery through its configured resource
+- **THEN** the running guest entrypoint SHALL write the mapping to a durable host resource before acknowledging it
+- **AND** native-only map insertion SHALL NOT satisfy persistence
+
 ### Requirement: Exact URI Resolution
 The discovery guest SHALL resolve an exact Selium URI to the corresponding host-visible resource or interface.
 
@@ -34,6 +39,10 @@ The discovery guest SHALL expose registration and resolution behaviour through e
 #### Scenario: Guest performs discovery query
 - **WHEN** another guest performs a discovery query through a supported interface
 - **THEN** the discovery guest SHALL return the matching discovery result through that interface without relying on an unspecified messaging layer
+
+#### Scenario: Discovery interface is concrete
+- **WHEN** discovery exposes registration or resolution
+- **THEN** it SHALL use named request-exchange, topic, live-table, or durable-log resources available through `selium-guest`/`selium-io`
 
 ### Requirement: Interface Metadata Visibility
 The discovery guest SHALL retain and return guest-facing interface metadata needed for callers to discover how to interact with registered resources.

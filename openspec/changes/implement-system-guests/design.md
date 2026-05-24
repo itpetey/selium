@@ -16,7 +16,7 @@ The system guests still serve the roles described in `ARCHITECTURE.md`, but thei
 **Current state:**
 - The foundation is implemented, archived under `openspec/changes/archive/2026-04-30-specify-host-guest-foundation/`, and reflected in `openspec/specs/`
 - No system guests are implemented in arch3 yet
-- No `modules/` directory exists yet
+- System guests will live under `crates/guests/...`
 - `SUMMARY.md` records the current split: `selium-guest` wraps primitive handles and `selium-io` owns guest-side I/O patterns
 
 **Constraints:**
@@ -137,7 +137,7 @@ The system guests still serve the roles described in `ARCHITECTURE.md`, but thei
 
 ## Migration Plan
 
-1. Create `modules/cluster`, `modules/discovery`, `modules/scheduler`, `modules/supervisor`, and `modules/external-api` as workspace crates.
+1. Create `crates/guests/cluster`, `crates/guests/discovery`, `crates/guests/scheduler`, `crates/guests/supervisor`, and `crates/guests/external-api` as workspace crates.
 2. Add zero-argument guest entrypoints, interface metadata, logging, and native-test seams for each crate.
 3. Define the runtime `SystemGuestDescriptor` set, scoped grants, dependencies, and readiness conditions.
 4. Implement guests in dependency order: cluster, discovery, scheduler, supervisor, external-api.

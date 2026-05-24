@@ -14,12 +14,21 @@ The cluster guest SHALL track host membership and availability for the cluster i
 - **WHEN** a host becomes visible to the configured cluster coordination mechanism
 - **THEN** the cluster guest SHALL record that host in cluster membership state
 
+#### Scenario: Running guest owns membership state
+- **WHEN** the cluster guest entrypoint starts
+- **THEN** it SHALL create, attach, or recover the configured membership table/log resource before reporting readiness
+- **AND** native-only state helpers SHALL NOT satisfy membership tracking without entrypoint wiring
+
 ### Requirement: Host Load Projection
 The cluster guest SHALL expose host load and availability data for consumers such as scheduler.
 
 #### Scenario: Scheduler reads host load
 - **WHEN** scheduler needs host capacity and availability inputs
 - **THEN** the cluster guest SHALL provide the current host load view through the defined state, topic, or live-table interface
+
+#### Scenario: Host load surface is concrete
+- **WHEN** host load changes are published
+- **THEN** the cluster guest SHALL write them to a named live table, topic, durable log, or request-exchange response that scheduler can consume
 
 ### Requirement: Shared-State Bootstrap
 The cluster guest SHALL initialise the day 1 shared state surfaces needed by other system guests.

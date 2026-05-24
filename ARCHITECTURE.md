@@ -42,30 +42,34 @@ Core technologies and design choices:
 
 ### Crates
 
-`selium-abi` library (crates/abi/) is responsible for:
+`selium-abi` library (crates/core/abi/) is responsible for:
 - Defining the canonical host-guest ABI
 - Defining capability grants, compound scopes, and resource identity classes
 - Defining hostcall payloads, completion states, and canonical framing rules
 
-`selium-kernel` library (crates/kernel/) is responsible for:
+`selium-kernel` library (crates/core/kernel/) is responsible for:
 - Exposing low-level primitives, e.g. shared memory, signalling, network, blob storage, append-only log storage, time, and process lifecycle
 - Resource tracking and capability-driven sharing of resources with WASM processes
 - Keeping a structured activity log that is both machine and human parseable, and accessible to guests given valid Capability
 - Guest process CPU, memory, storage, and bandwidth metering hooks
 
-`selium-runtime` library (crates/runtime/) is responsible for:
+`selium-runtime` library (crates/core/runtime/) is responsible for:
 - Wasmtiny-backed WASM runtime execution
 - Config-driven bootstrap of system guests
 - Capability and session enforcement at spawn time
 - Bridging external network protocols and TLS offload where required
 
-`selium-guest` library (crates/guest/) is responsible for:
+`selium-guest` library (crates/core/guest/) is responsible for:
 - Wrapping the ABI and kernel primitives
 - Providing ergonomic handles for guests to consume host resources
-- Providing the messaging-pattern layer, e.g. pub/sub, fanout, request/reply, streams, and live tables
+- Providing primitive handles, typed codecs, logging, platform calls, and macro-facing SDK support
 - Re-exporting tracing macros: `info!()`, `warn!()`, etc.
 
-`selium-guest-macros` library (crates/guest/macros/) is responsible for:
+`selium-io` library (crates/libs/io/) is responsible for:
+- Providing guest-side messaging-pattern overlays, e.g. channels, pub/sub, fanout seams, request/reply seams, streams, and live tables
+- Building those patterns on shared memory, signalling, durable logs, and network request exchanges
+
+`selium-guest-macros` library (crates/core/guest/macros/) is responsible for:
 - Defining procedural macros to assist with guest entrypoint function boilerplate
 - Generating guest-facing messaging metadata for discovery and runtime bootstrap
 
@@ -80,34 +84,34 @@ Core technologies and design choices:
 - Wrapping the guest API
 - Providing ergonomic handles for external code to interact with guests and hosts
 
-`selium-external-api` guest (modules/external-api/) is responsible for:
+`selium-external-api` guest (crates/guests/external-api/) is responsible for:
 - Creating/running the API server using an RPC channel
 - Bridging channel to QUIC socket
 
-`selium-supervisor` guest (modules/supervisor/) is responsible for:
+`selium-supervisor` guest (crates/guests/supervisor/) is responsible for:
 - Listening to host activity log for new guest processes
 - Monitoring guest processes
 - Handling errors and unplanned process termination using a rules-based setup
 
-`selium-scheduler` guest (modules/router/) is responsible for:
+`selium-scheduler` guest (crates/guests/scheduler/) is responsible for:
 - Starting and stopping guest processes (via host ABI)
 - Creating and destroying I/O channels
 - Deciding on placement in a multi-host environment
-- It will operate as a state machine using a cluster-shared I/O table - once a new state is committed, every scheduler will reconcile the new state with their current state.
+- It operates as a state machine using scheduler-owned durable/live state and cluster-provided host visibility; once desired state is committed, schedulers reconcile observed host state toward it.
 
-`selium-discovery` guest (modules/discovery/) is responsible for:
+`selium-discovery` guest (crates/guests/discovery/) is responsible for:
 - Owning the URI layout
 - Keeping a map of URI => host + resource ID
 - Providing a discovery service to guests
 - Metadata validation, e.g. type checking for channels to ensure that subscribers are receiving the encoded data they expect (not for day 1)
 
-`selium-cluster` guest (modules/cluster/) is responsible for:
+`selium-cluster` guest (crates/guests/cluster/) is responsible for:
 - Keeping track of hosts in the cluster
 - Providing a live table to `selium-scheduler` so it can make placement decisions based on host load and latency
 - Shutdown/update coordination - migrating processes, data, and channels from one host to others (not required for day 1)
 - Shared MPMC channel for data exchange
 - Shared consensus channel for coordination
-- Update DNS TXT record
+- DNS TXT record publishing is deferred behind the runtime/network bridge boundary for day 1
 
 NOTE: Other crates can exist outside these core crates. This is just a starting point.
 
