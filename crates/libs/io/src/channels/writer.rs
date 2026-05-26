@@ -163,6 +163,22 @@ fn map_core_error(error: crate::Error) -> Error {
     }
 }
 
+fn write_aborted_frame(
+    region: &ChannelRegion,
+    pos: u64,
+    payload_len: usize,
+    tag: u32,
+    mask: u64,
+) -> Result<()> {
+    let header = FrameHeader {
+        len: payload_len as u32,
+        tag,
+        flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_ABORTED,
+        _reserved: [0; 3],
+    };
+    write_raw(region, pos, &header.encode(), mask)
+}
+
 fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result<()> {
     if data.len() as u64 > region.capacity() {
         return Err(Error::ChannelFull);
@@ -205,22 +221,6 @@ fn write_reserved_frame(
         ..header
     };
     write_raw(region, pos, &ready_header.encode(), mask)
-}
-
-fn write_aborted_frame(
-    region: &ChannelRegion,
-    pos: u64,
-    payload_len: usize,
-    tag: u32,
-    mask: u64,
-) -> Result<()> {
-    let header = FrameHeader {
-        len: payload_len as u32,
-        tag,
-        flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_ABORTED,
-        _reserved: [0; 3],
-    };
-    write_raw(region, pos, &header.encode(), mask)
 }
 
 #[cfg(test)]

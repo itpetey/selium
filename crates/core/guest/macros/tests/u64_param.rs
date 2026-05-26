@@ -1,11 +1,10 @@
-use selium_guest::{
-    Capability, CapabilityGrant, LocalityScope, ResourceSelector, entrypoint,
-};
+use selium_guest::{Capability, CapabilityGrant, LocalityScope, ResourceSelector, entrypoint};
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-#[entrypoint]
-async fn param_entrypoint(_handle: u64) {
-    tracing::info!("param entrypoint invoked");
+fn encode_u64_argument(value: u64) -> Vec<u8> {
+    let mut bytes = vec![1u8]; // WasmValue::I64 tag
+    bytes.extend_from_slice(&value.to_le_bytes());
+    bytes
 }
 
 #[test]
@@ -46,8 +45,7 @@ fn module_with_entrypoint_and_i64_param(entrypoint: &str) -> Vec<u8> {
     .expect("compile wat")
 }
 
-fn encode_u64_argument(value: u64) -> Vec<u8> {
-    let mut bytes = vec![1u8]; // WasmValue::I64 tag
-    bytes.extend_from_slice(&value.to_le_bytes());
-    bytes
+#[entrypoint]
+async fn param_entrypoint(_handle: u64) {
+    tracing::info!("param entrypoint invoked");
 }

@@ -46,12 +46,173 @@ fn attach_shared_region(
 }
 
 #[expect(clippy::panic, reason = "test helper unreachable branch")]
+fn compare_exchange_shared_memory_u64(
+    runtime: &Runtime,
+    process_id: u64,
+    local_id: u64,
+    offset: u32,
+    current: u64,
+    new: u64,
+) -> u64 {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::SharedMemoryCompareExchangeU64 {
+            local_id,
+            offset,
+            current,
+            new,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::U64(previous)) => previous,
+        other => panic!("expected U64, got {other:?}"),
+    }
+}
+
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
 fn create_signal(runtime: &Runtime, process_id: u64) -> selium_abi::SignalDescriptor {
     let (status, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::SignalCreate);
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
     match runtime.poll_hostcall(process_id, op_id) {
         CompletionState::Ready(HostcallOutput::Signal(descriptor)) => descriptor,
         other => panic!("expected Signal, got {other:?}"),
+    }
+}
+
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
+fn fetch_add_shared_memory_u64(
+    runtime: &Runtime,
+    process_id: u64,
+    local_id: u64,
+    offset: u32,
+    value: u64,
+) -> u64 {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::SharedMemoryFetchAddU64 {
+            local_id,
+            offset,
+            value,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::U64(previous)) => previous,
+        other => panic!("expected U64, got {other:?}"),
+    }
+}
+
+/// Tests host queue create and attach hostcalls.
+#[test]
+fn host_queue_create_and_attach() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, attach_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueAttach {
+            shared_id: descriptor.shared_id,
+        },
+    );
+    let attached = match runtime.poll_hostcall(process_id, attach_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    assert_eq!(attached.shared_id, descriptor.shared_id);
+}
+
+/// Tests host queue recv on an empty queue returns pending.
+#[test]
+fn host_queue_recv_empty_returns_pending() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-pending-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, recv_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueRecv {
+            local_id: descriptor.local_id,
+        },
+    );
+    match runtime.poll_hostcall(process_id, recv_id) {
+        CompletionState::Pending { .. } => {}
+        other => panic!("expected Pending, got {other:?}"),
+    }
+}
+
+/// Tests host queue send and recv hostcalls.
+#[test]
+fn host_queue_send_and_recv() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-send-recv-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, send_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueSend {
+            local_id: descriptor.local_id,
+            value: 42,
+        },
+    );
+    assert_eq!(
+        runtime.poll_hostcall(process_id, send_id),
+        CompletionState::Ready(HostcallOutput::Empty)
+    );
+
+    let (_, recv_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueRecv {
+            local_id: descriptor.local_id,
+        },
+    );
+    match runtime.poll_hostcall(process_id, recv_id) {
+        CompletionState::Ready(HostcallOutput::ConnectionInfo {
+            client_process_id,
+            value,
+        }) => {
+            assert_eq!(client_process_id, process_id);
+            assert_eq!(value, 42);
+        }
+        other => panic!("expected ConnectionInfo, got {other:?}"),
     }
 }
 
@@ -147,67 +308,6 @@ fn shared_memory_atomic_u64_hostcalls_update_in_place() {
 
     let bytes = read_shared_memory(&runtime, process_id, mapping.local_id, 8, 8);
     assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 7);
-}
-
-/// Tests the selium-io frame header wire format through kernel shared memory.
-///
-/// This validates that frames written via one mapping can be read back
-/// through another, simulating two guests sharing a ring buffer region.
-#[test]
-fn shared_memory_ring_buffer_frame_format() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest(&runtime, "frame-format-test");
-
-    // Allocate a shared memory region large enough for a ring buffer header + data.
-    let region_size: u32 = 8192;
-    let region = alloc_shared_region(&runtime, process_id, region_size, 8);
-
-    // Attach a mapping to the region for writing.
-    let mapping = attach_shared_region(&runtime, process_id, region.shared_id, 0, region_size);
-
-    // The data area starts at offset 4096 (REGION_HEADER_BYTES).
-    let data_offset: u32 = 4096;
-
-    // Write a frame header + payload: "hello" at the data offset.
-    let payload = b"hello";
-    let header = selium_io::FrameHeader {
-        len: payload.len() as u32,
-        tag: 1,
-        flags: 0,
-        _reserved: [0; 3],
-    };
-    let header_bytes = header.encode();
-
-    // Write header and payload consecutively.
-    write_shared_memory(
-        &runtime,
-        process_id,
-        mapping.local_id,
-        data_offset,
-        header_bytes.to_vec(),
-    );
-    write_shared_memory(
-        &runtime,
-        process_id,
-        mapping.local_id,
-        data_offset + 12,
-        payload.to_vec(),
-    );
-
-    // Read back and validate the header.
-    let read_header_bytes =
-        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset, 12);
-    let decoded = selium_io::FrameHeader::decode(&read_header_bytes).expect("valid frame header");
-    assert_eq!(decoded.len, 5);
-    assert_eq!(decoded.tag, 1);
-
-    // Read back and validate the payload.
-    let read_payload =
-        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset + 12, 5);
-    assert_eq!(read_payload, b"hello");
-
-    // Verify frame_size() matches.
-    assert_eq!(decoded.frame_size(), 17);
 }
 
 /// Tests multi-memory shared region layout header write/read through the runtime.
@@ -306,6 +406,67 @@ fn shared_memory_multi_memory_layout_discovery() {
     assert_eq!(u32::from_le_bytes(read_len1.try_into().unwrap()), 4096);
 }
 
+/// Tests the selium-io frame header wire format through kernel shared memory.
+///
+/// This validates that frames written via one mapping can be read back
+/// through another, simulating two guests sharing a ring buffer region.
+#[test]
+fn shared_memory_ring_buffer_frame_format() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest(&runtime, "frame-format-test");
+
+    // Allocate a shared memory region large enough for a ring buffer header + data.
+    let region_size: u32 = 8192;
+    let region = alloc_shared_region(&runtime, process_id, region_size, 8);
+
+    // Attach a mapping to the region for writing.
+    let mapping = attach_shared_region(&runtime, process_id, region.shared_id, 0, region_size);
+
+    // The data area starts at offset 4096 (REGION_HEADER_BYTES).
+    let data_offset: u32 = 4096;
+
+    // Write a frame header + payload: "hello" at the data offset.
+    let payload = b"hello";
+    let header = selium_io::FrameHeader {
+        len: payload.len() as u32,
+        tag: 1,
+        flags: 0,
+        _reserved: [0; 3],
+    };
+    let header_bytes = header.encode();
+
+    // Write header and payload consecutively.
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        data_offset,
+        header_bytes.to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        data_offset + 12,
+        payload.to_vec(),
+    );
+
+    // Read back and validate the header.
+    let read_header_bytes =
+        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset, 12);
+    let decoded = selium_io::FrameHeader::decode(&read_header_bytes).expect("valid frame header");
+    assert_eq!(decoded.len, 5);
+    assert_eq!(decoded.tag, 1);
+
+    // Read back and validate the payload.
+    let read_payload =
+        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset + 12, 5);
+    assert_eq!(read_payload, b"hello");
+
+    // Verify frame_size() matches.
+    assert_eq!(decoded.frame_size(), 17);
+}
+
 /// Tests signal creation and notify through the runtime.
 ///
 /// Signals are the notification primitive used by selium-io channels.
@@ -401,77 +562,6 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
     report.guests[0].process_id
 }
 
-#[expect(clippy::panic, reason = "test helper unreachable branch")]
-fn write_shared_memory(
-    runtime: &Runtime,
-    process_id: u64,
-    local_id: u64,
-    offset: u32,
-    bytes: Vec<u8>,
-) {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::SharedMemoryWrite {
-            local_id,
-            offset,
-            bytes,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::Empty) => {}
-        other => panic!("expected Empty, got {other:?}"),
-    }
-}
-
-#[expect(clippy::panic, reason = "test helper unreachable branch")]
-fn fetch_add_shared_memory_u64(
-    runtime: &Runtime,
-    process_id: u64,
-    local_id: u64,
-    offset: u32,
-    value: u64,
-) -> u64 {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::SharedMemoryFetchAddU64 {
-            local_id,
-            offset,
-            value,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::U64(previous)) => previous,
-        other => panic!("expected U64, got {other:?}"),
-    }
-}
-
-#[expect(clippy::panic, reason = "test helper unreachable branch")]
-fn compare_exchange_shared_memory_u64(
-    runtime: &Runtime,
-    process_id: u64,
-    local_id: u64,
-    offset: u32,
-    current: u64,
-    new: u64,
-) -> u64 {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::SharedMemoryCompareExchangeU64 {
-            local_id,
-            offset,
-            current,
-            new,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::U64(previous)) => previous,
-        other => panic!("expected U64, got {other:?}"),
-    }
-}
-
 #[expect(
     clippy::indexing_slicing,
     reason = "test helper always bootstraps one guest"
@@ -494,115 +584,25 @@ fn spawn_guest_with_grants(runtime: &Runtime, name: &str, grants: Vec<Capability
     report.guests[0].process_id
 }
 
-/// Tests host queue create and attach hostcalls.
-#[test]
-fn host_queue_create_and_attach() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest_with_grants(
-        &runtime,
-        "queue-test",
-        vec![CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )],
-    );
-
-    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
-    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
-        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
-        other => panic!("expected HostQueue descriptor, got {other:?}"),
-    };
-
-    let (_, attach_id) = runtime.begin_hostcall(
+#[expect(clippy::panic, reason = "test helper unreachable branch")]
+fn write_shared_memory(
+    runtime: &Runtime,
+    process_id: u64,
+    local_id: u64,
+    offset: u32,
+    bytes: Vec<u8>,
+) {
+    let (status, op_id) = runtime.begin_hostcall(
         process_id,
-        HostcallRequest::HostQueueAttach {
-            shared_id: descriptor.shared_id,
+        HostcallRequest::SharedMemoryWrite {
+            local_id,
+            offset,
+            bytes,
         },
     );
-    let attached = match runtime.poll_hostcall(process_id, attach_id) {
-        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
-        other => panic!("expected HostQueue descriptor, got {other:?}"),
-    };
-
-    assert_eq!(attached.shared_id, descriptor.shared_id);
-}
-
-/// Tests host queue send and recv hostcalls.
-#[test]
-fn host_queue_send_and_recv() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest_with_grants(
-        &runtime,
-        "queue-send-recv-test",
-        vec![CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )],
-    );
-
-    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
-    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
-        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
-        other => panic!("expected HostQueue descriptor, got {other:?}"),
-    };
-
-    let (_, send_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::HostQueueSend {
-            local_id: descriptor.local_id,
-            value: 42,
-        },
-    );
-    assert_eq!(
-        runtime.poll_hostcall(process_id, send_id),
-        CompletionState::Ready(HostcallOutput::Empty)
-    );
-
-    let (_, recv_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::HostQueueRecv {
-            local_id: descriptor.local_id,
-        },
-    );
-    match runtime.poll_hostcall(process_id, recv_id) {
-        CompletionState::Ready(HostcallOutput::ConnectionInfo {
-            client_process_id,
-            value,
-        }) => {
-            assert_eq!(client_process_id, process_id);
-            assert_eq!(value, 42);
-        }
-        other => panic!("expected ConnectionInfo, got {other:?}"),
-    }
-}
-
-/// Tests host queue recv on an empty queue returns pending.
-#[test]
-fn host_queue_recv_empty_returns_pending() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest_with_grants(
-        &runtime,
-        "queue-pending-test",
-        vec![CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )],
-    );
-
-    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
-    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
-        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
-        other => panic!("expected HostQueue descriptor, got {other:?}"),
-    };
-
-    let (_, recv_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::HostQueueRecv {
-            local_id: descriptor.local_id,
-        },
-    );
-    match runtime.poll_hostcall(process_id, recv_id) {
-        CompletionState::Pending { .. } => {}
-        other => panic!("expected Pending, got {other:?}"),
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::Empty) => {}
+        other => panic!("expected Empty, got {other:?}"),
     }
 }

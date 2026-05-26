@@ -6,10 +6,17 @@ use selium_guest::{entrypoint, pattern_interface};
 
 pub type TopicRegion = selium_io::ChannelRegion;
 
+pub const DESIRED_WORKLOAD_TABLE: &str = "selium.scheduler.desired-workloads";
 pub const PLACEMENT_INTENT_EXCHANGE: &str = "selium.scheduler.placement";
 pub const SCHEDULER_STATE_LOG: &str = "selium.scheduler.state";
 pub const WORKLOAD_STATUS_TOPIC: &str = "selium.scheduler.status";
-pub const DESIRED_WORKLOAD_TABLE: &str = "selium.scheduler.desired-workloads";
+
+#[pattern_interface]
+pub trait SchedulerControl {
+    fn place(spec: WorkloadSpec);
+    fn scale(workload_id: String, replicas: u32);
+    fn status(workload_id: String);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPlacementInput {
@@ -51,23 +58,6 @@ pub struct PlacementDecision {
 pub struct SchedulerState {
     desired: BTreeMap<String, PlacementDecision>,
     status: BTreeMap<String, WorkloadStatus>,
-}
-
-#[pattern_interface]
-pub trait SchedulerControl {
-    fn place(spec: WorkloadSpec);
-    fn scale(workload_id: String, replicas: u32);
-    fn status(workload_id: String);
-}
-
-#[entrypoint]
-async fn scheduler_main() {
-    selium_guest::info!(guest = "selium-scheduler", "system guest booting");
-    selium_guest::mark_ready();
-}
-
-pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
-    schedulercontrol_pattern_metadata()
 }
 
 impl SchedulerState {
@@ -145,6 +135,10 @@ impl SchedulerState {
     }
 }
 
+pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
+    schedulercontrol_pattern_metadata()
+}
+
 fn host_satisfies(host: &HostPlacementInput, spec: &WorkloadSpec) -> bool {
     host.available
         && host.free_cpu_millis >= spec.cpu_millis
@@ -153,6 +147,12 @@ fn host_satisfies(host: &HostPlacementInput, spec: &WorkloadSpec) -> bool {
             .isolation_key
             .as_ref()
             .is_none_or(|key| !host.isolation_keys.contains(key))
+}
+
+#[entrypoint]
+async fn scheduler_main() {
+    selium_guest::info!(guest = "selium-scheduler", "system guest booting");
+    selium_guest::mark_ready();
 }
 
 #[cfg(test)]

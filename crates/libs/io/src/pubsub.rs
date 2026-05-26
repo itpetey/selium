@@ -204,17 +204,6 @@ impl Subscriber {
     }
 }
 
-fn map_channel_error(error: channels::Error) -> Error {
-    match error {
-        channels::Error::ChannelEmpty => Error::BufferEmpty,
-        channels::Error::ReaderBehind => Error::ReaderBehind,
-        channels::Error::ReservationContended => Error::ReservationContended,
-        channels::Error::InvalidFrame => Error::InvalidFrame,
-        channels::Error::Core(error) => error,
-        other => Error::Guest(other.to_string()),
-    }
-}
-
 impl<T> RkyvCodec<T> {
     pub fn new() -> Self {
         Self(PhantomData)
@@ -292,6 +281,12 @@ impl<C: Codec> TypedPublisher<C> {
     }
 }
 
+impl<C: Codec> TypedPublisher<C> {
+    pub(crate) fn from_raw(inner: Publisher, codec: C) -> Self {
+        Self { inner, codec }
+    }
+}
+
 impl<C: Codec + Default> TypedSubscriber<C> {
     /// Creates a new typed pub/sub topic from the subscriber side.
     pub fn create(capacity: u32) -> Result<Self> {
@@ -342,74 +337,10 @@ impl<C: Codec> TypedSubscriber<C> {
     }
 }
 
-fn attach_topic(shared_id: u64, capacity: u64) -> Result<(RingBuf, Signal)> {
-    let ring = RingBuf::attach(shared_id, capacity)?;
-    let signal_shared_id = ring
-        .region()
-        .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
-        .map_err(|_invalid_layout| Error::InvalidLayout)?;
-    let signal = Signal::attach(signal_shared_id).map_err(|e| Error::Guest(e.to_string()))?;
-    Ok((ring, signal))
-}
-
-fn create_topic(capacity: u32) -> Result<(RingBuf, Signal)> {
-    let capacity = round_capacity(capacity)?;
-    RingBuf::create(capacity)
-}
-
-fn reader_from_ring(ring: &RingBuf) -> Result<StrongReader> {
-    let tail = ring.read_next_tail()?;
-    reader_from_ring_at(ring, tail)
-}
-
-fn reader_from_ring_at(ring: &RingBuf, start_pos: u64) -> Result<StrongReader> {
-    let reader_id = ring.region().allocate_reader_slot(start_pos)?;
-    Ok(StrongReader::new(
-        ring.region().clone(),
-        start_pos,
-        reader_id,
-    ))
-}
-
-fn writer_from_ring(ring: &RingBuf) -> Result<RefCell<StrongWriter>> {
-    ring.region().increment_writer_count()?;
-    let writer_id = match ring.region().allocate_writer_id() {
-        Ok(writer_id) => writer_id,
-        Err(error) => {
-            if let Err(_rollback_error) = ring.region().decrement_writer_count() {}
-            return Err(error);
-        }
-    };
-    Ok(RefCell::new(StrongWriter::new(
-        ring.region().clone(),
-        writer_id,
-        None,
-    )))
-}
-
-pub(crate) fn create_pair() -> Result<(Publisher, Subscriber)> {
-    // Default capacity of 64 KB for table topics
-    let (ring, signal) = create_topic(64 * 1024)?;
-    let writer = writer_from_ring(&ring)?;
-    let publisher_signal = attach_signal(&signal)?;
-    let publisher = Publisher {
-        writer,
-        signal: publisher_signal,
-        shared_id: ring.shared_id(),
-        capacity: ring.capacity(),
-    };
-    let reader = reader_from_ring_at(&ring, 0)?;
-    let observed_generation = signal
-        .generation()
-        .map_err(|e| Error::Guest(e.to_string()))?;
-    let subscriber = Subscriber {
-        reader,
-        signal,
-        shared_id: ring.shared_id(),
-        capacity: ring.capacity(),
-        observed_generation,
-    };
-    Ok((publisher, subscriber))
+impl<C: Codec> TypedSubscriber<C> {
+    pub(crate) fn from_raw(inner: Subscriber, codec: C) -> Self {
+        Self { inner, codec }
+    }
 }
 
 pub(crate) fn attach_pair(shared_id: u64, capacity: u64) -> Result<(Publisher, Subscriber)> {
@@ -440,18 +371,87 @@ pub(crate) fn attach_pair(shared_id: u64, capacity: u64) -> Result<(Publisher, S
     Ok((publisher, subscriber))
 }
 
+pub(crate) fn create_pair() -> Result<(Publisher, Subscriber)> {
+    // Default capacity of 64 KB for table topics
+    let (ring, signal) = create_topic(64 * 1024)?;
+    let writer = writer_from_ring(&ring)?;
+    let publisher_signal = attach_signal(&signal)?;
+    let publisher = Publisher {
+        writer,
+        signal: publisher_signal,
+        shared_id: ring.shared_id(),
+        capacity: ring.capacity(),
+    };
+    let reader = reader_from_ring_at(&ring, 0)?;
+    let observed_generation = signal
+        .generation()
+        .map_err(|e| Error::Guest(e.to_string()))?;
+    let subscriber = Subscriber {
+        reader,
+        signal,
+        shared_id: ring.shared_id(),
+        capacity: ring.capacity(),
+        observed_generation,
+    };
+    Ok((publisher, subscriber))
+}
+
 fn attach_signal(signal: &Signal) -> Result<Signal> {
     Signal::attach(signal.shared_id()).map_err(|e| Error::Guest(e.to_string()))
 }
 
-impl<C: Codec> TypedPublisher<C> {
-    pub(crate) fn from_raw(inner: Publisher, codec: C) -> Self {
-        Self { inner, codec }
+fn attach_topic(shared_id: u64, capacity: u64) -> Result<(RingBuf, Signal)> {
+    let ring = RingBuf::attach(shared_id, capacity)?;
+    let signal_shared_id = ring
+        .region()
+        .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
+        .map_err(|_invalid_layout| Error::InvalidLayout)?;
+    let signal = Signal::attach(signal_shared_id).map_err(|e| Error::Guest(e.to_string()))?;
+    Ok((ring, signal))
+}
+
+fn create_topic(capacity: u32) -> Result<(RingBuf, Signal)> {
+    let capacity = round_capacity(capacity)?;
+    RingBuf::create(capacity)
+}
+
+fn map_channel_error(error: channels::Error) -> Error {
+    match error {
+        channels::Error::ChannelEmpty => Error::BufferEmpty,
+        channels::Error::ReaderBehind => Error::ReaderBehind,
+        channels::Error::ReservationContended => Error::ReservationContended,
+        channels::Error::InvalidFrame => Error::InvalidFrame,
+        channels::Error::Core(error) => error,
+        other => Error::Guest(other.to_string()),
     }
 }
 
-impl<C: Codec> TypedSubscriber<C> {
-    pub(crate) fn from_raw(inner: Subscriber, codec: C) -> Self {
-        Self { inner, codec }
-    }
+fn reader_from_ring(ring: &RingBuf) -> Result<StrongReader> {
+    let tail = ring.read_next_tail()?;
+    reader_from_ring_at(ring, tail)
+}
+
+fn reader_from_ring_at(ring: &RingBuf, start_pos: u64) -> Result<StrongReader> {
+    let reader_id = ring.region().allocate_reader_slot(start_pos)?;
+    Ok(StrongReader::new(
+        ring.region().clone(),
+        start_pos,
+        reader_id,
+    ))
+}
+
+fn writer_from_ring(ring: &RingBuf) -> Result<RefCell<StrongWriter>> {
+    ring.region().increment_writer_count()?;
+    let writer_id = match ring.region().allocate_writer_id() {
+        Ok(writer_id) => writer_id,
+        Err(error) => {
+            if let Err(_rollback_error) = ring.region().decrement_writer_count() {}
+            return Err(error);
+        }
+    };
+    Ok(RefCell::new(StrongWriter::new(
+        ring.region().clone(),
+        writer_id,
+        None,
+    )))
 }

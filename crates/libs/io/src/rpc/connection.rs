@@ -16,6 +16,19 @@ pub struct RpcConnection<Req, Rep> {
     _phantom: std::marker::PhantomData<(Req, Rep)>,
 }
 
+/// A single request received by the server, with the ability to reply.
+pub struct RpcRequest<'a, Req, Rep> {
+    payload: Req,
+    #[expect(
+        dead_code,
+        reason = "correlation_id not yet propagated to reply frames"
+    )]
+    correlation_id: u32,
+    reply_writer: &'a mut StrongWriter,
+    reply_signal: &'a Signal,
+    _phantom: std::marker::PhantomData<Rep>,
+}
+
 impl<Req, Rep> RpcConnection<Req, Rep> {
     /// Creates an RPC connection from the server side.
     pub fn for_server(shared_id: u64, client_process_id: u64) -> Result<Self, RpcError> {
@@ -189,19 +202,6 @@ impl<Req, Rep> RpcConnection<Req, Rep> {
             }
         }
     }
-}
-
-/// A single request received by the server, with the ability to reply.
-pub struct RpcRequest<'a, Req, Rep> {
-    payload: Req,
-    #[expect(
-        dead_code,
-        reason = "correlation_id not yet propagated to reply frames"
-    )]
-    correlation_id: u32,
-    reply_writer: &'a mut StrongWriter,
-    reply_signal: &'a Signal,
-    _phantom: std::marker::PhantomData<Rep>,
 }
 
 impl<'a, Req, Rep> RpcRequest<'a, Req, Rep> {

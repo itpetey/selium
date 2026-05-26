@@ -51,7 +51,11 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let param_kind = function.sig.inputs.iter().next().and_then(|arg| {
         if let syn::FnArg::Typed(pat_type) = arg {
             if let syn::Type::Path(type_path) = &*pat_type.ty {
-                type_path.path.segments.last().map(|seg| seg.ident.to_string())
+                type_path
+                    .path
+                    .segments
+                    .last()
+                    .map(|seg| seg.ident.to_string())
             } else {
                 None
             }

@@ -6,10 +6,17 @@ use selium_guest::{entrypoint, pattern_interface};
 
 pub type TopicRegion = selium_io::ChannelRegion;
 
-pub const RUNTIME_ACTIVITY_CURSOR: &str = "selium.supervisor.activity-cursor";
 pub const PROCESS_HEALTH_TABLE: &str = "selium.supervisor.health";
 pub const RECOVERY_INTENT_TOPIC: &str = "selium.supervisor.recovery";
 pub const RESTART_POLICY_LOG: &str = "selium.supervisor.restart-policy";
+pub const RUNTIME_ACTIVITY_CURSOR: &str = "selium.supervisor.activity-cursor";
+
+#[pattern_interface]
+pub trait SupervisorControl {
+    fn observe_process(process_id: u64);
+    fn health(process_id: u64);
+    fn recovery_intents();
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartPolicy {
@@ -55,23 +62,6 @@ pub enum RecoveryIntent {
 pub struct SupervisorState {
     processes: BTreeMap<u64, ManagedProcess>,
     recovery: Vec<RecoveryIntent>,
-}
-
-#[pattern_interface]
-pub trait SupervisorControl {
-    fn observe_process(process_id: u64);
-    fn health(process_id: u64);
-    fn recovery_intents();
-}
-
-#[entrypoint]
-async fn supervisor_main() {
-    selium_guest::info!(guest = "selium-supervisor", "system guest booting");
-    selium_guest::mark_ready();
-}
-
-pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
-    supervisorcontrol_pattern_metadata()
 }
 
 impl SupervisorState {
@@ -135,12 +125,22 @@ impl SupervisorState {
     }
 }
 
+pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
+    supervisorcontrol_pattern_metadata()
+}
+
 fn backoff_delay(initial_delay_ms: u64, max_delay_ms: u64, failures: u32) -> u64 {
     let mut delay = initial_delay_ms;
     for _ in 1..failures {
         delay = delay.saturating_mul(2).min(max_delay_ms);
     }
     delay.min(max_delay_ms)
+}
+
+#[entrypoint]
+async fn supervisor_main() {
+    selium_guest::info!(guest = "selium-supervisor", "system guest booting");
+    selium_guest::mark_ready();
 }
 
 #[cfg(test)]

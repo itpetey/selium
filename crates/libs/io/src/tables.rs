@@ -31,12 +31,6 @@ pub struct LiveTableRecord<V> {
     pub version: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveTableEntry<V> {
-    value: Option<V>,
-    version: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyOutcome {
     Applied(u64),
@@ -67,6 +61,12 @@ where
     subscriber: RefCell<TypedSubscriber<C>>,
     local: RefCell<HashMap<K, LiveTableEntry<V>>>,
     _phantom: PhantomData<C>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTableEntry<V> {
+    value: Option<V>,
+    version: u64,
 }
 
 impl<K, V, C> LiveTable<K, V, C>
@@ -269,31 +269,6 @@ where
     }
 }
 
-fn scan_entries<K, V>(
-    local: &HashMap<K, LiveTableEntry<V>>,
-    limit: usize,
-) -> Vec<(K, LiveTableRecord<V>)>
-where
-    K: Clone + Eq + Hash,
-    V: Clone,
-{
-    local
-        .iter()
-        .filter_map(|(key, entry)| {
-            entry.value.clone().map(|value| {
-                (
-                    key.clone(),
-                    LiveTableRecord {
-                        value,
-                        version: entry.version,
-                    },
-                )
-            })
-        })
-        .take(limit)
-        .collect()
-}
-
 fn apply_message_to<K, V>(
     local: &mut HashMap<K, LiveTableEntry<V>>,
     msg: LiveTableMessage<K, V>,
@@ -336,6 +311,31 @@ where
             ApplyOutcome::Deleted(version)
         }
     }
+}
+
+fn scan_entries<K, V>(
+    local: &HashMap<K, LiveTableEntry<V>>,
+    limit: usize,
+) -> Vec<(K, LiveTableRecord<V>)>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    local
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry.value.clone().map(|value| {
+                (
+                    key.clone(),
+                    LiveTableRecord {
+                        value,
+                        version: entry.version,
+                    },
+                )
+            })
+        })
+        .take(limit)
+        .collect()
 }
 
 #[cfg(test)]

@@ -411,16 +411,6 @@ pub enum DiscoveryRequest {
     Resolve(String),
 }
 
-/// Response from the discovery service.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum DiscoveryResponse {
-    /// The requested URI was found.
-    Found(ResourceTarget),
-    /// The requested URI was not found.
-    NotFound,
-}
-
 /// Target resource returned by discovery resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -433,6 +423,16 @@ pub struct ResourceTarget {
     pub resource_id: u64,
     /// Optional interface metadata.
     pub interface: Option<InterfaceMetadata>,
+}
+
+/// Response from the discovery service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum DiscoveryResponse {
+    /// The requested URI was found.
+    Found(ResourceTarget),
+    /// The requested URI was not found.
+    NotFound,
 }
 
 /// Host operation requested by a guest.

@@ -1,13 +1,5 @@
 //! Selium guest SDK.
 
-pub use selium_abi::{
-    Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
-    InterfaceMetadata, LocalityScope, ResourceClass, ResourceIdentity, ResourceSelector,
-    ResourceTarget, ScopeContext,
-};
-pub use selium_guest_macros::{entrypoint, pattern_interface};
-pub use tracing::{debug, error, info, trace, warn};
-
 pub use crate::{
     async_runtime::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
@@ -22,6 +14,13 @@ pub use crate::{
     signal::Signal,
     storage::{BlobStore, DurableLog},
 };
+pub use selium_abi::{
+    Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
+    InterfaceMetadata, LocalityScope, ResourceClass, ResourceIdentity, ResourceSelector,
+    ResourceTarget, ScopeContext,
+};
+pub use selium_guest_macros::{entrypoint, pattern_interface};
+pub use tracing::{debug, error, info, trace, warn};
 
 mod async_runtime;
 mod codec;

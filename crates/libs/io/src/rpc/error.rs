@@ -17,21 +17,6 @@ pub enum RpcError {
     Serialization(String),
 }
 
-impl fmt::Display for RpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ConnectionClosed => write!(f, "RPC connection closed"),
-            Self::InvalidRegion => write!(f, "invalid shared region"),
-            Self::LayoutMismatch => write!(f, "region layout mismatch"),
-            Self::BufferFull => write!(f, "RPC buffer full"),
-            Self::BufferEmpty => write!(f, "RPC buffer empty"),
-            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}
-
 /// Error type for connection acceptance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptError {
@@ -49,20 +34,20 @@ pub enum AcceptError {
     Serialization(String),
 }
 
-impl fmt::Display for AcceptError {
+impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConnectionClosed => write!(f, "RPC connection closed"),
             Self::InvalidRegion => write!(f, "invalid shared region"),
             Self::LayoutMismatch => write!(f, "region layout mismatch"),
-            Self::ConnectionClosed => write!(f, "connection closed"),
-            Self::BufferFull => write!(f, "accept buffer full"),
-            Self::BufferEmpty => write!(f, "accept buffer empty"),
+            Self::BufferFull => write!(f, "RPC buffer full"),
+            Self::BufferEmpty => write!(f, "RPC buffer empty"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for AcceptError {}
+impl std::error::Error for RpcError {}
 
 impl From<crate::Error> for RpcError {
     fn from(error: crate::Error) -> Self {
@@ -89,6 +74,21 @@ impl From<crate::channels::Error> for RpcError {
         }
     }
 }
+
+impl fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion => write!(f, "invalid shared region"),
+            Self::LayoutMismatch => write!(f, "region layout mismatch"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
+            Self::BufferFull => write!(f, "accept buffer full"),
+            Self::BufferEmpty => write!(f, "accept buffer empty"),
+            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
 
 impl From<crate::Error> for AcceptError {
     fn from(error: crate::Error) -> Self {

@@ -6,14 +6,6 @@ use crate::{
     state::{BlobStoreState, DurableLogState, Kernel},
 };
 
-fn hex_char(value: u8) -> char {
-    const HEX: [char; 16] = [
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-    ];
-    // SAFETY: `value & 0x0f` is always in 0..=15, within bounds of `HEX`.
-    unsafe { *HEX.get_unchecked((value & 0x0f) as usize) }
-}
-
 impl Kernel {
     /// Opens or creates a named durable log.
     pub fn open_log(&self, name: impl Into<String>) -> DurableLogDescriptor {
@@ -248,6 +240,14 @@ impl Kernel {
             .copied()
             .ok_or_else(|| Error::NotFound(format!("blob store {local_id}")))
     }
+}
+
+fn hex_char(value: u8) -> char {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    // SAFETY: `value & 0x0f` is always in 0..=15, within bounds of `HEX`.
+    unsafe { *HEX.get_unchecked((value & 0x0f) as usize) }
 }
 
 #[cfg(test)]

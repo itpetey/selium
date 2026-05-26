@@ -10,15 +10,10 @@ use selium_io::rpc::{RpcAccept, RpcConnection};
 
 pub type TopicRegion = selium_io::ChannelRegion;
 
-pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
-pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
-
-#[derive(Debug, Clone, Default)]
-pub struct DiscoveryStore {
-    registrations: BTreeMap<String, ResourceTarget>,
-}
+pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
+pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
 #[pattern_interface]
 pub trait DiscoveryControl {
@@ -26,6 +21,45 @@ pub trait DiscoveryControl {
     fn remove(uri: String);
     fn resolve_exact(uri: String);
     fn resolve_prefix(prefix: String);
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryStore {
+    registrations: BTreeMap<String, ResourceTarget>,
+}
+
+impl DiscoveryStore {
+    pub fn register(&mut self, target: ResourceTarget) -> Option<ResourceTarget> {
+        self.registrations.insert(target.uri.clone(), target)
+    }
+
+    pub fn remove(&mut self, uri: &str) -> Option<ResourceTarget> {
+        self.registrations.remove(uri)
+    }
+
+    pub fn resolve_exact(&self, uri: &str) -> Option<ResourceTarget> {
+        self.registrations.get(uri).cloned()
+    }
+
+    pub fn resolve_prefix(&self, prefix: &str) -> Vec<ResourceTarget> {
+        self.registrations
+            .range(prefix.to_string()..)
+            .take_while(|(uri, _target)| uri.starts_with(prefix))
+            .map(|(_uri, target)| target.clone())
+            .collect()
+    }
+
+    pub fn ingest_interface_metadata(&mut self, uri: &str, metadata: InterfaceMetadata) -> bool {
+        let Some(target) = self.registrations.get_mut(uri) else {
+            return false;
+        };
+        target.interface = Some(metadata);
+        true
+    }
+}
+
+pub fn interface_metadata() -> InterfaceMetadata {
+    discoverycontrol_pattern_metadata()
 }
 
 #[entrypoint]
@@ -95,40 +129,6 @@ async fn handler(
                 break;
             }
         }
-    }
-}
-
-pub fn interface_metadata() -> InterfaceMetadata {
-    discoverycontrol_pattern_metadata()
-}
-
-impl DiscoveryStore {
-    pub fn register(&mut self, target: ResourceTarget) -> Option<ResourceTarget> {
-        self.registrations.insert(target.uri.clone(), target)
-    }
-
-    pub fn remove(&mut self, uri: &str) -> Option<ResourceTarget> {
-        self.registrations.remove(uri)
-    }
-
-    pub fn resolve_exact(&self, uri: &str) -> Option<ResourceTarget> {
-        self.registrations.get(uri).cloned()
-    }
-
-    pub fn resolve_prefix(&self, prefix: &str) -> Vec<ResourceTarget> {
-        self.registrations
-            .range(prefix.to_string()..)
-            .take_while(|(uri, _target)| uri.starts_with(prefix))
-            .map(|(_uri, target)| target.clone())
-            .collect()
-    }
-
-    pub fn ingest_interface_metadata(&mut self, uri: &str, metadata: InterfaceMetadata) -> bool {
-        let Some(target) = self.registrations.get_mut(uri) else {
-            return false;
-        };
-        target.interface = Some(metadata);
-        true
     }
 }
 

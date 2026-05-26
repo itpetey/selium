@@ -158,6 +158,22 @@ impl StrongReader {
     }
 }
 
+impl StrongReader {
+    /// Close this reader and release its strong-reader cursor slot.
+    pub fn close(&mut self) {
+        if !self.terminated {
+            if let Err(_error) = self.region.release_reader_slot(self.reader_id) {}
+            self.terminated = true;
+        }
+    }
+}
+
+impl Drop for StrongReader {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl WeakReader {
     pub(crate) fn new(region: ChannelRegion, start_pos: u64) -> Self {
         Self {
@@ -247,20 +263,9 @@ impl Reader {
     }
 }
 
-impl StrongReader {
-    /// Close this reader and release its strong-reader cursor slot.
-    pub fn close(&mut self) {
-        if !self.terminated {
-            if let Err(_error) = self.region.release_reader_slot(self.reader_id) {}
-            self.terminated = true;
-        }
-    }
-}
-
-impl Drop for StrongReader {
-    fn drop(&mut self) {
-        self.close();
-    }
+fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
+    let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
+    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
 }
 
 fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec<u8>> {
@@ -299,9 +304,4 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
         buf.extend_from_slice(&part);
     }
     Ok(buf)
-}
-
-fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
-    let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
-    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
 }

@@ -4,13 +4,12 @@ use selium_abi::{
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
-/// Magic value for multi-memory shared region layout headers.
-pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
-
 const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
 const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
 const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
 const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
+/// Magic value for multi-memory shared region layout headers.
+pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
 /// Owned shared memory region allocated through the host.
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +21,17 @@ pub struct SharedRegion {
 #[derive(Clone, Copy, Debug)]
 pub struct SharedMemory {
     descriptor: SharedMappingDescriptor,
+}
+
+/// Builder for constructing a multi-memory shared region.
+///
+/// Sub-memories are stored contiguously with 8-byte alignment padding.
+/// The region header records `memory_count` and `(offset, len)` pairs.
+/// After `seal()`, no further modifications are permitted.
+pub struct SharedRegionBuilder {
+    capacity: u32,
+    memories: Vec<u32>,
+    sealed: bool,
 }
 
 impl SharedRegion {
@@ -212,17 +222,6 @@ impl SharedMemory {
         );
         Ok((offset, len))
     }
-}
-
-/// Builder for constructing a multi-memory shared region.
-///
-/// Sub-memories are stored contiguously with 8-byte alignment padding.
-/// The region header records `memory_count` and `(offset, len)` pairs.
-/// After `seal()`, no further modifications are permitted.
-pub struct SharedRegionBuilder {
-    capacity: u32,
-    memories: Vec<u32>,
-    sealed: bool,
 }
 
 impl SharedRegionBuilder {

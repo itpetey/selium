@@ -5,6 +5,14 @@ use crate::{
     hostcall::{hostcall_async, hostcall_ready},
 };
 
+/// Trait for accepting raw connections and turning them into typed resources.
+pub trait Accept {
+    /// The typed resource produced by acceptance.
+    type Item;
+    /// Accepts a raw incoming connection and produces a typed resource.
+    fn accept(connection: IncomingConnection) -> Result<Self::Item>;
+}
+
 /// An incoming connection from a client.
 #[derive(Debug, Clone, Copy)]
 pub struct IncomingConnection {
@@ -14,17 +22,15 @@ pub struct IncomingConnection {
     pub shared_id: u64,
 }
 
-/// Trait for accepting raw connections and turning them into typed resources.
-pub trait Accept {
-    /// The typed resource produced by acceptance.
-    type Item;
-    /// Accepts a raw incoming connection and produces a typed resource.
-    fn accept(connection: IncomingConnection) -> Result<Self::Item>;
-}
-
 /// A sender that enqueues connections into a host-mediated queue.
 #[derive(Clone, Debug)]
 pub struct ResourceSender {
+    descriptor: selium_abi::HostQueueDescriptor,
+}
+
+/// A listener that accepts incoming typed connections from a host-mediated queue.
+#[derive(Clone, Debug)]
+pub struct ResourceListener {
     descriptor: selium_abi::HostQueueDescriptor,
 }
 
@@ -54,12 +60,6 @@ impl ResourceSender {
             _ => Err(GuestError::UnexpectedHostcallOutput),
         }
     }
-}
-
-/// A listener that accepts incoming typed connections from a host-mediated queue.
-#[derive(Clone, Debug)]
-pub struct ResourceListener {
-    descriptor: selium_abi::HostQueueDescriptor,
 }
 
 impl ResourceListener {

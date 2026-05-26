@@ -6,10 +6,18 @@ use selium_guest::{entrypoint, pattern_interface};
 
 pub type TopicRegion = selium_io::ChannelRegion;
 
-pub const HOST_MEMBERSHIP_TABLE: &str = "selium.cluster.hosts";
-pub const HOST_LOAD_TABLE: &str = "selium.cluster.host-load";
 pub const CLUSTER_COORDINATION_EXCHANGE: &str = "selium.cluster.coordination";
 pub const EXTERNAL_BOOTSTRAP_TOPIC: &str = "selium.cluster.external-bootstrap";
+pub const HOST_LOAD_TABLE: &str = "selium.cluster.host-load";
+pub const HOST_MEMBERSHIP_TABLE: &str = "selium.cluster.hosts";
+
+#[pattern_interface]
+pub trait ClusterControl {
+    fn upsert_host(record: HostRecord);
+    fn remove_host(host_id: String);
+    fn update_host_load(host_id: String, load: HostLoad);
+    fn bootstrap_addresses();
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLoad {
@@ -45,31 +53,6 @@ pub struct ClusterState {
     hosts: BTreeMap<String, HostRecord>,
     bootstrap_addresses: Vec<String>,
     peers: Vec<String>,
-}
-
-#[pattern_interface]
-pub trait ClusterControl {
-    fn upsert_host(record: HostRecord);
-    fn remove_host(host_id: String);
-    fn update_host_load(host_id: String, load: HostLoad);
-    fn bootstrap_addresses();
-}
-
-#[entrypoint]
-async fn cluster_main() {
-    selium_guest::info!(guest = "selium-cluster", "system guest booting");
-    selium_guest::mark_ready();
-}
-
-pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
-    clustercontrol_pattern_metadata()
-}
-
-pub fn deferred_day1_work() -> Vec<DeferredClusterWork> {
-    vec![
-        DeferredClusterWork::DnsTxtPublishing,
-        DeferredClusterWork::QuicMtlsBridge,
-    ]
 }
 
 impl HostLoad {
@@ -119,6 +102,23 @@ impl ClusterState {
     pub fn bootstrap_addresses(&self) -> &[String] {
         &self.bootstrap_addresses
     }
+}
+
+pub fn deferred_day1_work() -> Vec<DeferredClusterWork> {
+    vec![
+        DeferredClusterWork::DnsTxtPublishing,
+        DeferredClusterWork::QuicMtlsBridge,
+    ]
+}
+
+pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
+    clustercontrol_pattern_metadata()
+}
+
+#[entrypoint]
+async fn cluster_main() {
+    selium_guest::info!(guest = "selium-cluster", "system guest booting");
+    selium_guest::mark_ready();
 }
 
 #[cfg(test)]

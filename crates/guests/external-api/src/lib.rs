@@ -35,6 +35,55 @@ pub enum ApiError {
     DelegationFailed { step: String, context: String },
 }
 
+fn accept_request(request: &str) -> Result<ClientFeedback, ApiError> {
+    let intent = parse_intent(request)?;
+    let delegated = decompose_intent(intent);
+    Ok(ClientFeedback {
+        accepted: true,
+        message: "request accepted".to_string(),
+        delegated,
+    })
+}
+
+fn decompose_intent(intent: UserIntent) -> Vec<DelegatedInteraction> {
+    match intent {
+        UserIntent::Deploy {
+            workload_id,
+            replicas,
+        }
+        | UserIntent::Start {
+            workload_id,
+            replicas,
+        } => vec![
+            DelegatedInteraction::DiscoveryResolve {
+                uri: workload_id.clone(),
+            },
+            DelegatedInteraction::SchedulerPlace {
+                workload_id,
+                replicas,
+            },
+        ],
+        UserIntent::Stop { workload_id } => {
+            vec![DelegatedInteraction::SchedulerStop { workload_id }]
+        }
+        UserIntent::Scale {
+            workload_id,
+            replicas,
+        } => vec![DelegatedInteraction::SchedulerScale {
+            workload_id,
+            replicas,
+        }],
+        UserIntent::Resolve { uri } => vec![DelegatedInteraction::DiscoveryResolve { uri }],
+    }
+}
+
+fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiError {
+    ApiError::DelegationFailed {
+        step: step.into(),
+        context: context.into(),
+    }
+}
+
 #[entrypoint]
 async fn external_api_main() {
     selium_guest::info!(
@@ -73,53 +122,10 @@ fn parse_intent(request: &str) -> Result<UserIntent, ApiError> {
     }
 }
 
-fn decompose_intent(intent: UserIntent) -> Vec<DelegatedInteraction> {
-    match intent {
-        UserIntent::Deploy {
-            workload_id,
-            replicas,
-        }
-        | UserIntent::Start {
-            workload_id,
-            replicas,
-        } => vec![
-            DelegatedInteraction::DiscoveryResolve {
-                uri: workload_id.clone(),
-            },
-            DelegatedInteraction::SchedulerPlace {
-                workload_id,
-                replicas,
-            },
-        ],
-        UserIntent::Stop { workload_id } => {
-            vec![DelegatedInteraction::SchedulerStop { workload_id }]
-        }
-        UserIntent::Scale {
-            workload_id,
-            replicas,
-        } => vec![DelegatedInteraction::SchedulerScale {
-            workload_id,
-            replicas,
-        }],
-        UserIntent::Resolve { uri } => vec![DelegatedInteraction::DiscoveryResolve { uri }],
-    }
-}
-
-fn accept_request(request: &str) -> Result<ClientFeedback, ApiError> {
-    let intent = parse_intent(request)?;
-    let delegated = decompose_intent(intent);
-    Ok(ClientFeedback {
-        accepted: true,
-        message: "request accepted".to_string(),
-        delegated,
-    })
-}
-
-fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiError {
-    ApiError::DelegationFailed {
-        step: step.into(),
-        context: context.into(),
-    }
+fn replicas(parts: &[&str], index: usize) -> Result<u32, ApiError> {
+    let raw = required(parts, index, "replicas")?;
+    raw.parse::<u32>()
+        .map_err(|_error| ApiError::InvalidReplicaCount(raw.to_string()))
 }
 
 fn required<'a>(parts: &'a [&str], index: usize, name: &'static str) -> Result<&'a str, ApiError> {
@@ -127,12 +133,6 @@ fn required<'a>(parts: &'a [&str], index: usize, name: &'static str) -> Result<&
         .get(index)
         .copied()
         .ok_or(ApiError::MissingArgument(name))
-}
-
-fn replicas(parts: &[&str], index: usize) -> Result<u32, ApiError> {
-    let raw = required(parts, index, "replicas")?;
-    raw.parse::<u32>()
-        .map_err(|_error| ApiError::InvalidReplicaCount(raw.to_string()))
 }
 
 #[cfg(test)]

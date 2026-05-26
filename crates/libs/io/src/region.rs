@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 
 pub const CAPACITY_OFFSET: u64 = 8;
 pub const MAGIC_OFFSET: u64 = 0;
+const MAX_READER_SLOTS: u16 = 128;
 /// Minimum region size that can hold a ring buffer.
 pub const MIN_REGION_BYTES: u64 = 8192;
 pub const NEXT_MUTATION_ID_OFFSET: u64 = 64;
@@ -9,15 +10,14 @@ pub const NEXT_TAIL_OFFSET: u64 = 32;
 pub const NEXT_WRITER_ID_OFFSET: u64 = 56;
 pub const READER_ACTIVE_OFFSET: u64 = 0;
 pub const READER_COUNT_OFFSET: u64 = 24;
-pub const READER_SLOT_BYTES: u64 = 16;
 pub const READER_SLOTS_OFFSET: u64 = 72;
+pub const READER_SLOT_BYTES: u64 = 16;
 /// Layout constants for a shared-memory ring buffer region.
 pub const REGION_HEADER_BYTES: u64 = 4096;
+const RESERVE_SPIN_LIMIT: usize = 1024;
 pub const SIGNAL_SHARED_ID_OFFSET: u64 = 48;
 pub const TAIL_CACHE_OFFSET: u64 = 40;
 pub const WRITER_COUNT_OFFSET: u64 = 16;
-const MAX_READER_SLOTS: u16 = 128;
-const RESERVE_SPIN_LIMIT: usize = 1024;
 
 /// A builder for creating or attaching to a shared memory ring buffer region.
 pub struct RegionBuilder;
@@ -309,10 +309,6 @@ impl ChannelRegion {
     }
 }
 
-fn encode_reader_position(position: u64) -> Result<u64> {
-    position.checked_add(1).ok_or(Error::CapacityExceeded)
-}
-
 fn aligned_region_size(capacity: u64) -> Result<u32> {
     let total = REGION_HEADER_BYTES
         .checked_add(capacity)
@@ -322,6 +318,21 @@ fn aligned_region_size(capacity: u64) -> Result<u32> {
         .ok_or(Error::CapacityExceeded)?
         .max(MIN_REGION_BYTES);
     u32::try_from(total_aligned).map_err(|_error| Error::CapacityExceeded)
+}
+
+fn encode_reader_position(position: u64) -> Result<u64> {
+    position.checked_add(1).ok_or(Error::CapacityExceeded)
+}
+
+fn next_writer_id(id: u64) -> Result<(u32, u64)> {
+    if id > u64::from(u32::MAX) {
+        return Err(Error::CapacityExceeded);
+    }
+    Ok((id as u32, id + 1))
+}
+
+fn reader_slot_offset(slot: u16, field_offset: u64) -> u64 {
+    READER_SLOTS_OFFSET + u64::from(slot) * READER_SLOT_BYTES + field_offset
 }
 
 fn reserve_tail_next(
@@ -345,17 +356,6 @@ fn reserve_tail_next(
         }
     }
     Ok(next)
-}
-
-fn next_writer_id(id: u64) -> Result<(u32, u64)> {
-    if id > u64::from(u32::MAX) {
-        return Err(Error::CapacityExceeded);
-    }
-    Ok((id as u32, id + 1))
-}
-
-fn reader_slot_offset(slot: u16, field_offset: u64) -> u64 {
-    READER_SLOTS_OFFSET + u64::from(slot) * READER_SLOT_BYTES + field_offset
 }
 
 #[cfg(test)]
