@@ -52,10 +52,7 @@ impl FrameHeader {
                 .try_into()
                 .map_err(|_invalid_layout| Error::InvalidFrame)?,
         );
-        let flags = bytes
-            .get(8)
-            .copied()
-            .ok_or(Error::InvalidFrame)?;
+        let flags = bytes.get(8).copied().ok_or(Error::InvalidFrame)?;
         let _reserved = bytes
             .get(9..12)
             .ok_or(Error::InvalidFrame)?

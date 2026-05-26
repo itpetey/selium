@@ -113,3 +113,26 @@ impl ResourceListener {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_listener_create_fails_outside_guest() {
+        let result = ResourceListener::create();
+        let _ = result.unwrap_err();
+    }
+
+    #[test]
+    fn resource_sender_attach_fails_with_invalid_shared_id() {
+        let result = ResourceSender::attach(0);
+        let _ = result.unwrap_err();
+    }
+
+    #[test]
+    fn resource_listener_attach_fails_with_invalid_shared_id() {
+        let result = ResourceListener::attach(0);
+        let _ = result.unwrap_err();
+    }
+}

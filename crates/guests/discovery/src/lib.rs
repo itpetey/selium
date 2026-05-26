@@ -1,8 +1,12 @@
 //! Discovery system guest.
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use selium_guest::{InterfaceMetadata, entrypoint, pattern_interface};
+use selium_guest::{
+    DiscoveryRequest, DiscoveryResponse, InterfaceMetadata, ResourceTarget, entrypoint,
+    pattern_interface,
+};
+use selium_io::rpc::{RpcAccept, RpcConnection};
 
 pub type TopicRegion = selium_io::ChannelRegion;
 
@@ -10,14 +14,6 @@ pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceTarget {
-    pub uri: String,
-    pub host_id: String,
-    pub resource_id: u64,
-    pub interface: Option<InterfaceMetadata>,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryStore {
@@ -33,9 +29,73 @@ pub trait DiscoveryControl {
 }
 
 #[entrypoint]
-async fn discovery_main() {
+async fn discovery_main(listener_shared_id: u64) {
     selium_guest::info!(guest = "selium-discovery", "system guest booting");
+
+    let listener = match selium_guest::ResourceListener::attach(listener_shared_id) {
+        Ok(l) => l,
+        Err(error) => {
+            selium_guest::error!("failed to attach discovery listener: {error}");
+            return;
+        }
+    };
+
+    selium_guest::info!(
+        shared_id = listener.descriptor().shared_id,
+        "discovery listener attached"
+    );
     selium_guest::mark_ready();
+
+    let store = Rc::new(RefCell::new(DiscoveryStore::default()));
+
+    loop {
+        let connection = match listener
+            .accept::<RpcAccept<DiscoveryRequest, DiscoveryResponse>>()
+            .await
+        {
+            Ok(c) => c,
+            Err(error) => {
+                selium_guest::warn!("discovery accept failed: {error}");
+                continue;
+            }
+        };
+
+        let store = store.clone();
+        selium_guest::spawn(handler(store, connection));
+    }
+}
+
+async fn handler(
+    store: Rc<RefCell<DiscoveryStore>>,
+    mut conn: RpcConnection<DiscoveryRequest, DiscoveryResponse>,
+) {
+    loop {
+        match conn.recv().await {
+            Ok(request) => {
+                let response = {
+                    let store = store.borrow();
+                    match request.payload() {
+                        DiscoveryRequest::Resolve(uri) => {
+                            if let Some(target) = store.resolve_exact(uri) {
+                                DiscoveryResponse::Found(target)
+                            } else {
+                                DiscoveryResponse::NotFound
+                            }
+                        }
+                    }
+                };
+                if let Err(error) = request.reply(response).await {
+                    selium_guest::warn!("discovery reply failed: {error}");
+                    break;
+                }
+            }
+            Err(selium_io::rpc::error::RpcError::ConnectionClosed) => break,
+            Err(error) => {
+                selium_guest::warn!("discovery recv failed: {error}");
+                break;
+            }
+        }
+    }
 }
 
 pub fn interface_metadata() -> InterfaceMetadata {
@@ -129,5 +189,54 @@ mod tests {
                 .resolve_exact("sel://tenant/app/api")
                 .is_some_and(|target| target.interface.is_some())
         );
+    }
+
+    #[test]
+    fn discovery_store_routes_resolve_request_exact() {
+        let mut store = DiscoveryStore::default();
+        store.register(target("sel://tenant/app/api", 7));
+
+        let request = DiscoveryRequest::Resolve("sel://tenant/app/api".to_string());
+        let response = match request {
+            DiscoveryRequest::Resolve(uri) => {
+                if let Some(t) = store.resolve_exact(&uri) {
+                    DiscoveryResponse::Found(t)
+                } else {
+                    DiscoveryResponse::NotFound
+                }
+            }
+        };
+
+        assert!(matches!(response, DiscoveryResponse::Found(_)));
+    }
+
+    #[test]
+    fn discovery_store_routes_resolve_request_not_found() {
+        let store = DiscoveryStore::default();
+
+        let request = DiscoveryRequest::Resolve("sel://tenant/app/api".to_string());
+        let response = match request {
+            DiscoveryRequest::Resolve(uri) => {
+                if let Some(t) = store.resolve_exact(&uri) {
+                    DiscoveryResponse::Found(t)
+                } else {
+                    DiscoveryResponse::NotFound
+                }
+            }
+        };
+
+        assert!(matches!(response, DiscoveryResponse::NotFound));
+    }
+
+    #[test]
+    fn discovery_store_routes_resolve_request_prefix() {
+        let mut store = DiscoveryStore::default();
+        store.register(target("sel://tenant/app/api", 7));
+        store.register(target("sel://tenant/app/worker", 8));
+        store.register(target("sel://tenant/other/api", 9));
+
+        let prefix = "sel://tenant/app/";
+        let results = store.resolve_prefix(prefix);
+        assert_eq!(results.len(), 2);
     }
 }

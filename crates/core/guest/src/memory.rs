@@ -4,7 +4,9 @@ use selium_abi::{
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+/// Magic value for multi-memory shared region layout headers.
+pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+
 const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
 const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
 const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
@@ -183,7 +185,7 @@ impl SharedMemory {
         let count = u32::from_le_bytes(
             bytes
                 .try_into()
-                .map_err(|_| GuestError::Host("invalid memory count".to_string()))?,
+                .map_err(|_error| GuestError::Host("invalid memory count".to_string()))?,
         );
         Ok(count)
     }
@@ -201,15 +203,135 @@ impl SharedMemory {
         let offset = u32::from_le_bytes(
             offset_bytes
                 .try_into()
-                .map_err(|_| GuestError::Host("invalid memory offset".to_string()))?,
+                .map_err(|_error| GuestError::Host("invalid memory offset".to_string()))?,
         );
         let len = u32::from_le_bytes(
             len_bytes
                 .try_into()
-                .map_err(|_| GuestError::Host("invalid memory length".to_string()))?,
+                .map_err(|_error| GuestError::Host("invalid memory length".to_string()))?,
         );
         Ok((offset, len))
     }
 }
 
+/// Builder for constructing a multi-memory shared region.
+///
+/// Sub-memories are stored contiguously with 8-byte alignment padding.
+/// The region header records `memory_count` and `(offset, len)` pairs.
+/// After `seal()`, no further modifications are permitted.
+pub struct SharedRegionBuilder {
+    capacity: u32,
+    memories: Vec<u32>,
+    sealed: bool,
+}
 
+impl SharedRegionBuilder {
+    /// Creates a new builder with the given total region capacity.
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            memories: Vec::new(),
+            sealed: false,
+        }
+    }
+
+    /// Adds a sub-memory of the given length to the layout.
+    pub fn add_memory(&mut self, len: u32) -> Result<&mut Self> {
+        if self.sealed {
+            return Err(GuestError::BuilderSealed);
+        }
+        self.memories.push(len);
+        Ok(self)
+    }
+
+    /// Finalises the layout, allocates the shared region, writes the header,
+    /// and returns the region descriptor.
+    pub fn seal(&mut self) -> Result<SharedRegion> {
+        if self.sealed {
+            return Err(GuestError::BuilderSealed);
+        }
+
+        let header_size = Self::header_size(self.memories.len() as u32);
+        let mut total = header_size;
+        for &len in &self.memories {
+            total = Self::align_up(total, 8) + len;
+        }
+
+        if total > self.capacity {
+            return Err(GuestError::CapacityExceeded);
+        }
+
+        let region = SharedRegion::allocate(self.capacity, 8)?;
+        let mapping = SharedMemory::attach(region.descriptor(), 0, self.capacity)?;
+
+        mapping.write(0, SHARED_REGION_MAGIC.to_le_bytes().to_vec())?;
+        mapping.write(
+            SHARED_REGION_HEADER_CAPACITY_OFFSET,
+            (self.capacity as u64).to_le_bytes().to_vec(),
+        )?;
+        mapping.write(
+            SHARED_REGION_HEADER_COUNT_OFFSET,
+            (self.memories.len() as u32).to_le_bytes().to_vec(),
+        )?;
+        mapping.write(
+            SHARED_REGION_HEADER_COUNT_OFFSET + 4,
+            0u32.to_le_bytes().to_vec(),
+        )?;
+
+        let mut offset = header_size;
+        for (i, &len) in self.memories.iter().enumerate() {
+            offset = Self::align_up(offset, 8);
+            let entry_offset =
+                SHARED_REGION_HEADER_ENTRY_OFFSET + i as u32 * SHARED_REGION_HEADER_ENTRY_SIZE;
+            mapping.write(entry_offset, offset.to_le_bytes().to_vec())?;
+            mapping.write(entry_offset + 4, len.to_le_bytes().to_vec())?;
+            offset += len;
+        }
+
+        self.sealed = true;
+        Ok(region)
+    }
+
+    fn header_size(memory_count: u32) -> u32 {
+        SHARED_REGION_HEADER_ENTRY_OFFSET + memory_count * SHARED_REGION_HEADER_ENTRY_SIZE
+    }
+
+    fn align_up(value: u32, alignment: u32) -> u32 {
+        let rem = value % alignment;
+        if rem == 0 {
+            value
+        } else {
+            value + alignment - rem
+        }
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn add_memory_after_seal_returns_error() {
+        let mut builder = SharedRegionBuilder::new(1024);
+        builder.sealed = true;
+        assert!(matches!(
+            builder.add_memory(64),
+            Err(GuestError::BuilderSealed)
+        ));
+    }
+
+    #[test]
+    fn seal_after_seal_returns_error() {
+        let mut builder = SharedRegionBuilder::new(1024);
+        builder.sealed = true;
+        assert!(matches!(builder.seal(), Err(GuestError::BuilderSealed)));
+    }
+
+    #[test]
+    fn total_exceeding_capacity_returns_error() {
+        let mut builder = SharedRegionBuilder::new(32);
+        builder.add_memory(16).unwrap();
+        builder.add_memory(32).unwrap();
+        assert!(matches!(builder.seal(), Err(GuestError::CapacityExceeded)));
+    }
+}

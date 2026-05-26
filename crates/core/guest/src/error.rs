@@ -19,6 +19,12 @@ pub enum GuestError {
     #[error("unexpected hostcall output")]
     /// The host returned a response variant that did not match the request.
     UnexpectedHostcallOutput,
+    #[error("builder is sealed")]
+    /// Builder does not accept further modifications.
+    BuilderSealed,
+    #[error("capacity exceeded")]
+    /// Capacity limit exceeded.
+    CapacityExceeded,
 }
 
 pub(crate) fn abi_error_to_guest_error(error: AbiError) -> GuestError {

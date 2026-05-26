@@ -23,88 +23,131 @@ impl<Req, Rep> RpcClient<Req, Rep> {
         let mapping = selium_guest::SharedMemory::attach(region.descriptor(), 0, region.len())
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let magic_bytes = mapping.read(0, 8).map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let magic_bytes = mapping
+            .read(0, 8)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let magic = u64::from_le_bytes(
-            magic_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            magic_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         );
-        if magic != crate::region::SHARED_REGION_MAGIC {
+        if magic != selium_guest::SHARED_REGION_MAGIC {
             return Err(RpcError::InvalidRegion);
         }
 
-        let count_bytes = mapping.read(16, 4).map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let count_bytes = mapping
+            .read(16, 4)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let count = u32::from_le_bytes(
-            count_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            count_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         );
         if count != 2 {
             return Err(RpcError::LayoutMismatch);
         }
 
-        let req_offset_bytes = mapping.read(24, 4).map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let req_len_bytes = mapping.read(28, 4).map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let req_offset_bytes = mapping
+            .read(24, 4)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let req_len_bytes = mapping
+            .read(28, 4)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let req_offset = u32::from_le_bytes(
-            req_offset_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            req_offset_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         ) as u64;
         let req_len = u32::from_le_bytes(
-            req_len_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            req_len_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         ) as u64;
 
-        let rep_offset_bytes = mapping.read(32, 4).map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let rep_len_bytes = mapping.read(36, 4).map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let rep_offset_bytes = mapping
+            .read(32, 4)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let rep_len_bytes = mapping
+            .read(36, 4)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let rep_offset = u32::from_le_bytes(
-            rep_offset_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            rep_offset_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         ) as u64;
         let rep_len = u32::from_le_bytes(
-            rep_len_bytes.try_into().map_err(|_| RpcError::InvalidRegion)?,
+            rep_len_bytes
+                .try_into()
+                .map_err(|_error| RpcError::InvalidRegion)?,
         ) as u64;
 
-        drop(mapping);
+        let _ = mapping;
 
         let req_data_capacity = req_len.saturating_sub(crate::region::REGION_HEADER_BYTES);
         let rep_data_capacity = rep_len.saturating_sub(crate::region::REGION_HEADER_BYTES);
 
         let req_region = crate::region::ChannelRegion::from_mapping(
-            selium_guest::SharedMemory::attach_shared(region.shared_id(), req_offset as u32, req_len as u32)
-                .map_err(|e| RpcError::Serialization(e.to_string()))?,
+            selium_guest::SharedMemory::attach_shared(
+                region.shared_id(),
+                req_offset as u32,
+                req_len as u32,
+            )
+            .map_err(|e| RpcError::Serialization(e.to_string()))?,
             req_data_capacity,
         );
         let req_ring = RingBuf::wrap_region(req_region, None)?;
         let req_signal_shared_id = req_ring
             .region()
             .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
-            .map_err(|_| RpcError::InvalidRegion)?;
+            .map_err(|_error| RpcError::InvalidRegion)?;
         let _req_signal = Signal::attach(req_signal_shared_id)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
         let rep_region = crate::region::ChannelRegion::from_mapping(
-            selium_guest::SharedMemory::attach_shared(region.shared_id(), rep_offset as u32, rep_len as u32)
-                .map_err(|e| RpcError::Serialization(e.to_string()))?,
+            selium_guest::SharedMemory::attach_shared(
+                region.shared_id(),
+                rep_offset as u32,
+                rep_len as u32,
+            )
+            .map_err(|e| RpcError::Serialization(e.to_string()))?,
             rep_data_capacity,
         );
         let rep_ring = RingBuf::wrap_region(rep_region, None)?;
         let rep_signal_shared_id = rep_ring
             .region()
             .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
-            .map_err(|_| RpcError::InvalidRegion)?;
+            .map_err(|_error| RpcError::InvalidRegion)?;
         let rep_signal = Signal::attach(rep_signal_shared_id)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        req_ring.region().increment_writer_count().map_err(|_| RpcError::InvalidRegion)?;
+        req_ring
+            .region()
+            .increment_writer_count()
+            .map_err(|_error| RpcError::InvalidRegion)?;
         let writer_id = match req_ring.region().allocate_writer_id() {
             Ok(id) => id,
             Err(error) => {
-                let _ = req_ring.region().decrement_writer_count();
+                let _unused = req_ring.region().decrement_writer_count();
                 return Err(error.into());
             }
         };
-        let request_writer = RefCell::new(StrongWriter::new(req_ring.region().clone(), writer_id, Some(_req_signal)));
+        let request_writer = RefCell::new(StrongWriter::new(
+            req_ring.region().clone(),
+            writer_id,
+            Some(_req_signal),
+        ));
 
         let reply_reader = {
             let tail = rep_ring.read_next_tail()?;
             let reader_id = rep_ring
                 .region()
                 .allocate_reader_slot(tail)
-                .map_err(|_| RpcError::InvalidRegion)?;
-            RefCell::new(StrongReader::new(rep_ring.region().clone(), tail, reader_id))
+                .map_err(|_error| RpcError::InvalidRegion)?;
+            RefCell::new(StrongReader::new(
+                rep_ring.region().clone(),
+                tail,
+                reader_id,
+            ))
         };
 
         Ok(Self {
@@ -125,9 +168,8 @@ impl<Req, Rep> RpcClient<Req, Rep> {
             + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
     {
         let correlation_id = self.next_correlation_id();
-        let bytes = selium_abi::encode_rkyv(&payload).map_err(|e| {
-            RpcError::Serialization(e.to_string())
-        })?;
+        let bytes = selium_abi::encode_rkyv(&payload)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
         {
             let mut writer = self.request_writer.borrow_mut();
@@ -146,9 +188,8 @@ impl<Req, Rep> RpcClient<Req, Rep> {
             match result {
                 Ok((payload, tag)) => {
                     if tag == correlation_id {
-                        let reply = selium_abi::decode_rkyv(&payload).map_err(|e| {
-                            RpcError::Serialization(e.to_string())
-                        })?;
+                        let reply = selium_abi::decode_rkyv(&payload)
+                            .map_err(|e| RpcError::Serialization(e.to_string()))?;
                         return Ok(reply);
                     }
                     return Err(RpcError::Serialization(
@@ -156,15 +197,24 @@ impl<Req, Rep> RpcClient<Req, Rep> {
                     ));
                 }
                 Err(crate::channels::Error::ChannelEmpty) => {
-                    if self.reply_reader.borrow().region().read_writer_count().map_err(|e| RpcError::from(e))? == 0 {
+                    if self
+                        .reply_reader
+                        .borrow()
+                        .region()
+                        .read_writer_count()
+                        .map_err(RpcError::from)?
+                        == 0
+                    {
                         return Err(RpcError::ConnectionClosed);
                     }
-                    let generation = self.reply_signal.generation().map_err(|e| {
-                        RpcError::Serialization(e.to_string())
-                    })?;
-                    self.reply_signal.wait(generation, 1000).await.map_err(|e| {
-                        RpcError::Serialization(e.to_string())
-                    })?;
+                    let generation = self
+                        .reply_signal
+                        .generation()
+                        .map_err(|e| RpcError::Serialization(e.to_string()))?;
+                    self.reply_signal
+                        .wait(generation, 1000)
+                        .await
+                        .map_err(|e| RpcError::Serialization(e.to_string()))?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -175,5 +225,19 @@ impl<Req, Rep> RpcClient<Req, Rep> {
         let id = self.correlation_id.get();
         self.correlation_id.set(id.wrapping_add(1));
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use selium_abi::{DiscoveryRequest, DiscoveryResponse};
+
+    use super::*;
+
+    #[test]
+    fn attach_rejects_invalid_region() {
+        let region = selium_guest::SharedRegion::attach(0, 32768);
+        let result = RpcClient::<DiscoveryRequest, DiscoveryResponse>::attach(region);
+        assert!(result.is_err());
     }
 }

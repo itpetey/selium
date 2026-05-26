@@ -81,7 +81,9 @@ impl From<crate::channels::Error> for RpcError {
         match error {
             crate::channels::Error::ChannelFull => Self::BufferFull,
             crate::channels::Error::ChannelEmpty => Self::BufferEmpty,
-            crate::channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
+            crate::channels::Error::InvalidFrame => {
+                Self::Serialization("invalid frame".to_string())
+            }
             crate::channels::Error::Core(e) => e.into(),
             other => Self::Serialization(other.to_string()),
         }
@@ -105,7 +107,9 @@ impl From<crate::channels::Error> for AcceptError {
         match error {
             crate::channels::Error::ChannelFull => Self::BufferFull,
             crate::channels::Error::ChannelEmpty => Self::BufferEmpty,
-            crate::channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
+            crate::channels::Error::InvalidFrame => {
+                Self::Serialization("invalid frame".to_string())
+            }
             crate::channels::Error::Core(e) => e.into(),
             other => Self::Serialization(other.to_string()),
         }

@@ -16,6 +16,6 @@ mod error;
 mod frame;
 pub mod pubsub;
 mod region;
-pub mod rpc;
 mod ring_buf;
+pub mod rpc;
 pub mod tables;

@@ -4,7 +4,10 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, ItemTrait, ReturnType, parse_macro_input};
 
-/// Marks an async zero-argument function as an exported Selium guest entrypoint.
+/// Marks an async function as an exported Selium guest entrypoint.
+///
+/// Accepts either `async fn entrypoint()`, `async fn entrypoint(ctx: Context<...>)`,
+/// or `async fn entrypoint(handle: u64)`.
 #[proc_macro_attribute]
 pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
@@ -16,10 +19,10 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    if !function.sig.inputs.is_empty() {
+    if function.sig.inputs.len() > 1 {
         return syn::Error::new_spanned(
             &function.sig.inputs,
-            "#[entrypoint] does not support function arguments",
+            "#[entrypoint] supports at most one argument",
         )
         .to_compile_error()
         .into();
@@ -45,13 +48,63 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let export_ident = format_ident!("__selium_guest_entrypoint_{}", ident);
     let export_name = ident.to_string();
 
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident() {
-            ::selium_guest::run_entrypoint_safely(#ident());
+    let param_kind = function.sig.inputs.iter().next().and_then(|arg| {
+        if let syn::FnArg::Typed(pat_type) = arg {
+            if let syn::Type::Path(type_path) = &*pat_type.ty {
+                type_path.path.segments.last().map(|seg| seg.ident.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
         }
+    });
+
+    let generated = match (function.sig.inputs.len(), param_kind.as_deref()) {
+        (0, _) => {
+            quote! {
+                #function
+
+                #[unsafe(export_name = #export_name)]
+                pub extern "C" fn #export_ident() {
+                    ::selium_guest::run_entrypoint_safely(#ident());
+                }
+            }
+        }
+        (1, Some("Context")) => {
+            quote! {
+                #function
+
+                #[unsafe(export_name = #export_name)]
+                pub extern "C" fn #export_ident(discovery_handle: i64) {
+                    let ctx = ::selium_io::rpc::Context::from_raw(discovery_handle as u64)
+                        .expect("failed to construct bootstrap context");
+                    ::selium_guest::run_entrypoint_safely(#ident(ctx));
+                }
+            }
+        }
+        (1, _) => {
+            quote! {
+                #function
+
+                #[unsafe(export_name = #export_name)]
+                pub extern "C" fn #export_ident(handle: i64) {
+                    ::selium_guest::run_entrypoint_safely(#ident(handle as u64));
+                }
+            }
+        }
+        _ => {
+            return syn::Error::new_spanned(
+                &function.sig.inputs,
+                "#[entrypoint] supports at most one argument",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    quote! {
+        #generated
 
         #[unsafe(export_name = "__selium_guest_poll")]
         pub extern "C" fn __selium_guest_poll() {

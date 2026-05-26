@@ -471,3 +471,138 @@ fn compare_exchange_shared_memory_u64(
         other => panic!("expected U64, got {other:?}"),
     }
 }
+
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test helper always bootstraps one guest"
+)]
+fn spawn_guest_with_grants(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> u64 {
+    let report = runtime
+        .bootstrap_system_guests(selium_runtime::RuntimeConfig {
+            system_guests: vec![SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module_with_entrypoint("boot"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants,
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+            }],
+        })
+        .expect("bootstrap");
+    report.guests[0].process_id
+}
+
+/// Tests host queue create and attach hostcalls.
+#[test]
+fn host_queue_create_and_attach() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, attach_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueAttach {
+            shared_id: descriptor.shared_id,
+        },
+    );
+    let attached = match runtime.poll_hostcall(process_id, attach_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    assert_eq!(attached.shared_id, descriptor.shared_id);
+}
+
+/// Tests host queue send and recv hostcalls.
+#[test]
+fn host_queue_send_and_recv() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-send-recv-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, send_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueSend {
+            local_id: descriptor.local_id,
+            value: 42,
+        },
+    );
+    assert_eq!(
+        runtime.poll_hostcall(process_id, send_id),
+        CompletionState::Ready(HostcallOutput::Empty)
+    );
+
+    let (_, recv_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueRecv {
+            local_id: descriptor.local_id,
+        },
+    );
+    match runtime.poll_hostcall(process_id, recv_id) {
+        CompletionState::Ready(HostcallOutput::ConnectionInfo {
+            client_process_id,
+            value,
+        }) => {
+            assert_eq!(client_process_id, process_id);
+            assert_eq!(value, 42);
+        }
+        other => panic!("expected ConnectionInfo, got {other:?}"),
+    }
+}
+
+/// Tests host queue recv on an empty queue returns pending.
+#[test]
+fn host_queue_recv_empty_returns_pending() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest_with_grants(
+        &runtime,
+        "queue-pending-test",
+        vec![CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )],
+    );
+
+    let (_, create_id) = runtime.begin_hostcall(process_id, HostcallRequest::HostQueueCreate);
+    let descriptor = match runtime.poll_hostcall(process_id, create_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(d)) => d,
+        other => panic!("expected HostQueue descriptor, got {other:?}"),
+    };
+
+    let (_, recv_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueRecv {
+            local_id: descriptor.local_id,
+        },
+    );
+    match runtime.poll_hostcall(process_id, recv_id) {
+        CompletionState::Pending { .. } => {}
+        other => panic!("expected Pending, got {other:?}"),
+    }
+}

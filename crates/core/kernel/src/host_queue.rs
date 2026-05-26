@@ -30,7 +30,10 @@ impl Kernel {
                 notify: Notify::new(),
             }),
         );
-        self.inner.local_host_queues.lock().insert(local_id, shared_id);
+        self.inner
+            .local_host_queues
+            .lock()
+            .insert(local_id, shared_id);
         HostQueueDescriptor {
             local_id,
             shared_id,
@@ -44,7 +47,10 @@ impl Kernel {
             return Err(Error::NotFound(format!("host queue {shared_id}")));
         }
         let local_id = self.next_local_id();
-        self.inner.local_host_queues.lock().insert(local_id, shared_id);
+        self.inner
+            .local_host_queues
+            .lock()
+            .insert(local_id, shared_id);
         Ok(HostQueueDescriptor {
             local_id,
             shared_id,

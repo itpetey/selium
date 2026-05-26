@@ -207,26 +207,26 @@ impl Runtime {
                 Ok(None) => CompletionState::Pending { operation_id },
                 Err(error) => CompletionState::Failed(kernel_error(error)),
             },
-            HostOperationState::HostQueueRecvWait {
-                local_id,
-                deadline,
-            } => match self.kernel.try_host_queue_recv(local_id) {
-                Ok(Some((client_process_id, value))) => {
-                    let output = HostcallOutput::ConnectionInfo {
-                        client_process_id,
-                        value,
-                    };
-                    operation.state = HostOperationState::Ready(output.clone());
-                    CompletionState::Ready(output)
+            HostOperationState::HostQueueRecvWait { local_id, deadline } => {
+                match self.kernel.try_host_queue_recv(local_id) {
+                    Ok(Some((client_process_id, value))) => {
+                        let output = HostcallOutput::ConnectionInfo {
+                            client_process_id,
+                            value,
+                        };
+                        operation.state = HostOperationState::Ready(output.clone());
+                        CompletionState::Ready(output)
+                    }
+                    Ok(None) if Instant::now() >= deadline => {
+                        let error =
+                            AbiError::new(AbiErrorCode::Timeout, "host queue recv timed out");
+                        operation.state = HostOperationState::Failed(error.clone());
+                        CompletionState::Failed(error)
+                    }
+                    Ok(None) => CompletionState::Pending { operation_id },
+                    Err(error) => CompletionState::Failed(kernel_error(error)),
                 }
-                Ok(None) if Instant::now() >= deadline => {
-                    let error = AbiError::new(AbiErrorCode::Timeout, "host queue recv timed out");
-                    operation.state = HostOperationState::Failed(error.clone());
-                    CompletionState::Failed(error)
-                }
-                Ok(None) => CompletionState::Pending { operation_id },
-                Err(error) => CompletionState::Failed(kernel_error(error)),
-            },
+            }
         }
     }
 
@@ -1041,11 +1041,7 @@ impl Runtime {
                     None,
                 )?;
                 let descriptor = self.kernel.create_host_queue();
-                self.claim_local_handle(
-                    process_id,
-                    ResourceClass::HostQueue,
-                    descriptor.local_id,
-                );
+                self.claim_local_handle(process_id, ResourceClass::HostQueue, descriptor.local_id);
                 self.claim_shared_resource(
                     process_id,
                     ResourceClass::HostQueue,
@@ -1062,12 +1058,11 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
-                let descriptor = self.kernel.attach_host_queue(shared_id).map_err(kernel_error)?;
-                self.claim_local_handle(
-                    process_id,
-                    ResourceClass::HostQueue,
-                    descriptor.local_id,
-                );
+                let descriptor = self
+                    .kernel
+                    .attach_host_queue(shared_id)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::HostQueue, descriptor.local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
@@ -1112,7 +1107,11 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
-                match self.kernel.try_host_queue_recv(local_id).map_err(kernel_error)? {
+                match self
+                    .kernel
+                    .try_host_queue_recv(local_id)
+                    .map_err(kernel_error)?
+                {
                     Some((client_process_id, value)) => {
                         Ok(HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                             client_process_id,
@@ -1205,12 +1204,11 @@ impl Runtime {
                     if let Ok(Some((client_process_id, value))) =
                         self.kernel.try_host_queue_recv(local_id)
                     {
-                        operation.state = HostOperationState::Ready(
-                            HostcallOutput::ConnectionInfo {
+                        operation.state =
+                            HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                                 client_process_id,
                                 value,
-                            },
-                        );
+                            });
                         if let Some(task_id) = operation.task_id {
                             wakeups.push((operation.process_id, task_id));
                         }

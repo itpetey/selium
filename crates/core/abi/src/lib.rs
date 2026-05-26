@@ -403,6 +403,38 @@ pub struct GuestLogEntry {
     pub message: String,
 }
 
+/// Request sent to the discovery service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum DiscoveryRequest {
+    /// Resolve a URI to a resource target.
+    Resolve(String),
+}
+
+/// Response from the discovery service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum DiscoveryResponse {
+    /// The requested URI was found.
+    Found(ResourceTarget),
+    /// The requested URI was not found.
+    NotFound,
+}
+
+/// Target resource returned by discovery resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ResourceTarget {
+    /// URI of the resource.
+    pub uri: String,
+    /// Host id where the resource resides.
+    pub host_id: String,
+    /// Resource identifier.
+    pub resource_id: u64,
+    /// Optional interface metadata.
+    pub interface: Option<InterfaceMetadata>,
+}
+
 /// Host operation requested by a guest.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck(), attr(allow(missing_docs)))]
@@ -1043,5 +1075,92 @@ mod tests {
         let framed = frame_bytes(b"hello").expect("frame bytes");
         let deframed = deframe_bytes(&framed).expect("deframe bytes");
         assert_eq!(deframed, b"hello");
+    }
+
+    #[test]
+    fn host_queue_create_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::HostQueueCreate,
+            task_id: Some(1),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn host_queue_attach_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::HostQueueAttach { shared_id: 42 },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn host_queue_send_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::HostQueueSend {
+                local_id: 7,
+                value: 99,
+            },
+            task_id: Some(3),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn host_queue_recv_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::HostQueueRecv { local_id: 7 },
+            task_id: Some(4),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn connection_info_output_round_trip() {
+        let output = HostcallOutput::ConnectionInfo {
+            client_process_id: 123,
+            value: 456,
+        };
+        let encoded = encode_rkyv(&output).expect("encode");
+        let decoded: HostcallOutput = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, output);
+    }
+
+    #[test]
+    fn discovery_request_resolve_round_trip() {
+        let request = DiscoveryRequest::Resolve("sel://tenant/app/api".to_string());
+        let encoded = encode_rkyv(&request).expect("encode");
+        let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_response_found_round_trip() {
+        let response = DiscoveryResponse::Found(ResourceTarget {
+            uri: "sel://tenant/app/api".to_string(),
+            host_id: "host-a".to_string(),
+            resource_id: 7,
+            interface: None,
+        });
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn discovery_response_not_found_round_trip() {
+        let response = DiscoveryResponse::NotFound;
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
     }
 }
