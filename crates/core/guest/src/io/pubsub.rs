@@ -1,5 +1,12 @@
 use std::{cell::RefCell, marker::PhantomData};
 
+use rkyv::{
+    Deserialize,
+    api::high::{HighDeserializer, HighValidator},
+    bytecheck::CheckBytes,
+    rancor::Error as RancorError,
+};
+
 use crate::{
     io::{
         Error, RingBuf,
@@ -9,12 +16,6 @@ use crate::{
         ring_buf::round_capacity,
     },
     signal::Signal,
-};
-use rkyv::{
-    Deserialize,
-    api::high::{HighDeserializer, HighValidator},
-    bytecheck::CheckBytes,
-    rancor::Error as RancorError,
 };
 
 /// A codec that converts between typed values and raw bytes.

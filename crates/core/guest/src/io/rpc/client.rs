@@ -1,11 +1,9 @@
 use std::cell::{Cell, RefCell};
 
-use crate::SHARED_REGION_MAGIC;
-use crate::io::channels;
-use crate::{SharedMemory, Signal, io::region};
-
 use crate::{
-    SharedRegion,
+    SHARED_REGION_MAGIC, SharedMemory, SharedRegion, Signal,
+    io::channels,
+    io::region,
     io::{
         RingBuf,
         channels::{StrongReader, StrongWriter},

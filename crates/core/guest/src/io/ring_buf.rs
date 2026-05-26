@@ -1,15 +1,16 @@
-use crate::io::region::{
-    NEXT_MUTATION_ID_OFFSET, NEXT_WRITER_ID_OFFSET, READER_COUNT_OFFSET, SIGNAL_SHARED_ID_OFFSET,
-    WRITER_COUNT_OFFSET,
-};
-use crate::signal::Signal;
-
-use crate::io::{
-    ChannelRegion, Cursor, RegionBuilder,
-    cursor::mask_for_capacity,
-    error::{Error, Result},
-    frame::FrameHeader,
-    region::TAIL_CACHE_OFFSET,
+use crate::{
+    io::region::{
+        NEXT_MUTATION_ID_OFFSET, NEXT_WRITER_ID_OFFSET, READER_COUNT_OFFSET,
+        SIGNAL_SHARED_ID_OFFSET, WRITER_COUNT_OFFSET,
+    },
+    io::{
+        ChannelRegion, Cursor, RegionBuilder,
+        cursor::mask_for_capacity,
+        error::{Error, Result},
+        frame::FrameHeader,
+        region::TAIL_CACHE_OFFSET,
+    },
+    signal::Signal,
 };
 
 const MAGIC_PREFIX: u64 = 0x53454C494F524E47;

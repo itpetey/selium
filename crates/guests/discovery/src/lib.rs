@@ -2,9 +2,9 @@
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use selium_guest::io::rpc::{RpcAccept, RpcConnection};
 use selium_guest::{
     DiscoveryRequest, DiscoveryResponse, InterfaceMetadata, ResourceTarget, entrypoint,
+    io::rpc::{RpcAccept, RpcConnection},
     pattern_interface,
 };
 
