@@ -45,3 +45,21 @@ Execute Selium guests on Wasmtiny, enforce scoped capability grants, and bootstr
 #### Scenario: Guest exits unexpectedly
 - **WHEN** a guest process terminates unexpectedly
 - **THEN** the runtime SHALL publish a corresponding lifecycle event to the host activity log
+
+### Requirement: Entrypoint Argument Passing
+`selium-runtime` SHALL inspect the WASM export signature of the entrypoint and pass arguments from `SystemGuestDescriptor::arguments` when the signature accepts an `i64` parameter.
+
+#### Scenario: Discovery guest receives its listener shared_id
+- **WHEN** a system guest descriptor defines `arguments = [listener_shared_id]` and the entrypoint takes a `u64` parameter
+- **THEN** the runtime SHALL forward that value into the guest as the entrypoint argument
+
+### Requirement: HostQueue Hostcall Dispatch
+`selium-runtime` SHALL dispatch `HostQueueSend` and `HostQueueRecv` hostcalls via the kernel, validating capability grants before enqueuing or dequeuing connection entries.
+
+#### Scenario: Authorised send succeeds
+- **WHEN** a guest with a capability grant to a target service invokes `HostQueueSend`
+- **THEN** the runtime SHALL enqueue the connection entry and return success
+
+#### Scenario: Unauthorised send is denied
+- **WHEN** a guest without a capability grant invokes `HostQueueSend`
+- **THEN** the runtime SHALL return `AbiErrorCode::CapabilityDenied`

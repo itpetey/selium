@@ -45,3 +45,17 @@ Expose Selium's low-level host primitives for shared memory, signalling, network
 #### Scenario: Guest process consumes resources
 - **WHEN** a guest process uses CPU, memory, storage, or bandwidth
 - **THEN** the kernel SHALL make those observations available to the runtime through the metering hooks
+
+### Requirement: Shared Region Layout Header
+`selium-kernel` shared memory regions SHALL support a layout header (magic, capacity, memory count, per-memory offset/length pairs) so that multiple parties can discover sub-memories after attaching via `shared_id`.
+
+#### Scenario: Two guests attach the same region and agree on layout
+- **WHEN** a guest seals a region built with `SharedRegionBuilder` and another guest attaches the same `shared_id`
+- **THEN** both parties SHALL read the identical layout header and enumerate the same sub-memories
+
+### Requirement: Per-Connection RPC Session Isolation
+`selium-kernel` SHALL enforce that a `SharedRegion` allocated for an RPC session is only accessible to the two authorised parties. No other guest SHALL be able to attach or read that region without possessing its `shared_id`.
+
+#### Scenario: Unauthorised guest attempts to attach a session region
+- **WHEN** a guest without the `shared_id` tries to attach a session region
+- **THEN** the kernel SHALL deny the attachment

@@ -49,3 +49,21 @@ Provide the ergonomic guest SDK over Selium ABI primitives, including safe handl
 #### Scenario: Native test exercises guest pattern code
 - **WHEN** a guest module is tested on a native target using the SDK's fallback path
 - **THEN** the test SHALL be able to validate guest logic without requiring full Wasm deployment
+
+### Requirement: Guest Context
+`selium-guest` SHALL provide a `Context` type that the runtime injects into the entrypoint. `Context` SHALL expose pre-connected handles for discovery (`RpcClient<DiscoveryRequest, DiscoveryResponse>`) and resource sending (`ResourceSender`).
+
+#### Scenario: Entrypoint receives a populated Context
+- **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context)`
+- **THEN** the runtime SHALL pass a `Context` with a ready `discovery()` client and a `ResourceSender` ready for use
+
+### Requirement: ResourceSender and ResourceListener Handles
+`selium-guest` SHALL provide `ResourceSender` and `ResourceListener` safe handles that wrap the `HostQueueSend` and `HostQueueRecv` ABI hostcalls. `ResourceListener::accept` SHALL support the `Accept` trait for typed connection acceptance.
+
+#### Scenario: Guest sends a connection to a server
+- **WHEN** a guest calls `ResourceSender::attach(handle)` and then `sender.send(shared_id).await`
+- **THEN** the host SHALL validate capability and enqueue the connection request
+
+#### Scenario: Server accepts a typed RPC connection
+- **WHEN** a server calls `listener.accept::<RpcAccept<Req, Rep>>().await`
+- **THEN** the system SHALL return an `RpcConnection<Req, Rep>` ready for request/reply

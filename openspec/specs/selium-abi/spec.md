@@ -38,3 +38,21 @@ The `selium-abi` capability model SHALL represent authority as a capability plus
 #### Scenario: Invalid detached handle
 - **WHEN** a guest uses a detached or invalid resource handle
 - **THEN** the ABI SHALL report an explicit failure instead of permitting undefined behaviour
+
+### Requirement: Host-Mediated Connection Queue Hostcalls
+`selium-abi` SHALL define `HostQueueCreate`, `HostQueueAttach`, `HostQueueSend`, and `HostQueueRecv` hostcall variants for establishing shared-memory connections between guests, together with a `HostQueueDescriptor` resource identity.
+
+#### Scenario: Client enqueues a connection
+- **WHEN** a guest invokes `HostQueueSend` with a valid `local_id` and `shared_id`
+- **THEN** the hostcall SHALL enqueue the connection entry or return a pending completion state if the queue is full
+
+#### Scenario: Server dequeues a connection
+- **WHEN** a guest invokes `HostQueueRecv` on its listener handle
+- **THEN** the hostcall SHALL return the next `ConnectionInfo` entry or a pending completion state if the queue is empty
+
+### Requirement: Connection Info Payload
+`selium-abi` SHALL define a `ConnectionInfo` hostcall output variant containing `client_process_id: ProcessId` and `value: u64` (the session `shared_id`).
+
+#### Scenario: Server accepts an incoming connection
+- **WHEN** a `HostQueueRecv` completes successfully
+- **THEN** the output SHALL carry the `ProcessId` of the connecting client alongside the session `shared_id`

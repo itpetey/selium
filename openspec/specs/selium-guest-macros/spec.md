@@ -24,3 +24,14 @@ Provide procedural macros for Selium guest entrypoints and generated guest inter
 #### Scenario: Runtime bootstraps macro-based guest
 - **WHEN** the runtime starts a guest built with the macro layer
 - **THEN** the generated glue SHALL remain compatible with runtime bootstrap expectations and guest tracing setup
+
+### Requirement: Context-Aware Entrypoint Parameter
+`selium-guest-macros` SHALL detect when the entrypoint function takes a `Context` parameter or a `u64` raw argument and generate the appropriate wrapper that constructs and injects the parameter before calling the user function.
+
+#### Scenario: Macro injects Context into entrypoint
+- **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context)`
+- **THEN** the macro SHALL generate a wrapper that calls `Context::from_raw(...)` and passes the result to `main`
+
+#### Scenario: Macro forwards raw u64 argument into entrypoint
+- **WHEN** a guest defines `#[entrypoint] async fn main(id: u64)`
+- **THEN** the macro SHALL generate a wrapper that forwards the runtime-provided `i64` argument directly as the `u64` parameter
