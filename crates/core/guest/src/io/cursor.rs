@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::io::{Error, Result};
 
 /// A monotonic cursor over a shared-memory ring buffer.
 ///
@@ -60,7 +60,7 @@ impl Cursor {
 /// Computes a mask for a given capacity (must be a power of two).
 pub fn mask_for_capacity(capacity: u64) -> Result<u64> {
     if !capacity.is_power_of_two() {
-        return Err(crate::Error::InvalidLayout);
+        return Err(Error::InvalidLayout);
     }
     Ok(capacity - 1)
 }
@@ -96,10 +96,7 @@ mod tests {
     fn mask_rounds_down_capacity() {
         assert_eq!(mask_for_capacity(64).unwrap(), 63);
         assert_eq!(mask_for_capacity(1).unwrap(), 0);
-        assert_eq!(
-            mask_for_capacity(3).unwrap_err(),
-            crate::Error::InvalidLayout
-        );
+        assert_eq!(mask_for_capacity(3).unwrap_err(), Error::InvalidLayout);
     }
 
     #[test]

@@ -1,6 +1,10 @@
-use selium_guest::Signal;
+use crate::io::region::{
+    NEXT_MUTATION_ID_OFFSET, NEXT_WRITER_ID_OFFSET, READER_COUNT_OFFSET, SIGNAL_SHARED_ID_OFFSET,
+    WRITER_COUNT_OFFSET,
+};
+use crate::signal::Signal;
 
-use crate::{
+use crate::io::{
     ChannelRegion, Cursor, RegionBuilder,
     cursor::mask_for_capacity,
     error::{Error, Result},
@@ -29,14 +33,14 @@ impl RingBuf {
         let mask = mask_for_capacity(capacity as u64)?;
         region.write_magic(MAGIC_PREFIX)?;
         region.write_capacity(capacity as u64)?;
-        region.write_header_u64(crate::region::WRITER_COUNT_OFFSET, 0)?;
-        region.write_header_u64(crate::region::READER_COUNT_OFFSET, 0)?;
+        region.write_header_u64(WRITER_COUNT_OFFSET, 0)?;
+        region.write_header_u64(READER_COUNT_OFFSET, 0)?;
         region.write_next_tail(0)?;
         region.write_header_u64(TAIL_CACHE_OFFSET, 0)?;
-        region.write_header_u64(crate::region::NEXT_WRITER_ID_OFFSET, 0)?;
-        region.write_header_u64(crate::region::NEXT_MUTATION_ID_OFFSET, 0)?;
+        region.write_header_u64(NEXT_WRITER_ID_OFFSET, 0)?;
+        region.write_header_u64(NEXT_MUTATION_ID_OFFSET, 0)?;
         let signal = Signal::create().map_err(|e| Error::Guest(e.to_string()))?;
-        region.write_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET, signal.shared_id())?;
+        region.write_header_u64(SIGNAL_SHARED_ID_OFFSET, signal.shared_id())?;
         let ring_signal =
             Signal::attach(signal.shared_id()).map_err(|e| Error::Guest(e.to_string()))?;
         Ok((
@@ -218,7 +222,6 @@ pub fn round_capacity(capacity: u32) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursor::mask_for_capacity;
 
     #[test]
     fn capacity_rounds_to_power_of_two() {

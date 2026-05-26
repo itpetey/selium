@@ -26,6 +26,8 @@ mod async_runtime;
 mod codec;
 mod error;
 mod hostcall;
+#[cfg(feature = "io")]
+pub mod io;
 mod memory;
 mod network;
 mod platform;

@@ -1,38 +1,31 @@
-use selium_guest::Signal;
+use std::cell::{Cell, RefCell};
+
+use crate::SHARED_REGION_MAGIC;
+use crate::io::channels;
+use crate::{SharedMemory, Signal, io::region};
 
 use crate::{
-    RingBuf,
-    channels::{StrongReader, StrongWriter},
-    rpc::error::RpcError,
+    SharedRegion,
+    io::{
+        RingBuf,
+        channels::{StrongReader, StrongWriter},
+        rpc::error::RpcError,
+    },
 };
 
-/// Server-side handle for an established RPC session.
-pub struct RpcConnection<Req, Rep> {
-    pub(crate) request_reader: StrongReader,
-    pub(crate) reply_writer: StrongWriter,
-    pub(crate) reply_signal: Signal,
-    #[expect(dead_code, reason = "stored for future logging and audit")]
-    pub(crate) client_process_id: u64,
+/// Client-side handle for making typed RPC requests.
+pub struct RpcClient<Req, Rep> {
+    request_writer: RefCell<StrongWriter>,
+    reply_reader: RefCell<StrongReader>,
+    reply_signal: Signal,
+    correlation_id: Cell<u32>,
     _phantom: std::marker::PhantomData<(Req, Rep)>,
 }
 
-/// A single request received by the server, with the ability to reply.
-pub struct RpcRequest<'a, Req, Rep> {
-    payload: Req,
-    #[expect(
-        dead_code,
-        reason = "correlation_id not yet propagated to reply frames"
-    )]
-    correlation_id: u32,
-    reply_writer: &'a mut StrongWriter,
-    reply_signal: &'a Signal,
-    _phantom: std::marker::PhantomData<Rep>,
-}
-
-impl<Req, Rep> RpcConnection<Req, Rep> {
-    /// Creates an RPC connection from the server side.
-    pub fn for_server(shared_id: u64, client_process_id: u64) -> Result<Self, RpcError> {
-        let mapping = selium_guest::SharedMemory::attach_shared(shared_id, 0, 8192)
+impl<Req, Rep> RpcClient<Req, Rep> {
+    /// Attaches to an RPC session region from the client side.
+    pub fn attach(region: SharedRegion) -> Result<Self, RpcError> {
+        let mapping = SharedMemory::attach(region.descriptor(), 0, region.len())
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
         let magic_bytes = mapping
@@ -43,7 +36,7 @@ impl<Req, Rep> RpcConnection<Req, Rep> {
                 .try_into()
                 .map_err(|_error| RpcError::InvalidRegion)?,
         );
-        if magic != selium_guest::SHARED_REGION_MAGIC {
+        if magic != SHARED_REGION_MAGIC {
             return Err(RpcError::InvalidRegion);
         }
 
@@ -95,93 +88,115 @@ impl<Req, Rep> RpcConnection<Req, Rep> {
 
         let _ = mapping;
 
-        let req_data_capacity = req_len.saturating_sub(crate::region::REGION_HEADER_BYTES);
-        let rep_data_capacity = rep_len.saturating_sub(crate::region::REGION_HEADER_BYTES);
+        let req_data_capacity = req_len.saturating_sub(region::REGION_HEADER_BYTES);
+        let rep_data_capacity = rep_len.saturating_sub(region::REGION_HEADER_BYTES);
 
-        let req_region = crate::region::ChannelRegion::from_mapping(
-            selium_guest::SharedMemory::attach_shared(shared_id, req_offset as u32, req_len as u32)
+        let req_region = region::ChannelRegion::from_mapping(
+            SharedMemory::attach_shared(region.shared_id(), req_offset as u32, req_len as u32)
                 .map_err(|e| RpcError::Serialization(e.to_string()))?,
             req_data_capacity,
         );
         let req_ring = RingBuf::wrap_region(req_region, None)?;
         let req_signal_shared_id = req_ring
             .region()
-            .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
+            .read_header_u64(region::SIGNAL_SHARED_ID_OFFSET)
             .map_err(|_error| RpcError::InvalidRegion)?;
         let _req_signal = Signal::attach(req_signal_shared_id)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let rep_region = crate::region::ChannelRegion::from_mapping(
-            selium_guest::SharedMemory::attach_shared(shared_id, rep_offset as u32, rep_len as u32)
+        let rep_region = region::ChannelRegion::from_mapping(
+            SharedMemory::attach_shared(region.shared_id(), rep_offset as u32, rep_len as u32)
                 .map_err(|e| RpcError::Serialization(e.to_string()))?,
             rep_data_capacity,
         );
         let rep_ring = RingBuf::wrap_region(rep_region, None)?;
         let rep_signal_shared_id = rep_ring
             .region()
-            .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
+            .read_header_u64(region::SIGNAL_SHARED_ID_OFFSET)
             .map_err(|_error| RpcError::InvalidRegion)?;
         let rep_signal = Signal::attach(rep_signal_shared_id)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let request_reader = {
-            let tail = req_ring.read_next_tail()?;
-            let reader_id = req_ring
-                .region()
-                .allocate_reader_slot(tail)
-                .map_err(|_error| RpcError::InvalidRegion)?;
-            StrongReader::new(req_ring.region().clone(), tail, reader_id)
-        };
-
-        rep_ring
+        req_ring
             .region()
             .increment_writer_count()
             .map_err(|_error| RpcError::InvalidRegion)?;
-        let writer_id = match rep_ring.region().allocate_writer_id() {
+        let writer_id = match req_ring.region().allocate_writer_id() {
             Ok(id) => id,
             Err(error) => {
-                let _unused = rep_ring.region().decrement_writer_count();
+                let _unused = req_ring.region().decrement_writer_count();
                 return Err(error.into());
             }
         };
-        let reply_writer = StrongWriter::new(
-            rep_ring.region().clone(),
+        let request_writer = RefCell::new(StrongWriter::new(
+            req_ring.region().clone(),
             writer_id,
-            Some(rep_signal.clone()),
-        );
+            Some(_req_signal),
+        ));
+
+        let reply_reader = {
+            let tail = rep_ring.read_next_tail()?;
+            let reader_id = rep_ring
+                .region()
+                .allocate_reader_slot(tail)
+                .map_err(|_error| RpcError::InvalidRegion)?;
+            RefCell::new(StrongReader::new(
+                rep_ring.region().clone(),
+                tail,
+                reader_id,
+            ))
+        };
 
         Ok(Self {
-            request_reader,
-            reply_writer,
+            request_writer,
+            reply_reader,
             reply_signal: rep_signal,
-            client_process_id,
+            correlation_id: Cell::new(0),
             _phantom: std::marker::PhantomData,
         })
     }
 
-    /// Receives the next request from the client.
-    pub async fn recv(&mut self) -> Result<RpcRequest<'_, Req, Rep>, RpcError>
+    /// Sends a typed request and awaits the matching reply.
+    pub async fn request(&self, payload: Req) -> Result<Rep, RpcError>
     where
         Req: selium_abi::RkyvEncode + Sized,
-        for<'a> Req::Archived: rkyv::Deserialize<Req, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        Rep: selium_abi::RkyvEncode + Sized,
+        for<'a> Rep::Archived: rkyv::Deserialize<Rep, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
             + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
     {
+        let correlation_id = self.next_correlation_id();
+        let bytes = selium_abi::encode_rkyv(&payload)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+
+        {
+            let mut writer = self.request_writer.borrow_mut();
+            writer.write(&bytes).map_err(|e| match e {
+                channels::Error::ChannelFull => RpcError::BufferFull,
+                channels::Error::Core(err) => err.into(),
+                other => RpcError::Serialization(other.to_string()),
+            })?;
+        }
+
         loop {
-            match self.request_reader.read() {
+            let result = {
+                let mut reader = self.reply_reader.borrow_mut();
+                reader.read()
+            };
+            match result {
                 Ok((payload, tag)) => {
-                    let request = selium_abi::decode_rkyv(&payload)
-                        .map_err(|e| RpcError::Serialization(e.to_string()))?;
-                    return Ok(RpcRequest {
-                        payload: request,
-                        correlation_id: tag,
-                        reply_writer: &mut self.reply_writer,
-                        reply_signal: &self.reply_signal,
-                        _phantom: std::marker::PhantomData,
-                    });
+                    if tag == correlation_id {
+                        let reply = selium_abi::decode_rkyv(&payload)
+                            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+                        return Ok(reply);
+                    }
+                    return Err(RpcError::Serialization(
+                        "reply correlation id mismatch".to_string(),
+                    ));
                 }
-                Err(crate::channels::Error::ChannelEmpty) => {
+                Err(channels::Error::ChannelEmpty) => {
                     if self
-                        .request_reader
+                        .reply_reader
+                        .borrow()
                         .region()
                         .read_writer_count()
                         .map_err(RpcError::from)?
@@ -202,38 +217,11 @@ impl<Req, Rep> RpcConnection<Req, Rep> {
             }
         }
     }
-}
 
-impl<'a, Req, Rep> RpcRequest<'a, Req, Rep> {
-    /// Returns a reference to the deserialized request payload.
-    pub fn payload(&self) -> &Req {
-        &self.payload
-    }
-
-    /// Returns the deserialized request payload.
-    pub fn into_payload(self) -> Req {
-        self.payload
-    }
-
-    /// Sends a reply to the client, consuming the request handle.
-    pub async fn reply(self, response: Rep) -> Result<(), RpcError>
-    where
-        Rep: selium_abi::RkyvEncode + Sized,
-    {
-        let bytes = selium_abi::encode_rkyv(&response)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-
-        self.reply_writer.write(&bytes).map_err(|e| match e {
-            crate::channels::Error::ChannelFull => RpcError::BufferFull,
-            crate::channels::Error::Core(err) => err.into(),
-            other => RpcError::Serialization(other.to_string()),
-        })?;
-
-        self.reply_signal
-            .notify()
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-
-        Ok(())
+    fn next_correlation_id(&self) -> u32 {
+        let id = self.correlation_id.get();
+        self.correlation_id.set(id.wrapping_add(1));
+        id
     }
 }
 
@@ -244,8 +232,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn for_server_rejects_invalid_region() {
-        let result = RpcConnection::<DiscoveryRequest, DiscoveryResponse>::for_server(0, 1);
+    fn attach_rejects_invalid_region() {
+        let region = SharedRegion::attach(0, 32768);
+        let result = RpcClient::<DiscoveryRequest, DiscoveryResponse>::attach(region);
         assert!(result.is_err());
     }
 }

@@ -1,7 +1,12 @@
-use selium_guest::Signal;
-
 use self::error::Result;
-use crate::ring_buf::{RingBuf, round_capacity};
+use crate::{
+    Signal,
+    io::{
+        self,
+        region::SIGNAL_SHARED_ID_OFFSET,
+        ring_buf::{RingBuf, round_capacity},
+    },
+};
 
 pub use self::{
     error::Error,
@@ -37,10 +42,10 @@ impl Channel {
         let mut ring = RingBuf::attach(shared_id, capacity).map_err(Error::Core)?;
         let signal_shared_id = ring
             .region()
-            .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
+            .read_header_u64(SIGNAL_SHARED_ID_OFFSET)
             .map_err(Error::Core)?;
         let signal = Signal::attach(signal_shared_id)
-            .map_err(|e| Error::Core(crate::Error::Guest(e.to_string())))?;
+            .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
         ring.set_signal(signal);
         Ok(Self { ring })
     }
@@ -125,5 +130,5 @@ impl Channel {
 }
 
 fn attach_signal(signal: &Signal) -> Result<Signal> {
-    Signal::attach(signal.shared_id()).map_err(|e| Error::Core(crate::Error::Guest(e.to_string())))
+    Signal::attach(signal.shared_id()).map_err(|e| Error::Core(io::Error::Guest(e.to_string())))
 }

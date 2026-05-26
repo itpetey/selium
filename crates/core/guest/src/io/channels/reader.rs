@@ -1,4 +1,4 @@
-use crate::{
+use crate::io::{
     channels::{Error, Result},
     frame::FrameHeader,
     region::ChannelRegion,

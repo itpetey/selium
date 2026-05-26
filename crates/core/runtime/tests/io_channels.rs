@@ -2,6 +2,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ResourceClass,
     ResourceSelector,
 };
+use selium_guest::io::FrameHeader;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
 #[expect(clippy::panic, reason = "test helper unreachable branch")]
@@ -427,7 +428,7 @@ fn shared_memory_ring_buffer_frame_format() {
 
     // Write a frame header + payload: "hello" at the data offset.
     let payload = b"hello";
-    let header = selium_io::FrameHeader {
+    let header = FrameHeader {
         len: payload.len() as u32,
         tag: 1,
         flags: 0,
@@ -454,7 +455,7 @@ fn shared_memory_ring_buffer_frame_format() {
     // Read back and validate the header.
     let read_header_bytes =
         read_shared_memory(&runtime, process_id, mapping.local_id, data_offset, 12);
-    let decoded = selium_io::FrameHeader::decode(&read_header_bytes).expect("valid frame header");
+    let decoded = FrameHeader::decode(&read_header_bytes).expect("valid frame header");
     assert_eq!(decoded.len, 5);
     assert_eq!(decoded.tag, 1);
 

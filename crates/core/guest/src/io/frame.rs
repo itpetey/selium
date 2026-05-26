@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use super::error::{Error, Result};
 
 /// A frame header stored at the start of each message in a ring buffer.
 ///

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::io::{Error, channels};
+
 /// Error type for RPC operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
@@ -49,27 +51,25 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-impl From<crate::Error> for RpcError {
-    fn from(error: crate::Error) -> Self {
+impl From<Error> for RpcError {
+    fn from(error: Error) -> Self {
         match error {
-            crate::Error::BufferFull => Self::BufferFull,
-            crate::Error::BufferEmpty => Self::BufferEmpty,
-            crate::Error::InvalidLayout => Self::InvalidRegion,
-            crate::Error::Guest(msg) => Self::Serialization(msg),
+            Error::BufferFull => Self::BufferFull,
+            Error::BufferEmpty => Self::BufferEmpty,
+            Error::InvalidLayout => Self::InvalidRegion,
+            Error::Guest(msg) => Self::Serialization(msg),
             other => Self::Serialization(other.to_string()),
         }
     }
 }
 
-impl From<crate::channels::Error> for RpcError {
-    fn from(error: crate::channels::Error) -> Self {
+impl From<channels::Error> for RpcError {
+    fn from(error: channels::Error) -> Self {
         match error {
-            crate::channels::Error::ChannelFull => Self::BufferFull,
-            crate::channels::Error::ChannelEmpty => Self::BufferEmpty,
-            crate::channels::Error::InvalidFrame => {
-                Self::Serialization("invalid frame".to_string())
-            }
-            crate::channels::Error::Core(e) => e.into(),
+            channels::Error::ChannelFull => Self::BufferFull,
+            channels::Error::ChannelEmpty => Self::BufferEmpty,
+            channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
+            channels::Error::Core(e) => e.into(),
             other => Self::Serialization(other.to_string()),
         }
     }
@@ -90,27 +90,25 @@ impl fmt::Display for AcceptError {
 
 impl std::error::Error for AcceptError {}
 
-impl From<crate::Error> for AcceptError {
-    fn from(error: crate::Error) -> Self {
+impl From<Error> for AcceptError {
+    fn from(error: Error) -> Self {
         match error {
-            crate::Error::BufferFull => Self::BufferFull,
-            crate::Error::BufferEmpty => Self::BufferEmpty,
-            crate::Error::InvalidLayout => Self::InvalidRegion,
-            crate::Error::Guest(msg) => Self::Serialization(msg),
+            Error::BufferFull => Self::BufferFull,
+            Error::BufferEmpty => Self::BufferEmpty,
+            Error::InvalidLayout => Self::InvalidRegion,
+            Error::Guest(msg) => Self::Serialization(msg),
             other => Self::Serialization(other.to_string()),
         }
     }
 }
 
-impl From<crate::channels::Error> for AcceptError {
-    fn from(error: crate::channels::Error) -> Self {
+impl From<channels::Error> for AcceptError {
+    fn from(error: channels::Error) -> Self {
         match error {
-            crate::channels::Error::ChannelFull => Self::BufferFull,
-            crate::channels::Error::ChannelEmpty => Self::BufferEmpty,
-            crate::channels::Error::InvalidFrame => {
-                Self::Serialization("invalid frame".to_string())
-            }
-            crate::channels::Error::Core(e) => e.into(),
+            channels::Error::ChannelFull => Self::BufferFull,
+            channels::Error::ChannelEmpty => Self::BufferEmpty,
+            channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
+            channels::Error::Core(e) => e.into(),
             other => Self::Serialization(other.to_string()),
         }
     }

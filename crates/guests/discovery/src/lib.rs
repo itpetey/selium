@@ -2,13 +2,11 @@
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
+use selium_guest::io::rpc::{RpcAccept, RpcConnection};
 use selium_guest::{
     DiscoveryRequest, DiscoveryResponse, InterfaceMetadata, ResourceTarget, entrypoint,
     pattern_interface,
 };
-use selium_io::rpc::{RpcAccept, RpcConnection};
-
-pub type TopicRegion = selium_io::ChannelRegion;
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
@@ -123,7 +121,7 @@ async fn handler(
                     break;
                 }
             }
-            Err(selium_io::rpc::error::RpcError::ConnectionClosed) => break,
+            Err(selium_guest::io::rpc::error::RpcError::ConnectionClosed) => break,
             Err(error) => {
                 selium_guest::warn!("discovery recv failed: {error}");
                 break;

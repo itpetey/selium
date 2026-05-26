@@ -1,4 +1,7 @@
-use crate::error::{Error, Result};
+use crate::{
+    SharedMemory, SharedRegion,
+    io::error::{Error, Result},
+};
 
 pub const CAPACITY_OFFSET: u64 = 8;
 pub const MAGIC_OFFSET: u64 = 0;
@@ -26,7 +29,7 @@ pub struct RegionBuilder;
 #[derive(Clone)]
 pub struct ChannelRegion {
     shared_id: u64,
-    mapping: selium_guest::SharedMemory,
+    mapping: SharedMemory,
     capacity: u64,
     size: u64,
 }
@@ -35,9 +38,9 @@ impl RegionBuilder {
     /// Creates a new shared memory region for a ring buffer of the given capacity.
     pub fn create(capacity: u32) -> Result<ChannelRegion> {
         let total_aligned = aligned_region_size(capacity as u64)?;
-        let region = selium_guest::SharedRegion::allocate(total_aligned, 8)
-            .map_err(|e| Error::Guest(e.to_string()))?;
-        let mapping = selium_guest::SharedMemory::attach(region.descriptor(), 0, total_aligned)
+        let region =
+            SharedRegion::allocate(total_aligned, 8).map_err(|e| Error::Guest(e.to_string()))?;
+        let mapping = SharedMemory::attach(region.descriptor(), 0, total_aligned)
             .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(ChannelRegion {
             shared_id: region.shared_id(),
@@ -50,7 +53,7 @@ impl RegionBuilder {
     /// Attaches to an existing shared memory region by its shared id.
     pub fn attach(shared_id: u64, capacity: u64) -> Result<ChannelRegion> {
         let total_aligned = aligned_region_size(capacity)?;
-        let mapping = selium_guest::SharedMemory::attach_shared(shared_id, 0, total_aligned)
+        let mapping = SharedMemory::attach_shared(shared_id, 0, total_aligned)
             .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(ChannelRegion {
             shared_id,
@@ -63,7 +66,7 @@ impl RegionBuilder {
 
 impl ChannelRegion {
     /// Wraps an existing shared memory mapping as a channel region.
-    pub fn from_mapping(mapping: selium_guest::SharedMemory, capacity: u64) -> Self {
+    pub fn from_mapping(mapping: SharedMemory, capacity: u64) -> Self {
         Self {
             shared_id: mapping.shared_id(),
             mapping,
@@ -143,7 +146,7 @@ impl ChannelRegion {
     }
 
     /// Returns a reference to the underlying shared memory mapping.
-    pub fn data_slice(&self) -> &selium_guest::SharedMemory {
+    pub fn data_slice(&self) -> &SharedMemory {
         &self.mapping
     }
 

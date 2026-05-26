@@ -1,15 +1,15 @@
 use std::{future::Future, pin::Pin, task::Poll};
 
 use selium_abi::{
-    CompletionState, HostcallEnvelope, HostcallOutput, HostcallRequest, OperationId, decode_rkyv,
-    encode_rkyv, unpack_hostcall_status,
+    decode_rkyv, encode_rkyv, unpack_hostcall_status, CompletionState, HostcallEnvelope,
+    HostcallOutput, HostcallRequest, OperationId,
 };
 
 use crate::{
-    GuestError, Result,
     async_runtime::current_task_id,
     error::abi_error_to_guest_error,
     platform::{selium_hostcall_create, selium_hostcall_drop, selium_hostcall_poll},
+    GuestError, Result,
 };
 
 pub(crate) struct HostcallFuture {

@@ -1,9 +1,11 @@
-use selium_guest::Signal;
-
 use crate::{
-    channels::{Error, Result},
-    frame::FrameHeader,
-    region::ChannelRegion,
+    Signal,
+    io::{
+        self,
+        channels::{Error, Result},
+        frame::FrameHeader,
+        region::ChannelRegion,
+    },
 };
 
 /// Writer that is tracked in the channel's shared metadata, preventing
@@ -66,7 +68,7 @@ impl StrongWriter {
         if let Some(signal) = &self.signal {
             signal
                 .notify()
-                .map_err(|e| Error::Core(crate::Error::Guest(e.to_string())))?;
+                .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
         }
 
         Ok(())
@@ -126,7 +128,7 @@ impl WeakWriter {
         if let Some(signal) = &self.signal {
             signal
                 .notify()
-                .map_err(|e| Error::Core(crate::Error::Guest(e.to_string())))?;
+                .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
         }
         Ok(())
     }
@@ -155,10 +157,10 @@ impl Writer {
     }
 }
 
-fn map_core_error(error: crate::Error) -> Error {
+fn map_core_error(error: io::Error) -> Error {
     match error {
-        crate::Error::BufferFull | crate::Error::CapacityExceeded => Error::ChannelFull,
-        crate::Error::ReservationContended => Error::ReservationContended,
+        io::Error::BufferFull | io::Error::CapacityExceeded => Error::ChannelFull,
+        io::Error::ReservationContended => Error::ReservationContended,
         other => Error::Core(other),
     }
 }
@@ -192,14 +194,14 @@ fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result
         region
             .data_slice()
             .write(offset as u32, data.get(..tail).unwrap_or_default().to_vec())
-            .map_err(|e| Error::Core(crate::error::Error::Guest(e.to_string())))?;
+            .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
     }
     if head > 0 {
         let offset = region.data_offset();
         region
             .data_slice()
             .write(offset as u32, data.get(tail..).unwrap_or_default().to_vec())
-            .map_err(|e| Error::Core(crate::error::Error::Guest(e.to_string())))?;
+            .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
     }
     Ok(())
 }
@@ -230,16 +232,16 @@ mod tests {
     #[test]
     fn core_reservation_contention_maps_to_channel_contention() {
         assert_eq!(
-            map_core_error(crate::Error::ReservationContended),
+            map_core_error(io::Error::ReservationContended),
             Error::ReservationContended
         );
     }
 
     #[test]
     fn core_capacity_errors_map_to_channel_full() {
-        assert_eq!(map_core_error(crate::Error::BufferFull), Error::ChannelFull);
+        assert_eq!(map_core_error(io::Error::BufferFull), Error::ChannelFull);
         assert_eq!(
-            map_core_error(crate::Error::CapacityExceeded),
+            map_core_error(io::Error::CapacityExceeded),
             Error::ChannelFull
         );
     }

@@ -1,7 +1,9 @@
 use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
-use selium_guest::SharedRegion;
 
-use crate::rpc::{RpcClient, error::RpcError};
+use crate::{
+    SharedRegion,
+    io::rpc::{RpcClient, error::RpcError},
+};
 
 /// Standard size for an RPC session region.
 pub const RPC_SESSION_REGION_SIZE: u32 = 32768;

@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 
 use selium_guest::{entrypoint, pattern_interface};
 
-pub type TopicRegion = selium_io::ChannelRegion;
-
 pub const CLUSTER_COORDINATION_EXCHANGE: &str = "selium.cluster.coordination";
 pub const EXTERNAL_BOOTSTRAP_TOPIC: &str = "selium.cluster.external-bootstrap";
 pub const HOST_LOAD_TABLE: &str = "selium.cluster.host-load";

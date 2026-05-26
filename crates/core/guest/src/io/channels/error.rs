@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::io;
+
 /// Result type for channel operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -21,7 +23,7 @@ pub enum Error {
     /// Channel has been closed.
     Closed,
     /// Error from the core I/O layer.
-    Core(crate::Error),
+    Core(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -41,8 +43,8 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::Error> for Error {
-    fn from(e: crate::Error) -> Self {
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
         Self::Core(e)
     }
 }
@@ -63,8 +65,8 @@ mod tests {
 
     #[test]
     fn core_error_conversion() {
-        let core_err = crate::Error::BufferFull;
+        let core_err = io::Error::BufferFull;
         let err: Error = core_err.into();
-        assert_eq!(err, Error::Core(crate::Error::BufferFull));
+        assert_eq!(err, Error::Core(io::Error::BufferFull));
     }
 }

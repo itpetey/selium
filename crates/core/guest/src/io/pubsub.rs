@@ -1,18 +1,20 @@
 use std::{cell::RefCell, marker::PhantomData};
 
+use crate::{
+    io::{
+        Error, RingBuf,
+        channels::{self, StrongReader, StrongWriter},
+        error::Result,
+        region::SIGNAL_SHARED_ID_OFFSET,
+        ring_buf::round_capacity,
+    },
+    signal::Signal,
+};
 use rkyv::{
     Deserialize,
     api::high::{HighDeserializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::Error as RancorError,
-};
-use selium_guest::Signal;
-
-use crate::{
-    Error, RingBuf,
-    channels::{self, StrongReader, StrongWriter},
-    error::Result,
-    ring_buf::round_capacity,
 };
 
 /// A codec that converts between typed values and raw bytes.
@@ -404,7 +406,7 @@ fn attach_topic(shared_id: u64, capacity: u64) -> Result<(RingBuf, Signal)> {
     let ring = RingBuf::attach(shared_id, capacity)?;
     let signal_shared_id = ring
         .region()
-        .read_header_u64(crate::region::SIGNAL_SHARED_ID_OFFSET)
+        .read_header_u64(SIGNAL_SHARED_ID_OFFSET)
         .map_err(|_invalid_layout| Error::InvalidLayout)?;
     let signal = Signal::attach(signal_shared_id).map_err(|e| Error::Guest(e.to_string()))?;
     Ok((ring, signal))

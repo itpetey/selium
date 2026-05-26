@@ -4,8 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use selium_guest::{entrypoint, pattern_interface};
 
-pub type TopicRegion = selium_io::ChannelRegion;
-
 pub const DESIRED_WORKLOAD_TABLE: &str = "selium.scheduler.desired-workloads";
 pub const PLACEMENT_INTENT_EXCHANGE: &str = "selium.scheduler.placement";
 pub const SCHEDULER_STATE_LOG: &str = "selium.scheduler.state";

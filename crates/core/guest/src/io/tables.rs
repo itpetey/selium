@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, hash::Hash, marker::PhantomData};
 
-use crate::{
+use crate::io::{
     error::{Error, Result},
     pubsub::{self, Codec, TypedPublisher, TypedSubscriber},
 };
