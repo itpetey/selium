@@ -99,6 +99,8 @@ pub enum Capability {
     GuestLogRead,
     /// Permission to write guest log entries.
     GuestLogWrite,
+    /// Permission to create, attach, send, and receive from host-mediated connection queues.
+    HostQueue,
 }
 
 /// Identity of a resource in either local-handle or shared-resource space.
@@ -155,6 +157,8 @@ pub enum ResourceClass {
     MeteringStream,
     /// Guest log resource.
     GuestLog,
+    /// Host-mediated connection queue resource.
+    HostQueue,
 }
 
 /// Context used to evaluate a capability grant.
@@ -258,6 +262,16 @@ pub struct SignalDescriptor {
     /// Local signal handle id.
     pub local_id: LocalResourceId,
     /// Shared signal id.
+    pub shared_id: SharedResourceId,
+}
+
+/// Descriptor for a host-mediated connection queue handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct HostQueueDescriptor {
+    /// Local queue handle id.
+    pub local_id: LocalResourceId,
+    /// Shared queue id.
     pub shared_id: SharedResourceId,
 }
 
@@ -672,6 +686,25 @@ pub enum HostcallRequest {
         /// Optional process id filter.
         process_id: Option<ProcessId>,
     },
+    /// Create a host-mediated connection queue.
+    HostQueueCreate,
+    /// Attach to an existing host-mediated connection queue.
+    HostQueueAttach {
+        /// Shared queue id to attach to.
+        shared_id: SharedResourceId,
+    },
+    /// Send a value to a host-mediated connection queue.
+    HostQueueSend {
+        /// Local queue handle.
+        local_id: LocalResourceId,
+        /// Value to enqueue.
+        value: u64,
+    },
+    /// Receive a value from a host-mediated connection queue.
+    HostQueueRecv {
+        /// Local queue handle.
+        local_id: LocalResourceId,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.
@@ -712,6 +745,8 @@ pub enum HostcallOutput {
     SharedMapping(SharedMappingDescriptor),
     /// A signal descriptor.
     Signal(SignalDescriptor),
+    /// A host-mediated connection queue descriptor.
+    HostQueue(HostQueueDescriptor),
     /// A network listener descriptor.
     Listener(NetworkListenerDescriptor),
     /// A network session descriptor.
@@ -751,6 +786,13 @@ pub enum HostcallOutput {
     SignalGeneration(u64),
     /// Raw `u64` value.
     U64(u64),
+    /// Connection queue entry with client process id and value.
+    ConnectionInfo {
+        /// Process id of the connecting client.
+        client_process_id: ProcessId,
+        /// Enqueued value (e.g. session shared_id).
+        value: u64,
+    },
 }
 
 /// Current completion state of a hostcall operation.

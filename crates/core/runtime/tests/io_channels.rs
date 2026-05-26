@@ -172,8 +172,9 @@ fn shared_memory_ring_buffer_frame_format() {
     let payload = b"hello";
     let header = selium_io::FrameHeader {
         len: payload.len() as u32,
+        tag: 1,
         flags: 0,
-        writer_id: 1,
+        _reserved: [0; 3],
     };
     let header_bytes = header.encode();
 
@@ -189,24 +190,120 @@ fn shared_memory_ring_buffer_frame_format() {
         &runtime,
         process_id,
         mapping.local_id,
-        data_offset + 8,
+        data_offset + 12,
         payload.to_vec(),
     );
 
     // Read back and validate the header.
     let read_header_bytes =
-        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset, 8);
+        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset, 12);
     let decoded = selium_io::FrameHeader::decode(&read_header_bytes).expect("valid frame header");
     assert_eq!(decoded.len, 5);
-    assert_eq!(decoded.writer_id, 1);
+    assert_eq!(decoded.tag, 1);
 
     // Read back and validate the payload.
     let read_payload =
-        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset + 8, 5);
+        read_shared_memory(&runtime, process_id, mapping.local_id, data_offset + 12, 5);
     assert_eq!(read_payload, b"hello");
 
     // Verify frame_size() matches.
-    assert_eq!(decoded.frame_size(), 13);
+    assert_eq!(decoded.frame_size(), 17);
+}
+
+/// Tests multi-memory shared region layout header write/read through the runtime.
+///
+/// Validates that a layout written by SharedRegionBuilder can be read back
+/// by an attaching party.
+#[test]
+fn shared_memory_multi_memory_layout_discovery() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest(&runtime, "layout-test");
+
+    let region_size: u32 = 8192;
+    let region = alloc_shared_region(&runtime, process_id, region_size, 8);
+    let mapping = attach_shared_region(&runtime, process_id, region.shared_id, 0, region_size);
+
+    // Write a SharedRegionBuilder-style layout header.
+    let magic: u64 = 0x53454C49554D454D;
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        0,
+        magic.to_le_bytes().to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        8,
+        (region_size as u64).to_le_bytes().to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        16,
+        2u32.to_le_bytes().to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        20,
+        0u32.to_le_bytes().to_vec(),
+    );
+
+    // Memory 0: offset 32, len 4096
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        24,
+        32u32.to_le_bytes().to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        28,
+        4096u32.to_le_bytes().to_vec(),
+    );
+
+    // Memory 1: offset 4128, len 4096
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        32,
+        4128u32.to_le_bytes().to_vec(),
+    );
+    write_shared_memory(
+        &runtime,
+        process_id,
+        mapping.local_id,
+        36,
+        4096u32.to_le_bytes().to_vec(),
+    );
+
+    // Attach a second mapping and read back the layout.
+    let mapping2 = attach_shared_region(&runtime, process_id, region.shared_id, 0, region_size);
+
+    let read_magic = read_shared_memory(&runtime, process_id, mapping2.local_id, 0, 8);
+    assert_eq!(u64::from_le_bytes(read_magic.try_into().unwrap()), magic);
+
+    let read_count = read_shared_memory(&runtime, process_id, mapping2.local_id, 16, 4);
+    assert_eq!(u32::from_le_bytes(read_count.try_into().unwrap()), 2);
+
+    let read_offset0 = read_shared_memory(&runtime, process_id, mapping2.local_id, 24, 4);
+    let read_len0 = read_shared_memory(&runtime, process_id, mapping2.local_id, 28, 4);
+    assert_eq!(u32::from_le_bytes(read_offset0.try_into().unwrap()), 32);
+    assert_eq!(u32::from_le_bytes(read_len0.try_into().unwrap()), 4096);
+
+    let read_offset1 = read_shared_memory(&runtime, process_id, mapping2.local_id, 32, 4);
+    let read_len1 = read_shared_memory(&runtime, process_id, mapping2.local_id, 36, 4);
+    assert_eq!(u32::from_le_bytes(read_offset1.try_into().unwrap()), 4128);
+    assert_eq!(u32::from_le_bytes(read_len1.try_into().unwrap()), 4096);
 }
 
 /// Tests signal creation and notify through the runtime.

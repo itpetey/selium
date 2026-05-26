@@ -6,6 +6,7 @@ pub use async_runtime::{
 pub use codec::{decode_typed, encode_typed};
 pub use error::{GuestError, Result};
 pub use memory::{SharedMemory, SharedRegion};
+pub use resource::{Accept, IncomingConnection, ResourceListener, ResourceSender};
 pub use network::{NetworkListener, NetworkSession, NetworkStream, RequestExchange};
 pub use platform::{mark_ready, process_id};
 pub use process::{ActivityLog, GuestLog, Metering, Process};
@@ -26,5 +27,6 @@ mod memory;
 mod network;
 mod platform;
 mod process;
+mod resource;
 mod signal;
 mod storage;

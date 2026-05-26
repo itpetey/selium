@@ -10,14 +10,14 @@ use crate::{
 /// buffer overwrite until the slowest strong reader has consumed the data.
 pub struct StrongWriter {
     region: ChannelRegion,
-    writer_id: u16,
+    writer_id: u32,
     signal: Option<Signal>,
 }
 
 /// Writer that is not tracked; may overwrite slow readers.
 pub struct WeakWriter {
     region: ChannelRegion,
-    writer_id: u16,
+    writer_id: u32,
     signal: Option<Signal>,
 }
 
@@ -30,7 +30,7 @@ pub enum Writer {
 }
 
 impl StrongWriter {
-    pub(crate) fn new(region: ChannelRegion, writer_id: u16, signal: Option<Signal>) -> Self {
+    pub(crate) fn new(region: ChannelRegion, writer_id: u32, signal: Option<Signal>) -> Self {
         Self {
             region,
             writer_id,
@@ -54,8 +54,9 @@ impl StrongWriter {
 
         let header = FrameHeader {
             len: payload.len() as u32,
+            tag: self.writer_id,
             flags: 0,
-            writer_id: self.writer_id,
+            _reserved: [0; 3],
         };
         let mask = self.region.capacity() - 1;
         if let Err(error) = write_reserved_frame(&self.region, pos, payload, header, mask) {
@@ -72,7 +73,7 @@ impl StrongWriter {
     }
 
     /// Returns the writer id stored in emitted frames.
-    pub fn writer_id(&self) -> u16 {
+    pub fn writer_id(&self) -> u32 {
         self.writer_id
     }
 
@@ -89,7 +90,7 @@ impl Drop for StrongWriter {
 }
 
 impl WeakWriter {
-    pub(crate) fn new(region: ChannelRegion, writer_id: u16, signal: Option<Signal>) -> Self {
+    pub(crate) fn new(region: ChannelRegion, writer_id: u32, signal: Option<Signal>) -> Self {
         Self {
             region,
             writer_id,
@@ -113,8 +114,9 @@ impl WeakWriter {
 
         let header = FrameHeader {
             len: payload.len() as u32,
+            tag: self.writer_id,
             flags: 0,
-            writer_id: self.writer_id,
+            _reserved: [0; 3],
         };
         let mask = self.region.capacity() - 1;
         if let Err(error) = write_reserved_frame(&self.region, pos, payload, header, mask) {
@@ -130,7 +132,7 @@ impl WeakWriter {
     }
 
     /// Returns the writer id stored in emitted frames.
-    pub fn writer_id(&self) -> u16 {
+    pub fn writer_id(&self) -> u32 {
         self.writer_id
     }
 }
@@ -145,7 +147,7 @@ impl Writer {
     }
 
     /// Returns the writer id.
-    pub fn writer_id(&self) -> u16 {
+    pub fn writer_id(&self) -> u32 {
         match self {
             Self::Strong(w) => w.writer_id,
             Self::Weak(w) => w.writer_id,
@@ -209,13 +211,14 @@ fn write_aborted_frame(
     region: &ChannelRegion,
     pos: u64,
     payload_len: usize,
-    writer_id: u16,
+    tag: u32,
     mask: u64,
 ) -> Result<()> {
     let header = FrameHeader {
         len: payload_len as u32,
+        tag,
         flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_ABORTED,
-        writer_id,
+        _reserved: [0; 3],
     };
     write_raw(region, pos, &header.encode(), mask)
 }

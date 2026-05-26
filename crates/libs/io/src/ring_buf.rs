@@ -53,6 +53,12 @@ impl RingBuf {
     /// Attaches to an existing ring buffer by shared region id.
     pub fn attach(shared_id: u64, capacity: u64) -> Result<Self> {
         let region = RegionBuilder::attach(shared_id, capacity)?;
+        Self::wrap_region(region, None)
+    }
+
+    /// Wraps an existing channel region as a ring buffer.
+    pub fn wrap_region(region: ChannelRegion, signal: Option<Signal>) -> Result<Self> {
+        let capacity = region.capacity();
         let mask = mask_for_capacity(capacity)?;
         let magic = region.read_magic()?;
         if magic != MAGIC_PREFIX {
@@ -65,7 +71,7 @@ impl RingBuf {
             region,
             mask,
             capacity,
-            signal: None,
+            signal,
         })
     }
 
@@ -155,15 +161,16 @@ impl RingBuf {
     }
 
     /// Writes a framed message at the given position.
-    pub fn write_frame(&self, pos: u64, payload: &[u8], writer_id: u16, flags: u16) -> Result<()> {
+    pub fn write_frame(&self, pos: u64, payload: &[u8], tag: u32, flags: u8) -> Result<()> {
         let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
         if frame_size > self.capacity {
             return Err(Error::CapacityExceeded);
         }
         let pending_header = FrameHeader {
             len: payload.len() as u32,
+            tag,
             flags: flags & !FrameHeader::FLAG_READY,
-            writer_id,
+            _reserved: [0; 3],
         };
         let header_bytes = pending_header.encode();
         self.write_at(pos, &header_bytes)?;

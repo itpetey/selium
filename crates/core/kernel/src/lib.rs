@@ -4,6 +4,7 @@ pub use error::{Error, Result};
 pub use state::Kernel;
 
 mod error;
+mod host_queue;
 mod memory;
 mod network;
 mod process;

@@ -117,7 +117,7 @@ impl Publisher {
     }
 
     /// Returns the writer id stored in frames published by this publisher.
-    pub fn writer_id(&self) -> u16 {
+    pub fn writer_id(&self) -> u32 {
         self.writer.borrow().writer_id()
     }
 
@@ -166,8 +166,8 @@ impl Subscriber {
         })
     }
 
-    /// Reads the next available raw message. Returns `(payload, writer_id)`.
-    pub fn read(&mut self) -> Result<(Vec<u8>, u16)> {
+    /// Reads the next available raw message. Returns `(payload, tag)`.
+    pub fn read(&mut self) -> Result<(Vec<u8>, u32)> {
         let frame = self.reader.read().map_err(map_channel_error)?;
         if !self.reader.has_ready_frame().map_err(map_channel_error)? {
             self.observed_generation = self
@@ -282,7 +282,7 @@ impl<C: Codec> TypedPublisher<C> {
     }
 
     /// Returns the writer id stored in frames published by this publisher.
-    pub fn writer_id(&self) -> u16 {
+    pub fn writer_id(&self) -> u32 {
         self.inner.writer_id()
     }
 
@@ -320,10 +320,10 @@ impl<C: Codec> TypedSubscriber<C> {
     }
 
     /// Reads and deserialises the next available message with its writer id.
-    pub fn read_with_writer_id(&mut self) -> Result<(C::Item, u16)> {
-        let (bytes, writer_id) = self.inner.read()?;
+    pub fn read_with_writer_id(&mut self) -> Result<(C::Item, u32)> {
+        let (bytes, tag) = self.inner.read()?;
         let item = self.codec.decode(&bytes)?;
-        Ok((item, writer_id))
+        Ok((item, tag))
     }
 
     /// Waits for new data using the notification signal.

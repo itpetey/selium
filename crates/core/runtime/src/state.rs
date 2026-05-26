@@ -48,6 +48,10 @@ pub(crate) enum HostOperationState {
         exchange_id: u64,
         deadline: Instant,
     },
+    HostQueueRecvWait {
+        local_id: u64,
+        deadline: Instant,
+    },
 }
 
 #[derive(Debug, Clone)]

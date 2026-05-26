@@ -9,7 +9,7 @@ use crate::{
 pub struct StrongReader {
     region: ChannelRegion,
     pos: u64,
-    reader_id: u16,
+    reader_id: u32,
     terminated: bool,
 }
 
@@ -34,7 +34,7 @@ pub enum Reader {
 }
 
 impl StrongReader {
-    pub(crate) fn new(region: ChannelRegion, start_pos: u64, reader_id: u16) -> Self {
+    pub(crate) fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
         Self {
             region,
             pos: start_pos,
@@ -43,8 +43,8 @@ impl StrongReader {
         }
     }
 
-    /// Reads the next frame. Returns `(payload, writer_id)`.
-    pub fn read(&mut self) -> Result<(Vec<u8>, u16)> {
+    /// Reads the next frame. Returns `(payload, tag)`.
+    pub fn read(&mut self) -> Result<(Vec<u8>, u32)> {
         if self.terminated {
             return Err(Error::Terminated);
         }
@@ -89,7 +89,7 @@ impl StrongReader {
             let payload = self.read_payload(payload_pos, header.len as u64, mask)?;
 
             self.advance(frame_size)?;
-            return Ok((payload, header.writer_id));
+            return Ok((payload, header.tag));
         }
     }
 
@@ -151,6 +151,11 @@ impl StrongReader {
     pub fn position(&self) -> u64 {
         self.pos
     }
+
+    /// Returns a reference to the underlying channel region.
+    pub fn region(&self) -> &ChannelRegion {
+        &self.region
+    }
 }
 
 impl WeakReader {
@@ -162,8 +167,8 @@ impl WeakReader {
         }
     }
 
-    /// Reads the next frame. Returns `(payload, writer_id)`.
-    pub fn read(&mut self) -> Result<(Vec<u8>, u16)> {
+    /// Reads the next frame. Returns `(payload, tag)`.
+    pub fn read(&mut self) -> Result<(Vec<u8>, u32)> {
         if self.terminated {
             return Err(Error::Terminated);
         }
@@ -214,7 +219,7 @@ impl WeakReader {
                 .pos
                 .checked_add(frame_size)
                 .ok_or(Error::InvalidFrame)?;
-            return Ok((payload, header.writer_id));
+            return Ok((payload, header.tag));
         }
     }
 
@@ -226,7 +231,7 @@ impl WeakReader {
 
 impl Reader {
     /// Reads the next available frame from the channel.
-    pub fn read(&mut self) -> Result<(Vec<u8>, u16)> {
+    pub fn read(&mut self) -> Result<(Vec<u8>, u32)> {
         match self {
             Self::Strong(r) => r.read(),
             Self::Weak(r) => r.read(),

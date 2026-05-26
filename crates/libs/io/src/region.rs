@@ -62,6 +62,16 @@ impl RegionBuilder {
 }
 
 impl ChannelRegion {
+    /// Wraps an existing shared memory mapping as a channel region.
+    pub fn from_mapping(mapping: selium_guest::SharedMemory, capacity: u64) -> Self {
+        Self {
+            shared_id: mapping.shared_id(),
+            mapping,
+            capacity,
+            size: REGION_HEADER_BYTES + capacity,
+        }
+    }
+
     /// Returns the shared region id.
     pub fn shared_id(&self) -> u64 {
         self.shared_id
@@ -218,7 +228,7 @@ impl ChannelRegion {
     }
 
     /// Allocates a stable writer id.
-    pub fn allocate_writer_id(&self) -> Result<u16> {
+    pub fn allocate_writer_id(&self) -> Result<u32> {
         for _ in 0..RESERVE_SPIN_LIMIT {
             let id = self.read_header_u64(NEXT_WRITER_ID_OFFSET)?;
             let (writer_id, next) = next_writer_id(id)?;
@@ -247,12 +257,12 @@ impl ChannelRegion {
     }
 
     /// Allocates a reader cursor slot and initialises it to `position`.
-    pub fn allocate_reader_slot(&self, position: u64) -> Result<u16> {
+    pub fn allocate_reader_slot(&self, position: u64) -> Result<u32> {
         let encoded_position = encode_reader_position(position)?;
         for slot in 0..MAX_READER_SLOTS {
             let active_offset = reader_slot_offset(slot, READER_ACTIVE_OFFSET);
             if self.compare_exchange_header_u64(active_offset, 0, encoded_position)? == 0 {
-                return Ok(slot);
+                return Ok(u32::from(slot));
             }
         }
 
@@ -260,22 +270,22 @@ impl ChannelRegion {
     }
 
     /// Updates an allocated reader cursor slot.
-    pub fn update_reader_slot(&self, slot: u16, position: u64) -> Result<()> {
-        if slot >= MAX_READER_SLOTS {
+    pub fn update_reader_slot(&self, slot: u32, position: u64) -> Result<()> {
+        if slot >= u32::from(MAX_READER_SLOTS) {
             return Err(Error::InvalidLayout);
         }
         self.write_header_u64(
-            reader_slot_offset(slot, READER_ACTIVE_OFFSET),
+            reader_slot_offset(slot as u16, READER_ACTIVE_OFFSET),
             encode_reader_position(position)?,
         )
     }
 
     /// Releases an allocated reader cursor slot.
-    pub fn release_reader_slot(&self, slot: u16) -> Result<()> {
-        if slot >= MAX_READER_SLOTS {
+    pub fn release_reader_slot(&self, slot: u32) -> Result<()> {
+        if slot >= u32::from(MAX_READER_SLOTS) {
             return Err(Error::InvalidLayout);
         }
-        let active_offset = reader_slot_offset(slot, READER_ACTIVE_OFFSET);
+        let active_offset = reader_slot_offset(slot as u16, READER_ACTIVE_OFFSET);
         let current = self.read_header_u64(active_offset)?;
         if current != 0 {
             self.compare_exchange_header_u64(active_offset, current, 0)?;
@@ -337,11 +347,11 @@ fn reserve_tail_next(
     Ok(next)
 }
 
-fn next_writer_id(id: u64) -> Result<(u16, u64)> {
-    if id > u64::from(u16::MAX) {
+fn next_writer_id(id: u64) -> Result<(u32, u64)> {
+    if id > u64::from(u32::MAX) {
         return Err(Error::CapacityExceeded);
     }
-    Ok((id as u16, id + 1))
+    Ok((id as u32, id + 1))
 }
 
 fn reader_slot_offset(slot: u16, field_offset: u64) -> u64 {
@@ -391,9 +401,151 @@ mod tests {
     }
 
     #[test]
-    fn next_writer_id_rejects_u16_wraparound() {
+    fn next_writer_id_rejects_u32_wraparound() {
         assert_eq!(next_writer_id(0), Ok((0, 1)));
-        assert_eq!(next_writer_id(u64::from(u16::MAX)), Ok((u16::MAX, 65536)));
-        assert_eq!(next_writer_id(65536), Err(Error::CapacityExceeded));
+        assert_eq!(next_writer_id(u64::from(u32::MAX)), Ok((u32::MAX, 4_294_967_296)));
+        assert_eq!(next_writer_id(4_294_967_296), Err(Error::CapacityExceeded));
+    }
+}
+
+/// Magic value for multi-memory shared region layout headers.
+pub(crate) const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+
+/// Layout constants for a multi-memory shared region header.
+const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
+const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
+const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
+const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
+
+/// Builder for constructing a multi-memory shared region.
+///
+/// Sub-memories are stored contiguously with 8-byte alignment padding.
+/// The region header records `memory_count` and `(offset, len)` pairs.
+/// After `seal()`, no further modifications are permitted.
+pub struct SharedRegionBuilder {
+    capacity: u32,
+    memories: Vec<u32>,
+    sealed: bool,
+}
+
+impl SharedRegionBuilder {
+    /// Creates a new builder with the given total region capacity.
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            memories: Vec::new(),
+            sealed: false,
+        }
+    }
+
+    /// Adds a sub-memory of the given length to the layout.
+    pub fn add_memory(&mut self, len: u32) -> Result<&mut Self> {
+        if self.sealed {
+            return Err(Error::BuilderSealed);
+        }
+        self.memories.push(len);
+        Ok(self)
+    }
+
+    /// Finalises the layout, allocates the shared region, writes the header,
+    /// and returns the region descriptor.
+    pub fn seal(&mut self) -> Result<selium_guest::SharedRegion> {
+        if self.sealed {
+            return Err(Error::BuilderSealed);
+        }
+
+        let header_size = Self::header_size(self.memories.len() as u32);
+        let mut total = header_size;
+        for &len in &self.memories {
+            total = Self::align_up(total, 8) + len;
+        }
+
+        if total > self.capacity {
+            return Err(Error::CapacityExceeded);
+        }
+
+        let region = selium_guest::SharedRegion::allocate(self.capacity, 8)
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        let mapping = selium_guest::SharedMemory::attach(region.descriptor(), 0, self.capacity)
+            .map_err(|e| Error::Guest(e.to_string()))?;
+
+        mapping
+            .write(0, SHARED_REGION_MAGIC.to_le_bytes().to_vec())
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        mapping
+            .write(
+                SHARED_REGION_HEADER_CAPACITY_OFFSET,
+                (self.capacity as u64).to_le_bytes().to_vec(),
+            )
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        mapping
+            .write(
+                SHARED_REGION_HEADER_COUNT_OFFSET,
+                (self.memories.len() as u32).to_le_bytes().to_vec(),
+            )
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        mapping
+            .write(
+                SHARED_REGION_HEADER_COUNT_OFFSET + 4,
+                0u32.to_le_bytes().to_vec(),
+            )
+            .map_err(|e| Error::Guest(e.to_string()))?;
+
+        let mut offset = header_size;
+        for (i, &len) in self.memories.iter().enumerate() {
+            offset = Self::align_up(offset, 8);
+            let entry_offset =
+                SHARED_REGION_HEADER_ENTRY_OFFSET + i as u32 * SHARED_REGION_HEADER_ENTRY_SIZE;
+            mapping
+                .write(entry_offset, offset.to_le_bytes().to_vec())
+                .map_err(|e| Error::Guest(e.to_string()))?;
+            mapping
+                .write(entry_offset + 4, len.to_le_bytes().to_vec())
+                .map_err(|e| Error::Guest(e.to_string()))?;
+            offset += len;
+        }
+
+        self.sealed = true;
+        Ok(region)
+    }
+
+    fn header_size(memory_count: u32) -> u32 {
+        SHARED_REGION_HEADER_ENTRY_OFFSET + memory_count * SHARED_REGION_HEADER_ENTRY_SIZE
+    }
+
+    fn align_up(value: u32, alignment: u32) -> u32 {
+        let rem = value % alignment;
+        if rem == 0 {
+            value
+        } else {
+            value + alignment - rem
+        }
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn add_memory_after_seal_returns_error() {
+        let mut builder = SharedRegionBuilder::new(1024);
+        builder.sealed = true;
+        assert!(matches!(builder.add_memory(64), Err(Error::BuilderSealed)));
+    }
+
+    #[test]
+    fn seal_after_seal_returns_error() {
+        let mut builder = SharedRegionBuilder::new(1024);
+        builder.sealed = true;
+        assert!(matches!(builder.seal(), Err(Error::BuilderSealed)));
+    }
+
+    #[test]
+    fn total_exceeding_capacity_returns_error() {
+        let mut builder = SharedRegionBuilder::new(32);
+        builder.add_memory(16).unwrap();
+        builder.add_memory(32).unwrap();
+        assert!(matches!(builder.seal(), Err(Error::CapacityExceeded)));
     }
 }

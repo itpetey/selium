@@ -17,6 +17,8 @@ pub enum Error {
     InvalidSignal,
     Abi(selium_abi::AbiErrorCode),
     Guest(String),
+    BuilderSealed,
+    IndexOutOfBounds,
 }
 
 impl fmt::Display for Error {
@@ -38,6 +40,8 @@ impl fmt::Display for Error {
             Self::InvalidSignal => write!(f, "invalid signal"),
             Self::Abi(code) => write!(f, "ABI error: {code:?}"),
             Self::Guest(msg) => write!(f, "guest error: {msg}"),
+            Self::BuilderSealed => write!(f, "builder is sealed"),
+            Self::IndexOutOfBounds => write!(f, "index out of bounds"),
         }
     }
 }
@@ -70,6 +74,11 @@ mod tests {
         assert_eq!(
             Error::Guest("failed".to_string()).to_string(),
             "guest error: failed"
+        );
+        assert_eq!(Error::BuilderSealed.to_string(), "builder is sealed");
+        assert_eq!(
+            Error::IndexOutOfBounds.to_string(),
+            "index out of bounds"
         );
     }
 }

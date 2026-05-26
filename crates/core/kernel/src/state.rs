@@ -33,6 +33,11 @@ pub(crate) struct SignalState {
     pub(crate) notify: Notify,
 }
 
+pub(crate) struct HostQueueState {
+    pub(crate) entries: Mutex<VecDeque<(u64, u64)>>,
+    pub(crate) notify: Notify,
+}
+
 pub(crate) struct ListenerState;
 
 pub(crate) struct SessionState {
@@ -101,6 +106,8 @@ pub(crate) struct KernelInner {
     pub(crate) local_logs: Mutex<HashMap<u64, SharedResourceId>>,
     pub(crate) blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
     pub(crate) local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
+    pub(crate) host_queues_by_shared: Mutex<HashMap<SharedResourceId, Arc<HostQueueState>>>,
+    pub(crate) local_host_queues: Mutex<HashMap<u64, SharedResourceId>>,
     pub(crate) processes: Mutex<HashMap<ProcessId, ProcessState>>,
     pub(crate) activity_log: Mutex<Vec<ActivityEvent>>,
     pub(crate) activity_log_changed: Condvar,
@@ -138,6 +145,8 @@ impl Default for KernelInner {
             local_logs: Mutex::new(HashMap::new()),
             blob_stores_by_shared: Mutex::new(HashMap::new()),
             local_blob_stores: Mutex::new(HashMap::new()),
+            host_queues_by_shared: Mutex::new(HashMap::new()),
+            local_host_queues: Mutex::new(HashMap::new()),
             processes: Mutex::new(HashMap::new()),
             activity_log: Mutex::new(Vec::new()),
             activity_log_changed: Condvar::new(),
