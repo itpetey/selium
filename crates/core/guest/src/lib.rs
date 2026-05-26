@@ -5,6 +5,7 @@ pub use crate::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
     },
     codec::{decode_typed, encode_typed},
+    context::Context,
     error::{GuestError, Result},
     memory::{SHARED_REGION_MAGIC, SharedMemory, SharedRegion, SharedRegionBuilder},
     network::{NetworkListener, NetworkSession, NetworkStream, RequestExchange},
@@ -24,6 +25,7 @@ pub use tracing::{debug, error, info, trace, warn};
 
 mod async_runtime;
 mod codec;
+mod context;
 mod error;
 mod hostcall;
 #[cfg(feature = "io")]

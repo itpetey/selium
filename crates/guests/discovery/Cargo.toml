@@ -14,7 +14,7 @@ categories.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-selium-guest.workspace = true
+selium-guest = { workspace = true, features = ["io"] }
 
 [lints]
 workspace = true
