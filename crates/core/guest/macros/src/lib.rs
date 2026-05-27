@@ -4,21 +4,13 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, ItemTrait, ReturnType, parse_macro_input};
 
-/// Marks an async function as an exported Selium guest entrypoint.
+/// Marks a function as an exported Selium guest entrypoint.
 ///
-/// Accepts either `async fn entrypoint()`, `async fn entrypoint(ctx: Context<...>)`,
-/// or `async fn entrypoint(handle: u64)`.
+/// Accepts `fn entrypoint()`, `async fn entrypoint()`, `fn entrypoint(ctx: Context)`,
+/// `async fn entrypoint(ctx: Context)`, or `fn entrypoint(handle: u64)`.
 #[proc_macro_attribute]
 pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
-    if function.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            function.sig.fn_token,
-            "#[entrypoint] requires an async function",
-        )
-        .to_compile_error()
-        .into();
-    }
     if function.sig.inputs.len() > 1 {
         return syn::Error::new_spanned(
             &function.sig.inputs,
@@ -38,7 +30,7 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     if !matches!(function.sig.output, ReturnType::Default) {
         return syn::Error::new_spanned(
             &function.sig.output,
-            "#[entrypoint] requires an async function returning ()",
+            "#[entrypoint] requires a function returning ()",
         )
         .to_compile_error()
         .into();
@@ -47,6 +39,7 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let metadata_fn = format_ident!("{}_entrypoint_metadata", ident);
     let export_ident = format_ident!("__selium_guest_entrypoint_{}", ident);
     let export_name = ident.to_string();
+    let is_async = function.sig.asyncness.is_some();
 
     let param_kind = function.sig.inputs.iter().next().and_then(|arg| {
         if let syn::FnArg::Typed(pat_type) = arg {
@@ -66,34 +59,56 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let generated = match (function.sig.inputs.len(), param_kind.as_deref()) {
         (0, _) => {
+            let call = if is_async {
+                quote!(#ident().await)
+            } else {
+                quote!(#ident())
+            };
             quote! {
                 #function
 
                 #[unsafe(export_name = #export_name)]
                 pub extern "C" fn #export_ident() {
-                    ::selium_guest::run_entrypoint_safely(#ident());
+                    ::selium_guest::run_entrypoint_safely(async move {
+                        #call;
+                    });
                 }
             }
         }
         (1, Some("Context")) => {
+            let call = if is_async {
+                quote!(#ident(ctx).await)
+            } else {
+                quote!(#ident(ctx))
+            };
             quote! {
                 #function
 
                 #[unsafe(export_name = #export_name)]
                 pub extern "C" fn #export_ident(discovery_handle: i64) {
-                    let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
-                        .expect("failed to construct bootstrap context");
-                    ::selium_guest::run_entrypoint_safely(#ident(ctx));
+                    ::selium_guest::run_entrypoint_safely(async move {
+                        let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
+                            .await
+                            .expect("failed to construct bootstrap context");
+                        #call;
+                    });
                 }
             }
         }
         (1, _) => {
+            let call = if is_async {
+                quote!(#ident(handle as u64).await)
+            } else {
+                quote!(#ident(handle as u64))
+            };
             quote! {
                 #function
 
                 #[unsafe(export_name = #export_name)]
                 pub extern "C" fn #export_ident(handle: i64) {
-                    ::selium_guest::run_entrypoint_safely(#ident(handle as u64));
+                    ::selium_guest::run_entrypoint_safely(async move {
+                        #call;
+                    });
                 }
             }
         }
