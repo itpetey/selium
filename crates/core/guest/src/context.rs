@@ -3,13 +3,16 @@ use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
 
 #[cfg(feature = "io")]
 use crate::{
-    SharedRegion,
+    GuestError, ResourceSender,
     io::rpc::{RpcClient, error::RpcError},
 };
 
-/// Standard size for an RPC session region.
+/// Size of RPC request buf (min. 512 URI chars)
 #[cfg(feature = "io")]
-pub const RPC_SESSION_REGION_SIZE: u32 = 32768;
+pub const RPC_REQ_CAPACITY: u32 = 2048;
+/// Size of RPC reply buf (4x shared_id replies)
+#[cfg(feature = "io")]
+pub const RPC_REP_CAPACITY: u32 = 36;
 
 /// Guest context injected by the runtime during bootstrap.
 ///
@@ -22,13 +25,17 @@ pub struct Context {
 impl Context {
     /// Creates a Context from a raw discovery handle (shared region id).
     #[cfg(feature = "io")]
-    pub fn from_raw(discovery_handle: u64) -> Result<Self, RpcError> {
-        let region = SharedRegion::attach(discovery_handle, RPC_SESSION_REGION_SIZE);
-        let discovery = RpcClient::attach(region)?;
+    pub async fn from_raw(discovery_handle: u64) -> Result<Self, GuestError> {
+        use crate::io;
+
+        let sender = ResourceSender::attach(discovery_handle)?;
+        let discovery = RpcClient::connect(sender, RPC_REQ_CAPACITY, RPC_REP_CAPACITY)
+            .await
+            .map_err(|e| GuestError::Io(io::Error::Rpc(e)))?;
         Ok(Self { discovery })
     }
     #[cfg(not(feature = "io"))]
-    pub fn from_raw() -> Result<Self, ()> {
+    pub async fn from_raw() -> Result<Self, ()> {
         Ok(Self {})
     }
 
@@ -50,9 +57,9 @@ impl Context {
 mod tests {
     use super::*;
 
-    #[test]
-    fn from_raw_with_invalid_handle_fails() {
-        let result = Context::from_raw(0);
+    #[tokio::test]
+    async fn from_raw_with_invalid_handle_fails() {
+        let result = Context::from_raw(0).await;
         assert!(result.is_err());
     }
 }

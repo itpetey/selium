@@ -18,6 +18,9 @@ selium-guest-macros = { path = "macros" }
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
 [features]
 default = ["io"]
 io = []

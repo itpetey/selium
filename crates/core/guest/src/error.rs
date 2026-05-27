@@ -1,6 +1,8 @@
 use selium_abi::{AbiError, Capability};
 use thiserror::Error;
 
+use crate::io;
+
 /// Result type used by the Selium guest SDK.
 pub type Result<T> = std::result::Result<T, GuestError>;
 
@@ -25,6 +27,8 @@ pub enum GuestError {
     #[error("capacity exceeded")]
     /// Capacity limit exceeded.
     CapacityExceeded,
+    #[error("I/O error: {0}")]
+    Io(io::Error),
 }
 
 pub(crate) fn abi_error_to_guest_error(error: AbiError) -> GuestError {

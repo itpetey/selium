@@ -1,13 +1,13 @@
 use std::cell::{Cell, RefCell};
 
 use crate::{
-    SHARED_REGION_MAGIC, SharedMemory, SharedRegion, Signal,
-    io::channels,
-    io::region,
+    ResourceSender, SharedMemory, SharedRegionBuilder, Signal,
+    io::rpc::error::RpcError,
     io::{
-        RingBuf,
-        channels::{StrongReader, StrongWriter},
-        rpc::error::RpcError,
+        ChannelRegion, RingBuf,
+        channels::{self, StrongReader, StrongWriter},
+        region::REGION_HEADER_BYTES,
+        ring_buf,
     },
 };
 
@@ -21,100 +21,81 @@ pub struct RpcClient<Req, Rep> {
 }
 
 impl<Req, Rep> RpcClient<Req, Rep> {
-    /// Attaches to an RPC session region from the client side.
-    pub fn attach(region: SharedRegion) -> Result<Self, RpcError> {
-        let mapping = SharedMemory::attach(region.descriptor(), 0, region.len())
+    /// Creates a new RPC session, initialises the shared region, and transmits
+    /// the region id to the server via the supplied listener queue.
+    pub async fn connect(
+        sender: ResourceSender,
+        request_capacity: u32,
+        reply_capacity: u32,
+    ) -> Result<Self, RpcError> {
+        let request_data_cap = ring_buf::round_capacity(request_capacity)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let reply_data_cap = ring_buf::round_capacity(reply_capacity)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let magic_bytes = mapping
-            .read(0, 8)
+        let request_sub_len = request_data_cap + REGION_HEADER_BYTES as u32;
+        let reply_sub_len = reply_data_cap + REGION_HEADER_BYTES as u32;
+
+        let total_capacity = {
+            let header_size = 40u32;
+            let mut total = header_size;
+            total = align_up(total, 8) + request_sub_len;
+            total = align_up(total, 8) + reply_sub_len;
+            total
+        };
+
+        // Step 2: Create SharedRegion with two sub-memories.
+        let mut builder = SharedRegionBuilder::new(total_capacity);
+        builder
+            .add_memory(request_sub_len)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let magic = u64::from_le_bytes(
-            magic_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
+        builder
+            .add_memory(reply_sub_len)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let region = builder
+            .seal()
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+
+        // Create signals for each ring buffer.
+        let req_signal = Signal::create().map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let rep_signal = Signal::create().map_err(|e| RpcError::Serialization(e.to_string()))?;
+
+        // Read sub-memory offsets and lengths from the region header.
+        let (req_offset, req_len) = region
+            .memory(0)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let (rep_offset, rep_len) = region
+            .memory(1)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+
+        // Map sub-memories and initialise ring buffer headers.
+        let req_mapping = SharedMemory::attach(region.descriptor(), req_offset, req_len)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let req_region = ChannelRegion::from_mapping(
+            req_mapping,
+            (req_len as u64).saturating_sub(REGION_HEADER_BYTES),
         );
-        if magic != SHARED_REGION_MAGIC {
-            return Err(RpcError::InvalidRegion);
-        }
-
-        let count_bytes = mapping
-            .read(16, 4)
+        req_region
+            .initialise(req_signal.shared_id())
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let count = u32::from_le_bytes(
-            count_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
+
+        let rep_mapping = SharedMemory::attach(region.descriptor(), rep_offset, rep_len)
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        let rep_region = ChannelRegion::from_mapping(
+            rep_mapping,
+            (rep_len as u64).saturating_sub(REGION_HEADER_BYTES),
         );
-        if count != 2 {
-            return Err(RpcError::LayoutMismatch);
-        }
-
-        let req_offset_bytes = mapping
-            .read(24, 4)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let req_len_bytes = mapping
-            .read(28, 4)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let req_offset = u32::from_le_bytes(
-            req_offset_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
-        ) as u64;
-        let req_len = u32::from_le_bytes(
-            req_len_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
-        ) as u64;
-
-        let rep_offset_bytes = mapping
-            .read(32, 4)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let rep_len_bytes = mapping
-            .read(36, 4)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
-        let rep_offset = u32::from_le_bytes(
-            rep_offset_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
-        ) as u64;
-        let rep_len = u32::from_le_bytes(
-            rep_len_bytes
-                .try_into()
-                .map_err(|_error| RpcError::InvalidRegion)?,
-        ) as u64;
-
-        let _ = mapping;
-
-        let req_data_capacity = req_len.saturating_sub(region::REGION_HEADER_BYTES);
-        let rep_data_capacity = rep_len.saturating_sub(region::REGION_HEADER_BYTES);
-
-        let req_region = region::ChannelRegion::from_mapping(
-            SharedMemory::attach_shared(region.shared_id(), req_offset as u32, req_len as u32)
-                .map_err(|e| RpcError::Serialization(e.to_string()))?,
-            req_data_capacity,
-        );
-        let req_ring = RingBuf::wrap_region(req_region, None)?;
-        let req_signal_shared_id = req_ring
-            .region()
-            .read_header_u64(region::SIGNAL_SHARED_ID_OFFSET)
-            .map_err(|_error| RpcError::InvalidRegion)?;
-        let _req_signal = Signal::attach(req_signal_shared_id)
+        rep_region
+            .initialise(rep_signal.shared_id())
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let rep_region = region::ChannelRegion::from_mapping(
-            SharedMemory::attach_shared(region.shared_id(), rep_offset as u32, rep_len as u32)
-                .map_err(|e| RpcError::Serialization(e.to_string()))?,
-            rep_data_capacity,
-        );
-        let rep_ring = RingBuf::wrap_region(rep_region, None)?;
-        let rep_signal_shared_id = rep_ring
-            .region()
-            .read_header_u64(region::SIGNAL_SHARED_ID_OFFSET)
-            .map_err(|_error| RpcError::InvalidRegion)?;
-        let rep_signal = Signal::attach(rep_signal_shared_id)
-            .map_err(|e| RpcError::Serialization(e.to_string()))?;
+        // Wrap as RingBufs with signals.
+        let req_ring =
+            RingBuf::wrap_region(req_region, Some(req_signal.clone())).map_err(RpcError::from)?;
+        let rep_ring =
+            RingBuf::wrap_region(rep_region, Some(rep_signal.clone())).map_err(RpcError::from)?;
 
+        // Set up writer for request channel.
         req_ring
             .region()
             .increment_writer_count()
@@ -129,11 +110,12 @@ impl<Req, Rep> RpcClient<Req, Rep> {
         let request_writer = RefCell::new(StrongWriter::new(
             req_ring.region().clone(),
             writer_id,
-            Some(_req_signal),
+            Some(req_signal),
         ));
 
+        // Set up reader for reply channel.
         let reply_reader = {
-            let tail = rep_ring.read_next_tail()?;
+            let tail = rep_ring.read_next_tail().map_err(RpcError::from)?;
             let reader_id = rep_ring
                 .region()
                 .allocate_reader_slot(tail)
@@ -144,6 +126,11 @@ impl<Req, Rep> RpcClient<Req, Rep> {
                 reader_id,
             ))
         };
+
+        sender
+            .send(region.shared_id())
+            .await
+            .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
         Ok(Self {
             request_writer,
@@ -223,16 +210,11 @@ impl<Req, Rep> RpcClient<Req, Rep> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use selium_abi::{DiscoveryRequest, DiscoveryResponse};
-
-    use super::*;
-
-    #[test]
-    fn attach_rejects_invalid_region() {
-        let region = SharedRegion::attach(0, 32768);
-        let result = RpcClient::<DiscoveryRequest, DiscoveryResponse>::attach(region);
-        assert!(result.is_err());
+fn align_up(value: u32, alignment: u32) -> u32 {
+    let rem = value % alignment;
+    if rem == 0 {
+        value
+    } else {
+        value + alignment - rem
     }
 }

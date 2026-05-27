@@ -1,4 +1,4 @@
-use std::fmt;
+use thiserror::Error;
 
 use crate::io;
 
@@ -6,47 +6,32 @@ use crate::io;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error type for channel operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq)]
 pub enum Error {
     /// Channel buffer is full.
+    #[error("channel buffer full")]
     ChannelFull,
     /// Channel buffer is empty.
+    #[error("channel buffer empty")]
     ChannelEmpty,
     /// Reader fell behind and lost data.
+    #[error("reader fell behind writer")]
     ReaderBehind,
     /// Writers contended for the reservation cursor.
+    #[error("channel reservation contended")]
     ReservationContended,
     /// Invalid frame header encountered.
+    #[error("invalid frame")]
     InvalidFrame,
     /// Channel has been terminated.
+    #[error("channel terminated")]
     Terminated,
     /// Channel has been closed.
+    #[error("channel closed")]
     Closed,
     /// Error from the core I/O layer.
-    Core(io::Error),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ChannelFull => write!(f, "channel buffer full"),
-            Self::ChannelEmpty => write!(f, "channel buffer empty"),
-            Self::ReaderBehind => write!(f, "reader fell behind writer"),
-            Self::ReservationContended => write!(f, "channel reservation contended"),
-            Self::InvalidFrame => write!(f, "invalid frame"),
-            Self::Terminated => write!(f, "channel terminated"),
-            Self::Closed => write!(f, "channel closed"),
-            Self::Core(e) => write!(f, "core error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        Self::Core(e)
-    }
+    #[error("core error: {0}")]
+    Core(#[from] io::Error),
 }
 
 #[cfg(test)]

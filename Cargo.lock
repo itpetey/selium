@@ -600,6 +600,7 @@ dependencies = [
  "selium-abi",
  "selium-guest-macros",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

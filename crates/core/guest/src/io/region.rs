@@ -1,6 +1,9 @@
 use crate::{
     SharedMemory, SharedRegion,
-    io::error::{Error, Result},
+    io::{
+        error::{Error, Result},
+        ring_buf::MAGIC_PREFIX,
+    },
 };
 
 pub const CAPACITY_OFFSET: u64 = 8;
@@ -158,6 +161,20 @@ impl ChannelRegion {
     /// Writes the region magic identifier.
     pub fn write_magic(&self, magic: u64) -> Result<()> {
         self.write_header_u64(MAGIC_OFFSET, magic)
+    }
+
+    /// Initialises a fresh sub-memory as a ring buffer with the given signal id.
+    pub fn initialise(&self, signal_shared_id: u64) -> Result<()> {
+        self.write_magic(MAGIC_PREFIX)?;
+        self.write_capacity(self.capacity)?;
+        self.write_header_u64(WRITER_COUNT_OFFSET, 0)?;
+        self.write_header_u64(READER_COUNT_OFFSET, 0)?;
+        self.write_next_tail(0)?;
+        self.write_header_u64(TAIL_CACHE_OFFSET, 0)?;
+        self.write_header_u64(NEXT_WRITER_ID_OFFSET, 0)?;
+        self.write_header_u64(NEXT_MUTATION_ID_OFFSET, 0)?;
+        self.write_header_u64(SIGNAL_SHARED_ID_OFFSET, signal_shared_id)?;
+        Ok(())
     }
 
     /// Reads the capacity stored in the shared region header.

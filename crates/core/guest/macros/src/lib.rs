@@ -81,7 +81,7 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #[unsafe(export_name = #export_name)]
                 pub extern "C" fn #export_ident(discovery_handle: i64) {
-                    let ctx = ::selium_io::rpc::Context::from_raw(discovery_handle as u64)
+                    let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
                         .expect("failed to construct bootstrap context");
                     ::selium_guest::run_entrypoint_safely(#ident(ctx));
                 }

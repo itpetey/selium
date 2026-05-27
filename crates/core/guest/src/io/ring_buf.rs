@@ -13,7 +13,7 @@ use crate::{
     signal::Signal,
 };
 
-const MAGIC_PREFIX: u64 = 0x53454C494F524E47;
+pub(crate) const MAGIC_PREFIX: u64 = 0x53454C494F524E47;
 
 /// A lock-free ring buffer log on shared memory.
 ///
