@@ -117,7 +117,7 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
     }
 }
 
-fn poll_operation(operation_id: OperationId) -> Result<Option<HostcallOutput>> {
+pub(crate) fn poll_operation(operation_id: OperationId) -> Result<Option<HostcallOutput>> {
     let mut output = vec![0_u8; 4096];
     loop {
         // SAFETY: `output` is a valid mutable buffer; `operation_id` was returned by

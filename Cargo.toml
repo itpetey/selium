@@ -36,6 +36,7 @@ selium-kernel = { path = "crates/core/kernel" }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "2.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
+quinn = { version = "0.11", default-features = false }
 tokio = { version = "1.52", default-features = false }
 tracing = { version = "0.1", default-features = false }
 wasmtiny = { path = "../../../wasmtiny" }

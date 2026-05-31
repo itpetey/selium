@@ -656,6 +656,10 @@ pub enum HostcallRequest {
         /// Local queue handle.
         local_id: LocalResourceId,
     },
+    /// Get the current wall-clock time as nanoseconds since UNIX epoch.
+    TimeNow,
+    /// Get the current monotonic time as nanoseconds since an arbitrary epoch.
+    TimeMonotonic,
 }
 
 /// Hostcall request paired with the guest task that initiated it.

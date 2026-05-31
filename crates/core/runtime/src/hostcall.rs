@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use selium_abi::{
@@ -988,6 +988,21 @@ impl Runtime {
                 Ok(HostOperationState::Ready(HostcallOutput::GuestLogEntries(
                     logs,
                 )))
+            }
+            HostcallRequest::TimeNow => {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_nanos() as u64;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
+            }
+            HostcallRequest::TimeMonotonic => {
+                static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                let nanos = EPOCH
+                    .get_or_init(Instant::now)
+                    .elapsed()
+                    .as_nanos() as u64;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
             }
         }
     }

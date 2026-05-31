@@ -1,10 +1,4 @@
-use std::{
-    future::Future,
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    task::Poll,
-};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, task::Poll};
 
 use selium_abi::{HostcallOutput, HostcallRequest};
 
@@ -72,17 +66,22 @@ impl UdpSocket {
             Ok((frame, _tag)) => {
                 // Parse frame: [addr_len 2 bytes][addr bytes][ecn 1 byte][payload]
                 if frame.len() < 2 {
-                    return Err(GuestError::Io(crate::io::Error::Guest("invalid udp frame".to_string())));
+                    return Err(GuestError::Io(crate::io::Error::Guest(
+                        "invalid udp frame".to_string(),
+                    )));
                 }
                 let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
                 if frame.len() < 2 + addr_len + 1 {
-                    return Err(GuestError::Io(crate::io::Error::Guest("invalid udp frame".to_string())));
+                    return Err(GuestError::Io(crate::io::Error::Guest(
+                        "invalid udp frame".to_string(),
+                    )));
                 }
-                let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
-                    .map_err(|e| GuestError::Io(crate::io::Error::Guest(format!("invalid address: {e}"))))?;
-                let addr: SocketAddr = addr_str
-                    .parse()
-                    .map_err(|e| GuestError::Io(crate::io::Error::Guest(format!("invalid address: {e}"))))?;
+                let addr_str = std::str::from_utf8(&frame[2..2 + addr_len]).map_err(|e| {
+                    GuestError::Io(crate::io::Error::Guest(format!("invalid address: {e}")))
+                })?;
+                let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                    GuestError::Io(crate::io::Error::Guest(format!("invalid address: {e}")))
+                })?;
                 let payload = &frame[2 + addr_len + 1..];
                 let to_copy = payload.len().min(buf.len());
                 buf[..to_copy].copy_from_slice(&payload[..to_copy]);
@@ -103,9 +102,9 @@ impl UdpSocket {
         frame.extend_from_slice(&addr_bytes);
         frame.extend_from_slice(buf);
 
-        self.send_writer.write(&frame).map_err(|e| {
-            GuestError::Io(crate::io::Error::Guest(format!("send write error: {e}")))
-        })
+        self.send_writer
+            .write(&frame)
+            .map_err(|e| GuestError::Io(crate::io::Error::Guest(format!("send write error: {e}"))))
     }
 
     /// Receives a single datagram asynchronously.
@@ -126,7 +125,9 @@ impl UdpSocket {
                     }
                     Poll::Ready(Err(e)) => {
                         self.pending_recv_wait = None;
-                        return Poll::Ready(Err(GuestError::Io(crate::io::Error::Guest(e.to_string()))));
+                        return Poll::Ready(Err(GuestError::Io(crate::io::Error::Guest(
+                            e.to_string(),
+                        ))));
                     }
                     Poll::Pending => return Poll::Pending,
                 }
@@ -141,12 +142,11 @@ impl UdpSocket {
                         .recv_signal
                         .generation()
                         .map_err(|e| GuestError::Io(crate::io::Error::Guest(e.to_string())))?;
-                    self.pending_recv_wait =
-                        Some(hostcall_async(HostcallRequest::SignalWait {
-                            local_id: self.recv_signal.local_id(),
-                            observed_generation: observed,
-                            timeout_ms: 30_000,
-                        }));
+                    self.pending_recv_wait = Some(hostcall_async(HostcallRequest::SignalWait {
+                        local_id: self.recv_signal.local_id(),
+                        observed_generation: observed,
+                        timeout_ms: 30_000,
+                    }));
 
                     // Poll the newly created future once.
                     if let Some(ref mut fut) = self.pending_recv_wait {
@@ -193,7 +193,9 @@ impl UdpSocket {
                     }
                     Poll::Ready(Err(e)) => {
                         self.pending_send_wait = None;
-                        return Poll::Ready(Err(GuestError::Io(crate::io::Error::Guest(e.to_string()))));
+                        return Poll::Ready(Err(GuestError::Io(crate::io::Error::Guest(
+                            e.to_string(),
+                        ))));
                     }
                     Poll::Pending => return Poll::Pending,
                 }
@@ -211,12 +213,11 @@ impl UdpSocket {
                         .send_signal
                         .generation()
                         .map_err(|e| GuestError::Io(crate::io::Error::Guest(e.to_string())))?;
-                    self.pending_send_wait =
-                        Some(hostcall_async(HostcallRequest::SignalWait {
-                            local_id: self.send_signal.local_id(),
-                            observed_generation: observed,
-                            timeout_ms: 30_000,
-                        }));
+                    self.pending_send_wait = Some(hostcall_async(HostcallRequest::SignalWait {
+                        local_id: self.send_signal.local_id(),
+                        observed_generation: observed,
+                        timeout_ms: 30_000,
+                    }));
 
                     // Poll the newly created future once.
                     if let Some(ref mut fut) = self.pending_send_wait {
@@ -248,6 +249,12 @@ impl UdpSocket {
     /// Returns the local socket address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+
+    /// Converts this `UdpSocket` into a Quinn-compatible `AsyncUdpSocket`.
+    #[cfg(feature = "quinn")]
+    pub fn into_quinn_socket(self) -> quinn_impl::QuinnUdpSocket {
+        quinn_impl::QuinnUdpSocket::new(self)
     }
 }
 
@@ -347,6 +354,342 @@ fn attach_udp_channels(shared_id: u64) -> Result<UdpChannelLayout> {
     })
 }
 
+#[cfg(feature = "quinn")]
+mod quinn_impl {
+    use std::{
+        cell::RefCell,
+        fmt::{self, Debug},
+        io::{self, IoSliceMut},
+        net::SocketAddr,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
+    use quinn::udp::{RecvMeta, Transmit};
+    use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller};
+    use selium_abi::{HostcallOutput, HostcallRequest};
+    use std::time::Instant;
+
+    use crate::hostcall::{HostcallFuture, hostcall_async};
+
+    use super::{Signal, StrongReader, StrongWriter, UdpSocket};
+
+    struct UdpSocketInner {
+        recv_reader: RefCell<StrongReader>,
+        recv_signal: Signal,
+        send_writer: RefCell<StrongWriter>,
+        send_signal: Signal,
+        local_addr: SocketAddr,
+    }
+
+    // SAFETY: The guest is single-threaded; shared-memory channel operations are
+    // atomic at the channel-frame level. No other thread will access these
+    // channels concurrently.
+    unsafe impl Send for UdpSocketInner {}
+    // SAFETY: Same as Send — the guest runtime is cooperative and single-threaded,
+    // so shared references to channel state are safe.
+    unsafe impl Sync for UdpSocketInner {}
+
+    #[derive(Clone)]
+    pub struct QuinnUdpSocket(Arc<UdpSocketInner>);
+
+    impl QuinnUdpSocket {
+        pub(crate) fn new(socket: UdpSocket) -> Self {
+            Self(Arc::new(UdpSocketInner {
+                recv_reader: RefCell::new(socket.recv_reader),
+                recv_signal: socket.recv_signal,
+                send_writer: RefCell::new(socket.send_writer),
+                send_signal: socket.send_signal,
+                local_addr: socket.local_addr,
+            }))
+        }
+    }
+
+    impl Debug for QuinnUdpSocket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("QuinnUdpSocket")
+                .field("local_addr", &self.0.local_addr)
+                .finish()
+        }
+    }
+
+    impl AsyncUdpSocket for QuinnUdpSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(QuinnUdpPoller {
+                inner: self.0.clone(),
+                pending_signal: None,
+            })
+        }
+
+        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+            // Encode frame: [addr_len 2 bytes][addr bytes][payload]
+            let addr_bytes = transmit.destination.to_string().into_bytes();
+            let addr_len = addr_bytes.len();
+            let mut frame = Vec::with_capacity(2 + addr_len + transmit.contents.len());
+            frame.extend_from_slice(&(addr_len as u16).to_le_bytes());
+            frame.extend_from_slice(&addr_bytes);
+            frame.extend_from_slice(transmit.contents);
+
+            match self.0.send_writer.borrow_mut().write(&frame) {
+                Ok(()) => Ok(()),
+                Err(crate::io::channels::Error::ChannelFull) => {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "channel full"))
+                }
+                Err(e) => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("send write error: {e}"),
+                )),
+            }
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            if bufs.is_empty() || meta.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            let inner = &*self.0;
+
+            // Try to read a frame from the recv channel.
+            match inner.recv_reader.borrow_mut().read() {
+                Ok((frame, _tag)) => {
+                    // Parse frame: [addr_len 2 bytes][addr bytes][ecn 1 byte][payload]
+                    if frame.len() < 2 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid udp frame: too short for addr_len",
+                        )));
+                    }
+                    let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+                    if frame.len() < 2 + addr_len + 1 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid udp frame: too short for addr + ecn",
+                        )));
+                    }
+                    let addr_str = match std::str::from_utf8(&frame[2..2 + addr_len]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid udp frame: addr is not utf8",
+                            )));
+                        }
+                    };
+                    let addr: SocketAddr = match addr_str.parse() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid udp frame: addr parse failed",
+                            )));
+                        }
+                    };
+                    let payload = &frame[2 + addr_len + 1..];
+                    let to_copy = payload.len().min(bufs[0].len());
+                    bufs[0][..to_copy].copy_from_slice(&payload[..to_copy]);
+
+                    meta[0] = RecvMeta {
+                        addr,
+                        len: to_copy,
+                        stride: to_copy,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+
+                    Poll::Ready(Ok(1))
+                }
+                Err(crate::io::channels::Error::ChannelEmpty) => {
+                    // Start a SignalWait hostcall and return Pending.
+                    let observed = match inner.recv_signal.generation() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("signal generation error: {e}"),
+                            )));
+                        }
+                    };
+
+                    let mut fut = hostcall_async(HostcallRequest::SignalWait {
+                        local_id: inner.recv_signal.local_id(),
+                        observed_generation: observed,
+                        timeout_ms: 30_000,
+                    });
+
+                    // Poll the future once.
+                    match Pin::new(&mut fut).poll(cx) {
+                        Poll::Ready(Ok(HostcallOutput::SignalGeneration(_))) => {
+                            // Signal fired; wake and try again.
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "unexpected hostcall output during recv wait",
+                        ))),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("hostcall error: {e}"),
+                        ))),
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
+                Err(e) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("recv read error: {e}"),
+                ))),
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.0.local_addr)
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            1
+        }
+
+        fn may_fragment(&self) -> bool {
+            false
+        }
+    }
+
+    struct QuinnUdpPoller {
+        inner: Arc<UdpSocketInner>,
+        pending_signal: Option<HostcallFuture>,
+    }
+
+    impl Debug for QuinnUdpPoller {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("QuinnUdpPoller").finish()
+        }
+    }
+
+    impl UdpPoller for QuinnUdpPoller {
+        fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+
+            // If a previous signal wait is pending, poll it.
+            if let Some(ref mut fut) = this.pending_signal {
+                let poll = Pin::new(fut).poll(cx);
+                match poll {
+                    Poll::Ready(Ok(HostcallOutput::SignalGeneration(_))) => {
+                        this.pending_signal = None;
+                    }
+                    Poll::Ready(Ok(_)) => {
+                        this.pending_signal = None;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "unexpected hostcall output during send wait",
+                        )));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.pending_signal = None;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("hostcall error: {e}"),
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // Wait on the send signal.
+            let observed = match this.inner.send_signal.generation() {
+                Ok(g) => g,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("signal generation error: {e}"),
+                    )));
+                }
+            };
+
+            let mut fut = hostcall_async(HostcallRequest::SignalWait {
+                local_id: this.inner.send_signal.local_id(),
+                observed_generation: observed,
+                timeout_ms: 30_000,
+            });
+
+            // Poll the future once.
+            match Pin::new(&mut fut).poll(cx) {
+                Poll::Ready(Ok(HostcallOutput::SignalGeneration(_))) => {
+                    // Signal fired; channel likely has space.
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected hostcall output during send wait",
+                ))),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("hostcall error: {e}"),
+                ))),
+                Poll::Pending => {
+                    this.pending_signal = Some(fut);
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct SeliumQuinnRuntime;
+
+    impl Runtime for SeliumQuinnRuntime {
+        fn spawn(&self, future: Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+            // Bridge Send-bound future to the guest's single-threaded runtime.
+            // SAFETY: The guest runtime is single-threaded and cooperative.
+            // The Send bound is required by Quinn's trait but is a no-op in
+            // our single-threaded environment.
+            let fut: Pin<Box<dyn std::future::Future<Output = ()>>> =
+                unsafe { std::mem::transmute(future) };
+            crate::async_runtime::spawn(fut);
+        }
+
+        fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn AsyncTimer>> {
+            // Convert std::time::Instant to our hostcall-backed Instant by
+            // capturing the offset between the two clocks at this moment.
+            let now_std = Instant::now();
+            let now_hostcall = crate::time::time_monotonic()
+                .expect("hostcall monotonic clock is available");
+            let remaining = deadline.saturating_duration_since(now_std);
+            let deadline_ns = now_hostcall.saturating_add(remaining.as_nanos() as u64);
+            Box::pin(crate::time::Timer::new(
+                crate::time::Instant::from_nanos(deadline_ns),
+            ))
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        fn wrap_udp_socket(
+            &self,
+            _socket: std::net::UdpSocket,
+        ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "use new_with_abstract_socket for QuinnUdpSocket",
+            ))
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+}
+
+#[cfg(feature = "quinn")]
+pub use quinn_impl::SeliumQuinnRuntime;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +698,30 @@ mod tests {
     fn attach_shared_with_invalid_region_fails() {
         let result = UdpSocket::attach_shared(0);
         assert!(matches!(result, Err(GuestError::Host(_))));
+    }
+
+    #[cfg(feature = "quinn")]
+    #[test]
+    fn quinn_udp_socket_impls_async_udp_socket() {
+        fn assert_bound<S: quinn::AsyncUdpSocket>() {}
+        assert_bound::<quinn_impl::QuinnUdpSocket>();
+    }
+
+    #[cfg(feature = "quinn")]
+    #[test]
+    fn selium_quinn_runtime_impls_runtime() {
+        fn assert_bound<R: quinn::Runtime>() {}
+        assert_bound::<quinn_impl::SeliumQuinnRuntime>();
+    }
+
+    #[cfg(feature = "quinn")]
+    #[test]
+    fn into_quinn_socket_exists_and_returns_quinn_udp_socket() {
+        fn assert_signature<F>(_f: F)
+        where
+            F: FnOnce(UdpSocket) -> quinn_impl::QuinnUdpSocket,
+        {
+        }
+        assert_signature(UdpSocket::into_quinn_socket);
     }
 }

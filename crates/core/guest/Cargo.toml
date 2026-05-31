@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"], optional = true }
 futures = { workspace = true, features = ["std"] }
+quinn = { workspace = true, optional = true }
 rkyv.workspace = true
 selium-abi.workspace = true
 selium-guest-macros = { path = "macros" }
@@ -27,6 +28,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 default = ["io"]
 axum = ["dep:axum", "io", "tokio/time"]
 io = ["dep:tokio"]
+quinn = ["dep:quinn", "io"]
 
 [lints]
 workspace = true
