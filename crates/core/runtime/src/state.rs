@@ -44,10 +44,6 @@ pub(crate) enum HostOperationState {
         observed_generation: u64,
         deadline: Instant,
     },
-    RequestResponseWait {
-        exchange_id: u64,
-        deadline: Instant,
-    },
     HostQueueRecvWait {
         local_id: u64,
         deadline: Instant,

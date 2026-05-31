@@ -137,14 +137,10 @@ pub enum ResourceClass {
     SharedMapping,
     /// Signal resource.
     Signal,
-    /// Network listener resource.
-    Listener,
-    /// Network session resource.
-    Session,
-    /// Network stream resource.
-    Stream,
-    /// Network request exchange resource.
-    RequestExchange,
+    /// TCP listener resource.
+    TcpListener,
+    /// TCP stream resource.
+    TcpStream,
     /// Durable log resource.
     DurableLog,
     /// Blob store resource.
@@ -273,40 +269,6 @@ pub struct HostQueueDescriptor {
     pub local_id: LocalResourceId,
     /// Shared queue id.
     pub shared_id: SharedResourceId,
-}
-
-/// Descriptor for a network listener handle.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkListenerDescriptor {
-    /// Local listener handle id.
-    pub local_id: LocalResourceId,
-    /// Shared listener id.
-    pub shared_id: SharedResourceId,
-    /// Address the listener is bound to.
-    pub address: String,
-}
-
-/// Descriptor for a network session handle.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkSessionDescriptor {
-    /// Local session handle id.
-    pub local_id: LocalResourceId,
-    /// Shared session id.
-    pub shared_id: SharedResourceId,
-    /// Session authority or remote endpoint.
-    pub authority: String,
-}
-
-/// Descriptor for a network stream handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct NetworkStreamDescriptor {
-    /// Local stream handle id.
-    pub local_id: LocalResourceId,
-    /// Local session handle associated with the stream.
-    pub network_session_id: LocalResourceId,
 }
 
 /// Descriptor for a durable log handle.
@@ -534,65 +496,15 @@ pub enum HostcallRequest {
         /// Maximum wait time in milliseconds.
         timeout_ms: u64,
     },
-    /// Open a network listener.
-    NetworkListen {
-        /// Address to listen on.
+    /// Bind a TCP listener.
+    TcpBind {
+        /// Address to bind to.
         address: String,
     },
-    /// Close a network listener.
-    NetworkListenerClose {
-        /// Local listener handle id to close.
-        local_id: LocalResourceId,
-    },
-    /// Open a network session.
-    NetworkConnect {
-        /// Authority or endpoint to connect to.
-        authority: String,
-    },
-    /// Close a network session.
-    NetworkSessionClose {
-        /// Local session handle id to close.
-        local_id: LocalResourceId,
-    },
-    /// Open a stream on a network session.
-    NetworkOpenStream {
-        /// Local network session handle id.
-        network_session_id: LocalResourceId,
-    },
-    /// Close a network stream.
-    NetworkStreamClose {
-        /// Local stream handle id to close.
-        local_id: LocalResourceId,
-    },
-    /// Send a chunk on a network stream.
-    NetworkStreamSend {
-        /// Local stream handle id.
-        local_id: LocalResourceId,
-        /// Chunk bytes to send.
-        bytes: Vec<u8>,
-    },
-    /// Receive a chunk from a network stream.
-    NetworkStreamRecv {
-        /// Local stream handle id.
-        local_id: LocalResourceId,
-    },
-    /// Send a request over a network session.
-    NetworkSendRequest {
-        /// Local network session handle id.
-        network_session_id: LocalResourceId,
-        /// Request method.
-        method: String,
-        /// Request path.
-        path: String,
-        /// Request body bytes.
-        body: Vec<u8>,
-    },
-    /// Wait for a network request response.
-    NetworkWaitRequestResponse {
-        /// Local request exchange id.
-        exchange_id: LocalResourceId,
-        /// Maximum wait time in milliseconds.
-        timeout_ms: u64,
+    /// Connect to a TCP endpoint.
+    TcpConnect {
+        /// Address to connect to.
+        address: String,
     },
     /// Open a durable log.
     StorageOpenLog {
@@ -779,12 +691,6 @@ pub enum HostcallOutput {
     Signal(SignalDescriptor),
     /// A host-mediated connection queue descriptor.
     HostQueue(HostQueueDescriptor),
-    /// A network listener descriptor.
-    Listener(NetworkListenerDescriptor),
-    /// A network session descriptor.
-    Session(NetworkSessionDescriptor),
-    /// A network stream descriptor.
-    Stream(NetworkStreamDescriptor),
     /// A durable log descriptor.
     DurableLog(DurableLogDescriptor),
     /// A blob store descriptor.
@@ -795,13 +701,6 @@ pub enum HostcallOutput {
     Bytes(Vec<u8>),
     /// Blob id string.
     BlobId(String),
-    /// Network response status and body.
-    Response {
-        /// Response status code.
-        status: u16,
-        /// Response body bytes.
-        body: Vec<u8>,
-    },
     /// Optional sequence number.
     Sequence(Option<u64>),
     /// Shared resource id.
@@ -1162,5 +1061,31 @@ mod tests {
         let encoded = encode_rkyv(&response).expect("encode");
         let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn tcp_bind_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::TcpBind {
+                address: "127.0.0.1:8080".to_string(),
+            },
+            task_id: Some(1),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn tcp_connect_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::TcpConnect {
+                address: "127.0.0.1:443".to_string(),
+            },
+            task_id: Some(2),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
     }
 }

@@ -74,6 +74,11 @@ impl StrongWriter {
         Ok(())
     }
 
+    /// Returns a reference to the underlying channel region.
+    pub fn region(&self) -> &ChannelRegion {
+        &self.region
+    }
+
     /// Returns the writer id stored in emitted frames.
     pub fn writer_id(&self) -> u32 {
         self.writer_id

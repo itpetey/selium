@@ -164,16 +164,12 @@ impl Runtime {
                 ResourceClass::Signal => {
                     drop(self.kernel.close_signal(local_id));
                 }
-                ResourceClass::Listener => {
-                    drop(self.kernel.close_listener(local_id));
+                ResourceClass::TcpListener => {
+                    drop(self.kernel.close_tcp_listener(local_id));
                 }
-                ResourceClass::Session => {
-                    drop(self.kernel.close_session(local_id));
+                ResourceClass::TcpStream => {
+                    drop(self.kernel.close_tcp_stream(local_id));
                 }
-                ResourceClass::Stream => {
-                    drop(self.kernel.close_stream(local_id));
-                }
-                ResourceClass::RequestExchange => {}
                 ResourceClass::DurableLog => {
                     drop(self.kernel.close_log(local_id));
                 }

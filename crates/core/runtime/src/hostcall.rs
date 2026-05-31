@@ -54,7 +54,6 @@ impl Runtime {
             HostOperationState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
             HostOperationState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
             HostOperationState::SignalWait { .. }
-            | HostOperationState::RequestResponseWait { .. }
             | HostOperationState::HostQueueRecvWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
         };
         let mut operations = self.operations.lock();
@@ -130,8 +129,7 @@ impl Runtime {
             },
             HostOperationState::Ready(_) => (selium_abi::HOSTCALL_STATUS_READY, operation_id),
             HostOperationState::Failed(_) => (selium_abi::HOSTCALL_STATUS_FAILED, operation_id),
-            HostOperationState::RequestResponseWait { .. }
-            | HostOperationState::HostQueueRecvWait { .. } => {
+            HostOperationState::HostQueueRecvWait { .. } => {
                 (selium_abi::HOSTCALL_STATUS_PENDING, operation_id)
             }
         }
@@ -183,28 +181,6 @@ impl Runtime {
                     CompletionState::Failed(error)
                 }
                 Ok(_) => CompletionState::Pending { operation_id },
-                Err(error) => CompletionState::Failed(kernel_error(error)),
-            },
-            HostOperationState::RequestResponseWait {
-                exchange_id,
-                deadline,
-            } => match self.kernel.read_request_response(exchange_id) {
-                Ok(Some((status, body))) => {
-                    let output = HostcallOutput::Response { status, body };
-                    operation.state = HostOperationState::Ready(output.clone());
-                    self.release_local_handle(
-                        operation.process_id,
-                        &ResourceClass::RequestExchange,
-                        exchange_id,
-                    );
-                    CompletionState::Ready(output)
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    let error = AbiError::new(AbiErrorCode::Timeout, "request response timed out");
-                    operation.state = HostOperationState::Failed(error.clone());
-                    CompletionState::Failed(error)
-                }
-                Ok(None) => CompletionState::Pending { operation_id },
                 Err(error) => CompletionState::Failed(kernel_error(error)),
             },
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
@@ -543,213 +519,51 @@ impl Runtime {
                 observed_generation,
                 timeout_ms,
             } => self.prepare_signal_wait(local_id, observed_generation, timeout_ms, process_id),
-            HostcallRequest::NetworkListen { address } => {
+            HostcallRequest::TcpBind { address } => {
                 self.require(
                     process_id,
                     Capability::Network,
-                    ResourceClass::Listener,
+                    ResourceClass::TcpListener,
                     None,
-                )?;
-                let descriptor = self.kernel.listen(address);
-                self.claim_local_handle(process_id, ResourceClass::Listener, descriptor.local_id);
-                self.claim_shared_resource(
-                    process_id,
-                    ResourceClass::Listener,
-                    descriptor.shared_id,
-                );
-                Ok(HostOperationState::Ready(HostcallOutput::Listener(
-                    descriptor,
-                )))
-            }
-            HostcallRequest::NetworkListenerClose { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Listener,
-                    local_id,
-                )?;
-                let shared_id = self.listener_shared_id(local_id)?;
-                self.kernel.close_listener(local_id).map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::Listener, local_id);
-                self.release_shared_resource(process_id, &ResourceClass::Listener, shared_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::NetworkConnect { authority } => {
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Session,
-                    None,
-                )?;
-                let descriptor = self.kernel.connect(authority);
-                self.claim_local_handle(process_id, ResourceClass::Session, descriptor.local_id);
-                self.claim_shared_resource(
-                    process_id,
-                    ResourceClass::Session,
-                    descriptor.shared_id,
-                );
-                Ok(HostOperationState::Ready(HostcallOutput::Session(
-                    descriptor,
-                )))
-            }
-            HostcallRequest::NetworkSessionClose { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Session,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .network_session_shared_id_public(local_id)
-                    .map_err(kernel_error)?;
-                self.kernel.close_session(local_id).map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::Session, local_id);
-                self.release_shared_resource(process_id, &ResourceClass::Session, shared_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::NetworkOpenStream { network_session_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Session,
-                    network_session_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .network_session_shared_id_public(network_session_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Session,
-                    Some(ResourceIdentity::Shared(shared_id)),
                 )?;
                 let descriptor = self
                     .kernel
-                    .open_stream(network_session_id)
-                    .map_err(kernel_error)?;
-                self.claim_local_handle(process_id, ResourceClass::Stream, descriptor.local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Stream(
+                    .tcp_bind(address)
+                    .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
+                self.claim_local_handle(
+                    process_id,
+                    ResourceClass::TcpListener,
+                    descriptor.local_id,
+                );
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::TcpListener,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
             }
-            HostcallRequest::NetworkStreamClose { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Stream,
-                    local_id,
-                )?;
-                self.kernel.close_stream(local_id).map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::Stream, local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::NetworkStreamSend { local_id, bytes } => {
-                let session_shared_id = self.stream_session_shared_id(process_id, local_id)?;
+            HostcallRequest::TcpConnect { address } => {
                 self.require(
                     process_id,
                     Capability::Network,
-                    ResourceClass::Stream,
-                    Some(ResourceIdentity::Shared(session_shared_id)),
+                    ResourceClass::TcpStream,
+                    None,
                 )?;
-                self.kernel
-                    .send_stream_chunk(local_id, bytes)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::NetworkStreamRecv { local_id } => {
-                let session_shared_id = self.stream_session_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::Stream,
-                    Some(ResourceIdentity::Shared(session_shared_id)),
-                )?;
-                match self
+                let descriptor = self
                     .kernel
-                    .recv_stream_chunk(local_id)
-                    .map_err(kernel_error)?
-                {
-                    Some(bytes) => Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes))),
-                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
-                }
-            }
-            HostcallRequest::NetworkSendRequest {
-                network_session_id,
-                method,
-                path,
-                body,
-            } => {
-                self.ensure_local_handle_owner(
+                    .tcp_connect(address)
+                    .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
+                self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
+                self.claim_shared_resource(
                     process_id,
-                    Capability::Network,
-                    ResourceClass::Session,
-                    network_session_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .network_session_shared_id_public(network_session_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::RequestExchange,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let exchange_id = self
-                    .kernel
-                    .send_request(network_session_id, method, path, body)
-                    .map_err(kernel_error)?;
-                self.claim_local_handle(process_id, ResourceClass::RequestExchange, exchange_id);
-                Ok(HostOperationState::Ready(HostcallOutput::LocalId(
-                    exchange_id,
+                    ResourceClass::TcpStream,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
+                    descriptor,
                 )))
-            }
-            HostcallRequest::NetworkWaitRequestResponse {
-                exchange_id,
-                timeout_ms,
-            } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::RequestExchange,
-                    exchange_id,
-                )?;
-                let (network_session_id, _, _, _) = self
-                    .kernel
-                    .request_summary(exchange_id)
-                    .map_err(kernel_error)?;
-                let shared_id = self
-                    .kernel
-                    .network_session_shared_id_public(network_session_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::RequestExchange,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                if let Some((status, body)) = self
-                    .kernel
-                    .read_request_response(exchange_id)
-                    .map_err(kernel_error)?
-                {
-                    self.release_local_handle(
-                        process_id,
-                        &ResourceClass::RequestExchange,
-                        exchange_id,
-                    );
-                    Ok(HostOperationState::Ready(HostcallOutput::Response {
-                        status,
-                        body,
-                    }))
-                } else {
-                    Ok(HostOperationState::RequestResponseWait {
-                        exchange_id,
-                        deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                    })
-                }
             }
             HostcallRequest::StorageOpenLog { name } => {
                 self.require(
@@ -1304,32 +1118,6 @@ impl Runtime {
                 format!("permission denied for capability {capability:?}"),
             ))
         }
-    }
-
-    fn listener_shared_id(&self, local_id: u64) -> std::result::Result<u64, AbiError> {
-        self.kernel
-            .listener_shared_id(local_id)
-            .map_err(kernel_error)
-    }
-
-    fn stream_session_shared_id(
-        &self,
-        process_id: ProcessId,
-        stream_id: u64,
-    ) -> std::result::Result<u64, AbiError> {
-        self.ensure_local_handle_owner(
-            process_id,
-            Capability::Network,
-            ResourceClass::Stream,
-            stream_id,
-        )?;
-        let network_session_id = self
-            .kernel
-            .stream_network_session_id(stream_id)
-            .map_err(kernel_error)?;
-        self.kernel
-            .network_session_shared_id_public(network_session_id)
-            .map_err(kernel_error)
     }
 
     fn log_shared_id(
@@ -1922,149 +1710,6 @@ mod tests {
         );
         assert_eq!(
             ready(&runtime, bootstrapped.process_id, close_blob_op),
-            HostcallOutput::Empty
-        );
-    }
-
-    #[test]
-    fn network_hostcalls_cover_sessions_streams_and_exchanges() {
-        let runtime = Runtime::default();
-        let bootstrapped = spawn_with_grants(
-            &runtime,
-            vec![
-                CapabilityGrant::new(
-                    Capability::Network,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Listener)],
-                ),
-                CapabilityGrant::new(
-                    Capability::Network,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Session)],
-                ),
-                CapabilityGrant::new(
-                    Capability::Network,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Stream)],
-                ),
-                CapabilityGrant::new(
-                    Capability::Network,
-                    vec![ResourceSelector::ResourceClass(
-                        ResourceClass::RequestExchange,
-                    )],
-                ),
-            ],
-        );
-
-        let (_, listen_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkListen {
-                address: "127.0.0.1:9000".to_string(),
-            },
-        );
-        let HostcallOutput::Listener(listener) =
-            ready(&runtime, bootstrapped.process_id, listen_op)
-        else {
-            panic!("expected listener");
-        };
-        let (_, connect_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkConnect {
-                authority: "selium.test".to_string(),
-            },
-        );
-        let HostcallOutput::Session(session) = ready(&runtime, bootstrapped.process_id, connect_op)
-        else {
-            panic!("expected network session");
-        };
-        let (_, stream_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkOpenStream {
-                network_session_id: session.local_id,
-            },
-        );
-        let HostcallOutput::Stream(stream) = ready(&runtime, bootstrapped.process_id, stream_op)
-        else {
-            panic!("expected stream");
-        };
-        let (_, send_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkStreamSend {
-                local_id: stream.local_id,
-                bytes: b"chunk".to_vec(),
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, send_op),
-            HostcallOutput::Empty
-        );
-        let (_, recv_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkStreamRecv {
-                local_id: stream.local_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, recv_op),
-            HostcallOutput::Bytes(b"chunk".to_vec())
-        );
-        let (_, request_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkSendRequest {
-                network_session_id: session.local_id,
-                method: "GET".to_string(),
-                path: "/health".to_string(),
-                body: b"ping".to_vec(),
-            },
-        );
-        let HostcallOutput::LocalId(exchange_id) =
-            ready(&runtime, bootstrapped.process_id, request_op)
-        else {
-            panic!("expected exchange id");
-        };
-        runtime
-            .kernel()
-            .respond_request(exchange_id, 200, b"pong".to_vec())
-            .expect("respond request");
-        let (_, response_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkWaitRequestResponse {
-                exchange_id,
-                timeout_ms: 1_000,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, response_op),
-            HostcallOutput::Response {
-                status: 200,
-                body: b"pong".to_vec(),
-            }
-        );
-        let (_, close_stream_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkStreamClose {
-                local_id: stream.local_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, close_stream_op),
-            HostcallOutput::Empty
-        );
-        let (_, close_session_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkSessionClose {
-                local_id: session.local_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, close_session_op),
-            HostcallOutput::Empty
-        );
-        let (_, close_listener_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::NetworkListenerClose {
-                local_id: listener.local_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, close_listener_op),
             HostcallOutput::Empty
         );
     }

@@ -8,12 +8,12 @@ pub use crate::{
     context::Context,
     error::{GuestError, Result},
     memory::{SHARED_REGION_MAGIC, SharedMemory, SharedRegion, SharedRegionBuilder},
-    network::{NetworkListener, NetworkSession, NetworkStream, RequestExchange},
     platform::{mark_ready, process_id},
     process::{ActivityLog, GuestLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     signal::Signal,
     storage::{BlobStore, DurableLog},
+    tcp::{TcpAccept, TcpListener, TcpStream},
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
@@ -31,9 +31,9 @@ mod hostcall;
 #[cfg(feature = "io")]
 pub mod io;
 mod memory;
-mod network;
 mod platform;
 mod process;
 mod resource;
 mod signal;
 mod storage;
+mod tcp;

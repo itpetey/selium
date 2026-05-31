@@ -7,7 +7,7 @@
 pub use cursor::Cursor;
 pub use error::{Error, Result};
 pub use frame::FrameHeader;
-pub use region::{ChannelRegion, RegionBuilder};
+pub use region::{ChannelRegion, REGION_HEADER_BYTES, RegionBuilder, SIGNAL_SHARED_ID_OFFSET};
 pub use ring_buf::RingBuf;
 
 pub mod channels;
