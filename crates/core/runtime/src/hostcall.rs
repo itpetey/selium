@@ -565,6 +565,27 @@ impl Runtime {
                     descriptor,
                 )))
             }
+            HostcallRequest::UdpBind { address } => {
+                self.require(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::UdpSocket,
+                    None,
+                )?;
+                let descriptor = self
+                    .kernel
+                    .udp_bind(address)
+                    .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
+                self.claim_local_handle(process_id, ResourceClass::UdpSocket, descriptor.shared_id);
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::UdpSocket,
+                    descriptor.shared_id,
+                );
+                Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
+                    descriptor,
+                )))
+            }
             HostcallRequest::StorageOpenLog { name } => {
                 self.require(
                     process_id,

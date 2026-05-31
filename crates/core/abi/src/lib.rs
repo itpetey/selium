@@ -141,6 +141,8 @@ pub enum ResourceClass {
     TcpListener,
     /// TCP stream resource.
     TcpStream,
+    /// UDP socket resource.
+    UdpSocket,
     /// Durable log resource.
     DurableLog,
     /// Blob store resource.
@@ -504,6 +506,11 @@ pub enum HostcallRequest {
     /// Connect to a TCP endpoint.
     TcpConnect {
         /// Address to connect to.
+        address: String,
+    },
+    /// Bind a UDP socket.
+    UdpBind {
+        /// Address to bind to.
         address: String,
     },
     /// Open a durable log.

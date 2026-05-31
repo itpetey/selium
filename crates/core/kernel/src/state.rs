@@ -51,6 +51,12 @@ pub(crate) struct TcpStreamState {
     pub(crate) outbound_signal: Arc<SignalState>,
 }
 
+pub(crate) struct UdpSocketState {
+    pub(crate) running: Arc<AtomicBool>,
+    pub(crate) recv_signal: Arc<SignalState>,
+    pub(crate) send_signal: Arc<SignalState>,
+}
+
 #[derive(Default)]
 pub(crate) struct DurableLogState {
     pub(crate) name: String,
@@ -90,6 +96,7 @@ pub(crate) struct KernelInner {
     pub(crate) local_host_queues: Mutex<HashMap<u64, SharedResourceId>>,
     pub(crate) tcp_listeners: Mutex<HashMap<u64, TcpListenerState>>,
     pub(crate) tcp_streams: Mutex<HashMap<SharedResourceId, TcpStreamState>>,
+    pub(crate) udp_sockets: Mutex<HashMap<SharedResourceId, UdpSocketState>>,
     pub(crate) processes: Mutex<HashMap<ProcessId, ProcessState>>,
     pub(crate) activity_log: Mutex<Vec<ActivityEvent>>,
     pub(crate) activity_log_changed: Condvar,
@@ -124,6 +131,7 @@ impl Default for KernelInner {
             local_host_queues: Mutex::new(HashMap::new()),
             tcp_listeners: Mutex::new(HashMap::new()),
             tcp_streams: Mutex::new(HashMap::new()),
+            udp_sockets: Mutex::new(HashMap::new()),
             processes: Mutex::new(HashMap::new()),
             activity_log: Mutex::new(Vec::new()),
             activity_log_changed: Condvar::new(),

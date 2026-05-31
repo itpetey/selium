@@ -9,6 +9,7 @@ pub use crate::{
     error::{GuestError, Result},
     memory::{SHARED_REGION_MAGIC, SharedMemory, SharedRegion, SharedRegionBuilder},
     net::tcp::{TcpAccept, TcpListener, TcpStream},
+    net::udp::UdpSocket,
     platform::{mark_ready, process_id},
     process::{ActivityLog, GuestLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},

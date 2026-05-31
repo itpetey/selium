@@ -170,6 +170,9 @@ impl Runtime {
                 ResourceClass::TcpStream => {
                     drop(self.kernel.close_tcp_stream(local_id));
                 }
+                ResourceClass::UdpSocket => {
+                    drop(self.kernel.close_udp_socket(local_id));
+                }
                 ResourceClass::DurableLog => {
                     drop(self.kernel.close_log(local_id));
                 }
