@@ -16,33 +16,88 @@ use crate::{
     state::{Kernel, TcpListenerState, TcpStreamState, UdpSocketState},
 };
 
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+const CAPACITY_OFFSET: u64 = 8;
+const DEFAULT_RING_CAPACITY: u32 = 64 * 1024;
+const FLAG_READY: u8 = 1;
+const FRAME_HEADER_SIZE: u64 = 12;
+const KERNEL_READER_SLOT: u32 = 0;
+const MAX_READER_SLOTS: u16 = 128;
+const NEXT_MUTATION_ID_OFFSET: u64 = 64;
+const NEXT_TAIL_OFFSET: u64 = 32;
+const NEXT_WRITER_ID_OFFSET: u64 = 56;
+const PROXY_POLL_INTERVAL_MS: u64 = 1;
+const READER_ACTIVE_OFFSET: u64 = 0;
+const READER_COUNT_OFFSET: u64 = 24;
+const READER_SLOTS_OFFSET: u64 = 72;
+const READER_SLOT_BYTES: u64 = 16;
+const REGION_HEADER_BYTES: u64 = 4096;
+const RING_MAGIC_PREFIX: u64 = 0x53454C494F524E47;
 const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
 const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
 const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
 const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
-
-const REGION_HEADER_BYTES: u64 = 4096;
-const RING_MAGIC_PREFIX: u64 = 0x53454C494F524E47;
-const CAPACITY_OFFSET: u64 = 8;
-const WRITER_COUNT_OFFSET: u64 = 16;
-const READER_COUNT_OFFSET: u64 = 24;
-const NEXT_TAIL_OFFSET: u64 = 32;
-const TAIL_CACHE_OFFSET: u64 = 40;
+const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 const SIGNAL_SHARED_ID_OFFSET: u64 = 48;
-const NEXT_WRITER_ID_OFFSET: u64 = 56;
-const NEXT_MUTATION_ID_OFFSET: u64 = 64;
-const READER_SLOTS_OFFSET: u64 = 72;
-const READER_SLOT_BYTES: u64 = 16;
-const READER_ACTIVE_OFFSET: u64 = 0;
-const MAX_READER_SLOTS: u16 = 128;
-const KERNEL_READER_SLOT: u32 = 0;
+const TAIL_CACHE_OFFSET: u64 = 40;
+const WRITER_COUNT_OFFSET: u64 = 16;
 
-const FRAME_HEADER_SIZE: u64 = 12;
-const FLAG_READY: u8 = 1;
+#[derive(Debug, Clone, Copy)]
+struct FrameHeader {
+    len: u32,
+    tag: u32,
+    flags: u8,
+    _reserved: [u8; 3],
+}
 
-const DEFAULT_RING_CAPACITY: u32 = 64 * 1024;
-const PROXY_POLL_INTERVAL_MS: u64 = 1;
+impl FrameHeader {
+    const FLAG_READY: u8 = 1;
+    #[expect(dead_code, reason = "reserved for future use")]
+    const FLAG_ABORTED: u8 = 1 << 1;
+
+    fn encode(&self) -> [u8; 12] {
+        let mut bytes = [0u8; 12];
+        bytes[..4].copy_from_slice(&self.len.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.tag.to_le_bytes());
+        bytes[8] = self.flags;
+        bytes[9..12].copy_from_slice(&self._reserved);
+        bytes
+    }
+
+    #[expect(clippy::indexing_slicing, reason = "length checked at start")]
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 12 {
+            return Err(Error::Wasm("frame header too short".to_string()));
+        }
+        let len = u32::from_le_bytes(
+            bytes[..4]
+                .try_into()
+                .map_err(|_e| Error::Wasm("invalid frame header len".to_string()))?,
+        );
+        let tag = u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .map_err(|_e| Error::Wasm("invalid frame header tag".to_string()))?,
+        );
+        let flags = bytes[8];
+        let _reserved = bytes[9..12]
+            .try_into()
+            .map_err(|_e| Error::Wasm("invalid frame header reserved".to_string()))?;
+        Ok(Self {
+            len,
+            tag,
+            flags,
+            _reserved,
+        })
+    }
+
+    fn frame_size(&self) -> u64 {
+        12 + self.len as u64
+    }
+
+    fn is_ready(&self) -> bool {
+        self.flags & Self::FLAG_READY != 0
+    }
+}
 
 impl Kernel {
     pub fn tcp_bind(&self, address: impl Into<String>) -> Result<HostQueueDescriptor> {
@@ -169,8 +224,8 @@ impl Kernel {
 
     pub fn udp_bind(&self, address: impl Into<String>) -> Result<SharedRegionDescriptor> {
         let address = address.into();
-        let socket = UdpSocket::bind(&address)
-            .map_err(|e| Error::Wasm(format!("udp bind failed: {e}")))?;
+        let socket =
+            UdpSocket::bind(&address).map_err(|e| Error::Wasm(format!("udp bind failed: {e}")))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(|e| Error::Wasm(format!("udp set_read_timeout failed: {e}")))?;
@@ -372,6 +427,10 @@ fn create_stream_region(
     ))
 }
 
+fn decode_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
+    FrameHeader::decode(bytes)
+}
+
 fn init_ring_buffer(
     kernel: &Kernel,
     mapping_id: u64,
@@ -424,351 +483,19 @@ fn init_ring_buffer(
     Ok(())
 }
 
-fn run_udp_proxy(
-    kernel: &Kernel,
-    socket: UdpSocket,
-    proxy_local_id: u64,
-    recv_offset: u64,
-    send_offset: u64,
-    capacity: u64,
-    recv_signal: selium_abi::SignalDescriptor,
-    send_signal: selium_abi::SignalDescriptor,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mapping_id = proxy_local_id;
-
-    let socket_recv = socket
-        .try_clone()
-        .map_err(|e| Error::Wasm(format!("udp socket clone failed: {e}")))?;
-    let socket_send = socket;
-
-    let k_recv = kernel.clone();
-    let running_recv = running.clone();
-    let recv_sig = kernel
-        .signal_state(recv_signal.local_id)
-        .map_err(|e| Error::Wasm(format!("recv signal not found: {e}")))?;
-
-    let recv_handle = thread::spawn(move || {
-        if let Err(_e) = udp_proxy_recv(
-            &k_recv,
-            socket_recv,
-            mapping_id,
-            recv_offset,
-            capacity,
-            recv_sig,
-            running_recv,
-        ) {}
-    });
-
-    let k_send = kernel.clone();
-    let send_sig = kernel
-        .signal_state(send_signal.local_id)
-        .map_err(|e| Error::Wasm(format!("send signal not found: {e}")))?;
-
-    let send_handle = thread::spawn(move || {
-        if let Err(_e) = udp_proxy_send(
-            &k_send,
-            socket_send,
-            mapping_id,
-            send_offset,
-            capacity,
-            send_sig,
-            running,
-        ) {}
-    });
-
-    drop(recv_handle.join());
-    drop(send_handle.join());
-
-    Ok(())
-}
-
-fn udp_proxy_recv(
-    kernel: &Kernel,
-    socket: UdpSocket,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    signal: Arc<crate::state::SignalState>,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut buf = vec![0u8; 65536];
-
-    while running.load(Ordering::Relaxed) {
-        match socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                // Frame format: [header 12 bytes][addr_len 2 bytes][addr bytes][ecn 1 byte][payload]
-                let addr_bytes = addr.to_string().into_bytes();
-                let addr_len = addr_bytes.len() as u16;
-                let ecn: u8 = 0; // ECN not implemented yet
-                let payload_len = n;
-                let frame_len = 2 + addr_bytes.len() + 1 + payload_len;
-
-                let mut frame = Vec::with_capacity(frame_len);
-                frame.extend_from_slice(&addr_len.to_le_bytes());
-                frame.extend_from_slice(&addr_bytes);
-                frame.push(ecn);
-                frame.extend_from_slice(&buf[..payload_len]);
-
-                if let Err(_e) = write_frame(
-                    kernel,
-                    mapping_id,
-                    offset,
-                    capacity,
-                    &frame,
-                    &signal,
-                ) {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout expired; check `running` and continue.
-            }
-            Err(e) => {
-                eprintln!("udp recv error: {e}");
-                break;
-            }
+fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<Option<u64>> {
+    let mut minimum = None;
+    for slot in 0..MAX_READER_SLOTS {
+        let slot_offset =
+            offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES + READER_ACTIVE_OFFSET;
+        let encoded = read_u64(kernel, mapping_id, slot_offset)?;
+        if encoded == 0 {
+            continue;
         }
+        let position = encoded - 1;
+        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
     }
-
-    running.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-fn udp_proxy_send(
-    kernel: &Kernel,
-    socket: UdpSocket,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    signal: Arc<crate::state::SignalState>,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut reader_pos: u64 = 0;
-
-    while running.load(Ordering::Relaxed) {
-        match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
-            Ok(Some(frame)) => {
-                update_kernel_reader_slot(
-                    kernel,
-                    mapping_id,
-                    offset,
-                    KERNEL_READER_SLOT,
-                    reader_pos,
-                )?;
-
-                // Parse frame: [addr_len 2 bytes][addr bytes][payload]
-                if frame.len() < 2 {
-                    continue;
-                }
-                let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
-                if frame.len() < 2 + addr_len {
-                    continue;
-                }
-                let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
-                    .map_err(|e| Error::Wasm(format!("invalid address bytes: {e}")))?;
-                let addr: SocketAddr = addr_str
-                    .parse()
-                    .map_err(|e| Error::Wasm(format!("invalid address: {e}")))?;
-                let payload = &frame[2 + addr_len..];
-
-                if let Err(_e) = socket.send_to(payload, addr) {
-                    break;
-                }
-
-                let _generation = signal.generation.fetch_add(1, Ordering::Release) + 1;
-                signal.notify.notify_waiters();
-            }
-            Ok(None) => {
-                let base = offset as u32;
-                match kernel.read_shared_memory(mapping_id, base + WRITER_COUNT_OFFSET as u32, 8) {
-                    Ok(bytes) => {
-                        let writer_count = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        if writer_count == 0 {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-                thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
-            }
-            Err(_) => {
-                break;
-            }
-        }
-    }
-
-    // Release kernel reader slot on exit
-    drop(release_kernel_reader_slot(
-        kernel,
-        mapping_id,
-        offset,
-        KERNEL_READER_SLOT,
-    ));
-
-    running.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-fn tcp_accept_loop(
-    kernel: &Kernel,
-    listener: TcpListener,
-    queue_local_id: u64,
-    _queue_shared_id: u64,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| Error::Wasm(format!("set_nonblocking failed: {e}")))?;
-
-    while running.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                let (region, inbound_signal, outbound_signal, inbound_offset, outbound_offset) =
-                    match create_stream_region(kernel) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("failed to create stream region: {e}");
-                            continue;
-                        }
-                    };
-
-                let shared_id = region.shared_id;
-                let running = Arc::new(AtomicBool::new(true));
-
-                let inbound_sig = match kernel.signal_state(inbound_signal.local_id) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("failed to get inbound signal state: {e}");
-                        continue;
-                    }
-                };
-                let outbound_sig = match kernel.signal_state(outbound_signal.local_id) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("failed to get outbound signal state: {e}");
-                        continue;
-                    }
-                };
-
-                kernel.inner.tcp_streams.lock().insert(
-                    shared_id,
-                    TcpStreamState {
-                        running: running.clone(),
-                        inbound_signal: inbound_sig,
-                        outbound_signal: outbound_sig,
-                    },
-                );
-
-                let proxy_mapping = match kernel.attach_shared_region(shared_id, 0, region.len) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("failed to pre-attach proxy mapping: {e}");
-                        continue;
-                    }
-                };
-                let proxy_local_id = proxy_mapping.local_id;
-
-                let k = kernel.clone();
-
-                thread::spawn(move || {
-                    let result = run_proxy(
-                        &k,
-                        stream,
-                        proxy_local_id,
-                        inbound_offset,
-                        outbound_offset,
-                        DEFAULT_RING_CAPACITY as u64,
-                        inbound_signal,
-                        outbound_signal,
-                        running,
-                    );
-                    drop(k.detach_shared_region(proxy_local_id));
-                    if let Err(_e) = result {}
-                });
-
-                if let Err(e) = kernel.host_queue_send(queue_local_id, 0, shared_id) {
-                    eprintln!("failed to enqueue connection: {e}");
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => {
-                return Err(Error::Wasm(format!("accept error: {e}")));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal proxy function needs many params"
-)]
-fn run_proxy(
-    kernel: &Kernel,
-    stream: TcpStream,
-    proxy_local_id: u64,
-    inbound_offset: u64,
-    outbound_offset: u64,
-    capacity: u64,
-    inbound_signal: selium_abi::SignalDescriptor,
-    outbound_signal: selium_abi::SignalDescriptor,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mapping_id = proxy_local_id;
-
-    let stream_inbound = stream
-        .try_clone()
-        .map_err(|e| Error::Wasm(format!("stream clone failed: {e}")))?;
-    let stream_outbound = stream;
-
-    let k_in = kernel.clone();
-    let running_in = running.clone();
-    let inbound_sig = kernel
-        .signal_state(inbound_signal.local_id)
-        .map_err(|e| Error::Wasm(format!("inbound signal not found: {e}")))?;
-
-    let inbound_handle = thread::spawn(move || {
-        if let Err(_e) = proxy_inbound(
-            &k_in,
-            stream_inbound,
-            mapping_id,
-            inbound_offset,
-            capacity,
-            inbound_sig,
-            running_in,
-        ) {}
-    });
-
-    let k_out = kernel.clone();
-    let outbound_sig = kernel
-        .signal_state(outbound_signal.local_id)
-        .map_err(|e| Error::Wasm(format!("outbound signal not found: {e}")))?;
-
-    let outbound_handle = thread::spawn(move || {
-        if let Err(_e) = proxy_outbound(
-            &k_out,
-            stream_outbound,
-            mapping_id,
-            outbound_offset,
-            capacity,
-            outbound_sig,
-            running,
-        ) {}
-    });
-
-    drop(inbound_handle.join());
-    drop(outbound_handle.join());
-
-    Ok(())
+    Ok(minimum)
 }
 
 fn proxy_inbound(
@@ -889,53 +616,36 @@ fn proxy_outbound(
     Ok(())
 }
 
-fn write_frame(
+fn read_at(
     kernel: &Kernel,
     mapping_id: u64,
-    offset: u64,
+    region_offset: u64,
     capacity: u64,
-    payload: &[u8],
-    signal: &Arc<crate::state::SignalState>,
-) -> Result<()> {
-    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
-    if frame_size > capacity {
-        return Err(Error::Wasm("frame exceeds capacity".to_string()));
+    pos: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    let data_offset = region_offset + REGION_HEADER_BYTES;
+    let raw_pos = data_offset + (pos & (capacity - 1));
+    let ring_end = data_offset + capacity;
+
+    if raw_pos + len <= ring_end {
+        kernel
+            .read_shared_memory(mapping_id, raw_pos as u32, len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at failed: {e}")))
+    } else {
+        let tail_len = ring_end - raw_pos;
+        let head_len = len - tail_len;
+        let mut result = Vec::with_capacity(len as usize);
+        let tail_bytes = kernel
+            .read_shared_memory(mapping_id, raw_pos as u32, tail_len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at tail failed: {e}")))?;
+        result.extend_from_slice(&tail_bytes);
+        let head_bytes = kernel
+            .read_shared_memory(mapping_id, data_offset as u32, head_len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at head failed: {e}")))?;
+        result.extend_from_slice(&head_bytes);
+        Ok(result)
     }
-
-    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
-
-    // Write pending header
-    let header = FrameHeader {
-        len: payload.len() as u32,
-        tag: 0,
-        flags: 0,
-        _reserved: [0; 3],
-    };
-    write_at(kernel, mapping_id, offset, capacity, pos, &header.encode())?;
-
-    // Write payload
-    let payload_pos = pos + FRAME_HEADER_SIZE;
-    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
-
-    // Write ready header
-    let ready_header = FrameHeader {
-        len: payload.len() as u32,
-        tag: 0,
-        flags: FLAG_READY,
-        _reserved: [0; 3],
-    };
-    write_at(
-        kernel,
-        mapping_id,
-        offset,
-        capacity,
-        pos,
-        &ready_header.encode(),
-    )?;
-
-    // Notify signal
-    signal.notify.notify_waiters();
-    Ok(())
 }
 
 fn read_frame(
@@ -983,6 +693,28 @@ fn read_frame(
     Ok(Some(payload))
 }
 
+fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
+    let bytes = kernel
+        .read_shared_memory(mapping_id, offset as u32, 8)
+        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
+        Error::Wasm("invalid u64 bytes".to_string())
+    })?))
+}
+
+fn release_kernel_reader_slot(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    slot: u32,
+) -> Result<()> {
+    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES;
+    kernel
+        .write_shared_memory(mapping_id, slot_offset as u32, &0u64.to_le_bytes())
+        .map_err(|e| Error::Wasm(format!("release reader slot failed: {e}")))?;
+    Ok(())
+}
+
 fn reserve_tail(
     kernel: &Kernel,
     mapping_id: u64,
@@ -1027,28 +759,345 @@ fn reserve_tail(
     Err(Error::Wasm("reservation contended".to_string()))
 }
 
-fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
-    let bytes = kernel
-        .read_shared_memory(mapping_id, offset as u32, 8)
-        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
-    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
-        Error::Wasm("invalid u64 bytes".to_string())
-    })?))
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal proxy function needs many params"
+)]
+fn run_proxy(
+    kernel: &Kernel,
+    stream: TcpStream,
+    proxy_local_id: u64,
+    inbound_offset: u64,
+    outbound_offset: u64,
+    capacity: u64,
+    inbound_signal: selium_abi::SignalDescriptor,
+    outbound_signal: selium_abi::SignalDescriptor,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mapping_id = proxy_local_id;
+
+    let stream_inbound = stream
+        .try_clone()
+        .map_err(|e| Error::Wasm(format!("stream clone failed: {e}")))?;
+    let stream_outbound = stream;
+
+    let k_in = kernel.clone();
+    let running_in = running.clone();
+    let inbound_sig = kernel
+        .signal_state(inbound_signal.local_id)
+        .map_err(|e| Error::Wasm(format!("inbound signal not found: {e}")))?;
+
+    let inbound_handle = thread::spawn(move || {
+        if let Err(_e) = proxy_inbound(
+            &k_in,
+            stream_inbound,
+            mapping_id,
+            inbound_offset,
+            capacity,
+            inbound_sig,
+            running_in,
+        ) {}
+    });
+
+    let k_out = kernel.clone();
+    let outbound_sig = kernel
+        .signal_state(outbound_signal.local_id)
+        .map_err(|e| Error::Wasm(format!("outbound signal not found: {e}")))?;
+
+    let outbound_handle = thread::spawn(move || {
+        if let Err(_e) = proxy_outbound(
+            &k_out,
+            stream_outbound,
+            mapping_id,
+            outbound_offset,
+            capacity,
+            outbound_sig,
+            running,
+        ) {}
+    });
+
+    drop(inbound_handle.join());
+    drop(outbound_handle.join());
+
+    Ok(())
 }
 
-fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<Option<u64>> {
-    let mut minimum = None;
-    for slot in 0..MAX_READER_SLOTS {
-        let slot_offset =
-            offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES + READER_ACTIVE_OFFSET;
-        let encoded = read_u64(kernel, mapping_id, slot_offset)?;
-        if encoded == 0 {
-            continue;
+fn run_udp_proxy(
+    kernel: &Kernel,
+    socket: UdpSocket,
+    proxy_local_id: u64,
+    recv_offset: u64,
+    send_offset: u64,
+    capacity: u64,
+    recv_signal: selium_abi::SignalDescriptor,
+    send_signal: selium_abi::SignalDescriptor,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mapping_id = proxy_local_id;
+
+    let socket_recv = socket
+        .try_clone()
+        .map_err(|e| Error::Wasm(format!("udp socket clone failed: {e}")))?;
+    let socket_send = socket;
+
+    let k_recv = kernel.clone();
+    let running_recv = running.clone();
+    let recv_sig = kernel
+        .signal_state(recv_signal.local_id)
+        .map_err(|e| Error::Wasm(format!("recv signal not found: {e}")))?;
+
+    let recv_handle = thread::spawn(move || {
+        if let Err(_e) = udp_proxy_recv(
+            &k_recv,
+            socket_recv,
+            mapping_id,
+            recv_offset,
+            capacity,
+            recv_sig,
+            running_recv,
+        ) {}
+    });
+
+    let k_send = kernel.clone();
+    let send_sig = kernel
+        .signal_state(send_signal.local_id)
+        .map_err(|e| Error::Wasm(format!("send signal not found: {e}")))?;
+
+    let send_handle = thread::spawn(move || {
+        if let Err(_e) = udp_proxy_send(
+            &k_send,
+            socket_send,
+            mapping_id,
+            send_offset,
+            capacity,
+            send_sig,
+            running,
+        ) {}
+    });
+
+    drop(recv_handle.join());
+    drop(send_handle.join());
+
+    Ok(())
+}
+
+fn tcp_accept_loop(
+    kernel: &Kernel,
+    listener: TcpListener,
+    queue_local_id: u64,
+    _queue_shared_id: u64,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::Wasm(format!("set_nonblocking failed: {e}")))?;
+
+    while running.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let (region, inbound_signal, outbound_signal, inbound_offset, outbound_offset) =
+                    match create_stream_region(kernel) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("failed to create stream region: {e}");
+                            continue;
+                        }
+                    };
+
+                let shared_id = region.shared_id;
+                let running = Arc::new(AtomicBool::new(true));
+
+                let inbound_sig = match kernel.signal_state(inbound_signal.local_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("failed to get inbound signal state: {e}");
+                        continue;
+                    }
+                };
+                let outbound_sig = match kernel.signal_state(outbound_signal.local_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("failed to get outbound signal state: {e}");
+                        continue;
+                    }
+                };
+
+                kernel.inner.tcp_streams.lock().insert(
+                    shared_id,
+                    TcpStreamState {
+                        running: running.clone(),
+                        inbound_signal: inbound_sig,
+                        outbound_signal: outbound_sig,
+                    },
+                );
+
+                let proxy_mapping = match kernel.attach_shared_region(shared_id, 0, region.len) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("failed to pre-attach proxy mapping: {e}");
+                        continue;
+                    }
+                };
+                let proxy_local_id = proxy_mapping.local_id;
+
+                let k = kernel.clone();
+
+                thread::spawn(move || {
+                    let result = run_proxy(
+                        &k,
+                        stream,
+                        proxy_local_id,
+                        inbound_offset,
+                        outbound_offset,
+                        DEFAULT_RING_CAPACITY as u64,
+                        inbound_signal,
+                        outbound_signal,
+                        running,
+                    );
+                    drop(k.detach_shared_region(proxy_local_id));
+                    if let Err(_e) = result {}
+                });
+
+                if let Err(e) = kernel.host_queue_send(queue_local_id, 0, shared_id) {
+                    eprintln!("failed to enqueue connection: {e}");
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(Error::Wasm(format!("accept error: {e}")));
+            }
         }
-        let position = encoded - 1;
-        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
     }
-    Ok(minimum)
+    Ok(())
+}
+
+fn udp_proxy_recv(
+    kernel: &Kernel,
+    socket: UdpSocket,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    signal: Arc<crate::state::SignalState>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut buf = vec![0u8; 65536];
+
+    while running.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, addr)) => {
+                // Frame format: [header 12 bytes][addr_len 2 bytes][addr bytes][ecn 1 byte][payload]
+                let addr_bytes = addr.to_string().into_bytes();
+                let addr_len = addr_bytes.len() as u16;
+                let ecn: u8 = 0; // ECN not implemented yet
+                let payload_len = n;
+                let frame_len = 2 + addr_bytes.len() + 1 + payload_len;
+
+                let mut frame = Vec::with_capacity(frame_len);
+                frame.extend_from_slice(&addr_len.to_le_bytes());
+                frame.extend_from_slice(&addr_bytes);
+                frame.push(ecn);
+                frame.extend_from_slice(&buf[..payload_len]);
+
+                if let Err(_e) = write_frame(kernel, mapping_id, offset, capacity, &frame, &signal)
+                {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout expired; check `running` and continue.
+            }
+            Err(e) => {
+                eprintln!("udp recv error: {e}");
+                break;
+            }
+        }
+    }
+
+    running.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+fn udp_proxy_send(
+    kernel: &Kernel,
+    socket: UdpSocket,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    signal: Arc<crate::state::SignalState>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut reader_pos: u64 = 0;
+
+    while running.load(Ordering::Relaxed) {
+        match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
+            Ok(Some(frame)) => {
+                update_kernel_reader_slot(
+                    kernel,
+                    mapping_id,
+                    offset,
+                    KERNEL_READER_SLOT,
+                    reader_pos,
+                )?;
+
+                // Parse frame: [addr_len 2 bytes][addr bytes][payload]
+                if frame.len() < 2 {
+                    continue;
+                }
+                let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+                if frame.len() < 2 + addr_len {
+                    continue;
+                }
+                let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
+                    .map_err(|e| Error::Wasm(format!("invalid address bytes: {e}")))?;
+                let addr: SocketAddr = addr_str
+                    .parse()
+                    .map_err(|e| Error::Wasm(format!("invalid address: {e}")))?;
+                let payload = &frame[2 + addr_len..];
+
+                if let Err(_e) = socket.send_to(payload, addr) {
+                    break;
+                }
+
+                let _generation = signal.generation.fetch_add(1, Ordering::Release) + 1;
+                signal.notify.notify_waiters();
+            }
+            Ok(None) => {
+                let base = offset as u32;
+                match kernel.read_shared_memory(mapping_id, base + WRITER_COUNT_OFFSET as u32, 8) {
+                    Ok(bytes) => {
+                        let writer_count = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                        if writer_count == 0 {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+
+    // Release kernel reader slot on exit
+    drop(release_kernel_reader_slot(
+        kernel,
+        mapping_id,
+        offset,
+        KERNEL_READER_SLOT,
+    ));
+
+    running.store(false, Ordering::Relaxed);
+    Ok(())
 }
 
 fn update_kernel_reader_slot(
@@ -1066,51 +1115,6 @@ fn update_kernel_reader_slot(
         .write_shared_memory(mapping_id, slot_offset as u32, &encoded.to_le_bytes())
         .map_err(|e| Error::Wasm(format!("update reader slot failed: {e}")))?;
     Ok(())
-}
-
-fn release_kernel_reader_slot(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    slot: u32,
-) -> Result<()> {
-    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES;
-    kernel
-        .write_shared_memory(mapping_id, slot_offset as u32, &0u64.to_le_bytes())
-        .map_err(|e| Error::Wasm(format!("release reader slot failed: {e}")))?;
-    Ok(())
-}
-
-fn read_at(
-    kernel: &Kernel,
-    mapping_id: u64,
-    region_offset: u64,
-    capacity: u64,
-    pos: u64,
-    len: u64,
-) -> Result<Vec<u8>> {
-    let data_offset = region_offset + REGION_HEADER_BYTES;
-    let raw_pos = data_offset + (pos & (capacity - 1));
-    let ring_end = data_offset + capacity;
-
-    if raw_pos + len <= ring_end {
-        kernel
-            .read_shared_memory(mapping_id, raw_pos as u32, len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at failed: {e}")))
-    } else {
-        let tail_len = ring_end - raw_pos;
-        let head_len = len - tail_len;
-        let mut result = Vec::with_capacity(len as usize);
-        let tail_bytes = kernel
-            .read_shared_memory(mapping_id, raw_pos as u32, tail_len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at tail failed: {e}")))?;
-        result.extend_from_slice(&tail_bytes);
-        let head_bytes = kernel
-            .read_shared_memory(mapping_id, data_offset as u32, head_len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at head failed: {e}")))?;
-        result.extend_from_slice(&head_bytes);
-        Ok(result)
-    }
 }
 
 fn write_at(
@@ -1149,66 +1153,53 @@ fn write_at(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FrameHeader {
-    len: u32,
-    tag: u32,
-    flags: u8,
-    _reserved: [u8; 3],
-}
-
-impl FrameHeader {
-    const FLAG_READY: u8 = 1;
-    #[expect(dead_code, reason = "reserved for future use")]
-    const FLAG_ABORTED: u8 = 1 << 1;
-
-    fn encode(&self) -> [u8; 12] {
-        let mut bytes = [0u8; 12];
-        bytes[..4].copy_from_slice(&self.len.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.tag.to_le_bytes());
-        bytes[8] = self.flags;
-        bytes[9..12].copy_from_slice(&self._reserved);
-        bytes
+fn write_frame(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    payload: &[u8],
+    signal: &Arc<crate::state::SignalState>,
+) -> Result<()> {
+    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
+    if frame_size > capacity {
+        return Err(Error::Wasm("frame exceeds capacity".to_string()));
     }
 
-    #[expect(clippy::indexing_slicing, reason = "length checked at start")]
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 12 {
-            return Err(Error::Wasm("frame header too short".to_string()));
-        }
-        let len = u32::from_le_bytes(
-            bytes[..4]
-                .try_into()
-                .map_err(|_e| Error::Wasm("invalid frame header len".to_string()))?,
-        );
-        let tag = u32::from_le_bytes(
-            bytes[4..8]
-                .try_into()
-                .map_err(|_e| Error::Wasm("invalid frame header tag".to_string()))?,
-        );
-        let flags = bytes[8];
-        let _reserved = bytes[9..12]
-            .try_into()
-            .map_err(|_e| Error::Wasm("invalid frame header reserved".to_string()))?;
-        Ok(Self {
-            len,
-            tag,
-            flags,
-            _reserved,
-        })
-    }
+    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
 
-    fn frame_size(&self) -> u64 {
-        12 + self.len as u64
-    }
+    // Write pending header
+    let header = FrameHeader {
+        len: payload.len() as u32,
+        tag: 0,
+        flags: 0,
+        _reserved: [0; 3],
+    };
+    write_at(kernel, mapping_id, offset, capacity, pos, &header.encode())?;
 
-    fn is_ready(&self) -> bool {
-        self.flags & Self::FLAG_READY != 0
-    }
-}
+    // Write payload
+    let payload_pos = pos + FRAME_HEADER_SIZE;
+    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
 
-fn decode_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
-    FrameHeader::decode(bytes)
+    // Write ready header
+    let ready_header = FrameHeader {
+        len: payload.len() as u32,
+        tag: 0,
+        flags: FLAG_READY,
+        _reserved: [0; 3],
+    };
+    write_at(
+        kernel,
+        mapping_id,
+        offset,
+        capacity,
+        pos,
+        &ready_header.encode(),
+    )?;
+
+    // Notify signal
+    signal.notify.notify_waiters();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1509,11 +1500,7 @@ mod tests {
 
         // Increment send writer count to simulate the guest writer.
         kernel
-            .fetch_add_shared_memory_u64(
-                mapping_id,
-                (send_offset + WRITER_COUNT_OFFSET) as u32,
-                1,
-            )
+            .fetch_add_shared_memory_u64(mapping_id, (send_offset + WRITER_COUNT_OFFSET) as u32, 1)
             .expect("increment send writer count");
 
         // Write a UDP frame to the send ring (guest -> kernel -> socket).
@@ -1571,11 +1558,7 @@ mod tests {
 
         // Increment send writer count.
         kernel
-            .fetch_add_shared_memory_u64(
-                mapping_id,
-                (send_offset + WRITER_COUNT_OFFSET) as u32,
-                1,
-            )
+            .fetch_add_shared_memory_u64(mapping_id, (send_offset + WRITER_COUNT_OFFSET) as u32, 1)
             .expect("increment send writer count");
 
         // Write a frame to the send ring addressed to the helper socket.
@@ -1646,14 +1629,12 @@ mod tests {
         let inbound_offset_bytes = kernel
             .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET, 4)
             .expect("read inbound offset");
-        let inbound_offset =
-            u32::from_le_bytes(inbound_offset_bytes.try_into().unwrap()) as u64;
+        let inbound_offset = u32::from_le_bytes(inbound_offset_bytes.try_into().unwrap()) as u64;
 
         // Register a reader slot at position 0 on the inbound ring.
         // Without a reader, minimum_reader_position() returns None and
         // reserve_tail never enforces backpressure.
-        let reader_slot_offset =
-            inbound_offset + READER_SLOTS_OFFSET + READER_ACTIVE_OFFSET;
+        let reader_slot_offset = inbound_offset + READER_SLOTS_OFFSET + READER_ACTIVE_OFFSET;
         kernel
             .write_shared_memory(mapping_id, reader_slot_offset as u32, &1u64.to_le_bytes())
             .expect("register inbound reader slot");

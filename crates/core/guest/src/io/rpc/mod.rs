@@ -1,5 +1,7 @@
 //! RPC module for typed request/reply communication between guests.
 
+use crate::{SHARED_REGION_MAGIC, SharedMemory, io::region::REGION_HEADER_BYTES};
+
 pub use accept::RpcAccept;
 pub use client::RpcClient;
 pub use connection::{RpcConnection, RpcRequest};
@@ -9,8 +11,6 @@ pub mod accept;
 pub mod client;
 pub mod connection;
 pub mod error;
-
-use crate::{SHARED_REGION_MAGIC, SharedMemory, io::region::REGION_HEADER_BYTES};
 
 /// Parsed layout of the two ring-buffer sub-memories within an RPC shared region.
 pub(crate) struct RpcChannelLayout {

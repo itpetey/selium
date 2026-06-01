@@ -998,10 +998,7 @@ impl Runtime {
             }
             HostcallRequest::TimeMonotonic => {
                 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-                let nanos = EPOCH
-                    .get_or_init(Instant::now)
-                    .elapsed()
-                    .as_nanos() as u64;
+                let nanos = EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64;
                 Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
             }
         }

@@ -21,6 +21,36 @@ use crate::{
     signal::Signal,
 };
 
+#[cfg(feature = "axum")]
+mod axum_impl {
+    use super::TcpListener;
+    use std::future::Future;
+    use tokio::io;
+
+    impl axum::serve::Listener for TcpListener {
+        type Io = super::TcpStream;
+        type Addr = std::net::SocketAddr;
+
+        fn accept(&mut self) -> impl Future<Output = (Self::Io, Self::Addr)> + Send {
+            async {
+                loop {
+                    match self.listener.accept::<super::TcpAccept>().await {
+                        Ok(stream) => return (stream, self.local_addr()),
+                        Err(_e) => {
+                            // Sleep briefly and retry on error
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<Self::Addr> {
+            Ok(self.local_addr())
+        }
+    }
+}
+
 /// A TCP stream backed by shared-memory ring buffers.
 pub struct TcpStream {
     inbound_reader: StrongReader,
@@ -41,6 +71,13 @@ pub struct TcpListener {
 
 /// Accepts incoming TCP connections and produces `TcpStream` handles.
 pub struct TcpAccept;
+
+struct TcpChannelLayout {
+    inbound_reader: StrongReader,
+    inbound_signal: Signal,
+    outbound_writer: StrongWriter,
+    outbound_signal: Signal,
+}
 
 impl TcpStream {
     /// Connects to a remote TCP endpoint via the host.
@@ -321,43 +358,6 @@ impl Accept for TcpAccept {
     fn accept(connection: IncomingConnection) -> Result<Self::Item> {
         TcpStream::attach_shared(connection.shared_id)
     }
-}
-
-#[cfg(feature = "axum")]
-mod axum_impl {
-    use super::TcpListener;
-    use std::future::Future;
-    use tokio::io;
-
-    impl axum::serve::Listener for TcpListener {
-        type Io = super::TcpStream;
-        type Addr = std::net::SocketAddr;
-
-        fn accept(&mut self) -> impl Future<Output = (Self::Io, Self::Addr)> + Send {
-            async {
-                loop {
-                    match self.listener.accept::<super::TcpAccept>().await {
-                        Ok(stream) => return (stream, self.local_addr()),
-                        Err(_e) => {
-                            // Sleep briefly and retry on error
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        fn local_addr(&self) -> io::Result<Self::Addr> {
-            Ok(self.local_addr())
-        }
-    }
-}
-
-struct TcpChannelLayout {
-    inbound_reader: StrongReader,
-    inbound_signal: Signal,
-    outbound_writer: StrongWriter,
-    outbound_signal: Signal,
 }
 
 fn attach_tcp_channels(shared_id: u64) -> Result<TcpChannelLayout> {

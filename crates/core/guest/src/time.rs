@@ -3,24 +3,22 @@
 //! Provides the [`Instant`] type backed by the hostcall monotonic clock, and a
 //! [`Timer`] for the guest's cooperative single-threaded scheduler.
 
-use std::ops::{Add, AddAssign, Sub};
-use std::time::Duration;
-
-use selium_abi::{HostcallOutput, HostcallRequest};
-
-use crate::{GuestError, Result, hostcall::hostcall_ready};
-use crate::{
-    async_runtime::current_task_id, hostcall::poll_operation, platform::selium_hostcall_create,
-};
-use selium_abi::{HOSTCALL_STATUS_FAILED, HostcallEnvelope, encode_rkyv, unpack_hostcall_status};
 use std::{
+    ops::{Add, AddAssign, Sub},
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use selium_abi::OperationId;
+use selium_abi::{
+    HOSTCALL_STATUS_FAILED, HostcallEnvelope, HostcallOutput, HostcallRequest, OperationId,
+    encode_rkyv, unpack_hostcall_status,
+};
 
-use crate::platform::selium_hostcall_drop;
+use crate::{
+    GuestError, Result, async_runtime::current_task_id, hostcall::hostcall_ready,
+    hostcall::poll_operation, platform::selium_hostcall_create, platform::selium_hostcall_drop,
+};
 
 /// A measurement of the monotonic clock, backed by the Selium host.
 ///
@@ -31,6 +29,34 @@ use crate::platform::selium_hostcall_drop;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant {
     nanos: u64,
+}
+
+/// A clock timer that uses a private [`SignalWait`] hostcall to sleep until
+/// the deadline.
+///
+/// On the first `poll()` where the deadline has not yet passed, this timer
+/// lazily creates a private signal and then issues a `SignalWait` with the
+/// remaining time as the timeout.  When the host completes the wait (timeout
+/// expires), it writes to the guest's mailbox, which wakes the guest reactor
+/// and causes the timer to be re-polled.
+///
+/// This avoids spawning OS threads, which are unavailable in a WASM guest,
+/// and integrates with the guest's cooperative single-threaded scheduler via
+/// the existing signal hostcall machinery.
+///
+/// This type is constructed indirectly via [`SeliumQuinnRuntime::new_timer`],
+/// so the `dead_code` lint does not see usage through the trait object
+/// dispatch.
+///
+/// [`SignalWait`]: selium_abi::HostcallRequest::SignalWait
+#[derive(Debug)]
+pub struct Timer {
+    deadline: Instant,
+    /// Local id of a private signal used for timeout-based wakeup.
+    /// Created lazily on the first poll where the deadline hasn't passed.
+    signal_id: Option<u64>,
+    /// In-flight SignalWait hostcall operation, if any.
+    operation_id: Option<OperationId>,
 }
 
 impl Instant {
@@ -158,42 +184,37 @@ impl Sub<Instant> for Instant {
     }
 }
 
-/// Returns the current wall-clock time as nanoseconds since the UNIX epoch.
-///
-/// This function issues a [`HostcallRequest::TimeNow`] hostcall.
-pub fn now() -> Result<u64> {
-    match hostcall_ready(HostcallRequest::TimeNow)? {
-        HostcallOutput::U64(nanos) => Ok(nanos),
-        _ => Err(GuestError::UnexpectedHostcallOutput),
-    }
-}
+#[cfg(feature = "quinn")]
+impl quinn::RuntimeInstant for Instant {
+    type Duration = std::time::Duration;
 
-/// A clock timer that uses a private [`SignalWait`] hostcall to sleep until
-/// the deadline.
-///
-/// On the first `poll()` where the deadline has not yet passed, this timer
-/// lazily creates a private signal and then issues a `SignalWait` with the
-/// remaining time as the timeout.  When the host completes the wait (timeout
-/// expires), it writes to the guest's mailbox, which wakes the guest reactor
-/// and causes the timer to be re-polled.
-///
-/// This avoids spawning OS threads, which are unavailable in a WASM guest,
-/// and integrates with the guest's cooperative single-threaded scheduler via
-/// the existing signal hostcall machinery.
-///
-/// This type is constructed indirectly via [`SeliumQuinnRuntime::new_timer`],
-/// so the `dead_code` lint does not see usage through the trait object
-/// dispatch.
-///
-/// [`SignalWait`]: selium_abi::HostcallRequest::SignalWait
-#[derive(Debug)]
-pub struct Timer {
-    deadline: Instant,
-    /// Local id of a private signal used for timeout-based wakeup.
-    /// Created lazily on the first poll where the deadline hasn't passed.
-    signal_id: Option<u64>,
-    /// In-flight SignalWait hostcall operation, if any.
-    operation_id: Option<OperationId>,
+    fn now() -> Self {
+        Instant::now()
+    }
+
+    fn duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::duration_since(self, earlier)
+    }
+
+    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
+        Instant::checked_duration_since(self, earlier)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::saturating_duration_since(self, earlier)
+    }
+
+    fn elapsed(&self) -> Self::Duration {
+        Instant::elapsed(self)
+    }
+
+    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_add(self, duration)
+    }
+
+    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_sub(self, duration)
+    }
 }
 
 impl Timer {
@@ -226,6 +247,21 @@ impl Timer {
     /// Closes a signal handle via a synchronous hostcall (best-effort).
     fn close_signal(local_id: u64) {
         let _ = hostcall_ready(HostcallRequest::SignalClose { local_id });
+    }
+}
+
+#[cfg(feature = "quinn")]
+impl quinn::AsyncTimer for Timer {
+    type Instant = Instant;
+
+    fn reset(self: Pin<&mut Self>, deadline: Instant) {
+        let this = self.get_mut();
+        this.cancel_wait();
+        this.deadline = deadline;
+    }
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        futures::Future::poll(self, cx)
     }
 }
 
@@ -315,51 +351,13 @@ impl Drop for Timer {
     }
 }
 
-#[cfg(feature = "quinn")]
-impl quinn::RuntimeInstant for Instant {
-    type Duration = std::time::Duration;
-
-    fn now() -> Self {
-        Instant::now()
-    }
-
-    fn duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::duration_since(self, earlier)
-    }
-
-    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
-        Instant::checked_duration_since(self, earlier)
-    }
-
-    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::saturating_duration_since(self, earlier)
-    }
-
-    fn elapsed(&self) -> Self::Duration {
-        Instant::elapsed(self)
-    }
-
-    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_add(self, duration)
-    }
-
-    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_sub(self, duration)
-    }
-}
-
-#[cfg(feature = "quinn")]
-impl quinn::AsyncTimer for Timer {
-    type Instant = Instant;
-
-    fn reset(self: Pin<&mut Self>, deadline: Instant) {
-        let this = self.get_mut();
-        this.cancel_wait();
-        this.deadline = deadline;
-    }
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        futures::Future::poll(self, cx)
+/// Returns the current wall-clock time as nanoseconds since the UNIX epoch.
+///
+/// This function issues a [`HostcallRequest::TimeNow`] hostcall.
+pub fn now() -> Result<u64> {
+    match hostcall_ready(HostcallRequest::TimeNow)? {
+        HostcallOutput::U64(nanos) => Ok(nanos),
+        _ => Err(GuestError::UnexpectedHostcallOutput),
     }
 }
 

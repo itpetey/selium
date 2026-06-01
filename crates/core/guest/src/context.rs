@@ -7,12 +7,12 @@ use crate::{
     io::rpc::{RpcClient, error::RpcError},
 };
 
-/// Size of RPC request buf (min. 512 URI chars)
-#[cfg(feature = "io")]
-pub const RPC_REQ_CAPACITY: u32 = 2048;
 /// Size of RPC reply buf (4x shared_id replies)
 #[cfg(feature = "io")]
 pub const RPC_REP_CAPACITY: u32 = 36;
+/// Size of RPC request buf (min. 512 URI chars)
+#[cfg(feature = "io")]
+pub const RPC_REQ_CAPACITY: u32 = 2048;
 
 /// Guest context injected by the runtime during bootstrap.
 ///
