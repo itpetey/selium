@@ -367,11 +367,13 @@ mod quinn_impl {
     };
 
     use quinn::udp::{RecvMeta, Transmit};
-    use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller};
+    use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
     use selium_abi::{HostcallOutput, HostcallRequest};
-    use std::time::Instant;
 
-    use crate::hostcall::{HostcallFuture, hostcall_async};
+    use crate::{
+        Instant,
+        hostcall::{HostcallFuture, hostcall_async},
+    };
 
     use super::{Signal, StrongReader, StrongWriter, UdpSocket};
 
@@ -415,36 +417,15 @@ mod quinn_impl {
     }
 
     impl AsyncUdpSocket for QuinnUdpSocket {
-        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-            Box::pin(QuinnUdpPoller {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            Box::pin(QuinnUdpSender {
                 inner: self.0.clone(),
                 pending_signal: None,
             })
         }
 
-        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-            // Encode frame: [addr_len 2 bytes][addr bytes][payload]
-            let addr_bytes = transmit.destination.to_string().into_bytes();
-            let addr_len = addr_bytes.len();
-            let mut frame = Vec::with_capacity(2 + addr_len + transmit.contents.len());
-            frame.extend_from_slice(&(addr_len as u16).to_le_bytes());
-            frame.extend_from_slice(&addr_bytes);
-            frame.extend_from_slice(transmit.contents);
-
-            match self.0.send_writer.borrow_mut().write(&frame) {
-                Ok(()) => Ok(()),
-                Err(crate::io::channels::Error::ChannelFull) => {
-                    Err(io::Error::new(io::ErrorKind::WouldBlock, "channel full"))
-                }
-                Err(e) => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("send write error: {e}"),
-                )),
-            }
-        }
-
         fn poll_recv(
-            &self,
+            &mut self,
             cx: &mut Context<'_>,
             bufs: &mut [IoSliceMut<'_>],
             meta: &mut [RecvMeta],
@@ -494,13 +475,10 @@ mod quinn_impl {
                     let to_copy = payload.len().min(bufs[0].len());
                     bufs[0][..to_copy].copy_from_slice(&payload[..to_copy]);
 
-                    meta[0] = RecvMeta {
-                        addr,
-                        len: to_copy,
-                        stride: to_copy,
-                        ecn: None,
-                        dst_ip: None,
-                    };
+                    meta[0] = RecvMeta::default();
+                    meta[0].addr = addr;
+                    meta[0].len = to_copy;
+                    meta[0].stride = to_copy;
 
                     Poll::Ready(Ok(1))
                 }
@@ -551,10 +529,6 @@ mod quinn_impl {
             Ok(self.0.local_addr)
         }
 
-        fn max_transmit_segments(&self) -> usize {
-            1
-        }
-
         fn max_receive_segments(&self) -> usize {
             1
         }
@@ -564,19 +538,23 @@ mod quinn_impl {
         }
     }
 
-    struct QuinnUdpPoller {
+    struct QuinnUdpSender {
         inner: Arc<UdpSocketInner>,
         pending_signal: Option<HostcallFuture>,
     }
 
-    impl Debug for QuinnUdpPoller {
+    impl Debug for QuinnUdpSender {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("QuinnUdpPoller").finish()
+            f.debug_struct("QuinnUdpSender").finish()
         }
     }
 
-    impl UdpPoller for QuinnUdpPoller {
-        fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    impl UdpSender for QuinnUdpSender {
+        fn poll_send(
+            self: Pin<&mut Self>,
+            transmit: &Transmit<'_>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
 
             // If a previous signal wait is pending, poll it.
@@ -604,42 +582,63 @@ mod quinn_impl {
                 }
             }
 
-            // Wait on the send signal.
-            let observed = match this.inner.send_signal.generation() {
-                Ok(g) => g,
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("signal generation error: {e}"),
-                    )));
-                }
-            };
+            // Encode frame: [addr_len 2 bytes][addr bytes][payload]
+            let addr_bytes = transmit.destination.to_string().into_bytes();
+            let addr_len = addr_bytes.len();
+            let mut frame = Vec::with_capacity(2 + addr_len + transmit.contents.len());
+            frame.extend_from_slice(&(addr_len as u16).to_le_bytes());
+            frame.extend_from_slice(&addr_bytes);
+            frame.extend_from_slice(transmit.contents);
 
-            let mut fut = hostcall_async(HostcallRequest::SignalWait {
-                local_id: this.inner.send_signal.local_id(),
-                observed_generation: observed,
-                timeout_ms: 30_000,
-            });
+            match this.inner.send_writer.borrow_mut().write(&frame) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(crate::io::channels::Error::ChannelFull) => {
+                    // Channel full. Start a signal wait and return Pending.
+                    let observed = match this.inner.send_signal.generation() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("signal generation error: {e}"),
+                            )));
+                        }
+                    };
 
-            // Poll the future once.
-            match Pin::new(&mut fut).poll(cx) {
-                Poll::Ready(Ok(HostcallOutput::SignalGeneration(_))) => {
-                    // Signal fired; channel likely has space.
-                    Poll::Ready(Ok(()))
+                    let mut fut = hostcall_async(HostcallRequest::SignalWait {
+                        local_id: this.inner.send_signal.local_id(),
+                        observed_generation: observed,
+                        timeout_ms: 30_000,
+                    });
+
+                    match Pin::new(&mut fut).poll(cx) {
+                        Poll::Ready(Ok(HostcallOutput::SignalGeneration(_))) => {
+                            // Signal fired; channel likely has space. Wake and retry.
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "unexpected hostcall output during send wait",
+                        ))),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("hostcall error: {e}"),
+                        ))),
+                        Poll::Pending => {
+                            this.pending_signal = Some(fut);
+                            Poll::Pending
+                        }
+                    }
                 }
-                Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
+                Err(e) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected hostcall output during send wait",
+                    format!("send write error: {e}"),
                 ))),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("hostcall error: {e}"),
-                ))),
-                Poll::Pending => {
-                    this.pending_signal = Some(fut);
-                    Poll::Pending
-                }
             }
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            1
         }
     }
 
@@ -647,6 +646,8 @@ mod quinn_impl {
     pub struct SeliumQuinnRuntime;
 
     impl Runtime for SeliumQuinnRuntime {
+        type Instant = Instant;
+
         fn spawn(&self, future: Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
             // Bridge Send-bound future to the guest's single-threaded runtime.
             // SAFETY: The guest runtime is single-threaded and cooperative.
@@ -657,24 +658,18 @@ mod quinn_impl {
             crate::async_runtime::spawn(fut);
         }
 
-        fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn AsyncTimer>> {
-            // Convert std::time::Instant to our hostcall-backed Instant by
-            // capturing the offset between the two clocks at this moment.
-            let now_std = Instant::now();
-            let now_hostcall = crate::time::time_monotonic()
-                .expect("hostcall monotonic clock is available");
-            let remaining = deadline.saturating_duration_since(now_std);
-            let deadline_ns = now_hostcall.saturating_add(remaining.as_nanos() as u64);
-            Box::pin(crate::time::Timer::new(
-                crate::time::Instant::from_nanos(deadline_ns),
-            ))
+        fn new_timer(
+            &self,
+            deadline: Self::Instant,
+        ) -> Pin<Box<dyn AsyncTimer<Instant = Self::Instant>>> {
+            Box::pin(crate::time::Timer::new(deadline))
         }
 
         #[cfg(not(target_family = "wasm"))]
         fn wrap_udp_socket(
             &self,
             _socket: std::net::UdpSocket,
-        ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        ) -> io::Result<Box<dyn AsyncUdpSocket>> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "use new_with_abstract_socket for QuinnUdpSocket",

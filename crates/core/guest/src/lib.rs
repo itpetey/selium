@@ -17,7 +17,7 @@ pub use crate::{
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     signal::Signal,
     storage::{BlobStore, DurableLog},
-    time::{Instant, TimeSource, Timer, time_monotonic, time_now},
+    time::{Instant, Timer, now},
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,

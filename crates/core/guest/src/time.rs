@@ -1,15 +1,10 @@
 //! Time primitives for Selium guests.
 //!
-//! Provides an ABI surface ([`time_now`], [`time_monotonic`]) that calls into
-//! the host via the hostcall system on wasm32 and fails gracefully on native
-//! targets.
-//!
-//! Also provides a [`Instant`] type backed by the hostcall monotonic clock,
-//! a [`TimeSource`] convenience wrapper, and a Quinn-compatible [`Timer`] for
-//! the guest's cooperative single-threaded scheduler.
+//! Provides the [`Instant`] type backed by the hostcall monotonic clock, and a
+//! [`Timer`] for the guest's cooperative single-threaded scheduler.
 
 use std::ops::{Add, AddAssign, Sub};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use selium_abi::{HostcallOutput, HostcallRequest};
 
@@ -47,13 +42,11 @@ impl Instant {
 
     /// Creates an `Instant` from a raw count of nanoseconds since the
     /// hostcall monotonic epoch.
-    #[must_use]
     pub const fn from_nanos(nanos: u64) -> Self {
         Self { nanos }
     }
 
     /// Returns the raw count of nanoseconds since the hostcall monotonic epoch.
-    #[must_use]
     pub const fn as_nanos(self) -> u64 {
         self.nanos
     }
@@ -65,9 +58,13 @@ impl Instant {
     ///
     /// Panics on native (non-WASM) targets where the hostcall is not
     /// available. On WASM this always succeeds.
-    #[must_use]
     pub fn now() -> Self {
-        let nanos = time_monotonic().expect("hostcall monotonic clock is available on WASM");
+        let nanos = match hostcall_ready(HostcallRequest::TimeMonotonic) {
+            Ok(HostcallOutput::U64(nanos)) => nanos,
+            Ok(_) => panic!("unexpected hostcall output for TimeMonotonic"),
+            Err(e) => panic!("failed to get monotonic time from host: {e}"),
+        };
+
         Self { nanos }
     }
 
@@ -76,7 +73,6 @@ impl Instant {
     /// # Panics
     ///
     /// Panics if `earlier` is later than `self`.
-    #[must_use]
     pub fn duration_since(&self, earlier: Self) -> Duration {
         self.checked_duration_since(earlier)
             .expect("supplied instant is later than self")
@@ -84,7 +80,6 @@ impl Instant {
 
     /// Returns the amount of time elapsed from `earlier` to `self`, or
     /// `None` if `earlier` is later than `self`.
-    #[must_use]
     pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
         self.nanos
             .checked_sub(earlier.nanos)
@@ -93,20 +88,17 @@ impl Instant {
 
     /// Returns the amount of time elapsed from `earlier` to `self`, or
     /// zero if `earlier` is later than `self`.
-    #[must_use]
     pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
         Duration::from_nanos(self.nanos.saturating_sub(earlier.nanos))
     }
 
     /// Returns the amount of time elapsed since this `Instant` was created.
-    #[must_use]
     pub fn elapsed(&self) -> Duration {
         Self::now().saturating_duration_since(*self)
     }
 
     /// Returns `Some(t)` where `t` is the time `self + duration`, or `None`
     /// if overflow occurred.
-    #[must_use]
     pub fn checked_add(&self, duration: Duration) -> Option<Self> {
         self.nanos
             .checked_add(duration.as_nanos() as u64)
@@ -115,7 +107,6 @@ impl Instant {
 
     /// Returns `Some(t)` where `t` is the time `self - duration`, or `None`
     /// if underflow occurred.
-    #[must_use]
     pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
         self.nanos
             .checked_sub(duration.as_nanos() as u64)
@@ -170,69 +161,15 @@ impl Sub<Instant> for Instant {
 /// Returns the current wall-clock time as nanoseconds since the UNIX epoch.
 ///
 /// This function issues a [`HostcallRequest::TimeNow`] hostcall.
-pub fn time_now() -> Result<u64> {
+pub fn now() -> Result<u64> {
     match hostcall_ready(HostcallRequest::TimeNow)? {
         HostcallOutput::U64(nanos) => Ok(nanos),
         _ => Err(GuestError::UnexpectedHostcallOutput),
     }
 }
 
-/// Returns the current monotonic time as nanoseconds since an arbitrary epoch.
-///
-/// This function issues a [`HostcallRequest::TimeMonotonic`] hostcall.
-pub fn time_monotonic() -> Result<u64> {
-    match hostcall_ready(HostcallRequest::TimeMonotonic)? {
-        HostcallOutput::U64(nanos) => Ok(nanos),
-        _ => Err(GuestError::UnexpectedHostcallOutput),
-    }
-}
-
-/// Time source backed by the Selium host clock (or the local clock on native).
-///
-/// Uses [`time_monotonic`] as its epoch baseline so that it works correctly on
-/// both `wasm32` (where [`Instant::now`] is unreliable) and native targets.
-pub struct TimeSource {
-    start_nanos: u64,
-}
-
-impl TimeSource {
-    /// Create a new time source.
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            start_nanos: time_monotonic()?,
-        })
-    }
-
-    /// Returns the number of nanoseconds since the time source was created.
-    ///
-    /// This is a monotonic clock suitable for measuring durations.
-    pub fn now_nanos(&self) -> Result<u64> {
-        Ok(time_monotonic()?.saturating_sub(self.start_nanos))
-    }
-
-    /// Returns the number of milliseconds since the time source was created.
-    pub fn now_millis(&self) -> Result<u64> {
-        Ok(self.now_nanos()? / 1_000_000)
-    }
-
-    /// Returns the current wall-clock time as nanoseconds since UNIX epoch.
-    pub fn wall_nanos(&self) -> Result<u64> {
-        time_now()
-    }
-
-    /// Returns the current wall-clock time.
-    pub fn wall(&self) -> SystemTime {
-        SystemTime::now()
-    }
-
-    /// Returns the elapsed time since this time source was created.
-    pub fn elapsed(&self) -> Result<Duration> {
-        Ok(Duration::from_nanos(self.now_nanos()?))
-    }
-}
-
-/// A Quinn-compatible timer that uses a private [`SignalWait`] hostcall to
-/// sleep until the deadline.
+/// A clock timer that uses a private [`SignalWait`] hostcall to sleep until
+/// the deadline.
 ///
 /// On the first `poll()` where the deadline has not yet passed, this timer
 /// lazily creates a private signal and then issues a `SignalWait` with the
@@ -379,18 +316,46 @@ impl Drop for Timer {
 }
 
 #[cfg(feature = "quinn")]
+impl quinn::RuntimeInstant for Instant {
+    type Duration = std::time::Duration;
+
+    fn now() -> Self {
+        Instant::now()
+    }
+
+    fn duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::duration_since(self, earlier)
+    }
+
+    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
+        Instant::checked_duration_since(self, earlier)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::saturating_duration_since(self, earlier)
+    }
+
+    fn elapsed(&self) -> Self::Duration {
+        Instant::elapsed(self)
+    }
+
+    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_add(self, duration)
+    }
+
+    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_sub(self, duration)
+    }
+}
+
+#[cfg(feature = "quinn")]
 impl quinn::AsyncTimer for Timer {
-    fn reset(self: Pin<&mut Self>, deadline: std::time::Instant) {
+    type Instant = Instant;
+
+    fn reset(self: Pin<&mut Self>, deadline: Instant) {
         let this = self.get_mut();
         this.cancel_wait();
-        // Keep the signal — it can be reused for the new deadline.
-        // Convert std::time::Instant to our Instant by capturing the offset
-        // between the two clocks at this moment.
-        let now_std = std::time::Instant::now();
-        let now_hostcall = time_monotonic().expect("hostcall monotonic clock is available on WASM");
-        let remaining = deadline.saturating_duration_since(now_std);
-        this.deadline =
-            Instant::from_nanos(now_hostcall.saturating_add(remaining.as_nanos() as u64));
+        this.deadline = deadline;
     }
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -404,19 +369,7 @@ mod tests {
 
     #[test]
     fn native_time_now_fails() {
-        let result = time_now();
-        assert!(matches!(result, Err(GuestError::Host(_))));
-    }
-
-    #[test]
-    fn native_time_monotonic_fails() {
-        let result = time_monotonic();
-        assert!(matches!(result, Err(GuestError::Host(_))));
-    }
-
-    #[test]
-    fn native_time_source_creation_fails() {
-        let result = TimeSource::new();
+        let result = now();
         assert!(matches!(result, Err(GuestError::Host(_))));
     }
 
