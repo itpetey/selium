@@ -218,11 +218,16 @@ fn write_reserved_frame(
     header: FrameHeader,
     mask: u64,
 ) -> Result<()> {
+    // Write non-ready header
     write_raw(region, pos, &header.encode(), mask)?;
     let payload_pos = pos
         .checked_add(FrameHeader::ENCODED_SIZE as u64)
         .ok_or(Error::InvalidFrame)?;
+
+    // Write payload
     write_raw(region, payload_pos, payload, mask)?;
+
+    // Rewrite header as ready
     let ready_header = FrameHeader {
         flags: header.flags | FrameHeader::FLAG_READY,
         ..header

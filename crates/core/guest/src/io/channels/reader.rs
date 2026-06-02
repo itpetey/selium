@@ -49,15 +49,21 @@ impl StrongReader {
             return Err(Error::Terminated);
         }
 
+        let capacity = self.region.capacity();
+        let mask = capacity - 1;
+
         loop {
-            let capacity = self.region.capacity();
-            let mask = capacity - 1;
             let tail = self
                 .region
                 .read_next_tail()
                 .map_err(|_channel_empty| Error::ChannelEmpty)?;
 
             if self.pos >= tail {
+                // Positions beyond the end of the buffer tail should be impossible,
+                // though if they happen in production it is not enough to justify
+                // process termination.
+                debug_assert!(self.pos == tail);
+
                 return Err(Error::ChannelEmpty);
             }
             if self.pos.wrapping_add(capacity) < tail {

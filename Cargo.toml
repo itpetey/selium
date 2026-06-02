@@ -25,7 +25,8 @@ keywords = ["data", "etl", "streaming", "wasm", "webassembly"]
 categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
-axum = { version = "0.8", default-features = false }
+# axum = { version = "0.8", default-features = false }
+axum = { path = "../../axum/axum", default-features = false }
 futures = { version = "0.3", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 # quinn = { version = "0.11", default-features = false }

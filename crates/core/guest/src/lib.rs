@@ -1,7 +1,7 @@
 //! Selium guest SDK.
 
 #[cfg(feature = "quinn")]
-pub use crate::net::udp::SeliumQuinnRuntime;
+pub use crate::net::quinn::SeliumQuinnRuntime;
 pub use crate::{
     async_runtime::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
