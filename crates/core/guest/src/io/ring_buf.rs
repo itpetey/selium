@@ -15,6 +15,10 @@ use crate::{
 
 pub(crate) const MAGIC_PREFIX: u64 = 0x53454C494F524E47;
 
+/// Minimum ring buffer data capacity (in bytes).
+/// Must hold at least one frame header (12 bytes) plus a small payload.
+const MIN_RING_CAPACITY: u64 = 64;
+
 /// A lock-free ring buffer log on shared memory.
 ///
 /// This is the primitive building block for all selium-io patterns.
@@ -29,7 +33,7 @@ pub struct RingBuf {
 
 impl RingBuf {
     /// Creates a new ring buffer with the given data capacity, backed by a fresh shared memory region.
-    pub fn create(capacity: u32) -> Result<(Self, Signal)> {
+    pub fn create(capacity: u64) -> Result<(Self, Signal)> {
         let region = RegionBuilder::create(capacity)?;
         let mask = mask_for_capacity(capacity as u64)?;
         region.write_magic(MAGIC_PREFIX)?;
@@ -155,11 +159,11 @@ impl RingBuf {
         let raw_pos = cursor.masked(self.mask);
         let mut result = Vec::with_capacity(len as usize);
         if tail_len > 0 {
-            let data = self.region.read_data(raw_pos, tail_len as u32)?;
+            let data = self.region.read_data(raw_pos, tail_len)?;
             result.extend_from_slice(&data);
         }
         if head_len > 0 {
-            let data = self.region.read_data(0, head_len as u32)?;
+            let data = self.region.read_data(0, head_len)?;
             result.extend_from_slice(&data);
         }
         Ok(result)
@@ -213,10 +217,10 @@ impl RingBuf {
 }
 
 /// Rounds a byte capacity to the next power of two for use as a ring buffer.
-pub fn round_capacity(capacity: u32) -> Result<u32> {
+pub fn round_capacity(capacity: u64) -> Result<u64> {
     capacity
         .checked_next_power_of_two()
-        .map(|rounded| rounded.max(64))
+        .map(|rounded| rounded.max(MIN_RING_CAPACITY))
         .ok_or(Error::CapacityExceeded)
 }
 
@@ -229,7 +233,7 @@ mod tests {
         assert_eq!(round_capacity(64), Ok(64));
         assert_eq!(round_capacity(100), Ok(128));
         assert_eq!(round_capacity(1), Ok(64));
-        assert_eq!(round_capacity(u32::MAX), Err(Error::CapacityExceeded));
+        assert_eq!(round_capacity(u64::MAX), Err(Error::CapacityExceeded));
     }
 
     #[test]

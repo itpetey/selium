@@ -142,6 +142,11 @@ impl WeakWriter {
     pub fn writer_id(&self) -> u32 {
         self.writer_id
     }
+
+    /// Allocates a globally unique mutation id for this writer's channel.
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        self.region.allocate_mutation_id().map_err(Error::Core)
+    }
 }
 
 impl Writer {
@@ -158,6 +163,14 @@ impl Writer {
         match self {
             Self::Strong(w) => w.writer_id,
             Self::Weak(w) => w.writer_id,
+        }
+    }
+
+    /// Allocates a globally unique mutation id for this writer's channel.
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        match self {
+            Self::Strong(w) => w.allocate_mutation_id(),
+            Self::Weak(w) => w.allocate_mutation_id(),
         }
     }
 }
@@ -198,14 +211,14 @@ fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result
         let offset = region.data_offset() + raw_start as u64;
         region
             .data_slice()
-            .write(offset as u32, data.get(..tail).unwrap_or_default().to_vec())
+            .write(offset, data.get(..tail).unwrap_or_default().to_vec())
             .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
     }
     if head > 0 {
         let offset = region.data_offset();
         region
             .data_slice()
-            .write(offset as u32, data.get(tail..).unwrap_or_default().to_vec())
+            .write(offset, data.get(tail..).unwrap_or_default().to_vec())
             .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
     }
     Ok(())

@@ -25,19 +25,19 @@ impl<Req, Rep> RpcClient<Req, Rep> {
     /// the region id to the server via the supplied listener queue.
     pub async fn connect(
         sender: ResourceSender,
-        request_capacity: u32,
-        reply_capacity: u32,
+        request_capacity: u64,
+        reply_capacity: u64,
     ) -> Result<Self, RpcError> {
         let request_data_cap = ring_buf::round_capacity(request_capacity)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
         let reply_data_cap = ring_buf::round_capacity(reply_capacity)
             .map_err(|e| RpcError::Serialization(e.to_string()))?;
 
-        let request_sub_len = request_data_cap + REGION_HEADER_BYTES as u32;
-        let reply_sub_len = reply_data_cap + REGION_HEADER_BYTES as u32;
+        let request_sub_len = request_data_cap + REGION_HEADER_BYTES;
+        let reply_sub_len = reply_data_cap + REGION_HEADER_BYTES;
 
         let total_capacity = {
-            let header_size = 40u32;
+            let header_size = 40; // @todo Magic number!
             let mut total = header_size;
             total = align_up(total, 8) + request_sub_len;
             total = align_up(total, 8) + reply_sub_len;
@@ -210,7 +210,7 @@ impl<Req, Rep> RpcClient<Req, Rep> {
     }
 }
 
-fn align_up(value: u32, alignment: u32) -> u32 {
+fn align_up(value: u64, alignment: u64) -> u64 {
     let rem = value % alignment;
     if rem == 0 {
         value

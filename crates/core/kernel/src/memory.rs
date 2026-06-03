@@ -12,8 +12,8 @@ impl Kernel {
     /// Allocates a shared memory region and returns its descriptor.
     pub fn allocate_shared_region(
         &self,
-        size: u32,
-        alignment: u32,
+        size: u64,
+        alignment: u64,
     ) -> Result<SharedRegionDescriptor> {
         let region_id = self
             .inner
@@ -40,8 +40,8 @@ impl Kernel {
     pub fn attach_shared_region(
         &self,
         shared_id: SharedResourceId,
-        region_offset: u32,
-        len: u32,
+        region_offset: u64,
+        len: u64,
     ) -> Result<SharedMappingDescriptor> {
         let region = self
             .inner
@@ -108,7 +108,7 @@ impl Kernel {
     }
 
     /// Reads bytes from a local shared memory mapping.
-    pub fn read_shared_memory(&self, local_id: u64, offset: u32, len: usize) -> Result<Vec<u8>> {
+    pub fn read_shared_memory(&self, local_id: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mapping = self.shared_mapping(local_id)?;
         let mut bytes = vec![0_u8; len];
         self.inner
@@ -120,7 +120,7 @@ impl Kernel {
     }
 
     /// Writes bytes to a local shared memory mapping.
-    pub fn write_shared_memory(&self, local_id: u64, offset: u32, bytes: &[u8]) -> Result<()> {
+    pub fn write_shared_memory(&self, local_id: u64, offset: u64, bytes: &[u8]) -> Result<()> {
         let mapping = self.shared_mapping(local_id)?;
         self.inner
             .store
@@ -133,7 +133,7 @@ impl Kernel {
     pub fn fetch_add_shared_memory_u64(
         &self,
         local_id: u64,
-        offset: u32,
+        offset: u64,
         value: u64,
     ) -> Result<u64> {
         let mapping = self.shared_mapping(local_id)?;
@@ -154,7 +154,7 @@ impl Kernel {
     pub fn compare_exchange_shared_memory_u64(
         &self,
         local_id: u64,
-        offset: u32,
+        offset: u64,
         current: u64,
         new: u64,
     ) -> Result<u64> {

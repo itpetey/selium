@@ -39,8 +39,8 @@ pub struct ChannelRegion {
 
 impl RegionBuilder {
     /// Creates a new shared memory region for a ring buffer of the given capacity.
-    pub fn create(capacity: u32) -> Result<ChannelRegion> {
-        let total_aligned = aligned_region_size(capacity as u64)?;
+    pub fn create(capacity: u64) -> Result<ChannelRegion> {
+        let total_aligned = aligned_region_size(capacity)?;
         let region =
             SharedRegion::allocate(total_aligned, 8).map_err(|e| Error::Guest(e.to_string()))?;
         let mapping = SharedMemory::attach(region.descriptor(), 0, total_aligned)
@@ -48,8 +48,8 @@ impl RegionBuilder {
         Ok(ChannelRegion {
             shared_id: region.shared_id(),
             mapping,
-            capacity: capacity as u64,
-            size: total_aligned as u64,
+            capacity,
+            size: total_aligned,
         })
     }
 
@@ -102,7 +102,7 @@ impl ChannelRegion {
     pub fn read_header_u64(&self, offset: u64) -> Result<u64> {
         let bytes = self
             .mapping
-            .read(offset as u32, 8)
+            .read(offset, 8)
             .map_err(|e| Error::Guest(e.to_string()))?;
         Ok(u64::from_le_bytes(
             bytes
@@ -114,29 +114,29 @@ impl ChannelRegion {
     /// Writes a u64 to the region header at the given offset.
     pub fn write_header_u64(&self, offset: u64, value: u64) -> Result<()> {
         self.mapping
-            .write(offset as u32, value.to_le_bytes().to_vec())
+            .write(offset, value.to_le_bytes().to_vec())
             .map_err(|e| Error::Guest(e.to_string()))
     }
 
     /// Atomically increments a header u64 and returns the previous value.
     pub fn fetch_add_header_u64(&self, offset: u64, add: u64) -> Result<u64> {
         self.mapping
-            .fetch_add_u64(offset as u32, add)
+            .fetch_add_u64(offset, add)
             .map_err(|e| Error::Guest(e.to_string()))
     }
 
     /// Atomically compares and exchanges a header u64, returning the previous value.
     pub fn compare_exchange_header_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64> {
         self.mapping
-            .compare_exchange_u64(offset as u32, current, new)
+            .compare_exchange_u64(offset, current, new)
             .map_err(|e| Error::Guest(e.to_string()))
     }
 
     /// Reads bytes from the ring data area.
-    pub fn read_data(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+    pub fn read_data(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let data_offset = REGION_HEADER_BYTES + offset;
         self.mapping
-            .read(data_offset as u32, len)
+            .read(data_offset, len)
             .map_err(|e| Error::Guest(e.to_string()))
     }
 
@@ -144,7 +144,7 @@ impl ChannelRegion {
     pub fn write_data(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         let data_offset = REGION_HEADER_BYTES + offset;
         self.mapping
-            .write(data_offset as u32, bytes.to_vec())
+            .write(data_offset, bytes.to_vec())
             .map_err(|e| Error::Guest(e.to_string()))
     }
 
@@ -329,15 +329,14 @@ impl ChannelRegion {
     }
 }
 
-fn aligned_region_size(capacity: u64) -> Result<u32> {
+fn aligned_region_size(capacity: u64) -> Result<u64> {
     let total = REGION_HEADER_BYTES
         .checked_add(capacity)
         .ok_or(Error::CapacityExceeded)?;
-    let total_aligned = total
+    Ok(total
         .checked_next_power_of_two()
         .ok_or(Error::CapacityExceeded)?
-        .max(MIN_REGION_BYTES);
-    u32::try_from(total_aligned).map_err(|_error| Error::CapacityExceeded)
+        .max(MIN_REGION_BYTES))
 }
 
 fn encode_reader_position(position: u64) -> Result<u64> {
@@ -393,7 +392,7 @@ mod tests {
 
     #[test]
     fn aligned_region_size_accounts_for_header_and_limits() {
-        assert_eq!(aligned_region_size(1), Ok(MIN_REGION_BYTES as u32));
+        assert_eq!(aligned_region_size(1), Ok(MIN_REGION_BYTES));
         assert_eq!(aligned_region_size(4096), Ok(8192));
         assert_eq!(aligned_region_size(u64::MAX), Err(Error::CapacityExceeded));
         assert_eq!(

@@ -31,7 +31,7 @@ impl Channel {
     /// Creates a new channel with the given ring buffer data capacity.
     ///
     /// Returns the channel and its notification signal.
-    pub fn create(capacity: u32) -> Result<(Self, Signal)> {
+    pub fn create(capacity: u64) -> Result<(Self, Signal)> {
         let capacity = round_capacity(capacity).map_err(Error::Core)?;
         let (ring, signal) = RingBuf::create(capacity).map_err(Error::Core)?;
         Ok((Self { ring }, signal))

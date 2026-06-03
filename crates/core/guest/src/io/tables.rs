@@ -1,8 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, hash::Hash, marker::PhantomData};
+use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
 use crate::io::{
     error::{Error, Result},
-    pubsub::{self, Codec, TypedPublisher, TypedSubscriber},
+    pubsub::{self, Publisher, Subscriber},
 };
 
 /// A table mutation published over a pub/sub topic.
@@ -53,14 +53,10 @@ enum ApplyOutcome {
 /// attach fails with [`Error::ReaderBehind`]; callers that need indefinite
 /// attachability must retain a large enough topic or restore from an
 /// application snapshot before following the live stream.
-pub struct LiveTable<K, V, C>
-where
-    C: Codec<Item = LiveTableMessage<K, V>>,
-{
-    publisher: TypedPublisher<C>,
-    subscriber: RefCell<TypedSubscriber<C>>,
+pub struct LiveTable<K, V> {
+    publisher: RefCell<Publisher<LiveTableMessage<K, V>>>,
+    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>>>,
     local: RefCell<HashMap<K, LiveTableEntry<V>>>,
-    _phantom: PhantomData<C>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,20 +65,15 @@ struct LiveTableEntry<V> {
     version: u64,
 }
 
-impl<K, V, C> LiveTable<K, V, C>
-where
-    C: Codec<Item = LiveTableMessage<K, V>> + Default,
-{
+impl<K, V> LiveTable<K, V> {
     /// Creates a new live table with its own pub/sub topic.
-    pub fn create() -> Result<Self> {
-        let (publisher, subscriber) = pubsub::create_pair()?;
-        let publisher = TypedPublisher::from_raw(publisher, C::default());
-        let subscriber = TypedSubscriber::from_raw(subscriber, C::default());
+    pub fn create(capacity: u64) -> Result<Self> {
+        let (publisher, subscriber) = pubsub::create_pair(capacity)?;
+
         Ok(Self {
-            publisher,
+            publisher: RefCell::new(publisher),
             subscriber: RefCell::new(subscriber),
             local: RefCell::new(HashMap::new()),
-            _phantom: PhantomData,
         })
     }
 
@@ -96,13 +87,10 @@ where
         K: Eq + Hash,
     {
         let (publisher, subscriber) = pubsub::attach_pair(shared_id, capacity)?;
-        let publisher = TypedPublisher::from_raw(publisher, C::default());
-        let subscriber = TypedSubscriber::from_raw(subscriber, C::default());
         let table = Self {
-            publisher,
+            publisher: RefCell::new(publisher),
             subscriber: RefCell::new(subscriber),
             local: RefCell::new(HashMap::new()),
-            _phantom: PhantomData,
         };
         table.sync()?;
         Ok(table)
@@ -114,14 +102,16 @@ where
         K: Clone + Eq + Hash,
         V: Clone,
     {
-        let mutation_id = self.publisher.allocate_mutation_id()?;
+        let mut publisher = self.publisher.borrow_mut();
+        let mutation_id = publisher.allocate_mutation_id()?;
         let msg = LiveTableMessage {
             mutation_id,
             key,
             value: Some(value),
             expected_version: None,
         };
-        self.publisher.publish(&msg)?;
+        publisher.publish(&msg)?;
+        drop(publisher);
         self.sync_until_own_mutation(mutation_id)?;
         Ok(())
     }
@@ -141,14 +131,16 @@ where
             });
         }
 
-        let mutation_id = self.publisher.allocate_mutation_id()?;
+        let mut publisher = self.publisher.borrow_mut();
+        let mutation_id = publisher.allocate_mutation_id()?;
         let msg = LiveTableMessage {
             mutation_id,
             key,
             value: Some(value),
             expected_version: Some(expected_version),
         };
-        self.publisher.publish(&msg)?;
+        publisher.publish(&msg)?;
+        drop(publisher);
         match self.sync_until_own_mutation(mutation_id)? {
             ApplyOutcome::Applied(version) => Ok(version),
             ApplyOutcome::Conflict { actual } => Err(Error::CasConflict {
@@ -165,14 +157,16 @@ where
         K: Clone + Eq + Hash,
         V: Clone,
     {
-        let mutation_id = self.publisher.allocate_mutation_id()?;
+        let mut publisher = self.publisher.borrow_mut();
+        let mutation_id = publisher.allocate_mutation_id()?;
         let msg = LiveTableMessage {
             mutation_id,
             key,
             value: None,
             expected_version: None,
         };
-        self.publisher.publish(&msg)?;
+        publisher.publish(&msg)?;
+        drop(publisher);
         self.sync_until_own_mutation(mutation_id)?;
         Ok(())
     }
@@ -249,7 +243,7 @@ where
     where
         K: Eq + Hash,
     {
-        let own_writer_id = self.publisher.writer_id();
+        let own_writer_id = self.publisher.borrow().writer_id();
         let mut subscriber = self.subscriber.borrow_mut();
         let mut local = self.local.borrow_mut();
         loop {

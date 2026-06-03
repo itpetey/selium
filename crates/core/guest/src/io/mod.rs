@@ -18,4 +18,4 @@ pub mod pubsub;
 mod region;
 mod ring_buf;
 pub mod rpc;
-pub mod tables;
+// pub mod tables;

@@ -238,7 +238,7 @@ pub struct SharedRegionDescriptor {
     /// Shared region id.
     pub shared_id: SharedResourceId,
     /// Region length in bytes.
-    pub len: u32,
+    pub len: u64,
 }
 
 /// Descriptor for a local mapping of a shared memory region.
@@ -250,7 +250,7 @@ pub struct SharedMappingDescriptor {
     /// Shared region id backing the mapping.
     pub shared_id: SharedResourceId,
     /// Mapping length in bytes.
-    pub len: u32,
+    pub len: u64,
 }
 
 /// Descriptor for a signal handle.
@@ -406,9 +406,9 @@ pub enum HostcallRequest {
     /// Allocate a shared memory region.
     SharedMemoryAllocate {
         /// Requested allocation size in bytes.
-        size: u32,
+        size: u64,
         /// Requested allocation alignment in bytes.
-        alignment: u32,
+        alignment: u64,
     },
     /// Destroy a shared memory region.
     SharedMemoryDestroy {
@@ -420,9 +420,9 @@ pub enum HostcallRequest {
         /// Shared region id to attach.
         shared_id: SharedResourceId,
         /// Offset into the shared region.
-        offset: u32,
+        offset: u64,
         /// Mapping length in bytes.
-        len: u32,
+        len: u64,
     },
     /// Detach a local shared memory mapping.
     SharedMemoryDetach {
@@ -434,16 +434,16 @@ pub enum HostcallRequest {
         /// Local mapping id to read from.
         local_id: LocalResourceId,
         /// Offset into the mapping.
-        offset: u32,
+        offset: u64,
         /// Number of bytes to read.
-        len: u32,
+        len: u64,
     },
     /// Write bytes to a local shared memory mapping.
     SharedMemoryWrite {
         /// Local mapping id to write to.
         local_id: LocalResourceId,
         /// Offset into the mapping.
-        offset: u32,
+        offset: u64,
         /// Bytes to write.
         bytes: Vec<u8>,
     },
@@ -452,7 +452,7 @@ pub enum HostcallRequest {
         /// Local mapping id to update.
         local_id: LocalResourceId,
         /// Offset into the mapping.
-        offset: u32,
+        offset: u64,
         /// Value to add, wrapping on overflow.
         value: u64,
     },
@@ -461,7 +461,7 @@ pub enum HostcallRequest {
         /// Local mapping id to update.
         local_id: LocalResourceId,
         /// Offset into the mapping.
-        offset: u32,
+        offset: u64,
         /// Expected current value.
         current: u64,
         /// Replacement value when `current` matches.

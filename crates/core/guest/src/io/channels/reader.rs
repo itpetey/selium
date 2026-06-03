@@ -245,6 +245,45 @@ impl WeakReader {
         }
     }
 
+    /// Returns whether the current cursor points at a complete readable frame.
+    pub(crate) fn has_ready_frame(&mut self) -> Result<bool> {
+        if self.terminated {
+            return Err(Error::Terminated);
+        }
+
+        loop {
+            let capacity = self.region.capacity();
+            let mask = capacity - 1;
+            let tail = self
+                .region
+                .read_next_tail()
+                .map_err(|_channel_empty| Error::ChannelEmpty)?;
+
+            if self.pos >= tail {
+                return Ok(false);
+            }
+            if self.pos.wrapping_add(capacity) < tail {
+                return Err(Error::ReaderBehind);
+            }
+
+            let header = read_header(&self.region, self.pos, mask)?;
+            let frame_size = header.frame_size();
+            let frame_end = self
+                .pos
+                .checked_add(frame_size)
+                .ok_or(Error::InvalidFrame)?;
+            if frame_size > capacity || frame_end > tail {
+                return Err(Error::InvalidFrame);
+            }
+            if !header.is_ready() {
+                return Ok(false);
+            }
+            if !header.is_aborted() {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Returns the current read position.
     pub fn position(&self) -> u64 {
         self.pos
@@ -288,7 +327,7 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
     if !wrap {
         return region
             .data_slice()
-            .read(raw_pos as u32, len as u32)
+            .read(raw_pos, len)
             .map_err(|_invalid_frame| Error::InvalidFrame);
     }
 
@@ -298,14 +337,14 @@ fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec
     if tail_len > 0 {
         let part = region
             .data_slice()
-            .read(raw_pos as u32, tail_len as u32)
+            .read(raw_pos, tail_len)
             .map_err(|_invalid_frame| Error::InvalidFrame)?;
         buf.extend_from_slice(&part);
     }
     if head_len > 0 {
         let part = region
             .data_slice()
-            .read(region.data_offset() as u32, head_len as u32)
+            .read(region.data_offset(), head_len)
             .map_err(|_invalid_frame| Error::InvalidFrame)?;
         buf.extend_from_slice(&part);
     }
