@@ -42,6 +42,9 @@ pub(crate) enum HostOperationState {
         local_id: u64,
         deadline: Instant,
     },
+    SleepWait {
+        deadline: Instant,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -10,7 +10,7 @@ use std::{
 
 use selium_abi::{HostcallOutput, HostcallRequest};
 
-use crate::{GuestError, Result, hostcall::hostcall_ready};
+use crate::{GuestError, Result, hostcall::{HostcallFuture, hostcall_async, hostcall_ready}};
 
 /// A measurement of the monotonic clock, backed by the Selium host.
 ///
@@ -155,6 +155,126 @@ pub fn now() -> Result<u64> {
     match hostcall_ready(HostcallRequest::TimeNow)? {
         HostcallOutput::U64(nanos) => Ok(nanos),
         _ => Err(GuestError::UnexpectedHostcallOutput),
+    }
+}
+
+/// Async timer that provides deadline-based wakeups via the `Sleep` hostcall.
+///
+/// `Timer` implements [`std::future::Future`] and, when the `quinn` feature is
+/// enabled, `quinn::AsyncTimer`. It is used by the Quinn transport for
+/// timeout management.
+pub struct Timer {
+    deadline: Instant,
+    sleep_future: Option<HostcallFuture>,
+}
+
+impl Timer {
+    /// Creates a new timer that will expire at the given deadline.
+    pub fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            sleep_future: None,
+        }
+    }
+
+    /// Cancels any in-flight sleep operation by dropping the future.
+    pub fn cancel_wait(&mut self) {
+        self.sleep_future = None;
+    }
+}
+
+impl std::fmt::Debug for Timer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Timer")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+impl std::future::Future for Timer {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let now = Instant::now();
+        if now >= self.deadline {
+            self.sleep_future = None;
+            return std::task::Poll::Ready(());
+        }
+
+        if self.sleep_future.is_none() {
+            let remaining = self.deadline - now;
+            let millis = remaining.as_millis() as u64;
+            self.sleep_future = Some(hostcall_async(HostcallRequest::Sleep { millis }));
+        }
+
+        if let Some(ref mut fut) = self.sleep_future {
+            match std::pin::Pin::new(fut).poll(cx) {
+                std::task::Poll::Ready(_) => {
+                    self.sleep_future = None;
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        self.cancel_wait();
+    }
+}
+
+#[cfg(feature = "quinn")]
+impl quinn::RuntimeInstant for Instant {
+    type Duration = Duration;
+
+    fn now() -> Self {
+        Instant::now()
+    }
+
+    fn duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::duration_since(self, earlier)
+    }
+
+    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
+        Instant::checked_duration_since(self, earlier)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::saturating_duration_since(self, earlier)
+    }
+
+    fn elapsed(&self) -> Self::Duration {
+        Instant::elapsed(self)
+    }
+
+    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_add(self, duration)
+    }
+
+    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_sub(self, duration)
+    }
+}
+
+#[cfg(feature = "quinn")]
+impl quinn::AsyncTimer for Timer {
+    type Instant = Instant;
+
+    fn reset(self: std::pin::Pin<&mut Self>, deadline: Instant) {
+        let this = self.get_mut();
+        this.cancel_wait();
+        this.deadline = deadline;
+    }
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        std::future::Future::poll(self, cx)
     }
 }
 

@@ -1,8 +1,5 @@
-# quinn-transport Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change quinn-guest-integration. Update Purpose after archive.
-## Requirements
 ### Requirement: AsyncUdpSocket Implementation
 `selium-guest` SHALL implement `quinn::AsyncUdpSocket` for a Quinn-compatible wrapper around `UdpSocket`, enabling Quinn to drive datagram receive operations over the shared-memory recv channel.
 
@@ -25,17 +22,6 @@ TBD - created by archiving change quinn-guest-integration. Update Purpose after 
 - **WHEN** Quinn calls `poll_send` and the send channel is full
 - **THEN** the implementation SHALL return `Poll::Pending` (full signal-to-atomic migration is deferred to the networking follow-up change)
 
-### Requirement: Runtime Implementation
-`selium-guest` SHALL implement `quinn::Runtime` to bridge Quinn's I/O driver with the guest's cooperative async runtime.
-
-#### Scenario: Quinn spawns the endpoint driver
-- **WHEN** `quinn::Endpoint::new_with_abstract_socket` calls `runtime.spawn(future)`
-- **THEN** the implementation SHALL spawn the future onto the guest's background task runner so it is polled by `poll_reactor()`
-
-#### Scenario: Quinn queries the current time
-- **WHEN** Quinn calls `runtime.now()`
-- **THEN** the implementation SHALL return the hostcall-backed `Instant::now()`
-
 ### Requirement: AsyncTimer Implementation
 `selium-guest` SHALL implement `quinn::AsyncTimer` to provide deadline-based wakeups for Quinn's timeout management using `HostcallRequest::Sleep` instead of the removed `SignalWait` hostcall.
 
@@ -47,17 +33,13 @@ TBD - created by archiving change quinn-guest-integration. Update Purpose after 
 - **WHEN** Quinn polls a timer whose deadline has not yet passed
 - **THEN** `poll` SHALL issue a `Sleep` hostcall for the remaining duration and return `Poll::Pending`
 
-### Requirement: Quinn-Compatible Socket Conversion
-`UdpSocket` SHALL provide a method to convert itself into the Quinn-compatible wrapper type, transferring ownership of the channel handles.
+### Requirement: Runtime Implementation
+`selium-guest` SHALL implement `quinn::Runtime` to bridge Quinn's I/O driver with the guest's cooperative async runtime.
 
-#### Scenario: Guest converts UdpSocket for Quinn use
-- **WHEN** guest code calls `udp_socket.into_quinn_socket()` with the `quinn` feature enabled
-- **THEN** the method SHALL return a `QuinnUdpSocket` (or equivalent) that implements `quinn::AsyncUdpSocket` and shares the underlying channel state via `Arc`
+#### Scenario: Quinn spawns the endpoint driver
+- **WHEN** `quinn::Endpoint::new_with_abstract_socket` calls `runtime.spawn(future)`
+- **THEN** the implementation SHALL spawn the future onto the guest's background task runner so it is polled by `poll_reactor()`
 
-### Requirement: Endpoint Construction
-The Quinn integration types SHALL be usable with `quinn::Endpoint::new_with_abstract_socket` to create a functional QUIC endpoint.
-
-#### Scenario: Guest constructs a QUIC client endpoint
-- **WHEN** guest code constructs a `quinn::Endpoint` using `new_with_abstract_socket` with the Quinn wrapper and runtime
-- **THEN** the endpoint SHALL be able to initiate QUIC connections and exchange data
-
+#### Scenario: Quinn queries the current time
+- **WHEN** Quinn calls `runtime.now()`
+- **THEN** the implementation SHALL return the hostcall-backed `Instant::now()`

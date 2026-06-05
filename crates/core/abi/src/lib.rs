@@ -615,6 +615,11 @@ pub enum HostcallRequest {
     TimeNow,
     /// Get the current monotonic time as nanoseconds since an arbitrary epoch.
     TimeMonotonic,
+    /// Sleep for the specified number of milliseconds.
+    Sleep {
+        /// Duration to sleep in milliseconds.
+        millis: u64,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.

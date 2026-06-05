@@ -48,6 +48,7 @@ impl Runtime {
             HostOperationState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
             HostOperationState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
             HostOperationState::HostQueueRecvWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
+            HostOperationState::SleepWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
         };
         let mut operations = self.operations.lock();
         let operation_id = self.next_operation_id(&operations);
@@ -103,6 +104,14 @@ impl Runtime {
                     }
                     Ok(None) => CompletionState::Pending { operation_id },
                     Err(error) => CompletionState::Failed(kernel_error(error)),
+                }
+            }
+            HostOperationState::SleepWait { deadline } => {
+                if Instant::now() >= deadline {
+                    operation.state = HostOperationState::Ready(HostcallOutput::Empty);
+                    CompletionState::Ready(HostcallOutput::Empty)
+                } else {
+                    CompletionState::Pending { operation_id }
                 }
             }
         }
@@ -732,6 +741,10 @@ impl Runtime {
                 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
                 let nanos = EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64;
                 Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
+            }
+            HostcallRequest::Sleep { millis } => {
+                let deadline = Instant::now() + Duration::from_millis(millis);
+                Ok(HostOperationState::SleepWait { deadline })
             }
         }
     }

@@ -12,6 +12,7 @@ use selium_abi::{HostcallOutput, HostcallRequest};
 use crate::{GuestError, Result, hostcall::hostcall_async};
 
 /// A UDP socket backed by shared-memory ring buffers (stub).
+#[derive(Clone)]
 pub struct UdpSocket {
     pub(super) local_addr: SocketAddr,
 }

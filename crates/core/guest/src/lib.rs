@@ -16,7 +16,7 @@ pub use crate::{
     process::{ActivityLog, GuestLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     storage::{BlobStore, DurableLog},
-    time::{Instant, now},
+    time::{Instant, Timer, now},
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
