@@ -1,20 +1,13 @@
-use self::error::Result;
-use crate::{
-    Signal,
-    io::{
-        self,
-        region::SIGNAL_SHARED_ID_OFFSET,
-        ring_buf::{RingBuf, round_capacity},
-    },
+use crate::io::{
+    error::{Error, Result},
+    ring_buf::{RingBuf, round_capacity},
 };
 
 pub use self::{
-    error::Error,
     reader::{Reader, StrongReader, WeakReader},
     writer::{StrongWriter, WeakWriter, Writer},
 };
 
-mod error;
 pub mod reader;
 pub mod writer;
 
@@ -23,30 +16,25 @@ pub mod writer;
 /// The channel stores framed messages in a lock-free ring buffer. Strong readers
 /// prevent buffer overwrite until they have consumed data; weak readers may lose
 /// data if they fall behind.
+///
+/// Notification uses the generation counter in the shared region with native
+/// atomic wait/notify instead of signals.
 pub struct Channel {
     ring: RingBuf,
 }
 
 impl Channel {
     /// Creates a new channel with the given ring buffer data capacity.
-    ///
-    /// Returns the channel and its notification signal.
-    pub fn create(capacity: u64) -> Result<(Self, Signal)> {
-        let capacity = round_capacity(capacity).map_err(Error::Core)?;
-        let (ring, signal) = RingBuf::create(capacity).map_err(Error::Core)?;
-        Ok((Self { ring }, signal))
+    pub fn create(capacity: u64) -> Result<Self> {
+        let capacity = round_capacity(capacity)?;
+        let ring = RingBuf::create(capacity)?;
+        Ok(Self { ring })
     }
 
     /// Attaches to an existing channel by shared region id.
-    pub fn attach(shared_id: u64, capacity: u64) -> Result<Self> {
-        let mut ring = RingBuf::attach(shared_id, capacity).map_err(Error::Core)?;
-        let signal_shared_id = ring
-            .region()
-            .read_header_u64(SIGNAL_SHARED_ID_OFFSET)
-            .map_err(Error::Core)?;
-        let signal = Signal::attach(signal_shared_id)
-            .map_err(|e| Error::Core(io::Error::Guest(e.to_string())))?;
-        ring.set_signal(signal);
+    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
+        let capacity = round_capacity(capacity)?;
+        let ring = RingBuf::attach(region_id, capacity)?;
         Ok(Self { ring })
     }
 
@@ -57,57 +45,30 @@ impl Channel {
 
     /// Creates a strong writer tracked in the channel metadata.
     pub fn strong_writer(&self) -> Result<StrongWriter> {
-        self.ring
-            .region()
-            .increment_writer_count()
-            .map_err(Error::Core)?;
-        let writer_id = match self.ring.region().allocate_writer_id().map_err(Error::Core) {
+        self.ring.region().increment_writer_count()?;
+        let writer_id = match self.ring.region().allocate_writer_id() {
             Ok(writer_id) => writer_id,
             Err(error) => {
-                if let Err(_rollback_error) = self.ring.region().decrement_writer_count() {}
+                let _ = self.ring.region().decrement_writer_count();
                 return Err(error);
             }
         };
-        let signal = match self.ring.signal().map(attach_signal).transpose() {
-            Ok(signal) => signal,
-            Err(error) => {
-                if let Err(_rollback_error) = self.ring.region().decrement_writer_count() {}
-                return Err(error);
-            }
-        };
-        Ok(StrongWriter::new(
-            self.ring.region().clone(),
-            writer_id,
-            signal,
-        ))
+        Ok(StrongWriter::new(self.ring.region().clone(), writer_id))
     }
 
     /// Creates a weak writer that acquires positions on demand.
     pub fn weak_writer(&self) -> Result<WeakWriter> {
-        let writer_id = self
-            .ring
-            .region()
-            .allocate_writer_id()
-            .map_err(Error::Core)?;
-        Ok(WeakWriter::new(
-            self.ring.region().clone(),
-            writer_id,
-            self.ring.signal().map(attach_signal).transpose()?,
-        ))
+        let writer_id = self.ring.region().allocate_writer_id()?;
+        Ok(WeakWriter::new(self.ring.region().clone(), writer_id))
     }
 
     /// Creates a strong reader that prevents buffer overwrite.
     pub fn strong_reader(&self) -> Result<StrongReader> {
-        let tail = self.ring.read_next_tail().map_err(Error::Core)?;
-        let start_pos = tail;
-        let reader_id = self
-            .ring
-            .region()
-            .allocate_reader_slot(start_pos)
-            .map_err(Error::Core)?;
+        let tail = self.ring.read_next_tail()?;
+        let reader_id = self.ring.region().allocate_reader_slot(tail)?;
         Ok(StrongReader::new(
             self.ring.region().clone(),
-            start_pos,
+            tail,
             reader_id,
         ))
     }
@@ -123,12 +84,8 @@ impl Channel {
         &self.ring
     }
 
-    /// Returns the channel notification signal when this handle has one attached.
-    pub fn signal(&self) -> Option<&Signal> {
-        self.ring.signal()
+    /// Returns the shared region id.
+    pub fn region_id(&self) -> u64 {
+        self.ring.region_id()
     }
-}
-
-fn attach_signal(signal: &Signal) -> Result<Signal> {
-    Signal::attach(signal.shared_id()).map_err(|e| Error::Core(io::Error::Guest(e.to_string())))
 }

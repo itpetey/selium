@@ -299,6 +299,52 @@ impl Runtime for SeliumQuinnRuntime {
     }
 }
 
+impl RuntimeInstant for Instant {
+    type Duration = std::time::Duration;
+
+    fn now() -> Self {
+        Instant::now()
+    }
+
+    fn duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::duration_since(self, earlier)
+    }
+
+    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
+        Instant::checked_duration_since(self, earlier)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::saturating_duration_since(self, earlier)
+    }
+
+    fn elapsed(&self) -> Self::Duration {
+        Instant::elapsed(self)
+    }
+
+    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_add(self, duration)
+    }
+
+    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_sub(self, duration)
+    }
+}
+
+impl quinn::AsyncTimer for Timer {
+    type Instant = Instant;
+
+    fn reset(self: Pin<&mut Self>, deadline: Instant) {
+        let this = self.get_mut();
+        this.cancel_wait();
+        this.deadline = deadline;
+    }
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        futures::Future::poll(self, cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

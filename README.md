@@ -27,14 +27,6 @@ You get the ergonomics of an application platform, with the safety properties of
 
 ---
 
-## What happened to the messaging platform?
-
-**The previous project can be found in the _legacy_ branch.**
-
-A messaging platform was never our end-goal. We have taken all of our learning from building that platform and applied it to the network stack for Selium 1.0.
-
----
-
 ## Getting started
 
 The fastest way to orient yourself is by [checking out an example](examples/).

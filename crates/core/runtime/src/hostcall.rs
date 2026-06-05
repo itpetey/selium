@@ -8,12 +8,21 @@ use selium_abi::{
     HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass, ResourceIdentity,
     ResourceSelector, TaskId,
 };
+use wasmtiny::RegionProt as WasmProt;
 
 use crate::{
     ReadinessCondition, SystemGuestDescriptor,
     error::kernel_error,
     state::{HostOperation, HostOperationState, Runtime},
 };
+
+/// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.
+fn to_wasm_prot(prot: selium_abi::RegionProt) -> WasmProt {
+    match prot {
+        selium_abi::RegionProt::ReadOnly => WasmProt::ReadOnly,
+        selium_abi::RegionProt::ReadWrite => WasmProt::ReadWrite,
+    }
+}
 
 impl Runtime {
     /// Begins a hostcall for a process and returns its initial status and operation id.
@@ -31,21 +40,6 @@ impl Runtime {
         request: HostcallRequest,
         task_id: Option<TaskId>,
     ) -> (u32, OperationId) {
-        if let HostcallRequest::SignalWait {
-            local_id,
-            observed_generation,
-            timeout_ms,
-        } = request
-        {
-            return self.begin_signal_wait_hostcall(
-                process_id,
-                task_id,
-                local_id,
-                observed_generation,
-                timeout_ms,
-            );
-        }
-
         let state = match self.dispatch_hostcall(process_id, request) {
             Ok(state) => state,
             Err(error) => HostOperationState::Failed(error),
@@ -53,8 +47,7 @@ impl Runtime {
         let status = match state {
             HostOperationState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
             HostOperationState::Failed(_) => selium_abi::HOSTCALL_STATUS_FAILED,
-            HostOperationState::SignalWait { .. }
-            | HostOperationState::HostQueueRecvWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
+            HostOperationState::HostQueueRecvWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
         };
         let mut operations = self.operations.lock();
         let operation_id = self.next_operation_id(&operations);
@@ -67,78 +60,6 @@ impl Runtime {
             },
         );
         (status, operation_id)
-    }
-
-    fn begin_signal_wait_hostcall(
-        &self,
-        process_id: ProcessId,
-        task_id: Option<TaskId>,
-        local_id: u64,
-        observed_generation: u64,
-        timeout_ms: u64,
-    ) -> (u32, OperationId) {
-        let state =
-            match self.prepare_signal_wait(local_id, observed_generation, timeout_ms, process_id) {
-                Ok(state) => state,
-                Err(error) => HostOperationState::Failed(error),
-            };
-        let mut operations = self.operations.lock();
-        let operation_id = self.next_operation_id(&operations);
-        operations.insert(
-            operation_id,
-            HostOperation {
-                process_id,
-                task_id,
-                state: state.clone(),
-            },
-        );
-        drop(operations);
-
-        match state {
-            HostOperationState::SignalWait {
-                local_id,
-                observed_generation,
-                deadline,
-                ..
-            } => match self.kernel.signal_generation(local_id) {
-                Ok(generation) if generation > observed_generation => {
-                    self.complete_hostcall_operation(
-                        operation_id,
-                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation)),
-                    );
-                    (selium_abi::HOSTCALL_STATUS_READY, operation_id)
-                }
-                Ok(_) if Instant::now() >= deadline => {
-                    self.complete_hostcall_operation(
-                        operation_id,
-                        HostOperationState::Failed(AbiError::new(
-                            AbiErrorCode::Timeout,
-                            "signal wait timed out",
-                        )),
-                    );
-                    (selium_abi::HOSTCALL_STATUS_FAILED, operation_id)
-                }
-                Ok(_) => (selium_abi::HOSTCALL_STATUS_PENDING, operation_id),
-                Err(error) => {
-                    self.complete_hostcall_operation(
-                        operation_id,
-                        HostOperationState::Failed(kernel_error(error)),
-                    );
-                    (selium_abi::HOSTCALL_STATUS_FAILED, operation_id)
-                }
-            },
-            HostOperationState::Ready(_) => (selium_abi::HOSTCALL_STATUS_READY, operation_id),
-            HostOperationState::Failed(_) => (selium_abi::HOSTCALL_STATUS_FAILED, operation_id),
-            HostOperationState::HostQueueRecvWait { .. } => {
-                (selium_abi::HOSTCALL_STATUS_PENDING, operation_id)
-            }
-        }
-    }
-
-    fn complete_hostcall_operation(&self, operation_id: OperationId, state: HostOperationState) {
-        if let Some(operation) = self.operations.lock().get_mut(&operation_id) {
-            operation.state = state;
-        }
     }
 
     /// Polls a hostcall operation for completion.
@@ -164,25 +85,6 @@ impl Runtime {
         match operation.state.clone() {
             HostOperationState::Ready(output) => CompletionState::Ready(output.clone()),
             HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
-            HostOperationState::SignalWait {
-                local_id,
-                shared_id: _,
-                observed_generation,
-                deadline,
-            } => match self.kernel.signal_generation(local_id) {
-                Ok(generation) if generation > observed_generation => {
-                    operation.state =
-                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation));
-                    CompletionState::Ready(HostcallOutput::SignalGeneration(generation))
-                }
-                Ok(_) if Instant::now() >= deadline => {
-                    let error = AbiError::new(AbiErrorCode::Timeout, "signal wait timed out");
-                    operation.state = HostOperationState::Failed(error.clone());
-                    CompletionState::Failed(error)
-                }
-                Ok(_) => CompletionState::Pending { operation_id },
-                Err(error) => CompletionState::Failed(kernel_error(error)),
-            },
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
                 match self.kernel.try_host_queue_recv(local_id) {
                     Ok(Some((client_process_id, value))) => {
@@ -233,292 +135,122 @@ impl Runtime {
         }
 
         match request {
-            HostcallRequest::SharedMemoryAllocate { size, alignment } => {
+            HostcallRequest::AllocRegion { pages, prot } => {
                 self.require(
                     process_id,
                     Capability::SharedMemory,
                     ResourceClass::SharedRegion,
                     None,
                 )?;
-                let descriptor = self
+                let size_bytes = (pages as u64) * 65536; // WASM page size
+                let size_u32 = u32::try_from(size_bytes).map_err(|_| {
+                    AbiError::new(AbiErrorCode::MalformedPayload, "region size exceeds u32")
+                })?;
+
+                // Allocate region in the shared registry (standalone, no guest mapping yet).
+                let (shared_id, _len) = self
                     .kernel
-                    .allocate_shared_region(size, alignment)
+                    .allocate_shared_region(size_u32)
                     .map_err(kernel_error)?;
-                self.claim_shared_resource(
-                    process_id,
-                    ResourceClass::SharedRegion,
-                    descriptor.shared_id,
-                );
-                Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
-                    descriptor,
+
+                // Note: we do NOT auto-attach here. The allocating process must
+                // call `AttachRegion` to map the region into its linear memory.
+                // This avoids double-attachment when the caller also calls
+                // AttachRegion with different protection/reader-slot parameters.
+                let page_offset = 0;
+
+                self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
+                Ok(HostOperationState::Ready(HostcallOutput::RegionAlloc(
+                    selium_abi::RegionAllocation {
+                        region_id: shared_id,
+                        page_offset,
+                    },
                 )))
             }
-            HostcallRequest::SharedMemoryDestroy { shared_id } => {
+            HostcallRequest::FreeRegion { region_id } => {
                 self.ensure_shared_resource_owner(
                     process_id,
                     Capability::SharedMemory,
                     ResourceClass::SharedRegion,
-                    shared_id,
+                    region_id,
                 )?;
-                if self.kernel.shared_region_mapping_count(shared_id) > 0 {
-                    return Err(AbiError::new(
-                        AbiErrorCode::DetachedResource,
-                        "shared region still has attached mappings",
-                    ));
+
+                // Detach the region from ALL loaded guests' wasm memory.
+                let wasm_region_id = self
+                    .kernel
+                    .wasmtiny_region_id(region_id)
+                    .map_err(kernel_error)?;
+                let mut guests = self.loaded_guests.lock();
+                let to_detach: Vec<ProcessId> = guests.keys().copied().collect();
+                for pid in to_detach {
+                    if let Some(guest) = guests.get_mut(&pid) {
+                        let _ = guest
+                            .app
+                            .detach_shared_region(guest.module_index, wasm_region_id);
+                    }
                 }
+                drop(guests);
+
+                // Detach all kernel-level mappings for this region before destroying.
+                self.kernel.detach_all_shared_mappings(region_id);
+
                 self.kernel
-                    .destroy_shared_region(shared_id)
+                    .destroy_shared_region(region_id)
                     .map_err(kernel_error)?;
-                self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
+                self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
-            HostcallRequest::SharedMemoryAttach {
-                shared_id,
-                offset,
-                len,
+            HostcallRequest::AttachRegion {
+                region_id,
+                reader_slot,
+                prot,
             } => {
                 self.require(
                     process_id,
                     Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
+                    ResourceClass::SharedRegion,
+                    Some(ResourceIdentity::Shared(region_id)),
                 )?;
-                let descriptor = self
+
+                // Look up the wasmtiny region id backing this selium region.
+                let wasm_region_id = self
                     .kernel
-                    .attach_shared_region(shared_id, offset, len)
+                    .wasmtiny_region_id(region_id)
                     .map_err(kernel_error)?;
-                self.claim_local_handle(
-                    process_id,
-                    ResourceClass::SharedMapping,
-                    descriptor.local_id,
-                );
-                Ok(HostOperationState::Ready(HostcallOutput::SharedMapping(
-                    descriptor,
+
+                // Map into the attaching guest's memory with requested protection.
+                let mut guests = self.loaded_guests.lock();
+                let guest = guests.get_mut(&process_id).ok_or_else(|| {
+                    AbiError::new(
+                        AbiErrorCode::InvalidHandle,
+                        "process not found for AttachRegion",
+                    )
+                })?;
+                let page_offset = guest
+                    .app
+                    .attach_shared_region(
+                        guest.module_index,
+                        wasm_region_id,
+                        to_wasm_prot(prot),
+                        reader_slot,
+                    )
+                    .map_err(|e| {
+                        AbiError::new(
+                            AbiErrorCode::Internal,
+                            format!("attach shared region failed: {e}"),
+                        )
+                    })?;
+                drop(guests);
+
+                let local_id = self
+                    .kernel
+                    .attach_shared_region_with_prot(region_id, prot, reader_slot)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::SharedMapping, local_id);
+                Ok(HostOperationState::Ready(HostcallOutput::RegionAttach(
+                    selium_abi::RegionAttachment { page_offset },
                 )))
             }
-            HostcallRequest::SharedMemoryDetach { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .shared_mapping_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                self.kernel
-                    .detach_shared_region(local_id)
-                    .map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::SharedMapping, local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::SharedMemoryRead {
-                local_id,
-                offset,
-                len,
-            } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .shared_mapping_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let bytes = self
-                    .kernel
-                    .read_shared_memory(local_id, offset, len as usize)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes)))
-            }
-            HostcallRequest::SharedMemoryWrite {
-                local_id,
-                offset,
-                bytes,
-            } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .shared_mapping_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                self.kernel
-                    .write_shared_memory(local_id, offset, &bytes)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::SharedMemoryFetchAddU64 {
-                local_id,
-                offset,
-                value,
-            } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .shared_mapping_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let previous = self
-                    .kernel
-                    .fetch_add_shared_memory_u64(local_id, offset, value)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::U64(previous)))
-            }
-            HostcallRequest::SharedMemoryCompareExchangeU64 {
-                local_id,
-                offset,
-                current,
-                new,
-            } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .shared_mapping_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::SharedMemory,
-                    ResourceClass::SharedMapping,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let previous = self
-                    .kernel
-                    .compare_exchange_shared_memory_u64(local_id, offset, current, new)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::U64(previous)))
-            }
-            HostcallRequest::SignalCreate => {
-                self.require(process_id, Capability::Signal, ResourceClass::Signal, None)?;
-                let descriptor = self.kernel.create_signal();
-                self.claim_signal(process_id, descriptor);
-                Ok(HostOperationState::Ready(HostcallOutput::Signal(
-                    descriptor,
-                )))
-            }
-            HostcallRequest::SignalAttach { shared_id } => {
-                self.require(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let descriptor = self.kernel.attach_signal(shared_id).map_err(kernel_error)?;
-                self.claim_local_handle(process_id, ResourceClass::Signal, descriptor.local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Signal(
-                    descriptor,
-                )))
-            }
-            HostcallRequest::SignalClose { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .signal_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.kernel.close_signal(local_id).map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::Signal, local_id);
-                if self.kernel.signal_handle_count(shared_id) == 0 {
-                    self.release_shared_resource(process_id, &ResourceClass::Signal, shared_id);
-                }
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::SignalNotify { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .signal_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let generation = self.kernel.notify_signal(local_id).map_err(kernel_error)?;
-                self.wake_signal_waiters(shared_id, generation);
-                Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
-                    generation,
-                )))
-            }
-            HostcallRequest::SignalGeneration { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    local_id,
-                )?;
-                let shared_id = self
-                    .kernel
-                    .signal_shared_id(local_id)
-                    .map_err(kernel_error)?;
-                self.require(
-                    process_id,
-                    Capability::Signal,
-                    ResourceClass::Signal,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let generation = self
-                    .kernel
-                    .signal_generation(local_id)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
-                    generation,
-                )))
-            }
-            HostcallRequest::SignalWait {
-                local_id,
-                observed_generation,
-                timeout_ms,
-            } => self.prepare_signal_wait(local_id, observed_generation, timeout_ms, process_id),
             HostcallRequest::TcpBind { address } => {
                 self.require(
                     process_id,
@@ -1004,33 +736,6 @@ impl Runtime {
         }
     }
 
-    fn wake_signal_waiters(&self, shared_id: u64, generation: u64) {
-        let mut wakeups = Vec::new();
-        {
-            let mut operations = self.operations.lock();
-            for operation in operations.values_mut() {
-                let should_wake = matches!(
-                    &operation.state,
-                    HostOperationState::SignalWait {
-                        shared_id: wait_shared_id,
-                        observed_generation,
-                        ..
-                    } if *wait_shared_id == shared_id && generation > *observed_generation
-                );
-                if should_wake {
-                    operation.state =
-                        HostOperationState::Ready(HostcallOutput::SignalGeneration(generation));
-                    if let Some(task_id) = operation.task_id {
-                        wakeups.push((operation.process_id, task_id));
-                    }
-                }
-            }
-        }
-        for (process_id, task_id) in wakeups {
-            self.wake_process_task(process_id, task_id);
-        }
-    }
-
     fn wake_host_queue_waiters(&self, shared_id: u64) {
         let mut wakeups = Vec::new();
         {
@@ -1065,47 +770,6 @@ impl Runtime {
         }
         for (process_id, task_id) in wakeups {
             self.wake_process_task(process_id, task_id);
-        }
-    }
-
-    fn prepare_signal_wait(
-        &self,
-        local_id: u64,
-        observed_generation: u64,
-        timeout_ms: u64,
-        process_id: ProcessId,
-    ) -> Result<HostOperationState, AbiError> {
-        self.ensure_local_handle_owner(
-            process_id,
-            Capability::Signal,
-            ResourceClass::Signal,
-            local_id,
-        )?;
-        let shared_id = self
-            .kernel
-            .signal_shared_id(local_id)
-            .map_err(kernel_error)?;
-        self.require(
-            process_id,
-            Capability::Signal,
-            ResourceClass::Signal,
-            Some(ResourceIdentity::Shared(shared_id)),
-        )?;
-        let generation = self
-            .kernel
-            .signal_generation(local_id)
-            .map_err(kernel_error)?;
-        if generation > observed_generation {
-            Ok(HostOperationState::Ready(HostcallOutput::SignalGeneration(
-                generation,
-            )))
-        } else {
-            Ok(HostOperationState::SignalWait {
-                local_id,
-                shared_id,
-                observed_generation,
-                deadline: Instant::now() + Duration::from_millis(timeout_ms),
-            })
         }
     }
 
@@ -1273,20 +937,6 @@ mod tests {
             .expect("compile wat")
     }
 
-    fn module_with_mailbox(entrypoint: &str) -> Vec<u8> {
-        wat::parse_str(format!(
-            "(module
-                (import \"selium\" \"mailbox_register\" (func $mailbox_register (param i32 i32)))
-                (memory (export \"memory\") 1)
-                (func (export \"{entrypoint}\")
-                    i32.const 0
-                    i32.const {}
-                    call $mailbox_register))",
-            selium_abi::mailbox::BYTE_LEN,
-        ))
-        .expect("compile mailbox wat")
-    }
-
     fn spawn_with_grants(
         runtime: &Runtime,
         grants: Vec<CapabilityGrant>,
@@ -1317,81 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn hostcall_signal_vertical_slice_uses_operation_table() {
-        let runtime = Runtime::default();
-        let bootstrapped = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "signals".to_string(),
-                module_id: "signals-module".to_string(),
-                module_bytes: module_with_entrypoint("boot", ""),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::Signal,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn signals guest");
-
-        let (status, create_id) =
-            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
-        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-        let CompletionState::Ready(HostcallOutput::Signal(signal)) =
-            runtime.poll_hostcall(bootstrapped.process_id, create_id)
-        else {
-            panic!("expected created signal");
-        };
-        let (_, attach_id) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SignalAttach {
-                shared_id: signal.shared_id,
-            },
-        );
-        let CompletionState::Ready(HostcallOutput::Signal(attached)) =
-            runtime.poll_hostcall(bootstrapped.process_id, attach_id)
-        else {
-            panic!("expected attached signal");
-        };
-
-        let (status, wait_id) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SignalWait {
-                local_id: signal.local_id,
-                observed_generation: 0,
-                timeout_ms: 1_000,
-            },
-        );
-        assert_eq!(status, selium_abi::HOSTCALL_STATUS_PENDING);
-        assert!(matches!(
-            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
-            CompletionState::Pending { .. }
-        ));
-
-        runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SignalNotify {
-                local_id: signal.local_id,
-            },
-        );
-        assert_eq!(
-            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
-            CompletionState::Ready(HostcallOutput::SignalGeneration(1))
-        );
-        let (_, close_id) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SignalClose {
-                local_id: attached.local_id,
-            },
-        );
-        assert_eq!(
-            runtime.poll_hostcall(bootstrapped.process_id, close_id),
-            CompletionState::Ready(HostcallOutput::Empty)
-        );
-    }
-
-    #[test]
     fn operation_ids_roll_over_without_saturating() {
         let runtime = Runtime::default();
         let bootstrapped = runtime
@@ -1402,8 +977,8 @@ mod tests {
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(
-                    Capability::Signal,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
@@ -1411,183 +986,25 @@ mod tests {
             .expect("spawn rollover guest");
         *runtime.next_operation_id.lock() = OperationId::MAX;
 
-        let (first_status, first_id) =
-            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
-        let (second_status, second_id) =
-            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
+        let (first_status, first_id) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
+        let (second_status, second_id) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
 
         assert_eq!(first_status, selium_abi::HOSTCALL_STATUS_READY);
         assert_eq!(second_status, selium_abi::HOSTCALL_STATUS_READY);
         assert_eq!(first_id, OperationId::MAX);
         assert_eq!(second_id, 1);
-    }
-
-    #[test]
-    fn signal_notify_wakes_registered_mailbox_task() {
-        let runtime = Runtime::default();
-        let bootstrapped = runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: "mailbox".to_string(),
-                module_id: "mailbox-module".to_string(),
-                module_bytes: module_with_mailbox("boot"),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::Signal,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            })
-            .expect("spawn mailbox guest");
-        let (status, create_id) =
-            runtime.begin_hostcall(bootstrapped.process_id, HostcallRequest::SignalCreate);
-        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-        let CompletionState::Ready(HostcallOutput::Signal(signal)) =
-            runtime.poll_hostcall(bootstrapped.process_id, create_id)
-        else {
-            panic!("expected created signal");
-        };
-        let task_id = 77;
-        let (status, wait_id) = runtime.begin_hostcall_with_task(
-            bootstrapped.process_id,
-            HostcallRequest::SignalWait {
-                local_id: signal.local_id,
-                observed_generation: 0,
-                timeout_ms: 1_000,
-            },
-            Some(task_id),
-        );
-        assert_eq!(status, selium_abi::HOSTCALL_STATUS_PENDING);
-
-        let (notify_status, _) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SignalNotify {
-                local_id: signal.local_id,
-            },
-        );
-        assert_eq!(notify_status, selium_abi::HOSTCALL_STATUS_READY);
-
-        let mailbox = runtime
-            .mailboxes
-            .lock()
-            .get(&bootstrapped.process_id)
-            .cloned()
-            .expect("registered mailbox");
-        let memory = mailbox.memory.lock().expect("mailbox memory");
-        assert_eq!(
-            memory
-                .read_u32(selium_abi::mailbox::FLAG_OFFSET as u32)
-                .expect("read flag"),
-            1
-        );
-        assert_eq!(
-            memory
-                .read_u32(selium_abi::mailbox::TAIL_OFFSET as u32)
-                .expect("read tail"),
-            1
-        );
-        assert_eq!(
-            memory
-                .read_u32(selium_abi::mailbox::RING_OFFSET as u32)
-                .expect("read ring"),
-            task_id
-        );
-        assert_eq!(
-            runtime.poll_hostcall(bootstrapped.process_id, wait_id),
-            CompletionState::Ready(HostcallOutput::SignalGeneration(1))
-        );
-    }
-
-    #[test]
-    fn shared_memory_hostcalls_cover_region_lifecycle() {
-        let runtime = Runtime::default();
-        let bootstrapped = spawn_with_grants(
-            &runtime,
-            vec![
-                CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-                ),
-                CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(
-                        ResourceClass::SharedMapping,
-                    )],
-                ),
-            ],
-        );
-
-        let (_, region_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryAllocate {
-                size: 64,
-                alignment: 8,
-            },
-        );
-        let HostcallOutput::SharedRegion(region) =
-            ready(&runtime, bootstrapped.process_id, region_op)
-        else {
-            panic!("expected shared region");
-        };
-        let (_, mapping_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryAttach {
-                shared_id: region.shared_id,
-                offset: 0,
-                len: region.len,
-            },
-        );
-        let HostcallOutput::SharedMapping(mapping) =
-            ready(&runtime, bootstrapped.process_id, mapping_op)
-        else {
-            panic!("expected shared mapping");
-        };
-
-        let (_, write_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryWrite {
-                local_id: mapping.local_id,
-                offset: 0,
-                bytes: b"hostcalls".to_vec(),
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, write_op),
-            HostcallOutput::Empty
-        );
-        let (_, read_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryRead {
-                local_id: mapping.local_id,
-                offset: 0,
-                len: 9,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, read_op),
-            HostcallOutput::Bytes(b"hostcalls".to_vec())
-        );
-        let (_, detach_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryDetach {
-                local_id: mapping.local_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, detach_op),
-            HostcallOutput::Empty
-        );
-        let (_, destroy_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::SharedMemoryDestroy {
-                shared_id: region.shared_id,
-            },
-        );
-        assert_eq!(
-            ready(&runtime, bootstrapped.process_id, destroy_op),
-            HostcallOutput::Empty
-        );
     }
 
     #[test]

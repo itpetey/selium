@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::io::{Error, channels};
+use selium_guest::io::Error;
 
 /// Error type for RPC operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,20 +56,8 @@ impl From<Error> for RpcError {
         match error {
             Error::BufferFull => Self::BufferFull,
             Error::BufferEmpty => Self::BufferEmpty,
-            Error::InvalidLayout => Self::InvalidRegion,
-            Error::Guest(msg) => Self::Serialization(msg),
-            other => Self::Serialization(other.to_string()),
-        }
-    }
-}
-
-impl From<channels::Error> for RpcError {
-    fn from(error: channels::Error) -> Self {
-        match error {
-            channels::Error::ChannelFull => Self::BufferFull,
-            channels::Error::ChannelEmpty => Self::BufferEmpty,
-            channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
-            channels::Error::Core(e) => e.into(),
+            Error::InvalidLayout | Error::InvalidRegion => Self::InvalidRegion,
+            Error::Guest(msg) | Error::SerializationFailed(msg) => Self::Serialization(msg),
             other => Self::Serialization(other.to_string()),
         }
     }
@@ -95,20 +83,8 @@ impl From<Error> for AcceptError {
         match error {
             Error::BufferFull => Self::BufferFull,
             Error::BufferEmpty => Self::BufferEmpty,
-            Error::InvalidLayout => Self::InvalidRegion,
-            Error::Guest(msg) => Self::Serialization(msg),
-            other => Self::Serialization(other.to_string()),
-        }
-    }
-}
-
-impl From<channels::Error> for AcceptError {
-    fn from(error: channels::Error) -> Self {
-        match error {
-            channels::Error::ChannelFull => Self::BufferFull,
-            channels::Error::ChannelEmpty => Self::BufferEmpty,
-            channels::Error::InvalidFrame => Self::Serialization("invalid frame".to_string()),
-            channels::Error::Core(e) => e.into(),
+            Error::InvalidLayout | Error::InvalidRegion => Self::InvalidRegion,
+            Error::Guest(msg) | Error::SerializationFailed(msg) => Self::Serialization(msg),
             other => Self::Serialization(other.to_string()),
         }
     }

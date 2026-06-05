@@ -161,9 +161,6 @@ impl Runtime {
                 ResourceClass::SharedMapping => {
                     drop(self.kernel.detach_shared_region(local_id));
                 }
-                ResourceClass::Signal => {
-                    drop(self.kernel.close_signal(local_id));
-                }
                 ResourceClass::TcpListener => {
                     drop(self.kernel.close_tcp_listener(local_id));
                 }
@@ -183,16 +180,29 @@ impl Runtime {
                 _ => {}
             }
         }
-        Ok(())
-    }
 
-    pub(crate) fn claim_signal(
-        &self,
-        process_id: ProcessId,
-        descriptor: selium_abi::SignalDescriptor,
-    ) {
-        self.claim_shared_resource(process_id, ResourceClass::Signal, descriptor.shared_id);
-        self.claim_local_handle(process_id, ResourceClass::Signal, descriptor.local_id);
+        // Auto-free shared regions owned by the terminated process.
+        let owned_regions = self
+            .shared_resource_owners
+            .lock()
+            .iter()
+            .filter_map(|((resource_class, shared_id), owners)| {
+                if resource_class == &ResourceClass::SharedRegion && owners.contains(&process_id) {
+                    Some(*shared_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for shared_id in owned_regions {
+            self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
+            if self.kernel.shared_region_mapping_count(shared_id) == 0 {
+                let _ = self.kernel.destroy_shared_region(shared_id);
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn claim_local_handle(

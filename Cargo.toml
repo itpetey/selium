@@ -6,6 +6,8 @@ members = [
   "crates/core/guest/macros",
   "crates/core/kernel",
   "crates/core/runtime",
+  "crates/patterns/rpc",
+  "crates/patterns/tables",
   "crates/guests/cluster",
   "crates/guests/discovery",
   "crates/guests/external-api",
@@ -36,6 +38,8 @@ rkyv = { version = "0.8", default-features = false }
 selium-abi = { path = "crates/core/abi" }
 selium-guest = { path = "crates/core/guest" }
 selium-kernel = { path = "crates/core/kernel" }
+selium-rpc = { path = "crates/patterns/rpc" }
+selium-tables = { path = "crates/patterns/tables" }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "2.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }

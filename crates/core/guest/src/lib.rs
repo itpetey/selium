@@ -9,20 +9,19 @@ pub use crate::{
     codec::{decode_typed, encode_typed},
     context::Context,
     error::{GuestError, Result},
-    memory::{SHARED_REGION_MAGIC, SharedMemory, SharedRegion, SharedRegionBuilder},
+    memory::{SHARED_REGION_MAGIC, SharedRegion, attach_region, free_region},
     net::tcp::{TcpAccept, TcpListener, TcpStream},
     net::udp::UdpSocket,
     platform::{mark_ready, process_id},
     process::{ActivityLog, GuestLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
-    signal::Signal,
     storage::{BlobStore, DurableLog},
-    time::{Instant, Timer, now},
+    time::{Instant, now},
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
-    InterfaceMetadata, LocalityScope, ResourceClass, ResourceIdentity, ResourceSelector,
-    ResourceTarget, ScopeContext,
+    InterfaceMetadata, LocalityScope, RegionProt, ResourceClass, ResourceIdentity,
+    ResourceSelector, ResourceTarget, ScopeContext,
 };
 pub use selium_guest_macros::{entrypoint, pattern_interface};
 pub use tracing::{debug, error, info, trace, warn};
@@ -39,6 +38,5 @@ mod net;
 mod platform;
 mod process;
 mod resource;
-mod signal;
 mod storage;
 pub mod time;

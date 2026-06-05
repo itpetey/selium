@@ -11,7 +11,7 @@ use selium_abi::{
     SharedResourceId, StorageRecord,
 };
 use tokio::sync::Notify;
-use wasmtiny::runtime::{SharedMemoryMapping, SharedRegionId, Store};
+use wasmtiny::runtime::{SharedRegionId, Store};
 
 /// In-memory kernel state and primitives used by the runtime.
 #[derive(Clone)]
@@ -25,13 +25,11 @@ pub(crate) struct SharedRegionRecord {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SharedMappingState {
-    pub(crate) mapping: SharedMemoryMapping,
+    pub(crate) region_id: SharedRegionId,
+    pub(crate) page_offset: u32,
     pub(crate) shared_id: SharedResourceId,
-}
-
-pub(crate) struct SignalState {
-    pub(crate) generation: AtomicU64,
-    pub(crate) notify: Notify,
+    pub(crate) prot: selium_abi::RegionProt,
+    pub(crate) reader_slot: Option<u32>,
 }
 
 pub(crate) struct HostQueueState {
@@ -47,14 +45,10 @@ pub(crate) struct TcpListenerState {
 
 pub(crate) struct TcpStreamState {
     pub(crate) running: Arc<AtomicBool>,
-    pub(crate) inbound_signal: Arc<SignalState>,
-    pub(crate) outbound_signal: Arc<SignalState>,
 }
 
 pub(crate) struct UdpSocketState {
     pub(crate) running: Arc<AtomicBool>,
-    pub(crate) recv_signal: Arc<SignalState>,
-    pub(crate) send_signal: Arc<SignalState>,
 }
 
 #[derive(Default)]
@@ -86,8 +80,6 @@ pub(crate) struct KernelInner {
     pub(crate) next_process_id: AtomicU64,
     pub(crate) shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
     pub(crate) shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
-    pub(crate) signals_by_shared: Mutex<HashMap<SharedResourceId, Arc<SignalState>>>,
-    pub(crate) local_signals: Mutex<HashMap<u64, SharedResourceId>>,
     pub(crate) durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
     pub(crate) local_logs: Mutex<HashMap<u64, SharedResourceId>>,
     pub(crate) blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
@@ -121,8 +113,6 @@ impl Default for KernelInner {
             next_process_id: AtomicU64::new(0),
             shared_regions: Mutex::new(HashMap::new()),
             shared_mappings: Mutex::new(HashMap::new()),
-            signals_by_shared: Mutex::new(HashMap::new()),
-            local_signals: Mutex::new(HashMap::new()),
             durable_logs_by_shared: Mutex::new(HashMap::new()),
             local_logs: Mutex::new(HashMap::new()),
             blob_stores_by_shared: Mutex::new(HashMap::new()),

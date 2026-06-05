@@ -148,7 +148,8 @@ impl Runtime {
         module_bytes: &[u8],
         process_id: selium_abi::ProcessId,
     ) -> Result<LoadedGuest> {
-        let mut app = WasmApplication::new();
+        let store = self.kernel.shared_store();
+        let mut app = WasmApplication::with_store(store);
         let module_index = app
             .load_module_from_memory(module_bytes)
             .map_err(map_wasm_error)?;

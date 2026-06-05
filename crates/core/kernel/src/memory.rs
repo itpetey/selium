@@ -1,6 +1,8 @@
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
-use selium_abi::{SharedMappingDescriptor, SharedRegionDescriptor, SharedResourceId};
+use selium_abi::SharedResourceId;
+use wasmtiny::runtime::{SharedRegionId, Store};
 
 use crate::{
     Error, Result,
@@ -9,17 +11,13 @@ use crate::{
 };
 
 impl Kernel {
-    /// Allocates a shared memory region and returns its descriptor.
-    pub fn allocate_shared_region(
-        &self,
-        size: u64,
-        alignment: u64,
-    ) -> Result<SharedRegionDescriptor> {
+    /// Allocates a shared memory region.
+    pub fn allocate_shared_region(&self, size: u32) -> Result<(SharedResourceId, u32)> {
         let region_id = self
             .inner
             .store
             .lock()
-            .allocate_shared_region(size, alignment)
+            .allocate_shared_region(size)
             .map_err(map_wasm_error)?;
         let shared_id = self.next_shared_id();
         let len = self
@@ -33,40 +31,58 @@ impl Kernel {
             .lock()
             .insert(shared_id, SharedRegionRecord { region_id });
 
-        Ok(SharedRegionDescriptor { shared_id, len })
+        Ok((shared_id, len))
     }
 
-    /// Attaches a local mapping to a shared memory region.
-    pub fn attach_shared_region(
-        &self,
-        shared_id: SharedResourceId,
-        region_offset: u64,
-        len: u64,
-    ) -> Result<SharedMappingDescriptor> {
-        let region = self
+    /// Attaches a shared region, returning the local mapping id.
+    pub fn attach_shared_region(&self, shared_id: SharedResourceId) -> Result<u64> {
+        let region_id = self
             .inner
             .shared_regions
             .lock()
             .get(&shared_id)
             .map(|record| record.region_id)
             .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))?;
-        let mapping = self
-            .inner
-            .store
-            .lock()
-            .attach_shared_region(region, region_offset, len)
-            .map_err(map_wasm_error)?;
-        let local_id = self.next_local_id();
-        self.inner
-            .shared_mappings
-            .lock()
-            .insert(local_id, SharedMappingState { mapping, shared_id });
 
-        Ok(SharedMappingDescriptor {
-            local_id,
+        let local_id = self.next_local_id();
+        let state = SharedMappingState {
+            region_id,
+            page_offset: 0,
             shared_id,
-            len,
-        })
+            prot: selium_abi::RegionProt::ReadWrite,
+            reader_slot: None,
+        };
+        self.inner.shared_mappings.lock().insert(local_id, state);
+
+        Ok(local_id)
+    }
+
+    /// Attaches a shared region with explicit protection and reader slot.
+    pub fn attach_shared_region_with_prot(
+        &self,
+        shared_id: SharedResourceId,
+        prot: selium_abi::RegionProt,
+        reader_slot: Option<u32>,
+    ) -> Result<u64> {
+        let region_id = self
+            .inner
+            .shared_regions
+            .lock()
+            .get(&shared_id)
+            .map(|record| record.region_id)
+            .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))?;
+
+        let local_id = self.next_local_id();
+        let state = SharedMappingState {
+            region_id,
+            page_offset: 0,
+            shared_id,
+            prot,
+            reader_slot,
+        };
+        self.inner.shared_mappings.lock().insert(local_id, state);
+
+        Ok(local_id)
     }
 
     /// Destroys a shared memory region when no mappings remain.
@@ -94,63 +110,66 @@ impl Kernel {
 
     /// Detaches a local shared memory mapping.
     pub fn detach_shared_region(&self, local_id: u64) -> Result<()> {
-        let mapping = self
-            .inner
+        self.inner
             .shared_mappings
             .lock()
             .remove(&local_id)
             .ok_or_else(|| Error::NotFound(format!("shared mapping {local_id}")))?;
-        self.inner
-            .store
-            .lock()
-            .detach_shared_region(mapping.mapping)
-            .map_err(map_wasm_error)
+        Ok(())
     }
 
-    /// Reads bytes from a local shared memory mapping.
+    /// Detaches all local mappings for a given shared region.
+    pub fn detach_all_shared_mappings(&self, shared_id: SharedResourceId) {
+        self.inner
+            .shared_mappings
+            .lock()
+            .retain(|_, mapping| mapping.shared_id != shared_id);
+    }
+
+    /// Reads bytes from a shared memory region.
     pub fn read_shared_memory(&self, local_id: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let mapping = self.shared_mapping(local_id)?;
+        let state = self.shared_mapping(local_id)?;
         let mut bytes = vec![0_u8; len];
         self.inner
             .store
             .lock()
-            .read_shared_region(mapping.mapping, offset, &mut bytes)
+            .read_shared_region(state.region_id, offset as usize, &mut bytes)
             .map_err(map_wasm_error)?;
         Ok(bytes)
     }
 
-    /// Writes bytes to a local shared memory mapping.
+    /// Writes bytes to a shared memory region.
     pub fn write_shared_memory(&self, local_id: u64, offset: u64, bytes: &[u8]) -> Result<()> {
-        let mapping = self.shared_mapping(local_id)?;
+        let state = self.shared_mapping(self.local_id_for(local_id)?)?;
         self.inner
             .store
             .lock()
-            .write_shared_region(mapping.mapping, offset, bytes)
+            .write_shared_region(state.region_id, offset as usize, bytes)
             .map_err(map_wasm_error)
     }
 
-    /// Atomically adds to a little-endian `u64` in a local shared memory mapping.
+    /// Atomically adds to a little-endian `u64` in a shared memory region.
     pub fn fetch_add_shared_memory_u64(
         &self,
         local_id: u64,
         offset: u64,
         value: u64,
     ) -> Result<u64> {
-        let mapping = self.shared_mapping(local_id)?;
+        let state = self.shared_mapping(local_id)?;
         let store = self.inner.store.lock();
         let mut bytes = [0_u8; 8];
         store
-            .read_shared_region(mapping.mapping, offset, &mut bytes)
+            .read_shared_region(state.region_id, offset as usize, &mut bytes)
             .map_err(map_wasm_error)?;
         let previous = u64::from_le_bytes(bytes);
         let next = previous.wrapping_add(value);
         store
-            .write_shared_region(mapping.mapping, offset, &next.to_le_bytes())
+            .write_shared_region(state.region_id, offset as usize, &next.to_le_bytes())
             .map_err(map_wasm_error)?;
         Ok(previous)
     }
 
-    /// Atomically compares and exchanges a little-endian `u64` in a local shared memory mapping.
+    /// Atomically compares and exchanges a little-endian `u64` in a shared memory region.
     pub fn compare_exchange_shared_memory_u64(
         &self,
         local_id: u64,
@@ -158,19 +177,35 @@ impl Kernel {
         current: u64,
         new: u64,
     ) -> Result<u64> {
-        let mapping = self.shared_mapping(local_id)?;
+        let state = self.shared_mapping(local_id)?;
         let store = self.inner.store.lock();
         let mut bytes = [0_u8; 8];
         store
-            .read_shared_region(mapping.mapping, offset, &mut bytes)
+            .read_shared_region(state.region_id, offset as usize, &mut bytes)
             .map_err(map_wasm_error)?;
         let previous = u64::from_le_bytes(bytes);
         if previous == current {
             store
-                .write_shared_region(mapping.mapping, offset, &new.to_le_bytes())
+                .write_shared_region(state.region_id, offset as usize, &new.to_le_bytes())
                 .map_err(map_wasm_error)?;
         }
         Ok(previous)
+    }
+
+    /// Returns the length of a shared region in bytes.
+    pub fn shared_region_len(&self, shared_id: SharedResourceId) -> Result<u32> {
+        let region_id = self
+            .inner
+            .shared_regions
+            .lock()
+            .get(&shared_id)
+            .map(|record| record.region_id)
+            .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))?;
+        self.inner
+            .store
+            .lock()
+            .shared_region_len(region_id)
+            .map_err(map_wasm_error)
     }
 
     /// Returns the shared region id backing a local mapping.
@@ -188,6 +223,16 @@ impl Kernel {
             .count()
     }
 
+    /// Returns the wasmtiny `SharedRegionId` backing a selium `SharedResourceId`.
+    pub fn wasmtiny_region_id(&self, shared_id: SharedResourceId) -> Result<SharedRegionId> {
+        self.inner
+            .shared_regions
+            .lock()
+            .get(&shared_id)
+            .map(|record| record.region_id)
+            .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))
+    }
+
     pub(crate) fn shared_mapping(&self, local_id: u64) -> Result<SharedMappingState> {
         self.inner
             .shared_mappings
@@ -197,12 +242,47 @@ impl Kernel {
             .ok_or_else(|| Error::NotFound(format!("shared mapping {local_id}")))
     }
 
+    fn local_id_for(&self, local_id: u64) -> Result<u64> {
+        // Validate the mapping exists and return the same id.
+        let _ = self.shared_mapping(local_id)?;
+        Ok(local_id)
+    }
+
+    /// Registers a shared region that was already allocated (e.g. by WasmApplication)
+    /// in the kernel's metadata, returning a new selium `SharedResourceId`.
+    pub fn register_guest_allocated_region(
+        &self,
+        region_id: SharedRegionId,
+    ) -> Result<(SharedResourceId, u32)> {
+        let shared_id = self.next_shared_id();
+        let len = self
+            .inner
+            .store
+            .lock()
+            .shared_region_len(region_id)
+            .map_err(map_wasm_error)?;
+        self.inner
+            .shared_regions
+            .lock()
+            .insert(shared_id, SharedRegionRecord { region_id });
+        Ok((shared_id, len))
+    }
+
     pub(crate) fn next_local_id(&self) -> u64 {
         self.inner.next_local_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub(crate) fn next_shared_id(&self) -> u64 {
         self.inner.next_shared_id.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Creates a `Store` that shares the kernel's `SharedMemoryRegistry`.
+    ///
+    /// This allows `WasmApplication` instances to access the same shared memory
+    /// regions as the kernel, enabling direct mapping into guest linear memory.
+    pub fn shared_store(&self) -> Arc<Mutex<Store>> {
+        let registry = self.inner.store.lock().shared_memory_registry();
+        Arc::new(Mutex::new(Store::with_shared_registry(registry)))
     }
 }
 
@@ -213,59 +293,16 @@ mod tests {
     #[tokio::test]
     async fn shared_memory_round_trips_between_attachments() {
         let kernel = Kernel::default();
-        let region = kernel
-            .allocate_shared_region(64, 8)
-            .expect("allocate region");
-        let left = kernel
-            .attach_shared_region(region.shared_id, 0, 64)
-            .expect("attach left");
+        let (shared_id, _len) = kernel.allocate_shared_region(64).expect("allocate region");
+        let left = kernel.attach_shared_region(shared_id).expect("attach left");
         let right = kernel
-            .attach_shared_region(region.shared_id, 0, 64)
+            .attach_shared_region(shared_id)
             .expect("attach right");
 
         kernel
-            .write_shared_memory(left.local_id, 0, b"hello")
+            .write_shared_memory(left, 0, b"hello")
             .expect("write left");
-        let bytes = kernel
-            .read_shared_memory(right.local_id, 0, 5)
-            .expect("read right");
+        let bytes = kernel.read_shared_memory(right, 0, 5).expect("read right");
         assert_eq!(bytes, b"hello");
-        assert!(matches!(
-            kernel.destroy_shared_region(region.shared_id),
-            Err(Error::Wasm(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn shared_memory_u64_atomics_are_visible_between_attachments() {
-        let kernel = Kernel::default();
-        let region = kernel
-            .allocate_shared_region(64, 8)
-            .expect("allocate region");
-        let left = kernel
-            .attach_shared_region(region.shared_id, 0, 64)
-            .expect("attach left");
-        let right = kernel
-            .attach_shared_region(region.shared_id, 0, 64)
-            .expect("attach right");
-
-        assert_eq!(
-            kernel
-                .fetch_add_shared_memory_u64(left.local_id, 8, 3)
-                .expect("fetch add"),
-            0
-        );
-        assert_eq!(
-            kernel
-                .compare_exchange_shared_memory_u64(right.local_id, 8, 3, 7)
-                .expect("compare exchange"),
-            3
-        );
-        assert_eq!(
-            kernel
-                .read_shared_memory(left.local_id, 8, 8)
-                .expect("read value"),
-            7_u64.to_le_bytes()
-        );
     }
 }

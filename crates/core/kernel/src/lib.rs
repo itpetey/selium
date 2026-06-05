@@ -8,6 +8,5 @@ mod host_queue;
 mod memory;
 mod network_runtime;
 mod process;
-mod signal;
 mod state;
 mod storage;

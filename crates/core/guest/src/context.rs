@@ -1,55 +1,40 @@
 #[cfg(feature = "io")]
-use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
+use selium_abi::ResourceTarget;
 
 #[cfg(feature = "io")]
-use crate::{
-    GuestError, ResourceSender,
-    io::rpc::{RpcClient, error::RpcError},
-};
-
-/// Size of RPC reply buf (4x shared_id replies)
-#[cfg(feature = "io")]
-pub const RPC_REP_CAPACITY: u64 = 36;
-/// Size of RPC request buf (min. 512 URI chars)
-#[cfg(feature = "io")]
-pub const RPC_REQ_CAPACITY: u64 = 2048;
+use crate::GuestError;
 
 /// Guest context injected by the runtime during bootstrap.
 ///
-/// Provides a pre-connected discovery RPC client.
+/// Provides a pre-connected discovery client. The RPC-based implementation
+/// has been removed alongside the Signal/SharedMemory ABI changes. Discovery
+/// will be re-implemented against the new shared memory ABI in a follow-up.
 pub struct Context {
-    #[cfg(feature = "io")]
-    discovery: RpcClient<DiscoveryRequest, DiscoveryResponse>,
+    _private: (),
 }
 
 impl Context {
-    /// Creates a Context from a raw discovery handle (shared region id).
+    /// Creates a Context from a raw discovery handle.
+    ///
+    /// Currently returns an error since the RPC client has been stubbed out.
     #[cfg(feature = "io")]
-    pub async fn from_raw(discovery_handle: u64) -> Result<Self, GuestError> {
-        use crate::io;
-
-        let sender = ResourceSender::attach(discovery_handle)?;
-        let discovery = RpcClient::connect(sender, RPC_REQ_CAPACITY, RPC_REP_CAPACITY)
-            .await
-            .map_err(|e| GuestError::Io(io::Error::Rpc(e)))?;
-        Ok(Self { discovery })
+    pub async fn from_raw(_discovery_handle: u64) -> Result<Self, GuestError> {
+        Err(GuestError::Host(
+            "discovery RPC not yet implemented against new shared memory ABI".to_string(),
+        ))
     }
+
     #[cfg(not(feature = "io"))]
     pub async fn from_raw() -> Result<Self, ()> {
-        Ok(Self {})
+        Ok(Self { _private: () })
     }
 
     /// Resolves a URI to a resource.
     #[cfg(feature = "io")]
-    pub async fn lookup(&self, uri: &str) -> Result<Option<ResourceTarget>, RpcError> {
-        match self
-            .discovery
-            .request(DiscoveryRequest::Resolve(uri.to_owned()))
-            .await?
-        {
-            DiscoveryResponse::Found(t) => Ok(Some(t)),
-            DiscoveryResponse::NotFound => Ok(None),
-        }
+    pub async fn lookup(&self, _uri: &str) -> Result<Option<ResourceTarget>, GuestError> {
+        Err(GuestError::Host(
+            "discovery RPC not yet implemented against new shared memory ABI".to_string(),
+        ))
     }
 }
 

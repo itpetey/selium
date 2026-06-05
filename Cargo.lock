@@ -109,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "block-buffer"
@@ -921,6 +921,7 @@ name = "selium-discovery"
 version = "1.0.0-alpha.6"
 dependencies = [
  "selium-guest",
+ "selium-rpc",
 ]
 
 [[package]]
@@ -971,6 +972,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-rpc"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+ "thiserror",
+]
+
+[[package]]
 name = "selium-runtime"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -995,6 +1006,15 @@ dependencies = [
 name = "selium-supervisor"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-tables"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "rkyv",
+ "selium-abi",
  "selium-guest",
 ]
 
@@ -1338,6 +1358,7 @@ dependencies = [
  "byteorder",
  "clap",
  "leb128",
+ "libc",
  "memchr",
  "parking_lot",
  "sha2 0.10.9",

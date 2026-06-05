@@ -1,19 +1,11 @@
-use crate::{
-    io::region::{
-        NEXT_MUTATION_ID_OFFSET, NEXT_WRITER_ID_OFFSET, READER_COUNT_OFFSET,
-        SIGNAL_SHARED_ID_OFFSET, WRITER_COUNT_OFFSET,
-    },
-    io::{
-        ChannelRegion, Cursor, RegionBuilder,
-        cursor::mask_for_capacity,
-        error::{Error, Result},
-        frame::FrameHeader,
-        region::TAIL_CACHE_OFFSET,
-    },
-    signal::Signal,
-};
+use std::sync::atomic::{Ordering, fence};
 
-pub(crate) const MAGIC_PREFIX: u64 = 0x53454C494F524E47;
+use crate::io::{
+    ChannelRegion, Cursor, RegionBuilder,
+    cursor::mask_for_capacity,
+    error::{Error, Result},
+    frame::FrameHeader,
+};
 
 /// Minimum ring buffer data capacity (in bytes).
 /// Must hold at least one frame header (12 bytes) plus a small payload.
@@ -23,77 +15,46 @@ const MIN_RING_CAPACITY: u64 = 64;
 ///
 /// This is the primitive building block for all selium-io patterns.
 /// It stores framed messages sequentially in a shared memory region.
-/// A `Signal` may be used to notify readers that new data is available.
+/// Writers use a single-phase write protocol with release/acquire fencing:
+/// payload is written first, then a release fence, then the header with the
+/// READY flag. Readers use an acquire fence before reading the header.
+///
+/// Cross-process notification uses the generation counter in the shared region
+/// with `memory.atomic.wait32` / `memory.atomic.notify` instead of signals.
 pub struct RingBuf {
     region: ChannelRegion,
     mask: u64,
     capacity: u64,
-    signal: Option<Signal>,
 }
 
 impl RingBuf {
     /// Creates a new ring buffer with the given data capacity, backed by a fresh shared memory region.
-    pub fn create(capacity: u64) -> Result<(Self, Signal)> {
+    pub fn create(capacity: u64) -> Result<Self> {
         let region = RegionBuilder::create(capacity)?;
-        let mask = mask_for_capacity(capacity as u64)?;
-        region.write_magic(MAGIC_PREFIX)?;
-        region.write_capacity(capacity as u64)?;
-        region.write_header_u64(WRITER_COUNT_OFFSET, 0)?;
-        region.write_header_u64(READER_COUNT_OFFSET, 0)?;
-        region.write_next_tail(0)?;
-        region.write_header_u64(TAIL_CACHE_OFFSET, 0)?;
-        region.write_header_u64(NEXT_WRITER_ID_OFFSET, 0)?;
-        region.write_header_u64(NEXT_MUTATION_ID_OFFSET, 0)?;
-        let signal = Signal::create().map_err(|e| Error::Guest(e.to_string()))?;
-        region.write_header_u64(SIGNAL_SHARED_ID_OFFSET, signal.shared_id())?;
-        let ring_signal =
-            Signal::attach(signal.shared_id()).map_err(|e| Error::Guest(e.to_string()))?;
-        Ok((
-            Self {
-                region,
-                mask,
-                capacity: capacity as u64,
-                signal: Some(ring_signal),
-            },
-            signal,
-        ))
-    }
-
-    /// Attaches to an existing ring buffer by shared region id.
-    pub fn attach(shared_id: u64, capacity: u64) -> Result<Self> {
-        let region = RegionBuilder::attach(shared_id, capacity)?;
-        Self::wrap_region(region, None)
-    }
-
-    /// Wraps an existing channel region as a ring buffer.
-    pub fn wrap_region(region: ChannelRegion, signal: Option<Signal>) -> Result<Self> {
-        let capacity = region.capacity();
         let mask = mask_for_capacity(capacity)?;
-        let magic = region.read_magic()?;
-        if magic != MAGIC_PREFIX {
-            return Err(Error::InvalidLayout);
-        }
-        if region.read_capacity()? != capacity {
-            return Err(Error::InvalidLayout);
-        }
+        region.initialise()?;
         Ok(Self {
             region,
             mask,
             capacity,
-            signal,
         })
     }
 
-    /// Attaches with a signal for wake notification.
-    pub fn attach_with_signal(shared_id: u64, capacity: u64, signal: Signal) -> Result<Self> {
-        let mut buf = Self::attach(shared_id, capacity)?;
-        buf.signal = Some(signal);
-        Ok(buf)
+    /// Attaches to an existing ring buffer by shared region id.
+    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
+        let region = RegionBuilder::attach(region_id, capacity)?;
+        Self::wrap_region(region)
     }
 
-    /// Sets the notification signal for this ring buffer handle.
-    pub(crate) fn set_signal(&mut self, signal: Signal) {
-        self.signal = Some(signal);
+    /// Wraps an existing channel region as a ring buffer.
+    pub fn wrap_region(region: ChannelRegion) -> Result<Self> {
+        let capacity = region.capacity();
+        let mask = mask_for_capacity(capacity)?;
+        Ok(Self {
+            region,
+            mask,
+            capacity,
+        })
     }
 
     /// Returns a reference to the underlying region.
@@ -112,21 +73,16 @@ impl RingBuf {
     }
 
     /// Returns the shared region id.
-    pub fn shared_id(&self) -> u64 {
-        self.region.shared_id()
+    pub fn region_id(&self) -> u64 {
+        self.region.region_id()
     }
 
-    /// Returns a reference to the notification signal, if set.
-    pub fn signal(&self) -> Option<&Signal> {
-        self.signal.as_ref()
-    }
-
-    /// Reads the current next_tail from shared memory.
+    /// Reads the current next_tail from private state.
     pub fn read_next_tail(&self) -> Result<u64> {
         self.region.read_next_tail()
     }
 
-    /// Reads the tail_cache from shared memory.
+    /// Reads the tail_cache from private state.
     pub fn read_tail_cache(&self) -> Result<u64> {
         self.region.read_tail_cache()
     }
@@ -169,50 +125,71 @@ impl RingBuf {
         Ok(result)
     }
 
-    /// Writes a framed message at the given position.
+    /// Writes a framed message using single-phase write with release fencing.
+    ///
+    /// 1. Write payload at `pos + ENCODED_SIZE`
+    /// 2. Release fence
+    /// 3. Write header with READY flag at `pos`
+    /// 4. Bump generation counter and notify waiters
     pub fn write_frame(&self, pos: u64, payload: &[u8], tag: u32, flags: u8) -> Result<()> {
         let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
         if frame_size > self.capacity {
             return Err(Error::CapacityExceeded);
         }
-        let pending_header = FrameHeader {
-            len: payload.len() as u32,
-            tag,
-            flags: flags & !FrameHeader::FLAG_READY,
-            _reserved: [0; 3],
-        };
-        let header_bytes = pending_header.encode();
-        self.write_at(pos, &header_bytes)?;
+
+        // Step 1: Write payload first.
         let payload_pos = pos
             .checked_add(FrameHeader::ENCODED_SIZE as u64)
             .ok_or(Error::InvalidFrame)?;
         self.write_at(payload_pos, payload)?;
+
+        // Step 2: Release fence ensures payload is visible before the header.
+        fence(Ordering::Release);
+
+        // Step 3: Write header with READY flag (single write, no two-phase).
         let ready_header = FrameHeader {
+            len: payload.len() as u32,
+            tag,
             flags: flags | FrameHeader::FLAG_READY,
-            ..pending_header
+            _reserved: [0; 3],
         };
         self.write_at(pos, &ready_header.encode())?;
 
-        if let Some(signal) = &self.signal {
-            signal.notify().map_err(|e| Error::Guest(e.to_string()))?;
-        }
+        // Step 4: Bump generation counter and notify waiters.
+        self.region.bump_generation()?;
+
         Ok(())
     }
 
-    /// Reads a frame header from a position.
+    /// Reads a frame header from a position with acquire fencing.
     pub fn read_frame_header(&self, pos: u64) -> Result<FrameHeader> {
+        // Acquire fence ensures we see the writer's payload before the header.
+        fence(Ordering::Acquire);
         let bytes = self.read_at(pos, FrameHeader::ENCODED_SIZE as u64)?;
         FrameHeader::decode(&bytes)
     }
 
-    /// Reads a full framed message from a position.
+    /// Reads a full framed message from a position with acquire fencing.
     pub fn read_frame(&self, pos: u64) -> Result<(FrameHeader, Vec<u8>)> {
-        let header = self.read_frame_header(pos)?;
+        // Acquire fence ensures we see the writer's payload.
+        fence(Ordering::Acquire);
+        let header = {
+            let bytes = self.read_at(pos, FrameHeader::ENCODED_SIZE as u64)?;
+            FrameHeader::decode(&bytes)?
+        };
+        if !header.is_ready() {
+            return Err(Error::BufferEmpty);
+        }
         let payload_pos = pos
             .checked_add(FrameHeader::ENCODED_SIZE as u64)
             .ok_or(Error::InvalidFrame)?;
         let payload = self.read_at(payload_pos, header.len as u64)?;
         Ok((header, payload))
+    }
+
+    /// Returns the current generation counter value.
+    pub fn generation(&self) -> Result<u64> {
+        self.region.load_generation()
     }
 }
 
@@ -244,5 +221,28 @@ mod tests {
     fn mask_for_power_of_two_is_correct() {
         assert!(mask_for_capacity(512).is_ok());
         assert!(mask_for_capacity(3).is_err());
+    }
+
+    #[test]
+    fn single_phase_write_read_round_trip() {
+        let ring = RingBuf::create(64).expect("create");
+        let pos = ring.reserve(12 + 5).expect("reserve"); // header + payload
+        ring.write_frame(pos, b"hello", 42, 0).expect("write");
+
+        let (header, payload) = ring.read_frame(pos).expect("read");
+        assert_eq!(header.len, 5);
+        assert_eq!(header.tag, 42);
+        assert!(header.is_ready());
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn generation_counter_advances_on_write() {
+        let ring = RingBuf::create(64).expect("create");
+        let gen_before = ring.generation().expect("gen");
+        let pos = ring.reserve(12 + 3).expect("reserve");
+        ring.write_frame(pos, b"abc", 0, 0).expect("write");
+        let gen_after = ring.generation().expect("gen");
+        assert!(gen_after > gen_before);
     }
 }

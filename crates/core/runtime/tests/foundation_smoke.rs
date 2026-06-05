@@ -1,6 +1,6 @@
 use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, LocalityScope,
-    ResourceClass, ResourceSelector,
+    RegionProt, ResourceClass, ResourceSelector,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
@@ -16,8 +16,8 @@ fn foundation_crates_work_together_through_hostcalls() {
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(
-                    Capability::Signal,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::Signal)],
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
@@ -26,26 +26,21 @@ fn foundation_crates_work_together_through_hostcalls() {
         .expect("bootstrap runtime");
     assert_eq!(report.guests.len(), 1);
 
-    let (status, create_id) =
-        runtime.begin_hostcall(report.guests[0].process_id, HostcallRequest::SignalCreate);
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    let CompletionState::Ready(HostcallOutput::Signal(signal)) =
-        runtime.poll_hostcall(report.guests[0].process_id, create_id)
-    else {
-        panic!("expected signal descriptor");
-    };
-
-    let (status, notify_id) = runtime.begin_hostcall(
+    // Allocate a shared region using the new ABI.
+    let (status, alloc_id) = runtime.begin_hostcall(
         report.guests[0].process_id,
-        HostcallRequest::SignalNotify {
-            local_id: signal.local_id,
+        HostcallRequest::AllocRegion {
+            pages: 1,
+            prot: RegionProt::ReadWrite,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    assert_eq!(
-        runtime.poll_hostcall(report.guests[0].process_id, notify_id),
-        CompletionState::Ready(HostcallOutput::SignalGeneration(1))
-    );
+    let CompletionState::Ready(HostcallOutput::RegionAlloc(allocation)) =
+        runtime.poll_hostcall(report.guests[0].process_id, alloc_id)
+    else {
+        panic!("expected region allocation");
+    };
+    assert!(allocation.region_id > 0);
 }
 
 #[test]
@@ -69,8 +64,14 @@ fn hostcalls_enforce_session_grants() {
         })
         .expect("bootstrap runtime");
 
-    let (status, operation_id) =
-        runtime.begin_hostcall(report.guests[0].process_id, HostcallRequest::SignalCreate);
+    // Attempt to allocate a region without SharedMemory capability.
+    let (status, operation_id) = runtime.begin_hostcall(
+        report.guests[0].process_id,
+        HostcallRequest::AllocRegion {
+            pages: 1,
+            prot: RegionProt::ReadWrite,
+        },
+    );
 
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
     assert!(matches!(

@@ -263,6 +263,35 @@ pub struct SignalDescriptor {
     pub shared_id: SharedResourceId,
 }
 
+/// Memory protection level for a shared region mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+#[repr(u8)]
+pub enum RegionProt {
+    /// Read-only mapping (`PROT_READ`).
+    ReadOnly = 0,
+    /// Read-write mapping (`PROT_READ | PROT_WRITE`).
+    ReadWrite = 1,
+}
+
+/// Descriptor for a shared region allocation returned by `AllocRegion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct RegionAllocation {
+    /// Shared region id.
+    pub region_id: u64,
+    /// Page offset within guest linear memory where the region is mapped.
+    pub page_offset: u32,
+}
+
+/// Descriptor for a shared region attachment returned by `AttachRegion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct RegionAttachment {
+    /// Page offset within guest linear memory where the region is mapped.
+    pub page_offset: u32,
+}
+
 /// Descriptor for a host-mediated connection queue handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -403,101 +432,6 @@ pub enum DiscoveryResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck(), attr(allow(missing_docs)))]
 pub enum HostcallRequest {
-    /// Allocate a shared memory region.
-    SharedMemoryAllocate {
-        /// Requested allocation size in bytes.
-        size: u64,
-        /// Requested allocation alignment in bytes.
-        alignment: u64,
-    },
-    /// Destroy a shared memory region.
-    SharedMemoryDestroy {
-        /// Shared region id to destroy.
-        shared_id: SharedResourceId,
-    },
-    /// Attach a local mapping to a shared memory region.
-    SharedMemoryAttach {
-        /// Shared region id to attach.
-        shared_id: SharedResourceId,
-        /// Offset into the shared region.
-        offset: u64,
-        /// Mapping length in bytes.
-        len: u64,
-    },
-    /// Detach a local shared memory mapping.
-    SharedMemoryDetach {
-        /// Local mapping id to detach.
-        local_id: LocalResourceId,
-    },
-    /// Read bytes from a local shared memory mapping.
-    SharedMemoryRead {
-        /// Local mapping id to read from.
-        local_id: LocalResourceId,
-        /// Offset into the mapping.
-        offset: u64,
-        /// Number of bytes to read.
-        len: u64,
-    },
-    /// Write bytes to a local shared memory mapping.
-    SharedMemoryWrite {
-        /// Local mapping id to write to.
-        local_id: LocalResourceId,
-        /// Offset into the mapping.
-        offset: u64,
-        /// Bytes to write.
-        bytes: Vec<u8>,
-    },
-    /// Atomically add to a little-endian `u64` in a local shared memory mapping.
-    SharedMemoryFetchAddU64 {
-        /// Local mapping id to update.
-        local_id: LocalResourceId,
-        /// Offset into the mapping.
-        offset: u64,
-        /// Value to add, wrapping on overflow.
-        value: u64,
-    },
-    /// Atomically compare and exchange a little-endian `u64` in a local shared memory mapping.
-    SharedMemoryCompareExchangeU64 {
-        /// Local mapping id to update.
-        local_id: LocalResourceId,
-        /// Offset into the mapping.
-        offset: u64,
-        /// Expected current value.
-        current: u64,
-        /// Replacement value when `current` matches.
-        new: u64,
-    },
-    /// Create a new signal.
-    SignalCreate,
-    /// Attach to an existing signal.
-    SignalAttach {
-        /// Shared signal id to attach.
-        shared_id: SharedResourceId,
-    },
-    /// Close a local signal handle.
-    SignalClose {
-        /// Local signal handle id to close.
-        local_id: LocalResourceId,
-    },
-    /// Notify waiters on a signal.
-    SignalNotify {
-        /// Local signal handle id to notify.
-        local_id: LocalResourceId,
-    },
-    /// Read the current signal generation.
-    SignalGeneration {
-        /// Local signal handle id to inspect.
-        local_id: LocalResourceId,
-    },
-    /// Wait for a signal generation to advance.
-    SignalWait {
-        /// Local signal handle id to wait on.
-        local_id: LocalResourceId,
-        /// Generation already observed by the caller.
-        observed_generation: u64,
-        /// Maximum wait time in milliseconds.
-        timeout_ms: u64,
-    },
     /// Bind a TCP listener.
     TcpBind {
         /// Address to bind to.
@@ -656,6 +590,27 @@ pub enum HostcallRequest {
         /// Local queue handle.
         local_id: LocalResourceId,
     },
+    /// Allocate a shared memory region mapped into guest linear memory.
+    AllocRegion {
+        /// Number of pages to allocate.
+        pages: u32,
+        /// Memory protection level.
+        prot: RegionProt,
+    },
+    /// Free a previously allocated shared memory region.
+    FreeRegion {
+        /// Region id to free.
+        region_id: u64,
+    },
+    /// Attach an existing shared memory region into this guest's linear memory.
+    AttachRegion {
+        /// Region id to attach.
+        region_id: u64,
+        /// Optional reader slot index for per-page protection.
+        reader_slot: Option<u32>,
+        /// Memory protection level.
+        prot: RegionProt,
+    },
     /// Get the current wall-clock time as nanoseconds since UNIX epoch.
     TimeNow,
     /// Get the current monotonic time as nanoseconds since an arbitrary epoch.
@@ -696,10 +651,7 @@ pub enum HostcallOutput {
     LocalId(LocalResourceId),
     /// A shared memory region descriptor.
     SharedRegion(SharedRegionDescriptor),
-    /// A shared memory mapping descriptor.
-    SharedMapping(SharedMappingDescriptor),
-    /// A signal descriptor.
-    Signal(SignalDescriptor),
+
     /// A host-mediated connection queue descriptor.
     HostQueue(HostQueueDescriptor),
     /// A durable log descriptor.
@@ -724,8 +676,6 @@ pub enum HostcallOutput {
     GuestLogEntries(Vec<GuestLogEntry>),
     /// Metering observation.
     Metering(MeteringObservation),
-    /// Signal generation value.
-    SignalGeneration(u64),
     /// Raw `u64` value.
     U64(u64),
     /// Connection queue entry with client process id and value.
@@ -735,6 +685,10 @@ pub enum HostcallOutput {
         /// Enqueued value (e.g. session shared_id).
         value: u64,
     },
+    /// A shared region allocation result.
+    RegionAlloc(RegionAllocation),
+    /// A shared region attachment result.
+    RegionAttach(RegionAttachment),
 }
 
 /// Current completion state of a hostcall operation.
@@ -957,10 +911,9 @@ mod tests {
     #[test]
     fn encode_and_decode_round_trip() {
         let request = HostcallEnvelope {
-            request: HostcallRequest::SignalWait {
-                local_id: 7,
-                observed_generation: 2,
-                timeout_ms: 1_000,
+            request: HostcallRequest::AllocRegion {
+                pages: 16,
+                prot: RegionProt::ReadWrite,
             },
             task_id: Some(42),
         };

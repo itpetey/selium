@@ -1,8 +1,8 @@
 [package]
-name = "selium-discovery"
+name = "selium-tables"
 version.workspace = true
 edition.workspace = true
-description = "Selium discovery system guest"
+description = "Selium live tables pattern crate for materialised views over pub/sub"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -10,12 +10,10 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-selium-guest = { workspace = true, features = ["io"] }
-selium-rpc.workspace = true
+rkyv.workspace = true
+selium-abi.workspace = true
+selium-guest.workspace = true
 
 [lints]
 workspace = true

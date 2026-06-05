@@ -33,7 +33,7 @@ pub enum GuestError {
 
 pub(crate) fn abi_error_to_guest_error(error: AbiError) -> GuestError {
     if error.code == selium_abi::AbiErrorCode::PermissionDenied {
-        GuestError::PermissionDenied(Capability::Signal)
+        GuestError::PermissionDenied(Capability::SharedMemory)
     } else {
         GuestError::Host(format!("{:?}: {}", error.code, error.message))
     }
