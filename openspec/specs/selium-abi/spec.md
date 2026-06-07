@@ -37,6 +37,29 @@
 - **WHEN** a `SleepWait` operation is polled and `Instant::now() >= deadline`
 - **THEN** the poll SHALL return `CompletionState::Ready(HostcallOutput::Empty)`
 
+## MODIFIED Requirements
+
+### Requirement: UdpBind Hostcall
+`UdpBind` graduates from stub to fully implemented. The hostcall SHALL return a `SharedRegionDescriptor` containing a multi-memory region with two ring buffers (recv and send), initialised with the standard coordination layout.
+
+#### Scenario: Guest binds UDP socket
+- **WHEN** a guest invokes `UdpBind` with a valid address
+- **THEN** the host SHALL bind a UDP socket, allocate a shared region with two ring buffers using the standard layout, spawn proxy threads, and return the region descriptor
+
+### Requirement: TcpConnect Hostcall
+`TcpConnect` SHALL return a `SharedRegionDescriptor` containing a multi-memory region with two ring buffers (inbound and outbound), initialised with the standard coordination layout.
+
+#### Scenario: Guest connects to TCP endpoint
+- **WHEN** a guest invokes `TcpConnect` with a valid address
+- **THEN** the host SHALL create a TCP connection, allocate a shared region with two ring buffers using the standard layout, spawn proxy threads, and return the region descriptor
+
+### Requirement: TcpBind Hostcall
+`TcpBind` SHALL return a `HostQueueDescriptor` as before, with the kernel spawning an accept loop that creates per-connection shared regions using the standard ring buffer layout.
+
+#### Scenario: Guest binds TCP listener
+- **WHEN** a guest invokes `TcpBind` with a valid address
+- **THEN** the host SHALL bind a TCP listener, create a host queue, spawn an accept loop, and return the queue descriptor
+
 ## REMOVED Requirements
 
 ### Requirement: Stable Hostcall Contracts (Signal and SharedMemory variants)
@@ -44,11 +67,5 @@
 **Migration**: Existing guest code using `Signal::wait` must switch to `memory.atomic.wait32` on the shared region's generation counter. Existing guest code using `SharedMemory` read/write hostcalls must switch to direct load/store at the page offset returned by `alloc_region`/`attach_region`.
 
 ### Requirement: Host-Mediated Connection Queue Hostcalls (MODIFIED)
-**Status**: `HostQueueCreate`, `HostQueueAttach`, `HostQueueSend`, and `HostQueueRecv` remain in the core ABI.
-**Reason**: While RPC connection handoff has moved to `selium-rpc` using the shared memory ABI directly, host queues remain necessary for the TcpListener accept mechanism. When a TcpListener accepts a connection, the kernel enqueues the incoming connection info into a host queue, and the guest retrieves it via `HostQueueRecv`.
-**Migration**: RPC-specific usage of host queues has been removed; host queues now serve only the TCP listener accept pattern.
-
-### Requirement: UdpBind Hostcall (RETAINED AS STUB)
-**Status**: `UdpBind` remains in the ABI but is implemented as a stub that returns errors.
-**Reason**: UDP socket creation will return region IDs that the guest attaches directly in a follow-up networking change. The current implementation maintains ABI compatibility while the networking module is updated.
-**Migration**: UDP functionality is temporarily gated behind the old ABI compatibility layer until the networking module is updated.
+**Status**: Retained. `HostQueueCreate`, `HostQueueAttach`, `HostQueueSend`, and `HostQueueRecv` remain in the core ABI unchanged.
+**Reason**: Host queues remain necessary for the TCP listener accept pattern and the RPC connection handshake. The previous spec incorrectly claimed RPC handoff had moved entirely to the shared memory ABI; in practice, the initial connection setup still uses `HostQueueSend`/`HostQueueRecv` to pass the `shared_id` from client to server.

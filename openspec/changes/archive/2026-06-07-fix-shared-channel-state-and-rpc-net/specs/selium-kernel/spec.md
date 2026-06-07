@@ -1,15 +1,4 @@
-## Purpose
-
-Expose Selium's low-level host primitives for shared memory, network, storage, process lifecycle, activity, and metering.
-
-## Requirements
-
-### Requirement: Shared Memory Regions
-`selium-kernel` SHALL expose shared memory regions as first-class primitive resources that can be allocated, attached, detached, and accessed independently of a guest's private linear memory.
-
-#### Scenario: Shared region attached to two guests
-- **WHEN** two guests attach the same valid shared memory region
-- **THEN** both guests SHALL be able to access the region according to the runtime memory model
+## MODIFIED Requirements
 
 ### Requirement: Protocol-Neutral Network Primitives
 `selium-kernel` SHALL expose protocol-neutral listener, session, stream, and request/response network primitives. Network proxy threads SHALL coordinate with guests through the standard shared-memory ring buffer layout using atomic operations on the coordination fields in page 0.
@@ -22,40 +11,12 @@ Expose Selium's low-level host primitives for shared memory, network, storage, p
 - **WHEN** a guest with the required network capability opens a UDP socket
 - **THEN** the kernel SHALL provide a datagram socket resource backed by a shared region with the standard ring buffer layout, and spawn proxy threads that coordinate through shared-memory atomics
 
-### Requirement: Durable Storage Primitives
-`selium-kernel` SHALL expose durable log and blob primitives with append, replay, checkpoint, put, and get operations.
-
-#### Scenario: Guest replays a durable log
-- **WHEN** a guest replays a durable log from a valid checkpoint or sequence
-- **THEN** the kernel SHALL return the retained records and bounds according to the storage contract
-
-### Requirement: Primitive Process Lifecycle
-`selium-kernel` SHALL expose primitive operations for starting, stopping, and inspecting guest processes without embedding placement or orchestration policy.
-
-#### Scenario: Runtime starts configured guest process
-- **WHEN** the runtime requests a new guest process using a valid module and entrypoint
-- **THEN** the kernel SHALL create the process resource and return an inspectable process identity
-
-### Requirement: Activity and Metering Hooks
-`selium-kernel` SHALL expose hooks that allow the runtime to project lifecycle events and resource-usage observations into host-visible logs and metering streams.
-
-#### Scenario: Guest process consumes resources
-- **WHEN** a guest process uses CPU, memory, storage, or bandwidth
-- **THEN** the kernel SHALL make those observations available to the runtime through the metering hooks
-
 ### Requirement: Shared Region Layout Header
 `selium-kernel` shared memory regions SHALL support a layout header (magic, capacity, memory count, per-memory offset/length pairs) so that multiple parties can discover sub-memories after attaching via `shared_id`. Each sub-memory SHALL use the standard ring buffer coordination layout with generation counter, `next_tail`, `writer_count`, and `reader_slots` in page 0.
 
 #### Scenario: Two guests attach the same region and agree on layout
 - **WHEN** a guest seals a region built with `SharedRegionBuilder` and another guest attaches the same `shared_id`
 - **THEN** both parties SHALL read the identical layout header and enumerate the same sub-memories, each with the standard coordination fields
-
-### Requirement: Per-Connection RPC Session Isolation
-`selium-kernel` SHALL enforce that a `SharedRegion` allocated for an RPC session is only accessible to the two authorised parties. No other guest SHALL be able to attach or read that region without possessing its `shared_id`.
-
-#### Scenario: Unauthorised guest attempts to attach a session region
-- **WHEN** a guest without the `shared_id` tries to attach a session region
-- **THEN** the kernel SHALL deny the attachment
 
 ### Requirement: UDP Bind Implementation
 `selium-kernel` SHALL implement `Kernel::udp_bind(address: String) -> Result<SharedRegionDescriptor>` that binds a real OS UDP socket and creates the shared-memory channel infrastructure using the standard ring buffer layout.
@@ -88,3 +49,9 @@ Expose Selium's low-level host primitives for shared memory, network, storage, p
 #### Scenario: Process teardown closes UDP socket
 - **WHEN** a guest process exits and the runtime cleans up resources with `ResourceClass::UdpSocket`
 - **THEN** the kernel SHALL call `close_udp_socket`, which sets `running = false` to stop proxy threads and removes the state entry
+
+## REMOVED Requirements
+
+### Requirement: Explicit Signalling Primitive
+**Reason**: The `Signal` type and its associated hostcalls (`signal_create`, `signal_wait`, `signal_notify`) were removed in the 2026-06-03 migration. Cross-process notification now uses the generation counter in the shared region with `memory.atomic.wait32`/`notify`.
+**Migration**: All coordination that previously used `Signal` now uses atomic wait/notify on the shared region's generation counter. The kernel proxy polls the generation counter instead of waiting on a signal.

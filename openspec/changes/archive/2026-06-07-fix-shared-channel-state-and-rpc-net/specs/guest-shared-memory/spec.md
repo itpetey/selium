@@ -1,37 +1,4 @@
-## ADDED Requirements
-
-### Requirement: Shared Region Allocation via Host ABI
-The host SHALL provide an `alloc_region` hostcall that allocates a shared memory region, maps it into the calling guest's linear memory, and returns a region identifier together with the page offset at which the region is accessible.
-
-#### Scenario: Guest allocates a shared region
-- **WHEN** a guest calls `alloc_region` with a valid page count and protection flag
-- **THEN** the host SHALL allocate a shared memory region of the requested size, extend the guest's linear memory to include those pages, and return `(region_id, page_offset)`
-
-#### Scenario: Guest allocates with read-only protection
-- **WHEN** a guest calls `alloc_region` with `RegionProt::ReadOnly`
-- **THEN** the host SHALL map the region into guest memory with `PROT_READ` only, and any store to those pages SHALL trap
-
-### Requirement: Shared Region Free
-The host SHALL provide a `free_region` hostcall that unmaps a shared region from the calling guest's linear memory and releases the region if no other instances are attached.
-
-#### Scenario: Guest frees a region it allocated
-- **WHEN** a guest calls `free_region` with a valid `region_id`
-- **THEN** the host SHALL unmap the region's pages from guest memory and decrement the region's attachment count
-
-#### Scenario: Region freed while other instances are attached
-- **WHEN** a guest calls `free_region` on a region with multiple attached instances
-- **THEN** the host SHALL unmap the pages from the calling guest only; the region SHALL persist until the last attachment is released
-
-### Requirement: Shared Region Attach
-The host SHALL provide an `attach_region` hostcall that maps an existing shared region into the calling guest's linear memory at a page offset determined by the runtime.
-
-#### Scenario: Guest attaches to an existing region
-- **WHEN** a guest calls `attach_region` with a valid `region_id` and protection flag
-- **THEN** the host SHALL validate the region exists, map it into guest memory, and return the `page_offset`
-
-#### Scenario: Guest attaches to a non-existent region
-- **WHEN** a guest calls `attach_region` with an invalid `region_id`
-- **THEN** the host SHALL return an error indicating the region was not found
+## MODIFIED Requirements
 
 ### Requirement: Native Atomic Access to Shared Regions
 Guests SHALL access shared region data and coordination fields using native WASM load, store, and atomic instructions at the page offset returned by `alloc_region` or `attach_region`.
@@ -55,6 +22,8 @@ Guests SHALL access shared region data and coordination fields using native WASM
 #### Scenario: Guest CAS on shared coordination field
 - **WHEN** a guest executes `memory.atomic.rmw.cmpxchg` on the shared `next_tail` field
 - **THEN** the CAS SHALL be visible to all other processes attached to the same region, enabling cross-process writer coordination
+
+## ADDED Requirements
 
 ### Requirement: Shared Region Coordination Layout
 Every shared region used for messaging SHALL include cross-process coordination fields in page 0 at fixed offsets, enabling many-to-many channel semantics without host mediation.

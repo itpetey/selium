@@ -107,12 +107,16 @@ async fn handler(
                 let response = {
                     let store = store.borrow();
                     match request.payload() {
-                        DiscoveryRequest::Resolve(uri) => {
-                            if let Some(target) = store.resolve_exact(uri) {
+                        Ok(DiscoveryRequest::Resolve(uri)) => {
+                            if let Some(target) = store.resolve_exact(&uri) {
                                 DiscoveryResponse::Found(target)
                             } else {
                                 DiscoveryResponse::NotFound
                             }
+                        }
+                        Err(error) => {
+                            selium_guest::warn!("discovery payload decode failed: {error}");
+                            continue;
                         }
                     }
                 };

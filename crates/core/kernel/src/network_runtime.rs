@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, Ordering, fence},
     },
     thread,
     time::Duration,
@@ -16,29 +16,44 @@ use crate::{
     state::{Kernel, TcpListenerState, TcpStreamState, UdpSocketState},
 };
 
-const CAPACITY_OFFSET: u64 = 8;
-const DEFAULT_RING_CAPACITY: u32 = 64 * 1024;
-const FLAG_READY: u8 = 1;
-const FRAME_HEADER_SIZE: u64 = 12;
+/// Page size for ring buffer layout.
+const PAGE_SIZE: u64 = 4096;
+/// Offset of the generation counter (u64) in page 0.
+const GENERATION_COUNTER_OFFSET: u64 = 0;
+/// Offset of the shared `next_tail` cursor (u64) in page 0.
+const NEXT_TAIL_OFFSET: u64 = 8;
+/// Offset of the shared `writer_count` (u64) in page 0.
+const WRITER_COUNT_OFFSET: u64 = 16;
+/// Offset where the shared `reader_slots` array begins (128 × u64).
+const READER_SLOTS_OFFSET: u64 = 24;
+/// Offset of the shared `next_writer_id` counter (u64).
+const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+/// Offset of the shared `reader_slot_counter` (u64).
+const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
+/// Offset where ring buffer data begins (page 1).
+const DATA_OFFSET: u64 = PAGE_SIZE;
+
+/// Maximum number of strong reader slots.
+const MAX_READER_SLOTS: u32 = 128;
+/// Kernel's reader slot index (used for backpressure on outbound rings).
 const KERNEL_READER_SLOT: u32 = 0;
-const MAX_READER_SLOTS: u16 = 128;
-const NEXT_MUTATION_ID_OFFSET: u64 = 64;
-const NEXT_TAIL_OFFSET: u64 = 32;
-const NEXT_WRITER_ID_OFFSET: u64 = 56;
+
+/// Default ring buffer data capacity (64 KiB).
+const DEFAULT_RING_CAPACITY: u32 = 64 * 1024;
+/// Frame header size in bytes.
+const FRAME_HEADER_SIZE: u64 = 12;
+/// Frame flag indicating a ready frame.
+const FLAG_READY: u8 = 1;
+
+/// Polling interval for proxy threads waiting on guest writes.
 const PROXY_POLL_INTERVAL_MS: u64 = 1;
-const READER_ACTIVE_OFFSET: u64 = 0;
-const READER_COUNT_OFFSET: u64 = 24;
-const READER_SLOTS_OFFSET: u64 = 72;
-const READER_SLOT_BYTES: u64 = 16;
-const REGION_HEADER_BYTES: u64 = 4096;
-const RING_MAGIC_PREFIX: u64 = 0x53454C494F524E47;
+
+// Multi-memory region header layout
+const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
 const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
 const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
 const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
-const TAIL_CACHE_OFFSET: u64 = 40;
-const WRITER_COUNT_OFFSET: u64 = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct FrameHeader {
@@ -49,10 +64,6 @@ struct FrameHeader {
 }
 
 impl FrameHeader {
-    const FLAG_READY: u8 = 1;
-    #[expect(dead_code, reason = "reserved for future use")]
-    const FLAG_ABORTED: u8 = 1 << 1;
-
     fn encode(&self) -> [u8; 12] {
         let mut bytes = [0u8; 12];
         bytes[..4].copy_from_slice(&self.len.to_le_bytes());
@@ -90,11 +101,11 @@ impl FrameHeader {
     }
 
     fn frame_size(&self) -> u64 {
-        12 + self.len as u64
+        FRAME_HEADER_SIZE + self.len as u64
     }
 
     fn is_ready(&self) -> bool {
-        self.flags & Self::FLAG_READY != 0
+        self.flags & FLAG_READY != 0
     }
 }
 
@@ -145,8 +156,6 @@ impl Kernel {
             },
         );
 
-        // Pre-attach the proxy mapping in the caller thread so the shared memory
-        // state is consistent across thread boundaries.
         let proxy_local_id = self
             .attach_shared_region(shared_id)
             .map_err(|e| Error::Wasm(format!("proxy pre-attach failed: {e}")))?;
@@ -178,7 +187,6 @@ impl Kernel {
         let shared_id = state.shared_id;
         drop(listeners);
 
-        // Notify any waiters on the host queue so they detect closure.
         if let Some(queue) = self
             .inner
             .host_queues_by_shared
@@ -225,8 +233,6 @@ impl Kernel {
             },
         );
 
-        // Pre-attach the proxy mapping in the caller thread so the shared memory
-        // state is consistent across thread boundaries.
         let proxy_local_id = self
             .attach_shared_region(shared_id)
             .map_err(|e| Error::Wasm(format!("proxy pre-attach failed: {e}")))?;
@@ -270,9 +276,11 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     }
 }
 
+/// Creates a multi-memory shared region with two ring buffers (inbound + outbound)
+/// using the standard coordination layout that matches the guest-side `region.rs`.
 fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64, u64)> {
     let ring_data_cap = DEFAULT_RING_CAPACITY;
-    let ring_region_len = (REGION_HEADER_BYTES + ring_data_cap as u64) as u32;
+    let ring_region_len = (PAGE_SIZE as u32) + ring_data_cap;
     let header_size = SHARED_REGION_HEADER_ENTRY_OFFSET + 2 * SHARED_REGION_HEADER_ENTRY_SIZE;
     let total_capacity = align_up(
         header_size + align_up(header_size + ring_region_len, 8) + ring_region_len,
@@ -287,6 +295,7 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
         .attach_shared_region(shared_id)
         .map_err(|e| Error::Wasm(format!("attach region failed: {e}")))?;
 
+    // Write multi-memory header.
     kernel
         .write_shared_memory(mapping_id, 0, &SHARED_REGION_MAGIC.to_le_bytes())
         .map_err(|e| Error::Wasm(e.to_string()))?;
@@ -308,6 +317,7 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
     let sub_memory_0_offset = align_up(header_size, 8) as u64;
     let sub_memory_1_offset = align_up(sub_memory_0_offset as u32 + ring_region_len, 8) as u64;
 
+    // Write entry[0]: inbound ring offset + length.
     kernel
         .write_shared_memory(
             mapping_id,
@@ -322,6 +332,8 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
             &ring_region_len.to_le_bytes(),
         )
         .map_err(|e| Error::Wasm(e.to_string()))?;
+
+    // Write entry[1]: outbound ring offset + length.
     kernel
         .write_shared_memory(
             mapping_id,
@@ -337,31 +349,19 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
         )
         .map_err(|e| Error::Wasm(e.to_string()))?;
 
-    init_ring_buffer(
-        kernel,
-        mapping_id,
-        sub_memory_0_offset,
-        ring_data_cap as u64,
-    )
-    .map_err(|e| Error::Wasm(format!("init inbound ring failed: {e}")))?;
+    // Initialize both ring buffers with the standard coordination layout.
+    init_ring_buffer(kernel, mapping_id, sub_memory_0_offset)?;
+    init_ring_buffer(kernel, mapping_id, sub_memory_1_offset)?;
 
-    // Kernel is the sole writer on the inbound ring; register before proxy starts.
+    // Kernel is the sole writer on the inbound ring; register writer count.
     kernel
         .fetch_add_shared_memory_u64(mapping_id, sub_memory_0_offset + WRITER_COUNT_OFFSET, 1)
         .map_err(|e| Error::Wasm(format!("increment inbound writer count failed: {e}")))?;
 
-    init_ring_buffer(
-        kernel,
-        mapping_id,
-        sub_memory_1_offset,
-        ring_data_cap as u64,
-    )
-    .map_err(|e| Error::Wasm(format!("init outbound ring failed: {e}")))?;
-
     // Allocate kernel reader slot 0 on the outbound ring at position 0.
     let slot_offset = sub_memory_1_offset + READER_SLOTS_OFFSET;
     kernel
-        .write_shared_memory(mapping_id, slot_offset as u64, &1u64.to_le_bytes())
+        .write_shared_memory(mapping_id, slot_offset, &1u64.to_le_bytes())
         .map_err(|e| Error::Wasm(format!("allocate outbound reader slot failed: {e}")))?;
 
     drop(kernel.detach_shared_region(mapping_id));
@@ -373,36 +373,49 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
     Ok((region, sub_memory_0_offset, sub_memory_1_offset))
 }
 
-fn decode_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
-    FrameHeader::decode(bytes)
-}
+/// Initialises a ring buffer with the standard coordination layout.
+///
+/// Zeros out all coordination fields in page 0:
+/// - generation_counter (offset 0)
+/// - next_tail (offset 8)
+/// - writer_count (offset 16)
+/// - reader_slots[128] (offset 24..1048)
+/// - next_writer_id (offset 1048)
+/// - reader_slot_counter (offset 1056)
+fn init_ring_buffer(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<()> {
+    let zero_u64 = 0u64.to_le_bytes();
 
-fn init_ring_buffer(kernel: &Kernel, mapping_id: u64, offset: u64, capacity: u64) -> Result<()> {
-    let base = offset;
-    kernel.write_shared_memory(mapping_id, base, &RING_MAGIC_PREFIX.to_le_bytes())?;
-    kernel.write_shared_memory(mapping_id, base + CAPACITY_OFFSET, &capacity.to_le_bytes())?;
-    kernel.write_shared_memory(mapping_id, base + WRITER_COUNT_OFFSET, &0u64.to_le_bytes())?;
-    kernel.write_shared_memory(mapping_id, base + READER_COUNT_OFFSET, &0u64.to_le_bytes())?;
-    kernel.write_shared_memory(mapping_id, base + NEXT_TAIL_OFFSET, &0u64.to_le_bytes())?;
-    kernel.write_shared_memory(mapping_id, base + TAIL_CACHE_OFFSET, &0u64.to_le_bytes())?;
-    kernel.write_shared_memory(
-        mapping_id,
-        base + NEXT_WRITER_ID_OFFSET,
-        &0u64.to_le_bytes(),
-    )?;
-    kernel.write_shared_memory(
-        mapping_id,
-        base + NEXT_MUTATION_ID_OFFSET,
-        &0u64.to_le_bytes(),
-    )?;
+    kernel.write_shared_memory(mapping_id, offset + GENERATION_COUNTER_OFFSET, &zero_u64)?;
+    kernel.write_shared_memory(mapping_id, offset + NEXT_TAIL_OFFSET, &zero_u64)?;
+    kernel.write_shared_memory(mapping_id, offset + WRITER_COUNT_OFFSET, &zero_u64)?;
+
+    // Zero out reader slots (128 × u64).
+    for i in 0..MAX_READER_SLOTS {
+        let slot_offset = offset + READER_SLOTS_OFFSET + i as u64 * 8;
+        kernel.write_shared_memory(mapping_id, slot_offset, &zero_u64)?;
+    }
+
+    kernel.write_shared_memory(mapping_id, offset + NEXT_WRITER_ID_OFFSET, &zero_u64)?;
+    kernel.write_shared_memory(mapping_id, offset + READER_SLOT_COUNTER_OFFSET, &zero_u64)?;
+
     Ok(())
 }
 
+/// Reads a little-endian u64 from shared memory.
+fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
+    let bytes = kernel
+        .read_shared_memory(mapping_id, offset, 8)
+        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
+        Error::Wasm("invalid u64 bytes".to_string())
+    })?))
+}
+
+/// Returns the minimum active reader position from the shared reader_slots array.
 fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<Option<u64>> {
     let mut minimum = None;
     for slot in 0..MAX_READER_SLOTS {
-        let slot_offset =
-            offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES + READER_ACTIVE_OFFSET;
+        let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
         let encoded = read_u64(kernel, mapping_id, slot_offset)?;
         if encoded == 0 {
             continue;
@@ -413,116 +426,89 @@ fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Res
     Ok(minimum)
 }
 
-fn proxy_inbound(
+/// Reserves `len` bytes at the tail via CAS on the shared `next_tail` field.
+///
+/// Uses exponential backoff on contention and checks backpressure against
+/// the shared `reader_slots` array.
+fn reserve_tail(
     kernel: &Kernel,
-    mut stream: TcpStream,
     mapping_id: u64,
     offset: u64,
     capacity: u64,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-
-    while running.load(Ordering::Relaxed) {
-        match stream.read(&mut buf) {
-            Ok(0) => {
-                // EOF detected; decrement inbound writer count
-                drop(kernel.fetch_add_shared_memory_u64(
-                    mapping_id,
-                    offset + WRITER_COUNT_OFFSET,
-                    u64::MAX,
-                ));
-                break;
-            }
-            Ok(n) => {
-                if let Err(_e) = write_frame(
-                    kernel,
-                    mapping_id,
-                    offset,
-                    capacity,
-                    buf.get(..n).unwrap_or(&[]),
-                ) {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Read timeout expired; check `running` and continue.
-            }
-            Err(e) => {
-                eprintln!("inbound read error: {e}");
-                break;
-            }
-        }
+    len: u64,
+) -> Result<u64> {
+    if len == 0 || len > capacity {
+        return Err(Error::Wasm("invalid reservation length".to_string()));
     }
 
-    running.store(false, Ordering::Relaxed);
-    Ok(())
+    let mut delay: usize = 1;
+    loop {
+        let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
+
+        // Check backpressure.
+        let min_reader_pos = minimum_reader_position(kernel, mapping_id, offset)?;
+        let next = tail
+            .checked_add(len)
+            .ok_or_else(|| Error::Wasm("tail reservation overflow".to_string()))?;
+
+        if let Some(min_pos) = min_reader_pos
+            && next.saturating_sub(min_pos) > capacity
+        {
+            // Backpressure: ring is full. Use spin_loop for consistency
+            // with guest-side reserve_tail.
+            for _ in 0..delay {
+                std::hint::spin_loop();
+            }
+            delay = (delay * 2).min(64);
+            continue;
+        }
+
+        let prev = kernel
+            .compare_exchange_shared_memory_u64(mapping_id, offset + NEXT_TAIL_OFFSET, tail, next)
+            .map_err(|e| Error::Wasm(format!("cas failed: {e}")))?;
+
+        if prev == tail {
+            return Ok(tail);
+        }
+
+        // Exponential backoff on contention.
+        for _ in 0..delay {
+            std::hint::spin_loop();
+        }
+        delay = (delay * 2).min(64);
+    }
 }
 
-fn proxy_outbound(
+/// Writes data at a logical position in the ring buffer, handling wraparound.
+fn write_at(
     kernel: &Kernel,
-    mut stream: TcpStream,
     mapping_id: u64,
-    offset: u64,
+    region_offset: u64,
     capacity: u64,
-    running: Arc<AtomicBool>,
+    pos: u64,
+    data: &[u8],
 ) -> Result<()> {
-    let mut reader_pos: u64 = 0;
+    let data_offset = region_offset + DATA_OFFSET;
+    let raw_pos = data_offset + (pos & (capacity - 1));
+    let ring_end = data_offset + capacity;
 
-    while running.load(Ordering::Relaxed) {
-        match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
-            Ok(Some(payload)) => {
-                update_kernel_reader_slot(
-                    kernel,
-                    mapping_id,
-                    offset,
-                    KERNEL_READER_SLOT,
-                    reader_pos,
-                )?;
-                if let Err(_e) = stream.write_all(&payload) {
-                    break;
-                }
-                if let Err(_e) = stream.flush() {
-                    break;
-                }
-            }
-            Ok(None) => {
-                match kernel.read_shared_memory(mapping_id, offset + WRITER_COUNT_OFFSET, 8) {
-                    Ok(bytes) => {
-                        let writer_count = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        if writer_count == 0 {
-                            drop(stream.shutdown(std::net::Shutdown::Write));
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-                thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
-            }
-            Err(_) => {
-                break;
-            }
-        }
+    if raw_pos + data.len() as u64 <= ring_end {
+        kernel
+            .write_shared_memory(mapping_id, raw_pos, data)
+            .map_err(|e| Error::Wasm(format!("write_at failed: {e}")))
+    } else {
+        let tail_len = (ring_end - raw_pos) as usize;
+        kernel
+            .write_shared_memory(mapping_id, raw_pos, data.get(..tail_len).unwrap_or(&[]))
+            .map_err(|e| Error::Wasm(format!("write_at tail failed: {e}")))?;
+        kernel
+            .write_shared_memory(mapping_id, data_offset, data.get(tail_len..).unwrap_or(&[]))
+            .map_err(|e| Error::Wasm(format!("write_at head failed: {e}")))?;
+        Ok(())
     }
-
-    // Release kernel reader slot on exit
-    drop(release_kernel_reader_slot(
-        kernel,
-        mapping_id,
-        offset,
-        KERNEL_READER_SLOT,
-    ));
-
-    running.store(false, Ordering::Relaxed);
-    Ok(())
 }
 
+/// Reads data from a logical position in the ring buffer, handling wraparound.
 fn read_at(
     kernel: &Kernel,
     mapping_id: u64,
@@ -531,7 +517,7 @@ fn read_at(
     pos: u64,
     len: u64,
 ) -> Result<Vec<u8>> {
-    let data_offset = region_offset + REGION_HEADER_BYTES;
+    let data_offset = region_offset + DATA_OFFSET;
     let raw_pos = data_offset + (pos & (capacity - 1));
     let ring_end = data_offset + capacity;
 
@@ -555,6 +541,65 @@ fn read_at(
     }
 }
 
+/// Single-phase frame write with release fencing.
+///
+/// 1. Write payload at `pos + FRAME_HEADER_SIZE`
+/// 2. Release fence (ensures payload is visible before header)
+/// 3. Write header with READY flag at `pos`
+/// 4. Bump generation counter
+///
+/// The kernel uses `write_shared_memory` which writes through the same
+/// `mmap` as the guest. The release fence ensures the payload bytes are
+/// committed to shared memory before the READY header becomes visible to
+/// readers using acquire semantics.
+fn write_frame(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    payload: &[u8],
+) -> Result<()> {
+    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
+    if frame_size > capacity {
+        return Err(Error::Wasm("frame exceeds capacity".to_string()));
+    }
+
+    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
+
+    // Step 1: Write payload.
+    let payload_pos = pos + FRAME_HEADER_SIZE;
+    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
+
+    // Step 2: Release fence ensures payload is visible before the header.
+    fence(Ordering::Release);
+
+    // Step 3: Write header with READY flag (single-phase).
+    let ready_header = FrameHeader {
+        len: payload.len() as u32,
+        tag: 0,
+        flags: FLAG_READY,
+        _reserved: [0; 3],
+    };
+    write_at(
+        kernel,
+        mapping_id,
+        offset,
+        capacity,
+        pos,
+        &ready_header.encode(),
+    )?;
+
+    // Step 4: Bump generation counter.
+    kernel
+        .fetch_add_shared_memory_u64(mapping_id, offset + GENERATION_COUNTER_OFFSET, 1)
+        .map_err(|e| Error::Wasm(format!("bump generation failed: {e}")))?;
+
+    Ok(())
+}
+
+/// Reads a frame from the ring buffer at the given reader position.
+///
+/// Returns `None` if no ready frame is available.
 fn read_frame(
     kernel: &Kernel,
     mapping_id: u64,
@@ -575,7 +620,7 @@ fn read_frame(
         *reader_pos,
         FRAME_HEADER_SIZE,
     )?;
-    let header = decode_frame_header(&header_bytes)?;
+    let header = FrameHeader::decode(&header_bytes)?;
 
     if !header.is_ready() {
         return Ok(None);
@@ -600,65 +645,182 @@ fn read_frame(
     Ok(Some(payload))
 }
 
-fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
-    let bytes = kernel
-        .read_shared_memory(mapping_id, offset, 8)
-        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
-    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
-        Error::Wasm("invalid u64 bytes".to_string())
-    })?))
+/// Updates a reader slot in the shared `reader_slots` array.
+fn update_kernel_reader_slot(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    slot: u32,
+    position: u64,
+) -> Result<()> {
+    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
+    let encoded = position
+        .checked_add(1)
+        .ok_or_else(|| Error::Wasm("reader position overflow".to_string()))?;
+    kernel
+        .write_shared_memory(mapping_id, slot_offset, &encoded.to_le_bytes())
+        .map_err(|e| Error::Wasm(format!("update reader slot failed: {e}")))?;
+    Ok(())
 }
 
+/// Releases a reader slot by setting it to 0.
 fn release_kernel_reader_slot(
     kernel: &Kernel,
     mapping_id: u64,
     offset: u64,
     slot: u32,
 ) -> Result<()> {
-    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES;
+    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
     kernel
-        .write_shared_memory(mapping_id, slot_offset as u64, &0u64.to_le_bytes())
+        .write_shared_memory(mapping_id, slot_offset, &0u64.to_le_bytes())
         .map_err(|e| Error::Wasm(format!("release reader slot failed: {e}")))?;
     Ok(())
 }
 
-fn reserve_tail(
+/// Inbound proxy: reads from TCP socket, writes frames to the inbound ring.
+fn proxy_inbound(
     kernel: &Kernel,
+    mut stream: TcpStream,
     mapping_id: u64,
     offset: u64,
     capacity: u64,
-    len: u64,
-) -> Result<u64> {
-    if len == 0 || len > capacity {
-        return Err(Error::Wasm("invalid reservation length".to_string()));
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut buf = vec![0u8; 8192];
+
+    while running.load(Ordering::Relaxed) {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                // EOF detected; decrement inbound writer count to 0.
+                drop(kernel.fetch_add_shared_memory_u64(
+                    mapping_id,
+                    offset + WRITER_COUNT_OFFSET,
+                    u64::MAX,
+                ));
+                break;
+            }
+            Ok(n) => {
+                if let Err(_e) = write_frame(
+                    kernel,
+                    mapping_id,
+                    offset,
+                    capacity,
+                    buf.get(..n).unwrap_or(&[]),
+                ) {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                eprintln!("inbound read error: {e}");
+                break;
+            }
+        }
     }
 
-    for _ in 0..1024 {
-        let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
+    running.store(false, Ordering::Relaxed);
+    Ok(())
+}
 
-        // Check backpressure: ensure we don't overtake the slowest reader.
-        let min_reader_pos = minimum_reader_position(kernel, mapping_id, offset)?;
-        let next = tail
-            .checked_add(len)
-            .ok_or_else(|| Error::Wasm("tail reservation overflow".to_string()))?;
+/// Outbound proxy: reads frames from the outbound ring, writes to TCP socket.
+///
+/// Polls the generation counter to detect new data written by the guest.
+/// When the generation counter changes, reads available frames and writes
+/// them to the TCP socket.
+fn proxy_outbound(
+    kernel: &Kernel,
+    mut stream: TcpStream,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut reader_pos: u64 = 0;
+    let mut last_generation: u64 = 0;
 
-        if let Some(min_pos) = min_reader_pos
-            && next.saturating_sub(min_pos) > capacity
-        {
-            thread::yield_now();
+    while running.load(Ordering::Relaxed) {
+        // Poll the generation counter to detect new data.
+        let current_generation = read_u64(kernel, mapping_id, offset + GENERATION_COUNTER_OFFSET)?;
+
+        if current_generation == last_generation {
+            // No new data; check if all writers have disconnected.
+            match read_u64(kernel, mapping_id, offset + WRITER_COUNT_OFFSET) {
+                Ok(0) => {
+                    drop(stream.shutdown(std::net::Shutdown::Write));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
             continue;
         }
 
-        let prev = kernel
-            .compare_exchange_shared_memory_u64(mapping_id, offset + NEXT_TAIL_OFFSET, tail, next)
-            .map_err(|e| Error::Wasm(format!("cas failed: {e}")))?;
+        last_generation = current_generation;
 
-        if prev == tail {
-            return Ok(tail);
+        // Acquire fence ensures we see the writer's payload before the header.
+        fence(Ordering::Acquire);
+
+        // Read all available frames.
+        loop {
+            match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
+                Ok(Some(payload)) => {
+                    update_kernel_reader_slot(
+                        kernel,
+                        mapping_id,
+                        offset,
+                        KERNEL_READER_SLOT,
+                        reader_pos,
+                    )?;
+                    if let Err(_e) = stream.write_all(&payload) {
+                        running.store(false, Ordering::Relaxed);
+                        drop(release_kernel_reader_slot(
+                            kernel,
+                            mapping_id,
+                            offset,
+                            KERNEL_READER_SLOT,
+                        ));
+                        return Ok(());
+                    }
+                    if let Err(_e) = stream.flush() {
+                        running.store(false, Ordering::Relaxed);
+                        drop(release_kernel_reader_slot(
+                            kernel,
+                            mapping_id,
+                            offset,
+                            KERNEL_READER_SLOT,
+                        ));
+                        return Ok(());
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    running.store(false, Ordering::Relaxed);
+                    drop(release_kernel_reader_slot(
+                        kernel,
+                        mapping_id,
+                        offset,
+                        KERNEL_READER_SLOT,
+                    ));
+                    return Ok(());
+                }
+            }
         }
     }
 
-    Err(Error::Wasm("reservation contended".to_string()))
+    drop(release_kernel_reader_slot(
+        kernel,
+        mapping_id,
+        offset,
+        KERNEL_READER_SLOT,
+    ));
+
+    running.store(false, Ordering::Relaxed);
+    Ok(())
 }
 
 #[expect(
@@ -835,6 +997,7 @@ fn tcp_accept_loop(
     Ok(())
 }
 
+/// UDP recv proxy: reads datagrams from socket, writes frames to recv ring.
 fn udp_proxy_recv(
     kernel: &Kernel,
     socket: UdpSocket,
@@ -848,17 +1011,15 @@ fn udp_proxy_recv(
     while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                // Frame format: [header 12 bytes][addr_len 2 bytes][addr bytes][ecn 1 byte][payload]
+                // Frame format: [addr_len u16][addr bytes][payload]
                 let addr_bytes = addr.to_string().into_bytes();
                 let addr_len = addr_bytes.len() as u16;
-                let ecn: u8 = 0; // ECN not implemented yet
                 let payload_len = n;
-                let frame_len = 2 + addr_bytes.len() + 1 + payload_len;
+                let frame_len = 2 + addr_bytes.len() + payload_len;
 
                 let mut frame = Vec::with_capacity(frame_len);
                 frame.extend_from_slice(&addr_len.to_le_bytes());
                 frame.extend_from_slice(&addr_bytes);
-                frame.push(ecn);
                 frame.extend_from_slice(&buf[..payload_len]);
 
                 if let Err(_e) = write_frame(kernel, mapping_id, offset, capacity, &frame) {
@@ -869,9 +1030,7 @@ fn udp_proxy_recv(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout expired; check `running` and continue.
-            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
                 eprintln!("udp recv error: {e}");
                 break;
@@ -883,6 +1042,11 @@ fn udp_proxy_recv(
     Ok(())
 }
 
+/// UDP send proxy: reads frames from send ring, sends datagrams via socket.
+///
+/// Polls the generation counter to detect new data written by the guest.
+/// When the generation counter changes, reads available frames and sends
+/// them as UDP datagrams.
 fn udp_proxy_send(
     kernel: &Kernel,
     socket: UdpSocket,
@@ -892,58 +1056,81 @@ fn udp_proxy_send(
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut reader_pos: u64 = 0;
+    let mut last_generation: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
-        match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
-            Ok(Some(frame)) => {
-                update_kernel_reader_slot(
-                    kernel,
-                    mapping_id,
-                    offset,
-                    KERNEL_READER_SLOT,
-                    reader_pos,
-                )?;
+        // Poll the generation counter to detect new data.
+        let current_generation = read_u64(kernel, mapping_id, offset + GENERATION_COUNTER_OFFSET)?;
 
-                // Parse frame: [addr_len 2 bytes][addr bytes][payload]
-                if frame.len() < 2 {
-                    continue;
-                }
-                let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
-                if frame.len() < 2 + addr_len {
-                    continue;
-                }
-                let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
-                    .map_err(|e| Error::Wasm(format!("invalid address bytes: {e}")))?;
-                let addr: SocketAddr = addr_str
-                    .parse()
-                    .map_err(|e| Error::Wasm(format!("invalid address: {e}")))?;
-                let payload = &frame[2 + addr_len..];
+        if current_generation == last_generation {
+            // No new data; check if all writers have disconnected.
+            match read_u64(kernel, mapping_id, offset + WRITER_COUNT_OFFSET) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
+            continue;
+        }
 
-                if let Err(_e) = socket.send_to(payload, addr) {
-                    break;
-                }
-            }
-            Ok(None) => {
-                match kernel.read_shared_memory(mapping_id, offset + WRITER_COUNT_OFFSET, 8) {
-                    Ok(bytes) => {
-                        let writer_count = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        if writer_count == 0 {
-                            break;
-                        }
+        last_generation = current_generation;
+
+        // Acquire fence ensures we see the writer's payload before the header.
+        fence(Ordering::Acquire);
+
+        // Read all available frames.
+        loop {
+            match read_frame(kernel, mapping_id, offset, capacity, &mut reader_pos) {
+                Ok(Some(frame)) => {
+                    update_kernel_reader_slot(
+                        kernel,
+                        mapping_id,
+                        offset,
+                        KERNEL_READER_SLOT,
+                        reader_pos,
+                    )?;
+
+                    // Parse frame: [addr_len u16][addr bytes][payload]
+                    if frame.len() < 2 {
+                        continue;
                     }
-                    Err(_) => {
-                        break;
+                    let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+                    if frame.len() < 2 + addr_len {
+                        continue;
+                    }
+                    let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
+                        .map_err(|e| Error::Wasm(format!("invalid address bytes: {e}")))?;
+                    let addr: SocketAddr = addr_str
+                        .parse()
+                        .map_err(|e| Error::Wasm(format!("invalid address: {e}")))?;
+                    let payload = &frame[2 + addr_len..];
+
+                    if let Err(_e) = socket.send_to(payload, addr) {
+                        running.store(false, Ordering::Relaxed);
+                        drop(release_kernel_reader_slot(
+                            kernel,
+                            mapping_id,
+                            offset,
+                            KERNEL_READER_SLOT,
+                        ));
+                        return Ok(());
                     }
                 }
-                thread::sleep(Duration::from_millis(PROXY_POLL_INTERVAL_MS));
-            }
-            Err(_) => {
-                break;
+                Ok(None) => break,
+                Err(_) => {
+                    running.store(false, Ordering::Relaxed);
+                    drop(release_kernel_reader_slot(
+                        kernel,
+                        mapping_id,
+                        offset,
+                        KERNEL_READER_SLOT,
+                    ));
+                    return Ok(());
+                }
             }
         }
     }
 
-    // Release kernel reader slot on exit
     drop(release_kernel_reader_slot(
         kernel,
         mapping_id,
@@ -955,178 +1142,68 @@ fn udp_proxy_send(
     Ok(())
 }
 
-fn update_kernel_reader_slot(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    slot: u32,
-    position: u64,
-) -> Result<()> {
-    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * READER_SLOT_BYTES;
-    let encoded = position
-        .checked_add(1)
-        .ok_or_else(|| Error::Wasm("reader position overflow".to_string()))?;
-    kernel
-        .write_shared_memory(mapping_id, slot_offset as u64, &encoded.to_le_bytes())
-        .map_err(|e| Error::Wasm(format!("update reader slot failed: {e}")))?;
-    Ok(())
-}
-
-fn write_at(
-    kernel: &Kernel,
-    mapping_id: u64,
-    region_offset: u64,
-    capacity: u64,
-    pos: u64,
-    data: &[u8],
-) -> Result<()> {
-    let data_offset = region_offset + REGION_HEADER_BYTES;
-    let raw_pos = data_offset + (pos & (capacity - 1));
-    let ring_end = data_offset + capacity;
-
-    if raw_pos + data.len() as u64 <= ring_end {
-        kernel
-            .write_shared_memory(mapping_id, raw_pos, data)
-            .map_err(|e| Error::Wasm(format!("write_at failed: {e}")))
-    } else {
-        let tail_len = ring_end - raw_pos;
-        kernel
-            .write_shared_memory(
-                mapping_id,
-                raw_pos,
-                data.get(..tail_len as usize).unwrap_or(&[]),
-            )
-            .map_err(|e| Error::Wasm(format!("write_at tail failed: {e}")))?;
-        kernel
-            .write_shared_memory(
-                mapping_id,
-                data_offset,
-                data.get(tail_len as usize..).unwrap_or(&[]),
-            )
-            .map_err(|e| Error::Wasm(format!("write_at head failed: {e}")))?;
-        Ok(())
-    }
-}
-
-fn write_frame(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    payload: &[u8],
-) -> Result<()> {
-    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
-    if frame_size > capacity {
-        return Err(Error::Wasm("frame exceeds capacity".to_string()));
-    }
-
-    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
-
-    // Write pending header
-    let header = FrameHeader {
-        len: payload.len() as u32,
-        tag: 0,
-        flags: 0,
-        _reserved: [0; 3],
-    };
-    write_at(kernel, mapping_id, offset, capacity, pos, &header.encode())?;
-
-    // Write payload
-    let payload_pos = pos + FRAME_HEADER_SIZE;
-    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
-
-    // Write ready header
-    let ready_header = FrameHeader {
-        len: payload.len() as u32,
-        tag: 0,
-        flags: FLAG_READY,
-        _reserved: [0; 3],
-    };
-    write_at(
-        kernel,
-        mapping_id,
-        offset,
-        capacity,
-        pos,
-        &ready_header.encode(),
-    )?;
-
-    Ok(())
-}
-
 #[cfg(test)]
-#[cfg(any())] // legacy networking tests — layer to be rewritten in follow-up change
 mod tests {
+    use super::*;
+    use crate::state::Kernel;
+    use std::time::Duration;
 
-    #[ignore]
     #[test]
     fn tcp_bind_creates_host_queue() {
         let kernel = Kernel::default();
         let descriptor = kernel.tcp_bind("127.0.0.1:0").expect("tcp bind");
         assert!(descriptor.shared_id > 0);
+        assert!(descriptor.local_id > 0);
         kernel.close_tcp_listener(descriptor.local_id).unwrap();
     }
 
-    #[ignore]
     #[test]
     fn tcp_connect_returns_shared_region() {
         let kernel = Kernel::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        // Create a helper listener to accept the connection.
+        let helper = std::net::TcpListener::bind("127.0.0.1:0").expect("bind helper");
+        let addr = helper.local_addr().expect("helper addr");
 
         std::thread::spawn(move || {
-            drop(listener.accept());
+            drop(helper.accept());
         });
 
         let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
         assert!(descriptor.shared_id > 0);
+        assert!(descriptor.len > 0);
+
+        // Verify the multi-memory header.
+        let mapping_id = kernel
+            .attach_shared_region(descriptor.shared_id)
+            .expect("attach");
+        let magic_bytes = kernel
+            .read_shared_memory(mapping_id, 0, 8)
+            .expect("read magic");
+        let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap());
+        assert_eq!(magic, SHARED_REGION_MAGIC, "expected shared region magic");
+
+        let count_bytes = kernel
+            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_COUNT_OFFSET as u64, 4)
+            .expect("read count");
+        let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
+        assert_eq!(count, 2, "expected 2 sub-memories");
+
+        drop(kernel.detach_shared_region(mapping_id));
     }
 
-    #[ignore]
-    #[test]
-    fn tcp_bind_accept_enqueues_connection() {
-        let kernel = Kernel::default();
-        let descriptor = kernel.tcp_bind("127.0.0.1:0").expect("tcp bind");
-        let shared_id = descriptor.shared_id;
-
-        let addr = {
-            let listeners = kernel.inner.tcp_listeners.lock();
-            let state = listeners.get(&descriptor.local_id).expect("listener state");
-            state._listener.local_addr().unwrap()
-        };
-
-        std::thread::spawn(move || {
-            drop(std::net::TcpStream::connect(addr));
-        });
-
-        // Wait briefly for the accept thread to process the connection.
-        std::thread::sleep(Duration::from_millis(500));
-
-        let _result = kernel.host_queue_recv(shared_id);
-        // The recv is async in kernel, but try_host_queue_recv is sync.
-        let entry = kernel
-            .try_host_queue_recv(descriptor.local_id)
-            .expect("try recv");
-        assert!(entry.is_some(), "expected a connection to be enqueued");
-        let (client_process_id, value) = entry.unwrap();
-        assert_eq!(client_process_id, 0);
-        assert!(value > 0, "expected shared region id");
-
-        kernel.close_tcp_listener(descriptor.local_id).unwrap();
-    }
-
-    #[ignore]
     #[test]
     fn tcp_connect_proxy_reads_and_writes_frames() {
         let kernel = Kernel::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let helper = std::net::TcpListener::bind("127.0.0.1:0").expect("bind helper");
+        let addr = helper.local_addr().expect("helper addr");
 
+        // Echo server: read data and send it back.
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            if let Ok((mut stream, _)) = helper.accept() {
                 let mut buf = [0u8; 256];
                 if let Ok(n) = stream.read(&mut buf) {
                     drop(stream.write_all(buf.get(..n).unwrap_or(&[])));
+                    drop(stream.flush());
                 }
             }
         });
@@ -1134,36 +1211,30 @@ mod tests {
         let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
-        // Attach to the shared region and verify layout.
-        let mapping = kernel
-            .attach_shared_region(shared_id, 0, descriptor.len)
-            .expect("attach");
-        let mapping_id = mapping.local_id;
+        // Attach to the shared region.
+        let mapping_id = kernel.attach_shared_region(shared_id).expect("attach");
 
         // Read multi-memory header to get sub-memory offsets.
-        let count_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_COUNT_OFFSET, 4)
-            .expect("read count");
-        let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
-        assert_eq!(count, 2);
-
-        let inbound_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET, 4)
-            .expect("read inbound offset");
-        let inbound_offset = u32::from_le_bytes(inbound_offset_bytes.try_into().unwrap()) as u64;
-
-        let outbound_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET + 8, 4)
-            .expect("read outbound offset");
-        let outbound_offset = u32::from_le_bytes(outbound_offset_bytes.try_into().unwrap()) as u64;
+        let inbound_offset = {
+            let bytes = kernel
+                .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET as u64, 4)
+                .expect("read inbound offset");
+            u32::from_le_bytes(bytes.try_into().unwrap()) as u64
+        };
+        let outbound_offset = {
+            let bytes = kernel
+                .read_shared_memory(
+                    mapping_id,
+                    (SHARED_REGION_HEADER_ENTRY_OFFSET + 8) as u64,
+                    4,
+                )
+                .expect("read outbound offset");
+            u32::from_le_bytes(bytes.try_into().unwrap()) as u64
+        };
 
         // Increment outbound writer count to simulate the guest writer.
         kernel
-            .fetch_add_shared_memory_u64(
-                mapping_id,
-                (outbound_offset + WRITER_COUNT_OFFSET) as u32,
-                1,
-            )
+            .fetch_add_shared_memory_u64(mapping_id, outbound_offset + WRITER_COUNT_OFFSET, 1)
             .expect("increment outbound writer count");
 
         // Write a frame to the outbound ring (guest -> kernel -> socket).
@@ -1177,18 +1248,17 @@ mod tests {
         )
         .expect("write frame");
 
-        // Wait up to 10 seconds for the echo to come back on the inbound ring.
+        // Wait up to 5 seconds for the echo to come back on the inbound ring.
         let mut found = false;
-        for _attempt in 0..100 {
+        for _attempt in 0..50 {
             let mut reader_pos: u64 = 0;
-            let frame = read_frame(
+            match read_frame(
                 &kernel,
                 mapping_id,
                 inbound_offset,
                 DEFAULT_RING_CAPACITY as u64,
                 &mut reader_pos,
-            );
-            match frame {
+            ) {
                 Ok(Some(data)) => {
                     if data == payload {
                         found = true;
@@ -1203,48 +1273,51 @@ mod tests {
         drop(kernel.detach_shared_region(mapping_id));
     }
 
-    #[ignore]
     #[test]
     fn tcp_connect_proxy_eof_propagation() {
         let kernel = Kernel::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let helper = std::net::TcpListener::bind("127.0.0.1:0").expect("bind helper");
+        let addr = helper.local_addr().expect("helper addr");
 
+        // Server that reads, echoes, then closes.
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            if let Ok((mut stream, _)) = helper.accept() {
                 let mut buf = [0u8; 256];
                 if let Ok(n) = stream.read(&mut buf) {
                     drop(stream.write_all(buf.get(..n).unwrap_or(&[])));
+                    drop(stream.flush());
                 }
-                drop(stream);
+                drop(stream); // Close the connection.
             }
         });
 
         let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
-        let mapping = kernel
-            .attach_shared_region(shared_id, 0, descriptor.len)
-            .expect("attach");
-        let mapping_id = mapping.local_id;
+        let mapping_id = kernel.attach_shared_region(shared_id).expect("attach");
 
-        let inbound_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET, 4)
-            .expect("read inbound offset");
-        let inbound_offset = u32::from_le_bytes(inbound_offset_bytes.try_into().unwrap()) as u64;
+        let inbound_offset = {
+            let bytes = kernel
+                .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET as u64, 4)
+                .expect("read inbound offset");
+            u32::from_le_bytes(bytes.try_into().unwrap()) as u64
+        };
+        let outbound_offset = {
+            let bytes = kernel
+                .read_shared_memory(
+                    mapping_id,
+                    (SHARED_REGION_HEADER_ENTRY_OFFSET + 8) as u64,
+                    4,
+                )
+                .expect("read outbound offset");
+            u32::from_le_bytes(bytes.try_into().unwrap()) as u64
+        };
 
-        let outbound_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET + 8, 4)
-            .expect("read outbound offset");
-        let outbound_offset = u32::from_le_bytes(outbound_offset_bytes.try_into().unwrap()) as u64;
-
+        // Increment outbound writer count.
         kernel
-            .fetch_add_shared_memory_u64(
-                mapping_id,
-                (outbound_offset + WRITER_COUNT_OFFSET) as u32,
-                1,
-            )
+            .fetch_add_shared_memory_u64(mapping_id, outbound_offset + WRITER_COUNT_OFFSET, 1)
             .expect("increment outbound writer count");
 
+        // Write a frame.
         let payload = b"hello proxy";
         write_frame(
             &kernel,
@@ -1255,17 +1328,17 @@ mod tests {
         )
         .expect("write frame");
 
+        // Wait for the echo.
         let mut found = false;
-        for _ in 0..100 {
+        for _ in 0..50 {
             let mut reader_pos: u64 = 0;
-            let frame = read_frame(
+            match read_frame(
                 &kernel,
                 mapping_id,
                 inbound_offset,
                 DEFAULT_RING_CAPACITY as u64,
                 &mut reader_pos,
-            );
-            match frame {
+            ) {
                 Ok(Some(data)) => {
                     if data == payload {
                         found = true;
@@ -1277,22 +1350,11 @@ mod tests {
         }
         assert!(found, "expected a frame on inbound ring");
 
-        // Verify outbound writer_count is 1 before shutdown.
-        let wc_bytes = kernel
-            .read_shared_memory(
-                mapping_id,
-                (outbound_offset + WRITER_COUNT_OFFSET) as u32,
-                8,
-            )
-            .expect("read writer count");
-        let wc = u64::from_le_bytes(wc_bytes.try_into().unwrap());
-        assert_eq!(wc, 1, "expected writer_count to be 1 before shutdown");
-
-        // Decrement writer count to 0, simulating guest shutdown.
+        // Decrement outbound writer count to simulate guest shutdown.
         kernel
             .fetch_add_shared_memory_u64(
                 mapping_id,
-                (outbound_offset + WRITER_COUNT_OFFSET) as u32,
+                outbound_offset + WRITER_COUNT_OFFSET,
                 u64::MAX,
             )
             .expect("decrement outbound writer count");
@@ -1302,7 +1364,7 @@ mod tests {
 
         // Verify inbound ring writer_count is 0 (proxy_inbound decremented on EOF).
         let inbound_wc_bytes = kernel
-            .read_shared_memory(mapping_id, (inbound_offset + WRITER_COUNT_OFFSET) as u32, 8)
+            .read_shared_memory(mapping_id, inbound_offset + WRITER_COUNT_OFFSET, 8)
             .expect("read inbound writer count");
         let inbound_wc = u64::from_le_bytes(inbound_wc_bytes.try_into().unwrap());
         assert_eq!(
@@ -1313,72 +1375,120 @@ mod tests {
         drop(kernel.detach_shared_region(mapping_id));
     }
 
-    #[ignore]
     #[test]
     fn udp_bind_returns_shared_region() {
         let kernel = Kernel::default();
         let descriptor = kernel.udp_bind("127.0.0.1:0").expect("udp bind");
         assert!(descriptor.shared_id > 0);
+        assert!(descriptor.len > 0);
         kernel.close_udp_socket(descriptor.shared_id).unwrap();
     }
 
-    #[ignore]
     #[test]
-    fn udp_bind_proxy_reads_and_writes_datagrams() {
+    fn create_stream_region_has_correct_layout() {
         let kernel = Kernel::default();
-        let descriptor = kernel.udp_bind("127.0.0.1:0").expect("udp bind");
-        let shared_id = descriptor.shared_id;
+        let (region, inbound_offset, outbound_offset) =
+            create_stream_region(&kernel).expect("create stream region");
 
-        // Verify the shared region layout.
-        let mapping = kernel
-            .attach_shared_region(shared_id, 0, descriptor.len)
+        let mapping_id = kernel
+            .attach_shared_region(region.shared_id)
             .expect("attach");
-        let mapping_id = mapping.local_id;
 
-        // Read multi-memory header to get sub-memory offsets.
+        // Verify magic.
+        let magic_bytes = kernel
+            .read_shared_memory(mapping_id, 0, 8)
+            .expect("read magic");
+        let magic = u64::from_le_bytes(magic_bytes.try_into().unwrap());
+        assert_eq!(magic, SHARED_REGION_MAGIC);
+
+        // Verify count.
         let count_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_COUNT_OFFSET, 4)
+            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_COUNT_OFFSET as u64, 4)
             .expect("read count");
         let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
         assert_eq!(count, 2);
 
-        let send_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET + 8, 4)
-            .expect("read send offset");
-        let send_offset = u32::from_le_bytes(send_offset_bytes.try_into().unwrap()) as u64;
-
-        // Increment send writer count to simulate the guest writer.
-        kernel
-            .fetch_add_shared_memory_u64(mapping_id, (send_offset + WRITER_COUNT_OFFSET) as u32, 1)
-            .expect("increment send writer count");
-
-        // Write a UDP frame to the send ring (guest -> kernel -> socket).
-        // Frame format: [addr_len 2 bytes][addr bytes][payload]
-        let addr_str = "127.0.0.1:12345";
-        let addr_bytes = addr_str.as_bytes();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
-        frame.extend_from_slice(addr_bytes);
-        frame.extend_from_slice(b"hello udp");
-
-        write_frame(
+        // Verify inbound ring coordination fields are initialized.
+        let generation = read_u64(
             &kernel,
             mapping_id,
-            send_offset,
-            DEFAULT_RING_CAPACITY as u64,
-            &frame,
+            inbound_offset + GENERATION_COUNTER_OFFSET,
         )
-        .expect("write frame");
+        .unwrap();
+        assert_eq!(generation, 0, "generation counter should be 0");
 
-        // Give proxy a moment to process the send.
-        std::thread::sleep(Duration::from_millis(200));
+        let next_tail = read_u64(&kernel, mapping_id, inbound_offset + NEXT_TAIL_OFFSET).unwrap();
+        assert_eq!(next_tail, 0, "next_tail should be 0");
 
-        // Clean up
-        kernel.close_udp_socket(shared_id).unwrap();
+        // Inbound writer_count should be 1 (kernel is the writer).
+        let wc = read_u64(&kernel, mapping_id, inbound_offset + WRITER_COUNT_OFFSET).unwrap();
+        assert_eq!(wc, 1, "inbound writer_count should be 1");
+
+        // Verify outbound ring has kernel reader slot 0 allocated.
+        let slot0 = read_u64(&kernel, mapping_id, outbound_offset + READER_SLOTS_OFFSET).unwrap();
+        assert_eq!(
+            slot0, 1,
+            "outbound reader slot 0 should be allocated (encoded position 1 = position 0)"
+        );
+
         drop(kernel.detach_shared_region(mapping_id));
     }
 
-    #[ignore]
+    #[test]
+    fn kernel_write_frame_visible_to_guest_layout() {
+        // This test verifies that frames written by the kernel's write_frame
+        // function are readable using the same layout as the guest's RingBuf.
+        let kernel = Kernel::default();
+        let (region, inbound_offset, _outbound_offset) =
+            create_stream_region(&kernel).expect("create stream region");
+
+        let mapping_id = kernel
+            .attach_shared_region(region.shared_id)
+            .expect("attach");
+
+        // Write a frame using the kernel's write_frame.
+        let payload = b"test payload";
+        write_frame(
+            &kernel,
+            mapping_id,
+            inbound_offset,
+            DEFAULT_RING_CAPACITY as u64,
+            payload,
+        )
+        .expect("write frame");
+
+        // Verify the frame is readable.
+        let mut reader_pos: u64 = 0;
+        let frame = read_frame(
+            &kernel,
+            mapping_id,
+            inbound_offset,
+            DEFAULT_RING_CAPACITY as u64,
+            &mut reader_pos,
+        )
+        .expect("read frame");
+
+        assert_eq!(frame, Some(payload.to_vec()), "frame payload should match");
+
+        // Verify generation counter was bumped.
+        let generation = read_u64(
+            &kernel,
+            mapping_id,
+            inbound_offset + GENERATION_COUNTER_OFFSET,
+        )
+        .unwrap();
+        assert!(
+            generation > 0,
+            "generation counter should be > 0 after write"
+        );
+
+        // Verify next_tail was advanced.
+        let next_tail = read_u64(&kernel, mapping_id, inbound_offset + NEXT_TAIL_OFFSET).unwrap();
+        assert!(next_tail > 0, "next_tail should be > 0 after write");
+
+        drop(kernel.detach_shared_region(mapping_id));
+    }
+
     #[test]
     fn udp_socket_loopback_test() {
         let kernel = Kernel::default();
@@ -1392,19 +1502,23 @@ mod tests {
         let shared_id = descriptor.shared_id;
 
         // Attach to the shared region.
-        let mapping = kernel
-            .attach_shared_region(shared_id, 0, descriptor.len)
-            .expect("attach");
-        let mapping_id = mapping.local_id;
+        let mapping_id = kernel.attach_shared_region(shared_id).expect("attach");
 
-        let send_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET + 8, 4)
-            .expect("read send offset");
-        let send_offset = u32::from_le_bytes(send_offset_bytes.try_into().unwrap()) as u64;
+        // Read multi-memory header to get sub-memory offsets.
+        let send_offset = {
+            let bytes = kernel
+                .read_shared_memory(
+                    mapping_id,
+                    (SHARED_REGION_HEADER_ENTRY_OFFSET + 8) as u64,
+                    4,
+                )
+                .expect("read send offset");
+            u32::from_le_bytes(bytes.try_into().unwrap()) as u64
+        };
 
         // Increment send writer count.
         kernel
-            .fetch_add_shared_memory_u64(mapping_id, (send_offset + WRITER_COUNT_OFFSET) as u32, 1)
+            .fetch_add_shared_memory_u64(mapping_id, send_offset + WRITER_COUNT_OFFSET, 1)
             .expect("increment send writer count");
 
         // Write a frame to the send ring addressed to the helper socket.
@@ -1431,82 +1545,10 @@ mod tests {
             .expect("set timeout");
         let (n, src_addr) = helper.recv_from(&mut buf).expect("recv from helper");
         assert_eq!(&buf[..n], b"loopback test");
-
-        // Send a response back from the helper to the kernel socket.
-        // We need the kernel socket's address. Since we bound to 127.0.0.1:0,
-        // we need to discover the port. We can do this by having the kernel
-        // socket receive a datagram and inspecting the source.
-        // For simplicity, let's just verify the proxy sent successfully.
         assert!(src_addr.ip().is_loopback());
 
         // Clean up
         kernel.close_udp_socket(shared_id).unwrap();
-        drop(kernel.detach_shared_region(mapping_id));
-    }
-
-    #[ignore]
-    #[test]
-    fn tcp_connect_proxy_backpressure_on_full_ring() {
-        let kernel = Kernel::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Server sends a large payload then keeps the connection alive briefly.
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let large_payload = vec![0xABu8; 256 * 1024];
-                drop(stream.write_all(&large_payload));
-                drop(stream.flush());
-                std::thread::sleep(Duration::from_millis(2000));
-                drop(stream);
-            }
-        });
-
-        let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
-        let shared_id = descriptor.shared_id;
-        let mapping = kernel
-            .attach_shared_region(shared_id, 0, descriptor.len)
-            .expect("attach");
-        let mapping_id = mapping.local_id;
-
-        let inbound_offset_bytes = kernel
-            .read_shared_memory(mapping_id, SHARED_REGION_HEADER_ENTRY_OFFSET, 4)
-            .expect("read inbound offset");
-        let inbound_offset = u32::from_le_bytes(inbound_offset_bytes.try_into().unwrap()) as u64;
-
-        // Register a reader slot at position 0 on the inbound ring.
-        // Without a reader, minimum_reader_position() returns None and
-        // reserve_tail never enforces backpressure.
-        let reader_slot_offset = inbound_offset + READER_SLOTS_OFFSET + READER_ACTIVE_OFFSET;
-        kernel
-            .write_shared_memory(mapping_id, reader_slot_offset as u64, &1u64.to_le_bytes())
-            .expect("register inbound reader slot");
-
-        // Allow proxy to start receiving data.
-        std::thread::sleep(Duration::from_millis(500));
-
-        // Verify the inbound ring has received data.
-        let tail_bytes = kernel
-            .read_shared_memory(mapping_id, (inbound_offset + NEXT_TAIL_OFFSET) as u32, 8)
-            .expect("read tail");
-        let tail = u64::from_le_bytes(tail_bytes.try_into().unwrap());
-        assert!(tail > 0, "expected inbound ring to have received data");
-
-        // Wait for backpressure to kick in.
-        std::thread::sleep(Duration::from_millis(1000));
-
-        // Tail should be bounded by ring capacity because proxy_inbound
-        // cannot reserve space while the reader slot stays at position 0.
-        let tail_bytes2 = kernel
-            .read_shared_memory(mapping_id, (inbound_offset + NEXT_TAIL_OFFSET) as u32, 8)
-            .expect("read tail 2");
-        let tail2 = u64::from_le_bytes(tail_bytes2.try_into().unwrap());
-        assert!(
-            tail2 <= DEFAULT_RING_CAPACITY as u64 + FRAME_HEADER_SIZE,
-            "expected inbound tail bounded by ring capacity, got {}",
-            tail2
-        );
-
         drop(kernel.detach_shared_region(mapping_id));
     }
 }

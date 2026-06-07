@@ -9,13 +9,29 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Byte offset of the generation counter within the shared region.
 pub const GENERATION_COUNTER_OFFSET: u64 = 0;
 
+/// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
+pub const NEXT_TAIL_OFFSET: u64 = 8;
+
+/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
+pub const WRITER_COUNT_OFFSET: u64 = 16;
+
+/// Byte offset where the shared `reader_slots` array begins (128 × u64).
+pub const READER_SLOTS_OFFSET: u64 = 24;
+
+/// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
+pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+
+/// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
+pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
+
 /// Byte offset where ring buffer data begins (page 1).
 pub const DATA_OFFSET: u64 = PAGE_SIZE;
 
 /// Minimum region size that can hold a ring buffer (header page + one data page).
 pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
 
-const MAX_READER_SLOTS: usize = 128;
+/// Maximum number of strong reader slots available in the shared region.
+pub const MAX_READER_SLOTS: usize = 128;
 
 /// A direct-memory mapping of a shared region.
 ///
@@ -79,6 +95,31 @@ impl RegionMapping {
     /// Returns the mapping size in bytes.
     pub fn size(&self) -> u64 {
         self.inner.size
+    }
+
+    /// Creates a sub-mapping that points to a sub-region of this mapping.
+    ///
+    /// The sub-mapping shares the same underlying memory (via Arc) but has
+    /// a different base pointer and size. This is useful for multi-memory
+    /// regions where each sub-memory has its own offset and length.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `offset + size` does not exceed the
+    /// parent mapping's size.
+    pub fn sub_region(&self, offset: u64, size: u64) -> Result<Self> {
+        if offset.checked_add(size).ok_or(Error::CapacityExceeded)? > self.inner.size {
+            return Err(Error::IndexOutOfBounds);
+        }
+        let new_base = unsafe { self.inner.base.add(offset as usize) };
+        Ok(Self {
+            inner: Arc::new(RegionMappingInner {
+                base: new_base,
+                size,
+                // Share the parent's backing to keep the memory alive.
+                _backing: self.inner._backing.clone(),
+            }),
+        })
     }
 
     /// Reads bytes at the given offset.
@@ -196,30 +237,19 @@ impl RegionMapping {
 
 /// Per-guest private channel state. Not stored in shared memory.
 ///
-/// Cloned `ChannelRegion` handles share this state via `Arc`, so all
-/// readers and writers created from the same channel coordinate through it.
+/// Only process-local optimisation fields remain here. Cross-process
+/// coordination metadata (`next_tail`, `writer_count`, `reader_slots`,
+/// `next_writer_id`) lives in the shared region at well-known offsets.
 struct ChannelPrivateState {
-    next_tail: AtomicU64,
     tail_cache: AtomicU64,
-    writer_count: AtomicU64,
-    next_writer_id: AtomicU64,
     next_mutation_id: AtomicU64,
-    reader_slots: Vec<AtomicU64>,
 }
 
 impl Default for ChannelPrivateState {
     fn default() -> Self {
-        let mut reader_slots = Vec::with_capacity(MAX_READER_SLOTS);
-        for _ in 0..MAX_READER_SLOTS {
-            reader_slots.push(AtomicU64::new(0));
-        }
         Self {
-            next_tail: AtomicU64::new(0),
             tail_cache: AtomicU64::new(0),
-            writer_count: AtomicU64::new(0),
-            next_writer_id: AtomicU64::new(0),
             next_mutation_id: AtomicU64::new(0),
-            reader_slots,
         }
     }
 }
@@ -229,9 +259,14 @@ pub struct RegionBuilder;
 
 /// A shared memory region allocated for ring buffer I/O.
 ///
-/// The shared region contains only a generation counter (for atomic wait/notify)
-/// and ring buffer data. All other metadata (tail cursor, reader slots, writer
-/// IDs) lives in per-guest private memory via `ChannelPrivateState`.
+/// The shared region contains cross-process coordination fields in page 0:
+/// generation counter (offset 0), `next_tail` (offset 8), `writer_count`
+/// (offset 16), `reader_slots` (128 × u64 at offset 24), `next_writer_id`
+/// (offset 1048), and `reader_slot_counter` (offset 1056). Ring buffer data
+/// starts at page 1 (offset 4096).
+///
+/// Process-local optimisation fields (`tail_cache`, `next_mutation_id`) live
+/// in per-guest private memory via `ChannelPrivateState`.
 #[derive(Clone)]
 pub struct ChannelRegion {
     region_id: u64,
@@ -330,15 +365,28 @@ impl ChannelRegion {
         Ok(new_gen + 1)
     }
 
-    /// Reads the next_tail cursor from private state.
-    pub fn read_next_tail(&self) -> Result<u64> {
-        Ok(self.private.next_tail.load(Ordering::Acquire))
+    /// Loads the shared `next_tail` cursor from shared memory.
+    pub fn load_next_tail(&self) -> Result<u64> {
+        self.mapping
+            .atomic_load_u64(NEXT_TAIL_OFFSET, Ordering::Acquire)
     }
 
-    /// Writes the next_tail cursor to private state.
+    /// Atomically CAS on the shared `next_tail` cursor.
+    /// Returns the previous value (equals `current` on success).
+    pub fn cas_next_tail(&self, current: u64, new: u64) -> Result<u64> {
+        self.mapping
+            .compare_exchange_u64(NEXT_TAIL_OFFSET, current, new)
+    }
+
+    /// Reads the next_tail cursor from shared memory (alias for `load_next_tail`).
+    pub fn read_next_tail(&self) -> Result<u64> {
+        self.load_next_tail()
+    }
+
+    /// Writes the next_tail cursor to shared memory.
     pub fn write_next_tail(&self, value: u64) -> Result<()> {
-        self.private.next_tail.store(value, Ordering::Release);
-        Ok(())
+        self.mapping
+            .atomic_store_u64(NEXT_TAIL_OFFSET, value, Ordering::Release)
     }
 
     /// Reads the tail_cache from private state.
@@ -346,87 +394,118 @@ impl ChannelRegion {
         Ok(self.private.tail_cache.load(Ordering::Acquire))
     }
 
-    /// Reads the writer count from private state.
+    /// Loads the shared `writer_count` from shared memory.
+    pub fn load_writer_count(&self) -> Result<u64> {
+        self.mapping
+            .atomic_load_u64(WRITER_COUNT_OFFSET, Ordering::Acquire)
+    }
+
+    /// Atomically adds to the shared `writer_count`, returning the previous value.
+    pub fn fetch_add_writer_count(&self, delta: u64) -> Result<u64> {
+        self.mapping
+            .fetch_add_u64(WRITER_COUNT_OFFSET, delta, Ordering::SeqCst)
+    }
+
+    /// Reads the writer count from shared memory.
     pub fn read_writer_count(&self) -> Result<u64> {
-        Ok(self.private.writer_count.load(Ordering::Acquire))
+        self.load_writer_count()
     }
 
-    /// Increments the writer count and returns the previous value.
+    /// Increments the shared writer count and returns the previous value.
     pub fn increment_writer_count(&self) -> Result<u64> {
-        Ok(self.private.writer_count.fetch_add(1, Ordering::SeqCst))
+        self.fetch_add_writer_count(1)
     }
 
-    /// Decrements the writer count.
+    /// Decrements the shared writer count.
     pub fn decrement_writer_count(&self) -> Result<()> {
-        self.private
-            .writer_count
-            .fetch_add(u64::MAX, Ordering::SeqCst);
+        self.fetch_add_writer_count(u64::MAX)?;
         Ok(())
     }
 
-    /// Allocates a stable writer id.
+    /// Loads a reader slot value from the shared `reader_slots` array.
+    pub fn load_reader_slot(&self, slot: u32) -> Result<u64> {
+        if slot as usize >= MAX_READER_SLOTS {
+            return Err(Error::InvalidLayout);
+        }
+        let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
+        self.mapping.atomic_load_u64(offset, Ordering::Acquire)
+    }
+
+    /// Stores a value into a reader slot in the shared `reader_slots` array.
+    pub fn store_reader_slot(&self, slot: u32, value: u64) -> Result<()> {
+        if slot as usize >= MAX_READER_SLOTS {
+            return Err(Error::InvalidLayout);
+        }
+        let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
+        self.mapping
+            .atomic_store_u64(offset, value, Ordering::Release)
+    }
+
+    /// Atomically increments the shared `next_writer_id` counter, returning the previous value.
+    pub fn fetch_add_next_writer_id(&self) -> Result<u64> {
+        self.mapping
+            .fetch_add_u64(NEXT_WRITER_ID_OFFSET, 1, Ordering::SeqCst)
+    }
+
+    /// Atomically increments the shared `reader_slot_counter`, returning the previous value.
+    pub fn fetch_add_reader_slot_counter(&self) -> Result<u64> {
+        self.mapping
+            .fetch_add_u64(READER_SLOT_COUNTER_OFFSET, 1, Ordering::SeqCst)
+    }
+
+    /// Allocates a stable writer id from the shared counter.
     pub fn allocate_writer_id(&self) -> Result<u32> {
-        let id = self.private.next_writer_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.fetch_add_next_writer_id()?;
         if id > u64::from(u32::MAX) {
             return Err(Error::CapacityExceeded);
         }
         Ok(id as u32)
     }
 
-    /// Allocates a globally unique mutation id.
+    /// Allocates a globally unique mutation id from private state.
     pub fn allocate_mutation_id(&self) -> Result<u64> {
         Ok(self.private.next_mutation_id.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
-    /// Reads the strong reader count from private state.
+    /// Reads the strong reader count by scanning shared reader slots.
     pub fn read_reader_count(&self) -> Result<u64> {
         let mut count = 0;
-        for slot in &self.private.reader_slots {
-            if slot.load(Ordering::Acquire) != 0 {
+        for i in 0..MAX_READER_SLOTS as u32 {
+            if self.load_reader_slot(i)? != 0 {
                 count += 1;
             }
         }
         Ok(count)
     }
 
-    /// Allocates a reader cursor slot and initialises it to `position`.
+    /// Allocates a reader cursor slot via the shared `reader_slot_counter`
+    /// (fetch_add for global uniqueness) and initialises it to `position`.
     pub fn allocate_reader_slot(&self, position: u64) -> Result<u32> {
+        let slot_index = self.fetch_add_reader_slot_counter()?;
+        if slot_index >= MAX_READER_SLOTS as u64 {
+            return Err(Error::CapacityExceeded);
+        }
         let encoded_position = encode_reader_position(position)?;
-        for (i, slot) in self.private.reader_slots.iter().enumerate() {
-            if slot
-                .compare_exchange(0, encoded_position, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(i as u32);
-            }
-        }
-        Err(Error::CapacityExceeded)
+        self.store_reader_slot(slot_index as u32, encoded_position)?;
+        Ok(slot_index as u32)
     }
 
-    /// Updates an allocated reader cursor slot.
+    /// Updates an allocated reader cursor slot in the shared `reader_slots` array.
     pub fn update_reader_slot(&self, slot: u32, position: u64) -> Result<()> {
-        if slot as usize >= MAX_READER_SLOTS {
-            return Err(Error::InvalidLayout);
-        }
         let encoded = encode_reader_position(position)?;
-        self.private.reader_slots[slot as usize].store(encoded, Ordering::Release);
-        Ok(())
+        self.store_reader_slot(slot, encoded)
     }
 
-    /// Releases an allocated reader cursor slot.
+    /// Releases an allocated reader cursor slot in the shared `reader_slots` array.
     pub fn release_reader_slot(&self, slot: u32) -> Result<()> {
-        if slot as usize >= MAX_READER_SLOTS {
-            return Err(Error::InvalidLayout);
-        }
-        self.private.reader_slots[slot as usize].store(0, Ordering::Release);
-        Ok(())
+        self.store_reader_slot(slot, 0)
     }
 
-    /// Returns the minimum active strong-reader cursor from private state.
+    /// Returns the minimum active strong-reader cursor from shared reader slots.
     pub fn minimum_reader_position(&self) -> Result<Option<u64>> {
         let mut minimum = None;
-        for slot in &self.private.reader_slots {
-            let encoded_position = slot.load(Ordering::Acquire);
+        for i in 0..MAX_READER_SLOTS as u32 {
+            let encoded_position = self.load_reader_slot(i)?;
             if encoded_position == 0 {
                 continue;
             }
@@ -439,6 +518,7 @@ impl ChannelRegion {
     /// Atomically reserves `len` bytes at the tail, returning the reservation position.
     ///
     /// Uses exponential backoff on CAS contention (1→2→4→…→64 spin-loop iterations).
+    /// CAS operates on the shared `next_tail` field for cross-process coordination.
     pub fn reserve_tail(&self, len: u64, protect_readers: bool) -> Result<u64> {
         if len == 0 || len > self.capacity {
             return Err(Error::CapacityExceeded);
@@ -446,7 +526,7 @@ impl ChannelRegion {
 
         let mut delay: usize = 1;
         loop {
-            let tail = self.read_next_tail()?;
+            let tail = self.load_next_tail()?;
             let minimum_reader_position = if protect_readers {
                 self.minimum_reader_position()?
             } else {
@@ -460,12 +540,8 @@ impl ChannelRegion {
                 protect_readers,
             )?;
 
-            if self
-                .private
-                .next_tail
-                .compare_exchange(tail, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            let prev = self.cas_next_tail(tail, next)?;
+            if prev == tail {
                 return Ok(tail);
             }
 
@@ -489,10 +565,21 @@ impl ChannelRegion {
         self.mapping.write(data_offset, bytes)
     }
 
-    /// Initialises a fresh region with only the generation counter.
+    /// Initialises a fresh region with all shared coordination fields zeroed.
     pub fn initialise(&self) -> Result<()> {
         self.mapping
-            .atomic_store_u64(GENERATION_COUNTER_OFFSET, 0, Ordering::Release)
+            .atomic_store_u64(GENERATION_COUNTER_OFFSET, 0, Ordering::Release)?;
+        self.mapping
+            .atomic_store_u64(NEXT_TAIL_OFFSET, 0, Ordering::Release)?;
+        self.mapping
+            .atomic_store_u64(WRITER_COUNT_OFFSET, 0, Ordering::Release)?;
+        for i in 0..MAX_READER_SLOTS as u32 {
+            self.store_reader_slot(i, 0)?;
+        }
+        self.mapping
+            .atomic_store_u64(NEXT_WRITER_ID_OFFSET, 0, Ordering::Release)?;
+        self.mapping
+            .atomic_store_u64(READER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)
     }
 }
 
@@ -645,5 +732,118 @@ mod tests {
         for h in handles {
             h.join().expect("thread panicked");
         }
+    }
+
+    #[test]
+    fn two_writers_coordinate_on_shared_next_tail() {
+        // Two ChannelRegion clones sharing the same underlying mapping
+        // simulate cross-process writers.
+        let region_a = RegionBuilder::create(4096).expect("create");
+        region_a.initialise().expect("init");
+        let region_b = region_a.clone();
+
+        let pos_a = region_a.reserve_tail(16, false).expect("reserve a");
+        let pos_b = region_b.reserve_tail(16, false).expect("reserve b");
+
+        // Positions must be unique and non-overlapping.
+        assert_ne!(pos_a, pos_b);
+        assert!(
+            pos_a + 16 <= pos_b || pos_b + 16 <= pos_a,
+            "reservations must not overlap"
+        );
+
+        // Both regions see the same next_tail.
+        assert_eq!(
+            region_a.load_next_tail().expect("tail a"),
+            region_b.load_next_tail().expect("tail b"),
+        );
+    }
+
+    #[test]
+    fn reader_sees_writer_count_from_cloned_region() {
+        let region_a = RegionBuilder::create(64).expect("create");
+        region_a.initialise().expect("init");
+        let region_b = region_a.clone();
+
+        // Writer count is shared.
+        assert_eq!(region_a.load_writer_count().expect("wc a"), 0);
+        region_a.increment_writer_count().expect("inc");
+        assert_eq!(region_b.load_writer_count().expect("wc b"), 1);
+
+        region_a.decrement_writer_count().expect("dec");
+        assert_eq!(region_b.load_writer_count().expect("wc b after dec"), 0);
+    }
+
+    #[test]
+    fn writer_backpressure_from_shared_reader_slots() {
+        let region = RegionBuilder::create(64).expect("create");
+        region.initialise().expect("init");
+
+        // Allocate a reader slot at position 0.
+        let slot = region.allocate_reader_slot(0).expect("alloc slot");
+
+        // Fill the ring up to capacity.
+        let mut total_reserved = 0u64;
+        loop {
+            match region.reserve_tail(8, true) {
+                Ok(_pos) => total_reserved += 8,
+                Err(Error::BufferFull) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        // The ring should be full because the reader slot is at position 0.
+        assert!(
+            total_reserved <= 64,
+            "reserved {total_reserved} bytes but capacity is 64"
+        );
+
+        // Advance the reader slot to free space.
+        region.update_reader_slot(slot, total_reserved).expect("update slot");
+
+        // Now we should be able to reserve more space.
+        let pos = region.reserve_tail(8, true).expect("reserve after advance");
+        assert!(pos >= total_reserved);
+    }
+
+    #[test]
+    fn reader_detects_eof_when_writer_count_reaches_zero() {
+        let region = RegionBuilder::create(64).expect("create");
+        region.initialise().expect("init");
+
+        // Initially no writers.
+        assert_eq!(region.load_writer_count().expect("wc"), 0);
+
+        // Add a writer.
+        region.increment_writer_count().expect("inc");
+        assert_eq!(region.load_writer_count().expect("wc"), 1);
+
+        // Writer disconnects.
+        region.decrement_writer_count().expect("dec");
+        assert_eq!(region.load_writer_count().expect("wc after dec"), 0);
+    }
+
+    #[test]
+    fn shared_reader_slot_counter_allocates_unique_indices() {
+        let region_a = RegionBuilder::create(4096).expect("create");
+        region_a.initialise().expect("init");
+        let region_b = region_a.clone();
+
+        let slot_a = region_a.allocate_reader_slot(0).expect("alloc a");
+        let slot_b = region_b.allocate_reader_slot(0).expect("alloc b");
+
+        assert_ne!(slot_a, slot_b, "slot indices must be unique");
+    }
+
+    #[test]
+    fn shared_writer_id_allocation() {
+        let region_a = RegionBuilder::create(64).expect("create");
+        region_a.initialise().expect("init");
+        let region_b = region_a.clone();
+
+        let id_a = region_a.allocate_writer_id().expect("id a");
+        let id_b = region_b.allocate_writer_id().expect("id b");
+
+        assert_ne!(id_a, id_b, "writer IDs must be unique");
     }
 }

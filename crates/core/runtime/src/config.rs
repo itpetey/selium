@@ -80,4 +80,35 @@ impl SystemGuestDescriptor {
             readiness: ReadinessCondition::Immediate,
         }
     }
+
+    /// Sets the discovery handle (host queue shared_id) for this guest.
+    ///
+    /// The discovery handle is passed as the first entrypoint argument.
+    /// Application guests use this to connect to the discovery service
+    /// via `Context::from_raw(discovery_handle)`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Create a host queue for discovery.
+    /// let discovery_queue = kernel.create_host_queue();
+    /// let discovery_shared_id = discovery_queue.shared_id;
+    ///
+    /// // Configure the discovery guest with the shared_id.
+    /// let mut discovery_guest = SystemGuestDescriptor::from_entrypoint_metadata(
+    ///     "discovery", "discovery-module", module_bytes, metadata, grants,
+    /// );
+    /// discovery_guest.set_discovery_handle(discovery_shared_id);
+    ///
+    /// // Configure application guests with the same shared_id.
+    /// let mut app_guest = SystemGuestDescriptor::from_entrypoint_metadata(
+    ///     "my-app", "app-module", app_bytes, app_metadata, app_grants,
+    /// );
+    /// app_guest.set_discovery_handle(discovery_shared_id);
+    /// app_guest.dependencies.push("discovery".to_string());
+    /// ```
+    pub fn set_discovery_handle(&mut self, shared_id: u64) {
+        // Encode the shared_id as a little-endian u64 argument.
+        self.arguments = vec![shared_id.to_le_bytes().to_vec()];
+    }
 }
