@@ -54,80 +54,80 @@ impl StrongReader {
         let capacity = self.region.capacity();
         let mask = capacity - 1;
 
-        loop {
-            let tail = self.region.read_next_tail()?;
+        let tail = self.region.read_next_tail()?;
 
-            if self.pos >= tail {
-                return Err(Error::BufferEmpty);
-            }
-            if self.pos.wrapping_add(capacity) < tail {
-                return Err(Error::ReaderBehind);
-            }
-
-            // Acquire fence ensures we see the writer's payload before the header.
-            fence(Ordering::Acquire);
-
-            let header = read_header(&self.region, self.pos, mask)?;
-            let frame_size = header.frame_size();
-
-            // Only read payload if the READY flag is set (single-phase write).
-            if !header.is_ready() {
-                return Err(Error::BufferEmpty);
-            }
-
-            let frame_end = self
-                .pos
-                .checked_add(frame_size)
-                .ok_or(Error::InvalidFrame)?;
-            if frame_size > capacity || frame_end > tail {
-                return Err(Error::InvalidFrame);
-            }
-
-            let payload_pos = self
-                .pos
-                .checked_add(FrameHeader::ENCODED_SIZE as u64)
-                .ok_or(Error::InvalidFrame)?;
-            let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
-
-            self.advance(frame_size)?;
-            return Ok((payload, header.tag));
+        if self.pos >= tail {
+            return Err(Error::BufferEmpty);
         }
+        if self.pos.wrapping_add(capacity) < tail {
+            return Err(Error::ReaderBehind);
+        }
+
+        // Acquire fence ensures we see the writer's payload before the header.
+        fence(Ordering::Acquire);
+
+        let header = read_header(&self.region, self.pos, mask)?;
+        let frame_size = header.frame_size();
+
+        // Only read payload if the READY flag is set (single-phase write).
+        if !header.is_ready() {
+            return Err(Error::BufferEmpty);
+        }
+
+        let frame_end = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        if frame_size > capacity || frame_end > tail {
+            return Err(Error::InvalidFrame);
+        }
+
+        let payload_pos = self
+            .pos
+            .checked_add(FrameHeader::ENCODED_SIZE as u64)
+            .ok_or(Error::InvalidFrame)?;
+        let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
+
+        self.advance(frame_size)?;
+        Ok((payload, header.tag))
     }
 
-    /// Returns whether the current cursor points at a complete readable frame.
-    pub(crate) fn has_ready_frame(&mut self) -> Result<bool> {
+    /// Non-blocking check for frame readiness.
+    ///
+    /// Returns `Ok(true)` if a complete frame with the READY flag set is
+    /// immediately readable at the current cursor position, `Ok(false)` if
+    /// no frame is ready. Suitable for async polling integrations such as Quinn.
+    pub fn poll_ready(&mut self) -> Result<bool> {
         if self.terminated {
             return Err(Error::Terminated);
         }
 
-        loop {
-            let capacity = self.region.capacity();
-            let mask = capacity - 1;
-            let tail = self.region.read_next_tail()?;
+        let capacity = self.region.capacity();
+        let mask = capacity - 1;
+        let tail = self.region.read_next_tail()?;
 
-            if self.pos >= tail {
-                return Ok(false);
-            }
-            if self.pos.wrapping_add(capacity) < tail {
-                return Err(Error::ReaderBehind);
-            }
-
-            fence(Ordering::Acquire);
-
-            let header = read_header(&self.region, self.pos, mask)?;
-            let frame_size = header.frame_size();
-            let frame_end = self
-                .pos
-                .checked_add(frame_size)
-                .ok_or(Error::InvalidFrame)?;
-            if frame_size > capacity || frame_end > tail {
-                return Err(Error::InvalidFrame);
-            }
-            if !header.is_ready() {
-                return Ok(false);
-            }
-            return Ok(true);
+        if self.pos >= tail {
+            return Ok(false);
         }
+        if self.pos.wrapping_add(capacity) < tail {
+            return Err(Error::ReaderBehind);
+        }
+
+        fence(Ordering::Acquire);
+
+        let header = read_header(&self.region, self.pos, mask)?;
+        let frame_size = header.frame_size();
+        let frame_end = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        if frame_size > capacity || frame_end > tail {
+            return Err(Error::InvalidFrame);
+        }
+        if !header.is_ready() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn advance(&mut self, frame_size: u64) -> Result<()> {
@@ -147,9 +147,7 @@ impl StrongReader {
     pub fn region(&self) -> &ChannelRegion {
         &self.region
     }
-}
 
-impl StrongReader {
     /// Close this reader and release its strong-reader cursor slot.
     pub fn close(&mut self) {
         if !self.terminated {
@@ -179,84 +177,89 @@ impl WeakReader {
         if self.terminated {
             return Err(Error::Terminated);
         }
-        loop {
-            let capacity = self.region.capacity();
-            let mask = capacity - 1;
-            let tail = self.region.read_next_tail()?;
+        let capacity = self.region.capacity();
+        let mask = capacity - 1;
+        let tail = self.region.read_next_tail()?;
 
-            if self.pos >= tail {
-                return Err(Error::BufferEmpty);
-            }
-            if self.pos.wrapping_add(capacity) < tail {
-                self.pos = tail;
-                return Err(Error::ReaderBehind);
-            }
-
-            fence(Ordering::Acquire);
-
-            let header = read_header(&self.region, self.pos, mask)?;
-            let frame_size = header.frame_size();
-
-            if !header.is_ready() {
-                return Err(Error::BufferEmpty);
-            }
-
-            let frame_end = self
-                .pos
-                .checked_add(frame_size)
-                .ok_or(Error::InvalidFrame)?;
-            if frame_size > capacity || frame_end > tail {
-                return Err(Error::InvalidFrame);
-            }
-
-            let payload_pos = self
-                .pos
-                .checked_add(FrameHeader::ENCODED_SIZE as u64)
-                .ok_or(Error::InvalidFrame)?;
-            let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
-
-            self.pos = self
-                .pos
-                .checked_add(frame_size)
-                .ok_or(Error::InvalidFrame)?;
-            return Ok((payload, header.tag));
+        if self.pos >= tail {
+            return Err(Error::BufferEmpty);
         }
+        if self.pos.wrapping_add(capacity) < tail {
+            self.pos = tail;
+            return Err(Error::ReaderBehind);
+        }
+
+        fence(Ordering::Acquire);
+
+        let header = read_header(&self.region, self.pos, mask)?;
+        let frame_size = header.frame_size();
+
+        if !header.is_ready() {
+            return Err(Error::BufferEmpty);
+        }
+
+        let frame_end = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        if frame_size > capacity || frame_end > tail {
+            return Err(Error::InvalidFrame);
+        }
+
+        let payload_pos = self
+            .pos
+            .checked_add(FrameHeader::ENCODED_SIZE as u64)
+            .ok_or(Error::InvalidFrame)?;
+        let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
+
+        self.pos = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        Ok((payload, header.tag))
     }
 
-    /// Returns whether the current cursor points at a complete readable frame.
-    pub(crate) fn has_ready_frame(&mut self) -> Result<bool> {
+    /// Non-blocking check for frame readiness.
+    ///
+    /// Returns `Ok(true)` if a complete frame with the READY flag set is
+    /// immediately readable at the current cursor position, `Ok(false)` if
+    /// no frame is ready.
+    pub fn poll_ready(&mut self) -> Result<bool> {
         if self.terminated {
             return Err(Error::Terminated);
         }
 
-        loop {
-            let capacity = self.region.capacity();
-            let mask = capacity - 1;
-            let tail = self.region.read_next_tail()?;
+        let capacity = self.region.capacity();
+        let mask = capacity - 1;
+        let tail = self.region.read_next_tail()?;
 
-            if self.pos >= tail {
-                return Ok(false);
-            }
-            if self.pos.wrapping_add(capacity) < tail {
-                return Err(Error::ReaderBehind);
-            }
-
-            fence(Ordering::Acquire);
-
-            let header = read_header(&self.region, self.pos, mask)?;
-            let frame_size = header.frame_size();
-            let frame_end = self
-                .pos
-                .checked_add(frame_size)
-                .ok_or(Error::InvalidFrame)?;
-            if frame_size > capacity || frame_end > tail {
-                return Err(Error::InvalidFrame);
-            }
-            if !header.is_ready() {
-                return Ok(false);
-            }
-            return Ok(true);
+        if self.pos >= tail {
+            return Ok(false);
         }
+        if self.pos.wrapping_add(capacity) < tail {
+            return Err(Error::ReaderBehind);
+        }
+
+        fence(Ordering::Acquire);
+
+        let header = read_header(&self.region, self.pos, mask)?;
+        let frame_size = header.frame_size();
+        let frame_end = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        if frame_size > capacity || frame_end > tail {
+            return Err(Error::InvalidFrame);
+        }
+        if !header.is_ready() {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Returns the current generation counter from the underlying ring buffer.
+    pub fn generation(&self) -> Result<u64> {
+        self.region.load_generation()
     }
 
     /// Returns the current read position.

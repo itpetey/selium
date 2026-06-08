@@ -26,10 +26,7 @@ pub(crate) struct SharedRegionRecord {
 #[derive(Clone, Copy)]
 pub(crate) struct SharedMappingState {
     pub(crate) region_id: SharedRegionId,
-    pub(crate) page_offset: u32,
     pub(crate) shared_id: SharedResourceId,
-    pub(crate) prot: selium_abi::RegionProt,
-    pub(crate) reader_slot: Option<u32>,
 }
 
 pub(crate) struct HostQueueState {

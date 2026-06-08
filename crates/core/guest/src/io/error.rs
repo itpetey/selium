@@ -47,6 +47,8 @@ pub enum Error {
     Guest(String),
     #[error("index out of bounds")]
     IndexOutOfBounds,
+    #[error("subscriber data was overwritten: publisher advanced past ring capacity")]
+    Overwritten,
 }
 
 #[cfg(test)]
@@ -78,6 +80,10 @@ mod tests {
             "guest error: failed"
         );
         assert_eq!(Error::IndexOutOfBounds.to_string(), "index out of bounds");
+        assert_eq!(
+            Error::Overwritten.to_string(),
+            "subscriber data was overwritten: publisher advanced past ring capacity"
+        );
     }
 
     #[test]

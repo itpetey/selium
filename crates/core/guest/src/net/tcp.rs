@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{
     GuestError, Result,
     hostcall::hostcall_async,
-    io::{ChannelRegion, FrameHeader, RegionMapping, RingBuf, PAGE_SIZE},
+    io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf},
     resource::{Accept, IncomingConnection, ResourceListener},
 };
 
@@ -162,9 +162,7 @@ impl AsyncRead for TcpStream {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "load writer count: {e}"
-                    ))));
+                    return Poll::Ready(Err(io::Error::other(format!("load writer count: {e}"))));
                 }
             }
             cx.waker().wake_by_ref();
@@ -390,10 +388,10 @@ fn parse_dual_ring_region(parent_mapping: &RegionMapping) -> Result<(RingBuf, Ri
     let outbound_region = ChannelRegion::from_mapping(outbound_mapping, outbound_capacity);
 
     // Create RingBuf instances.
-    let inbound_ring =
-        RingBuf::wrap_region(inbound_region).map_err(|e| GuestError::Host(format!("wrap inbound: {e}")))?;
-    let outbound_ring =
-        RingBuf::wrap_region(outbound_region).map_err(|e| GuestError::Host(format!("wrap outbound: {e}")))?;
+    let inbound_ring = RingBuf::wrap_region(inbound_region)
+        .map_err(|e| GuestError::Host(format!("wrap inbound: {e}")))?;
+    let outbound_ring = RingBuf::wrap_region(outbound_region)
+        .map_err(|e| GuestError::Host(format!("wrap outbound: {e}")))?;
 
     Ok((inbound_ring, outbound_ring))
 }

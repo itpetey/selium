@@ -47,11 +47,49 @@
 
 ## 7. External API Guest
 
-- [ ] 7.1 Implement the external listener using the current network primitive or runtime bridge, and keep mTLS identity at the configured bridge boundary unless guest-facing support is added (**blocked:** no configured runtime network bridge maps a logical listener to an IP/port, and no guest accept API exists)
-- [x] 7.2 Implement user-intent parsing and decomposition
-- [ ] 7.3 Implement discovery and scheduler delegation using the appropriate guest interfaces
-- [ ] 7.4 Implement client feedback flows using request exchanges and status topics where appropriate
-- [x] 7.5 Implement clear error propagation and failure context for callers
+### 7.1 External listener (previously blocked — now unblocked)
+
+The kernel's `tcp_bind()` → `tcp_accept_loop()` → `run_proxy()` infrastructure already exists in `network_runtime.rs`, and the guest SDK exposes `TcpListener::bind()` + `TcpListener::accept()` + `TcpStream` (with `AsyncRead`/`AsyncWrite`). No additional runtime bridge is needed.
+
+- [ ] 7.1a Add `bind_addr: String` field to `ApiContext` and a constructor that accepts it alongside the discovery `Context`
+- [ ] 7.1b Replace the placeholder `external_api_main` entrypoint with a real accept loop: bind a `TcpListener` on `ApiContext::bind_addr`, call `mark_ready()`, then loop calling `listener.accept()` and spawning a handler per connection
+- [ ] 7.1c Implement `handle_connection`: read bytes from `TcpStream` via `AsyncRead`, accumulate until newline (`\n`), pass the line to the request pipeline, write the `ClientFeedback` response back via `AsyncWrite`
+- [ ] 7.1d Handle connection lifecycle: detect EOF (read returns 0), handle I/O errors gracefully, ensure the outbound ring writer count is decremented on connection close
+- [ ] 7.1e Add `tokio` to `selium-external-api` dev-dependencies for native-mode tests (use `tokio::io::{AsyncReadExt, AsyncWriteExt}`). Note: full integration testing requires WASM mode because `TcpStream::attach_shared()` returns an error in native mode.
+- [ ] 7.1f Grant `Capability::Network`, `Capability::SharedMemory`, and `Capability::HostQueue` to the external API guest in the runtime bootstrap config. `Network` is needed for `TcpListener::bind()`; `SharedMemory` for ring buffer attachment; `HostQueue` for `TcpListener::accept()` → `HostQueueRecv`.
+
+### 7.2 Parsing and decomposition
+
+- [x] 7.2a Define `UserIntent`, `DelegatedInteraction`, `ApiError`, and `ClientFeedback` types
+- [x] 7.2b Implement `parse_intent` with full error coverage (EmptyRequest, UnknownCommand, MissingArgument, InvalidReplicaCount)
+- [x] 7.2c Implement `decompose_intent` mapping all five `UserIntent` variants to ordered `DelegatedInteraction` lists
+- [x] 7.2d Define the text-protocol grammar in module documentation
+- [x] 7.2e Write unit tests for `parse_intent` (valid commands, all error variants)
+- [x] 7.2f Write unit tests for `decompose_intent` (all five `UserIntent` → `DelegatedInteraction` mappings)
+- [x] 7.2g Write end-to-end tests for the sync `accept_request_sync` pipeline
+
+### 7.3 Discovery and scheduler delegation
+
+Discovery dispatch is wired through `Context::lookup()`. Scheduler dispatch is stubbed pending scheduler guest implementation.
+
+- [x] 7.3a Define `SchedulerRequest` and `SchedulerResponse` types (stub with `#[allow(dead_code)]` and TODO to move to `selium_abi` when scheduler crate is ready)
+- [x] 7.3b Implement `dispatch_interaction`: route `DiscoveryResolve` to `Context::lookup()`, route scheduler interactions to a TODO stub that logs and succeeds
+- [x] 7.3c Implement `dispatch_all` to dispatch a `&[DelegatedInteraction]` in order, returning the first error
+- [x] 7.3d Map dispatch errors to `ApiError::DelegationFailed { step, context }`
+- [ ] 7.3e Replace scheduler dispatch stub with real `RpcClient<SchedulerRequest, SchedulerResponse>` calls once the scheduler guest implements the RPC service (separate follow-up, tracked in section 5)
+
+### 7.4 Client feedback
+
+- [x] 7.4a Implement async `accept_request`: parse → decompose → dispatch → return `ClientFeedback { accepted: true, message, delegated }`
+- [x] 7.4b Implement sync `accept_request_sync` for testing (parse → decompose → ClientFeedback, no dispatch)
+- [ ] 7.4c Write `ClientFeedback` as a text response to the outbound `TcpStream` in `handle_connection` (part of 7.1c)
+- [ ] 7.4d For parse/dispatch errors: write `ClientFeedback { accepted: false, message: "<error>", delegated: [] }` back to the client instead of dropping the connection
+
+### 7.5 Error propagation
+
+- [x] 7.5a `ApiError` variants cover all failure modes (EmptyRequest, UnknownCommand, InvalidReplicaCount, MissingArgument, DelegationFailed)
+- [x] 7.5b `delegation_error()` helper constructs `DelegationFailed` with step and context
+- [x] 7.5c `parse_intent` returns `ApiError` (not a string or generic error) for all parse failures
 
 ## 8. Integration
 
@@ -70,7 +108,11 @@ The native state-machine helpers and tests are not sufficient completion evidenc
 
 Public Rust functions in guest crates are not host-visible interfaces unless they are called by the entrypoint, exported as Wasm functions, or surfaced through a concrete host resource such as a request exchange, durable log, topic, or live table.
 
-Blocked external-api tasks 7.1, 7.3, and 7.4 require a prerequisite runtime/network bridge that defines configured IP/port binding, external request routing to a guest-owned listener or request exchange, and a guest-visible response path. `DurableLog` must not be used for system/boot logs; guest operational logs use tracing through `selium-guest`.
+The external-api listener (7.1) was previously marked blocked on the assumption that no guest accept API or runtime network bridge existed. As of `complete-pubsub-external-api-and-cleanup-warnings`, the kernel's `tcp_bind()` → `tcp_accept_loop()` → `run_proxy()` infrastructure in `network_runtime.rs` provides the host-side proxy, and the guest SDK's `TcpListener::bind()` + `TcpListener::accept()` + `TcpStream` (with `AsyncRead`/`AsyncWrite`) provides the guest-side API. The remaining work is guest-side entrypoint wiring and capability grants, not new runtime infrastructure.
+
+Scheduler dispatch (7.3e) remains blocked on the scheduler guest implementing `SchedulerPlace`/`SchedulerStop`/`SchedulerScale` RPC handlers (section 5). Until then, `deploy`, `start`, `stop`, and `scale` commands log and return success without side effects; only `resolve` works end-to-end.
+
+`DurableLog` must not be used for system/boot logs; guest operational logs use tracing through `selium-guest`.
 
 ## 9. Documentation
 

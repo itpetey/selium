@@ -47,38 +47,7 @@ impl Kernel {
         let local_id = self.next_local_id();
         let state = SharedMappingState {
             region_id,
-            page_offset: 0,
             shared_id,
-            prot: selium_abi::RegionProt::ReadWrite,
-            reader_slot: None,
-        };
-        self.inner.shared_mappings.lock().insert(local_id, state);
-
-        Ok(local_id)
-    }
-
-    /// Attaches a shared region with explicit protection and reader slot.
-    pub fn attach_shared_region_with_prot(
-        &self,
-        shared_id: SharedResourceId,
-        prot: selium_abi::RegionProt,
-        reader_slot: Option<u32>,
-    ) -> Result<u64> {
-        let region_id = self
-            .inner
-            .shared_regions
-            .lock()
-            .get(&shared_id)
-            .map(|record| record.region_id)
-            .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))?;
-
-        let local_id = self.next_local_id();
-        let state = SharedMappingState {
-            region_id,
-            page_offset: 0,
-            shared_id,
-            prot,
-            reader_slot,
         };
         self.inner.shared_mappings.lock().insert(local_id, state);
 

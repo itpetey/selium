@@ -145,6 +145,9 @@ impl Runtime {
 
         match request {
             HostcallRequest::AllocRegion { pages, prot } => {
+                // Ignore unused `prot` field
+                let _prot = prot;
+
                 self.require(
                     process_id,
                     Capability::SharedMemory,
@@ -253,7 +256,7 @@ impl Runtime {
 
                 let local_id = self
                     .kernel
-                    .attach_shared_region_with_prot(region_id, prot, reader_slot)
+                    .attach_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::SharedMapping, local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAttach(
