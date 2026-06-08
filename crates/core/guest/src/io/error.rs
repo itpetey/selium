@@ -57,7 +57,10 @@ mod tests {
 
     #[test]
     fn display_covers_core_error_variants() {
-        assert_eq!(Error::InvalidLayout.to_string(), "invalid ring buffer layout");
+        assert_eq!(
+            Error::InvalidLayout.to_string(),
+            "invalid ring buffer layout"
+        );
         assert_eq!(Error::BufferFull.to_string(), "buffer full");
         assert_eq!(Error::BufferEmpty.to_string(), "buffer empty");
         assert_eq!(

@@ -116,34 +116,33 @@ impl ApiContext {
     }
 }
 
-/// Parses a whitespace-delimited text request into a [`UserIntent`].
-pub fn parse_intent(request: &str) -> Result<UserIntent, ApiError> {
-    let parts = request.split_whitespace().collect::<Vec<_>>();
-    let Some(command) = parts.first() else {
-        return Err(ApiError::EmptyRequest);
-    };
+/// Parses a text request, decomposes it into delegated interactions, and
+/// dispatches each to the appropriate RPC service.
+///
+/// Returns [`ClientFeedback`] with the acceptance status and dispatched interactions.
+pub async fn accept_request(
+    ctx: &mut ApiContext,
+    request: &str,
+) -> Result<ClientFeedback, ApiError> {
+    let intent = parse_intent(request)?;
+    let delegated = decompose_intent(intent);
+    dispatch_all(ctx, &delegated).await?;
+    Ok(ClientFeedback {
+        accepted: true,
+        message: "request accepted".to_string(),
+        delegated,
+    })
+}
 
-    match *command {
-        "deploy" => Ok(UserIntent::Deploy {
-            workload_id: required(&parts, 1, "workload_id")?.to_string(),
-            replicas: replicas(&parts, 2)?,
-        }),
-        "start" => Ok(UserIntent::Start {
-            workload_id: required(&parts, 1, "workload_id")?.to_string(),
-            replicas: replicas(&parts, 2)?,
-        }),
-        "stop" => Ok(UserIntent::Stop {
-            workload_id: required(&parts, 1, "workload_id")?.to_string(),
-        }),
-        "scale" => Ok(UserIntent::Scale {
-            workload_id: required(&parts, 1, "workload_id")?.to_string(),
-            replicas: replicas(&parts, 2)?,
-        }),
-        "resolve" => Ok(UserIntent::Resolve {
-            uri: required(&parts, 1, "uri")?.to_string(),
-        }),
-        other => Err(ApiError::UnknownCommand(other.to_string())),
-    }
+/// Synchronous version of `accept_request` for testing (no dispatch).
+pub fn accept_request_sync(request: &str) -> Result<ClientFeedback, ApiError> {
+    let intent = parse_intent(request)?;
+    let delegated = decompose_intent(intent);
+    Ok(ClientFeedback {
+        accepted: true,
+        message: "request accepted".to_string(),
+        delegated,
+    })
 }
 
 /// Decomposes a [`UserIntent`] into an ordered list of [`DelegatedInteraction`] steps.
@@ -179,6 +178,17 @@ pub fn decompose_intent(intent: UserIntent) -> Vec<DelegatedInteraction> {
     }
 }
 
+/// Dispatches all delegated interactions in order, returning the first error.
+pub async fn dispatch_all(
+    ctx: &mut ApiContext,
+    interactions: &[DelegatedInteraction],
+) -> Result<(), ApiError> {
+    for interaction in interactions {
+        dispatch_interaction(ctx, interaction).await?;
+    }
+    Ok(())
+}
+
 /// Dispatches a single [`DelegatedInteraction`] to the appropriate RPC service.
 ///
 /// Discovery interactions are sent to the discovery guest via the context.
@@ -209,44 +219,34 @@ pub async fn dispatch_interaction(
     }
 }
 
-/// Dispatches all delegated interactions in order, returning the first error.
-pub async fn dispatch_all(
-    ctx: &mut ApiContext,
-    interactions: &[DelegatedInteraction],
-) -> Result<(), ApiError> {
-    for interaction in interactions {
-        dispatch_interaction(ctx, interaction).await?;
+/// Parses a whitespace-delimited text request into a [`UserIntent`].
+pub fn parse_intent(request: &str) -> Result<UserIntent, ApiError> {
+    let parts = request.split_whitespace().collect::<Vec<_>>();
+    let Some(command) = parts.first() else {
+        return Err(ApiError::EmptyRequest);
+    };
+
+    match *command {
+        "deploy" => Ok(UserIntent::Deploy {
+            workload_id: required(&parts, 1, "workload_id")?.to_string(),
+            replicas: replicas(&parts, 2)?,
+        }),
+        "start" => Ok(UserIntent::Start {
+            workload_id: required(&parts, 1, "workload_id")?.to_string(),
+            replicas: replicas(&parts, 2)?,
+        }),
+        "stop" => Ok(UserIntent::Stop {
+            workload_id: required(&parts, 1, "workload_id")?.to_string(),
+        }),
+        "scale" => Ok(UserIntent::Scale {
+            workload_id: required(&parts, 1, "workload_id")?.to_string(),
+            replicas: replicas(&parts, 2)?,
+        }),
+        "resolve" => Ok(UserIntent::Resolve {
+            uri: required(&parts, 1, "uri")?.to_string(),
+        }),
+        other => Err(ApiError::UnknownCommand(other.to_string())),
     }
-    Ok(())
-}
-
-/// Parses a text request, decomposes it into delegated interactions, and
-/// dispatches each to the appropriate RPC service.
-///
-/// Returns [`ClientFeedback`] with the acceptance status and dispatched interactions.
-pub async fn accept_request(
-    ctx: &mut ApiContext,
-    request: &str,
-) -> Result<ClientFeedback, ApiError> {
-    let intent = parse_intent(request)?;
-    let delegated = decompose_intent(intent);
-    dispatch_all(ctx, &delegated).await?;
-    Ok(ClientFeedback {
-        accepted: true,
-        message: "request accepted".to_string(),
-        delegated,
-    })
-}
-
-/// Synchronous version of `accept_request` for testing (no dispatch).
-pub fn accept_request_sync(request: &str) -> Result<ClientFeedback, ApiError> {
-    let intent = parse_intent(request)?;
-    let delegated = decompose_intent(intent);
-    Ok(ClientFeedback {
-        accepted: true,
-        message: "request accepted".to_string(),
-        delegated,
-    })
 }
 
 fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiError {
@@ -254,6 +254,16 @@ fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiE
         step: step.into(),
         context: context.into(),
     }
+}
+
+#[entrypoint]
+async fn external_api_main(ctx: Context) {
+    let _api_ctx = ApiContext::from_context(ctx);
+    selium_guest::info!(
+        guest = "selium-external-api",
+        "external API transport is blocked until the runtime exposes a configured inbound network bridge"
+    );
+    selium_guest::mark_ready();
 }
 
 fn replicas(parts: &[&str], index: usize) -> Result<u32, ApiError> {
@@ -267,16 +277,6 @@ fn required<'a>(parts: &'a [&str], index: usize, name: &'static str) -> Result<&
         .get(index)
         .copied()
         .ok_or(ApiError::MissingArgument(name))
-}
-
-#[entrypoint]
-async fn external_api_main(ctx: Context) {
-    let _api_ctx = ApiContext::from_context(ctx);
-    selium_guest::info!(
-        guest = "selium-external-api",
-        "external API transport is blocked until the runtime exposes a configured inbound network bridge"
-    );
-    selium_guest::mark_ready();
 }
 
 #[cfg(test)]

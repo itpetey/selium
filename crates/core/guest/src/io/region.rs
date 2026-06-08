@@ -1,37 +1,30 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::io::error::{Error, Result};
 
-/// WASM page size used for region layout (4 KiB).
-pub const PAGE_SIZE: u64 = 4096;
-
-/// Byte offset of the generation counter within the shared region.
-pub const GENERATION_COUNTER_OFFSET: u64 = 0;
-
-/// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
-pub const NEXT_TAIL_OFFSET: u64 = 8;
-
-/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
-pub const WRITER_COUNT_OFFSET: u64 = 16;
-
-/// Byte offset where the shared `reader_slots` array begins (128 × u64).
-pub const READER_SLOTS_OFFSET: u64 = 24;
-
-/// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
-pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
-
-/// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
-pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
-
 /// Byte offset where ring buffer data begins (page 1).
 pub const DATA_OFFSET: u64 = PAGE_SIZE;
-
-/// Minimum region size that can hold a ring buffer (header page + one data page).
-pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
-
+/// Byte offset of the generation counter within the shared region.
+pub const GENERATION_COUNTER_OFFSET: u64 = 0;
 /// Maximum number of strong reader slots available in the shared region.
 pub const MAX_READER_SLOTS: usize = 128;
+/// Minimum region size that can hold a ring buffer (header page + one data page).
+pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
+/// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
+pub const NEXT_TAIL_OFFSET: u64 = 8;
+/// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
+pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+/// WASM page size used for region layout (4 KiB).
+pub const PAGE_SIZE: u64 = 4096;
+/// Byte offset where the shared `reader_slots` array begins (128 × u64).
+pub const READER_SLOTS_OFFSET: u64 = 24;
+/// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
+pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
+/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
+pub const WRITER_COUNT_OFFSET: u64 = 16;
 
 /// A direct-memory mapping of a shared region.
 ///
@@ -51,10 +44,37 @@ struct RegionMappingInner {
     _backing: Option<Arc<Vec<u8>>>,
 }
 
-// Safety: RegionMapping points to shared memory accessible within a single
-// guest's address space. Atomic operations ensure correct concurrent access.
-unsafe impl Send for RegionMappingInner {}
-unsafe impl Sync for RegionMappingInner {}
+/// A builder for creating or attaching to a shared memory ring buffer region.
+pub struct RegionBuilder;
+
+/// A shared memory region allocated for ring buffer I/O.
+///
+/// The shared region contains cross-process coordination fields in page 0:
+/// generation counter (offset 0), `next_tail` (offset 8), `writer_count`
+/// (offset 16), `reader_slots` (128 × u64 at offset 24), `next_writer_id`
+/// (offset 1048), and `reader_slot_counter` (offset 1056). Ring buffer data
+/// starts at page 1 (offset 4096).
+///
+/// Process-local optimisation fields (`tail_cache`, `next_mutation_id`) live
+/// in per-guest private memory via `ChannelPrivateState`.
+#[derive(Clone)]
+pub struct ChannelRegion {
+    region_id: u64,
+    mapping: RegionMapping,
+    private: Arc<ChannelPrivateState>,
+    capacity: u64,
+    size: u64,
+}
+
+/// Per-guest private channel state. Not stored in shared memory.
+///
+/// Only process-local optimisation fields remain here. Cross-process
+/// coordination metadata (`next_tail`, `writer_count`, `reader_slots`,
+/// `next_writer_id`) lives in the shared region at well-known offsets.
+struct ChannelPrivateState {
+    tail_cache: AtomicU64,
+    next_mutation_id: AtomicU64,
+}
 
 impl RegionMapping {
     /// Creates a mapping backed by a heap allocation (for native testing).
@@ -235,46 +255,9 @@ impl RegionMapping {
     }
 }
 
-/// Per-guest private channel state. Not stored in shared memory.
-///
-/// Only process-local optimisation fields remain here. Cross-process
-/// coordination metadata (`next_tail`, `writer_count`, `reader_slots`,
-/// `next_writer_id`) lives in the shared region at well-known offsets.
-struct ChannelPrivateState {
-    tail_cache: AtomicU64,
-    next_mutation_id: AtomicU64,
-}
+unsafe impl Send for RegionMappingInner {}
 
-impl Default for ChannelPrivateState {
-    fn default() -> Self {
-        Self {
-            tail_cache: AtomicU64::new(0),
-            next_mutation_id: AtomicU64::new(0),
-        }
-    }
-}
-
-/// A builder for creating or attaching to a shared memory ring buffer region.
-pub struct RegionBuilder;
-
-/// A shared memory region allocated for ring buffer I/O.
-///
-/// The shared region contains cross-process coordination fields in page 0:
-/// generation counter (offset 0), `next_tail` (offset 8), `writer_count`
-/// (offset 16), `reader_slots` (128 × u64 at offset 24), `next_writer_id`
-/// (offset 1048), and `reader_slot_counter` (offset 1056). Ring buffer data
-/// starts at page 1 (offset 4096).
-///
-/// Process-local optimisation fields (`tail_cache`, `next_mutation_id`) live
-/// in per-guest private memory via `ChannelPrivateState`.
-#[derive(Clone)]
-pub struct ChannelRegion {
-    region_id: u64,
-    mapping: RegionMapping,
-    private: Arc<ChannelPrivateState>,
-    capacity: u64,
-    size: u64,
-}
+unsafe impl Sync for RegionMappingInner {}
 
 impl RegionBuilder {
     /// Creates a new shared memory region for a ring buffer of the given capacity.
@@ -583,6 +566,15 @@ impl ChannelRegion {
     }
 }
 
+impl Default for ChannelPrivateState {
+    fn default() -> Self {
+        Self {
+            tail_cache: AtomicU64::new(0),
+            next_mutation_id: AtomicU64::new(0),
+        }
+    }
+}
+
 fn aligned_region_size(capacity: u64) -> Result<u64> {
     let total = DATA_OFFSET
         .checked_add(capacity)
@@ -799,7 +791,9 @@ mod tests {
         );
 
         // Advance the reader slot to free space.
-        region.update_reader_slot(slot, total_reserved).expect("update slot");
+        region
+            .update_reader_slot(slot, total_reserved)
+            .expect("update slot");
 
         // Now we should be able to reserve more space.
         let pos = region.reserve_tail(8, true).expect("reserve after advance");

@@ -15,6 +15,10 @@ pub struct QuinnUdpSocket(UdpSocket);
 #[derive(Debug)]
 pub struct SeliumQuinnRuntime;
 
+struct QuinnUdpSender {
+    _inner: UdpSocket,
+}
+
 impl QuinnUdpSocket {
     pub(crate) fn new(sock: UdpSocket) -> Self {
         Self(sock)
@@ -60,32 +64,6 @@ impl Debug for QuinnUdpSocket {
     }
 }
 
-struct QuinnUdpSender {
-    _inner: UdpSocket,
-}
-
-impl UdpSender for QuinnUdpSender {
-    fn poll_send(
-        self: Pin<&mut Self>,
-        _transmit: &quinn::udp::Transmit<'_>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        // TODO(networking-followup): Implement send to shared-memory channel
-        // using atomic wait instead of the removed SignalWait hostcall.
-        Poll::Pending
-    }
-
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
-}
-
-impl Debug for QuinnUdpSender {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QuinnUdpSender").finish()
-    }
-}
-
 impl Runtime for SeliumQuinnRuntime {
     type Instant = Instant;
 
@@ -116,5 +94,76 @@ impl Runtime for SeliumQuinnRuntime {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+}
+
+impl UdpSender for QuinnUdpSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        _transmit: &quinn::udp::Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // TODO(networking-followup): Implement send to shared-memory channel
+        // using atomic wait instead of the removed SignalWait hostcall.
+        Poll::Pending
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+}
+
+impl Debug for QuinnUdpSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuinnUdpSender").finish()
+    }
+}
+
+impl quinn::RuntimeInstant for Instant {
+    type Duration = Duration;
+
+    fn now() -> Self {
+        Instant::now()
+    }
+
+    fn duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::duration_since(self, earlier)
+    }
+
+    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
+        Instant::checked_duration_since(self, earlier)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
+        Instant::saturating_duration_since(self, earlier)
+    }
+
+    fn elapsed(&self) -> Self::Duration {
+        Instant::elapsed(self)
+    }
+
+    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_add(self, duration)
+    }
+
+    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
+        Instant::checked_sub(self, duration)
+    }
+}
+
+impl quinn::AsyncTimer for Timer {
+    type Instant = Instant;
+
+    fn reset(self: std::pin::Pin<&mut Self>, deadline: Instant) {
+        let this = self.get_mut();
+        this.cancel_wait();
+        this.deadline = deadline;
+    }
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        std::future::Future::poll(self, cx)
     }
 }

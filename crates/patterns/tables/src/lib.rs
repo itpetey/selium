@@ -76,9 +76,10 @@ where
     K: Clone + Eq + Hash + rkyv::Archive + selium_abi::RkyvEncode,
     V: Clone + rkyv::Archive + selium_abi::RkyvEncode,
     LiveTableMessage<K, V>: selium_abi::RkyvEncode,
-    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived:
-        rkyv::Deserialize<LiveTableMessage<K, V>, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived: rkyv::Deserialize<
+            LiveTableMessage<K, V>,
+            rkyv::api::high::HighDeserializer<rkyv::rancor::Error>,
+        > + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
 {
     /// Creates a new live table with its own pub/sub topic.
     pub fn create(capacity: u64) -> Result<Self> {

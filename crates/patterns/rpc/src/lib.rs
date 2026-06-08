@@ -24,38 +24,36 @@
 //! Connection establishment uses a `HostQueue` to pass the `shared_id` from
 //! client to server.
 
-pub use error::{AcceptError, RpcError};
-
-pub mod error;
-
-use std::marker::PhantomData;
-use std::sync::atomic::{Ordering, fence};
-
-use selium_abi::{decode_rkyv, encode_rkyv};
-use selium_guest::io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf};
+use std::{
+    marker::PhantomData,
+    sync::atomic::{Ordering, fence},
+};
 
 use rkyv::{
     api::high::{HighDeserializer, HighValidator},
     rancor::Error as RancorError,
 };
+use selium_abi::{decode_rkyv, encode_rkyv};
+use selium_guest::io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf};
 
-/// Magic value for multi-memory shared region layout headers.
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+pub use error::{AcceptError, RpcError};
 
-/// Multi-memory header offsets.
-const HEADER_MAGIC_OFFSET: u64 = 0;
+pub mod error;
+
+/// Default reply ring capacity in bytes.
+const DEFAULT_REP_CAPACITY: u64 = 4096;
+/// Default request ring capacity in bytes.
+const DEFAULT_REQ_CAPACITY: u64 = 4096;
 const HEADER_CAPACITY_OFFSET: u64 = 8;
 const HEADER_COUNT_OFFSET: u64 = 16;
 const HEADER_ENTRY_OFFSET: u64 = 24;
-const HEADER_ENTRY_SIZE: u64 = 8; // 4 bytes offset + 4 bytes len
-
+const HEADER_ENTRY_SIZE: u64 = 8;
+/// Multi-memory header offsets.
+const HEADER_MAGIC_OFFSET: u64 = 0;
 /// Header size (magic + capacity + count + 2 entries).
 const HEADER_SIZE: u64 = HEADER_ENTRY_OFFSET + 2 * HEADER_ENTRY_SIZE;
-
-/// Default request ring capacity in bytes.
-const DEFAULT_REQ_CAPACITY: u64 = 4096;
-/// Default reply ring capacity in bytes.
-const DEFAULT_REP_CAPACITY: u64 = 4096;
+/// Magic value for multi-memory shared region layout headers.
+const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
 /// Client-side handle for making typed RPC requests.
 ///
@@ -67,6 +65,31 @@ pub struct RpcClient<Req, Rep> {
     next_correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
 }
+
+/// Server-side handle for an established RPC session.
+///
+/// Receives `Req` requests and sends `Rep` replies over shared-memory
+/// ring buffers.
+pub struct RpcConnection<Req, Rep> {
+    request_ring: RingBuf,
+    reply_ring: RingBuf,
+    reader_pos: u64,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// A single request received by the server, with the ability to reply.
+pub struct RpcRequest<'a, Req, Rep> {
+    reply_ring: &'a RingBuf,
+    payload_bytes: Vec<u8>,
+    correlation: u32,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// Accept implementation for RPC connections.
+///
+/// Attaches to the shared region from an `IncomingConnection` and
+/// returns an `RpcConnection`.
+pub struct RpcAccept<Req, Rep>(PhantomData<(Req, Rep)>);
 
 impl<Req, Rep> RpcClient<Req, Rep>
 where
@@ -158,17 +181,6 @@ where
             selium_guest::yield_now().await;
         }
     }
-}
-
-/// Server-side handle for an established RPC session.
-///
-/// Receives `Req` requests and sends `Rep` replies over shared-memory
-/// ring buffers.
-pub struct RpcConnection<Req, Rep> {
-    request_ring: RingBuf,
-    reply_ring: RingBuf,
-    reader_pos: u64,
-    _phantom: PhantomData<(Req, Rep)>,
 }
 
 impl<Req, Rep> RpcConnection<Req, Rep>
@@ -275,14 +287,6 @@ where
     }
 }
 
-/// A single request received by the server, with the ability to reply.
-pub struct RpcRequest<'a, Req, Rep> {
-    reply_ring: &'a RingBuf,
-    payload_bytes: Vec<u8>,
-    correlation: u32,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
 impl<'a, Req, Rep> RpcRequest<'a, Req, Rep>
 where
     Req: rkyv::Archive + Sized,
@@ -323,12 +327,6 @@ where
     }
 }
 
-/// Accept implementation for RPC connections.
-///
-/// Attaches to the shared region from an `IncomingConnection` and
-/// returns an `RpcConnection`.
-pub struct RpcAccept<Req, Rep>(PhantomData<(Req, Rep)>);
-
 impl<Req, Rep> selium_guest::Accept for RpcAccept<Req, Rep>
 where
     Req: rkyv::Archive + Sized,
@@ -352,78 +350,6 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     } else {
         value + alignment - rem
     }
-}
-
-/// Creates a multi-memory region with two ring buffers for RPC.
-///
-/// The region layout:
-/// - Multi-memory header at offset 0
-/// - Request ring at entry[0].offset (page 0 = coordination, page 1+ = data)
-/// - Reply ring at entry[1].offset (page 0 = coordination, page 1+ = data)
-///
-/// Returns (request_ring, reply_ring, shared_id).
-fn create_rpc_region(
-    req_capacity: u64,
-    rep_capacity: u64,
-) -> Result<(RingBuf, RingBuf, u64), RpcError> {
-    // Each sub-memory: page 0 (coordination) + data pages.
-    let req_region_len = PAGE_SIZE + req_capacity;
-    let rep_region_len = PAGE_SIZE + rep_capacity;
-
-    // Calculate offsets.
-    let sub_memory_0_offset = align_up(HEADER_SIZE, 8);
-    let sub_memory_1_offset = align_up(sub_memory_0_offset + req_region_len, 8);
-    let total_capacity = align_up(sub_memory_1_offset + rep_region_len, 8);
-
-    // Create a single RegionMapping for the entire region.
-    let parent_mapping = RegionMapping::allocate(total_capacity)?;
-
-    // Write multi-memory header.
-    parent_mapping.write(HEADER_MAGIC_OFFSET, &SHARED_REGION_MAGIC.to_le_bytes())?;
-    parent_mapping.write(HEADER_CAPACITY_OFFSET, &total_capacity.to_le_bytes())?;
-    parent_mapping.write(HEADER_COUNT_OFFSET, &2u32.to_le_bytes())?;
-
-    // Write entry[0]: request ring.
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET,
-        &(sub_memory_0_offset as u32).to_le_bytes(),
-    )?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 4,
-        &(req_region_len as u32).to_le_bytes(),
-    )?;
-
-    // Write entry[1]: reply ring.
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 8,
-        &(sub_memory_1_offset as u32).to_le_bytes(),
-    )?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 12,
-        &(rep_region_len as u32).to_le_bytes(),
-    )?;
-
-    // Create sub-mappings for each ring.
-    let req_mapping = parent_mapping.sub_region(sub_memory_0_offset, req_region_len)?;
-    let rep_mapping = parent_mapping.sub_region(sub_memory_1_offset, rep_region_len)?;
-
-    // Create ChannelRegions from the sub-mappings.
-    let req_region = ChannelRegion::from_mapping(req_mapping, req_capacity);
-    let rep_region = ChannelRegion::from_mapping(rep_mapping, rep_capacity);
-
-    // Initialize both regions.
-    req_region.initialise()?;
-    rep_region.initialise()?;
-
-    // Increment writer counts to indicate the client is connected.
-    req_region.increment_writer_count()?;
-    rep_region.increment_writer_count()?;
-
-    // Create RingBuf instances.
-    let request_ring = RingBuf::wrap_region(req_region)?;
-    let reply_ring = RingBuf::wrap_region(rep_region)?;
-
-    Ok((request_ring, reply_ring, 0))
 }
 
 /// Attaches to an RPC region by shared_id and extracts the two ring buffers.
@@ -505,6 +431,78 @@ fn attach_rpc_region(
     let reply_ring = RingBuf::wrap_region(rep_region)?;
 
     Ok((request_ring, reply_ring))
+}
+
+/// Creates a multi-memory region with two ring buffers for RPC.
+///
+/// The region layout:
+/// - Multi-memory header at offset 0
+/// - Request ring at entry[0].offset (page 0 = coordination, page 1+ = data)
+/// - Reply ring at entry[1].offset (page 0 = coordination, page 1+ = data)
+///
+/// Returns (request_ring, reply_ring, shared_id).
+fn create_rpc_region(
+    req_capacity: u64,
+    rep_capacity: u64,
+) -> Result<(RingBuf, RingBuf, u64), RpcError> {
+    // Each sub-memory: page 0 (coordination) + data pages.
+    let req_region_len = PAGE_SIZE + req_capacity;
+    let rep_region_len = PAGE_SIZE + rep_capacity;
+
+    // Calculate offsets.
+    let sub_memory_0_offset = align_up(HEADER_SIZE, 8);
+    let sub_memory_1_offset = align_up(sub_memory_0_offset + req_region_len, 8);
+    let total_capacity = align_up(sub_memory_1_offset + rep_region_len, 8);
+
+    // Create a single RegionMapping for the entire region.
+    let parent_mapping = RegionMapping::allocate(total_capacity)?;
+
+    // Write multi-memory header.
+    parent_mapping.write(HEADER_MAGIC_OFFSET, &SHARED_REGION_MAGIC.to_le_bytes())?;
+    parent_mapping.write(HEADER_CAPACITY_OFFSET, &total_capacity.to_le_bytes())?;
+    parent_mapping.write(HEADER_COUNT_OFFSET, &2u32.to_le_bytes())?;
+
+    // Write entry[0]: request ring.
+    parent_mapping.write(
+        HEADER_ENTRY_OFFSET,
+        &(sub_memory_0_offset as u32).to_le_bytes(),
+    )?;
+    parent_mapping.write(
+        HEADER_ENTRY_OFFSET + 4,
+        &(req_region_len as u32).to_le_bytes(),
+    )?;
+
+    // Write entry[1]: reply ring.
+    parent_mapping.write(
+        HEADER_ENTRY_OFFSET + 8,
+        &(sub_memory_1_offset as u32).to_le_bytes(),
+    )?;
+    parent_mapping.write(
+        HEADER_ENTRY_OFFSET + 12,
+        &(rep_region_len as u32).to_le_bytes(),
+    )?;
+
+    // Create sub-mappings for each ring.
+    let req_mapping = parent_mapping.sub_region(sub_memory_0_offset, req_region_len)?;
+    let rep_mapping = parent_mapping.sub_region(sub_memory_1_offset, rep_region_len)?;
+
+    // Create ChannelRegions from the sub-mappings.
+    let req_region = ChannelRegion::from_mapping(req_mapping, req_capacity);
+    let rep_region = ChannelRegion::from_mapping(rep_mapping, rep_capacity);
+
+    // Initialize both regions.
+    req_region.initialise()?;
+    rep_region.initialise()?;
+
+    // Increment writer counts to indicate the client is connected.
+    req_region.increment_writer_count()?;
+    rep_region.increment_writer_count()?;
+
+    // Create RingBuf instances.
+    let request_ring = RingBuf::wrap_region(req_region)?;
+    let reply_ring = RingBuf::wrap_region(rep_region)?;
+
+    Ok((request_ring, reply_ring, 0))
 }
 
 /// Tries to read a reply frame with the given correlation tag from the reply ring.

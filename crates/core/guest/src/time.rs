@@ -10,7 +10,10 @@ use std::{
 
 use selium_abi::{HostcallOutput, HostcallRequest};
 
-use crate::{GuestError, Result, hostcall::{HostcallFuture, hostcall_async, hostcall_ready}};
+use crate::{
+    GuestError, Result,
+    hostcall::{HostcallFuture, hostcall_async, hostcall_ready},
+};
 
 /// A measurement of the monotonic clock, backed by the Selium host.
 ///
@@ -21,6 +24,16 @@ use crate::{GuestError, Result, hostcall::{HostcallFuture, hostcall_async, hostc
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant {
     nanos: u64,
+}
+
+/// Async timer that provides deadline-based wakeups via the `Sleep` hostcall.
+///
+/// `Timer` implements [`std::future::Future`] and, when the `quinn` feature is
+/// enabled, `quinn::AsyncTimer`. It is used by the Quinn transport for
+/// timeout management.
+pub struct Timer {
+    deadline: Instant,
+    sleep_future: Option<HostcallFuture>,
 }
 
 impl Instant {
@@ -148,26 +161,6 @@ impl Sub<Instant> for Instant {
     }
 }
 
-/// Returns the current wall-clock time as nanoseconds since the UNIX epoch.
-///
-/// This function issues a [`HostcallRequest::TimeNow`] hostcall.
-pub fn now() -> Result<u64> {
-    match hostcall_ready(HostcallRequest::TimeNow)? {
-        HostcallOutput::U64(nanos) => Ok(nanos),
-        _ => Err(GuestError::UnexpectedHostcallOutput),
-    }
-}
-
-/// Async timer that provides deadline-based wakeups via the `Sleep` hostcall.
-///
-/// `Timer` implements [`std::future::Future`] and, when the `quinn` feature is
-/// enabled, `quinn::AsyncTimer`. It is used by the Quinn transport for
-/// timeout management.
-pub struct Timer {
-    deadline: Instant,
-    sleep_future: Option<HostcallFuture>,
-}
-
 impl Timer {
     /// Creates a new timer that will expire at the given deadline.
     pub fn new(deadline: Instant) -> Self {
@@ -230,51 +223,13 @@ impl Drop for Timer {
     }
 }
 
-#[cfg(feature = "quinn")]
-impl quinn::RuntimeInstant for Instant {
-    type Duration = Duration;
-
-    fn now() -> Self {
-        Instant::now()
-    }
-
-    fn duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::duration_since(self, earlier)
-    }
-
-    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
-        Instant::checked_duration_since(self, earlier)
-    }
-
-    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::saturating_duration_since(self, earlier)
-    }
-
-    fn elapsed(&self) -> Self::Duration {
-        Instant::elapsed(self)
-    }
-
-    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_add(self, duration)
-    }
-
-    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_sub(self, duration)
-    }
-}
-
-#[cfg(feature = "quinn")]
-impl quinn::AsyncTimer for Timer {
-    type Instant = Instant;
-
-    fn reset(self: std::pin::Pin<&mut Self>, deadline: Instant) {
-        let this = self.get_mut();
-        this.cancel_wait();
-        this.deadline = deadline;
-    }
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        std::future::Future::poll(self, cx)
+/// Returns the current wall-clock time as nanoseconds since the UNIX epoch.
+///
+/// This function issues a [`HostcallRequest::TimeNow`] hostcall.
+pub fn now() -> Result<u64> {
+    match hostcall_ready(HostcallRequest::TimeNow)? {
+        HostcallOutput::U64(nanos) => Ok(nanos),
+        _ => Err(GuestError::UnexpectedHostcallOutput),
     }
 }
 

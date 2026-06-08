@@ -232,15 +232,15 @@ where
     }
 }
 
-pub fn create_pair<T>(capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
-    let publisher = Publisher::create(capacity)?;
-    let subscriber = Subscriber::attach(publisher.region_id(), publisher.capacity())?;
-    Ok((publisher, subscriber))
-}
-
 pub fn attach_pair<T>(region_id: u64, capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
     let publisher = Publisher::attach(region_id, capacity)?;
     let subscriber = Subscriber::attach(region_id, capacity)?;
+    Ok((publisher, subscriber))
+}
+
+pub fn create_pair<T>(capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
+    let publisher = Publisher::create(capacity)?;
+    let subscriber = Subscriber::attach(publisher.region_id(), publisher.capacity())?;
     Ok((publisher, subscriber))
 }
 

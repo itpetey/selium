@@ -9,11 +9,15 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!(
-        "(module (memory 1) (func (export \"{entrypoint}\")))"
-    ))
-    .expect("compile wat")
+/// Tests AllocRegion and FreeRegion lifecycle.
+#[test]
+#[ignore]
+fn alloc_and_free_region_lifecycle() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest(&runtime, "region-lifecycle");
+
+    let region_id = alloc_region(&runtime, process_id, 1);
+    free_region(&runtime, process_id, region_id);
 }
 
 /// Allocates a shared region via the `AllocRegion` hostcall.
@@ -33,48 +37,38 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, pages: u32) -> u64 {
     }
 }
 
-/// Attaches to a shared region via the `AttachRegion` hostcall.
-#[expect(clippy::panic, reason = "test helper")]
-fn attach_region(
-    runtime: &Runtime,
-    process_id: ProcessId,
-    region_id: u64,
-) -> selium_abi::RegionAttachment {
+/// Tests that protection and reader_slot parameters are correctly accepted by the hostcall
+/// and that the region is mapped into guest linear memory with the requested protection.
+/// The per-page mprotect enforcement is handled by wasmtiny's `map_shared_region`.
+#[test]
+fn attach_accepts_protection_and_reader_slot() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest(&runtime, "prot-slot");
+
+    let region_id = alloc_region(&runtime, process_id, 1);
+
+    // Attach with specific protection and reader slot - verify hostcall succeeds
+    // and returns a non-zero page offset (meaning it was mapped into guest memory).
+    let reader_slot = Some(0u32);
+    let prot = RegionProt::ReadOnly;
     let (status, op_id) = runtime.begin_hostcall(
         process_id,
         HostcallRequest::AttachRegion {
             region_id,
-            reader_slot: None,
-            prot: RegionProt::ReadWrite,
+            reader_slot,
+            prot,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::RegionAttach(attachment)) => attachment,
+    let attachment = match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::RegionAttach(att)) => att,
         other => panic!("expected RegionAttach, got {other:?}"),
-    }
-}
+    };
+    assert_ne!(
+        attachment.page_offset, 0,
+        "page_offset should be non-zero after mapping"
+    );
 
-/// Frees a shared region via the `FreeRegion` hostcall.
-#[expect(clippy::panic, reason = "test helper")]
-fn free_region(runtime: &Runtime, process_id: ProcessId, region_id: u64) {
-    let (status, op_id) =
-        runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::Empty) => {}
-        other => panic!("expected Empty, got {other:?}"),
-    }
-}
-
-/// Tests AllocRegion and FreeRegion lifecycle.
-#[test]
-#[ignore]
-fn alloc_and_free_region_lifecycle() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest(&runtime, "region-lifecycle");
-
-    let region_id = alloc_region(&runtime, process_id, 1);
     free_region(&runtime, process_id, region_id);
 }
 
@@ -120,75 +114,26 @@ fn attach_reads_and_writes_through_kernel() {
     free_region(&runtime, process_id, region_id);
 }
 
-/// Tests that two attachments to the same region share data.
-#[test]
-#[ignore]
-fn two_attachments_share_region() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest(&runtime, "two-attach");
-
-    let region_id = alloc_region(&runtime, process_id, 1);
-
-    // First attachment via kernel.
-    let left = runtime
-        .kernel()
-        .attach_shared_region(region_id)
-        .expect("left attach");
-    runtime
-        .kernel()
-        .write_shared_memory(left, 0, b"shared!")
-        .expect("left write");
-
-    // Second attachment via kernel.
-    let right = runtime
-        .kernel()
-        .attach_shared_region(region_id)
-        .expect("right attach");
-    let bytes = runtime
-        .kernel()
-        .read_shared_memory(right, 0, 7)
-        .expect("right read");
-    assert_eq!(bytes, b"shared!");
-
-    runtime
-        .kernel()
-        .detach_shared_region(left)
-        .expect("detach left");
-    runtime
-        .kernel()
-        .detach_shared_region(right)
-        .expect("detach right");
-
-    free_region(&runtime, process_id, region_id);
-}
-
-/// Tests that freeing a region with active mappings fails.
-#[test]
-#[ignore]
-fn free_fails_when_mapped() {
-    let runtime = Runtime::default();
-    let process_id = spawn_guest(&runtime, "free-mapped");
-
-    let region_id = alloc_region(&runtime, process_id, 1);
-
-    // Attach via kernel (creates a mapping).
-    let local_id = runtime
-        .kernel()
-        .attach_shared_region(region_id)
-        .expect("attach");
-
-    // FreeRegion should fail because mapping still exists.
-    let (_, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
+/// Attaches to a shared region via the `AttachRegion` hostcall.
+#[expect(clippy::panic, reason = "test helper")]
+fn attach_region(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    region_id: u64,
+) -> selium_abi::RegionAttachment {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::AttachRegion {
+            region_id,
+            reader_slot: None,
+            prot: RegionProt::ReadWrite,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
     match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Failed(_) => {} // expected
-        other => panic!("expected Failed, got {other:?}"),
+        CompletionState::Ready(HostcallOutput::RegionAttach(attachment)) => attachment,
+        other => panic!("expected RegionAttach, got {other:?}"),
     }
-
-    runtime
-        .kernel()
-        .detach_shared_region(local_id)
-        .expect("detach");
-    free_region(&runtime, process_id, region_id);
 }
 
 /// Tests the selium-io frame header wire format through kernel shared memory.
@@ -242,39 +187,52 @@ fn frame_header_round_trip() {
     free_region(&runtime, process_id, region_id);
 }
 
-/// Tests that protection and reader_slot parameters are correctly accepted by the hostcall
-/// and that the region is mapped into guest linear memory with the requested protection.
-/// The per-page mprotect enforcement is handled by wasmtiny's `map_shared_region`.
+/// Tests that freeing a region with active mappings fails.
 #[test]
-fn attach_accepts_protection_and_reader_slot() {
+#[ignore]
+fn free_fails_when_mapped() {
     let runtime = Runtime::default();
-    let process_id = spawn_guest(&runtime, "prot-slot");
+    let process_id = spawn_guest(&runtime, "free-mapped");
 
     let region_id = alloc_region(&runtime, process_id, 1);
 
-    // Attach with specific protection and reader slot - verify hostcall succeeds
-    // and returns a non-zero page offset (meaning it was mapped into guest memory).
-    let reader_slot = Some(0u32);
-    let prot = RegionProt::ReadOnly;
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::AttachRegion {
-            region_id,
-            reader_slot,
-            prot,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    let attachment = match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::RegionAttach(att)) => att,
-        other => panic!("expected RegionAttach, got {other:?}"),
-    };
-    assert_ne!(
-        attachment.page_offset, 0,
-        "page_offset should be non-zero after mapping"
-    );
+    // Attach via kernel (creates a mapping).
+    let local_id = runtime
+        .kernel()
+        .attach_shared_region(region_id)
+        .expect("attach");
 
+    // FreeRegion should fail because mapping still exists.
+    let (_, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Failed(_) => {} // expected
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    runtime
+        .kernel()
+        .detach_shared_region(local_id)
+        .expect("detach");
     free_region(&runtime, process_id, region_id);
+}
+
+/// Frees a shared region via the `FreeRegion` hostcall.
+#[expect(clippy::panic, reason = "test helper")]
+fn free_region(runtime: &Runtime, process_id: ProcessId, region_id: u64) {
+    let (status, op_id) =
+        runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::Empty) => {}
+        other => panic!("expected Empty, got {other:?}"),
+    }
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!(
+        "(module (memory 1) (func (export \"{entrypoint}\")))"
+    ))
+    .expect("compile wat")
 }
 
 #[expect(clippy::indexing_slicing, reason = "test helper")]
@@ -299,4 +257,46 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
         })
         .expect("bootstrap");
     report.guests[0].process_id
+}
+
+/// Tests that two attachments to the same region share data.
+#[test]
+#[ignore]
+fn two_attachments_share_region() {
+    let runtime = Runtime::default();
+    let process_id = spawn_guest(&runtime, "two-attach");
+
+    let region_id = alloc_region(&runtime, process_id, 1);
+
+    // First attachment via kernel.
+    let left = runtime
+        .kernel()
+        .attach_shared_region(region_id)
+        .expect("left attach");
+    runtime
+        .kernel()
+        .write_shared_memory(left, 0, b"shared!")
+        .expect("left write");
+
+    // Second attachment via kernel.
+    let right = runtime
+        .kernel()
+        .attach_shared_region(region_id)
+        .expect("right attach");
+    let bytes = runtime
+        .kernel()
+        .read_shared_memory(right, 0, 7)
+        .expect("right read");
+    assert_eq!(bytes, b"shared!");
+
+    runtime
+        .kernel()
+        .detach_shared_region(left)
+        .expect("detach left");
+    runtime
+        .kernel()
+        .detach_shared_region(right)
+        .expect("detach right");
+
+    free_region(&runtime, process_id, region_id);
 }

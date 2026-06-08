@@ -16,14 +16,6 @@ use crate::{
     state::{HostOperation, HostOperationState, Runtime},
 };
 
-/// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.
-fn to_wasm_prot(prot: selium_abi::RegionProt) -> WasmProt {
-    match prot {
-        selium_abi::RegionProt::ReadOnly => WasmProt::ReadOnly,
-        selium_abi::RegionProt::ReadWrite => WasmProt::ReadWrite,
-    }
-}
-
 impl Runtime {
     /// Begins a hostcall for a process and returns its initial status and operation id.
     pub fn begin_hostcall(
@@ -940,6 +932,14 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
             })
         }
     })
+}
+
+/// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.
+fn to_wasm_prot(prot: selium_abi::RegionProt) -> WasmProt {
+    match prot {
+        selium_abi::RegionProt::ReadOnly => WasmProt::ReadOnly,
+        selium_abi::RegionProt::ReadWrite => WasmProt::ReadWrite,
+    }
 }
 
 #[cfg(test)]

@@ -38,13 +38,8 @@ pub(crate) struct LoadedGuest {
 pub(crate) enum HostOperationState {
     Ready(HostcallOutput),
     Failed(AbiError),
-    HostQueueRecvWait {
-        local_id: u64,
-        deadline: Instant,
-    },
-    SleepWait {
-        deadline: Instant,
-    },
+    HostQueueRecvWait { local_id: u64, deadline: Instant },
+    SleepWait { deadline: Instant },
 }
 
 #[derive(Debug, Clone)]

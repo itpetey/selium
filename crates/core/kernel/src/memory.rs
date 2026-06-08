@@ -1,5 +1,7 @@
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::atomic::Ordering,
+    sync::{Arc, Mutex},
+};
 
 use selium_abi::SharedResourceId;
 use wasmtiny::runtime::{SharedRegionId, Store};

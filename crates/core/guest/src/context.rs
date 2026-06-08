@@ -1,25 +1,22 @@
 #[cfg(feature = "io")]
+use std::sync::atomic::{Ordering, fence};
+
+#[cfg(feature = "io")]
 use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
 
 #[cfg(feature = "io")]
 use crate::GuestError;
-
-#[cfg(feature = "io")]
-use crate::resource::ResourceSender;
-
 #[cfg(feature = "io")]
 use crate::io::{FrameHeader, RingBuf};
-
 #[cfg(feature = "io")]
-use std::sync::atomic::{Ordering, fence};
-
-/// RPC ring capacity for discovery requests.
-#[cfg(feature = "io")]
-const RPC_REQ_CAPACITY: u64 = 4096;
+use crate::resource::ResourceSender;
 
 /// RPC ring capacity for discovery replies.
 #[cfg(feature = "io")]
 const RPC_REP_CAPACITY: u64 = 4096;
+/// RPC ring capacity for discovery requests.
+#[cfg(feature = "io")]
+const RPC_REQ_CAPACITY: u64 = 4096;
 
 /// Guest context injected by the runtime during bootstrap.
 ///

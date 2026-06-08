@@ -286,11 +286,6 @@ impl Reader {
     }
 }
 
-fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
-    let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
-    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
-}
-
 pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -318,4 +313,9 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
         buf.extend_from_slice(&part);
     }
     Ok(buf)
+}
+
+fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
+    let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
+    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
 }

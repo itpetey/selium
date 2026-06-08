@@ -16,44 +16,39 @@ use crate::{
     state::{Kernel, TcpListenerState, TcpStreamState, UdpSocketState},
 };
 
-/// Page size for ring buffer layout.
-const PAGE_SIZE: u64 = 4096;
-/// Offset of the generation counter (u64) in page 0.
-const GENERATION_COUNTER_OFFSET: u64 = 0;
-/// Offset of the shared `next_tail` cursor (u64) in page 0.
-const NEXT_TAIL_OFFSET: u64 = 8;
-/// Offset of the shared `writer_count` (u64) in page 0.
-const WRITER_COUNT_OFFSET: u64 = 16;
-/// Offset where the shared `reader_slots` array begins (128 × u64).
-const READER_SLOTS_OFFSET: u64 = 24;
-/// Offset of the shared `next_writer_id` counter (u64).
-const NEXT_WRITER_ID_OFFSET: u64 = 1048;
-/// Offset of the shared `reader_slot_counter` (u64).
-const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
 /// Offset where ring buffer data begins (page 1).
 const DATA_OFFSET: u64 = PAGE_SIZE;
-
-/// Maximum number of strong reader slots.
-const MAX_READER_SLOTS: u32 = 128;
-/// Kernel's reader slot index (used for backpressure on outbound rings).
-const KERNEL_READER_SLOT: u32 = 0;
-
 /// Default ring buffer data capacity (64 KiB).
 const DEFAULT_RING_CAPACITY: u32 = 64 * 1024;
-/// Frame header size in bytes.
-const FRAME_HEADER_SIZE: u64 = 12;
 /// Frame flag indicating a ready frame.
 const FLAG_READY: u8 = 1;
-
+/// Frame header size in bytes.
+const FRAME_HEADER_SIZE: u64 = 12;
+/// Offset of the generation counter (u64) in page 0.
+const GENERATION_COUNTER_OFFSET: u64 = 0;
+/// Kernel's reader slot index (used for backpressure on outbound rings).
+const KERNEL_READER_SLOT: u32 = 0;
+/// Maximum number of strong reader slots.
+const MAX_READER_SLOTS: u32 = 128;
+/// Offset of the shared `next_tail` cursor (u64) in page 0.
+const NEXT_TAIL_OFFSET: u64 = 8;
+/// Offset of the shared `next_writer_id` counter (u64).
+const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+/// Page size for ring buffer layout.
+const PAGE_SIZE: u64 = 4096;
 /// Polling interval for proxy threads waiting on guest writes.
 const PROXY_POLL_INTERVAL_MS: u64 = 1;
-
-// Multi-memory region header layout
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+/// Offset where the shared `reader_slots` array begins (128 × u64).
+const READER_SLOTS_OFFSET: u64 = 24;
+/// Offset of the shared `reader_slot_counter` (u64).
+const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
 const SHARED_REGION_HEADER_CAPACITY_OFFSET: u32 = 8;
 const SHARED_REGION_HEADER_COUNT_OFFSET: u32 = 16;
 const SHARED_REGION_HEADER_ENTRY_OFFSET: u32 = 24;
 const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
+const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+/// Offset of the shared `writer_count` (u64) in page 0.
+const WRITER_COUNT_OFFSET: u64 = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct FrameHeader {
@@ -401,16 +396,6 @@ fn init_ring_buffer(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<()>
     Ok(())
 }
 
-/// Reads a little-endian u64 from shared memory.
-fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
-    let bytes = kernel
-        .read_shared_memory(mapping_id, offset, 8)
-        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
-    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
-        Error::Wasm("invalid u64 bytes".to_string())
-    })?))
-}
-
 /// Returns the minimum active reader position from the shared reader_slots array.
 fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<Option<u64>> {
     let mut minimum = None;
@@ -424,257 +409,6 @@ fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Res
         minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
     }
     Ok(minimum)
-}
-
-/// Reserves `len` bytes at the tail via CAS on the shared `next_tail` field.
-///
-/// Uses exponential backoff on contention and checks backpressure against
-/// the shared `reader_slots` array.
-fn reserve_tail(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    len: u64,
-) -> Result<u64> {
-    if len == 0 || len > capacity {
-        return Err(Error::Wasm("invalid reservation length".to_string()));
-    }
-
-    let mut delay: usize = 1;
-    loop {
-        let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
-
-        // Check backpressure.
-        let min_reader_pos = minimum_reader_position(kernel, mapping_id, offset)?;
-        let next = tail
-            .checked_add(len)
-            .ok_or_else(|| Error::Wasm("tail reservation overflow".to_string()))?;
-
-        if let Some(min_pos) = min_reader_pos
-            && next.saturating_sub(min_pos) > capacity
-        {
-            // Backpressure: ring is full. Use spin_loop for consistency
-            // with guest-side reserve_tail.
-            for _ in 0..delay {
-                std::hint::spin_loop();
-            }
-            delay = (delay * 2).min(64);
-            continue;
-        }
-
-        let prev = kernel
-            .compare_exchange_shared_memory_u64(mapping_id, offset + NEXT_TAIL_OFFSET, tail, next)
-            .map_err(|e| Error::Wasm(format!("cas failed: {e}")))?;
-
-        if prev == tail {
-            return Ok(tail);
-        }
-
-        // Exponential backoff on contention.
-        for _ in 0..delay {
-            std::hint::spin_loop();
-        }
-        delay = (delay * 2).min(64);
-    }
-}
-
-/// Writes data at a logical position in the ring buffer, handling wraparound.
-fn write_at(
-    kernel: &Kernel,
-    mapping_id: u64,
-    region_offset: u64,
-    capacity: u64,
-    pos: u64,
-    data: &[u8],
-) -> Result<()> {
-    let data_offset = region_offset + DATA_OFFSET;
-    let raw_pos = data_offset + (pos & (capacity - 1));
-    let ring_end = data_offset + capacity;
-
-    if raw_pos + data.len() as u64 <= ring_end {
-        kernel
-            .write_shared_memory(mapping_id, raw_pos, data)
-            .map_err(|e| Error::Wasm(format!("write_at failed: {e}")))
-    } else {
-        let tail_len = (ring_end - raw_pos) as usize;
-        kernel
-            .write_shared_memory(mapping_id, raw_pos, data.get(..tail_len).unwrap_or(&[]))
-            .map_err(|e| Error::Wasm(format!("write_at tail failed: {e}")))?;
-        kernel
-            .write_shared_memory(mapping_id, data_offset, data.get(tail_len..).unwrap_or(&[]))
-            .map_err(|e| Error::Wasm(format!("write_at head failed: {e}")))?;
-        Ok(())
-    }
-}
-
-/// Reads data from a logical position in the ring buffer, handling wraparound.
-fn read_at(
-    kernel: &Kernel,
-    mapping_id: u64,
-    region_offset: u64,
-    capacity: u64,
-    pos: u64,
-    len: u64,
-) -> Result<Vec<u8>> {
-    let data_offset = region_offset + DATA_OFFSET;
-    let raw_pos = data_offset + (pos & (capacity - 1));
-    let ring_end = data_offset + capacity;
-
-    if raw_pos + len <= ring_end {
-        kernel
-            .read_shared_memory(mapping_id, raw_pos, len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at failed: {e}")))
-    } else {
-        let tail_len = ring_end - raw_pos;
-        let head_len = len - tail_len;
-        let mut result = Vec::with_capacity(len as usize);
-        let tail_bytes = kernel
-            .read_shared_memory(mapping_id, raw_pos, tail_len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at tail failed: {e}")))?;
-        result.extend_from_slice(&tail_bytes);
-        let head_bytes = kernel
-            .read_shared_memory(mapping_id, data_offset, head_len as usize)
-            .map_err(|e| Error::Wasm(format!("read_at head failed: {e}")))?;
-        result.extend_from_slice(&head_bytes);
-        Ok(result)
-    }
-}
-
-/// Single-phase frame write with release fencing.
-///
-/// 1. Write payload at `pos + FRAME_HEADER_SIZE`
-/// 2. Release fence (ensures payload is visible before header)
-/// 3. Write header with READY flag at `pos`
-/// 4. Bump generation counter
-///
-/// The kernel uses `write_shared_memory` which writes through the same
-/// `mmap` as the guest. The release fence ensures the payload bytes are
-/// committed to shared memory before the READY header becomes visible to
-/// readers using acquire semantics.
-fn write_frame(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    payload: &[u8],
-) -> Result<()> {
-    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
-    if frame_size > capacity {
-        return Err(Error::Wasm("frame exceeds capacity".to_string()));
-    }
-
-    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
-
-    // Step 1: Write payload.
-    let payload_pos = pos + FRAME_HEADER_SIZE;
-    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
-
-    // Step 2: Release fence ensures payload is visible before the header.
-    fence(Ordering::Release);
-
-    // Step 3: Write header with READY flag (single-phase).
-    let ready_header = FrameHeader {
-        len: payload.len() as u32,
-        tag: 0,
-        flags: FLAG_READY,
-        _reserved: [0; 3],
-    };
-    write_at(
-        kernel,
-        mapping_id,
-        offset,
-        capacity,
-        pos,
-        &ready_header.encode(),
-    )?;
-
-    // Step 4: Bump generation counter.
-    kernel
-        .fetch_add_shared_memory_u64(mapping_id, offset + GENERATION_COUNTER_OFFSET, 1)
-        .map_err(|e| Error::Wasm(format!("bump generation failed: {e}")))?;
-
-    Ok(())
-}
-
-/// Reads a frame from the ring buffer at the given reader position.
-///
-/// Returns `None` if no ready frame is available.
-fn read_frame(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    capacity: u64,
-    reader_pos: &mut u64,
-) -> Result<Option<Vec<u8>>> {
-    let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
-    if *reader_pos >= tail {
-        return Ok(None);
-    }
-
-    let header_bytes = read_at(
-        kernel,
-        mapping_id,
-        offset,
-        capacity,
-        *reader_pos,
-        FRAME_HEADER_SIZE,
-    )?;
-    let header = FrameHeader::decode(&header_bytes)?;
-
-    if !header.is_ready() {
-        return Ok(None);
-    }
-
-    let frame_size = header.frame_size();
-    if frame_size > capacity {
-        return Err(Error::Wasm("invalid frame size".to_string()));
-    }
-
-    let payload_pos = *reader_pos + FRAME_HEADER_SIZE;
-    let payload = read_at(
-        kernel,
-        mapping_id,
-        offset,
-        capacity,
-        payload_pos,
-        header.len as u64,
-    )?;
-
-    *reader_pos += frame_size;
-    Ok(Some(payload))
-}
-
-/// Updates a reader slot in the shared `reader_slots` array.
-fn update_kernel_reader_slot(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    slot: u32,
-    position: u64,
-) -> Result<()> {
-    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
-    let encoded = position
-        .checked_add(1)
-        .ok_or_else(|| Error::Wasm("reader position overflow".to_string()))?;
-    kernel
-        .write_shared_memory(mapping_id, slot_offset, &encoded.to_le_bytes())
-        .map_err(|e| Error::Wasm(format!("update reader slot failed: {e}")))?;
-    Ok(())
-}
-
-/// Releases a reader slot by setting it to 0.
-fn release_kernel_reader_slot(
-    kernel: &Kernel,
-    mapping_id: u64,
-    offset: u64,
-    slot: u32,
-) -> Result<()> {
-    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
-    kernel
-        .write_shared_memory(mapping_id, slot_offset, &0u64.to_le_bytes())
-        .map_err(|e| Error::Wasm(format!("release reader slot failed: {e}")))?;
-    Ok(())
 }
 
 /// Inbound proxy: reads from TCP socket, writes frames to the inbound ring.
@@ -821,6 +555,164 @@ fn proxy_outbound(
 
     running.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// Reads data from a logical position in the ring buffer, handling wraparound.
+fn read_at(
+    kernel: &Kernel,
+    mapping_id: u64,
+    region_offset: u64,
+    capacity: u64,
+    pos: u64,
+    len: u64,
+) -> Result<Vec<u8>> {
+    let data_offset = region_offset + DATA_OFFSET;
+    let raw_pos = data_offset + (pos & (capacity - 1));
+    let ring_end = data_offset + capacity;
+
+    if raw_pos + len <= ring_end {
+        kernel
+            .read_shared_memory(mapping_id, raw_pos, len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at failed: {e}")))
+    } else {
+        let tail_len = ring_end - raw_pos;
+        let head_len = len - tail_len;
+        let mut result = Vec::with_capacity(len as usize);
+        let tail_bytes = kernel
+            .read_shared_memory(mapping_id, raw_pos, tail_len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at tail failed: {e}")))?;
+        result.extend_from_slice(&tail_bytes);
+        let head_bytes = kernel
+            .read_shared_memory(mapping_id, data_offset, head_len as usize)
+            .map_err(|e| Error::Wasm(format!("read_at head failed: {e}")))?;
+        result.extend_from_slice(&head_bytes);
+        Ok(result)
+    }
+}
+
+/// Reads a frame from the ring buffer at the given reader position.
+///
+/// Returns `None` if no ready frame is available.
+fn read_frame(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    reader_pos: &mut u64,
+) -> Result<Option<Vec<u8>>> {
+    let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
+    if *reader_pos >= tail {
+        return Ok(None);
+    }
+
+    let header_bytes = read_at(
+        kernel,
+        mapping_id,
+        offset,
+        capacity,
+        *reader_pos,
+        FRAME_HEADER_SIZE,
+    )?;
+    let header = FrameHeader::decode(&header_bytes)?;
+
+    if !header.is_ready() {
+        return Ok(None);
+    }
+
+    let frame_size = header.frame_size();
+    if frame_size > capacity {
+        return Err(Error::Wasm("invalid frame size".to_string()));
+    }
+
+    let payload_pos = *reader_pos + FRAME_HEADER_SIZE;
+    let payload = read_at(
+        kernel,
+        mapping_id,
+        offset,
+        capacity,
+        payload_pos,
+        header.len as u64,
+    )?;
+
+    *reader_pos += frame_size;
+    Ok(Some(payload))
+}
+
+/// Reads a little-endian u64 from shared memory.
+fn read_u64(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<u64> {
+    let bytes = kernel
+        .read_shared_memory(mapping_id, offset, 8)
+        .map_err(|e| Error::Wasm(format!("read u64 failed: {e}")))?;
+    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_e| {
+        Error::Wasm("invalid u64 bytes".to_string())
+    })?))
+}
+
+/// Releases a reader slot by setting it to 0.
+fn release_kernel_reader_slot(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    slot: u32,
+) -> Result<()> {
+    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
+    kernel
+        .write_shared_memory(mapping_id, slot_offset, &0u64.to_le_bytes())
+        .map_err(|e| Error::Wasm(format!("release reader slot failed: {e}")))?;
+    Ok(())
+}
+
+/// Reserves `len` bytes at the tail via CAS on the shared `next_tail` field.
+///
+/// Uses exponential backoff on contention and checks backpressure against
+/// the shared `reader_slots` array.
+fn reserve_tail(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    len: u64,
+) -> Result<u64> {
+    if len == 0 || len > capacity {
+        return Err(Error::Wasm("invalid reservation length".to_string()));
+    }
+
+    let mut delay: usize = 1;
+    loop {
+        let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
+
+        // Check backpressure.
+        let min_reader_pos = minimum_reader_position(kernel, mapping_id, offset)?;
+        let next = tail
+            .checked_add(len)
+            .ok_or_else(|| Error::Wasm("tail reservation overflow".to_string()))?;
+
+        if let Some(min_pos) = min_reader_pos
+            && next.saturating_sub(min_pos) > capacity
+        {
+            // Backpressure: ring is full. Use spin_loop for consistency
+            // with guest-side reserve_tail.
+            for _ in 0..delay {
+                std::hint::spin_loop();
+            }
+            delay = (delay * 2).min(64);
+            continue;
+        }
+
+        let prev = kernel
+            .compare_exchange_shared_memory_u64(mapping_id, offset + NEXT_TAIL_OFFSET, tail, next)
+            .map_err(|e| Error::Wasm(format!("cas failed: {e}")))?;
+
+        if prev == tail {
+            return Ok(tail);
+        }
+
+        // Exponential backoff on contention.
+        for _ in 0..delay {
+            std::hint::spin_loop();
+        }
+        delay = (delay * 2).min(64);
+    }
 }
 
 #[expect(
@@ -1139,6 +1031,109 @@ fn udp_proxy_send(
     ));
 
     running.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Updates a reader slot in the shared `reader_slots` array.
+fn update_kernel_reader_slot(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    slot: u32,
+    position: u64,
+) -> Result<()> {
+    let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
+    let encoded = position
+        .checked_add(1)
+        .ok_or_else(|| Error::Wasm("reader position overflow".to_string()))?;
+    kernel
+        .write_shared_memory(mapping_id, slot_offset, &encoded.to_le_bytes())
+        .map_err(|e| Error::Wasm(format!("update reader slot failed: {e}")))?;
+    Ok(())
+}
+
+/// Writes data at a logical position in the ring buffer, handling wraparound.
+fn write_at(
+    kernel: &Kernel,
+    mapping_id: u64,
+    region_offset: u64,
+    capacity: u64,
+    pos: u64,
+    data: &[u8],
+) -> Result<()> {
+    let data_offset = region_offset + DATA_OFFSET;
+    let raw_pos = data_offset + (pos & (capacity - 1));
+    let ring_end = data_offset + capacity;
+
+    if raw_pos + data.len() as u64 <= ring_end {
+        kernel
+            .write_shared_memory(mapping_id, raw_pos, data)
+            .map_err(|e| Error::Wasm(format!("write_at failed: {e}")))
+    } else {
+        let tail_len = (ring_end - raw_pos) as usize;
+        kernel
+            .write_shared_memory(mapping_id, raw_pos, data.get(..tail_len).unwrap_or(&[]))
+            .map_err(|e| Error::Wasm(format!("write_at tail failed: {e}")))?;
+        kernel
+            .write_shared_memory(mapping_id, data_offset, data.get(tail_len..).unwrap_or(&[]))
+            .map_err(|e| Error::Wasm(format!("write_at head failed: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Single-phase frame write with release fencing.
+///
+/// 1. Write payload at `pos + FRAME_HEADER_SIZE`
+/// 2. Release fence (ensures payload is visible before header)
+/// 3. Write header with READY flag at `pos`
+/// 4. Bump generation counter
+///
+/// The kernel uses `write_shared_memory` which writes through the same
+/// `mmap` as the guest. The release fence ensures the payload bytes are
+/// committed to shared memory before the READY header becomes visible to
+/// readers using acquire semantics.
+fn write_frame(
+    kernel: &Kernel,
+    mapping_id: u64,
+    offset: u64,
+    capacity: u64,
+    payload: &[u8],
+) -> Result<()> {
+    let frame_size = FRAME_HEADER_SIZE + payload.len() as u64;
+    if frame_size > capacity {
+        return Err(Error::Wasm("frame exceeds capacity".to_string()));
+    }
+
+    let pos = reserve_tail(kernel, mapping_id, offset, capacity, frame_size)?;
+
+    // Step 1: Write payload.
+    let payload_pos = pos + FRAME_HEADER_SIZE;
+    write_at(kernel, mapping_id, offset, capacity, payload_pos, payload)?;
+
+    // Step 2: Release fence ensures payload is visible before the header.
+    fence(Ordering::Release);
+
+    // Step 3: Write header with READY flag (single-phase).
+    let ready_header = FrameHeader {
+        len: payload.len() as u32,
+        tag: 0,
+        flags: FLAG_READY,
+        _reserved: [0; 3],
+    };
+    write_at(
+        kernel,
+        mapping_id,
+        offset,
+        capacity,
+        pos,
+        &ready_header.encode(),
+    )?;
+
+    // Step 4: Bump generation counter.
+    kernel
+        .fetch_add_shared_memory_u64(mapping_id, offset + GENERATION_COUNTER_OFFSET, 1)
+        .map_err(|e| Error::Wasm(format!("bump generation failed: {e}")))?;
+
     Ok(())
 }
 

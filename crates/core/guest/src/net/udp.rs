@@ -1,7 +1,9 @@
 //! UDP socket backed by shared-memory ring buffers.
 
-use std::net::SocketAddr;
-use std::sync::atomic::{Ordering, fence};
+use std::{
+    net::SocketAddr,
+    sync::atomic::{Ordering, fence},
+};
 
 use selium_abi::{HostcallOutput, HostcallRequest};
 
@@ -11,13 +13,12 @@ use crate::{
     io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf},
 };
 
-/// Magic value for multi-memory shared region layout headers.
-const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
-
-/// Multi-memory header offsets.
-const HEADER_MAGIC_OFFSET: u64 = 0;
 const HEADER_COUNT_OFFSET: u64 = 16;
 const HEADER_ENTRY_OFFSET: u64 = 24;
+/// Multi-memory header offsets.
+const HEADER_MAGIC_OFFSET: u64 = 0;
+/// Magic value for multi-memory shared region layout headers.
+const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
 /// A UDP socket backed by shared-memory ring buffers.
 ///

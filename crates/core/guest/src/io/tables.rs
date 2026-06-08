@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, hash::Hash};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    hash::Hash,
+};
 
 use crate::io::{
     error::{Error, Result},
