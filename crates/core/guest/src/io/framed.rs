@@ -31,6 +31,24 @@ use crate::io::{
 /// or [`tokio::io::AsyncWrite`] that transports raw frame bytes.
 pub struct FrameCodec;
 
+/// A framed reader that wraps a raw byte-stream reader to provide frame-level
+/// read operations with [`FrameHeader`] decoding and tag extraction.
+///
+/// Internally uses `tokio_util::codec::FramedRead<R, FrameCodec>`.
+pub struct FramedRead<R> {
+    inner: TokioFramedRead<R, FrameCodec>,
+    /// A frame that was peeked by `poll_ready` but not yet consumed.
+    peeked: Option<(Vec<u8>, u32)>,
+}
+
+/// A framed writer that wraps a raw byte-stream writer to provide frame-level
+/// write operations with [`FrameHeader`] encoding.
+///
+/// Internally uses `tokio_util::codec::FramedWrite<W, FrameCodec>`.
+pub struct FramedWrite<W> {
+    inner: TokioFramedWrite<W, FrameCodec>,
+}
+
 impl Decoder for FrameCodec {
     type Item = (Vec<u8>, u32); // (payload, tag)
     type Error = Error;
@@ -76,16 +94,6 @@ impl Encoder<(Vec<u8>, u32)> for FrameCodec {
         dst.extend_from_slice(&payload);
         Ok(())
     }
-}
-
-/// A framed reader that wraps a raw byte-stream reader to provide frame-level
-/// read operations with [`FrameHeader`] decoding and tag extraction.
-///
-/// Internally uses `tokio_util::codec::FramedRead<R, FrameCodec>`.
-pub struct FramedRead<R> {
-    inner: TokioFramedRead<R, FrameCodec>,
-    /// A frame that was peeked by `poll_ready` but not yet consumed.
-    peeked: Option<(Vec<u8>, u32)>,
 }
 
 impl<R> FramedRead<R> {
@@ -176,14 +184,6 @@ impl FramedRead<Reader> {
         let weak = strong.downgrade();
         FramedRead::new(weak)
     }
-}
-
-/// A framed writer that wraps a raw byte-stream writer to provide frame-level
-/// write operations with [`FrameHeader`] encoding.
-///
-/// Internally uses `tokio_util::codec::FramedWrite<W, FrameCodec>`.
-pub struct FramedWrite<W> {
-    inner: TokioFramedWrite<W, FrameCodec>,
 }
 
 impl<W> FramedWrite<W> {

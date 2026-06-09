@@ -198,9 +198,7 @@ fn write_frame_bytes(region: &ChannelRegion, pos: u64, buf: &[u8]) -> Result<()>
     let mask = region.capacity() - 1;
 
     let header_size = FrameHeader::ENCODED_SIZE as u64;
-    let payload = buf
-        .get(FrameHeader::ENCODED_SIZE..)
-        .unwrap_or_default();
+    let payload = buf.get(FrameHeader::ENCODED_SIZE..).unwrap_or_default();
 
     // Step 1: Write payload at pos + ENCODED_SIZE.
     let payload_pos = pos.checked_add(header_size).ok_or(Error::InvalidFrame)?;
@@ -268,7 +266,9 @@ mod tests {
         buf.extend_from_slice(&header.encode());
         buf.extend_from_slice(b"hello");
 
-        let pos = region.reserve_tail(buf.len() as u64, true).expect("reserve");
+        let pos = region
+            .reserve_tail(buf.len() as u64, true)
+            .expect("reserve");
         write_frame_bytes(&region, pos, &buf).expect("write");
 
         // Read back the header and verify READY flag.
