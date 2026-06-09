@@ -1,0 +1,47 @@
+// Flatbuffers schema for discovery service messages.
+namespace selium.discovery;
+
+/// Interface metadata for a discovered resource.
+table InterfaceMetadata {
+    /// Interface name.
+    name: string;
+    /// Method names exposed by the interface.
+    methods: [string];
+}
+
+/// Target resource returned by discovery resolution.
+table ResourceTarget {
+    /// URI of the resource.
+    uri: string;
+    /// Host id where the resource resides.
+    host_id: string;
+    /// Resource identifier.
+    resource_id: ulong;
+    /// Optional interface metadata.
+    interface: InterfaceMetadata;
+}
+
+/// Discovery request message.
+///
+/// Variant tag values:
+///   0 = Resolve(uri)
+table DiscoveryRequest {
+    /// Variant discriminator.
+    variant: ubyte;
+    /// URI to resolve (used by Resolve variant).
+    uri: string;
+}
+
+/// Discovery response message.
+///
+/// Variant tag values:
+///   0 = Found(target)
+///   1 = NotFound
+table DiscoveryResponse {
+    /// Variant discriminator.
+    variant: ubyte;
+    /// The discovered resource (used by Found variant).
+    target: ResourceTarget;
+}
+
+root_type DiscoveryResponse;

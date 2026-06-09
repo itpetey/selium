@@ -8,6 +8,7 @@ pub use crate::{
     },
     codec::{decode_typed, encode_typed},
     context::Context,
+    encoding::{FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor},
     error::{GuestError, Result},
     memory::{SHARED_REGION_MAGIC, SharedRegion, attach_region, free_region},
     net::tcp::{TcpAccept, TcpListener, TcpStream},
@@ -23,13 +24,17 @@ pub use selium_abi::{
     InterfaceMetadata, LocalityScope, RegionProt, ResourceClass, ResourceIdentity,
     ResourceSelector, ResourceTarget, ScopeContext,
 };
-pub use selium_guest_macros::{entrypoint, pattern_interface};
+pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
 pub use tracing::{debug, error, info, trace, warn};
 
 mod async_runtime;
 mod codec;
 mod context;
+pub mod encoding;
 mod error;
+#[allow(warnings)]
+#[rustfmt::skip]
+pub mod fbs;
 mod hostcall;
 #[cfg(feature = "io")]
 pub mod io;

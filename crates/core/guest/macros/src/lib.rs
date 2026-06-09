@@ -4,6 +4,14 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, ItemTrait, ReturnType, parse_macro_input};
 
+mod schema;
+
+/// Struct-level schema annotation declaring a message type.
+#[proc_macro_attribute]
+pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
+    schema::expand(attr, item)
+}
+
 /// Marks a function as an exported Selium guest entrypoint.
 ///
 /// Accepts `fn entrypoint()`, `async fn entrypoint()`, `fn entrypoint(ctx: Context)`,

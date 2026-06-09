@@ -1,22 +1,37 @@
 use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
-use rkyv::{
-    api::high::{HighDeserializer, HighValidator},
-    rancor::Error as RancorError,
+use crate::{
+    encoding::{FlatMsg, HasSchema, SchemaDescriptor},
+    io::{
+        error::{Error, Result},
+        pubsub::{self, Publisher, Subscriber},
+    },
+    schema,
 };
-use selium_abi::RkyvEncode;
 
-use crate::io::{
-    error::{Error, Result},
-    pubsub::{self, Publisher, Subscriber},
-};
+/// Wire type for live table mutations, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/live_table.fbs",
+    ty = "selium.live_table.LiveTableMessage",
+    binding = "crate::fbs::selium::live_table::LiveTableMessage"
+)]
+pub struct LiveTableMessageWire {
+    /// Topic-wide mutation id used to acknowledge writes in stream order.
+    pub mutation_id: u64,
+    /// The entry key encoded as bytes via FlatMsg.
+    pub key_bytes: Vec<u8>,
+    /// The entry value encoded as bytes via FlatMsg (empty for tombstones).
+    pub value_bytes: Vec<u8>,
+    /// Optional version that must be current for this mutation to apply (0 = none).
+    pub expected_version: u64,
+}
 
 /// A table mutation published over a pub/sub topic.
 ///
 /// Every `set` publishes one of these messages. All processes attached to
 /// the same topic replay the stream to build their local materialised view.
-#[derive(Debug, Clone, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(bytecheck())]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LiveTableMessage<K, V> {
     /// Topic-wide mutation id used to acknowledge writes in stream order.
     pub mutation_id: u64,
@@ -26,6 +41,51 @@ pub struct LiveTableMessage<K, V> {
     pub value: Option<V>,
     /// Optional version that must be current for this mutation to apply.
     pub expected_version: Option<u64>,
+}
+
+impl<K: FlatMsg, V: FlatMsg> FlatMsg for LiveTableMessage<K, V> {
+    fn encode(value: &Self) -> Vec<u8> {
+        let key_bytes = FlatMsg::encode(&value.key);
+        let value_bytes = match &value.value {
+            Some(v) => FlatMsg::encode(v),
+            None => Vec::new(),
+        };
+        let expected_version = value.expected_version.unwrap_or(0);
+
+        let wire = LiveTableMessageWire::new(
+            value.mutation_id,
+            key_bytes,
+            value_bytes,
+            expected_version,
+        );
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+        let wire: LiveTableMessageWire = FlatMsg::decode(bytes)?;
+        let key: K = FlatMsg::decode(&wire.key_bytes)?;
+        let value: Option<V> = if wire.value_bytes.is_empty() {
+            None
+        } else {
+            Some(FlatMsg::decode(&wire.value_bytes)?)
+        };
+        let expected_version = if wire.expected_version == 0 {
+            None
+        } else {
+            Some(wire.expected_version)
+        };
+
+        Ok(Self {
+            mutation_id: wire.mutation_id,
+            key,
+            value,
+            expected_version,
+        })
+    }
+}
+
+impl<K: FlatMsg, V: FlatMsg> HasSchema for LiveTableMessage<K, V> {
+    const SCHEMA: SchemaDescriptor = LiveTableMessageWireSchema;
 }
 
 /// A materialised live table record.
@@ -70,15 +130,8 @@ pub struct LiveTable<K, V> {
 
 impl<K, V> LiveTable<K, V>
 where
-    K: rkyv::Archive + Clone + Eq + Hash,
-    V: rkyv::Archive + Clone,
-    for<'a> K::Archived: rkyv::Deserialize<K, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    for<'a> V::Archived: rkyv::Deserialize<V, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived: rkyv::Deserialize<LiveTableMessage<K, V>, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    LiveTableMessage<K, V>: RkyvEncode,
+    K: FlatMsg + Clone + Eq + Hash,
+    V: FlatMsg + Clone,
 {
     /// Creates a new live table with its own pub/sub topic.
     pub fn create(capacity: u64) -> Result<Self> {
@@ -347,8 +400,8 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 1,
-                key: "alpha",
-                value: Some(10),
+                key: "alpha".to_string(),
+                value: Some(10u64),
                 expected_version: None,
             },
         );
@@ -358,22 +411,28 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 2,
-                key: "alpha",
-                value: Some(20),
+                key: "alpha".to_string(),
+                value: Some(20u64),
                 expected_version: Some(1),
             },
         );
         assert_eq!(version, ApplyOutcome::Applied(2));
-        assert_eq!(local.get("alpha").map(|record| record.version), Some(2));
-        assert_eq!(local.get("alpha").and_then(|record| record.value), Some(20));
+        assert_eq!(
+            local.get("alpha").map(|record| record.version),
+            Some(2)
+        );
+        assert_eq!(
+            local.get("alpha").and_then(|record| record.value),
+            Some(20u64)
+        );
     }
 
     #[test]
     fn apply_message_rejects_stale_cas() {
         let mut local = HashMap::from([(
-            "alpha",
+            "alpha".to_string(),
             LiveTableRecord {
-                value: Some(10),
+                value: Some(10u64),
                 version: 2,
             },
         )]);
@@ -382,21 +441,24 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 1,
-                key: "alpha",
-                value: Some(20),
+                key: "alpha".to_string(),
+                value: Some(20u64),
                 expected_version: Some(1),
             },
         );
         assert_eq!(version, ApplyOutcome::Conflict { actual: Some(2) });
-        assert_eq!(local.get("alpha").and_then(|record| record.value), Some(10));
+        assert_eq!(
+            local.get("alpha").and_then(|record| record.value),
+            Some(10u64)
+        );
     }
 
     #[test]
     fn apply_message_deletes_records() {
         let mut local = HashMap::from([(
-            "alpha",
+            "alpha".to_string(),
             LiveTableRecord {
-                value: Some(10),
+                value: Some(10u64),
                 version: 1,
             },
         )]);
@@ -405,19 +467,25 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 1,
-                key: "alpha",
+                key: "alpha".to_string(),
                 value: None,
                 expected_version: None,
             },
         );
-        assert_eq!(local.get("alpha").and_then(|record| record.value), None);
-        assert_eq!(local.get("alpha").map(|record| record.version), Some(2));
+        assert_eq!(
+            local.get("alpha").and_then(|record| record.value),
+            None
+        );
+        assert_eq!(
+            local.get("alpha").map(|record| record.version),
+            Some(2)
+        );
     }
 
     #[test]
     fn apply_message_recreates_only_with_tombstone_version() {
         let mut local = HashMap::from([(
-            "alpha",
+            "alpha".to_string(),
             LiveTableRecord {
                 value: None,
                 version: 2,
@@ -428,8 +496,8 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 1,
-                key: "alpha",
-                value: Some(10),
+                key: "alpha".to_string(),
+                value: Some(10u64),
                 expected_version: Some(0),
             },
         );
@@ -439,19 +507,22 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 2,
-                key: "alpha",
-                value: Some(20),
+                key: "alpha".to_string(),
+                value: Some(20u64),
                 expected_version: Some(2),
             },
         );
         assert_eq!(recreated, ApplyOutcome::Applied(3));
-        assert_eq!(local.get("alpha").and_then(|record| record.value), Some(20));
+        assert_eq!(
+            local.get("alpha").and_then(|record| record.value),
+            Some(20u64)
+        );
     }
 
     #[test]
     fn scan_limit_counts_live_records_only() {
         let mut local = HashMap::from([(
-            "deleted",
+            "deleted".to_string(),
             LiveTableRecord {
                 value: None,
                 version: 2,
@@ -461,8 +532,8 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 1,
-                key: "first",
-                value: Some(1),
+                key: "first".to_string(),
+                value: Some(1u64),
                 expected_version: None,
             },
         );
@@ -470,8 +541,8 @@ mod tests {
             &mut local,
             LiveTableMessage {
                 mutation_id: 2,
-                key: "second",
-                value: Some(2),
+                key: "second".to_string(),
+                value: Some(2u64),
                 expected_version: None,
             },
         );

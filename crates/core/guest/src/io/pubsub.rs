@@ -5,18 +5,16 @@ use std::{
 };
 
 use futures::{Sink, Stream};
-use rkyv::{
-    api::high::{HighDeserializer, HighValidator},
-    rancor::Error as RancorError,
-};
-use selium_abi::{RkyvEncode, decode_rkyv, encode_rkyv};
 
-use crate::io::{
-    Error, RingBuf,
-    channels::{BlockingReader, BlockingWriter, Reader, Writer},
-    error::Result,
-    framed::{FramedRead, FramedWrite},
-    ring_buf::round_capacity,
+use crate::{
+    encoding::FlatMsg,
+    io::{
+        Error, RingBuf,
+        channels::{BlockingReader, BlockingWriter, Reader, Writer},
+        error::Result,
+        framed::{FramedRead, FramedWrite},
+        ring_buf::round_capacity,
+    },
 };
 
 pub struct Publisher<T, W = Writer> {
@@ -70,10 +68,10 @@ impl<T, W> Publisher<T, W> {
     /// Publishes a typed message synchronously (convenience wrapper).
     pub fn publish(&mut self, item: &T) -> Result<()>
     where
-        T: RkyvEncode,
+        T: FlatMsg,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let bytes = encode_rkyv(item).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
+        let bytes = FlatMsg::encode(item);
         self.writer.write_frame(&bytes, 0)
     }
 }
@@ -126,7 +124,7 @@ impl<T> Publisher<T, BlockingWriter> {
 
 impl<T, W> Sink<T> for Publisher<T, W>
 where
-    T: RkyvEncode + Unpin,
+    T: FlatMsg + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     type Error = Error;
@@ -137,7 +135,7 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<()> {
         let this = self.get_mut();
-        let bytes = encode_rkyv(&item).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
+        let bytes = FlatMsg::encode(&item);
         this.writer.write_frame(&bytes, 0)?;
         Ok(())
     }
@@ -194,16 +192,14 @@ impl<T, R> Subscriber<T, R> {
     /// like `selium-tables` that need to identify which publisher wrote a message.
     pub fn read_with_writer_id(&mut self) -> Result<(T, u32)>
     where
-        T: rkyv::Archive + Sized,
-        for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
-            + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+        T: FlatMsg,
         R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpin,
     {
         let (payload, writer_id) = self.reader.read_frame()?;
         // Update last_generation after successful read.
         self.last_generation = self.reader.generation()?;
         let value: T =
-            decode_rkyv(&payload).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
+            FlatMsg::decode(&payload).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
         Ok((value, writer_id))
     }
 }
@@ -238,9 +234,7 @@ impl<T> Subscriber<T, BlockingReader> {
 
 impl<T, R> Stream for Subscriber<T, R>
 where
-    T: rkyv::Archive + Sized + Unpin,
-    for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    T: FlatMsg + Unpin,
     R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpin,
 {
     type Item = Result<T>;
@@ -269,7 +263,7 @@ where
                 Ok(g) => g,
                 Err(e) => return Poll::Ready(Some(Err(e))),
             };
-            match decode_rkyv(&payload) {
+            match FlatMsg::decode(&payload) {
                 Ok(value) => return Poll::Ready(Some(Ok(value))),
                 Err(e) => {
                     return Poll::Ready(Some(Err(Error::SerializationFailed(format!("{e}")))));

@@ -13,9 +13,9 @@ categories.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"], optional = true }
 bytes.workspace = true
+flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
 quinn = { workspace = true, optional = true }
-rkyv.workspace = true
 selium-abi.workspace = true
 selium-guest-macros = { path = "macros" }
 thiserror.workspace = true
@@ -23,7 +23,12 @@ tokio = { workspace = true, features = ["io-util"], optional = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
 
+[build-dependencies]
+flatbuffers-build.workspace = true
+flatc-fork.workspace = true
+
 [dev-dependencies]
+flatbuffers.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]

@@ -26,16 +26,13 @@
 
 use std::{fmt, marker::PhantomData};
 
-use rkyv::{
-    api::high::{HighDeserializer, HighValidator},
-    rancor::Error as RancorError,
-};
-use selium_abi::{decode_rkyv, encode_rkyv};
-
-use crate::io::{
-    ChannelRegion, Error, PAGE_SIZE, RegionMapping, RingBuf,
-    channels::{BlockingReader, BlockingWriter},
-    framed::{FramedRead, FramedWrite},
+use crate::{
+    encoding::FlatMsg,
+    io::{
+        ChannelRegion, Error, PAGE_SIZE, RegionMapping, RingBuf,
+        channels::{BlockingReader, BlockingWriter},
+        framed::{FramedRead, FramedWrite},
+    },
 };
 
 /// Default reply ring capacity in bytes.
@@ -50,7 +47,7 @@ const HEADER_ENTRY_SIZE: u64 = 8;
 const HEADER_MAGIC_OFFSET: u64 = 0;
 /// Header size (magic + capacity + count + 2 entries).
 const HEADER_SIZE: u64 = HEADER_ENTRY_OFFSET + 2 * HEADER_ENTRY_SIZE;
-/// Magic value for multi-memory shared region layout headers.
+/// Magic value for multi-memory shared region layout header.
 const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
 /// Error type for RPC operations.
@@ -178,10 +175,8 @@ impl From<Error> for AcceptError {
 
 impl<Req, Rep> RpcClient<Req, Rep>
 where
-    Req: selium_abi::RkyvEncode,
-    Rep: rkyv::Archive + Sized,
-    for<'a> Rep::Archived: rkyv::Deserialize<Rep, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    Req: FlatMsg,
+    Rep: FlatMsg,
 {
     /// Creates a new RPC session by allocating a shared region with two
     /// ring buffers, sending the `shared_id` via `ResourceSender`, and
@@ -219,7 +214,7 @@ where
 
     /// Sends a typed request and awaits the matching reply.
     ///
-    /// The request is rkyv-encoded and written as a frame to the request
+    /// The request is Flatbuffers-encoded and written as a frame to the request
     /// ring. The client then blocks on the reply ring's generation counter
     /// (via polling in native mode, `memory.atomic.wait32` in WASM mode)
     /// until a reply frame with the matching correlation tag is available.
@@ -228,8 +223,7 @@ where
         self.next_correlation = self.next_correlation.wrapping_add(1);
 
         // Encode the request payload.
-        let encoded = encode_rkyv(&payload)
-            .map_err(|e| RpcError::Serialization(format!("encode request: {e}")))?;
+        let encoded = FlatMsg::encode(&payload);
 
         // Write the frame to the request ring.
         self.request_writer.write_frame(&encoded, correlation)?;
@@ -267,10 +261,8 @@ where
 
 impl<Req, Rep> RpcConnection<Req, Rep>
 where
-    Req: rkyv::Archive + Sized,
-    for<'a> Req::Archived: rkyv::Deserialize<Req, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    Rep: selium_abi::RkyvEncode,
+    Req: FlatMsg,
+    Rep: FlatMsg,
 {
     /// Creates an RPC connection from the server side by attaching to
     /// the shared region identified by `shared_id`.
@@ -368,19 +360,17 @@ where
 
 impl<'a, Req, Rep> RpcRequest<'a, Req, Rep>
 where
-    Req: rkyv::Archive + Sized,
-    for<'b> Req::Archived: rkyv::Deserialize<Req, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'b, RancorError>>,
-    Rep: selium_abi::RkyvEncode,
+    Req: FlatMsg,
+    Rep: FlatMsg,
 {
     /// Returns a reference to the raw request payload bytes.
     pub fn payload_bytes(&self) -> &[u8] {
         &self.payload_bytes
     }
 
-    /// Decodes the request payload from rkyv bytes.
+    /// Decodes the request payload from Flatbuffers bytes.
     pub fn payload(&self) -> Result<Req, RpcError> {
-        decode_rkyv::<Req>(&self.payload_bytes)
+        Req::decode(&self.payload_bytes)
             .map_err(|e| RpcError::Serialization(format!("decode request: {e}")))
     }
 
@@ -391,11 +381,10 @@ where
 
     /// Sends a reply to the client.
     ///
-    /// The response is rkyv-encoded and written as a frame to the reply
+    /// The response is Flatbuffers-encoded and written as a frame to the reply
     /// ring with the same correlation tag as the request.
     pub async fn reply(self, response: Rep) -> Result<(), RpcError> {
-        let encoded = encode_rkyv(&response)
-            .map_err(|e| RpcError::Serialization(format!("encode reply: {e}")))?;
+        let encoded = FlatMsg::encode(&response);
 
         self.reply_writer.write_frame(&encoded, self.correlation)?;
 
@@ -405,10 +394,8 @@ where
 
 impl<Req, Rep> crate::Accept for RpcAccept<Req, Rep>
 where
-    Req: rkyv::Archive + Sized,
-    for<'a> Req::Archived: rkyv::Deserialize<Req, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    Rep: selium_abi::RkyvEncode,
+    Req: FlatMsg,
+    Rep: FlatMsg,
 {
     type Item = RpcConnection<Req, Rep>;
 
@@ -601,9 +588,7 @@ fn try_read_reply<Rep>(
     correlation: u32,
 ) -> Result<Option<Rep>, RpcError>
 where
-    Rep: rkyv::Archive + Sized,
-    for<'a> Rep::Archived: rkyv::Deserialize<Rep, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    Rep: FlatMsg,
 {
     // Try to read a frame
     match reply_reader.read_frame() {
@@ -612,7 +597,7 @@ where
                 return Ok(None);
             }
 
-            let decoded: Rep = decode_rkyv::<Rep>(&payload_bytes)
+            let decoded: Rep = FlatMsg::decode(&payload_bytes)
                 .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")))?;
 
             Ok(Some(decoded))
@@ -638,12 +623,8 @@ mod tests {
         rep_capacity: u64,
     ) -> Result<(RpcClient<Req, Rep>, RpcConnection<Req, Rep>), RpcError>
     where
-        Req: selium_abi::RkyvEncode + rkyv::Archive + Sized,
-        for<'a> Req::Archived: rkyv::Deserialize<Req, HighDeserializer<RancorError>>
-            + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-        Rep: selium_abi::RkyvEncode + rkyv::Archive + Sized,
-        for<'a> Rep::Archived: rkyv::Deserialize<Rep, HighDeserializer<RancorError>>
-            + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+        Req: FlatMsg,
+        Rep: FlatMsg,
     {
         let req_cap = if req_capacity == 0 {
             DEFAULT_REQ_CAPACITY
@@ -735,16 +716,55 @@ mod tests {
         Ok((client, server))
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-    #[rkyv(bytecheck())]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestRequest {
         value: String,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-    #[rkyv(bytecheck())]
+    impl FlatMsg for TestRequest {
+        fn encode(value: &Self) -> Vec<u8> {
+            let mut result = Vec::new();
+            result.extend_from_slice(&(value.value.len() as u32).to_le_bytes());
+            result.extend_from_slice(value.value.as_bytes());
+            result
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
+            if bytes.len() < 4 {
+                return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
+            }
+            let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            if bytes.len() < 4 + len {
+                return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
+            }
+            let value = std::str::from_utf8(&bytes[4..4 + len])
+                .map_err(|e| flatbuffers::InvalidFlatbuffer::Utf8Error {
+                    error: e,
+                    range: 4..4 + len,
+                    error_trace: Default::default(),
+                })?
+                .to_string();
+            Ok(Self { value })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestResponse {
         result: u32,
+    }
+
+    impl FlatMsg for TestResponse {
+        fn encode(value: &Self) -> Vec<u8> {
+            value.result.to_le_bytes().to_vec()
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
+            if bytes.len() < 4 {
+                return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
+            }
+            let result = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            Ok(Self { result })
+        }
     }
 
     #[test]

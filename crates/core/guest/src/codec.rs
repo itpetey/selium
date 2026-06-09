@@ -1,38 +1,59 @@
-use rkyv::{
-    api::high::{HighDeserializer, HighValidator},
-    rancor::Error as RancorError,
-};
-use selium_abi::{decode_rkyv, deframe_bytes, encode_rkyv, frame_bytes};
+use selium_abi::{deframe_bytes, frame_bytes};
 
-use crate::{Result, error::abi_error_to_guest_error};
+use crate::{Result, encoding::FlatMsg, error::abi_error_to_guest_error};
 
-/// Decodes a framed rkyv value received by a guest interface.
+/// Decodes a framed Flatbuffers value received by a guest interface.
 pub fn decode_typed<T>(bytes: &[u8]) -> Result<T>
 where
-    T: rkyv::Archive + Sized,
-    for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
-        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    T: FlatMsg,
 {
     let payload = deframe_bytes(bytes).map_err(abi_error_to_guest_error)?;
-    Ok(decode_rkyv(payload)?)
+    FlatMsg::decode(payload).map_err(|e| crate::GuestError::Host(format!("FlatMsg decode: {e}")))
 }
 
-/// Encodes a value as framed rkyv bytes for a guest interface.
+/// Encodes a value as framed Flatbuffers bytes for a guest interface.
 pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>>
 where
-    T: selium_abi::RkyvEncode,
+    T: FlatMsg,
 {
-    frame_bytes(&encode_rkyv(value)?).map_err(abi_error_to_guest_error)
+    frame_bytes(&FlatMsg::encode(value)).map_err(abi_error_to_guest_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-    #[rkyv(bytecheck())]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct DemoPayload {
         message: String,
+    }
+
+    impl FlatMsg for DemoPayload {
+        fn encode(value: &Self) -> Vec<u8> {
+            // Simple encoding: length-prefixed string
+            let mut result = Vec::new();
+            result.extend_from_slice(&(value.message.len() as u32).to_le_bytes());
+            result.extend_from_slice(value.message.as_bytes());
+            result
+        }
+
+        fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+            if bytes.len() < 4 {
+                return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
+            }
+            let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            if bytes.len() < 4 + len {
+                return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
+            }
+            let message = std::str::from_utf8(&bytes[4..4 + len])
+                .map_err(|e| flatbuffers::InvalidFlatbuffer::Utf8Error {
+                    error: e,
+                    range: 4..4 + len,
+                    error_trace: Default::default(),
+                })?
+                .to_string();
+            Ok(Self { message })
+        }
     }
 
     #[test]
