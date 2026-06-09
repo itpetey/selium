@@ -34,6 +34,69 @@ pub struct BlockingWriter {
     writer_id: u32,
 }
 
+impl Writer {
+    pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
+        Self { region, writer_id }
+    }
+
+    /// Returns the writer id stored in emitted frames.
+    pub fn writer_id(&self) -> u32 {
+        self.writer_id
+    }
+
+    /// Allocates a globally unique mutation id for this writer's channel.
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        self.region.allocate_mutation_id()
+    }
+
+    /// Returns a reference to the underlying channel region.
+    pub fn region(&self) -> &ChannelRegion {
+        &self.region
+    }
+
+    /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count.
+    pub fn upgrade(self) -> Result<BlockingWriter> {
+        self.region.increment_writer_count()?;
+        Ok(BlockingWriter::from_writer_id(self.region, self.writer_id))
+    }
+}
+
+impl AsyncWrite for Writer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let len = buf.len() as u64;
+        if len > self.region.capacity() {
+            return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
+        }
+
+        let pos = match self.region.reserve_tail(len, false) {
+            Ok(p) => p,
+            Err(Error::BufferFull) => return Poll::Pending,
+            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
+        };
+
+        if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
+            return Poll::Ready(Err(std::io::Error::other(e)));
+        }
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl BlockingWriter {
     /// Creates a new blocking writer. Increments writer_count and allocates a writer_id.
     pub(crate) fn new(region: ChannelRegion) -> Result<Self> {
@@ -122,69 +185,6 @@ impl AsyncWrite for BlockingWriter {
 impl Drop for BlockingWriter {
     fn drop(&mut self) {
         let _ = self.region.decrement_writer_count();
-    }
-}
-
-impl Writer {
-    pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
-        Self { region, writer_id }
-    }
-
-    /// Returns the writer id stored in emitted frames.
-    pub fn writer_id(&self) -> u32 {
-        self.writer_id
-    }
-
-    /// Allocates a globally unique mutation id for this writer's channel.
-    pub fn allocate_mutation_id(&self) -> Result<u64> {
-        self.region.allocate_mutation_id()
-    }
-
-    /// Returns a reference to the underlying channel region.
-    pub fn region(&self) -> &ChannelRegion {
-        &self.region
-    }
-
-    /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count.
-    pub fn upgrade(self) -> Result<BlockingWriter> {
-        self.region.increment_writer_count()?;
-        Ok(BlockingWriter::from_writer_id(self.region, self.writer_id))
-    }
-}
-
-impl AsyncWrite for Writer {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let len = buf.len() as u64;
-        if len > self.region.capacity() {
-            return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
-        }
-
-        let pos = match self.region.reserve_tail(len, false) {
-            Ok(p) => p,
-            Err(Error::BufferFull) => return Poll::Pending,
-            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
-        };
-
-        if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
-            return Poll::Ready(Err(std::io::Error::other(e)));
-        }
-
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }
 
