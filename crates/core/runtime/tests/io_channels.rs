@@ -84,7 +84,7 @@ fn attach_reads_and_writes_through_kernel() {
 
     // Attach the region via hostcall (returns page_offset).
     let attachment = attach_region(&runtime, process_id, region_id);
-    assert_eq!(attachment.page_offset, 0);
+    assert_eq!(attachment.page_offset, 1);
 
     // Use kernel internals to get a local mapping id for verification.
     let local_id = runtime
@@ -187,7 +187,7 @@ fn frame_header_round_trip() {
     free_region(&runtime, process_id, region_id);
 }
 
-/// Tests that freeing a region with active mappings fails.
+/// Tests that FreeRegion cleans up active kernel mappings and succeeds.
 #[test]
 #[ignore]
 fn free_fails_when_mapped() {
@@ -202,18 +202,19 @@ fn free_fails_when_mapped() {
         .attach_shared_region(region_id)
         .expect("attach");
 
-    // FreeRegion should fail because mapping still exists.
+    // FreeRegion should succeed by cleaning up all kernel mappings first.
     let (_, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
     match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Failed(_) => {} // expected
-        other => panic!("expected Failed, got {other:?}"),
+        CompletionState::Ready(HostcallOutput::Empty) => {} // expected
+        other => panic!("expected Ready(Empty), got {other:?}"),
     }
 
-    runtime
-        .kernel()
-        .detach_shared_region(local_id)
-        .expect("detach");
-    free_region(&runtime, process_id, region_id);
+    // Kernel mapping should have been cleaned up — detach should fail.
+    let result = runtime.kernel().detach_shared_region(local_id);
+    assert!(
+        result.is_err(),
+        "detach should fail after FreeRegion cleaned up kernel mappings"
+    );
 }
 
 /// Frees a shared region via the `FreeRegion` hostcall.

@@ -3,12 +3,17 @@ use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
+    sync::atomic::{Ordering, fence},
     task::{Context, Poll},
 };
 
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, udp::RecvMeta};
 
-use crate::{Instant, net::udp::UdpSocket};
+use crate::{
+    Instant,
+    io::{FrameHeader, RingBuf},
+    net::udp::UdpSocket,
+};
 
 pub struct QuinnUdpSocket(UdpSocket);
 
@@ -16,7 +21,7 @@ pub struct QuinnUdpSocket(UdpSocket);
 pub struct SeliumQuinnRuntime;
 
 struct QuinnUdpSender {
-    _inner: UdpSocket,
+    inner: UdpSocket,
 }
 
 impl QuinnUdpSocket {
@@ -28,19 +33,105 @@ impl QuinnUdpSocket {
 impl AsyncUdpSocket for QuinnUdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(QuinnUdpSender {
-            _inner: self.0.clone(),
+            inner: self.0.clone(),
         })
     }
 
     fn poll_recv(
         &mut self,
-        _cx: &mut Context<'_>,
-        _bufs: &mut [IoSliceMut<'_>],
-        _meta: &mut [RecvMeta],
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        // TODO(networking-follow-up): Implement recv from shared-memory channel
-        // using atomic wait instead of the removed SignalWait hostcall.
-        Poll::Pending
+        let recv_ring = &self.0.recv_ring;
+        let read_pos = &mut self.0.read_pos;
+
+        // Check if writer is still connected
+        let writer_count = recv_ring
+            .region()
+            .load_writer_count()
+            .map_err(|e| io::Error::other(format!("load writer count: {e}")))?;
+
+        if writer_count == 0 && *read_pos >= recv_ring.region().load_next_tail().unwrap_or(0) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "UDP recv ring closed",
+            )));
+        }
+
+        // Check for available data
+        let tail = recv_ring
+            .region()
+            .load_next_tail()
+            .map_err(|e| io::Error::other(format!("load tail: {e}")))?;
+
+        if *read_pos >= tail {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        // Read frame header
+        fence(Ordering::Acquire);
+        let header = recv_ring
+            .read_frame_header(*read_pos)
+            .map_err(|e| io::Error::other(format!("read header: {e}")))?;
+
+        if !header.is_ready() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let frame_size = header.frame_size();
+        let payload_pos = *read_pos + FrameHeader::ENCODED_SIZE as u64;
+        let frame_data = recv_ring
+            .read_at(payload_pos, header.len as u64)
+            .map_err(|e| io::Error::other(format!("read payload: {e}")))?;
+
+        *read_pos += frame_size;
+
+        // Parse frame: [addr_len u16][addr bytes][payload]
+        if frame_data.len() < 2 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let addr_len = u16::from_le_bytes([frame_data[0], frame_data[1]]) as usize;
+        if frame_data.len() < 2 + addr_len {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let addr_str = std::str::from_utf8(&frame_data[2..2 + addr_len])
+            .map_err(|e| io::Error::other(format!("invalid address bytes: {e}")))?;
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| io::Error::other(format!("invalid address: {e}")))?;
+
+        let payload = &frame_data[2 + addr_len..];
+
+        // Copy payload to the first buffer
+        if bufs.is_empty() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no buffers provided",
+            )));
+        }
+
+        let to_copy = payload.len().min(bufs[0].len());
+        bufs[0][..to_copy].copy_from_slice(&payload[..to_copy]);
+
+        // Populate metadata
+        if !meta.is_empty() {
+            meta[0] = RecvMeta {
+                len: to_copy,
+                stride: to_copy,
+                addr,
+                ecn: None,
+                dst_ip: None,
+            };
+        }
+
+        Poll::Ready(Ok(1))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -100,12 +191,39 @@ impl Runtime for SeliumQuinnRuntime {
 impl UdpSender for QuinnUdpSender {
     fn poll_send(
         self: Pin<&mut Self>,
-        _transmit: &quinn::udp::Transmit<'_>,
+        transmit: &quinn::udp::Transmit<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        // TODO(networking-followup): Implement send to shared-memory channel
-        // using atomic wait instead of the removed SignalWait hostcall.
-        Poll::Pending
+        let send_ring = &self.inner.send_ring;
+
+        // Encode destination address + payload into frame
+        let addr_bytes = transmit.destination.to_string().into_bytes();
+        let addr_len = addr_bytes.len() as u16;
+        let frame_len = 2 + addr_bytes.len() + transmit.data.len();
+
+        let mut frame = Vec::with_capacity(frame_len);
+        frame.extend_from_slice(&addr_len.to_le_bytes());
+        frame.extend_from_slice(&addr_bytes);
+        frame.extend_from_slice(transmit.data);
+
+        let frame_size = FrameHeader::ENCODED_SIZE as u64 + frame.len() as u64;
+
+        // Reserve space on send ring
+        let pos = match send_ring.reserve(frame_size) {
+            Ok(p) => p,
+            Err(crate::io::Error::BufferFull) => {
+                return Poll::Pending;
+            }
+            Err(e) => {
+                return Poll::Ready(Err(io::Error::other(format!("reserve: {e}"))));
+            }
+        };
+
+        // Write frame
+        match send_ring.write_frame(pos, &frame, 0, 0) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(io::Error::other(format!("write frame: {e}")))),
+        }
     }
 
     fn max_transmit_segments(&self) -> usize {

@@ -255,8 +255,19 @@ impl RegionMapping {
     }
 }
 
+// SAFETY (Send): RegionMappingInner contains a `base: *mut u8` raw pointer.
+// In WASM mode, this pointer references shared linear memory that remains valid
+// for the guest's entire lifetime, so moving it across threads is safe.
+// In native mode, the pointer points into an `Arc<Vec<u8>>` held by `_backing`,
+// which keeps the allocation alive for as long as this struct exists.
+// All access to the pointed-to memory goes through atomic operations at
+// well-known offsets, so concurrent access from different threads is sound.
 unsafe impl Send for RegionMappingInner {}
 
+// SAFETY (Sync): See the Send rationale above. In both WASM and native modes,
+// the raw pointer is stable and all mutations go through atomic operations
+// (load/store/CAS with appropriate ordering), so sharing `&RegionMappingInner`
+// across threads is safe.
 unsafe impl Sync for RegionMappingInner {}
 
 impl RegionBuilder {

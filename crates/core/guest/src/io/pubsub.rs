@@ -13,27 +13,28 @@ use selium_abi::{RkyvEncode, decode_rkyv, encode_rkyv};
 
 use crate::io::{
     Error, RingBuf,
-    channels::{WeakReader, WeakWriter},
+    channels::{Reader, WeakReader, WeakWriter, Writer},
     error::Result,
+    framed::{FramedRead, FramedWrite},
     ring_buf::round_capacity,
 };
 
-pub struct Publisher<T> {
-    writer: WeakWriter,
+pub struct Publisher<T, W = WeakWriter> {
+    writer: FramedWrite<W>,
     region_id: u64,
     capacity: u64,
     _t: PhantomData<T>,
 }
 
-pub struct Subscriber<T> {
-    reader: WeakReader,
+pub struct Subscriber<T, R = WeakReader> {
+    reader: FramedRead<R>,
     region_id: u64,
     capacity: u64,
     last_generation: u64,
     _t: PhantomData<T>,
 }
 
-impl<T> Publisher<T> {
+impl<T> Publisher<T, WeakWriter> {
     pub fn create(capacity: u64) -> Result<Self> {
         let ring = create_topic(capacity)?;
         let writer = writer_from_ring(&ring)?;
@@ -55,7 +56,9 @@ impl<T> Publisher<T> {
             _t: PhantomData,
         })
     }
+}
 
+impl<T, W: crate::io::framed::FrameWrite> Publisher<T, W> {
     pub fn region_id(&self) -> u64 {
         self.region_id
     }
@@ -64,25 +67,63 @@ impl<T> Publisher<T> {
         self.capacity
     }
 
-    pub fn writer_id(&self) -> u32 {
-        self.writer.writer_id()
-    }
-
-    pub fn allocate_mutation_id(&self) -> Result<u64> {
-        self.writer.allocate_mutation_id()
-    }
-
     /// Publishes a typed message synchronously (convenience wrapper around Sink).
     pub fn publish(&mut self, item: &T) -> Result<()>
     where
         T: RkyvEncode,
     {
         let bytes = encode_rkyv(item).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
-        self.writer.write(&bytes)
+        self.writer.write_frame(&bytes, 0)
     }
 }
 
-impl<T> Sink<T> for Publisher<T>
+impl<T> Publisher<T, WeakWriter> {
+    pub fn writer_id(&self) -> u32 {
+        self.writer.inner().writer_id()
+    }
+
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        self.writer.inner().allocate_mutation_id()
+    }
+}
+
+impl<T> Publisher<T, Writer> {
+    pub fn writer_id(&self) -> u32 {
+        self.writer.inner().writer_id()
+    }
+
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        self.writer.inner().allocate_mutation_id()
+    }
+}
+
+impl<T> Publisher<T, WeakWriter> {
+    /// Upgrade the inner weak writer to a strong writer.
+    pub fn upgrade(self) -> Result<Publisher<T, Writer>> {
+        let strong_writer = self.writer.upgrade()?;
+        Ok(Publisher {
+            writer: strong_writer,
+            region_id: self.region_id,
+            capacity: self.capacity,
+            _t: PhantomData,
+        })
+    }
+}
+
+impl<T> Publisher<T, Writer> {
+    /// Downgrade the inner strong writer to a weak writer.
+    pub fn downgrade(self) -> Publisher<T, WeakWriter> {
+        let weak_writer = self.writer.downgrade();
+        Publisher {
+            writer: weak_writer,
+            region_id: self.region_id,
+            capacity: self.capacity,
+            _t: PhantomData,
+        }
+    }
+}
+
+impl<T, W: crate::io::framed::FrameWrite + Unpin> Sink<T> for Publisher<T, W>
 where
     T: RkyvEncode + Unpin,
 {
@@ -95,7 +136,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<()> {
         let this = self.get_mut();
         let bytes = encode_rkyv(&item).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
-        this.writer.write(&bytes)?;
+        this.writer.write_frame(&bytes, 0)?;
         Ok(())
     }
 
@@ -108,7 +149,7 @@ where
     }
 }
 
-impl<T> Subscriber<T> {
+impl<T> Subscriber<T, WeakReader> {
     pub fn create(capacity: u64) -> Result<Self> {
         let ring = create_topic(capacity)?;
         let reader = reader_from_ring(&ring)?;
@@ -134,26 +175,15 @@ impl<T> Subscriber<T> {
             _t: PhantomData,
         })
     }
+}
 
+impl<T, R: crate::io::framed::FrameRead> Subscriber<T, R> {
     pub fn region_id(&self) -> u64 {
         self.region_id
     }
 
     pub fn capacity(&self) -> u64 {
         self.capacity
-    }
-
-    /// Checks whether the publisher has overwritten data past the ring capacity.
-    ///
-    /// Computes `delta = current_generation - last_generation`. If `delta > capacity`,
-    /// the subscriber's read position has been overwritten and data is lost.
-    fn check_overwritten(&self) -> Result<()> {
-        let current = self.reader.generation()?;
-        let delta = current.wrapping_sub(self.last_generation);
-        if delta > self.capacity {
-            return Err(Error::Overwritten);
-        }
-        Ok(())
     }
 
     /// Reads the next raw message with its writer_id (tag).
@@ -166,8 +196,7 @@ impl<T> Subscriber<T> {
         for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
             + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
     {
-        self.check_overwritten()?;
-        let (payload, writer_id) = self.reader.read()?;
+        let (payload, writer_id) = self.reader.read_frame()?;
         // Update last_generation after successful read.
         self.last_generation = self.reader.generation()?;
         let value: T =
@@ -176,21 +205,45 @@ impl<T> Subscriber<T> {
     }
 }
 
-impl<T> Stream for Subscriber<T>
+impl<T> Subscriber<T, WeakReader> {
+    /// Upgrade the inner weak reader to a strong reader.
+    pub fn upgrade(self) -> Result<Subscriber<T, Reader>> {
+        let strong_reader = self.reader.upgrade()?;
+        Ok(Subscriber {
+            reader: strong_reader,
+            region_id: self.region_id,
+            capacity: self.capacity,
+            last_generation: self.last_generation,
+            _t: PhantomData,
+        })
+    }
+}
+
+impl<T> Subscriber<T, Reader> {
+    /// Downgrade the inner strong reader to a weak reader.
+    pub fn downgrade(self) -> Subscriber<T, WeakReader> {
+        let weak_reader = self.reader.downgrade();
+        Subscriber {
+            reader: weak_reader,
+            region_id: self.region_id,
+            capacity: self.capacity,
+            last_generation: self.last_generation,
+            _t: PhantomData,
+        }
+    }
+}
+
+impl<T, R> Stream for Subscriber<T, R>
 where
     T: rkyv::Archive + Sized + Unpin,
     for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    R: crate::io::framed::FrameRead + Unpin,
 {
     type Item = Result<T>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-
-        // Check for overwritten data before attempting to read.
-        if let Err(e) = this.check_overwritten() {
-            return Poll::Ready(Some(Err(e)));
-        }
 
         let has_frame = match this.reader.poll_ready() {
             Ok(ready) => ready,
@@ -199,7 +252,7 @@ where
         };
 
         if has_frame {
-            let (payload, _tag) = match this.reader.read() {
+            let (payload, _tag) = match this.reader.read_frame() {
                 Ok(frame) => frame,
                 Err(Error::BufferEmpty) => {
                     // Spurious readiness; yield and retry.
@@ -253,21 +306,16 @@ fn create_topic(capacity: u64) -> Result<RingBuf> {
     RingBuf::create(capacity)
 }
 
-fn reader_from_ring(ring: &RingBuf) -> Result<WeakReader> {
+fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<WeakReader>> {
     let tail = ring.read_next_tail()?;
-    Ok(WeakReader::new(ring.region().clone(), tail))
+    let weak_reader = WeakReader::new(ring.region().clone(), tail);
+    Ok(FramedRead::new(weak_reader))
 }
 
-fn writer_from_ring(ring: &RingBuf) -> Result<WeakWriter> {
-    ring.region().increment_writer_count()?;
-    let writer_id = match ring.region().allocate_writer_id() {
-        Ok(writer_id) => writer_id,
-        Err(error) => {
-            let _ = ring.region().decrement_writer_count();
-            return Err(error);
-        }
-    };
-    Ok(WeakWriter::new(ring.region().clone(), writer_id))
+fn writer_from_ring(ring: &RingBuf) -> Result<FramedWrite<WeakWriter>> {
+    let writer_id = ring.region().allocate_writer_id()?;
+    let weak_writer = WeakWriter::new(ring.region().clone(), writer_id);
+    Ok(FramedWrite::new(weak_writer))
 }
 
 #[cfg(test)]
@@ -278,7 +326,7 @@ mod tests {
     /// In native test mode, `create_pair` doesn't share memory because
     /// `RegionBuilder::attach` allocates a new heap region. This helper
     /// constructs both from the same ring directly.
-    fn test_pair<T>(capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
+    fn test_pair<T>(capacity: u64) -> Result<(Publisher<T, WeakWriter>, Subscriber<T, WeakReader>)> {
         let capacity = round_capacity(capacity)?;
         let ring = RingBuf::create(capacity)?;
         let writer = writer_from_ring(&ring)?;
@@ -316,14 +364,13 @@ mod tests {
         // The subscriber should detect that data was overwritten.
         let result = subscriber.read_with_writer_id();
         // The overwrite check runs before the read, so Overwritten is expected.
-        // ReaderBehind is also acceptable if the weak reader detects the overrun first.
         assert!(
-            matches!(result, Err(Error::Overwritten) | Err(Error::ReaderBehind)),
-            "expected Overwritten or ReaderBehind, got {result:?}"
+            matches!(result, Err(Error::Overwritten)),
+            "expected Overwritten, got {result:?}"
         );
 
         // Verify the generation counter actually advanced.
-        let gen_now = subscriber.reader.generation().expect("gen");
+        let gen_now = subscriber.reader.inner().generation().expect("gen");
         assert!(
             gen_now.wrapping_sub(gen_start) > subscriber.capacity,
             "generation delta should exceed capacity"

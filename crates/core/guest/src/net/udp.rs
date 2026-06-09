@@ -27,9 +27,9 @@ const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 /// - Send ring: guest writes → kernel reads
 pub struct UdpSocket {
     pub(super) local_addr: SocketAddr,
-    recv_ring: RingBuf,
-    send_ring: RingBuf,
-    read_pos: u64,
+    pub(super) recv_ring: RingBuf,
+    pub(super) send_ring: RingBuf,
+    pub(super) read_pos: u64,
 }
 
 impl UdpSocket {

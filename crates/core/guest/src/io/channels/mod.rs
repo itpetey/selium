@@ -4,8 +4,8 @@ use crate::io::{
 };
 
 pub use self::{
-    reader::{Reader, StrongReader, WeakReader},
-    writer::{StrongWriter, WeakWriter, Writer},
+    reader::{Reader, WeakReader},
+    writer::{WeakWriter, Writer},
 };
 
 pub mod reader;
@@ -39,38 +39,23 @@ impl Channel {
     }
 
     /// Creates a strong writer for this channel.
+    ///
+    /// The writer increments `writer_count` and allocates a `writer_id`.
     pub fn writer(&self) -> Result<Writer> {
-        Ok(Writer::Strong(self.strong_writer()?))
+        Writer::new(self.ring.region().clone())
     }
 
-    /// Creates a strong writer tracked in the channel metadata.
-    pub fn strong_writer(&self) -> Result<StrongWriter> {
-        self.ring.region().increment_writer_count()?;
-        let writer_id = match self.ring.region().allocate_writer_id() {
-            Ok(writer_id) => writer_id,
-            Err(error) => {
-                let _ = self.ring.region().decrement_writer_count();
-                return Err(error);
-            }
-        };
-        Ok(StrongWriter::new(self.ring.region().clone(), writer_id))
-    }
-
-    /// Creates a weak writer that acquires positions on demand.
+    /// Creates a weak writer that does not contribute to `writer_count`.
     pub fn weak_writer(&self) -> Result<WeakWriter> {
         let writer_id = self.ring.region().allocate_writer_id()?;
         Ok(WeakWriter::new(self.ring.region().clone(), writer_id))
     }
 
     /// Creates a strong reader that prevents buffer overwrite.
-    pub fn strong_reader(&self) -> Result<StrongReader> {
+    pub fn strong_reader(&self) -> Result<Reader> {
         let tail = self.ring.read_next_tail()?;
         let reader_id = self.ring.region().allocate_reader_slot(tail)?;
-        Ok(StrongReader::new(
-            self.ring.region().clone(),
-            tail,
-            reader_id,
-        ))
+        Ok(Reader::new(self.ring.region().clone(), tail, reader_id))
     }
 
     /// Creates a weak reader that may lose data if slow.

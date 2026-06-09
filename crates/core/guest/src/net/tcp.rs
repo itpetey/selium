@@ -4,17 +4,19 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::atomic::{Ordering, fence},
     task::{Context, Poll},
 };
 
 use selium_abi::{HostcallOutput, HostcallRequest};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     GuestError, Result,
     hostcall::hostcall_async,
-    io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf},
+    io::{
+        ChannelRegion, PAGE_SIZE, RegionMapping, RingBuf,
+        channels::{Reader, Writer},
+    },
     resource::{Accept, IncomingConnection, ResourceListener},
 };
 
@@ -28,15 +30,11 @@ const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 /// A TCP stream backed by shared-memory ring buffers.
 ///
 /// Uses two ring buffers within a multi-memory shared region:
-/// - Inbound ring: kernel writes → guest reads
-/// - Outbound ring: guest writes → kernel reads
+/// - Inbound ring: kernel writes → guest reads (via `Reader`)
+/// - Outbound ring: guest writes → kernel reads (via `Writer`)
 pub struct TcpStream {
-    inbound: RingBuf,
-    outbound: RingBuf,
-    read_pos: u64,
-    read_buf: Vec<u8>,
-    read_offset: usize,
-    eof: bool,
+    reader: Reader,
+    writer: Writer,
 }
 
 /// A TCP listener that accepts incoming connections via the host.
@@ -53,7 +51,7 @@ impl TcpStream {
     ///
     /// Issues the `TcpConnect` hostcall, receives a `SharedRegionDescriptor`,
     /// attaches the region, parses the multi-memory header, and creates
-    /// inbound and outbound `RingBuf` handles.
+    /// inbound and outbound `Reader`/`Writer` handles.
     pub async fn connect(address: impl Into<String>) -> Result<Self> {
         let descriptor = match hostcall_async(HostcallRequest::TcpConnect {
             address: address.into(),
@@ -70,7 +68,7 @@ impl TcpStream {
     /// Attaches to an existing shared region containing TCP stream ring buffers.
     ///
     /// Parses the multi-memory header to discover the inbound and outbound
-    /// sub-memories, then creates `RingBuf` handles for each.
+    /// sub-memories, then creates `Reader` and `Writer` handles for each.
     ///
     /// In WASM mode, this calls `attach_region(shared_id)` to map the region.
     /// In native mode, this returns an error because hostcalls are not available.
@@ -82,7 +80,7 @@ impl TcpStream {
         // 1. Call attach_region(shared_id, None, RegionProt::ReadWrite)
         // 2. Create a RegionMapping from the attachment's page_offset
         // 3. Parse the multi-memory header
-        // 4. Create RingBuf instances for inbound and outbound rings
+        // 4. Create Reader/Writer instances for inbound and outbound rings
         Err(GuestError::Host(format!(
             "TCP stream attach requires WASM mode (shared_id={shared_id})"
         )))
@@ -91,34 +89,33 @@ impl TcpStream {
     /// Creates a `TcpStream` from a pre-attached region mapping.
     ///
     /// Parses the multi-memory header to discover the inbound and outbound
-    /// sub-memories, then creates `RingBuf` handles for each.
+    /// sub-memories, then creates `Reader` and `Writer` handles for each.
     ///
     /// This is useful for in-process testing or when the caller has already
     /// attached to the shared region.
     pub fn from_mapping(parent_mapping: &RegionMapping) -> Result<Self> {
-        let (inbound, outbound) = parse_dual_ring_region(parent_mapping)?;
-        Ok(Self {
-            inbound,
-            outbound,
-            read_pos: 0,
-            read_buf: Vec::new(),
-            read_offset: 0,
-            eof: false,
-        })
+        let (inbound_ring, outbound_ring) = parse_dual_ring_region(parent_mapping)?;
+        Self::from_rings(inbound_ring, outbound_ring)
     }
 
     /// Creates a `TcpStream` from pre-built ring buffers (for testing).
-    #[cfg(test)]
-    #[allow(dead_code, reason = "test helper for future integration tests")]
-    pub(crate) fn from_rings(inbound: RingBuf, outbound: RingBuf) -> Self {
-        Self {
-            inbound,
-            outbound,
-            read_pos: 0,
-            read_buf: Vec::new(),
-            read_offset: 0,
-            eof: false,
-        }
+    pub fn from_rings(inbound: RingBuf, outbound: RingBuf) -> Result<Self> {
+        // Create Reader for inbound ring (guest reads from kernel)
+        let inbound_region = inbound.region().clone();
+        let tail = inbound
+            .read_next_tail()
+            .map_err(|e| GuestError::Host(format!("read tail: {e}")))?;
+        let reader_id = inbound_region
+            .allocate_reader_slot(tail)
+            .map_err(|e| GuestError::Host(format!("allocate reader slot: {e}")))?;
+        let reader = Reader::new(inbound_region, tail, reader_id);
+
+        // Create Writer for outbound ring (guest writes to kernel)
+        let outbound_region = outbound.region().clone();
+        let writer = Writer::new(outbound_region)
+            .map_err(|e| GuestError::Host(format!("create writer: {e}")))?;
+
+        Ok(Self { reader, writer })
     }
 }
 
@@ -126,127 +123,27 @@ impl AsyncRead for TcpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // If we have buffered data from a previous frame, copy it out.
-        if self.read_offset < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_offset..];
-            let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
-            self.read_offset += to_copy;
-            if self.read_offset >= self.read_buf.len() {
-                self.read_buf.clear();
-                self.read_offset = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-
-        // Check for EOF.
-        if self.eof {
-            return Poll::Ready(Ok(()));
-        }
-
-        // Try to read a frame from the inbound ring.
-        let tail = match self.inbound.region().load_next_tail() {
-            Ok(t) => t,
-            Err(e) => return Poll::Ready(Err(io::Error::other(format!("load tail: {e}")))),
-        };
-
-        if self.read_pos >= tail {
-            // No data available. Check if the kernel has disconnected.
-            match self.inbound.region().load_writer_count() {
-                Ok(0) => {
-                    self.eof = true;
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::other(format!("load writer count: {e}"))));
-                }
-            }
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        // Read the frame header.
-        fence(Ordering::Acquire);
-        let header = match self.inbound.read_frame_header(self.read_pos) {
-            Ok(h) => h,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::other(format!("read header: {e}"))));
-            }
-        };
-
-        if !header.is_ready() {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        let frame_size = header.frame_size();
-        let payload_pos = self.read_pos + FrameHeader::ENCODED_SIZE as u64;
-        let payload = match self.inbound.read_at(payload_pos, header.len as u64) {
-            Ok(p) => p,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::other(format!("read payload: {e}"))));
-            }
-        };
-
-        self.read_pos += frame_size;
-
-        // Copy payload to the caller's buffer.
-        let to_copy = payload.len().min(buf.remaining());
-        buf.put_slice(&payload[..to_copy]);
-
-        // Buffer any remaining data.
-        if to_copy < payload.len() {
-            self.read_buf = payload;
-            self.read_offset = to_copy;
-        }
-
-        Poll::Ready(Ok(()))
+        Pin::new(&mut self.reader).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for TcpStream {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let frame_size = FrameHeader::ENCODED_SIZE as u64 + buf.len() as u64;
-
-        // Reserve space in the outbound ring.
-        let pos = match self.outbound.reserve(frame_size) {
-            Ok(p) => p,
-            Err(crate::io::Error::BufferFull) => {
-                return Poll::Pending;
-            }
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::other(format!("reserve: {e}"))));
-            }
-        };
-
-        // Write the frame.
-        match self.outbound.write_frame(pos, buf, 0, 0) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(io::Error::other(format!("write frame: {e}")))),
-        }
+        Pin::new(&mut self.writer).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Decrement writer count on the outbound ring to signal EOF to the kernel.
-        if let Err(_e) = self.outbound.region().decrement_writer_count() {
-            // Ignore errors during shutdown.
-        }
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
 

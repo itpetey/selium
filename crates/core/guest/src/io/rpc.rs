@@ -1,4 +1,4 @@
-//! Selium RPC pattern crate.
+//! Selium RPC pattern for typed request/reply communication.
 //!
 //! Provides typed request/reply communication between guests using
 //! shared-memory ring buffers. Built on top of `selium-guest` IO primitives.
@@ -25,8 +25,8 @@
 //! client to server.
 
 use std::{
+    fmt,
     marker::PhantomData,
-    sync::atomic::{Ordering, fence},
 };
 
 use rkyv::{
@@ -34,11 +34,12 @@ use rkyv::{
     rancor::Error as RancorError,
 };
 use selium_abi::{decode_rkyv, encode_rkyv};
-use selium_guest::io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf};
 
-pub use error::{AcceptError, RpcError};
-
-pub mod error;
+use crate::io::{
+    ChannelRegion, Error, PAGE_SIZE, RegionMapping, RingBuf,
+    channels::{Reader, Writer},
+    framed::{FramedRead, FramedWrite},
+};
 
 /// Default reply ring capacity in bytes.
 const DEFAULT_REP_CAPACITY: u64 = 4096;
@@ -55,13 +56,101 @@ const HEADER_SIZE: u64 = HEADER_ENTRY_OFFSET + 2 * HEADER_ENTRY_SIZE;
 /// Magic value for multi-memory shared region layout headers.
 const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
+/// Error type for RPC operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcError {
+    /// The peer has closed the connection.
+    ConnectionClosed,
+    /// The shared region is invalid or corrupted.
+    InvalidRegion,
+    /// The region layout does not match the expected structure.
+    LayoutMismatch,
+    /// The ring buffer is full.
+    BufferFull,
+    /// The ring buffer is empty.
+    BufferEmpty,
+    /// Encoding or decoding failed.
+    Serialization(String),
+}
+
+/// Error type for connection acceptance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptError {
+    /// The shared region is invalid or corrupted.
+    InvalidRegion,
+    /// The region layout does not match the expected structure.
+    LayoutMismatch,
+    /// The peer has closed the connection.
+    ConnectionClosed,
+    /// The ring buffer is full.
+    BufferFull,
+    /// The ring buffer is empty.
+    BufferEmpty,
+    /// Encoding or decoding failed.
+    Serialization(String),
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionClosed => write!(f, "RPC connection closed"),
+            Self::InvalidRegion => write!(f, "invalid shared region"),
+            Self::LayoutMismatch => write!(f, "region layout mismatch"),
+            Self::BufferFull => write!(f, "RPC buffer full"),
+            Self::BufferEmpty => write!(f, "RPC buffer empty"),
+            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+impl From<Error> for RpcError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::BufferFull => Self::BufferFull,
+            Error::BufferEmpty => Self::BufferEmpty,
+            Error::InvalidLayout | Error::InvalidRegion => Self::InvalidRegion,
+            Error::Guest(msg) | Error::SerializationFailed(msg) => Self::Serialization(msg),
+            other => Self::Serialization(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion => write!(f, "invalid shared region"),
+            Self::LayoutMismatch => write!(f, "region layout mismatch"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
+            Self::BufferFull => write!(f, "accept buffer full"),
+            Self::BufferEmpty => write!(f, "accept buffer empty"),
+            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
+
+impl From<Error> for AcceptError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::BufferFull => Self::BufferFull,
+            Error::BufferEmpty => Self::BufferEmpty,
+            Error::InvalidLayout | Error::InvalidRegion => Self::InvalidRegion,
+            Error::Guest(msg) | Error::SerializationFailed(msg) => Self::Serialization(msg),
+            other => Self::Serialization(other.to_string()),
+        }
+    }
+}
+
 /// Client-side handle for making typed RPC requests.
 ///
 /// Sends `Req` payloads and receives `Rep` replies over shared-memory
 /// ring buffers.
 pub struct RpcClient<Req, Rep> {
-    request_ring: RingBuf,
-    reply_ring: RingBuf,
+    request_writer: FramedWrite<Writer>,
+    reply_reader: FramedRead<Reader>,
     next_correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
 }
@@ -71,15 +160,14 @@ pub struct RpcClient<Req, Rep> {
 /// Receives `Req` requests and sends `Rep` replies over shared-memory
 /// ring buffers.
 pub struct RpcConnection<Req, Rep> {
-    request_ring: RingBuf,
-    reply_ring: RingBuf,
-    reader_pos: u64,
+    request_reader: FramedRead<Reader>,
+    reply_writer: FramedWrite<Writer>,
     _phantom: PhantomData<(Req, Rep)>,
 }
 
 /// A single request received by the server, with the ability to reply.
 pub struct RpcRequest<'a, Req, Rep> {
-    reply_ring: &'a RingBuf,
+    reply_writer: &'a mut FramedWrite<Writer>,
     payload_bytes: Vec<u8>,
     correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
@@ -102,7 +190,7 @@ where
     /// ring buffers, sending the `shared_id` via `ResourceSender`, and
     /// attaching to the rings.
     pub async fn connect(
-        sender: selium_guest::ResourceSender,
+        sender: crate::ResourceSender,
         request_capacity: u64,
         reply_capacity: u64,
     ) -> Result<Self, RpcError> {
@@ -117,7 +205,7 @@ where
             reply_capacity
         };
 
-        let (request_ring, reply_ring, shared_id) = create_rpc_region(req_cap, rep_cap)?;
+        let (request_writer, reply_reader, shared_id) = create_rpc_region(req_cap, rep_cap)?;
 
         sender
             .send(shared_id)
@@ -125,8 +213,8 @@ where
             .map_err(|e| RpcError::Serialization(format!("failed to send shared_id: {e}")))?;
 
         Ok(Self {
-            request_ring,
-            reply_ring,
+            request_writer,
+            reply_reader,
             next_correlation: 1,
             _phantom: PhantomData,
         })
@@ -146,24 +234,21 @@ where
         let encoded = encode_rkyv(&payload)
             .map_err(|e| RpcError::Serialization(format!("encode request: {e}")))?;
 
-        // Reserve space and write the frame to the request ring.
-        let frame_size = FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64;
-        let pos = self.request_ring.reserve(frame_size)?;
-        self.request_ring
-            .write_frame(pos, &encoded, correlation, 0)?;
+        // Write the frame to the request ring.
+        self.request_writer.write_frame(&encoded, correlation)?;
 
         // Block on the reply ring's generation counter.
-        let mut last_generation = self.reply_ring.generation()?;
+        let mut last_generation = self.reply_reader.generation()?;
 
         loop {
             // Poll the generation counter for changes.
-            let current_generation = self.reply_ring.generation()?;
+            let current_generation = self.reply_reader.generation()?;
 
             if current_generation != last_generation {
                 last_generation = current_generation;
 
                 // Generation changed — try to read a reply frame.
-                match try_read_reply::<Rep>(&self.reply_ring, correlation) {
+                match try_read_reply::<Rep>(&mut self.reply_reader, correlation) {
                     Ok(Some(reply)) => return Ok(reply),
                     Ok(None) => {}
                     Err(RpcError::BufferEmpty) => {}
@@ -172,13 +257,13 @@ where
             }
 
             // Check if the server has disconnected.
-            let writer_count = self.reply_ring.region().load_writer_count()?;
+            let writer_count = self.reply_reader.inner().region().load_writer_count()?;
             if writer_count == 0 {
                 return Err(RpcError::ConnectionClosed);
             }
 
             // Yield to allow the server to process.
-            selium_guest::yield_now().await;
+            crate::yield_now().await;
         }
     }
 }
@@ -211,23 +296,34 @@ where
     /// rings. This is useful for in-process testing or when the caller
     /// has already attached to the shared region.
     pub fn from_mapping(parent_mapping: &RegionMapping) -> Result<Self, RpcError> {
-        let (request_ring, reply_ring) = attach_rpc_region(0, parent_mapping)?;
+        let (request_reader, reply_writer) = attach_rpc_region(0, parent_mapping)?;
         Ok(Self {
-            request_ring,
-            reply_ring,
-            reader_pos: 0,
+            request_reader,
+            reply_writer,
             _phantom: PhantomData,
         })
     }
 
     /// Creates an RPC connection from pre-built ring buffers (for testing).
-    pub fn from_rings(request_ring: RingBuf, reply_ring: RingBuf) -> Self {
-        Self {
-            request_ring,
-            reply_ring,
-            reader_pos: 0,
+    pub fn from_rings(request_ring: RingBuf, reply_ring: RingBuf) -> Result<Self, RpcError> {
+        let request_reader_region = request_ring.region().clone();
+        let reply_writer_region = reply_ring.region().clone();
+
+        // Create reader for request ring (server reads requests)
+        let tail = request_ring.read_next_tail()?;
+        let reader_id = request_reader_region.allocate_reader_slot(tail)?;
+        let request_reader = Reader::new(request_reader_region, tail, reader_id);
+        let request_reader = FramedRead::new(request_reader);
+
+        // Create writer for reply ring (server writes replies)
+        let reply_writer = Writer::new(reply_writer_region)?;
+        let reply_writer = FramedWrite::new(reply_writer);
+
+        Ok(Self {
+            request_reader,
+            reply_writer,
             _phantom: PhantomData,
-        }
+        })
     }
 
     /// Receives the next request from the client.
@@ -237,52 +333,38 @@ where
     /// frame is available. Returns an `RpcRequest` that can be used to
     /// inspect the payload and send a reply.
     pub async fn recv(&mut self) -> Result<RpcRequest<'_, Req, Rep>, RpcError> {
-        let mut last_generation = self.request_ring.generation()?;
+        let mut last_generation = self.request_reader.generation()?;
 
         loop {
             // Poll the generation counter for changes.
-            let current_generation = self.request_ring.generation()?;
+            let current_generation = self.request_reader.generation()?;
 
             if current_generation != last_generation {
                 last_generation = current_generation;
 
-                // Acquire fence ensures we see the writer's payload before the header.
-                fence(Ordering::Acquire);
-
                 // Try to read a frame.
-                let tail = self.request_ring.region().load_next_tail()?;
-
-                if self.reader_pos < tail {
-                    let header = self.request_ring.read_frame_header(self.reader_pos)?;
-
-                    if header.is_ready() {
-                        let frame_size = header.frame_size();
-                        let payload_pos = self
-                            .reader_pos
-                            .checked_add(FrameHeader::ENCODED_SIZE as u64)
-                            .ok_or(RpcError::InvalidRegion)?;
-                        let payload_bytes =
-                            self.request_ring.read_at(payload_pos, header.len as u64)?;
-
-                        let correlation = header.tag;
-                        self.reader_pos += frame_size;
-
+                match self.request_reader.read_frame() {
+                    Ok((payload_bytes, correlation)) => {
                         return Ok(RpcRequest {
-                            reply_ring: &self.reply_ring,
+                            reply_writer: &mut self.reply_writer,
                             payload_bytes,
                             correlation,
                             _phantom: PhantomData,
                         });
                     }
+                    Err(Error::BufferEmpty) => {
+                        // No frame yet, continue polling
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
 
             // No new data; check if client disconnected.
-            let writer_count = self.request_ring.region().load_writer_count()?;
+            let writer_count = self.request_reader.inner().region().load_writer_count()?;
             if writer_count == 0 {
                 return Err(RpcError::ConnectionClosed);
             }
-            selium_guest::yield_now().await;
+            crate::yield_now().await;
         }
     }
 }
@@ -318,16 +400,13 @@ where
         let encoded = encode_rkyv(&response)
             .map_err(|e| RpcError::Serialization(format!("encode reply: {e}")))?;
 
-        let frame_size = FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64;
-        let pos = self.reply_ring.reserve(frame_size)?;
-        self.reply_ring
-            .write_frame(pos, &encoded, self.correlation, 0)?;
+        self.reply_writer.write_frame(&encoded, self.correlation)?;
 
         Ok(())
     }
 }
 
-impl<Req, Rep> selium_guest::Accept for RpcAccept<Req, Rep>
+impl<Req, Rep> crate::Accept for RpcAccept<Req, Rep>
 where
     Req: rkyv::Archive + Sized,
     for<'a> Req::Archived: rkyv::Deserialize<Req, HighDeserializer<RancorError>>
@@ -336,9 +415,9 @@ where
 {
     type Item = RpcConnection<Req, Rep>;
 
-    fn accept(connection: selium_guest::IncomingConnection) -> selium_guest::Result<Self::Item> {
+    fn accept(connection: crate::IncomingConnection) -> crate::Result<Self::Item> {
         RpcConnection::for_server(connection.shared_id, connection.client_process_id)
-            .map_err(|e| selium_guest::GuestError::Host(format!("RPC accept failed: {e}")))
+            .map_err(|e| crate::GuestError::Host(format!("RPC accept failed: {e}")))
     }
 }
 
@@ -355,11 +434,11 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 /// Attaches to an RPC region by shared_id and extracts the two ring buffers.
 ///
 /// Parses the multi-memory header to discover the request and reply ring
-/// sub-memories, then creates RingBuf handles for each.
+/// sub-memories, then creates FramedRead/FramedWrite handles for each.
 fn attach_rpc_region(
     _shared_id: u64,
     parent_mapping: &RegionMapping,
-) -> Result<(RingBuf, RingBuf), RpcError> {
+) -> Result<(FramedRead<Reader>, FramedWrite<Writer>), RpcError> {
     // Read and validate magic.
     let magic_bytes = parent_mapping.read(HEADER_MAGIC_OFFSET, 8)?;
     let magic = u64::from_le_bytes(
@@ -426,11 +505,23 @@ fn attach_rpc_region(
     let req_region = ChannelRegion::from_mapping(req_mapping, req_capacity);
     let rep_region = ChannelRegion::from_mapping(rep_mapping, rep_capacity);
 
-    // Create RingBuf instances.
+    // Create RingBuf instances to initialize regions properly.
     let request_ring = RingBuf::wrap_region(req_region)?;
     let reply_ring = RingBuf::wrap_region(rep_region)?;
 
-    Ok((request_ring, reply_ring))
+    // Server reads from request ring (needs a Reader)
+    let req_region = request_ring.region().clone();
+    let tail = request_ring.read_next_tail()?;
+    let reader_id = req_region.allocate_reader_slot(tail)?;
+    let request_reader = Reader::new(req_region, tail, reader_id);
+    let request_reader = FramedRead::new(request_reader);
+
+    // Server writes to reply ring (needs a Writer)
+    let rep_region = reply_ring.region().clone();
+    let reply_writer = Writer::new(rep_region)?;
+    let reply_writer = FramedWrite::new(reply_writer);
+
+    Ok((request_reader, reply_writer))
 }
 
 /// Creates a multi-memory region with two ring buffers for RPC.
@@ -440,11 +531,11 @@ fn attach_rpc_region(
 /// - Request ring at entry[0].offset (page 0 = coordination, page 1+ = data)
 /// - Reply ring at entry[1].offset (page 0 = coordination, page 1+ = data)
 ///
-/// Returns (request_ring, reply_ring, shared_id).
+/// Returns (request_writer, reply_reader, shared_id).
 fn create_rpc_region(
     req_capacity: u64,
     rep_capacity: u64,
-) -> Result<(RingBuf, RingBuf, u64), RpcError> {
+) -> Result<(FramedWrite<Writer>, FramedRead<Reader>, u64), RpcError> {
     // Each sub-memory: page 0 (coordination) + data pages.
     let req_region_len = PAGE_SIZE + req_capacity;
     let rep_region_len = PAGE_SIZE + rep_capacity;
@@ -494,46 +585,44 @@ fn create_rpc_region(
     req_region.initialise()?;
     rep_region.initialise()?;
 
-    // Increment writer counts to indicate the client is connected.
-    req_region.increment_writer_count()?;
-    rep_region.increment_writer_count()?;
+    // Client writes to request ring (needs a Writer)
+    let request_writer = Writer::new(req_region.clone())?;
+    let request_writer = FramedWrite::new(request_writer);
 
-    // Create RingBuf instances.
-    let request_ring = RingBuf::wrap_region(req_region)?;
-    let reply_ring = RingBuf::wrap_region(rep_region)?;
+    // Client reads from reply ring (needs a Reader)
+    let tail = rep_region.load_next_tail()?;
+    let reader_id = rep_region.allocate_reader_slot(tail)?;
+    let reply_reader = Reader::new(rep_region, tail, reader_id);
+    let reply_reader = FramedRead::new(reply_reader);
 
-    Ok((request_ring, reply_ring, 0))
+    Ok((request_writer, reply_reader, 0))
 }
 
 /// Tries to read a reply frame with the given correlation tag from the reply ring.
-fn try_read_reply<Rep>(ring: &RingBuf, correlation: u32) -> Result<Option<Rep>, RpcError>
+fn try_read_reply<Rep>(
+    reply_reader: &mut FramedRead<Reader>,
+    correlation: u32,
+) -> Result<Option<Rep>, RpcError>
 where
     Rep: rkyv::Archive + Sized,
     for<'a> Rep::Archived: rkyv::Deserialize<Rep, HighDeserializer<RancorError>>
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
-    let tail = ring.region().load_next_tail()?;
-    if tail == 0 {
-        return Ok(None);
+    // Try to read a frame
+    match reply_reader.read_frame() {
+        Ok((payload_bytes, tag)) => {
+            if tag != correlation {
+                return Ok(None);
+            }
+
+            let decoded: Rep = decode_rkyv::<Rep>(&payload_bytes)
+                .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")))?;
+
+            Ok(Some(decoded))
+        }
+        Err(Error::BufferEmpty) => Ok(None),
+        Err(e) => Err(e.into()),
     }
-
-    // Read the first frame (RPC replies are single-frame for now).
-    fence(Ordering::Acquire);
-    let header = ring.read_frame_header(0)?;
-    if !header.is_ready() {
-        return Ok(None);
-    }
-    if header.tag != correlation {
-        return Ok(None);
-    }
-
-    let payload_pos = FrameHeader::ENCODED_SIZE as u64;
-    let payload_bytes = ring.read_at(payload_pos, header.len as u64)?;
-
-    let decoded: Rep = decode_rkyv::<Rep>(&payload_bytes)
-        .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")))?;
-
-    Ok(Some(decoded))
 }
 
 #[cfg(test)]
@@ -615,29 +704,34 @@ mod tests {
         req_region.initialise()?;
         rep_region.initialise()?;
 
-        // Client is the writer on request ring, server is the writer on reply ring.
-        req_region.increment_writer_count()?;
-        rep_region.increment_writer_count()?;
+        // Client: writer on request ring, reader on reply ring
+        let client_req_writer = Writer::new(req_region.clone())?;
+        let client_req_writer = FramedWrite::new(client_req_writer);
 
-        // Create RingBuf instances for client (using cloned regions that share memory).
-        let client_req_ring = RingBuf::wrap_region(req_region.clone())?;
-        let client_rep_ring = RingBuf::wrap_region(rep_region.clone())?;
+        let tail = rep_region.load_next_tail()?;
+        let reader_id = rep_region.allocate_reader_slot(tail)?;
+        let client_reply_reader = Reader::new(rep_region.clone(), tail, reader_id);
+        let client_reply_reader = FramedRead::new(client_reply_reader);
 
-        // Create RingBuf instances for server (using the same regions).
-        let server_req_ring = RingBuf::wrap_region(req_region)?;
-        let server_rep_ring = RingBuf::wrap_region(rep_region)?;
+        // Server: reader on request ring, writer on reply ring
+        let tail = req_region.load_next_tail()?;
+        let reader_id = req_region.allocate_reader_slot(tail)?;
+        let server_req_reader = Reader::new(req_region, tail, reader_id);
+        let server_req_reader = FramedRead::new(server_req_reader);
+
+        let server_reply_writer = Writer::new(rep_region)?;
+        let server_reply_writer = FramedWrite::new(server_reply_writer);
 
         let client = RpcClient {
-            request_ring: client_req_ring,
-            reply_ring: client_rep_ring,
+            request_writer: client_req_writer,
+            reply_reader: client_reply_reader,
             next_correlation: 1,
             _phantom: PhantomData,
         };
 
         let server = RpcConnection {
-            request_ring: server_req_ring,
-            reply_ring: server_rep_ring,
-            reader_pos: 0,
+            request_reader: server_req_reader,
+            reply_writer: server_reply_writer,
             _phantom: PhantomData,
         };
 
@@ -668,7 +762,7 @@ mod tests {
         let reply_result_for_client = Rc::clone(&reply_result);
 
         // Spawn server handler as a guest task.
-        selium_guest::spawn(async move {
+        crate::spawn(async move {
             let request = server.recv().await.expect("recv");
             let req = request.payload().expect("payload");
             assert_eq!(req.value, "hello");
@@ -679,7 +773,7 @@ mod tests {
         });
 
         // Spawn client request as a guest task.
-        selium_guest::spawn(async move {
+        crate::spawn(async move {
             let reply = client
                 .request(TestRequest {
                     value: "hello".to_string(),
@@ -690,7 +784,7 @@ mod tests {
         });
 
         // Drive all spawned tasks to completion.
-        selium_guest::poll_reactor();
+        crate::poll_reactor();
 
         let reply = reply_result.borrow().clone().expect("reply received");
         assert_eq!(reply.result, 42);

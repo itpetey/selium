@@ -4,6 +4,12 @@ use std::{
     hash::Hash,
 };
 
+use rkyv::{
+    api::high::{HighDeserializer, HighValidator},
+    rancor::Error as RancorError,
+};
+use selium_abi::RkyvEncode;
+
 use crate::io::{
     error::{Error, Result},
     pubsub::{self, Publisher, Subscriber},
@@ -69,7 +75,20 @@ struct LiveTableEntry<V> {
     version: u64,
 }
 
-impl<K, V> LiveTable<K, V> {
+impl<K, V> LiveTable<K, V>
+where
+    K: rkyv::Archive + Clone + Eq + Hash,
+    V: rkyv::Archive + Clone,
+    for<'a> K::Archived: rkyv::Deserialize<K, HighDeserializer<RancorError>>
+        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    for<'a> V::Archived: rkyv::Deserialize<V, HighDeserializer<RancorError>>
+        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived: rkyv::Deserialize<
+            LiveTableMessage<K, V>,
+            HighDeserializer<RancorError>,
+        > + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    LiveTableMessage<K, V>: RkyvEncode,
+{
     /// Creates a new live table with its own pub/sub topic.
     pub fn create(capacity: u64) -> Result<Self> {
         let (publisher, subscriber) = pubsub::create_pair(capacity)?;

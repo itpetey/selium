@@ -1,4 +1,10 @@
-use std::sync::atomic::{Ordering, fence};
+use std::{
+    pin::Pin,
+    sync::atomic::{Ordering, fence},
+    task::{Context, Poll},
+};
+
+use tokio::io::AsyncWrite;
 
 use crate::io::{
     channels::{Error, Result},
@@ -6,34 +12,48 @@ use crate::io::{
     region::ChannelRegion,
 };
 
-/// Writer that is tracked in the channel's private metadata, preventing
+/// Strong byte-stream writer tracked in the channel metadata, preventing
 /// buffer overwrite until the slowest strong reader has consumed the data.
-pub struct StrongWriter {
+///
+/// Implements [`AsyncWrite`] for byte-stream consumption. Each `poll_write`
+/// call creates one frame with `tag = 0` and `protect_readers = true`.
+pub struct Writer {
     region: ChannelRegion,
     writer_id: u32,
 }
 
-/// Writer that is not tracked; may overwrite slow readers.
+/// Weak byte-stream writer not tracked in channel metadata; may overwrite
+/// slow readers. Implements [`AsyncWrite`].
 pub struct WeakWriter {
     region: ChannelRegion,
     writer_id: u32,
 }
 
-/// A channel writer. Supports both strong and weak variants.
-pub enum Writer {
-    /// Strong writer tracked in channel metadata.
-    Strong(StrongWriter),
-    /// Weak writer not tracked in channel metadata.
-    Weak(WeakWriter),
-}
+impl Writer {
+    /// Creates a new strong writer. Increments writer_count and allocates a writer_id.
+    pub(crate) fn new(region: ChannelRegion) -> Result<Self> {
+        region.increment_writer_count()?;
+        let writer_id = match region.allocate_writer_id() {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = region.decrement_writer_count();
+                return Err(error);
+            }
+        };
+        Ok(Self { region, writer_id })
+    }
 
-impl StrongWriter {
-    pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
+    /// Creates a strong writer from a pre-allocated writer_id.
+    /// Caller is responsible for having already incremented writer_count.
+    pub(crate) fn from_writer_id(region: ChannelRegion, writer_id: u32) -> Self {
         Self { region, writer_id }
     }
 
     /// Writes a framed payload using single-phase write with release fencing.
-    pub fn write(&mut self, payload: &[u8]) -> Result<()> {
+    ///
+    /// This is the frame-level write operation. Each call writes one complete
+    /// frame with the given tag.
+    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
         if payload.len() > u32::MAX as usize {
             return Err(Error::InvalidFrame);
         }
@@ -42,7 +62,7 @@ impl StrongWriter {
             return Err(Error::BufferFull);
         }
         let pos = self.region.reserve_tail(frame_size, true)?;
-        write_frame_single_phase(&self.region, pos, payload, self.writer_id)?;
+        write_frame_single_phase(&self.region, pos, payload, tag)?;
         Ok(())
     }
 
@@ -60,11 +80,53 @@ impl StrongWriter {
     pub fn allocate_mutation_id(&self) -> Result<u64> {
         self.region.allocate_mutation_id()
     }
+
+    /// Downgrade this strong writer to a weak writer.
+    /// Decrements writer_count to compensate for the lost Drop decrement.
+    pub fn downgrade(self) -> WeakWriter {
+        let _ = self.region.decrement_writer_count();
+        let weak = WeakWriter {
+            region: self.region.clone(),
+            writer_id: self.writer_id,
+        };
+        // Prevent Drop from decrementing again (we already did it).
+        // We can't set writer_count back, so we use mem::forget on self
+        // after extracting what we need. But since Drop only decrements
+        // writer_count and we already did that, we need to prevent the
+        // double decrement. Use a manual approach:
+        std::mem::forget(self);
+        weak
+    }
 }
 
-impl Drop for StrongWriter {
+impl Drop for Writer {
     fn drop(&mut self) {
         let _ = self.region.decrement_writer_count();
+    }
+}
+
+impl AsyncWrite for Writer {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.write_frame(buf, 0) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(Error::BufferFull) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -74,7 +136,7 @@ impl WeakWriter {
     }
 
     /// Writes payload data without applying strong-reader backpressure.
-    pub fn write(&mut self, payload: &[u8]) -> Result<()> {
+    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
         if payload.len() > u32::MAX as usize {
             return Err(Error::InvalidFrame);
         }
@@ -83,7 +145,7 @@ impl WeakWriter {
             return Err(Error::BufferFull);
         }
         let pos = self.region.reserve_tail(frame_size, false)?;
-        write_frame_single_phase(&self.region, pos, payload, self.writer_id)?;
+        write_frame_single_phase(&self.region, pos, payload, tag)?;
         Ok(())
     }
 
@@ -96,31 +158,41 @@ impl WeakWriter {
     pub fn allocate_mutation_id(&self) -> Result<u64> {
         self.region.allocate_mutation_id()
     }
+
+    /// Returns a reference to the underlying channel region.
+    pub fn region(&self) -> &ChannelRegion {
+        &self.region
+    }
+
+    /// Upgrade this weak writer to a strong writer. Increments writer_count.
+    pub fn upgrade(self) -> Result<Writer> {
+        self.region.increment_writer_count()?;
+        Ok(Writer::from_writer_id(self.region, self.writer_id))
+    }
 }
 
-impl Writer {
-    /// Writes payload data into the channel.
-    pub fn write(&mut self, payload: &[u8]) -> Result<()> {
-        match self {
-            Self::Strong(w) => w.write(payload),
-            Self::Weak(w) => w.write(payload),
+impl AsyncWrite for WeakWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.write_frame(buf, 0) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(Error::BufferFull) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
         }
     }
 
-    /// Returns the writer id.
-    pub fn writer_id(&self) -> u32 {
-        match self {
-            Self::Strong(w) => w.writer_id,
-            Self::Weak(w) => w.writer_id,
-        }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
-    /// Allocates a globally unique mutation id for this writer's channel.
-    pub fn allocate_mutation_id(&self) -> Result<u64> {
-        match self {
-            Self::Strong(w) => w.allocate_mutation_id(),
-            Self::Weak(w) => w.allocate_mutation_id(),
-        }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 

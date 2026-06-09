@@ -935,6 +935,14 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
 }
 
 /// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.
+///
+/// The selium-abi crate defines its own `RegionProt` enum to maintain
+/// independence from the wasmtiny runtime implementation. This conversion
+/// function bridges the two types at the runtime boundary where hostcalls
+/// need to pass protection flags to the WASM engine.
+///
+/// Both enums have identical variants (ReadOnly, ReadWrite) and semantics,
+/// so the conversion is a simple 1:1 mapping.
 fn to_wasm_prot(prot: selium_abi::RegionProt) -> WasmProt {
     match prot {
         selium_abi::RegionProt::ReadOnly => WasmProt::ReadOnly,

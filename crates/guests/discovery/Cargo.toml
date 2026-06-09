@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 selium-guest = { workspace = true, features = ["io"] }
-selium-rpc.workspace = true
 
 [lints]
 workspace = true

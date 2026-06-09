@@ -921,7 +921,6 @@ name = "selium-discovery"
 version = "1.0.0-alpha.6"
 dependencies = [
  "selium-guest",
- "selium-rpc",
 ]
 
 [[package]]
@@ -972,16 +971,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "selium-rpc"
-version = "1.0.0-alpha.6"
-dependencies = [
- "rkyv",
- "selium-abi",
- "selium-guest",
- "thiserror",
-]
-
-[[package]]
 name = "selium-runtime"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -1006,15 +995,6 @@ dependencies = [
 name = "selium-supervisor"
 version = "1.0.0-alpha.6"
 dependencies = [
- "selium-guest",
-]
-
-[[package]]
-name = "selium-tables"
-version = "1.0.0-alpha.6"
-dependencies = [
- "rkyv",
- "selium-abi",
  "selium-guest",
 ]
 
