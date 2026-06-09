@@ -99,12 +99,6 @@ impl Writer {
     }
 }
 
-impl Drop for Writer {
-    fn drop(&mut self) {
-        let _ = self.region.decrement_writer_count();
-    }
-}
-
 impl AsyncWrite for Writer {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -127,6 +121,12 @@ impl AsyncWrite for Writer {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.region.decrement_writer_count();
     }
 }
 

@@ -326,7 +326,9 @@ mod tests {
     /// In native test mode, `create_pair` doesn't share memory because
     /// `RegionBuilder::attach` allocates a new heap region. This helper
     /// constructs both from the same ring directly.
-    fn test_pair<T>(capacity: u64) -> Result<(Publisher<T, WeakWriter>, Subscriber<T, WeakReader>)> {
+    fn test_pair<T>(
+        capacity: u64,
+    ) -> Result<(Publisher<T, WeakWriter>, Subscriber<T, WeakReader>)> {
         let capacity = round_capacity(capacity)?;
         let ring = RingBuf::create(capacity)?;
         let writer = writer_from_ring(&ring)?;

@@ -24,10 +24,7 @@
 //! Connection establishment uses a `HostQueue` to pass the `shared_id` from
 //! client to server.
 
-use std::{
-    fmt,
-    marker::PhantomData,
-};
+use std::{fmt, marker::PhantomData};
 
 use rkyv::{
     api::high::{HighDeserializer, HighValidator},
@@ -90,6 +87,41 @@ pub enum AcceptError {
     Serialization(String),
 }
 
+/// Client-side handle for making typed RPC requests.
+///
+/// Sends `Req` payloads and receives `Rep` replies over shared-memory
+/// ring buffers.
+pub struct RpcClient<Req, Rep> {
+    request_writer: FramedWrite<Writer>,
+    reply_reader: FramedRead<Reader>,
+    next_correlation: u32,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// Server-side handle for an established RPC session.
+///
+/// Receives `Req` requests and sends `Rep` replies over shared-memory
+/// ring buffers.
+pub struct RpcConnection<Req, Rep> {
+    request_reader: FramedRead<Reader>,
+    reply_writer: FramedWrite<Writer>,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// A single request received by the server, with the ability to reply.
+pub struct RpcRequest<'a, Req, Rep> {
+    reply_writer: &'a mut FramedWrite<Writer>,
+    payload_bytes: Vec<u8>,
+    correlation: u32,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// Accept implementation for RPC connections.
+///
+/// Attaches to the shared region from an `IncomingConnection` and
+/// returns an `RpcConnection`.
+pub struct RpcAccept<Req, Rep>(PhantomData<(Req, Rep)>);
+
 impl fmt::Display for RpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -143,41 +175,6 @@ impl From<Error> for AcceptError {
         }
     }
 }
-
-/// Client-side handle for making typed RPC requests.
-///
-/// Sends `Req` payloads and receives `Rep` replies over shared-memory
-/// ring buffers.
-pub struct RpcClient<Req, Rep> {
-    request_writer: FramedWrite<Writer>,
-    reply_reader: FramedRead<Reader>,
-    next_correlation: u32,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
-/// Server-side handle for an established RPC session.
-///
-/// Receives `Req` requests and sends `Rep` replies over shared-memory
-/// ring buffers.
-pub struct RpcConnection<Req, Rep> {
-    request_reader: FramedRead<Reader>,
-    reply_writer: FramedWrite<Writer>,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
-/// A single request received by the server, with the ability to reply.
-pub struct RpcRequest<'a, Req, Rep> {
-    reply_writer: &'a mut FramedWrite<Writer>,
-    payload_bytes: Vec<u8>,
-    correlation: u32,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
-/// Accept implementation for RPC connections.
-///
-/// Attaches to the shared region from an `IncomingConnection` and
-/// returns an `RpcConnection`.
-pub struct RpcAccept<Req, Rep>(PhantomData<(Req, Rep)>);
 
 impl<Req, Rep> RpcClient<Req, Rep>
 where

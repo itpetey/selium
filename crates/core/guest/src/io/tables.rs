@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    hash::Hash,
-};
+use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
 use rkyv::{
     api::high::{HighDeserializer, HighValidator},
@@ -83,10 +79,8 @@ where
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
     for<'a> V::Archived: rkyv::Deserialize<V, HighDeserializer<RancorError>>
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived: rkyv::Deserialize<
-            LiveTableMessage<K, V>,
-            HighDeserializer<RancorError>,
-        > + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    for<'a> <LiveTableMessage<K, V> as rkyv::Archive>::Archived: rkyv::Deserialize<LiveTableMessage<K, V>, HighDeserializer<RancorError>>
+        + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
     LiveTableMessage<K, V>: RkyvEncode,
 {
     /// Creates a new live table with its own pub/sub topic.

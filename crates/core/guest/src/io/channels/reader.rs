@@ -192,12 +192,6 @@ impl Reader {
     }
 }
 
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 impl AsyncRead for Reader {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -264,10 +258,7 @@ impl AsyncRead for Reader {
             return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
         }
 
-        let payload_pos = match self
-            .pos
-            .checked_add(FrameHeader::ENCODED_SIZE as u64)
-        {
+        let payload_pos = match self.pos.checked_add(FrameHeader::ENCODED_SIZE as u64) {
             Some(p) => p,
             None => return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame))),
         };
@@ -291,6 +282,12 @@ impl AsyncRead for Reader {
         }
 
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -475,10 +472,7 @@ impl AsyncRead for WeakReader {
             return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
         }
 
-        let payload_pos = match self
-            .pos
-            .checked_add(FrameHeader::ENCODED_SIZE as u64)
-        {
+        let payload_pos = match self.pos.checked_add(FrameHeader::ENCODED_SIZE as u64) {
             Some(p) => p,
             None => return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame))),
         };

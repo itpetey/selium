@@ -9,25 +9,6 @@ use crate::io::{
     error::{Error, Result},
 };
 
-/// A framed reader that wraps a byte-stream reader to provide frame-level
-/// read operations with `FrameHeader` decoding and tag extraction.
-///
-/// Generic over the inner reader type, allowing composition with `Reader`,
-/// `WeakReader`, or any other type that provides `read_frame()` and
-/// `generation()` methods.
-pub struct FramedRead<R> {
-    inner: R,
-}
-
-/// A framed writer that wraps a byte-stream writer to provide frame-level
-/// write operations with `FrameHeader` encoding.
-///
-/// Generic over the inner writer type, allowing composition with `Writer`,
-/// `WeakWriter`, or any other type that provides `write_frame()` methods.
-pub struct FramedWrite<W> {
-    inner: W,
-}
-
 /// Trait for types that can read frames and expose a generation counter.
 ///
 /// Implemented by `Reader` and `WeakReader` to allow `FramedRead` to work
@@ -50,44 +31,23 @@ pub trait FrameWrite {
     fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()>;
 }
 
-impl FrameRead for Reader {
-    fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
-        Reader::read_frame(self)
-    }
-
-    fn generation(&self) -> Result<u64> {
-        Reader::generation(self)
-    }
-
-    fn poll_ready(&mut self) -> Result<bool> {
-        Reader::poll_ready(self)
-    }
+/// A framed reader that wraps a byte-stream reader to provide frame-level
+/// read operations with `FrameHeader` decoding and tag extraction.
+///
+/// Generic over the inner reader type, allowing composition with `Reader`,
+/// `WeakReader`, or any other type that provides `read_frame()` and
+/// `generation()` methods.
+pub struct FramedRead<R> {
+    inner: R,
 }
 
-impl FrameRead for WeakReader {
-    fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
-        WeakReader::read_frame(self)
-    }
-
-    fn generation(&self) -> Result<u64> {
-        WeakReader::generation(self)
-    }
-
-    fn poll_ready(&mut self) -> Result<bool> {
-        WeakReader::poll_ready(self)
-    }
-}
-
-impl FrameWrite for Writer {
-    fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
-        Writer::write_frame(self, payload, tag)
-    }
-}
-
-impl FrameWrite for WeakWriter {
-    fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
-        WeakWriter::write_frame(self, payload, tag)
-    }
+/// A framed writer that wraps a byte-stream writer to provide frame-level
+/// write operations with `FrameHeader` encoding.
+///
+/// Generic over the inner writer type, allowing composition with `Writer`,
+/// `WeakWriter`, or any other type that provides `write_frame()` methods.
+pub struct FramedWrite<W> {
+    inner: W,
 }
 
 impl<R: FrameRead> FramedRead<R> {
@@ -130,6 +90,23 @@ impl<R: FrameRead> FramedRead<R> {
     }
 }
 
+// Upgrade/downgrade support for FramedRead
+impl FramedRead<WeakReader> {
+    /// Upgrade the inner weak reader to a strong reader.
+    pub fn upgrade(self) -> Result<FramedRead<Reader>> {
+        let strong = self.inner.upgrade()?;
+        Ok(FramedRead::new(strong))
+    }
+}
+
+impl FramedRead<Reader> {
+    /// Downgrade the inner strong reader to a weak reader.
+    pub fn downgrade(self) -> FramedRead<WeakReader> {
+        let weak = self.inner.downgrade();
+        FramedRead::new(weak)
+    }
+}
+
 impl<W: FrameWrite> FramedWrite<W> {
     /// Creates a new `FramedWrite` wrapping the given writer.
     pub fn new(inner: W) -> Self {
@@ -163,23 +140,6 @@ impl<W: FrameWrite> FramedWrite<W> {
     }
 }
 
-// Upgrade/downgrade support for FramedRead
-impl FramedRead<WeakReader> {
-    /// Upgrade the inner weak reader to a strong reader.
-    pub fn upgrade(self) -> Result<FramedRead<Reader>> {
-        let strong = self.inner.upgrade()?;
-        Ok(FramedRead::new(strong))
-    }
-}
-
-impl FramedRead<Reader> {
-    /// Downgrade the inner strong reader to a weak reader.
-    pub fn downgrade(self) -> FramedRead<WeakReader> {
-        let weak = self.inner.downgrade();
-        FramedRead::new(weak)
-    }
-}
-
 // Upgrade/downgrade support for FramedWrite
 impl FramedWrite<WeakWriter> {
     /// Upgrade the inner weak writer to a strong writer.
@@ -194,5 +154,45 @@ impl FramedWrite<Writer> {
     pub fn downgrade(self) -> FramedWrite<WeakWriter> {
         let weak = self.inner.downgrade();
         FramedWrite::new(weak)
+    }
+}
+
+impl FrameRead for Reader {
+    fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
+        Reader::read_frame(self)
+    }
+
+    fn generation(&self) -> Result<u64> {
+        Reader::generation(self)
+    }
+
+    fn poll_ready(&mut self) -> Result<bool> {
+        Reader::poll_ready(self)
+    }
+}
+
+impl FrameRead for WeakReader {
+    fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
+        WeakReader::read_frame(self)
+    }
+
+    fn generation(&self) -> Result<u64> {
+        WeakReader::generation(self)
+    }
+
+    fn poll_ready(&mut self) -> Result<bool> {
+        WeakReader::poll_ready(self)
+    }
+}
+
+impl FrameWrite for Writer {
+    fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
+        Writer::write_frame(self, payload, tag)
+    }
+}
+
+impl FrameWrite for WeakWriter {
+    fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
+        WeakWriter::write_frame(self, payload, tag)
     }
 }
