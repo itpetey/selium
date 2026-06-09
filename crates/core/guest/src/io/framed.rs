@@ -4,7 +4,7 @@
 //! [`FrameCodec`] that handles [`FrameHeader`](crate::io::FrameHeader) encoding
 //! and decoding. `FramedRead<R>` and `FramedWrite<W>` add convenience methods
 //! (`read_frame`, `write_frame`, `poll_ready`, `generation`) and upgrade/downgrade
-//! support for strong/weak channel types.
+//! support for [non-]blocking channel types.
 
 use std::{
     pin::Pin,
@@ -18,7 +18,7 @@ use tokio_util::codec::{
 };
 
 use crate::io::{
-    channels::{Reader, WeakReader, WeakWriter, Writer},
+    channels::{BlockingReader, BlockingWriter, Reader, Writer},
     error::{Error, Result},
     frame::FrameHeader,
 };
@@ -168,21 +168,21 @@ impl<R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpi
 }
 
 // Upgrade/downgrade support
-impl FramedRead<WeakReader> {
-    /// Upgrade the inner weak reader to a strong reader.
-    pub fn upgrade(self) -> Result<FramedRead<Reader>> {
-        let weak = self.into_inner();
-        let strong = weak.upgrade()?;
-        Ok(FramedRead::new(strong))
+impl FramedRead<Reader> {
+    /// Upgrade the inner non-blocking reader to a blocking reader.
+    pub fn upgrade(self) -> Result<FramedRead<BlockingReader>> {
+        let nonb = self.into_inner();
+        let blocking = nonb.upgrade()?;
+        Ok(FramedRead::new(blocking))
     }
 }
 
-impl FramedRead<Reader> {
-    /// Downgrade the inner strong reader to a weak reader.
-    pub fn downgrade(self) -> FramedRead<WeakReader> {
-        let strong = self.into_inner();
-        let weak = strong.downgrade();
-        FramedRead::new(weak)
+impl FramedRead<BlockingReader> {
+    /// Downgrade the inner blocking reader to a non-blocking reader.
+    pub fn downgrade(self) -> FramedRead<Reader> {
+        let blocking = self.into_inner();
+        let nonb = blocking.downgrade();
+        FramedRead::new(nonb)
     }
 }
 
@@ -245,21 +245,21 @@ impl<W> FramedWrite<W> {
 }
 
 // Upgrade/downgrade support
-impl FramedWrite<WeakWriter> {
-    /// Upgrade the inner weak writer to a strong writer.
-    pub fn upgrade(self) -> Result<FramedWrite<Writer>> {
-        let weak = self.into_inner();
-        let strong = weak.upgrade()?;
-        Ok(FramedWrite::new(strong))
+impl FramedWrite<Writer> {
+    /// Upgrade the inner non-blocking writer to a blocking writer.
+    pub fn upgrade(self) -> Result<FramedWrite<BlockingWriter>> {
+        let nonb = self.into_inner();
+        let blocking = nonb.upgrade()?;
+        Ok(FramedWrite::new(blocking))
     }
 }
 
-impl FramedWrite<Writer> {
-    /// Downgrade the inner strong writer to a weak writer.
-    pub fn downgrade(self) -> FramedWrite<WeakWriter> {
-        let strong = self.into_inner();
-        let weak = strong.downgrade();
-        FramedWrite::new(weak)
+impl FramedWrite<BlockingWriter> {
+    /// Downgrade the inner blocking writer to a non-blocking writer.
+    pub fn downgrade(self) -> FramedWrite<Writer> {
+        let blocking = self.into_inner();
+        let nonb = blocking.downgrade();
+        FramedWrite::new(nonb)
     }
 }
 

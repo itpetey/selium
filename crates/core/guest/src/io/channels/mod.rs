@@ -4,17 +4,17 @@ use crate::io::{
 };
 
 pub use self::{
-    reader::{HasGeneration, Reader, WeakReader},
-    writer::{WeakWriter, Writer},
+    reader::{BlockingReader, HasGeneration, Reader},
+    writer::{BlockingWriter, Writer},
 };
 
 pub mod reader;
 pub mod writer;
 
-/// A shared-memory-backed channel with strong/weak reader and writer semantics.
+/// A shared-memory-backed channel with [non-]blocking reader and writer semantics.
 ///
-/// The channel stores framed messages in a lock-free ring buffer. Strong readers
-/// prevent buffer overwrite until they have consumed data; weak readers may lose
+/// The channel stores framed messages in a lock-free ring buffer. Blocking readers
+/// prevent buffer overwrite until they have consumed data; non-blocking readers may lose
 /// data if they fall behind.
 ///
 /// Notification uses the generation counter in the shared region with native
@@ -38,30 +38,34 @@ impl Channel {
         Ok(Self { ring })
     }
 
-    /// Creates a strong writer for this channel.
+    /// Creates a blocking writer for this channel.
     ///
     /// The writer increments `writer_count` and allocates a `writer_id`.
+    pub fn blocking_writer(&self) -> Result<BlockingWriter> {
+        BlockingWriter::new(self.ring.region().clone())
+    }
+
+    /// Creates a non-blocking writer that does not contribute to `writer_count`.
     pub fn writer(&self) -> Result<Writer> {
-        Writer::new(self.ring.region().clone())
-    }
-
-    /// Creates a weak writer that does not contribute to `writer_count`.
-    pub fn weak_writer(&self) -> Result<WeakWriter> {
         let writer_id = self.ring.region().allocate_writer_id()?;
-        Ok(WeakWriter::new(self.ring.region().clone(), writer_id))
+        Ok(Writer::new(self.ring.region().clone(), writer_id))
     }
 
-    /// Creates a strong reader that prevents buffer overwrite.
-    pub fn strong_reader(&self) -> Result<Reader> {
+    /// Creates a non-blocking reader that may lose data if slow.
+    pub fn reader(&self) -> Reader {
+        let tail = self.ring.read_next_tail().unwrap_or(0);
+        Reader::new(self.ring.region().clone(), tail)
+    }
+
+    /// Creates a blocking reader that prevents buffer overwrite.
+    pub fn blocking_reader(&self) -> Result<BlockingReader> {
         let tail = self.ring.read_next_tail()?;
         let reader_id = self.ring.region().allocate_reader_slot(tail)?;
-        Ok(Reader::new(self.ring.region().clone(), tail, reader_id))
-    }
-
-    /// Creates a weak reader that may lose data if slow.
-    pub fn weak_reader(&self) -> WeakReader {
-        let tail = self.ring.read_next_tail().unwrap_or(0);
-        WeakReader::new(self.ring.region().clone(), tail)
+        Ok(BlockingReader::new(
+            self.ring.region().clone(),
+            tail,
+            reader_id,
+        ))
     }
 
     /// Returns the underlying ring buffer.

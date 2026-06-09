@@ -34,7 +34,7 @@ use selium_abi::{decode_rkyv, encode_rkyv};
 
 use crate::io::{
     ChannelRegion, Error, PAGE_SIZE, RegionMapping, RingBuf,
-    channels::{Reader, Writer},
+    channels::{BlockingReader, BlockingWriter},
     framed::{FramedRead, FramedWrite},
 };
 
@@ -92,8 +92,8 @@ pub enum AcceptError {
 /// Sends `Req` payloads and receives `Rep` replies over shared-memory
 /// ring buffers.
 pub struct RpcClient<Req, Rep> {
-    request_writer: FramedWrite<Writer>,
-    reply_reader: FramedRead<Reader>,
+    request_writer: FramedWrite<BlockingWriter>,
+    reply_reader: FramedRead<BlockingReader>,
     next_correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
 }
@@ -103,14 +103,14 @@ pub struct RpcClient<Req, Rep> {
 /// Receives `Req` requests and sends `Rep` replies over shared-memory
 /// ring buffers.
 pub struct RpcConnection<Req, Rep> {
-    request_reader: FramedRead<Reader>,
-    reply_writer: FramedWrite<Writer>,
+    request_reader: FramedRead<BlockingReader>,
+    reply_writer: FramedWrite<BlockingWriter>,
     _phantom: PhantomData<(Req, Rep)>,
 }
 
 /// A single request received by the server, with the ability to reply.
 pub struct RpcRequest<'a, Req, Rep> {
-    reply_writer: &'a mut FramedWrite<Writer>,
+    reply_writer: &'a mut FramedWrite<BlockingWriter>,
     payload_bytes: Vec<u8>,
     correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
@@ -309,11 +309,11 @@ where
         // Create reader for request ring (server reads requests)
         let tail = request_ring.read_next_tail()?;
         let reader_id = request_reader_region.allocate_reader_slot(tail)?;
-        let request_reader = Reader::new(request_reader_region, tail, reader_id);
+        let request_reader = BlockingReader::new(request_reader_region, tail, reader_id);
         let request_reader = FramedRead::new(request_reader);
 
         // Create writer for reply ring (server writes replies)
-        let reply_writer = Writer::new(reply_writer_region)?;
+        let reply_writer = BlockingWriter::new(reply_writer_region)?;
         let reply_writer = FramedWrite::new(reply_writer);
 
         Ok(Self {
@@ -435,7 +435,7 @@ fn align_up(value: u64, alignment: u64) -> u64 {
 fn attach_rpc_region(
     _shared_id: u64,
     parent_mapping: &RegionMapping,
-) -> Result<(FramedRead<Reader>, FramedWrite<Writer>), RpcError> {
+) -> Result<(FramedRead<BlockingReader>, FramedWrite<BlockingWriter>), RpcError> {
     // Read and validate magic.
     let magic_bytes = parent_mapping.read(HEADER_MAGIC_OFFSET, 8)?;
     let magic = u64::from_le_bytes(
@@ -510,12 +510,12 @@ fn attach_rpc_region(
     let req_region = request_ring.region().clone();
     let tail = request_ring.read_next_tail()?;
     let reader_id = req_region.allocate_reader_slot(tail)?;
-    let request_reader = Reader::new(req_region, tail, reader_id);
+    let request_reader = BlockingReader::new(req_region, tail, reader_id);
     let request_reader = FramedRead::new(request_reader);
 
-    // Server writes to reply ring (needs a Writer)
+    // Server writes to reply ring (needs a BlockingWriter)
     let rep_region = reply_ring.region().clone();
-    let reply_writer = Writer::new(rep_region)?;
+    let reply_writer = BlockingWriter::new(rep_region)?;
     let reply_writer = FramedWrite::new(reply_writer);
 
     Ok((request_reader, reply_writer))
@@ -532,7 +532,7 @@ fn attach_rpc_region(
 fn create_rpc_region(
     req_capacity: u64,
     rep_capacity: u64,
-) -> Result<(FramedWrite<Writer>, FramedRead<Reader>, u64), RpcError> {
+) -> Result<(FramedWrite<BlockingWriter>, FramedRead<BlockingReader>, u64), RpcError> {
     // Each sub-memory: page 0 (coordination) + data pages.
     let req_region_len = PAGE_SIZE + req_capacity;
     let rep_region_len = PAGE_SIZE + rep_capacity;
@@ -582,14 +582,14 @@ fn create_rpc_region(
     req_region.initialise()?;
     rep_region.initialise()?;
 
-    // Client writes to request ring (needs a Writer)
-    let request_writer = Writer::new(req_region.clone())?;
+    // Client writes to request ring (needs a BlockingWriter)
+    let request_writer = BlockingWriter::new(req_region.clone())?;
     let request_writer = FramedWrite::new(request_writer);
 
     // Client reads from reply ring (needs a Reader)
     let tail = rep_region.load_next_tail()?;
     let reader_id = rep_region.allocate_reader_slot(tail)?;
-    let reply_reader = Reader::new(rep_region, tail, reader_id);
+    let reply_reader = BlockingReader::new(rep_region, tail, reader_id);
     let reply_reader = FramedRead::new(reply_reader);
 
     Ok((request_writer, reply_reader, 0))
@@ -597,7 +597,7 @@ fn create_rpc_region(
 
 /// Tries to read a reply frame with the given correlation tag from the reply ring.
 fn try_read_reply<Rep>(
-    reply_reader: &mut FramedRead<Reader>,
+    reply_reader: &mut FramedRead<BlockingReader>,
     correlation: u32,
 ) -> Result<Option<Rep>, RpcError>
 where
@@ -702,21 +702,21 @@ mod tests {
         rep_region.initialise()?;
 
         // Client: writer on request ring, reader on reply ring
-        let client_req_writer = Writer::new(req_region.clone())?;
+        let client_req_writer = BlockingWriter::new(req_region.clone())?;
         let client_req_writer = FramedWrite::new(client_req_writer);
 
         let tail = rep_region.load_next_tail()?;
         let reader_id = rep_region.allocate_reader_slot(tail)?;
-        let client_reply_reader = Reader::new(rep_region.clone(), tail, reader_id);
+        let client_reply_reader = BlockingReader::new(rep_region.clone(), tail, reader_id);
         let client_reply_reader = FramedRead::new(client_reply_reader);
 
         // Server: reader on request ring, writer on reply ring
         let tail = req_region.load_next_tail()?;
         let reader_id = req_region.allocate_reader_slot(tail)?;
-        let server_req_reader = Reader::new(req_region, tail, reader_id);
+        let server_req_reader = BlockingReader::new(req_region, tail, reader_id);
         let server_req_reader = FramedRead::new(server_req_reader);
 
-        let server_reply_writer = Writer::new(rep_region)?;
+        let server_reply_writer = BlockingWriter::new(rep_region)?;
         let server_reply_writer = FramedWrite::new(server_reply_writer);
 
         let client = RpcClient {

@@ -28,7 +28,7 @@ const FRAME_HEADER_SIZE: u64 = 12;
 const GENERATION_COUNTER_OFFSET: u64 = 0;
 /// Kernel's reader slot index (used for backpressure on outbound rings).
 const KERNEL_READER_SLOT: u32 = 0;
-/// Maximum number of strong reader slots.
+/// Maximum number of blocking reader slots.
 const MAX_READER_SLOTS: u32 = 128;
 /// Offset of the shared `next_tail` cursor (u64) in page 0.
 const NEXT_TAIL_OFFSET: u64 = 8;

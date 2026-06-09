@@ -13,20 +13,20 @@ use selium_abi::{RkyvEncode, decode_rkyv, encode_rkyv};
 
 use crate::io::{
     Error, RingBuf,
-    channels::{Reader, WeakReader, WeakWriter, Writer},
+    channels::{BlockingReader, BlockingWriter, Reader, Writer},
     error::Result,
     framed::{FramedRead, FramedWrite},
     ring_buf::round_capacity,
 };
 
-pub struct Publisher<T, W = WeakWriter> {
+pub struct Publisher<T, W = Writer> {
     writer: FramedWrite<W>,
     region_id: u64,
     capacity: u64,
     _t: PhantomData<T>,
 }
 
-pub struct Subscriber<T, R = WeakReader> {
+pub struct Subscriber<T, R = Reader> {
     reader: FramedRead<R>,
     region_id: u64,
     capacity: u64,
@@ -34,7 +34,7 @@ pub struct Subscriber<T, R = WeakReader> {
     _t: PhantomData<T>,
 }
 
-impl<T> Publisher<T, WeakWriter> {
+impl<T> Publisher<T, Writer> {
     pub fn create(capacity: u64) -> Result<Self> {
         let ring = create_topic(capacity)?;
         let writer = writer_from_ring(&ring)?;
@@ -78,16 +78,6 @@ impl<T, W> Publisher<T, W> {
     }
 }
 
-impl<T> Publisher<T, WeakWriter> {
-    pub fn writer_id(&self) -> u32 {
-        self.writer.inner().writer_id()
-    }
-
-    pub fn allocate_mutation_id(&self) -> Result<u64> {
-        self.writer.inner().allocate_mutation_id()
-    }
-}
-
 impl<T> Publisher<T, Writer> {
     pub fn writer_id(&self) -> u32 {
         self.writer.inner().writer_id()
@@ -98,12 +88,22 @@ impl<T> Publisher<T, Writer> {
     }
 }
 
-impl<T> Publisher<T, WeakWriter> {
-    /// Upgrade the inner weak writer to a strong writer.
-    pub fn upgrade(self) -> Result<Publisher<T, Writer>> {
-        let strong_writer = self.writer.upgrade()?;
+impl<T> Publisher<T, BlockingWriter> {
+    pub fn writer_id(&self) -> u32 {
+        self.writer.inner().writer_id()
+    }
+
+    pub fn allocate_mutation_id(&self) -> Result<u64> {
+        self.writer.inner().allocate_mutation_id()
+    }
+}
+
+impl<T> Publisher<T, Writer> {
+    /// Upgrade the inner non-blocking writer to a blocking writer.
+    pub fn upgrade(self) -> Result<Publisher<T, BlockingWriter>> {
+        let writer = self.writer.upgrade()?;
         Ok(Publisher {
-            writer: strong_writer,
+            writer,
             region_id: self.region_id,
             capacity: self.capacity,
             _t: PhantomData,
@@ -111,12 +111,12 @@ impl<T> Publisher<T, WeakWriter> {
     }
 }
 
-impl<T> Publisher<T, Writer> {
-    /// Downgrade the inner strong writer to a weak writer.
-    pub fn downgrade(self) -> Publisher<T, WeakWriter> {
-        let weak_writer = self.writer.downgrade();
+impl<T> Publisher<T, BlockingWriter> {
+    /// Downgrade the inner blocking writer to a non-blocking writer.
+    pub fn downgrade(self) -> Publisher<T, Writer> {
+        let writer = self.writer.downgrade();
         Publisher {
-            writer: weak_writer,
+            writer,
             region_id: self.region_id,
             capacity: self.capacity,
             _t: PhantomData,
@@ -151,7 +151,7 @@ where
     }
 }
 
-impl<T> Subscriber<T, WeakReader> {
+impl<T> Subscriber<T, Reader> {
     pub fn create(capacity: u64) -> Result<Self> {
         let ring = create_topic(capacity)?;
         let reader = reader_from_ring(&ring)?;
@@ -208,12 +208,12 @@ impl<T, R> Subscriber<T, R> {
     }
 }
 
-impl<T> Subscriber<T, WeakReader> {
-    /// Upgrade the inner weak reader to a strong reader.
-    pub fn upgrade(self) -> Result<Subscriber<T, Reader>> {
-        let strong_reader = self.reader.upgrade()?;
+impl<T> Subscriber<T, Reader> {
+    /// Upgrade the inner non-blocking reader to a blocking reader.
+    pub fn upgrade(self) -> Result<Subscriber<T, BlockingReader>> {
+        let reader = self.reader.upgrade()?;
         Ok(Subscriber {
-            reader: strong_reader,
+            reader,
             region_id: self.region_id,
             capacity: self.capacity,
             last_generation: self.last_generation,
@@ -222,12 +222,12 @@ impl<T> Subscriber<T, WeakReader> {
     }
 }
 
-impl<T> Subscriber<T, Reader> {
-    /// Downgrade the inner strong reader to a weak reader.
-    pub fn downgrade(self) -> Subscriber<T, WeakReader> {
-        let weak_reader = self.reader.downgrade();
+impl<T> Subscriber<T, BlockingReader> {
+    /// Downgrade the inner blocking reader to a non-blocking reader.
+    pub fn downgrade(self) -> Subscriber<T, Reader> {
+        let reader = self.reader.downgrade();
         Subscriber {
-            reader: weak_reader,
+            reader,
             region_id: self.region_id,
             capacity: self.capacity,
             last_generation: self.last_generation,
@@ -306,16 +306,16 @@ fn create_topic(capacity: u64) -> Result<RingBuf> {
     RingBuf::create(capacity)
 }
 
-fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<WeakReader>> {
+fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<Reader>> {
     let tail = ring.read_next_tail()?;
-    let weak_reader = WeakReader::new(ring.region().clone(), tail);
-    Ok(FramedRead::new(weak_reader))
+    let reader = Reader::new(ring.region().clone(), tail);
+    Ok(FramedRead::new(reader))
 }
 
-fn writer_from_ring(ring: &RingBuf) -> Result<FramedWrite<WeakWriter>> {
+fn writer_from_ring(ring: &RingBuf) -> Result<FramedWrite<Writer>> {
     let writer_id = ring.region().allocate_writer_id()?;
-    let weak_writer = WeakWriter::new(ring.region().clone(), writer_id);
-    Ok(FramedWrite::new(weak_writer))
+    let writer = Writer::new(ring.region().clone(), writer_id);
+    Ok(FramedWrite::new(writer))
 }
 
 #[cfg(test)]
@@ -326,9 +326,7 @@ mod tests {
     /// In native test mode, `create_pair` doesn't share memory because
     /// `RegionBuilder::attach` allocates a new heap region. This helper
     /// constructs both from the same ring directly.
-    fn test_pair<T>(
-        capacity: u64,
-    ) -> Result<(Publisher<T, WeakWriter>, Subscriber<T, WeakReader>)> {
+    fn test_pair<T>(capacity: u64) -> Result<(Publisher<T, Writer>, Subscriber<T, Reader>)> {
         let capacity = round_capacity(capacity)?;
         let ring = RingBuf::create(capacity)?;
         let writer = writer_from_ring(&ring)?;

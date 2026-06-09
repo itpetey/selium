@@ -1,7 +1,7 @@
 //! Selium I/O pattern library for guests.
 //!
 //! Provides shared-memory-backed ring buffers, typed channels with
-//! strong/weak readers and writers, and pub/sub with `Publisher` and `Subscriber`.
+//! [non-]blocking readers and writers, and pub/sub with `Publisher` and `Subscriber`.
 //!
 //! The shared region layout contains cross-process coordination fields in
 //! page 0 (generation counter, `next_tail`, `writer_count`, `reader_slots`,

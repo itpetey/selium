@@ -14,14 +14,14 @@ use crate::io::{
 
 /// Trait for reader types that can report their ring buffer generation counter.
 ///
-/// Both [`Reader`] and [`WeakReader`] implement this, allowing framed types
-/// to work generically over strong and weak read handles.
+/// Both [`Reader`] and [`BlockingReader`] implement this, allowing framed types
+/// to work generically over non-blocking and blocking read handles respectively.
 pub trait HasGeneration {
     /// Returns the current generation counter from the underlying ring buffer.
     fn generation(&self) -> Result<u64>;
 }
 
-/// Strong byte-stream reader that tracks its position via a reader slot,
+/// Blocking byte-stream reader that tracks its position via a reader slot,
 /// preventing the ring buffer from overwriting unread data.
 ///
 /// Implements [`AsyncRead`] for raw byte-stream consumption. Each
@@ -29,7 +29,7 @@ pub trait HasGeneration {
 /// payload) as they appear in the ring buffer. Use
 /// [`FramedRead`](crate::io::framed::FramedRead) for frame-level
 /// operations.
-pub struct Reader {
+pub struct BlockingReader {
     region: ChannelRegion,
     pos: u64,
     reader_id: u32,
@@ -41,11 +41,11 @@ pub struct Reader {
     pending_offset: usize,
 }
 
-/// Weak byte-stream reader that does not prevent buffer overwrite.
+/// Non-blocking byte-stream reader that does not prevent buffer overwrite.
 ///
 /// If writers overtake this reader, it reports [`Error::Overwritten`] and
 /// resumes at the live tail. Implements [`AsyncRead`].
-pub struct WeakReader {
+pub struct Reader {
     region: ChannelRegion,
     pos: u64,
     terminated: bool,
@@ -56,7 +56,7 @@ pub struct WeakReader {
     pending_offset: usize,
 }
 
-impl Reader {
+impl BlockingReader {
     pub(crate) fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
         Self {
             region,
@@ -84,10 +84,10 @@ impl Reader {
         &self.region
     }
 
-    /// Downgrade this strong reader to a weak reader, releasing the reader slot.
-    pub fn downgrade(mut self) -> WeakReader {
+    /// Downgrade this blocking reader to a non-blocking reader, releasing the reader slot.
+    pub fn downgrade(mut self) -> Reader {
         let _ = self.region.release_reader_slot(self.reader_id);
-        let weak = WeakReader {
+        let reader = Reader {
             region: self.region.clone(),
             pos: self.pos,
             terminated: self.terminated,
@@ -96,7 +96,7 @@ impl Reader {
             pending_offset: self.pending_offset,
         };
         self.terminated = true; // prevent Drop from releasing again
-        weak
+        reader
     }
 
     /// Close this reader and release its reader slot.
@@ -116,13 +116,13 @@ impl Reader {
     }
 }
 
-impl HasGeneration for Reader {
+impl HasGeneration for BlockingReader {
     fn generation(&self) -> Result<u64> {
         self.region.load_generation()
     }
 }
 
-impl AsyncRead for Reader {
+impl AsyncRead for BlockingReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -211,13 +211,13 @@ impl AsyncRead for Reader {
     }
 }
 
-impl Drop for Reader {
+impl Drop for BlockingReader {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl WeakReader {
+impl Reader {
     pub(crate) fn new(region: ChannelRegion, start_pos: u64) -> Self {
         Self {
             region,
@@ -244,22 +244,22 @@ impl WeakReader {
         &self.region
     }
 
-    /// Upgrade this weak reader to a strong reader, allocating a reader slot.
-    pub fn upgrade(self) -> Result<Reader> {
+    /// Upgrade this non-blocking reader to a blocking reader, allocating a reader slot.
+    pub fn upgrade(self) -> Result<BlockingReader> {
         let reader_id = self.region.allocate_reader_slot(self.pos)?;
-        let mut reader = Reader::new(self.region, self.pos, reader_id);
+        let mut reader = BlockingReader::new(self.region, self.pos, reader_id);
         reader.last_generation = self.last_generation;
         Ok(reader)
     }
 }
 
-impl HasGeneration for WeakReader {
+impl HasGeneration for Reader {
     fn generation(&self) -> Result<u64> {
         self.region.load_generation()
     }
 }
 
-impl AsyncRead for WeakReader {
+impl AsyncRead for Reader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -298,7 +298,7 @@ impl AsyncRead for WeakReader {
             }
         }
 
-        // Weak reader: if overtaken, jump to tail and report error.
+        // Non-blocking reader: if overtaken, jump to tail and report error.
         if self.pos.wrapping_add(capacity) < tail {
             self.pos = tail;
             return Poll::Ready(Err(std::io::Error::other(Error::Overwritten)));

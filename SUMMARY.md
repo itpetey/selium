@@ -21,7 +21,7 @@ selium-kernel  selium-runtime
 - `selium-kernel`: Primitive host resource layer. Owns shared memory, signals, network listener/session/stream state, request exchanges, durable logs, blob stores, process records, activity logs, guest logs, and metering observations.
 - `selium-runtime`: Wasmtiny-backed orchestration layer. Loads guest modules, enforces grants, tracks resource ownership, bootstraps system guests, registers Wasm imports, and coordinates hostcalls.
 - `selium-guest`: Ergonomic guest SDK. Provides typed handles for shared memory, signals, storage, network, process lifecycle, activity logs, guest logs.
-- `selium-io`: Guest-side I/O pattern library. Provides shared-memory-backed ring buffers, typed channels with strong/weak readers and writers, versioned live tables with CAS, and pub/sub fanout.
+- `selium-io`: Guest-side I/O pattern library. Provides shared-memory-backed ring buffers, typed channels with [non-]blocking readers and writers, versioned live tables with CAS, and pub/sub fanout.
 - `selium-guest-macros`: Proc macro layer. Generates guest entrypoint exports and metadata via `#[entrypoint]`, and pattern metadata via `#[pattern_interface]`.
 - `selium-cluster`: System guest that owns day 1 host membership, host load projection, bootstrap address visibility, and protocol-neutral cluster coordination seams.
 - `selium-discovery`: System guest that owns Selium URI registration, exact lookup, prefix lookup, and guest interface metadata visibility.

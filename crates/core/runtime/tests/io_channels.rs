@@ -11,7 +11,6 @@ use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
 /// Tests AllocRegion and FreeRegion lifecycle.
 #[test]
-#[ignore]
 fn alloc_and_free_region_lifecycle() {
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "region-lifecycle");
@@ -75,7 +74,6 @@ fn attach_accepts_protection_and_reader_slot() {
 /// Tests that a region can be allocated, attached, and the pages are
 /// accessible through the kernel.
 #[test]
-#[ignore]
 fn attach_reads_and_writes_through_kernel() {
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "attach-rw");
@@ -138,7 +136,6 @@ fn attach_region(
 
 /// Tests the selium-io frame header wire format through kernel shared memory.
 #[test]
-#[ignore]
 fn frame_header_round_trip() {
     use selium_guest::io::FrameHeader;
 
@@ -189,7 +186,6 @@ fn frame_header_round_trip() {
 
 /// Tests that FreeRegion cleans up active kernel mappings and succeeds.
 #[test]
-#[ignore]
 fn free_fails_when_mapped() {
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "free-mapped");
@@ -262,7 +258,6 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
 
 /// Tests that two attachments to the same region share data.
 #[test]
-#[ignore]
 fn two_attachments_share_region() {
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "two-attach");

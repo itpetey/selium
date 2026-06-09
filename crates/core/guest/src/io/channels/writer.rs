@@ -12,8 +12,15 @@ use crate::io::{
     region::ChannelRegion,
 };
 
-/// Strong byte-stream writer tracked in the channel metadata, preventing
-/// buffer overwrite until the slowest strong reader has consumed the data.
+/// Non-blocking byte-stream writer not tracked in channel metadata; may overwrite
+/// slow readers. Implements [`AsyncWrite`].
+pub struct Writer {
+    region: ChannelRegion,
+    writer_id: u32,
+}
+
+/// Blocking byte-stream writer tracked in the channel metadata, preventing
+/// buffer overwrite until the slowest blocking reader has consumed the data.
 ///
 /// Implements [`AsyncWrite`] for raw byte-stream production. Each
 /// `poll_write` call takes a buffer of raw frame bytes (`[header:12][payload:N]`)
@@ -22,20 +29,13 @@ use crate::io::{
 ///
 /// Use [`FramedWrite`](crate::io::framed::FramedWrite) for frame-level
 /// operations with automatic header encoding.
-pub struct Writer {
+pub struct BlockingWriter {
     region: ChannelRegion,
     writer_id: u32,
 }
 
-/// Weak byte-stream writer not tracked in channel metadata; may overwrite
-/// slow readers. Implements [`AsyncWrite`].
-pub struct WeakWriter {
-    region: ChannelRegion,
-    writer_id: u32,
-}
-
-impl Writer {
-    /// Creates a new strong writer. Increments writer_count and allocates a writer_id.
+impl BlockingWriter {
+    /// Creates a new blocking writer. Increments writer_count and allocates a writer_id.
     pub(crate) fn new(region: ChannelRegion) -> Result<Self> {
         region.increment_writer_count()?;
         let writer_id = match region.allocate_writer_id() {
@@ -48,7 +48,7 @@ impl Writer {
         Ok(Self { region, writer_id })
     }
 
-    /// Creates a strong writer from a pre-allocated writer_id.
+    /// Creates a blocking writer from a pre-allocated writer_id.
     /// Caller is responsible for having already incremented writer_count.
     pub(crate) fn from_writer_id(region: ChannelRegion, writer_id: u32) -> Self {
         Self { region, writer_id }
@@ -69,21 +69,21 @@ impl Writer {
         self.region.allocate_mutation_id()
     }
 
-    /// Downgrade this strong writer to a weak writer.
+    /// Downgrade this blocking writer to a non-blocking writer.
     /// Decrements writer_count to compensate for the lost Drop decrement.
-    pub fn downgrade(self) -> WeakWriter {
+    pub fn downgrade(self) -> Writer {
         let _ = self.region.decrement_writer_count();
-        let weak = WeakWriter {
+        let writer = Writer {
             region: self.region.clone(),
             writer_id: self.writer_id,
         };
         // Prevent Drop from decrementing again (we already did it).
         std::mem::forget(self);
-        weak
+        writer
     }
 }
 
-impl AsyncWrite for Writer {
+impl AsyncWrite for BlockingWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -119,13 +119,13 @@ impl AsyncWrite for Writer {
     }
 }
 
-impl Drop for Writer {
+impl Drop for BlockingWriter {
     fn drop(&mut self) {
         let _ = self.region.decrement_writer_count();
     }
 }
 
-impl WeakWriter {
+impl Writer {
     pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
         Self { region, writer_id }
     }
@@ -145,14 +145,14 @@ impl WeakWriter {
         &self.region
     }
 
-    /// Upgrade this weak writer to a strong writer. Increments writer_count.
-    pub fn upgrade(self) -> Result<Writer> {
+    /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count.
+    pub fn upgrade(self) -> Result<BlockingWriter> {
         self.region.increment_writer_count()?;
-        Ok(Writer::from_writer_id(self.region, self.writer_id))
+        Ok(BlockingWriter::from_writer_id(self.region, self.writer_id))
     }
 }
 
-impl AsyncWrite for WeakWriter {
+impl AsyncWrite for Writer {
     fn poll_write(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,

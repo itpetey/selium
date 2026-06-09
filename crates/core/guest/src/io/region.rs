@@ -9,7 +9,7 @@ use crate::io::error::{Error, Result};
 pub const DATA_OFFSET: u64 = PAGE_SIZE;
 /// Byte offset of the generation counter within the shared region.
 pub const GENERATION_COUNTER_OFFSET: u64 = 0;
-/// Maximum number of strong reader slots available in the shared region.
+/// Maximum number of blocking reader slots available in the shared region.
 pub const MAX_READER_SLOTS: usize = 128;
 /// Minimum region size that can hold a ring buffer (header page + one data page).
 pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
@@ -461,7 +461,7 @@ impl ChannelRegion {
         Ok(self.private.next_mutation_id.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
-    /// Reads the strong reader count by scanning shared reader slots.
+    /// Reads the blocking reader count by scanning shared reader slots.
     pub fn read_reader_count(&self) -> Result<u64> {
         let mut count = 0;
         for i in 0..MAX_READER_SLOTS as u32 {
@@ -495,7 +495,7 @@ impl ChannelRegion {
         self.store_reader_slot(slot, 0)
     }
 
-    /// Returns the minimum active strong-reader cursor from shared reader slots.
+    /// Returns the minimum active blocking-reader cursor from shared reader slots.
     pub fn minimum_reader_position(&self) -> Result<Option<u64>> {
         let mut minimum = None;
         for i in 0..MAX_READER_SLOTS as u32 {

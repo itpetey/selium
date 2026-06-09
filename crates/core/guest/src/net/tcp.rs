@@ -15,7 +15,7 @@ use crate::{
     hostcall::hostcall_async,
     io::{
         ChannelRegion, PAGE_SIZE, RegionMapping, RingBuf,
-        channels::{Reader, Writer},
+        channels::{BlockingReader, BlockingWriter},
     },
     resource::{Accept, IncomingConnection, ResourceListener},
 };
@@ -33,8 +33,8 @@ const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 /// - Inbound ring: kernel writes → guest reads (via `Reader`)
 /// - Outbound ring: guest writes → kernel reads (via `Writer`)
 pub struct TcpStream {
-    reader: Reader,
-    writer: Writer,
+    reader: BlockingReader,
+    writer: BlockingWriter,
 }
 
 /// A TCP listener that accepts incoming connections via the host.
@@ -108,11 +108,11 @@ impl TcpStream {
         let reader_id = inbound_region
             .allocate_reader_slot(tail)
             .map_err(|e| GuestError::Host(format!("allocate reader slot: {e}")))?;
-        let reader = Reader::new(inbound_region, tail, reader_id);
+        let reader = BlockingReader::new(inbound_region, tail, reader_id);
 
         // Create Writer for outbound ring (guest writes to kernel)
         let outbound_region = outbound.region().clone();
-        let writer = Writer::new(outbound_region)
+        let writer = BlockingWriter::new(outbound_region)
             .map_err(|e| GuestError::Host(format!("create writer: {e}")))?;
 
         Ok(Self { reader, writer })
