@@ -4,7 +4,7 @@ use crate::io::{
 };
 
 pub use self::{
-    reader::{Reader, WeakReader},
+    reader::{HasGeneration, Reader, WeakReader},
     writer::{WeakWriter, Writer},
 };
 

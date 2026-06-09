@@ -12,7 +12,7 @@
 pub use cursor::Cursor;
 pub use error::{Error, Result};
 pub use frame::FrameHeader;
-pub use framed::{FrameRead, FrameWrite, FramedRead, FramedWrite};
+pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use region::{
     ChannelRegion, DATA_OFFSET, MAX_READER_SLOTS, NEXT_TAIL_OFFSET, NEXT_WRITER_ID_OFFSET,
     PAGE_SIZE, READER_SLOT_COUNTER_OFFSET, READER_SLOTS_OFFSET, RegionBuilder, RegionMapping,

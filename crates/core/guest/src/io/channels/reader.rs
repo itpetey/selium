@@ -12,21 +12,32 @@ use crate::io::{
     region::ChannelRegion,
 };
 
+/// Trait for reader types that can report their ring buffer generation counter.
+///
+/// Both [`Reader`] and [`WeakReader`] implement this, allowing framed types
+/// to work generically over strong and weak read handles.
+pub trait HasGeneration {
+    /// Returns the current generation counter from the underlying ring buffer.
+    fn generation(&self) -> Result<u64>;
+}
+
 /// Strong byte-stream reader that tracks its position via a reader slot,
 /// preventing the ring buffer from overwriting unread data.
 ///
-/// Implements [`AsyncRead`] for byte-stream consumption. Also exposes
-/// frame-level operations (`read_frame`, `poll_ready`) for use with
-/// [`FramedRead`](crate::io::framed::FramedRead).
+/// Implements [`AsyncRead`] for raw byte-stream consumption. Each
+/// `poll_read` returns bytes from a single complete frame (header +
+/// payload) as they appear in the ring buffer. Use
+/// [`FramedRead`](crate::io::framed::FramedRead) for frame-level
+/// operations.
 pub struct Reader {
     region: ChannelRegion,
     pos: u64,
     reader_id: u32,
     terminated: bool,
     last_generation: u64,
-    /// Buffered payload bytes from a frame partially copied to the caller.
-    pending_payload: Vec<u8>,
-    /// Offset into `pending_payload` for the next copy.
+    /// Buffered frame bytes from a read partially copied to the caller.
+    pending_frame: Vec<u8>,
+    /// Offset into `pending_frame` for the next copy.
     pending_offset: usize,
 }
 
@@ -39,9 +50,9 @@ pub struct WeakReader {
     pos: u64,
     terminated: bool,
     last_generation: u64,
-    /// Buffered payload bytes from a frame partially copied to the caller.
-    pending_payload: Vec<u8>,
-    /// Offset into `pending_payload` for the next copy.
+    /// Buffered frame bytes from a read partially copied to the caller.
+    pending_frame: Vec<u8>,
+    /// Offset into `pending_frame` for the next copy.
     pending_offset: usize,
 }
 
@@ -53,109 +64,14 @@ impl Reader {
             reader_id,
             terminated: false,
             last_generation: 0,
-            pending_payload: Vec::new(),
+            pending_frame: Vec::new(),
             pending_offset: 0,
         }
-    }
-
-    /// Reads the next complete frame. Returns `(payload, tag)`.
-    ///
-    /// This is the frame-level read operation, used by
-    /// [`FramedRead`](crate::io::framed::FramedRead) and other frame-aware types.
-    pub fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
-        if self.terminated {
-            return Err(Error::Terminated);
-        }
-
-        let capacity = self.region.capacity();
-        let mask = capacity - 1;
-        let tail = self.region.read_next_tail()?;
-
-        if self.pos >= tail {
-            return Err(Error::BufferEmpty);
-        }
-        if self.pos.wrapping_add(capacity) < tail {
-            return Err(Error::Overwritten);
-        }
-
-        // Acquire fence ensures we see the writer's payload before the header.
-        fence(Ordering::Acquire);
-
-        let header = read_header(&self.region, self.pos, mask)?;
-        let frame_size = header.frame_size();
-
-        if !header.is_ready() {
-            return Err(Error::BufferEmpty);
-        }
-
-        let frame_end = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        if frame_size > capacity || frame_end > tail {
-            return Err(Error::InvalidFrame);
-        }
-
-        let payload_pos = self
-            .pos
-            .checked_add(FrameHeader::ENCODED_SIZE as u64)
-            .ok_or(Error::InvalidFrame)?;
-        let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
-
-        self.advance(frame_size)?;
-        self.last_generation = self.region.load_generation().unwrap_or(0);
-        Ok((payload, header.tag))
-    }
-
-    /// Non-blocking check for frame readiness.
-    ///
-    /// Returns `Ok(true)` if a complete frame with the READY flag set is
-    /// immediately readable at the current cursor position, `Ok(false)` if
-    /// no frame is ready.
-    pub fn poll_ready(&mut self) -> Result<bool> {
-        if self.terminated {
-            return Err(Error::Terminated);
-        }
-
-        let capacity = self.region.capacity();
-        let mask = capacity - 1;
-        let tail = self.region.read_next_tail()?;
-
-        if self.pos >= tail {
-            return Ok(false);
-        }
-        if self.pos.wrapping_add(capacity) < tail {
-            return Err(Error::Overwritten);
-        }
-
-        fence(Ordering::Acquire);
-
-        let header = read_header(&self.region, self.pos, mask)?;
-        let frame_size = header.frame_size();
-        let frame_end = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        if frame_size > capacity || frame_end > tail {
-            return Err(Error::InvalidFrame);
-        }
-        if !header.is_ready() {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
     /// Returns the current generation counter from the underlying ring buffer.
     pub fn generation(&self) -> Result<u64> {
         self.region.load_generation()
-    }
-
-    fn advance(&mut self, frame_size: u64) -> Result<()> {
-        self.pos = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        self.region.update_reader_slot(self.reader_id, self.pos)
     }
 
     /// Returns the current read position.
@@ -176,7 +92,7 @@ impl Reader {
             pos: self.pos,
             terminated: self.terminated,
             last_generation: self.last_generation,
-            pending_payload: std::mem::take(&mut self.pending_payload),
+            pending_frame: std::mem::take(&mut self.pending_frame),
             pending_offset: self.pending_offset,
         };
         self.terminated = true; // prevent Drop from releasing again
@@ -190,6 +106,20 @@ impl Reader {
             self.terminated = true;
         }
     }
+
+    fn advance(&mut self, frame_size: u64) -> Result<()> {
+        self.pos = self
+            .pos
+            .checked_add(frame_size)
+            .ok_or(Error::InvalidFrame)?;
+        self.region.update_reader_slot(self.reader_id, self.pos)
+    }
+}
+
+impl HasGeneration for Reader {
+    fn generation(&self) -> Result<u64> {
+        self.region.load_generation()
+    }
 }
 
 impl AsyncRead for Reader {
@@ -198,14 +128,14 @@ impl AsyncRead for Reader {
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // Drain any buffered payload from a previous partial read.
-        if self.pending_offset < self.pending_payload.len() {
-            let remaining = &self.pending_payload[self.pending_offset..];
+        // Drain any buffered frame bytes from a previous partial read.
+        if self.pending_offset < self.pending_frame.len() {
+            let remaining = &self.pending_frame[self.pending_offset..];
             let to_copy = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             self.pending_offset += to_copy;
-            if self.pending_offset >= self.pending_payload.len() {
-                self.pending_payload.clear();
+            if self.pending_offset >= self.pending_frame.len() {
+                self.pending_frame.clear();
                 self.pending_offset = 0;
             }
             return Poll::Ready(Ok(()));
@@ -258,13 +188,9 @@ impl AsyncRead for Reader {
             return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
         }
 
-        let payload_pos = match self.pos.checked_add(FrameHeader::ENCODED_SIZE as u64) {
-            Some(p) => p,
-            None => return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame))),
-        };
-
-        let payload = match read_raw(&self.region, payload_pos, header.len as u64, mask) {
-            Ok(p) => p,
+        // Read the full frame (header + payload) from the ring buffer.
+        let frame_bytes = match read_raw(&self.region, self.pos, frame_size, mask) {
+            Ok(b) => b,
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
         };
 
@@ -273,11 +199,11 @@ impl AsyncRead for Reader {
         }
         self.last_generation = self.region.load_generation().unwrap_or(0);
 
-        let to_copy = payload.len().min(buf.remaining());
-        buf.put_slice(&payload[..to_copy]);
+        let to_copy = frame_bytes.len().min(buf.remaining());
+        buf.put_slice(&frame_bytes[..to_copy]);
 
-        if to_copy < payload.len() {
-            self.pending_payload = payload;
+        if to_copy < frame_bytes.len() {
+            self.pending_frame = frame_bytes;
             self.pending_offset = to_copy;
         }
 
@@ -298,91 +224,9 @@ impl WeakReader {
             pos: start_pos,
             terminated: false,
             last_generation: 0,
-            pending_payload: Vec::new(),
+            pending_frame: Vec::new(),
             pending_offset: 0,
         }
-    }
-
-    /// Reads the next complete frame. Returns `(payload, tag)`.
-    pub fn read_frame(&mut self) -> Result<(Vec<u8>, u32)> {
-        if self.terminated {
-            return Err(Error::Terminated);
-        }
-        let capacity = self.region.capacity();
-        let mask = capacity - 1;
-        let tail = self.region.read_next_tail()?;
-
-        if self.pos >= tail {
-            return Err(Error::BufferEmpty);
-        }
-        if self.pos.wrapping_add(capacity) < tail {
-            self.pos = tail;
-            return Err(Error::Overwritten);
-        }
-
-        fence(Ordering::Acquire);
-
-        let header = read_header(&self.region, self.pos, mask)?;
-        let frame_size = header.frame_size();
-
-        if !header.is_ready() {
-            return Err(Error::BufferEmpty);
-        }
-
-        let frame_end = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        if frame_size > capacity || frame_end > tail {
-            return Err(Error::InvalidFrame);
-        }
-
-        let payload_pos = self
-            .pos
-            .checked_add(FrameHeader::ENCODED_SIZE as u64)
-            .ok_or(Error::InvalidFrame)?;
-        let payload = read_raw(&self.region, payload_pos, header.len as u64, mask)?;
-
-        self.pos = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        self.last_generation = self.region.load_generation().unwrap_or(0);
-        Ok((payload, header.tag))
-    }
-
-    /// Non-blocking check for frame readiness.
-    pub fn poll_ready(&mut self) -> Result<bool> {
-        if self.terminated {
-            return Err(Error::Terminated);
-        }
-
-        let capacity = self.region.capacity();
-        let mask = capacity - 1;
-        let tail = self.region.read_next_tail()?;
-
-        if self.pos >= tail {
-            return Ok(false);
-        }
-        if self.pos.wrapping_add(capacity) < tail {
-            return Err(Error::Overwritten);
-        }
-
-        fence(Ordering::Acquire);
-
-        let header = read_header(&self.region, self.pos, mask)?;
-        let frame_size = header.frame_size();
-        let frame_end = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
-        if frame_size > capacity || frame_end > tail {
-            return Err(Error::InvalidFrame);
-        }
-        if !header.is_ready() {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
     /// Returns the current generation counter from the underlying ring buffer.
@@ -405,9 +249,13 @@ impl WeakReader {
         let reader_id = self.region.allocate_reader_slot(self.pos)?;
         let mut reader = Reader::new(self.region, self.pos, reader_id);
         reader.last_generation = self.last_generation;
-        // Prevent WeakReader's drop from doing anything meaningful
-        // (it has no drop impl, so this is automatic)
         Ok(reader)
+    }
+}
+
+impl HasGeneration for WeakReader {
+    fn generation(&self) -> Result<u64> {
+        self.region.load_generation()
     }
 }
 
@@ -417,14 +265,14 @@ impl AsyncRead for WeakReader {
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // Drain any buffered payload from a previous partial read.
-        if self.pending_offset < self.pending_payload.len() {
-            let remaining = &self.pending_payload[self.pending_offset..];
+        // Drain any buffered frame bytes from a previous partial read.
+        if self.pending_offset < self.pending_frame.len() {
+            let remaining = &self.pending_frame[self.pending_offset..];
             let to_copy = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             self.pending_offset += to_copy;
-            if self.pending_offset >= self.pending_payload.len() {
-                self.pending_payload.clear();
+            if self.pending_offset >= self.pending_frame.len() {
+                self.pending_frame.clear();
                 self.pending_offset = 0;
             }
             return Poll::Ready(Ok(()));
@@ -472,13 +320,9 @@ impl AsyncRead for WeakReader {
             return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
         }
 
-        let payload_pos = match self.pos.checked_add(FrameHeader::ENCODED_SIZE as u64) {
-            Some(p) => p,
-            None => return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame))),
-        };
-
-        let payload = match read_raw(&self.region, payload_pos, header.len as u64, mask) {
-            Ok(p) => p,
+        // Read the full frame (header + payload) from the ring buffer.
+        let frame_bytes = match read_raw(&self.region, self.pos, frame_size, mask) {
+            Ok(b) => b,
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
         };
 
@@ -488,11 +332,11 @@ impl AsyncRead for WeakReader {
         };
         self.last_generation = self.region.load_generation().unwrap_or(0);
 
-        let to_copy = payload.len().min(buf.remaining());
-        buf.put_slice(&payload[..to_copy]);
+        let to_copy = frame_bytes.len().min(buf.remaining());
+        buf.put_slice(&frame_bytes[..to_copy]);
 
-        if to_copy < payload.len() {
-            self.pending_payload = payload;
+        if to_copy < frame_bytes.len() {
+            self.pending_frame = frame_bytes;
             self.pending_offset = to_copy;
         }
 

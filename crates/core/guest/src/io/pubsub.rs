@@ -58,7 +58,7 @@ impl<T> Publisher<T, WeakWriter> {
     }
 }
 
-impl<T, W: crate::io::framed::FrameWrite> Publisher<T, W> {
+impl<T, W> Publisher<T, W> {
     pub fn region_id(&self) -> u64 {
         self.region_id
     }
@@ -67,10 +67,11 @@ impl<T, W: crate::io::framed::FrameWrite> Publisher<T, W> {
         self.capacity
     }
 
-    /// Publishes a typed message synchronously (convenience wrapper around Sink).
+    /// Publishes a typed message synchronously (convenience wrapper).
     pub fn publish(&mut self, item: &T) -> Result<()>
     where
         T: RkyvEncode,
+        W: tokio::io::AsyncWrite + Unpin,
     {
         let bytes = encode_rkyv(item).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
         self.writer.write_frame(&bytes, 0)
@@ -123,9 +124,10 @@ impl<T> Publisher<T, Writer> {
     }
 }
 
-impl<T, W: crate::io::framed::FrameWrite + Unpin> Sink<T> for Publisher<T, W>
+impl<T, W> Sink<T> for Publisher<T, W>
 where
     T: RkyvEncode + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     type Error = Error;
 
@@ -177,7 +179,7 @@ impl<T> Subscriber<T, WeakReader> {
     }
 }
 
-impl<T, R: crate::io::framed::FrameRead> Subscriber<T, R> {
+impl<T, R> Subscriber<T, R> {
     pub fn region_id(&self) -> u64 {
         self.region_id
     }
@@ -195,6 +197,7 @@ impl<T, R: crate::io::framed::FrameRead> Subscriber<T, R> {
         T: rkyv::Archive + Sized,
         for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
             + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+        R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpin,
     {
         let (payload, writer_id) = self.reader.read_frame()?;
         // Update last_generation after successful read.
@@ -238,7 +241,7 @@ where
     T: rkyv::Archive + Sized + Unpin,
     for<'a> T::Archived: rkyv::Deserialize<T, HighDeserializer<RancorError>>
         + rkyv::bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
-    R: crate::io::framed::FrameRead + Unpin,
+    R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpin,
 {
     type Item = Result<T>;
 
@@ -262,9 +265,6 @@ where
                 Err(e) => return Poll::Ready(Some(Err(e))),
             };
             // Update last_generation after successful read.
-            // Propagate the error: if generation() fails, the shared region is
-            // in a bad state and the subscriber should surface it rather than
-            // continuing with stale overwrite-detection state.
             this.last_generation = match this.reader.generation() {
                 Ok(g) => g,
                 Err(e) => return Poll::Ready(Some(Err(e))),

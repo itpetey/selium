@@ -15,8 +15,13 @@ use crate::io::{
 /// Strong byte-stream writer tracked in the channel metadata, preventing
 /// buffer overwrite until the slowest strong reader has consumed the data.
 ///
-/// Implements [`AsyncWrite`] for byte-stream consumption. Each `poll_write`
-/// call creates one frame with `tag = 0` and `protect_readers = true`.
+/// Implements [`AsyncWrite`] for raw byte-stream production. Each
+/// `poll_write` call takes a buffer of raw frame bytes (`[header:12][payload:N]`)
+/// and writes them to the ring buffer using a two-phase protocol (payload
+/// first, release fence, header) to guarantee reader consistency.
+///
+/// Use [`FramedWrite`](crate::io::framed::FramedWrite) for frame-level
+/// operations with automatic header encoding.
 pub struct Writer {
     region: ChannelRegion,
     writer_id: u32,
@@ -49,23 +54,6 @@ impl Writer {
         Self { region, writer_id }
     }
 
-    /// Writes a framed payload using single-phase write with release fencing.
-    ///
-    /// This is the frame-level write operation. Each call writes one complete
-    /// frame with the given tag.
-    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
-        if payload.len() > u32::MAX as usize {
-            return Err(Error::InvalidFrame);
-        }
-        let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
-        if frame_size > self.region.capacity() {
-            return Err(Error::BufferFull);
-        }
-        let pos = self.region.reserve_tail(frame_size, true)?;
-        write_frame_single_phase(&self.region, pos, payload, tag)?;
-        Ok(())
-    }
-
     /// Returns a reference to the underlying channel region.
     pub fn region(&self) -> &ChannelRegion {
         &self.region
@@ -90,10 +78,6 @@ impl Writer {
             writer_id: self.writer_id,
         };
         // Prevent Drop from decrementing again (we already did it).
-        // We can't set writer_count back, so we use mem::forget on self
-        // after extracting what we need. But since Drop only decrements
-        // writer_count and we already did that, we need to prevent the
-        // double decrement. Use a manual approach:
         std::mem::forget(self);
         weak
     }
@@ -101,18 +85,29 @@ impl Writer {
 
 impl AsyncWrite for Writer {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        match self.write_frame(buf, 0) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(Error::BufferFull) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
+        let len = buf.len() as u64;
+        if len > self.region.capacity() {
+            return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
+
+        let pos = match self.region.reserve_tail(len, true) {
+            Ok(p) => p,
+            Err(Error::BufferFull) => return Poll::Pending,
+            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
+        };
+
+        if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
+            return Poll::Ready(Err(std::io::Error::other(e)));
+        }
+
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -133,20 +128,6 @@ impl Drop for Writer {
 impl WeakWriter {
     pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
         Self { region, writer_id }
-    }
-
-    /// Writes payload data without applying strong-reader backpressure.
-    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
-        if payload.len() > u32::MAX as usize {
-            return Err(Error::InvalidFrame);
-        }
-        let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
-        if frame_size > self.region.capacity() {
-            return Err(Error::BufferFull);
-        }
-        let pos = self.region.reserve_tail(frame_size, false)?;
-        write_frame_single_phase(&self.region, pos, payload, tag)?;
-        Ok(())
     }
 
     /// Returns the writer id stored in emitted frames.
@@ -173,18 +154,29 @@ impl WeakWriter {
 
 impl AsyncWrite for WeakWriter {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        match self.write_frame(buf, 0) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(Error::BufferFull) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
+        let len = buf.len() as u64;
+        if len > self.region.capacity() {
+            return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
+
+        let pos = match self.region.reserve_tail(len, false) {
+            Ok(p) => p,
+            Err(Error::BufferFull) => return Poll::Pending,
+            Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
+        };
+
+        if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
+            return Poll::Ready(Err(std::io::Error::other(e)));
+        }
+
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -196,37 +188,34 @@ impl AsyncWrite for WeakWriter {
     }
 }
 
-/// Single-phase frame write with release/acquire fencing.
+/// Two-phase write of an already-encoded frame (header + payload) to the ring buffer.
 ///
-/// 1. Write payload at `pos + ENCODED_SIZE`
-/// 2. Release fence
-/// 3. Write header with READY flag at `pos`
-/// 4. Bump generation counter
-fn write_frame_single_phase(
-    region: &ChannelRegion,
-    pos: u64,
-    payload: &[u8],
-    tag: u32,
-) -> Result<()> {
+/// Writes payload first (bytes after the 12-byte header), then a release
+/// fence, then the header. This ensures readers never observe a READY
+/// header before the completed payload. Finally bumps the generation
+/// counter to notify waiters.
+fn write_frame_bytes(region: &ChannelRegion, pos: u64, buf: &[u8]) -> Result<()> {
     let mask = region.capacity() - 1;
 
-    // Step 1: Write payload.
-    let payload_pos = pos
-        .checked_add(FrameHeader::ENCODED_SIZE as u64)
-        .ok_or(Error::InvalidFrame)?;
+    let header_size = FrameHeader::ENCODED_SIZE as u64;
+    let payload = buf
+        .get(FrameHeader::ENCODED_SIZE..)
+        .unwrap_or_default();
+
+    // Step 1: Write payload at pos + ENCODED_SIZE.
+    let payload_pos = pos.checked_add(header_size).ok_or(Error::InvalidFrame)?;
     write_raw(region, payload_pos, payload, mask)?;
 
     // Step 2: Release fence ensures payload is visible before the header.
     fence(Ordering::Release);
 
-    // Step 3: Write header with READY flag (single write).
-    let header = FrameHeader {
-        len: payload.len() as u32,
-        tag,
-        flags: FrameHeader::FLAG_READY,
-        _reserved: [0; 3],
-    };
-    write_raw(region, pos, &header.encode(), mask)?;
+    // Step 3: Write header at pos (already has FLAG_READY from the codec).
+    write_raw(
+        region,
+        pos,
+        buf.get(..FrameHeader::ENCODED_SIZE).unwrap_or_default(),
+        mask,
+    )?;
 
     // Step 4: Bump generation counter and notify waiters.
     region.bump_generation()?;
@@ -264,19 +253,36 @@ mod tests {
     use crate::io::channels::reader::read_raw;
 
     #[test]
-    fn single_phase_write_produces_ready_frame() {
+    fn two_phase_write_produces_ready_frame() {
         let region = RegionBuilder::create(64).expect("create");
         region.initialise().expect("init");
-        let pos = region.reserve_tail(12 + 5, true).expect("reserve");
-        write_frame_single_phase(&region, pos, b"hello", 1).expect("write");
+
+        // Encode a frame manually: header + payload.
+        let header = FrameHeader {
+            len: 5,
+            tag: 1,
+            flags: FrameHeader::FLAG_READY,
+            _reserved: [0; 3],
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header.encode());
+        buf.extend_from_slice(b"hello");
+
+        let pos = region.reserve_tail(buf.len() as u64, true).expect("reserve");
+        write_frame_bytes(&region, pos, &buf).expect("write");
 
         // Read back the header and verify READY flag.
         let mask = region.capacity() - 1;
         let header_bytes =
             read_raw(&region, pos, FrameHeader::ENCODED_SIZE as u64, mask).expect("read header");
-        let header = FrameHeader::decode(&header_bytes).expect("decode");
-        assert!(header.is_ready());
-        assert_eq!(header.len, 5);
-        assert_eq!(header.tag, 1);
+        let decoded = FrameHeader::decode(&header_bytes).expect("decode");
+        assert!(decoded.is_ready());
+        assert_eq!(decoded.len, 5);
+        assert_eq!(decoded.tag, 1);
+
+        // Read back the payload.
+        let payload_pos = pos + FrameHeader::ENCODED_SIZE as u64;
+        let payload = read_raw(&region, payload_pos, 5, mask).expect("read payload");
+        assert_eq!(payload, b"hello");
     }
 }

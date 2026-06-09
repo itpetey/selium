@@ -8,7 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Replaces the previous three-layer hierarchy (`io::Error` → `channels::Error`
 /// → `RpcError`) with one enum. Each variant maps directly to a distinct failure
 /// mode — no `From` chains or nested wrapping.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, Error, PartialEq)]
 pub enum Error {
     #[error("invalid ring buffer layout")]
     InvalidLayout,
@@ -49,6 +49,16 @@ pub enum Error {
     IndexOutOfBounds,
     #[error("subscriber data was overwritten: publisher advanced past ring capacity")]
     Overwritten,
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        // Try to recover the original Error if it was wrapped via io::Error::other.
+        if let Some(our_err) = err.get_ref().and_then(|e| e.downcast_ref::<Error>()) {
+            return our_err.clone();
+        }
+        Self::Guest(format!("IO error: {err}"))
+    }
 }
 
 #[cfg(test)]
