@@ -29,10 +29,13 @@ pub struct LiveTableMessage<K, V> {
 }
 
 /// A materialised live table record.
+///
+/// A `None` value represents a tombstone — the key was deleted but its
+/// version is still tracked for CAS consistency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTableRecord<V> {
-    /// The entry value.
-    pub value: V,
+    /// The entry value, or `None` for deleted entries (tombstones).
+    pub value: Option<V>,
     /// Monotonic version assigned by replay order.
     pub version: u64,
 }
@@ -62,13 +65,7 @@ enum ApplyOutcome {
 pub struct LiveTable<K, V> {
     publisher: RefCell<Publisher<LiveTableMessage<K, V>>>,
     subscriber: RefCell<Subscriber<LiveTableMessage<K, V>>>,
-    local: RefCell<HashMap<K, LiveTableEntry<V>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveTableEntry<V> {
-    value: Option<V>,
-    version: u64,
+    local: RefCell<HashMap<K, LiveTableRecord<V>>>,
 }
 
 impl<K, V> LiveTable<K, V>
@@ -205,17 +202,15 @@ where
     }
 
     /// Returns the record for a key, including its version.
+    ///
+    /// Returns the record even for tombstones (deleted keys). Check
+    /// `record.value` to determine whether the entry is live.
     pub fn get_record(&self, key: &K) -> Result<Option<LiveTableRecord<V>>>
     where
         K: Eq + Hash,
         V: Clone,
     {
-        Ok(self.local.borrow().get(key).and_then(|entry| {
-            entry.value.clone().map(|value| LiveTableRecord {
-                value,
-                version: entry.version,
-            })
-        }))
+        Ok(self.local.borrow().get(key).cloned())
     }
 
     /// Returns the current version for a key, including tombstones from deletes.
@@ -281,7 +276,7 @@ where
 }
 
 fn apply_message_to<K, V>(
-    local: &mut HashMap<K, LiveTableEntry<V>>,
+    local: &mut HashMap<K, LiveTableRecord<V>>,
     msg: LiveTableMessage<K, V>,
 ) -> ApplyOutcome
 where
@@ -304,7 +299,7 @@ where
         Some(value) => {
             local.insert(
                 msg.key,
-                LiveTableEntry {
+                LiveTableRecord {
                     value: Some(value),
                     version,
                 },
@@ -314,7 +309,7 @@ where
         None => {
             local.insert(
                 msg.key,
-                LiveTableEntry {
+                LiveTableRecord {
                     value: None,
                     version,
                 },
@@ -325,7 +320,7 @@ where
 }
 
 fn scan_entries<K, V>(
-    local: &HashMap<K, LiveTableEntry<V>>,
+    local: &HashMap<K, LiveTableRecord<V>>,
     limit: usize,
 ) -> Vec<(K, LiveTableRecord<V>)>
 where
@@ -334,17 +329,8 @@ where
 {
     local
         .iter()
-        .filter_map(|(key, entry)| {
-            entry.value.clone().map(|value| {
-                (
-                    key.clone(),
-                    LiveTableRecord {
-                        value,
-                        version: entry.version,
-                    },
-                )
-            })
-        })
+        .filter(|(_, record)| record.value.is_some())
+        .map(|(key, record)| (key.clone(), record.clone()))
         .take(limit)
         .collect()
 }
@@ -386,7 +372,7 @@ mod tests {
     fn apply_message_rejects_stale_cas() {
         let mut local = HashMap::from([(
             "alpha",
-            LiveTableEntry {
+            LiveTableRecord {
                 value: Some(10),
                 version: 2,
             },
@@ -409,7 +395,7 @@ mod tests {
     fn apply_message_deletes_records() {
         let mut local = HashMap::from([(
             "alpha",
-            LiveTableEntry {
+            LiveTableRecord {
                 value: Some(10),
                 version: 1,
             },
@@ -432,7 +418,7 @@ mod tests {
     fn apply_message_recreates_only_with_tombstone_version() {
         let mut local = HashMap::from([(
             "alpha",
-            LiveTableEntry {
+            LiveTableRecord {
                 value: None,
                 version: 2,
             },
@@ -466,7 +452,7 @@ mod tests {
     fn scan_limit_counts_live_records_only() {
         let mut local = HashMap::from([(
             "deleted",
-            LiveTableEntry {
+            LiveTableRecord {
                 value: None,
                 version: 2,
             },
