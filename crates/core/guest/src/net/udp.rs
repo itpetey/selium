@@ -2,9 +2,12 @@
 
 use std::{
     net::SocketAddr,
+    pin::Pin,
     sync::atomic::{Ordering, fence},
+    task::{Context, Poll},
 };
 
+use futures::{Sink, Stream};
 use selium_abi::{HostcallOutput, HostcallRequest};
 
 use crate::{
@@ -103,73 +106,10 @@ impl UdpSocket {
         Ok(self.local_addr)
     }
 
-    /// Receives a datagram from the recv ring.
+    /// Encodes a datagram into the wire format.
     ///
-    /// Returns `(payload, source_address)`.
-    pub async fn recv_from(&mut self) -> Result<(Vec<u8>, SocketAddr)> {
-        loop {
-            let tail = self
-                .recv_ring
-                .region()
-                .load_next_tail()
-                .map_err(|e| GuestError::Host(format!("load recv tail: {e}")))?;
-
-            if self.read_pos >= tail {
-                // Check if the kernel has disconnected.
-                let writer_count = self
-                    .recv_ring
-                    .region()
-                    .load_writer_count()
-                    .map_err(|e| GuestError::Host(format!("load writer count: {e}")))?;
-                if writer_count == 0 {
-                    return Err(GuestError::Host("UDP recv ring closed".to_string()));
-                }
-                crate::yield_now().await;
-                continue;
-            }
-
-            // Read the frame.
-            fence(Ordering::Acquire);
-            let header = self
-                .recv_ring
-                .read_frame_header(self.read_pos)
-                .map_err(|e| GuestError::Host(format!("read recv header: {e}")))?;
-
-            if !header.is_ready() {
-                crate::yield_now().await;
-                continue;
-            }
-
-            let frame_size = header.frame_size();
-            let payload_pos = self.read_pos + FrameHeader::ENCODED_SIZE as u64;
-            let frame_data = self
-                .recv_ring
-                .read_at(payload_pos, header.len as u64)
-                .map_err(|e| GuestError::Host(format!("read recv payload: {e}")))?;
-
-            self.read_pos += frame_size;
-
-            // Parse frame: [addr_len u16][addr bytes][payload]
-            if frame_data.len() < 2 {
-                continue;
-            }
-            let addr_len = u16::from_le_bytes([frame_data[0], frame_data[1]]) as usize;
-            if frame_data.len() < 2 + addr_len {
-                continue;
-            }
-            let addr_str = std::str::from_utf8(&frame_data[2..2 + addr_len])
-                .map_err(|e| GuestError::Host(format!("invalid address bytes: {e}")))?;
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| GuestError::Host(format!("invalid address: {e}")))?;
-            let payload = frame_data[2 + addr_len..].to_vec();
-
-            return Ok((payload, addr));
-        }
-    }
-
-    /// Sends a datagram to the specified address via the send ring.
-    pub async fn send_to(&self, payload: &[u8], addr: SocketAddr) -> Result<usize> {
+    /// Frame format: `[addr_len: u16 LE][addr: UTF-8 bytes][payload: bytes]`
+    pub fn encode_datagram(payload: &[u8], addr: SocketAddr) -> Vec<u8> {
         let addr_bytes = addr.to_string().into_bytes();
         let addr_len = addr_bytes.len() as u16;
         let frame_len = 2 + addr_bytes.len() + payload.len();
@@ -178,8 +118,45 @@ impl UdpSocket {
         frame.extend_from_slice(&addr_len.to_le_bytes());
         frame.extend_from_slice(&addr_bytes);
         frame.extend_from_slice(payload);
+        frame
+    }
 
+    /// Decodes a datagram from the wire format.
+    ///
+    /// Returns `(source_address, payload)`.
+    pub fn decode_datagram(frame: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
+        if frame.len() < 2 {
+            return Err(GuestError::Host("frame too short".to_string()));
+        }
+        let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+        if frame.len() < 2 + addr_len {
+            return Err(GuestError::Host("frame too short for address".to_string()));
+        }
+        let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
+            .map_err(|e| GuestError::Host(format!("invalid address bytes: {e}")))?;
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| GuestError::Host(format!("invalid address: {e}")))?;
+        let payload = frame[2 + addr_len..].to_vec();
+        Ok((addr, payload))
+    }
+}
+
+impl Sink<(Vec<u8>, SocketAddr)> for UdpSocket {
+    type Error = GuestError;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // The send ring handles backpressure via reserve(), so we're always ready
+        // to accept a send attempt. If the ring is full, start_send will return
+        // an error which the caller can handle.
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: (Vec<u8>, SocketAddr)) -> Result<()> {
+        let (payload, addr) = item;
+        let frame = Self::encode_datagram(&payload, addr);
         let frame_size = FrameHeader::ENCODED_SIZE as u64 + frame.len() as u64;
+
         let pos = self
             .send_ring
             .reserve(frame_size)
@@ -188,7 +165,84 @@ impl UdpSocket {
             .write_frame(pos, &frame, 0, 0)
             .map_err(|e| GuestError::Host(format!("write send: {e}")))?;
 
-        Ok(payload.len())
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Ring buffer writes are immediately visible to the reader.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Nothing to do on close; the ring buffer will be dropped.
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Stream for UdpSocket {
+    type Item = Result<(Vec<u8>, SocketAddr)>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+
+        // Check for available data.
+        let tail = match this.recv_ring.region().load_next_tail() {
+            Ok(t) => t,
+            Err(e) => return Poll::Ready(Some(Err(GuestError::Host(format!("load tail: {e}"))))),
+        };
+
+        if this.read_pos >= tail {
+            // Check if the kernel has disconnected.
+            let writer_count = match this.recv_ring.region().load_writer_count() {
+                Ok(c) => c,
+                Err(e) => {
+                    return Poll::Ready(Some(Err(GuestError::Host(format!(
+                        "load writer count: {e}"
+                    )))));
+                }
+            };
+            if writer_count == 0 {
+                return Poll::Ready(Some(Err(GuestError::Host(
+                    "UDP recv ring closed".to_string(),
+                ))));
+            }
+            // No data available, wake and return pending.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        // Read the frame.
+        fence(Ordering::Acquire);
+        let header = match this.recv_ring.read_frame_header(this.read_pos) {
+            Ok(h) => h,
+            Err(e) => return Poll::Ready(Some(Err(GuestError::Host(format!("read header: {e}"))))),
+        };
+
+        if !header.is_ready() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let frame_size = header.frame_size();
+        let payload_pos = this.read_pos + FrameHeader::ENCODED_SIZE as u64;
+        let frame_data = match this.recv_ring.read_at(payload_pos, header.len as u64) {
+            Ok(d) => d,
+            Err(e) => {
+                return Poll::Ready(Some(Err(GuestError::Host(format!("read payload: {e}")))));
+            }
+        };
+
+        this.read_pos += frame_size;
+
+        // Decode the datagram.
+        match Self::decode_datagram(&frame_data) {
+            Ok((addr, payload)) => Poll::Ready(Some(Ok((payload, addr)))),
+            Err(_) => {
+                // Malformed frame, wake and try again.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
     }
 }
 

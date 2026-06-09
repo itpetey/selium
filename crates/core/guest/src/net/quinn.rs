@@ -89,25 +89,15 @@ impl AsyncUdpSocket for QuinnUdpSocket {
 
         *read_pos += frame_size;
 
-        // Parse frame: [addr_len u16][addr bytes][payload]
-        if frame_data.len() < 2 {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        let addr_len = u16::from_le_bytes([frame_data[0], frame_data[1]]) as usize;
-        if frame_data.len() < 2 + addr_len {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        let addr_str = std::str::from_utf8(&frame_data[2..2 + addr_len])
-            .map_err(|e| io::Error::other(format!("invalid address bytes: {e}")))?;
-        let addr: SocketAddr = addr_str
-            .parse()
-            .map_err(|e| io::Error::other(format!("invalid address: {e}")))?;
-
-        let payload = &frame_data[2 + addr_len..];
+        // Decode the datagram.
+        let (addr, payload) = match UdpSocket::decode_datagram(&frame_data) {
+            Ok(result) => result,
+            Err(_) => {
+                // Malformed frame, wake and try again.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
 
         // Copy payload to the first buffer
         if bufs.is_empty() {
@@ -196,16 +186,8 @@ impl UdpSender for QuinnUdpSender {
     ) -> Poll<io::Result<()>> {
         let send_ring = &self.inner.send_ring;
 
-        // Encode destination address + payload into frame
-        let addr_bytes = transmit.destination.to_string().into_bytes();
-        let addr_len = addr_bytes.len() as u16;
-        let frame_len = 2 + addr_bytes.len() + transmit.data.len();
-
-        let mut frame = Vec::with_capacity(frame_len);
-        frame.extend_from_slice(&addr_len.to_le_bytes());
-        frame.extend_from_slice(&addr_bytes);
-        frame.extend_from_slice(transmit.data);
-
+        // Encode the datagram.
+        let frame = UdpSocket::encode_datagram(transmit.contents, transmit.destination);
         let frame_size = FrameHeader::ENCODED_SIZE as u64 + frame.len() as u64;
 
         // Reserve space on send ring
