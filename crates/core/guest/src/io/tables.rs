@@ -43,51 +43,6 @@ pub struct LiveTableMessage<K, V> {
     pub expected_version: Option<u64>,
 }
 
-impl<K: FlatMsg, V: FlatMsg> FlatMsg for LiveTableMessage<K, V> {
-    fn encode(value: &Self) -> Vec<u8> {
-        let key_bytes = FlatMsg::encode(&value.key);
-        let value_bytes = match &value.value {
-            Some(v) => FlatMsg::encode(v),
-            None => Vec::new(),
-        };
-        let expected_version = value.expected_version.unwrap_or(0);
-
-        let wire = LiveTableMessageWire::new(
-            value.mutation_id,
-            key_bytes,
-            value_bytes,
-            expected_version,
-        );
-        FlatMsg::encode(&wire)
-    }
-
-    fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
-        let wire: LiveTableMessageWire = FlatMsg::decode(bytes)?;
-        let key: K = FlatMsg::decode(&wire.key_bytes)?;
-        let value: Option<V> = if wire.value_bytes.is_empty() {
-            None
-        } else {
-            Some(FlatMsg::decode(&wire.value_bytes)?)
-        };
-        let expected_version = if wire.expected_version == 0 {
-            None
-        } else {
-            Some(wire.expected_version)
-        };
-
-        Ok(Self {
-            mutation_id: wire.mutation_id,
-            key,
-            value,
-            expected_version,
-        })
-    }
-}
-
-impl<K: FlatMsg, V: FlatMsg> HasSchema for LiveTableMessage<K, V> {
-    const SCHEMA: SchemaDescriptor = LiveTableMessageWireSchema;
-}
-
 /// A materialised live table record.
 ///
 /// A `None` value represents a tombstone — the key was deleted but its
@@ -126,6 +81,47 @@ pub struct LiveTable<K, V> {
     publisher: RefCell<Publisher<LiveTableMessage<K, V>>>,
     subscriber: RefCell<Subscriber<LiveTableMessage<K, V>>>,
     local: RefCell<HashMap<K, LiveTableRecord<V>>>,
+}
+
+impl<K: FlatMsg, V: FlatMsg> FlatMsg for LiveTableMessage<K, V> {
+    fn encode(value: &Self) -> Vec<u8> {
+        let key_bytes = FlatMsg::encode(&value.key);
+        let value_bytes = match &value.value {
+            Some(v) => FlatMsg::encode(v),
+            None => Vec::new(),
+        };
+        let expected_version = value.expected_version.unwrap_or(0);
+
+        let wire =
+            LiveTableMessageWire::new(value.mutation_id, key_bytes, value_bytes, expected_version);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+        let wire: LiveTableMessageWire = FlatMsg::decode(bytes)?;
+        let key: K = FlatMsg::decode(&wire.key_bytes)?;
+        let value: Option<V> = if wire.value_bytes.is_empty() {
+            None
+        } else {
+            Some(FlatMsg::decode(&wire.value_bytes)?)
+        };
+        let expected_version = if wire.expected_version == 0 {
+            None
+        } else {
+            Some(wire.expected_version)
+        };
+
+        Ok(Self {
+            mutation_id: wire.mutation_id,
+            key,
+            value,
+            expected_version,
+        })
+    }
+}
+
+impl<K: FlatMsg, V: FlatMsg> HasSchema for LiveTableMessage<K, V> {
+    const SCHEMA: SchemaDescriptor = LiveTableMessageWireSchema;
 }
 
 impl<K, V> LiveTable<K, V>
@@ -417,10 +413,7 @@ mod tests {
             },
         );
         assert_eq!(version, ApplyOutcome::Applied(2));
-        assert_eq!(
-            local.get("alpha").map(|record| record.version),
-            Some(2)
-        );
+        assert_eq!(local.get("alpha").map(|record| record.version), Some(2));
         assert_eq!(
             local.get("alpha").and_then(|record| record.value),
             Some(20u64)
@@ -472,14 +465,8 @@ mod tests {
                 expected_version: None,
             },
         );
-        assert_eq!(
-            local.get("alpha").and_then(|record| record.value),
-            None
-        );
-        assert_eq!(
-            local.get("alpha").map(|record| record.version),
-            Some(2)
-        );
+        assert_eq!(local.get("alpha").and_then(|record| record.value), None);
+        assert_eq!(local.get("alpha").map(|record| record.version), Some(2));
     }
 
     #[test]

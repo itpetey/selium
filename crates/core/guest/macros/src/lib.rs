@@ -6,12 +6,6 @@ use syn::{ItemFn, ItemTrait, ReturnType, parse_macro_input};
 
 mod schema;
 
-/// Struct-level schema annotation declaring a message type.
-#[proc_macro_attribute]
-pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
-    schema::expand(attr, item)
-}
-
 /// Marks a function as an exported Selium guest entrypoint.
 ///
 /// Accepts `fn entrypoint()`, `async fn entrypoint()`, `fn entrypoint(ctx: Context)`,
@@ -171,4 +165,10 @@ pub fn pattern_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Struct-level schema annotation declaring a message type.
+#[proc_macro_attribute]
+pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
+    schema::expand(attr, item)
 }

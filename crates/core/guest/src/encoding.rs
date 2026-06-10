@@ -5,19 +5,7 @@
 
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
 
-/// Marker trait linking a Rust type to a Flatbuffers schema.
-pub trait HasSchema {
-    /// Static schema descriptor used for port metadata.
-    const SCHEMA: SchemaDescriptor;
-}
-
-/// Flatbuffers-backed message that can be transmitted over an endpoint.
-pub trait FlatMsg: Sized {
-    /// Encode the owned value into Flatbuffer bytes.
-    fn encode(value: &Self) -> Vec<u8>;
-    /// Decode the owned value from Flatbuffer bytes.
-    fn decode(bytes: &[u8]) -> Result<Self, InvalidFlatbuffer>;
-}
+use crate::schema;
 
 /// Helper for encoding schema fields into Flatbuffers-ready values.
 pub trait FieldEncoder {
@@ -29,6 +17,20 @@ pub trait FieldEncoder {
         &self,
         builder: &mut FlatBufferBuilder<'bldr, A>,
     ) -> Self::Output<'bldr>;
+}
+
+/// Flatbuffers-backed message that can be transmitted over an endpoint.
+pub trait FlatMsg: Sized {
+    /// Encode the owned value into Flatbuffer bytes.
+    fn encode(value: &Self) -> Vec<u8>;
+    /// Decode the owned value from Flatbuffer bytes.
+    fn decode(bytes: &[u8]) -> Result<Self, InvalidFlatbuffer>;
+}
+
+/// Marker trait linking a Rust type to a Flatbuffers schema.
+pub trait HasSchema {
+    /// Static schema descriptor used for port metadata.
+    const SCHEMA: SchemaDescriptor;
 }
 
 /// Helper for converting Flatbuffer string accessors into owned `String`s.
@@ -44,6 +46,102 @@ pub struct SchemaDescriptor {
     pub fqname: &'static str,
     /// 16-byte content hash identifying the schema.
     pub hash: [u8; 16],
+}
+
+/// Wire type for InterfaceMetadata, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/discovery.fbs",
+    ty = "selium.discovery.InterfaceMetadata",
+    binding = "crate::fbs::selium::discovery::InterfaceMetadata"
+)]
+pub struct InterfaceMetadataWire {
+    /// Interface name.
+    pub name: String,
+    /// Method names exposed by the interface.
+    pub methods: Vec<String>,
+}
+
+/// Wire type for ResourceTarget, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/discovery.fbs",
+    ty = "selium.discovery.ResourceTarget",
+    binding = "crate::fbs::selium::discovery::ResourceTarget"
+)]
+pub struct ResourceTargetWire {
+    /// URI of the resource.
+    pub uri: String,
+    /// Host id where the resource resides.
+    pub host_id: String,
+    /// Resource identifier.
+    pub resource_id: u64,
+    /// Optional interface metadata.
+    pub interface: Option<InterfaceMetadataWire>,
+}
+
+/// Wire type for DiscoveryRequest, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/discovery.fbs",
+    ty = "selium.discovery.DiscoveryRequest",
+    binding = "crate::fbs::selium::discovery::DiscoveryRequest"
+)]
+pub struct DiscoveryRequestWire {
+    /// Variant discriminator (0 = Resolve).
+    pub variant: u8,
+    /// URI to resolve (used by Resolve variant).
+    pub uri: String,
+}
+
+/// Wire type for DiscoveryResponse, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/discovery.fbs",
+    ty = "selium.discovery.DiscoveryResponse",
+    binding = "crate::fbs::selium::discovery::DiscoveryResponse"
+)]
+pub struct DiscoveryResponseWire {
+    /// Variant discriminator (0 = Found, 1 = NotFound).
+    pub variant: u8,
+    /// The discovered resource (used by Found variant).
+    pub target: Option<ResourceTargetWire>,
+}
+
+impl From<&selium_abi::InterfaceMetadata> for InterfaceMetadataWire {
+    fn from(value: &selium_abi::InterfaceMetadata) -> Self {
+        Self::new(value.name.clone(), value.methods.clone())
+    }
+}
+
+impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
+    fn from(value: &selium_abi::ResourceTarget) -> Self {
+        Self::new(
+            value.uri.clone(),
+            value.host_id.clone(),
+            value.resource_id,
+            value.interface.as_ref().map(InterfaceMetadataWire::from),
+        )
+    }
+}
+
+impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
+    fn from(value: &selium_abi::DiscoveryRequest) -> Self {
+        match value {
+            selium_abi::DiscoveryRequest::Resolve(uri) => Self::new(0, uri.clone()),
+        }
+    }
+}
+
+impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
+    fn from(value: &selium_abi::DiscoveryResponse) -> Self {
+        match value {
+            selium_abi::DiscoveryResponse::Found(target) => {
+                Self::new(0, Some(ResourceTargetWire::from(target)))
+            }
+            selium_abi::DiscoveryResponse::NotFound => Self::new(1, None),
+        }
+    }
 }
 
 impl FlatMsg for () {
@@ -178,77 +276,6 @@ impl StringFieldValue for Option<&str> {
     }
 }
 
-// FlatMsg implementations for selium-abi discovery types.
-// These use Flatbuffers-backed wire types for proper schema-driven serialization.
-
-use crate::schema;
-
-/// Wire type for InterfaceMetadata, backed by Flatbuffers.
-#[derive(Debug, Clone, PartialEq)]
-#[schema(
-    path = "schemas/discovery.fbs",
-    ty = "selium.discovery.InterfaceMetadata",
-    binding = "crate::fbs::selium::discovery::InterfaceMetadata"
-)]
-pub struct InterfaceMetadataWire {
-    /// Interface name.
-    pub name: String,
-    /// Method names exposed by the interface.
-    pub methods: Vec<String>,
-}
-
-/// Wire type for ResourceTarget, backed by Flatbuffers.
-#[derive(Debug, Clone, PartialEq)]
-#[schema(
-    path = "schemas/discovery.fbs",
-    ty = "selium.discovery.ResourceTarget",
-    binding = "crate::fbs::selium::discovery::ResourceTarget"
-)]
-pub struct ResourceTargetWire {
-    /// URI of the resource.
-    pub uri: String,
-    /// Host id where the resource resides.
-    pub host_id: String,
-    /// Resource identifier.
-    pub resource_id: u64,
-    /// Optional interface metadata.
-    pub interface: Option<InterfaceMetadataWire>,
-}
-
-/// Wire type for DiscoveryRequest, backed by Flatbuffers.
-#[derive(Debug, Clone, PartialEq)]
-#[schema(
-    path = "schemas/discovery.fbs",
-    ty = "selium.discovery.DiscoveryRequest",
-    binding = "crate::fbs::selium::discovery::DiscoveryRequest"
-)]
-pub struct DiscoveryRequestWire {
-    /// Variant discriminator (0 = Resolve).
-    pub variant: u8,
-    /// URI to resolve (used by Resolve variant).
-    pub uri: String,
-}
-
-/// Wire type for DiscoveryResponse, backed by Flatbuffers.
-#[derive(Debug, Clone, PartialEq)]
-#[schema(
-    path = "schemas/discovery.fbs",
-    ty = "selium.discovery.DiscoveryResponse",
-    binding = "crate::fbs::selium::discovery::DiscoveryResponse"
-)]
-pub struct DiscoveryResponseWire {
-    /// Variant discriminator (0 = Found, 1 = NotFound).
-    pub variant: u8,
-    /// The discovered resource (used by Found variant).
-    pub target: Option<ResourceTargetWire>,
-}
-
-impl From<&selium_abi::InterfaceMetadata> for InterfaceMetadataWire {
-    fn from(value: &selium_abi::InterfaceMetadata) -> Self {
-        Self::new(value.name.clone(), value.methods.clone())
-    }
-}
-
 impl From<InterfaceMetadataWire> for selium_abi::InterfaceMetadata {
     fn from(wire: InterfaceMetadataWire) -> Self {
         Self {
@@ -272,17 +299,6 @@ impl FlatMsg for selium_abi::InterfaceMetadata {
 
 impl HasSchema for selium_abi::InterfaceMetadata {
     const SCHEMA: SchemaDescriptor = InterfaceMetadataWireSchema;
-}
-
-impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
-    fn from(value: &selium_abi::ResourceTarget) -> Self {
-        Self::new(
-            value.uri.clone(),
-            value.host_id.clone(),
-            value.resource_id,
-            value.interface.as_ref().map(InterfaceMetadataWire::from),
-        )
-    }
 }
 
 impl From<ResourceTargetWire> for selium_abi::ResourceTarget {
@@ -312,14 +328,6 @@ impl HasSchema for selium_abi::ResourceTarget {
     const SCHEMA: SchemaDescriptor = ResourceTargetWireSchema;
 }
 
-impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
-    fn from(value: &selium_abi::DiscoveryRequest) -> Self {
-        match value {
-            selium_abi::DiscoveryRequest::Resolve(uri) => Self::new(0, uri.clone()),
-        }
-    }
-}
-
 impl From<DiscoveryRequestWire> for selium_abi::DiscoveryRequest {
     fn from(wire: DiscoveryRequestWire) -> Self {
         match wire.variant {
@@ -343,17 +351,6 @@ impl FlatMsg for selium_abi::DiscoveryRequest {
 
 impl HasSchema for selium_abi::DiscoveryRequest {
     const SCHEMA: SchemaDescriptor = DiscoveryRequestWireSchema;
-}
-
-impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
-    fn from(value: &selium_abi::DiscoveryResponse) -> Self {
-        match value {
-            selium_abi::DiscoveryResponse::Found(target) => {
-                Self::new(0, Some(ResourceTargetWire::from(target)))
-            }
-            selium_abi::DiscoveryResponse::NotFound => Self::new(1, None),
-        }
-    }
 }
 
 impl From<DiscoveryResponseWire> for selium_abi::DiscoveryResponse {

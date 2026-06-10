@@ -5,18 +5,6 @@ use syn::{
     parse::Parser, parse_macro_input, spanned::Spanned,
 };
 
-/// Returns the path prefix for encoding types.
-///
-/// When the macro is used inside `selium-guest` itself, we need `crate::encoding`
-/// instead of `selium_guest::encoding`. We detect this via `CARGO_CRATE_NAME`.
-fn encoding_path() -> proc_macro2::TokenStream {
-    if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("selium_guest") {
-        quote! { crate::encoding }
-    } else {
-        quote! { selium_guest::encoding }
-    }
-}
-
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parser = |input: syn::parse::ParseStream| -> syn::Result<(Option<String>, Option<String>, Option<SynPath>)> {
         let mut path_lit: Option<String> = None;
@@ -71,122 +59,216 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_struct(
-    st: ItemStruct,
-    fqname: String,
-    binding_path: SynPath,
-    hash_lit: syn::LitByteStr,
-) -> TokenStream {
-    let mut st2 = st.clone();
-    st2.attrs = st
-        .attrs
-        .iter()
-        .filter(|attr| !attr.path().is_ident("schema"))
-        .cloned()
-        .collect();
-    let struct_ident = st.ident.clone();
-    let schema_ident = syn::Ident::new(
-        &format!("{}Schema", struct_ident),
-        proc_macro2::Span::call_site(),
-    );
-    let binding_ident = binding_path.segments.last().unwrap().ident.clone();
-    let args_ident = syn::Ident::new(
-        &format!("{}Args", binding_ident),
-        proc_macro2::Span::call_site(),
-    );
-
-    let mut args_segments = binding_path.segments.clone();
-    args_segments.pop();
-    args_segments.push(syn::PathSegment {
-        ident: args_ident.clone(),
-        arguments: syn::PathArguments::None,
-    });
-    let args_path = syn::Path {
-        leading_colon: binding_path.leading_colon,
-        segments: args_segments,
-    };
-
-    let fields = match &st.fields {
-        syn::Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
-        _ => panic!("#[schema] requires a struct with named fields"),
-    };
-
-    let ctor_params = fields.iter().map(|f| {
-        let id = f.ident.as_ref().unwrap();
-        let ty = &f.ty;
-        quote! { #id: #ty }
-    });
-    let ctor_inits = fields.iter().map(|f| {
-        let id = f.ident.as_ref().unwrap();
-        quote! { #id }
-    });
-
-    let encode_fields = fields.iter().map(|f| encode_field(f));
-    let decode_fields = fields.iter().map(|f| decode_field(f));
-
-    let fq_lit = fqname.clone();
-    let binding_path_ts = quote! { #binding_path };
+fn decode_field(field: &syn::Field) -> proc_macro2::TokenStream {
+    let id = field.ident.as_ref().unwrap();
     let enc = encoding_path();
+    match &field.ty {
+        syn::Type::Path(tp) => {
+            if let Some(inner) = option_inner(tp) {
+                decode_option_field(id, inner)
+            } else if let Some(inner) = vec_inner(tp) {
+                decode_vec_field(id, inner, true)
+            } else {
+                let ident = &tp.path.segments.last().unwrap().ident;
+                if ident == "String" {
+                    quote! { #id: #enc::StringFieldValue::into_owned(view.#id()) }
+                } else if is_scalar_ident(ident) {
+                    quote! { #id: view.#id() }
+                } else {
+                    quote! { #id: #tp::from_flatbuffer(view.#id()) }
+                }
+            }
+        }
+        _ => quote! { #id: view.#id() },
+    }
+}
 
-    let expanded = quote! {
-        #st2
+fn decode_option_field(id: &syn::Ident, inner: &syn::Type) -> proc_macro2::TokenStream {
+    if let syn::Type::Path(tp) = inner {
+        if let Some(vec_inner) = vec_inner(tp) {
+            return decode_vec_field(id, vec_inner, false);
+        }
+        let ident = &tp.path.segments.last().unwrap().ident;
+        if ident == "String" {
+            return quote! { #id: view.#id().map(|value| value.to_string()) };
+        }
+        if is_scalar_ident(ident) {
+            return quote! { #id: view.#id() };
+        }
+        return quote! { #id: view.#id().map(#tp::from_flatbuffer) };
+    }
 
-        #[allow(non_upper_case_globals)]
-        pub const #schema_ident: #enc::SchemaDescriptor = #enc::SchemaDescriptor {
-            fqname: #fq_lit,
-            hash: *#hash_lit,
+    quote! { #id: view.#id() }
+}
+
+fn decode_vec_field(
+    id: &syn::Ident,
+    inner: &syn::Type,
+    is_required: bool,
+) -> proc_macro2::TokenStream {
+    if let syn::Type::Path(tp) = inner {
+        let ident = &tp.path.segments.last().unwrap().ident;
+        if ident == "u8" {
+            if is_required {
+                return quote! {
+                    #id: view.#id().map(|value| value.bytes().to_vec()).unwrap_or_default()
+                };
+            }
+            return quote! {
+                #id: view.#id().map(|value| value.bytes().to_vec())
+            };
+        }
+        if ident == "String" {
+            let map_expr = quote! { value.iter().map(|item| item.to_string()).collect::<::std::vec::Vec<_>>() };
+            if is_required {
+                return quote! { #id: view.#id().map(|value| #map_expr).unwrap_or_default() };
+            }
+            return quote! { #id: view.#id().map(|value| #map_expr) };
+        }
+        if is_scalar_ident(ident) {
+            if is_required {
+                return quote! {
+                    #id: view.#id().map(|value| value.iter().collect::<::std::vec::Vec<_>>()).unwrap_or_default()
+                };
+            }
+            return quote! { #id: view.#id().map(|value| value.iter().collect::<::std::vec::Vec<_>>()) };
+        }
+    }
+
+    let map_expr =
+        quote! { value.iter().map(#inner::from_flatbuffer).collect::<::std::vec::Vec<_>>() };
+    if is_required {
+        return quote! { #id: view.#id().map(|value| #map_expr).unwrap_or_default() };
+    }
+
+    quote! { #id: view.#id().map(|value| #map_expr) }
+}
+
+fn encode_field(field: &syn::Field) -> proc_macro2::TokenStream {
+    let id = field.ident.as_ref().unwrap();
+    let enc = encoding_path();
+    match &field.ty {
+        syn::Type::Path(tp) => {
+            if let Some(inner) = option_inner(tp) {
+                encode_option_field(id, inner)
+            } else if let Some(inner) = vec_inner(tp) {
+                encode_vec_field(id, inner, true)
+            } else {
+                let ident = &tp.path.segments.last().unwrap().ident;
+                if ident == "String" {
+                    quote! { args.#id = Some(builder.create_string(&self.#id)); }
+                } else if is_scalar_ident(ident) {
+                    quote! { args.#id = self.#id; }
+                } else {
+                    quote! {
+                        args.#id = #enc::FieldEncoder::encode_field(
+                            &self.#id,
+                            builder,
+                        );
+                    }
+                }
+            }
+        }
+        _ => quote! { args.#id = self.#id; },
+    }
+}
+
+fn encode_option_field(id: &syn::Ident, inner: &syn::Type) -> proc_macro2::TokenStream {
+    if let syn::Type::Path(tp) = inner {
+        if let Some(vec_inner) = vec_inner(tp) {
+            return encode_vec_field(id, vec_inner, false);
+        }
+        let ident = &tp.path.segments.last().unwrap().ident;
+        if ident == "String" {
+            return quote! {
+                args.#id = self.#id.as_ref().map(|value| builder.create_string(value));
+            };
+        }
+        if is_scalar_ident(ident) {
+            return quote! { args.#id = self.#id; };
+        }
+        return quote! {
+            args.#id = self.#id.as_ref().map(|value| value.write_flatbuffer(builder));
         };
+    }
 
-        impl #enc::HasSchema for #struct_ident {
-            const SCHEMA: #enc::SchemaDescriptor = #schema_ident;
+    quote! { args.#id = self.#id.as_ref().cloned(); }
+}
+
+fn encode_vec_field(
+    id: &syn::Ident,
+    inner: &syn::Type,
+    is_required: bool,
+) -> proc_macro2::TokenStream {
+    if let syn::Type::Path(tp) = inner {
+        let ident = &tp.path.segments.last().unwrap().ident;
+        if ident == "u8" {
+            if is_required {
+                return quote! { args.#id = Some(builder.create_vector(&self.#id)); };
+            }
+            return quote! {
+                args.#id = self.#id.as_ref().map(|value| builder.create_vector(value));
+            };
         }
-
-        impl #enc::FieldEncoder for #struct_ident {
-            type Output<'bldr> = Option<flatbuffers::WIPOffset<#binding_path_ts<'bldr>>>;
-
-            fn encode_field<'bldr, A: flatbuffers::Allocator + 'bldr>(
-                &self,
-                builder: &mut flatbuffers::FlatBufferBuilder<'bldr, A>,
-            ) -> Self::Output<'bldr> {
-                Some(self.write_flatbuffer(builder))
+        if ident == "String" {
+            let offsets_ident =
+                syn::Ident::new(&format!("{}_offsets", id), proc_macro2::Span::call_site());
+            if is_required {
+                return quote! {
+                    let #offsets_ident: Vec<_> = self.#id.iter().map(|value| builder.create_string(value)).collect();
+                    args.#id = Some(builder.create_vector(&#offsets_ident));
+                };
             }
+            return quote! {
+                args.#id = self.#id.as_ref().map(|value| {
+                    let #offsets_ident: Vec<_> = value.iter().map(|item| builder.create_string(item)).collect();
+                    builder.create_vector(&#offsets_ident)
+                });
+            };
         }
-
-        impl #struct_ident {
-            pub fn new( #( #ctor_params ),* ) -> Self {
-                Self { #( #ctor_inits, )* }
+        if is_scalar_ident(ident) {
+            if is_required {
+                return quote! { args.#id = Some(builder.create_vector(&self.#id)); };
             }
-
-            pub fn write_flatbuffer<'bldr, A: flatbuffers::Allocator + 'bldr>(
-                &self,
-                builder: &mut flatbuffers::FlatBufferBuilder<'bldr, A>,
-            ) -> flatbuffers::WIPOffset<#binding_path_ts<'bldr>> {
-                let mut args = #args_path::default();
-                #( #encode_fields )*
-                #binding_path_ts::create(builder, &args)
-            }
-
-            pub fn from_flatbuffer(view: #binding_path_ts<'_>) -> Self {
-                Self { #( #decode_fields, )* }
-            }
+            return quote! {
+                args.#id = self.#id.as_ref().map(|value| builder.create_vector(value));
+            };
         }
-
-        impl #enc::FlatMsg for #struct_ident {
-            fn encode(value: &Self) -> Vec<u8> {
-                let mut builder = flatbuffers::FlatBufferBuilder::new();
-                let root = value.write_flatbuffer(&mut builder);
-                builder.finish(root, None);
-                builder.finished_data().to_vec()
-            }
-
-            fn decode(bytes: &[u8]) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
-                let view = flatbuffers::root::<#binding_path_ts<'_>>(bytes)?;
-                Ok(Self::from_flatbuffer(view))
-            }
+        let offsets_ident =
+            syn::Ident::new(&format!("{}_offsets", id), proc_macro2::Span::call_site());
+        if is_required {
+            return quote! {
+                let #offsets_ident: Vec<_> = self.#id
+                    .iter()
+                    .map(|item| item.write_flatbuffer(builder))
+                    .collect();
+                args.#id = Some(builder.create_vector(&#offsets_ident));
+            };
         }
-    };
+        return quote! {
+            args.#id = self.#id.as_ref().map(|value| {
+                let #offsets_ident: Vec<_> = value
+                    .iter()
+                    .map(|item| item.write_flatbuffer(builder))
+                    .collect();
+                builder.create_vector(&#offsets_ident)
+            });
+        };
+    }
 
-    expanded.into()
+    quote! { args.#id = self.#id.as_ref().map(|value| value.write_flatbuffer(builder)); }
+}
+
+/// Returns the path prefix for encoding types.
+///
+/// When the macro is used inside `selium-guest` itself, we need `crate::encoding`
+/// instead of `selium_guest::encoding`. We detect this via `CARGO_CRATE_NAME`.
+fn encoding_path() -> proc_macro2::TokenStream {
+    if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("selium_guest") {
+        quote! { crate::encoding }
+    } else {
+        quote! { selium_guest::encoding }
+    }
 }
 
 fn expand_enum(
@@ -320,234 +402,122 @@ fn expand_enum(
     expanded.into()
 }
 
-fn encode_field(field: &syn::Field) -> proc_macro2::TokenStream {
-    let id = field.ident.as_ref().unwrap();
+fn expand_struct(
+    st: ItemStruct,
+    fqname: String,
+    binding_path: SynPath,
+    hash_lit: syn::LitByteStr,
+) -> TokenStream {
+    let mut st2 = st.clone();
+    st2.attrs = st
+        .attrs
+        .iter()
+        .filter(|attr| !attr.path().is_ident("schema"))
+        .cloned()
+        .collect();
+    let struct_ident = st.ident.clone();
+    let schema_ident = syn::Ident::new(
+        &format!("{}Schema", struct_ident),
+        proc_macro2::Span::call_site(),
+    );
+    let binding_ident = binding_path.segments.last().unwrap().ident.clone();
+    let args_ident = syn::Ident::new(
+        &format!("{}Args", binding_ident),
+        proc_macro2::Span::call_site(),
+    );
+
+    let mut args_segments = binding_path.segments.clone();
+    args_segments.pop();
+    args_segments.push(syn::PathSegment {
+        ident: args_ident.clone(),
+        arguments: syn::PathArguments::None,
+    });
+    let args_path = syn::Path {
+        leading_colon: binding_path.leading_colon,
+        segments: args_segments,
+    };
+
+    let fields = match &st.fields {
+        syn::Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
+        _ => panic!("#[schema] requires a struct with named fields"),
+    };
+
+    let ctor_params = fields.iter().map(|f| {
+        let id = f.ident.as_ref().unwrap();
+        let ty = &f.ty;
+        quote! { #id: #ty }
+    });
+    let ctor_inits = fields.iter().map(|f| {
+        let id = f.ident.as_ref().unwrap();
+        quote! { #id }
+    });
+
+    let encode_fields = fields.iter().map(|f| encode_field(f));
+    let decode_fields = fields.iter().map(|f| decode_field(f));
+
+    let fq_lit = fqname.clone();
+    let binding_path_ts = quote! { #binding_path };
     let enc = encoding_path();
-    match &field.ty {
-        syn::Type::Path(tp) => {
-            if let Some(inner) = option_inner(tp) {
-                encode_option_field(id, inner)
-            } else if let Some(inner) = vec_inner(tp) {
-                encode_vec_field(id, inner, true)
-            } else {
-                let ident = &tp.path.segments.last().unwrap().ident;
-                if ident == "String" {
-                    quote! { args.#id = Some(builder.create_string(&self.#id)); }
-                } else if is_scalar_ident(ident) {
-                    quote! { args.#id = self.#id; }
-                } else {
-                    quote! {
-                        args.#id = #enc::FieldEncoder::encode_field(
-                            &self.#id,
-                            builder,
-                        );
-                    }
-                }
-            }
-        }
-        _ => quote! { args.#id = self.#id; },
-    }
-}
 
-fn decode_field(field: &syn::Field) -> proc_macro2::TokenStream {
-    let id = field.ident.as_ref().unwrap();
-    let enc = encoding_path();
-    match &field.ty {
-        syn::Type::Path(tp) => {
-            if let Some(inner) = option_inner(tp) {
-                decode_option_field(id, inner)
-            } else if let Some(inner) = vec_inner(tp) {
-                decode_vec_field(id, inner, true)
-            } else {
-                let ident = &tp.path.segments.last().unwrap().ident;
-                if ident == "String" {
-                    quote! { #id: #enc::StringFieldValue::into_owned(view.#id()) }
-                } else if is_scalar_ident(ident) {
-                    quote! { #id: view.#id() }
-                } else {
-                    quote! { #id: #tp::from_flatbuffer(view.#id()) }
-                }
-            }
-        }
-        _ => quote! { #id: view.#id() },
-    }
-}
+    let expanded = quote! {
+        #st2
 
-fn encode_option_field(id: &syn::Ident, inner: &syn::Type) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(tp) = inner {
-        if let Some(vec_inner) = vec_inner(tp) {
-            return encode_vec_field(id, vec_inner, false);
-        }
-        let ident = &tp.path.segments.last().unwrap().ident;
-        if ident == "String" {
-            return quote! {
-                args.#id = self.#id.as_ref().map(|value| builder.create_string(value));
-            };
-        }
-        if is_scalar_ident(ident) {
-            return quote! { args.#id = self.#id; };
-        }
-        return quote! {
-            args.#id = self.#id.as_ref().map(|value| value.write_flatbuffer(builder));
+        #[allow(non_upper_case_globals)]
+        pub const #schema_ident: #enc::SchemaDescriptor = #enc::SchemaDescriptor {
+            fqname: #fq_lit,
+            hash: *#hash_lit,
         };
-    }
 
-    quote! { args.#id = self.#id.as_ref().cloned(); }
-}
-
-fn decode_option_field(id: &syn::Ident, inner: &syn::Type) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(tp) = inner {
-        if let Some(vec_inner) = vec_inner(tp) {
-            return decode_vec_field(id, vec_inner, false);
+        impl #enc::HasSchema for #struct_ident {
+            const SCHEMA: #enc::SchemaDescriptor = #schema_ident;
         }
-        let ident = &tp.path.segments.last().unwrap().ident;
-        if ident == "String" {
-            return quote! { #id: view.#id().map(|value| value.to_string()) };
-        }
-        if is_scalar_ident(ident) {
-            return quote! { #id: view.#id() };
-        }
-        return quote! { #id: view.#id().map(#tp::from_flatbuffer) };
-    }
 
-    quote! { #id: view.#id() }
-}
+        impl #enc::FieldEncoder for #struct_ident {
+            type Output<'bldr> = Option<flatbuffers::WIPOffset<#binding_path_ts<'bldr>>>;
 
-fn encode_vec_field(
-    id: &syn::Ident,
-    inner: &syn::Type,
-    is_required: bool,
-) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(tp) = inner {
-        let ident = &tp.path.segments.last().unwrap().ident;
-        if ident == "u8" {
-            if is_required {
-                return quote! { args.#id = Some(builder.create_vector(&self.#id)); };
+            fn encode_field<'bldr, A: flatbuffers::Allocator + 'bldr>(
+                &self,
+                builder: &mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+            ) -> Self::Output<'bldr> {
+                Some(self.write_flatbuffer(builder))
             }
-            return quote! {
-                args.#id = self.#id.as_ref().map(|value| builder.create_vector(value));
-            };
         }
-        if ident == "String" {
-            let offsets_ident =
-                syn::Ident::new(&format!("{}_offsets", id), proc_macro2::Span::call_site());
-            if is_required {
-                return quote! {
-                    let #offsets_ident: Vec<_> = self.#id.iter().map(|value| builder.create_string(value)).collect();
-                    args.#id = Some(builder.create_vector(&#offsets_ident));
-                };
+
+        impl #struct_ident {
+            pub fn new( #( #ctor_params ),* ) -> Self {
+                Self { #( #ctor_inits, )* }
             }
-            return quote! {
-                args.#id = self.#id.as_ref().map(|value| {
-                    let #offsets_ident: Vec<_> = value.iter().map(|item| builder.create_string(item)).collect();
-                    builder.create_vector(&#offsets_ident)
-                });
-            };
-        }
-        if is_scalar_ident(ident) {
-            if is_required {
-                return quote! { args.#id = Some(builder.create_vector(&self.#id)); };
+
+            pub fn write_flatbuffer<'bldr, A: flatbuffers::Allocator + 'bldr>(
+                &self,
+                builder: &mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+            ) -> flatbuffers::WIPOffset<#binding_path_ts<'bldr>> {
+                let mut args = #args_path::default();
+                #( #encode_fields )*
+                #binding_path_ts::create(builder, &args)
             }
-            return quote! {
-                args.#id = self.#id.as_ref().map(|value| builder.create_vector(value));
-            };
-        }
-        let offsets_ident =
-            syn::Ident::new(&format!("{}_offsets", id), proc_macro2::Span::call_site());
-        if is_required {
-            return quote! {
-                let #offsets_ident: Vec<_> = self.#id
-                    .iter()
-                    .map(|item| item.write_flatbuffer(builder))
-                    .collect();
-                args.#id = Some(builder.create_vector(&#offsets_ident));
-            };
-        }
-        return quote! {
-            args.#id = self.#id.as_ref().map(|value| {
-                let #offsets_ident: Vec<_> = value
-                    .iter()
-                    .map(|item| item.write_flatbuffer(builder))
-                    .collect();
-                builder.create_vector(&#offsets_ident)
-            });
-        };
-    }
 
-    quote! { args.#id = self.#id.as_ref().map(|value| value.write_flatbuffer(builder)); }
-}
-
-fn decode_vec_field(
-    id: &syn::Ident,
-    inner: &syn::Type,
-    is_required: bool,
-) -> proc_macro2::TokenStream {
-    if let syn::Type::Path(tp) = inner {
-        let ident = &tp.path.segments.last().unwrap().ident;
-        if ident == "u8" {
-            if is_required {
-                return quote! {
-                    #id: view.#id().map(|value| value.bytes().to_vec()).unwrap_or_default()
-                };
+            pub fn from_flatbuffer(view: #binding_path_ts<'_>) -> Self {
+                Self { #( #decode_fields, )* }
             }
-            return quote! {
-                #id: view.#id().map(|value| value.bytes().to_vec())
-            };
         }
-        if ident == "String" {
-            let map_expr = quote! { value.iter().map(|item| item.to_string()).collect::<::std::vec::Vec<_>>() };
-            if is_required {
-                return quote! { #id: view.#id().map(|value| #map_expr).unwrap_or_default() };
+
+        impl #enc::FlatMsg for #struct_ident {
+            fn encode(value: &Self) -> Vec<u8> {
+                let mut builder = flatbuffers::FlatBufferBuilder::new();
+                let root = value.write_flatbuffer(&mut builder);
+                builder.finish(root, None);
+                builder.finished_data().to_vec()
             }
-            return quote! { #id: view.#id().map(|value| #map_expr) };
-        }
-        if is_scalar_ident(ident) {
-            if is_required {
-                return quote! {
-                    #id: view.#id().map(|value| value.iter().collect::<::std::vec::Vec<_>>()).unwrap_or_default()
-                };
+
+            fn decode(bytes: &[u8]) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+                let view = flatbuffers::root::<#binding_path_ts<'_>>(bytes)?;
+                Ok(Self::from_flatbuffer(view))
             }
-            return quote! { #id: view.#id().map(|value| value.iter().collect::<::std::vec::Vec<_>>()) };
         }
-    }
+    };
 
-    let map_expr =
-        quote! { value.iter().map(#inner::from_flatbuffer).collect::<::std::vec::Vec<_>>() };
-    if is_required {
-        return quote! { #id: view.#id().map(|value| #map_expr).unwrap_or_default() };
-    }
-
-    quote! { #id: view.#id().map(|value| #map_expr) }
-}
-
-fn option_inner(tp: &syn::TypePath) -> Option<&syn::Type> {
-    let last = tp.path.segments.last().unwrap();
-    if last.ident != "Option" {
-        return None;
-    }
-
-    if let syn::PathArguments::AngleBracketed(args) = &last.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return Some(inner);
-    }
-
-    None
-}
-
-fn vec_inner(tp: &syn::TypePath) -> Option<&syn::Type> {
-    let last = tp.path.segments.last().unwrap();
-    if last.ident != "Vec" {
-        return None;
-    }
-
-    if let syn::PathArguments::AngleBracketed(args) = &last.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return Some(inner);
-    }
-
-    None
+    expanded.into()
 }
 
 fn is_scalar_ident(ident: &proc_macro2::Ident) -> bool {
@@ -569,17 +539,19 @@ fn is_scalar_ident(ident: &proc_macro2::Ident) -> bool {
     )
 }
 
-fn parse_string_expr(expr: Expr) -> syn::Result<String> {
-    match expr {
-        Expr::Lit(ExprLit {
-            lit: Lit::Str(lit), ..
-        }) => Ok(lit.value()),
-        Expr::Macro(ExprMacro { mac, .. }) if mac.path.is_ident("concat") => {
-            parse_concat_macro(mac)
-        }
-        Expr::Macro(ExprMacro { mac, .. }) if mac.path.is_ident("env") => parse_env_macro(mac),
-        other => Err(syn::Error::new_spanned(other, "expected string literal")),
+fn option_inner(tp: &syn::TypePath) -> Option<&syn::Type> {
+    let last = tp.path.segments.last().unwrap();
+    if last.ident != "Option" {
+        return None;
     }
+
+    if let syn::PathArguments::AngleBracketed(args) = &last.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return Some(inner);
+    }
+
+    None
 }
 
 fn parse_concat_macro(mac: syn::Macro) -> syn::Result<String> {
@@ -617,4 +589,32 @@ fn parse_env_macro(mac: syn::Macro) -> syn::Result<String> {
             "env! argument must be a string literal",
         ))
     }
+}
+
+fn parse_string_expr(expr: Expr) -> syn::Result<String> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(lit), ..
+        }) => Ok(lit.value()),
+        Expr::Macro(ExprMacro { mac, .. }) if mac.path.is_ident("concat") => {
+            parse_concat_macro(mac)
+        }
+        Expr::Macro(ExprMacro { mac, .. }) if mac.path.is_ident("env") => parse_env_macro(mac),
+        other => Err(syn::Error::new_spanned(other, "expected string literal")),
+    }
+}
+
+fn vec_inner(tp: &syn::TypePath) -> Option<&syn::Type> {
+    let last = tp.path.segments.last().unwrap();
+    if last.ident != "Vec" {
+        return None;
+    }
+
+    if let syn::PathArguments::AngleBracketed(args) = &last.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return Some(inner);
+    }
+
+    None
 }
