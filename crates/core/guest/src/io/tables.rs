@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
 use crate::{
-    encoding::{FlatMsg, HasSchema, SchemaDescriptor},
+    encoding::FlatMsg,
     io::{
         error::{Error, Result},
         pubsub::{self, Publisher, Subscriber},
@@ -9,29 +9,17 @@ use crate::{
     schema,
 };
 
-/// Wire type for live table mutations, backed by Flatbuffers.
-#[derive(Debug, Clone, PartialEq)]
-#[schema(
-    path = "schemas/live_table.fbs",
-    ty = "selium.live_table.LiveTableMessage",
-    binding = "crate::fbs::selium::live_table::LiveTableMessage"
-)]
-pub struct LiveTableMessageWire {
-    /// Topic-wide mutation id used to acknowledge writes in stream order.
-    pub mutation_id: u64,
-    /// The entry key encoded as bytes via FlatMsg.
-    pub key_bytes: Vec<u8>,
-    /// The entry value encoded as bytes via FlatMsg (empty for tombstones).
-    pub value_bytes: Vec<u8>,
-    /// Optional version that must be current for this mutation to apply (0 = none).
-    pub expected_version: u64,
-}
-
 /// A table mutation published over a pub/sub topic.
 ///
 /// Every `set` publishes one of these messages. All processes attached to
 /// the same topic replay the stream to build their local materialised view.
 #[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/live_table.fbs",
+    ty = "selium.live_table.LiveTableMessage",
+    binding = "crate::fbs::selium::live_table::LiveTableMessage",
+    wire = LiveTableMessageWire
+)]
 pub struct LiveTableMessage<K, V> {
     /// Topic-wide mutation id used to acknowledge writes in stream order.
     pub mutation_id: u64,
@@ -81,47 +69,6 @@ pub struct LiveTable<K, V> {
     publisher: RefCell<Publisher<LiveTableMessage<K, V>>>,
     subscriber: RefCell<Subscriber<LiveTableMessage<K, V>>>,
     local: RefCell<HashMap<K, LiveTableRecord<V>>>,
-}
-
-impl<K: FlatMsg, V: FlatMsg> FlatMsg for LiveTableMessage<K, V> {
-    fn encode(value: &Self) -> Vec<u8> {
-        let key_bytes = FlatMsg::encode(&value.key);
-        let value_bytes = match &value.value {
-            Some(v) => FlatMsg::encode(v),
-            None => Vec::new(),
-        };
-        let expected_version = value.expected_version.unwrap_or(0);
-
-        let wire =
-            LiveTableMessageWire::new(value.mutation_id, key_bytes, value_bytes, expected_version);
-        FlatMsg::encode(&wire)
-    }
-
-    fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
-        let wire: LiveTableMessageWire = FlatMsg::decode(bytes)?;
-        let key: K = FlatMsg::decode(&wire.key_bytes)?;
-        let value: Option<V> = if wire.value_bytes.is_empty() {
-            None
-        } else {
-            Some(FlatMsg::decode(&wire.value_bytes)?)
-        };
-        let expected_version = if wire.expected_version == 0 {
-            None
-        } else {
-            Some(wire.expected_version)
-        };
-
-        Ok(Self {
-            mutation_id: wire.mutation_id,
-            key,
-            value,
-            expected_version,
-        })
-    }
-}
-
-impl<K: FlatMsg, V: FlatMsg> HasSchema for LiveTableMessage<K, V> {
-    const SCHEMA: SchemaDescriptor = LiveTableMessageWireSchema;
 }
 
 impl<K, V> LiveTable<K, V>

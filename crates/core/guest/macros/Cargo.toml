@@ -30,6 +30,7 @@ selium-guest = { path = ".." }
 selium-runtime = { path = "../../runtime" }
 tokio.workspace = true
 tracing.workspace = true
+trybuild.workspace = true
 wat.workspace = true
 
 [lints]

@@ -1,15 +1,21 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     Expr, ExprLit, ExprMacro, Item, ItemEnum, ItemStruct, Lit, LitStr, Path as SynPath,
     parse::Parser, parse_macro_input, spanned::Spanned,
 };
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parser = |input: syn::parse::ParseStream| -> syn::Result<(Option<String>, Option<String>, Option<SynPath>)> {
+    let parser = |input: syn::parse::ParseStream| -> syn::Result<(
+        Option<String>,
+        Option<String>,
+        Option<SynPath>,
+        Option<syn::Ident>,
+    )> {
         let mut path_lit: Option<String> = None;
         let mut fqname: Option<String> = None;
         let mut binding_path: Option<SynPath> = None;
+        let mut wire_ident: Option<syn::Ident> = None;
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
             input.parse::<syn::Token![=]>()?;
@@ -21,10 +27,21 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let p: SynPath = input.parse()?;
                     binding_path = Some(p);
                 }
+            } else if key == "wire" {
+                if input.peek(syn::LitStr) {
+                    let s: LitStr = input.parse()?;
+                    wire_ident = Some(syn::Ident::new(&s.value(), s.span()));
+                } else {
+                    wire_ident = Some(input.parse()?);
+                }
             } else if key == "path" || key == "ty" {
                 let expr: Expr = input.parse()?;
                 let value = parse_string_expr(expr)?;
-                if key == "path" { path_lit = Some(value); } else { fqname = Some(value); }
+                if key == "path" {
+                    path_lit = Some(value);
+                } else {
+                    fqname = Some(value);
+                }
             } else {
                 return Err(input.error("unknown key in #[schema]"));
             }
@@ -32,14 +49,30 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let _comma: syn::Token![,] = input.parse()?;
             }
         }
-        Ok((path_lit, fqname, binding_path))
+        Ok((path_lit, fqname, binding_path, wire_ident))
     };
 
-    let (path_lit, fqname, binding_path) =
+    let (path_lit, fqname, binding_path, wire_ident) =
         parser.parse(attr).expect("invalid #[schema] attributes");
     let fbs_path = path_lit.expect("#[schema] requires path = \"...\"");
     let fqname = fqname.expect("#[schema] requires ty = \"ns.Type\"");
     let binding_path = binding_path.expect("#[schema] requires binding = path::to::Type");
+
+    let item = parse_macro_input!(item as Item);
+
+    // Early check: generic structs require the wire parameter.
+    // This runs before .fbs file I/O so the error is clean.
+    if let Item::Struct(ref st) = item {
+        let generic_params = collect_generic_params(&st.generics);
+        if !generic_params.is_empty() && wire_ident.is_none() {
+            return syn::Error::new_spanned(
+                &st.generics,
+                "struct has generic type parameters; add wire = WireTypeName to #[schema] to generate a wire type",
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     let base = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing");
     let full = std::path::Path::new(&base).join(&fbs_path);
@@ -49,13 +82,261 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let hash_bytes = &hash.as_bytes()[0..16];
     let hash_lit = syn::LitByteStr::new(hash_bytes, proc_macro2::Span::call_site());
 
-    let item = parse_macro_input!(item as Item);
     match item {
-        Item::Struct(st) => expand_struct(st, fqname, binding_path, hash_lit),
+        Item::Struct(st) => expand_struct(st, fbs_path, fqname, binding_path, hash_lit, wire_ident),
         Item::Enum(en) => expand_enum(en, fqname, binding_path, hash_lit),
         other => syn::Error::new_spanned(other, "#[schema] requires a struct or enum")
             .to_compile_error()
             .into(),
+    }
+}
+
+fn collect_generic_params(generics: &syn::Generics) -> Vec<syn::Ident> {
+    generics
+        .params
+        .iter()
+        .filter_map(|p| {
+            if let syn::GenericParam::Type(tp) = p {
+                Some(tp.ident.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn type_references_generic(ty: &syn::Type, generic_params: &[syn::Ident]) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        for seg in &tp.path.segments {
+            if generic_params.iter().any(|gp| gp == &seg.ident) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Clone)]
+enum FieldKind {
+    /// `field: K` — direct generic type parameter.
+    Generic,
+    /// `field: Option<V>` where `V` is a generic type parameter.
+    OptionGeneric,
+    /// `field: Option<u64>` — optional scalar (sentinel encoding).
+    OptionScalar,
+    /// Concrete non-generic type — pass through unchanged.
+    Concrete,
+}
+
+fn classify_field(field: &syn::Field, generic_params: &[syn::Ident]) -> FieldKind {
+    match &field.ty {
+        syn::Type::Path(tp) => {
+            if let Some(inner) = option_inner(tp) {
+                if type_references_generic(inner, generic_params) {
+                    FieldKind::OptionGeneric
+                } else if is_scalar_type(inner) {
+                    FieldKind::OptionScalar
+                } else {
+                    FieldKind::Concrete
+                }
+            } else if type_references_generic(&field.ty, generic_params) {
+                FieldKind::Generic
+            } else {
+                FieldKind::Concrete
+            }
+        }
+        _ => FieldKind::Concrete,
+    }
+}
+
+fn is_scalar_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        if let Some(ident) = tp.path.get_ident() {
+            return is_scalar_ident(ident);
+        }
+    }
+    false
+}
+
+fn generate_wire_struct(
+    st: &ItemStruct,
+    wire_ident: &syn::Ident,
+    fbs_path: &str,
+    fqname: &str,
+    binding_path: &SynPath,
+    generic_params: &[syn::Ident],
+) -> proc_macro2::TokenStream {
+    let fields = match &st.fields {
+        syn::Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
+        _ => panic!("#[schema] wire generation requires named fields"),
+    };
+
+    let wire_fields: Vec<proc_macro2::TokenStream> = fields
+        .iter()
+        .map(|f| {
+            let field_name = f.ident.as_ref().unwrap();
+            let kind = classify_field(f, generic_params);
+            match kind {
+                FieldKind::Generic => {
+                    let wire_name = format_ident!("{}_bytes", field_name);
+                    quote! { pub #wire_name: Vec<u8> }
+                }
+                FieldKind::OptionGeneric => {
+                    let wire_name = format_ident!("{}_bytes", field_name);
+                    quote! { pub #wire_name: Vec<u8> }
+                }
+                FieldKind::OptionScalar => {
+                    // Option<scalar> → scalar (sentinel value)
+                    let inner = option_inner(match &f.ty {
+                        syn::Type::Path(tp) => tp,
+                        _ => unreachable!(),
+                    })
+                    .unwrap();
+                    quote! { pub #field_name: #inner }
+                }
+                FieldKind::Concrete => {
+                    let ty = &f.ty;
+                    quote! { pub #field_name: #ty }
+                }
+            }
+        })
+        .collect();
+
+    // Copy derive attributes from the domain struct.
+    let derive_attrs: Vec<_> = st
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("derive"))
+        .collect();
+
+    let fbs_path_lit = fbs_path;
+    let fqname_lit = fqname;
+
+    quote! {
+        #(#derive_attrs)*
+        #[schema(
+            path = #fbs_path_lit,
+            ty = #fqname_lit,
+            binding = #binding_path
+        )]
+        pub struct #wire_ident {
+            #(#wire_fields),*
+        }
+    }
+}
+
+fn generate_bridge_impls(
+    st: &ItemStruct,
+    wire_ident: &syn::Ident,
+    generic_params: &[syn::Ident],
+) -> proc_macro2::TokenStream {
+    let domain_ident = &st.ident;
+    let enc = encoding_path();
+
+    let fields = match &st.fields {
+        syn::Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
+        _ => panic!("#[schema] wire generation requires named fields"),
+    };
+
+    // --- Encode: domain fields → wire constructor args ---
+    let encode_exprs: Vec<proc_macro2::TokenStream> = fields
+        .iter()
+        .map(|f| {
+            let field_name = f.ident.as_ref().unwrap();
+            let kind = classify_field(f, generic_params);
+            match kind {
+                FieldKind::Generic => {
+                    quote! { #enc::FlatMsg::encode(&value.#field_name) }
+                }
+                FieldKind::OptionGeneric => {
+                    quote! {
+                        match &value.#field_name {
+                            Some(v) => #enc::FlatMsg::encode(v),
+                            None => Vec::new(),
+                        }
+                    }
+                }
+                FieldKind::OptionScalar => {
+                    quote! { value.#field_name.unwrap_or_default() }
+                }
+                FieldKind::Concrete => {
+                    quote! { value.#field_name.clone() }
+                }
+            }
+        })
+        .collect();
+
+    // --- Decode: wire fields → domain field initialisers ---
+    let decode_fields: Vec<proc_macro2::TokenStream> = fields
+        .iter()
+        .map(|f| {
+            let field_name = f.ident.as_ref().unwrap();
+            let kind = classify_field(f, generic_params);
+            match kind {
+                FieldKind::Generic => {
+                    let wire_field = format_ident!("{}_bytes", field_name);
+                    quote! { #field_name: #enc::FlatMsg::decode(&wire.#wire_field)? }
+                }
+                FieldKind::OptionGeneric => {
+                    let wire_field = format_ident!("{}_bytes", field_name);
+                    quote! {
+                        #field_name: if wire.#wire_field.is_empty() {
+                            None
+                        } else {
+                            Some(#enc::FlatMsg::decode(&wire.#wire_field)?)
+                        }
+                    }
+                }
+                FieldKind::OptionScalar => {
+                    let ty = &f.ty;
+                    // Extract the inner scalar type from Option<T>.
+                    let inner_ty = match ty {
+                        syn::Type::Path(tp) => option_inner(tp).unwrap(),
+                        _ => unreachable!(),
+                    };
+                    quote! {
+                        #field_name: {
+                            let v: #inner_ty = wire.#field_name;
+                            let zero: #inner_ty = ::std::default::Default::default();
+                            if v == zero { None } else { Some(v) }
+                        }
+                    }
+                }
+                FieldKind::Concrete => {
+                    quote! { #field_name: wire.#field_name }
+                }
+            }
+        })
+        .collect();
+
+    // Generic bounds: each type param gets `: FlatMsg`.
+    let bounded_params: Vec<proc_macro2::TokenStream> = generic_params
+        .iter()
+        .map(|gp| quote! { #gp: #enc::FlatMsg })
+        .collect();
+
+    let generic_args: Vec<_> = generic_params.iter().collect();
+
+    let wire_schema_ident = format_ident!("{}Schema", wire_ident);
+
+    quote! {
+        impl<#(#bounded_params),*> #enc::FlatMsg for #domain_ident<#(#generic_args),*> {
+            fn encode(value: &Self) -> Vec<u8> {
+                let wire = #wire_ident::new(#(#encode_exprs),*);
+                #enc::FlatMsg::encode(&wire)
+            }
+
+            fn decode(bytes: &[u8]) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+                let wire: #wire_ident = #enc::FlatMsg::decode(bytes)?;
+                Ok(Self {
+                    #(#decode_fields),*
+                })
+            }
+        }
+
+        impl<#(#bounded_params),*> #enc::HasSchema for #domain_ident<#(#generic_args),*> {
+            const SCHEMA: #enc::SchemaDescriptor = #wire_schema_ident;
+        }
     }
 }
 
@@ -404,6 +685,45 @@ fn expand_enum(
 
 fn expand_struct(
     st: ItemStruct,
+    fbs_path: String,
+    fqname: String,
+    binding_path: SynPath,
+    hash_lit: syn::LitByteStr,
+    wire_ident: Option<syn::Ident>,
+) -> TokenStream {
+    let generic_params = collect_generic_params(&st.generics);
+
+    // Error: generic struct without wire parameter.
+    if !generic_params.is_empty() && wire_ident.is_none() {
+        return syn::Error::new_spanned(
+            &st.generics,
+            "struct has generic type parameters; add wire = WireTypeName to #[schema] to generate a wire type",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Wire generation path.
+    if let Some(ref wire) = wire_ident {
+        return expand_struct_with_wire(
+            st,
+            fbs_path,
+            fqname,
+            binding_path,
+            hash_lit,
+            wire,
+            &generic_params,
+        );
+    }
+
+    // Existing direct-impl path (non-generic structs).
+    expand_struct_direct(st, fqname, binding_path, hash_lit)
+}
+
+/// Direct-impl path: generates FlatMsg, HasSchema, FieldEncoder, new, write_flatbuffer,
+/// from_flatbuffer on the annotated struct itself.
+fn expand_struct_direct(
+    st: ItemStruct,
     fqname: String,
     binding_path: SynPath,
     hash_lit: syn::LitByteStr,
@@ -515,6 +835,48 @@ fn expand_struct(
                 Ok(Self::from_flatbuffer(view))
             }
         }
+    };
+
+    expanded.into()
+}
+
+/// Wire path: emits the cleaned domain struct, the wire struct (with `#[schema]`),
+/// and bridge FlatMsg/HasSchema impls on the domain type.
+fn expand_struct_with_wire(
+    st: ItemStruct,
+    fbs_path: String,
+    fqname: String,
+    binding_path: SynPath,
+    _hash_lit: syn::LitByteStr,
+    wire_ident: &syn::Ident,
+    generic_params: &[syn::Ident],
+) -> TokenStream {
+    // Cleaned domain struct (strip #[schema] attribute, keep everything else).
+    let mut cleaned = st.clone();
+    cleaned.attrs = st
+        .attrs
+        .iter()
+        .filter(|attr| !attr.path().is_ident("schema"))
+        .cloned()
+        .collect();
+
+    let wire_struct = generate_wire_struct(
+        &st,
+        wire_ident,
+        &fbs_path,
+        &fqname,
+        &binding_path,
+        generic_params,
+    );
+
+    let bridge = generate_bridge_impls(&st, wire_ident, generic_params);
+
+    let expanded = quote! {
+        #cleaned
+
+        #wire_struct
+
+        #bridge
     };
 
     expanded.into()

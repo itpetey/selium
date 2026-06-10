@@ -1,40 +1,4 @@
-## Purpose
-
-Provide procedural macros for Selium guest entrypoints and generated guest interface metadata.
-
-## Requirements
-
-### Requirement: Guest Entrypoint Macro
-`selium-guest-macros` SHALL provide a macro that generates the ABI glue needed to expose a guest entrypoint through `selium-abi` and `selium-guest`.
-
-#### Scenario: Macro-generated entrypoint glue
-- **WHEN** a guest author annotates a supported async entrypoint with the provided macro
-- **THEN** the macro SHALL generate the required ABI-compatible entry glue
-
-### Requirement: Generated Pattern Metadata
-`selium-guest-macros` SHALL generate metadata for guest-declared messaging interfaces so that discovery and binding layers can reason about them consistently.
-
-#### Scenario: Messaging interface metadata emitted
-- **WHEN** a guest declares a messaging interface using the macro layer
-- **THEN** the macro SHALL emit metadata describing the interface in a form consumable by the guest SDK and runtime tooling
-
-### Requirement: Bootstrap-Aware Macro Integration
-`selium-guest-macros` SHALL interoperate with the guest SDK so generated entrypoints and messaging metadata can participate in runtime bootstrap and tracing setup.
-
-#### Scenario: Runtime bootstraps macro-based guest
-- **WHEN** the runtime starts a guest built with the macro layer
-- **THEN** the generated glue SHALL remain compatible with runtime bootstrap expectations and guest tracing setup
-
-### Requirement: Context-Aware Entrypoint Parameter
-`selium-guest-macros` SHALL detect when the entrypoint function takes a `Context` parameter or a `u64` raw argument and generate the appropriate wrapper that constructs and injects the parameter before calling the user function.
-
-#### Scenario: Macro injects Context into entrypoint
-- **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context)`
-- **THEN** the macro SHALL generate a wrapper that calls `Context::from_raw(...)` and passes the result to `main`
-
-#### Scenario: Macro forwards raw u64 argument into entrypoint
-- **WHEN** a guest defines `#[entrypoint] async fn main(id: u64)`
-- **THEN** the macro SHALL generate a wrapper that forwards the runtime-provided `i64` argument directly as the `u64` parameter
+## ADDED Requirements
 
 ### Requirement: Wire parameter on schema macro
 
