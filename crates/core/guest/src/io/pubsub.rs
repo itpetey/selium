@@ -10,7 +10,7 @@ use crate::{
     encoding::FlatMsg,
     io::{
         Error, RingBuf,
-        channels::{BlockingReader, BlockingWriter, Reader, Writer},
+        channels::{BlockingReader, BlockingWriter, ChannelBackpressure, Reader, Writer},
         error::Result,
         framed::{FramedRead, FramedWrite},
         ring_buf::round_capacity,
@@ -297,7 +297,7 @@ fn attach_topic(region_id: u64, capacity: u64) -> Result<RingBuf> {
 
 fn create_topic(capacity: u64) -> Result<RingBuf> {
     let capacity = round_capacity(capacity)?;
-    RingBuf::create(capacity)
+    RingBuf::create(capacity, selium_abi::ResourceKind::PubSubTopic)
 }
 
 fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<Reader>> {
@@ -308,7 +308,7 @@ fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<Reader>> {
 
 fn writer_from_ring(ring: &RingBuf) -> Result<FramedWrite<Writer>> {
     let writer_id = ring.region().allocate_writer_id()?;
-    let writer = Writer::new(ring.region().clone(), writer_id);
+    let writer = Writer::new(ring.region().clone(), writer_id, ChannelBackpressure::Park);
     Ok(FramedWrite::new(writer))
 }
 
@@ -322,7 +322,7 @@ mod tests {
     /// constructs both from the same ring directly.
     fn test_pair<T>(capacity: u64) -> Result<(Publisher<T, Writer>, Subscriber<T, Reader>)> {
         let capacity = round_capacity(capacity)?;
-        let ring = RingBuf::create(capacity)?;
+        let ring = RingBuf::create(capacity, selium_abi::ResourceKind::PubSubTopic)?;
         let writer = writer_from_ring(&ring)?;
         let publisher = Publisher {
             writer,

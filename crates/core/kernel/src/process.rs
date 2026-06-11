@@ -31,6 +31,8 @@ impl Kernel {
                 entrypoint: descriptor.entrypoint.clone(),
                 running: true,
                 grants,
+                log_channel_shared_id: None,
+                log_channel_state: None,
             },
         );
         self.record_activity(ActivityEvent {
@@ -117,6 +119,151 @@ impl Kernel {
         let guest_logs = self.inner.guest_logs.lock();
         let cursor = cursor.min(guest_logs.len());
         guest_logs.get(cursor..).unwrap_or_default().to_vec()
+    }
+
+    /// Registers a shared region as the log channel for a process.
+    ///
+    /// The kernel attaches to the shared region as a non-blocking reader.
+    /// Log entries published to the channel will be available via
+    /// `read_guest_logs_from` alongside entries written via the legacy
+    /// `write_guest_log` path (dual-path during transition).
+    pub fn register_log_channel(
+        &self,
+        process_id: ProcessId,
+        shared_id: selium_abi::SharedResourceId,
+    ) -> Result<()> {
+        // Attach to the shared region for reading.
+        let local_mapping_id = self.attach_shared_region(shared_id)?;
+
+        let mut processes = self.inner.processes.lock();
+        let process = processes
+            .get_mut(&process_id)
+            .ok_or_else(|| Error::NotFound(format!("process {process_id}")))?;
+        process.log_channel_shared_id = Some(shared_id);
+        process.log_channel_state = Some(crate::state::LogChannelState {
+            local_mapping_id,
+            read_position: 0,
+        });
+        Ok(())
+    }
+
+    /// Returns the log channel shared region id for a process, if registered.
+    pub fn log_channel_shared_id(&self, process_id: ProcessId) -> Option<selium_abi::SharedResourceId> {
+        self.inner
+            .processes
+            .lock()
+            .get(&process_id)
+            .and_then(|p| p.log_channel_shared_id)
+    }
+
+    /// Drains available frames from a process's log channel.
+    ///
+    /// Returns raw frame payloads (without the 12-byte header). The caller
+    /// is responsible for decoding the payloads (e.g., as FlatBuffer LogRecords).
+    ///
+    /// Handles `Overwritten` gracefully: if the read position has been overtaken
+    /// by the writer, advances to the current tail and returns available frames.
+    pub fn drain_log_channel(&self, process_id: ProcessId) -> Result<Vec<Vec<u8>>> {
+        let mut processes = self.inner.processes.lock();
+        let process = processes
+            .get_mut(&process_id)
+            .ok_or_else(|| Error::NotFound(format!("process {process_id}")))?;
+
+        let state = match process.log_channel_state.as_mut() {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+
+        let local_mapping_id = state.local_mapping_id;
+        let mut read_pos = state.read_position;
+
+        // Ring buffer layout constants (must match selium-guest's io::region).
+        const DATA_OFFSET: u64 = 4096; // PAGE_SIZE
+        const HEADER_SIZE: u64 = 12;
+        const FLAG_READY: u8 = 0x01;
+
+        // Read the shared region length to compute the mask.
+        let shared_id = process
+            .log_channel_shared_id
+            .ok_or_else(|| Error::NotFound("no log channel".to_string()))?;
+        let region_len = self.shared_region_len(shared_id)? as u64;
+        let data_capacity = region_len - DATA_OFFSET;
+        let mask = data_capacity - 1; // power-of-two capacity
+
+        // Read next_tail from shared memory (offset 8 in the coordination area).
+        let next_tail_bytes = self.read_shared_memory(local_mapping_id, 8, 8)?;
+        let next_tail = u64::from_le_bytes(
+            next_tail_bytes
+                .try_into()
+                .map_err(|_| Error::Wasm("invalid next_tail".to_string()))?,
+        );
+
+        // If read_pos has been overtaken, skip to next_tail - capacity.
+        if next_tail > read_pos + data_capacity {
+            read_pos = next_tail - data_capacity;
+        }
+
+        let mut frames = Vec::new();
+
+        while read_pos < next_tail {
+            let raw_pos = read_pos & mask;
+
+            // Read the 12-byte header.
+            let header_bytes =
+                self.read_shared_memory(local_mapping_id, DATA_OFFSET + raw_pos, HEADER_SIZE as usize)?;
+
+            if header_bytes.len() < HEADER_SIZE as usize {
+                break;
+            }
+
+            let len = u32::from_le_bytes([header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3]]);
+            let flags = header_bytes[8];
+
+            // Check READY flag.
+            if flags & FLAG_READY == 0 {
+                break; // Frame not yet written.
+            }
+
+            let payload_len = len as usize;
+            if payload_len == 0 {
+                read_pos += HEADER_SIZE;
+                continue;
+            }
+
+            // Read the payload (may wrap around the ring).
+            let payload_start = (raw_pos + HEADER_SIZE) & mask;
+            let mut payload = vec![0u8; payload_len];
+
+            let tail_len = (data_capacity - payload_start) as usize;
+            if tail_len >= payload_len {
+                // Payload fits in one segment.
+                let data = self.read_shared_memory(
+                    local_mapping_id,
+                    DATA_OFFSET + payload_start,
+                    payload_len,
+                )?;
+                payload.copy_from_slice(&data);
+            } else {
+                // Payload wraps around.
+                let tail_data =
+                    self.read_shared_memory(local_mapping_id, DATA_OFFSET + payload_start, tail_len)?;
+                payload[..tail_len].copy_from_slice(&tail_data);
+                let head_data = self.read_shared_memory(
+                    local_mapping_id,
+                    DATA_OFFSET,
+                    payload_len - tail_len,
+                )?;
+                payload[tail_len..].copy_from_slice(&head_data);
+            }
+
+            frames.push(payload);
+            read_pos += HEADER_SIZE + payload_len as u64;
+        }
+
+        // Update the read position.
+        state.read_position = read_pos;
+
+        Ok(frames)
     }
 
     /// Returns the capability grants assigned to a process.

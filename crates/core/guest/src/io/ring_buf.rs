@@ -1,5 +1,7 @@
 use std::sync::atomic::{Ordering, fence};
 
+use selium_abi::ResourceKind;
+
 use crate::io::{
     ChannelRegion, Cursor, RegionBuilder,
     cursor::mask_for_capacity,
@@ -29,8 +31,11 @@ pub struct RingBuf {
 
 impl RingBuf {
     /// Creates a new ring buffer with the given data capacity, backed by a fresh shared memory region.
-    pub fn create(capacity: u64) -> Result<Self> {
-        let region = RegionBuilder::create(capacity)?;
+    ///
+    /// The `purpose` tag is threaded through to the `AllocRegion` hostcall for
+    /// runtime discovery registration (informational only, not used for AAA).
+    pub fn create(capacity: u64, purpose: ResourceKind) -> Result<Self> {
+        let region = RegionBuilder::create(capacity, purpose)?;
         let mask = mask_for_capacity(capacity)?;
         region.initialise()?;
         Ok(Self {
@@ -225,7 +230,7 @@ mod tests {
 
     #[test]
     fn single_phase_write_read_round_trip() {
-        let ring = RingBuf::create(64).expect("create");
+        let ring = RingBuf::create(64, ResourceKind::SharedMemory).expect("create");
         let pos = ring.reserve(12 + 5).expect("reserve"); // header + payload
         ring.write_frame(pos, b"hello", 42, 0).expect("write");
 
@@ -238,7 +243,7 @@ mod tests {
 
     #[test]
     fn generation_counter_advances_on_write() {
-        let ring = RingBuf::create(64).expect("create");
+        let ring = RingBuf::create(64, ResourceKind::SharedMemory).expect("create");
         let gen_before = ring.generation().expect("gen");
         let pos = ring.reserve(12 + 3).expect("reserve");
         ring.write_frame(pos, b"abc", 0, 0).expect("write");

@@ -22,6 +22,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"], optional = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"], optional = true }
 
 [build-dependencies]
 flatbuffers-build.workspace = true
@@ -32,9 +33,10 @@ flatbuffers.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
-default = ["io"]
+default = ["io", "logging"]
 axum = ["dep:axum", "io", "tokio/time"]
 io = ["dep:tokio"]
+logging = ["dep:tracing-subscriber"]
 quinn = ["dep:quinn", "io"]
 
 [lints]

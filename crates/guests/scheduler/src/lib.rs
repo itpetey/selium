@@ -149,6 +149,7 @@ fn host_satisfies(host: &HostPlacementInput, spec: &WorkloadSpec) -> bool {
 
 #[entrypoint]
 async fn scheduler_main() {
+    let _ = selium_guest::log::init();
     selium_guest::info!(guest = "selium-scheduler", "system guest booting");
     selium_guest::mark_ready();
 }

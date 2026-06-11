@@ -19,17 +19,23 @@ table ResourceTarget {
     resource_id: ulong;
     /// Optional interface metadata.
     interface: InterfaceMetadata;
+    /// Optional tenant identifier for multi-tenant isolation.
+    tenant: string;
 }
 
 /// Discovery request message.
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
+///   1 = Register { uri, target }
+///   2 = Revoke { uri }
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
-    /// URI to resolve (used by Resolve variant).
+    /// URI to resolve or register (used by Resolve, Register, Revoke variants).
     uri: string;
+    /// Target resource for registration (used by Register variant).
+    target: ResourceTarget;
 }
 
 /// Discovery response message.
@@ -37,6 +43,9 @@ table DiscoveryRequest {
 /// Variant tag values:
 ///   0 = Found(target)
 ///   1 = NotFound
+///   2 = Registered
+///   3 = Revoked
+///   4 = Forbidden
 table DiscoveryResponse {
     /// Variant discriminator.
     variant: ubyte;

@@ -10,6 +10,9 @@ pub enum DiscoveryResponseOffset {}
 /// Variant tag values:
 ///   0 = Found(target)
 ///   1 = NotFound
+///   2 = Registered
+///   3 = Revoked
+///   4 = Forbidden
 pub struct DiscoveryResponse<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }

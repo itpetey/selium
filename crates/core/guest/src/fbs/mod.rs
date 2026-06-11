@@ -18,4 +18,15 @@ pub mod selium {
     mod live_table_message_generated;
     pub use self::live_table_message_generated::*;
   }
+  pub mod logging {
+    use super::*;
+    mod field_generated;
+    pub use self::field_generated::*;
+    mod log_level_generated;
+    pub use self::log_level_generated::*;
+    mod log_record_generated;
+    pub use self::log_record_generated::*;
+    mod span_generated;
+    pub use self::span_generated::*;
+  }
 }

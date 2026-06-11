@@ -7,7 +7,7 @@ use std::{
 use tokio::io::AsyncWrite;
 
 use crate::io::{
-    channels::{Error, Result},
+    channels::{ChannelBackpressure, Error, Result},
     frame::FrameHeader,
     region::ChannelRegion,
 };
@@ -17,6 +17,7 @@ use crate::io::{
 pub struct Writer {
     region: ChannelRegion,
     writer_id: u32,
+    backpressure: ChannelBackpressure,
 }
 
 /// Blocking byte-stream writer tracked in the channel metadata, preventing
@@ -35,13 +36,26 @@ pub struct BlockingWriter {
 }
 
 impl Writer {
-    pub(crate) fn new(region: ChannelRegion, writer_id: u32) -> Self {
-        Self { region, writer_id }
+    pub(crate) fn new(
+        region: ChannelRegion,
+        writer_id: u32,
+        backpressure: ChannelBackpressure,
+    ) -> Self {
+        Self {
+            region,
+            writer_id,
+            backpressure,
+        }
     }
 
     /// Returns the writer id stored in emitted frames.
     pub fn writer_id(&self) -> u32 {
         self.writer_id
+    }
+
+    /// Returns the backpressure strategy for this writer's channel.
+    pub fn backpressure(&self) -> ChannelBackpressure {
+        self.backpressure
     }
 
     /// Allocates a globally unique mutation id for this writer's channel.
@@ -75,7 +89,9 @@ impl AsyncWrite for Writer {
             return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
 
-        let pos = match self.region.reserve_tail(len, false) {
+        // On Drop channels, never protect readers (fire-and-forget).
+        let protect_readers = self.backpressure == ChannelBackpressure::Park;
+        let pos = match self.region.reserve_tail(len, protect_readers) {
             Ok(p) => p,
             Err(Error::BufferFull) => return Poll::Pending,
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
@@ -139,6 +155,7 @@ impl BlockingWriter {
         let writer = Writer {
             region: self.region.clone(),
             writer_id: self.writer_id,
+            backpressure: ChannelBackpressure::Park,
         };
         // Prevent Drop from decrementing again (we already did it).
         std::mem::forget(self);
@@ -252,7 +269,8 @@ mod tests {
 
     #[test]
     fn two_phase_write_produces_ready_frame() {
-        let region = RegionBuilder::create(64).expect("create");
+        let region =
+            RegionBuilder::create(64, selium_abi::ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Encode a frame manually: header + payload.

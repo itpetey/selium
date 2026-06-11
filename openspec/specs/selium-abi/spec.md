@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+`selium-abi` defines the core ABI types shared between Selium guest code and the runtime, including hostcall request/response variants, shared region descriptors, discovery protocol types, and resource kind enumerations used throughout the Selium system.
+
+## Requirements
 
 ### Requirement: Shared Region Hostcall Variants
 `selium-abi` SHALL define `AllocRegion`, `FreeRegion`, and `AttachRegion` variants on `HostcallRequest` with the following payloads:
@@ -37,10 +41,8 @@
 - **WHEN** a `SleepWait` operation is polled and `Instant::now() >= deadline`
 - **THEN** the poll SHALL return `CompletionState::Ready(HostcallOutput::Empty)`
 
-## MODIFIED Requirements
-
 ### Requirement: UdpBind Hostcall
-`UdpBind` graduates from stub to fully implemented. The hostcall SHALL return a `SharedRegionDescriptor` containing a multi-memory region with two ring buffers (recv and send), initialised with the standard coordination layout.
+`UdpBind` SHALL return a `SharedRegionDescriptor` containing a multi-memory region with two ring buffers (recv and send), initialised with the standard coordination layout.
 
 #### Scenario: Guest binds UDP socket
 - **WHEN** a guest invokes `UdpBind` with a valid address
@@ -59,13 +61,3 @@
 #### Scenario: Guest binds TCP listener
 - **WHEN** a guest invokes `TcpBind` with a valid address
 - **THEN** the host SHALL bind a TCP listener, create a host queue, spawn an accept loop, and return the queue descriptor
-
-## REMOVED Requirements
-
-### Requirement: Stable Hostcall Contracts (Signal and SharedMemory variants)
-**Reason**: `Signal` and `SharedMemory` hostcalls are replaced by `alloc_region`/`free_region`/`attach_region` plus native WASM atomic instructions (`memory.atomic.wait32`/`notify`).
-**Migration**: Existing guest code using `Signal::wait` must switch to `memory.atomic.wait32` on the shared region's generation counter. Existing guest code using `SharedMemory` read/write hostcalls must switch to direct load/store at the page offset returned by `alloc_region`/`attach_region`.
-
-### Requirement: Host-Mediated Connection Queue Hostcalls (MODIFIED)
-**Status**: Retained. `HostQueueCreate`, `HostQueueAttach`, `HostQueueSend`, and `HostQueueRecv` remain in the core ABI unchanged.
-**Reason**: Host queues remain necessary for the TCP listener accept pattern and the RPC connection handshake. The previous spec incorrectly claimed RPC handoff had moved entirely to the shared memory ABI; in practice, the initial connection setup still uses `HostQueueSend`/`HostQueueRecv` to pass the `shared_id` from client to server.

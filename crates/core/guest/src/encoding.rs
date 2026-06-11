@@ -78,6 +78,8 @@ pub struct ResourceTargetWire {
     pub resource_id: u64,
     /// Optional interface metadata.
     pub interface: Option<InterfaceMetadataWire>,
+    /// Optional tenant identifier for multi-tenant isolation.
+    pub tenant: Option<String>,
 }
 
 /// Wire type for DiscoveryRequest, backed by Flatbuffers.
@@ -88,10 +90,12 @@ pub struct ResourceTargetWire {
     binding = "crate::fbs::selium::discovery::DiscoveryRequest"
 )]
 pub struct DiscoveryRequestWire {
-    /// Variant discriminator (0 = Resolve).
+    /// Variant discriminator (0 = Resolve, 1 = Register, 2 = Revoke).
     pub variant: u8,
-    /// URI to resolve (used by Resolve variant).
+    /// URI to resolve or register.
     pub uri: String,
+    /// Target resource for registration (used by Register variant).
+    pub target: Option<ResourceTargetWire>,
 }
 
 /// Wire type for DiscoveryResponse, backed by Flatbuffers.
@@ -102,7 +106,7 @@ pub struct DiscoveryRequestWire {
     binding = "crate::fbs::selium::discovery::DiscoveryResponse"
 )]
 pub struct DiscoveryResponseWire {
-    /// Variant discriminator (0 = Found, 1 = NotFound).
+    /// Variant discriminator (0 = Found, 1 = NotFound, 2 = Registered, 3 = Revoked, 4 = Forbidden).
     pub variant: u8,
     /// The discovered resource (used by Found variant).
     pub target: Option<ResourceTargetWire>,
@@ -121,6 +125,7 @@ impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
             value.host_id.clone(),
             value.resource_id,
             value.interface.as_ref().map(InterfaceMetadataWire::from),
+            value.tenant.clone(),
         )
     }
 }
@@ -128,7 +133,11 @@ impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
 impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
     fn from(value: &selium_abi::DiscoveryRequest) -> Self {
         match value {
-            selium_abi::DiscoveryRequest::Resolve(uri) => Self::new(0, uri.clone()),
+            selium_abi::DiscoveryRequest::Resolve(uri) => Self::new(0, uri.clone(), None),
+            selium_abi::DiscoveryRequest::Register { uri, target } => {
+                Self::new(1, uri.clone(), Some(ResourceTargetWire::from(target)))
+            }
+            selium_abi::DiscoveryRequest::Revoke { uri } => Self::new(2, uri.clone(), None),
         }
     }
 }
@@ -140,6 +149,9 @@ impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
                 Self::new(0, Some(ResourceTargetWire::from(target)))
             }
             selium_abi::DiscoveryResponse::NotFound => Self::new(1, None),
+            selium_abi::DiscoveryResponse::Registered => Self::new(2, None),
+            selium_abi::DiscoveryResponse::Revoked => Self::new(3, None),
+            selium_abi::DiscoveryResponse::Forbidden => Self::new(4, None),
         }
     }
 }
@@ -308,6 +320,7 @@ impl From<ResourceTargetWire> for selium_abi::ResourceTarget {
             host_id: wire.host_id,
             resource_id: wire.resource_id,
             interface: wire.interface.map(selium_abi::InterfaceMetadata::from),
+            tenant: wire.tenant,
         }
     }
 }
@@ -332,6 +345,23 @@ impl From<DiscoveryRequestWire> for selium_abi::DiscoveryRequest {
     fn from(wire: DiscoveryRequestWire) -> Self {
         match wire.variant {
             0 => selium_abi::DiscoveryRequest::Resolve(wire.uri),
+            1 => {
+                let target = wire
+                    .target
+                    .map(selium_abi::ResourceTarget::from)
+                    .unwrap_or(selium_abi::ResourceTarget {
+                        uri: String::new(),
+                        host_id: String::new(),
+                        resource_id: 0,
+                        interface: None,
+                        tenant: None,
+                    });
+                selium_abi::DiscoveryRequest::Register {
+                    uri: wire.uri,
+                    target,
+                }
+            }
+            2 => selium_abi::DiscoveryRequest::Revoke { uri: wire.uri },
             _ => selium_abi::DiscoveryRequest::Resolve(String::new()),
         }
     }
@@ -363,6 +393,10 @@ impl From<DiscoveryResponseWire> for selium_abi::DiscoveryResponse {
                     selium_abi::DiscoveryResponse::NotFound
                 }
             }
+            1 => selium_abi::DiscoveryResponse::NotFound,
+            2 => selium_abi::DiscoveryResponse::Registered,
+            3 => selium_abi::DiscoveryResponse::Revoked,
+            4 => selium_abi::DiscoveryResponse::Forbidden,
             _ => selium_abi::DiscoveryResponse::NotFound,
         }
     }
@@ -456,6 +490,7 @@ mod tests {
                 name: "MyInterface".to_string(),
                 methods: vec!["method_a".to_string(), "method_b".to_string()],
             }),
+            tenant: None,
         });
         let bytes = FlatMsg::encode(&response);
         let decoded: selium_abi::DiscoveryResponse = FlatMsg::decode(&bytes).expect("decode");
@@ -469,6 +504,7 @@ mod tests {
             host_id: "host-1".to_string(),
             resource_id: 42,
             interface: None,
+            tenant: None,
         });
         let bytes = FlatMsg::encode(&response);
         let decoded: selium_abi::DiscoveryResponse = FlatMsg::decode(&bytes).expect("decode");

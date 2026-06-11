@@ -38,6 +38,7 @@ pub mod fbs;
 mod hostcall;
 #[cfg(feature = "io")]
 pub mod io;
+pub mod log;
 mod memory;
 mod net;
 mod platform;

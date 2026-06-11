@@ -396,12 +396,49 @@ pub struct GuestLogEntry {
     pub message: String,
 }
 
+/// Informational tag for the intended use of an allocated shared memory region.
+///
+/// **Not** used for AAA decisions — a guest may spoof this value; the only effect
+/// is cosmetic (e.g. discovery URI alias, UI icon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ResourceKind {
+    /// Shared memory region for tracing log transport.
+    LogChannel,
+    /// Shared memory region for a live table.
+    LiveTable,
+    /// Shared memory region for RPC request/reply rings.
+    RpcRing,
+    /// Shared memory region for pub/sub topic.
+    PubSubTopic,
+    /// Shared memory region for network socket buffers.
+    NetworkBuffer,
+    /// Shared memory region for durable log storage.
+    DurableLog,
+    /// Shared memory region for blob store.
+    BlobStore,
+    /// Generic/unknown shared memory region.
+    SharedMemory,
+}
+
 /// Request sent to the discovery service.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum DiscoveryRequest {
     /// Resolve a URI to a resource target.
     Resolve(String),
+    /// Register a URI→target mapping.
+    Register {
+        /// URI to register.
+        uri: String,
+        /// Target resource to map the URI to.
+        target: ResourceTarget,
+    },
+    /// Remove a URI→target mapping.
+    Revoke {
+        /// URI to revoke.
+        uri: String,
+    },
 }
 
 /// Target resource returned by discovery resolution.
@@ -416,6 +453,8 @@ pub struct ResourceTarget {
     pub resource_id: u64,
     /// Optional interface metadata.
     pub interface: Option<InterfaceMetadata>,
+    /// Optional tenant identifier for multi-tenant isolation.
+    pub tenant: Option<String>,
 }
 
 /// Response from the discovery service.
@@ -426,6 +465,12 @@ pub enum DiscoveryResponse {
     Found(ResourceTarget),
     /// The requested URI was not found.
     NotFound,
+    /// The URI was successfully registered.
+    Registered,
+    /// The URI was successfully revoked.
+    Revoked,
+    /// The caller is not authorised to register the given target.
+    Forbidden,
 }
 
 /// Host operation requested by a guest.
@@ -596,6 +641,8 @@ pub enum HostcallRequest {
         pages: u32,
         /// Memory protection level.
         prot: RegionProt,
+        /// Informational purpose tag for the allocated region.
+        purpose: ResourceKind,
     },
     /// Free a previously allocated shared memory region.
     FreeRegion {
@@ -619,6 +666,11 @@ pub enum HostcallRequest {
     Sleep {
         /// Duration to sleep in milliseconds.
         millis: u64,
+    },
+    /// Register a shared memory region as the guest's log channel with the kernel.
+    GuestLogRegister {
+        /// Shared region id of the log channel to register.
+        shared_id: SharedResourceId,
     },
 }
 
@@ -919,6 +971,7 @@ mod tests {
             request: HostcallRequest::AllocRegion {
                 pages: 16,
                 prot: RegionProt::ReadWrite,
+                purpose: ResourceKind::SharedMemory,
             },
             task_id: Some(42),
         };
@@ -1018,6 +1071,7 @@ mod tests {
             host_id: "host-a".to_string(),
             resource_id: 7,
             interface: None,
+            tenant: None,
         });
         let encoded = encode_rkyv(&response).expect("encode");
         let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
@@ -1052,6 +1106,101 @@ mod tests {
                 address: "127.0.0.1:443".to_string(),
             },
             task_id: Some(2),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn resource_kind_round_trip() {
+        for kind in [
+            ResourceKind::LogChannel,
+            ResourceKind::LiveTable,
+            ResourceKind::RpcRing,
+            ResourceKind::PubSubTopic,
+            ResourceKind::NetworkBuffer,
+            ResourceKind::DurableLog,
+            ResourceKind::BlobStore,
+            ResourceKind::SharedMemory,
+        ] {
+            let encoded = encode_rkyv(&kind).expect("encode");
+            let decoded: ResourceKind = decode_rkyv(&encoded).expect("decode");
+            assert_eq!(decoded, kind);
+        }
+    }
+
+    #[test]
+    fn discovery_request_register_round_trip() {
+        let request = DiscoveryRequest::Register {
+            uri: "sel://process/42/logs".to_string(),
+            target: ResourceTarget {
+                uri: "sel://process/42/logs".to_string(),
+                host_id: "host-a".to_string(),
+                resource_id: 7,
+                interface: None,
+                tenant: None,
+            },
+        };
+        let encoded = encode_rkyv(&request).expect("encode");
+        let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_request_revoke_round_trip() {
+        let request = DiscoveryRequest::Revoke {
+            uri: "sel://process/42/logs".to_string(),
+        };
+        let encoded = encode_rkyv(&request).expect("encode");
+        let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_response_registered_round_trip() {
+        let response = DiscoveryResponse::Registered;
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn discovery_response_revoked_round_trip() {
+        let response = DiscoveryResponse::Revoked;
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn discovery_response_forbidden_round_trip() {
+        let response = DiscoveryResponse::Forbidden;
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn alloc_region_with_purpose_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::AllocRegion {
+                pages: 8,
+                prot: RegionProt::ReadWrite,
+                purpose: ResourceKind::LogChannel,
+            },
+            task_id: Some(5),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn guest_log_register_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::GuestLogRegister { shared_id: 42 },
+            task_id: None,
         };
         let encoded = encode_rkyv(&envelope).expect("encode");
         let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");

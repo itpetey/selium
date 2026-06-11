@@ -141,6 +141,16 @@ impl Runtime {
     }
 
     pub(crate) fn cleanup_process_resources(&self, process_id: ProcessId) -> Result<()> {
+        // Revoke all discovery URIs registered for this process.
+        let revoked_uris = crate::discovery::take_uris(&self.process_discovery_uris, process_id);
+
+        // Enqueue Revoke operations for each URI.
+        for uri in revoked_uris {
+            self.pending_discovery_ops.lock().push_back(
+                selium_abi::DiscoveryRequest::Revoke { uri },
+            );
+        }
+
         let owned_handles = self
             .local_handle_owners
             .lock()

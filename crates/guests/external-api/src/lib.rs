@@ -258,6 +258,7 @@ fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiE
 
 #[entrypoint]
 async fn external_api_main(ctx: Context) {
+    let _ = selium_guest::log::init();
     let _api_ctx = ApiContext::from_context(ctx);
     selium_guest::info!(
         guest = "selium-external-api",

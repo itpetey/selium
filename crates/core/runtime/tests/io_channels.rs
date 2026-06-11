@@ -27,6 +27,7 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, pages: u32) -> u64 {
         HostcallRequest::AllocRegion {
             pages,
             prot: RegionProt::ReadWrite,
+            purpose: selium_abi::ResourceKind::SharedMemory,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);

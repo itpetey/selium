@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+`Context` is the bootstrap object passed to every Selium guest entrypoint, providing access to shared memory primitives and a pre-connected discovery RPC client for URI resolution, registration, and revocation.
+
+## Requirements
 
 ### Requirement: Discovery client in Context
 `Context` SHALL provide access to a pre-connected `RpcClient<DiscoveryRequest, DiscoveryResponse>` through a `discovery()` method. The runtime SHALL establish this connection during bootstrap before the entrypoint is called. The `Context` SHALL use `RpcClient` from `selium-guest::io::rpc` rather than implementing the RPC protocol inline.
@@ -22,8 +26,20 @@
 - **WHEN** a guest calls `ctx.lookup(uri)` and the discovery service has disconnected
 - **THEN** the method SHALL return `Err(GuestError::Host(...))` with a message indicating the discovery service disconnected
 
-## REMOVED Requirements
+### Requirement: Context register convenience method
+`Context` SHALL provide a `register(&mut self, uri: &str, target: ResourceTarget) -> Result<(), GuestError>` convenience method that delegates to `self.discovery().request(DiscoveryRequest::Register { uri: uri.to_string(), target }).await` and maps the response.
 
-### Requirement: Inline RPC implementation in Context
-**Reason**: `Context` previously implemented the RPC framing protocol inline (frame header encoding/decoding, generation counter polling, writer count checks) because `selium-rpc` depended on `selium-guest`, creating a circular dependency. With `RpcClient` now residing in `selium-guest::io::rpc`, the inline implementation is unnecessary.
-**Migration**: No guest code changes required. `Context::lookup` retains the same signature and behavior.
+#### Scenario: Guest registers a URI via Context
+- **WHEN** a guest calls `ctx.register("sel://tenant/logs/app", target).await`
+- **THEN** the method SHALL send `DiscoveryRequest::Register` via the RPC client and return `Ok(())` on `DiscoveryResponse::Registered`
+
+#### Scenario: Registration rejected (Forbidden)
+- **WHEN** a guest calls `ctx.register(uri, target).await` and the discovery service returns `DiscoveryResponse::Forbidden`
+- **THEN** the method SHALL return `Err(GuestError::Host("registration forbidden"))`
+
+### Requirement: Context revoke convenience method
+`Context` SHALL provide a `revoke(&mut self, uri: &str) -> Result<(), GuestError>` convenience method that delegates to `self.discovery().request(DiscoveryRequest::Revoke { uri: uri.to_string() }).await` and maps the response.
+
+#### Scenario: Guest revokes a URI via Context
+- **WHEN** a guest calls `ctx.revoke("sel://tenant/logs/app").await`
+- **THEN** the method SHALL send `DiscoveryRequest::Revoke` via the RPC client and return `Ok(())` on `DiscoveryResponse::Revoked`

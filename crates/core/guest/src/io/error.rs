@@ -49,6 +49,8 @@ pub enum Error {
     IndexOutOfBounds,
     #[error("subscriber data was overwritten: publisher advanced past ring capacity")]
     Overwritten,
+    #[error("backpressure not supported on this channel")]
+    BackpressureNotSupported,
 }
 
 impl From<std::io::Error> for Error {

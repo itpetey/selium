@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+`selium-guest` SHALL provide frame-level I/O abstractions (`FramedRead`, `FramedWrite`, `FrameRead`, `FrameWrite`) that wrap shared-memory ring buffer readers and writers with frame header encoding, tag correlation, and generation counter tracking, enabling higher-level messaging patterns (pub/sub, RPC) to operate over a common framed transport.
+
+## Requirements
 
 ### Requirement: FramedRead Type
 `selium-guest` SHALL provide a `FramedRead<R>` type that wraps any `FrameRead` implementor to provide frame-level read operations with `FrameHeader` decoding and tag extraction. The `FrameRead` trait provides `read_frame()`, `generation()`, and `poll_ready()` methods, enabling `FramedRead` to work generically over both strong and weak reader types while preserving frame-level semantics that `AsyncRead` cannot express.
@@ -54,3 +58,35 @@
 #### Scenario: FrameWrite provides frame-level write
 - **WHEN** a type implements `FrameWrite`
 - **THEN** it SHALL provide `write_frame(payload: &[u8], tag: u32) -> Result<()>`
+
+### Requirement: Channel creation with backpressure
+`Channel` SHALL provide `create(capacity: u64) -> Result<Self>` that creates a channel with default backpressure behaviour where writers respect blocking reader positions.
+
+#### Scenario: Channel created with default backpressure
+- **WHEN** a caller invokes `Channel::create(65536)`
+- **THEN** `blocking_writer()` SHALL succeed and writers SHALL respect blocking reader positions
+
+### Requirement: Channel backpressure error variant
+`selium_guest::io::Error` SHALL provide error variants appropriate for channel operations.
+
+#### Scenario: Error variant exists for channel operations
+- **WHEN** a channel operation encounters a backpressure-related error
+- **THEN** the error SHALL be representable via the existing `io::Error` type
+
+### Requirement: Strong Writer Backpressure via AsyncWrite
+`Writer` SHALL implement `tokio::io::AsyncWrite`. The `poll_write` method SHALL write bytes as a framed payload to the outbound ring buffer with strong-reader backpressure (`protect_readers = true`). If the buffer is full, `poll_write` SHALL return `Poll::Pending`.
+
+#### Scenario: Writer sends bytes
+- **WHEN** a caller invokes `poll_write(buf)` on a `Writer`
+- **THEN** the method SHALL reserve space in the ring buffer, write a frame containing the buffer bytes, and return `Poll::Ready(Ok(buf.len()))`
+
+#### Scenario: Writer buffer full
+- **WHEN** a caller invokes `poll_write(buf)` and the ring buffer cannot accommodate the frame without overwriting unread strong-reader data
+- **THEN** the method SHALL return `Poll::Pending`
+
+### Requirement: RingBuf creation with ResourceKind
+`RingBuf::create` SHALL accept `capacity: u64` and create a ring buffer with the standard coordination layout for shared memory communication.
+
+#### Scenario: RingBuf created with default parameters
+- **WHEN** a caller invokes `RingBuf::create(65536)`
+- **THEN** a ring buffer SHALL be created with the standard coordination layout

@@ -1,6 +1,6 @@
 use selium_abi::{
-    ActivityEvent, CapabilityGrant, GuestLogEntry, HostcallOutput, HostcallRequest,
-    MeteringObservation, ProcessDescriptor,
+    ActivityEvent, CapabilityGrant, HostcallOutput, HostcallRequest, MeteringObservation,
+    ProcessDescriptor,
 };
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
@@ -74,24 +74,6 @@ impl Metering {
         match hostcall_ready(HostcallRequest::MeteringRead { process_id })? {
             HostcallOutput::Metering(observation) => Ok(Some(observation)),
             HostcallOutput::Empty => Ok(None),
-            _ => Err(GuestError::UnexpectedHostcallOutput),
-        }
-    }
-}
-
-impl GuestLog {
-    /// Writes a guest log entry.
-    pub fn write(entry: GuestLogEntry) -> Result<()> {
-        match hostcall_ready(HostcallRequest::GuestLogWrite { entry })? {
-            HostcallOutput::Empty => Ok(()),
-            _ => Err(GuestError::UnexpectedHostcallOutput),
-        }
-    }
-
-    /// Reads guest log entries from a cursor, optionally filtering by process.
-    pub fn read_from(cursor: usize, process_id: Option<u64>) -> Result<Vec<GuestLogEntry>> {
-        match hostcall_ready(HostcallRequest::GuestLogRead { cursor, process_id })? {
-            HostcallOutput::GuestLogEntries(entries) => Ok(entries),
             _ => Err(GuestError::UnexpectedHostcallOutput),
         }
     }

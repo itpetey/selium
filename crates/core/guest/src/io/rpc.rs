@@ -102,6 +102,7 @@ pub struct RpcClient<Req, Rep> {
 pub struct RpcConnection<Req, Rep> {
     request_reader: FramedRead<BlockingReader>,
     reply_writer: FramedWrite<BlockingWriter>,
+    client_process_id: u64,
     _phantom: PhantomData<(Req, Rep)>,
 }
 
@@ -289,6 +290,7 @@ where
         Ok(Self {
             request_reader,
             reply_writer,
+            client_process_id: 0,
             _phantom: PhantomData,
         })
     }
@@ -311,8 +313,14 @@ where
         Ok(Self {
             request_reader,
             reply_writer,
+            client_process_id: 0,
             _phantom: PhantomData,
         })
+    }
+
+    /// Returns the process id of the connected client (set by the runtime).
+    pub fn client_process_id(&self) -> u64 {
+        self.client_process_id
     }
 
     /// Receives the next request from the client.
@@ -710,6 +718,7 @@ mod tests {
         let server = RpcConnection {
             request_reader: server_req_reader,
             reply_writer: server_reply_writer,
+            client_process_id: 0,
             _phantom: PhantomData,
         };
 

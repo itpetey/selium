@@ -74,6 +74,61 @@ impl Context {
         match response {
             DiscoveryResponse::Found(target) => Ok(Some(target)),
             DiscoveryResponse::NotFound => Ok(None),
+            DiscoveryResponse::Registered | DiscoveryResponse::Revoked | DiscoveryResponse::Forbidden => {
+                Err(GuestError::Host("unexpected discovery response variant".to_string()))
+            }
+        }
+    }
+
+    /// Registers a URI→target mapping in the discovery service.
+    ///
+    /// Convenience method that delegates to `self.discovery().request()`.
+    /// Returns `Err(GuestError::Host("registration forbidden"))` if the discovery
+    /// service rejects the registration.
+    #[cfg(feature = "io")]
+    pub async fn register(&mut self, uri: &str, target: ResourceTarget) -> Result<(), GuestError> {
+        let request = DiscoveryRequest::Register {
+            uri: uri.to_string(),
+            target,
+        };
+
+        let response = self
+            .discovery()
+            .request(request)
+            .await
+            .map_err(|e| GuestError::Host(format!("discovery register: {e}")))?;
+
+        match response {
+            DiscoveryResponse::Registered => Ok(()),
+            DiscoveryResponse::Forbidden => {
+                Err(GuestError::Host("registration forbidden: process does not own resource".to_string()))
+            }
+            other => Err(GuestError::Host(format!(
+                "unexpected discovery response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Revokes a URI→target mapping in the discovery service.
+    ///
+    /// Convenience method that delegates to `self.discovery().request()`.
+    #[cfg(feature = "io")]
+    pub async fn revoke(&mut self, uri: &str) -> Result<(), GuestError> {
+        let request = DiscoveryRequest::Revoke {
+            uri: uri.to_string(),
+        };
+
+        let response = self
+            .discovery()
+            .request(request)
+            .await
+            .map_err(|e| GuestError::Host(format!("discovery revoke: {e}")))?;
+
+        match response {
+            DiscoveryResponse::Revoked => Ok(()),
+            other => Err(GuestError::Host(format!(
+                "unexpected discovery response: {other:?}"
+            ))),
         }
     }
 
@@ -93,5 +148,33 @@ mod tests {
         assert!(result.is_err());
         // In native mode, ResourceSender::attach(0) fails because there's
         // no host queue infrastructure.
+    }
+
+    /// Verifies that Context::register and Context::revoke methods exist
+    /// with the correct signatures. Full RPC-based testing requires the
+    /// runtime infrastructure and is covered by integration tests.
+    #[cfg(feature = "io")]
+    #[test]
+    fn register_and_revoke_method_signatures() {
+        // Verify the methods exist with correct signatures by checking
+        // that they would compile if called on a Context.
+        fn _assert_register_signature(ctx: &mut Context) {
+            let _ = async {
+                let target = ResourceTarget {
+                    uri: "sel://test".to_string(),
+                    host_id: "host".to_string(),
+                    resource_id: 1,
+                    interface: None,
+                    tenant: None,
+                };
+                let _: Result<(), GuestError> = ctx.register("sel://test", target).await;
+            };
+        }
+
+        fn _assert_revoke_signature(ctx: &mut Context) {
+            let _ = async {
+                let _: Result<(), GuestError> = ctx.revoke("sel://test").await;
+            };
+        }
     }
 }

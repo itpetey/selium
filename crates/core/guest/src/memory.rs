@@ -1,4 +1,4 @@
-use selium_abi::{HostcallOutput, HostcallRequest, RegionAllocation, RegionAttachment, RegionProt};
+use selium_abi::{HostcallOutput, HostcallRequest, RegionAllocation, RegionAttachment, RegionProt, ResourceKind};
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
@@ -16,8 +16,8 @@ pub struct SharedRegion {
 
 impl SharedRegion {
     /// Allocates a shared memory region with the requested number of pages.
-    pub fn allocate(pages: u32, prot: RegionProt) -> Result<Self> {
-        match hostcall_ready(HostcallRequest::AllocRegion { pages, prot })? {
+    pub fn allocate(pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Self> {
+        match hostcall_ready(HostcallRequest::AllocRegion { pages, prot, purpose })? {
             HostcallOutput::RegionAlloc(allocation) => Ok(Self { allocation }),
             _ => Err(GuestError::UnexpectedHostcallOutput),
         }

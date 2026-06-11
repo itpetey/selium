@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use selium_abi::ResourceKind;
+
 use crate::io::error::{Error, Result};
 
 /// Byte offset where ring buffer data begins (page 1).
@@ -274,8 +276,8 @@ impl RegionBuilder {
     /// Creates a new shared memory region for a ring buffer of the given capacity.
     ///
     /// In native mode this uses a heap allocation. In WASM mode it would call
-    /// the `alloc_region` hostcall.
-    pub fn create(capacity: u64) -> Result<ChannelRegion> {
+    /// the `alloc_region` hostcall with the given `purpose` tag.
+    pub fn create(capacity: u64, _purpose: ResourceKind) -> Result<ChannelRegion> {
         let total_aligned = aligned_region_size(capacity)?;
         let mapping = RegionMapping::allocate(total_aligned)?;
         Ok(ChannelRegion {
@@ -703,7 +705,7 @@ mod tests {
 
     #[test]
     fn channel_region_reserve_tail_with_backoff() {
-        let region = RegionBuilder::create(64).expect("create");
+        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
         let pos = region.reserve_tail(8, false).expect("reserve");
         assert_eq!(pos, 0);
@@ -713,7 +715,9 @@ mod tests {
 
     #[test]
     fn exponential_backoff_under_concurrent_contention() {
-        let region = std::sync::Arc::new(RegionBuilder::create(4096).expect("create"));
+        let region = std::sync::Arc::new(
+            RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create"),
+        );
         region.initialise().expect("init");
 
         let mut handles = Vec::new();
@@ -741,7 +745,7 @@ mod tests {
     fn two_writers_coordinate_on_shared_next_tail() {
         // Two ChannelRegion clones sharing the same underlying mapping
         // simulate cross-process writers.
-        let region_a = RegionBuilder::create(4096).expect("create");
+        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -764,7 +768,7 @@ mod tests {
 
     #[test]
     fn reader_sees_writer_count_from_cloned_region() {
-        let region_a = RegionBuilder::create(64).expect("create");
+        let region_a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -779,7 +783,7 @@ mod tests {
 
     #[test]
     fn writer_backpressure_from_shared_reader_slots() {
-        let region = RegionBuilder::create(64).expect("create");
+        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Allocate a reader slot at position 0.
@@ -813,7 +817,7 @@ mod tests {
 
     #[test]
     fn reader_detects_eof_when_writer_count_reaches_zero() {
-        let region = RegionBuilder::create(64).expect("create");
+        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Initially no writers.
@@ -830,7 +834,7 @@ mod tests {
 
     #[test]
     fn shared_reader_slot_counter_allocates_unique_indices() {
-        let region_a = RegionBuilder::create(4096).expect("create");
+        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -842,7 +846,7 @@ mod tests {
 
     #[test]
     fn shared_writer_id_allocation() {
-        let region_a = RegionBuilder::create(64).expect("create");
+        let region_a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 

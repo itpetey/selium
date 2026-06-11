@@ -44,6 +44,9 @@ pub enum Error {
     #[error("wasmtiny runtime error: {0}")]
     /// Underlying Wasmtiny operation failed.
     Wasm(String),
+    #[error("host operation failed: {0}")]
+    /// Host-side operation failed (e.g., discovery RPC).
+    Host(String),
 }
 
 pub(crate) fn kernel_error(error: selium_kernel::Error) -> AbiError {

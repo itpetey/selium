@@ -4,10 +4,11 @@ use std::{
 };
 
 use selium_abi::{
-    AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, GuestLogEntry,
-    HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass, ResourceIdentity,
-    ResourceSelector, TaskId,
+    AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
+    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
+    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId,
 };
+use selium_guest::FlatMsg;
 use wasmtiny::RegionProt as WasmProt;
 
 use crate::{
@@ -136,8 +137,9 @@ impl Runtime {
         }
 
         match request {
-            HostcallRequest::AllocRegion { pages, prot } => {
-                // Ignore unused `prot` field
+            HostcallRequest::AllocRegion { pages, prot, purpose } => {
+                // Ignore unused `prot` field; `purpose` is informational and used
+                // for Tier-1 discovery registration.
                 let _prot = prot;
 
                 self.require(
@@ -164,6 +166,29 @@ impl Runtime {
                 let page_offset = 0;
 
                 self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
+
+                // Tier-1 discovery registration: generate URIs and track them.
+                let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
+
+                // Enqueue Register operations for each URI.
+                for uri in &uris {
+                    let target = ResourceTarget {
+                        uri: uri.clone(),
+                        host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
+                        resource_id: shared_id,
+                        interface: None,
+                        tenant: None, // TODO: populate from process authority when tenant tracking is added
+                    };
+                    self.pending_discovery_ops.lock().push_back(
+                        DiscoveryRequest::Register {
+                            uri: uri.clone(),
+                            target,
+                        },
+                    );
+                }
+
+                crate::discovery::record_uris(&self.process_discovery_uris, process_id, uris);
+
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAlloc(
                     selium_abi::RegionAllocation {
                         region_id: shared_id,
@@ -713,7 +738,9 @@ impl Runtime {
                     ResourceClass::GuestLog,
                     target_process_id.map(ResourceIdentity::Local),
                 )?;
-                let logs = self
+
+                // Read from the legacy guest_logs vec (existing path).
+                let mut logs: Vec<GuestLogEntry> = self
                     .kernel
                     .read_guest_logs_from(cursor)
                     .into_iter()
@@ -721,6 +748,24 @@ impl Runtime {
                         target_process_id.is_none() || entry.process_id == target_process_id
                     })
                     .collect();
+
+                // Also drain from log channels if target process has one.
+                if let Some(target_pid) = target_process_id {
+                    if let Ok(frames) = self.kernel.drain_log_channel(target_pid) {
+                        for frame in frames {
+                            // Decode FlatBuffer LogRecord into GuestLogEntry.
+                            if let Ok(record) = selium_guest::log::LogRecord::decode(&frame) {
+                                logs.push(GuestLogEntry {
+                                    process_id: Some(target_pid),
+                                    level: format!("{:?}", record.level),
+                                    target: record.target,
+                                    message: record.message,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 Ok(HostOperationState::Ready(HostcallOutput::GuestLogEntries(
                     logs,
                 )))
@@ -740,6 +785,30 @@ impl Runtime {
             HostcallRequest::Sleep { millis } => {
                 let deadline = Instant::now() + Duration::from_millis(millis);
                 Ok(HostOperationState::SleepWait { deadline })
+            }
+            HostcallRequest::GuestLogRegister { shared_id } => {
+                // Validate that shared_id belongs to the calling process.
+                let owns = self
+                    .shared_resource_owners
+                    .lock()
+                    .get(&(ResourceClass::SharedRegion, shared_id))
+                    .is_some_and(|owners| owners.contains(&process_id));
+
+                if !owns {
+                    return Err(AbiError::new(
+                        AbiErrorCode::DetachedResource,
+                        format!("GuestLogRegister: shared_id {shared_id} not owned by process {process_id}"),
+                    ));
+                }
+
+                // Register the log channel with the kernel. The kernel stores
+                // the shared_id per process; actual channel reading is done
+                // via the kernel's shared memory primitives.
+                self.kernel
+                    .register_log_channel(process_id, shared_id)
+                    .map_err(kernel_error)?;
+
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
         }
     }
@@ -1015,6 +1084,7 @@ mod tests {
             HostcallRequest::AllocRegion {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
             },
         );
         let (second_status, second_id) = runtime.begin_hostcall(
@@ -1022,6 +1092,7 @@ mod tests {
             HostcallRequest::AllocRegion {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
             },
         );
 
@@ -1310,5 +1381,63 @@ mod tests {
             ready(&runtime, bootstrapped.process_id, stop_op),
             HostcallOutput::Empty
         );
+    }
+
+    #[test]
+    fn guest_log_register_valid_and_foreign() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+
+        // Allocate a shared region owned by this process.
+        let (_, alloc_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::LogChannel,
+            },
+        );
+        let HostcallOutput::RegionAlloc(alloc) =
+            ready(&runtime, bootstrapped.process_id, alloc_op)
+        else {
+            panic!("expected RegionAlloc");
+        };
+
+        // GuestLogRegister with own shared_id should succeed.
+        let (_, reg_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::GuestLogRegister {
+                shared_id: alloc.region_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, reg_op),
+            HostcallOutput::Empty
+        );
+
+        // Verify the kernel recorded the log channel.
+        assert_eq!(
+            runtime
+                .kernel()
+                .log_channel_shared_id(bootstrapped.process_id),
+            Some(alloc.region_id)
+        );
+
+        // GuestLogRegister with a non-existent shared_id should fail.
+        let (status, foreign_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::GuestLogRegister { shared_id: 99999 },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        assert!(matches!(
+            runtime.poll_hostcall(bootstrapped.process_id, foreign_op),
+            CompletionState::Failed(_)
+        ));
     }
 }

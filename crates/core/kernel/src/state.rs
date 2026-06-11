@@ -63,11 +63,23 @@ pub(crate) struct BlobStoreState {
     pub(crate) manifests: HashMap<String, String>,
 }
 
+/// State for a log channel attached by a process via GuestLogRegister.
+pub(crate) struct LogChannelState {
+    /// Local mapping id for reading from the shared region.
+    pub(crate) local_mapping_id: u64,
+    /// Current read position (tail cursor) in the ring buffer.
+    pub(crate) read_position: u64,
+}
+
 pub(crate) struct ProcessState {
     pub(crate) module_id: String,
     pub(crate) entrypoint: String,
     pub(crate) running: bool,
     pub(crate) grants: Vec<CapabilityGrant>,
+    /// Shared region id of the log channel registered via `GuestLogRegister`, if any.
+    pub(crate) log_channel_shared_id: Option<SharedResourceId>,
+    /// Log channel state for reading frames, if a log channel is registered.
+    pub(crate) log_channel_state: Option<LogChannelState>,
 }
 
 pub(crate) struct KernelInner {

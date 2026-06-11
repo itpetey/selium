@@ -32,6 +32,7 @@ fn foundation_crates_work_together_through_hostcalls() {
         HostcallRequest::AllocRegion {
             pages: 1,
             prot: RegionProt::ReadWrite,
+            purpose: selium_abi::ResourceKind::SharedMemory,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -70,6 +71,7 @@ fn hostcalls_enforce_session_grants() {
         HostcallRequest::AllocRegion {
             pages: 1,
             prot: RegionProt::ReadWrite,
+            purpose: selium_abi::ResourceKind::SharedMemory,
         },
     );
 
