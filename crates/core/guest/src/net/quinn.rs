@@ -3,37 +3,68 @@ use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
-    sync::atomic::{Ordering, fence},
+    sync::{
+        Arc,
+        atomic::{Ordering, fence},
+    },
     task::{Context, Poll},
 };
 
-use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, udp::RecvMeta};
+use quinn::{AsyncUdpSocket, UdpSender, udp::RecvMeta};
+// AsyncTimer and Runtime are used in #[cfg(target_arch = "wasm32")] blocks
+#[cfg(target_arch = "wasm32")]
+use quinn::{AsyncTimer, Runtime};
 
-use crate::{
-    Instant,
-    io::{FrameHeader, RingBuf},
-    net::udp::UdpSocket,
-};
+use crate::{io::FrameHeader, net::udp::UdpSocket};
 
-pub struct QuinnUdpSocket(UdpSocket);
+/// Shared socket state that can be cheaply cloned between the async socket
+/// and any number of senders.
+///
+/// The read cursor (`read_pos`) is intentionally NOT in this struct — it is
+/// owned exclusively by [`QuinnUdpSocket`] so that only one task drives
+/// `poll_recv`.
+struct UdpSocketInner {
+    local_addr: SocketAddr,
+    recv_ring: crate::io::RingBuf,
+    send_ring: crate::io::RingBuf,
+}
+
+pub struct QuinnUdpSocket {
+    inner: Arc<UdpSocketInner>,
+    read_pos: u64,
+}
 
 #[derive(Debug)]
 pub struct SeliumQuinnRuntime;
 
 struct QuinnUdpSender {
-    inner: UdpSocket,
+    inner: Arc<UdpSocketInner>,
 }
 
-impl QuinnUdpSocket {
-    pub(crate) fn new(sock: UdpSocket) -> Self {
-        Self(sock)
+#[cfg(target_arch = "wasm32")]
+fn from_quinn_instant(qi: web_time::Instant) -> crate::time::Instant {
+    let zero = web_time::Instant::from(std::time::Duration::ZERO);
+    let duration = qi.duration_since(zero);
+    crate::time::Instant::from_nanos(duration.as_nanos() as u64)
+}
+
+impl From<UdpSocket> for QuinnUdpSocket {
+    fn from(socket: UdpSocket) -> Self {
+        Self {
+            inner: Arc::new(UdpSocketInner {
+                local_addr: socket.local_addr,
+                recv_ring: socket.recv_ring,
+                send_ring: socket.send_ring,
+            }),
+            read_pos: socket.read_pos,
+        }
     }
 }
 
 impl AsyncUdpSocket for QuinnUdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(QuinnUdpSender {
-            inner: self.0.clone(),
+            inner: self.inner.clone(),
         })
     }
 
@@ -43,8 +74,8 @@ impl AsyncUdpSocket for QuinnUdpSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let recv_ring = &self.0.recv_ring;
-        let read_pos = &mut self.0.read_pos;
+        let recv_ring = &self.inner.recv_ring;
+        let read_pos = &mut self.read_pos;
 
         // Check if writer is still connected
         let writer_count = recv_ring
@@ -112,20 +143,20 @@ impl AsyncUdpSocket for QuinnUdpSocket {
 
         // Populate metadata
         if !meta.is_empty() {
-            meta[0] = RecvMeta {
-                len: to_copy,
-                stride: to_copy,
-                addr,
-                ecn: None,
-                dst_ip: None,
-            };
+            let mut m = <RecvMeta as std::default::Default>::default();
+            m.len = to_copy;
+            m.stride = to_copy;
+            m.addr = addr;
+            m.ecn = None;
+            m.dst_ip = None;
+            meta[0] = m;
         }
 
         Poll::Ready(Ok(1))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.0.local_addr)
+        Ok(self.inner.local_addr)
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -140,14 +171,13 @@ impl AsyncUdpSocket for QuinnUdpSocket {
 impl Debug for QuinnUdpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuinnUdpSocket")
-            .field("local_addr", &self.0.local_addr)
+            .field("local_addr", &self.inner.local_addr)
             .finish()
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Runtime for SeliumQuinnRuntime {
-    type Instant = Instant;
-
     fn spawn(&self, future: Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
         // Bridge Send-bound future to the guest's single-threaded runtime.
         // SAFETY: The guest runtime is single-threaded and cooperative.
@@ -158,23 +188,22 @@ impl Runtime for SeliumQuinnRuntime {
         crate::async_runtime::spawn(fut);
     }
 
-    fn new_timer(
-        &self,
-        deadline: Self::Instant,
-    ) -> Pin<Box<dyn AsyncTimer<Instant = Self::Instant>>> {
-        Box::pin(crate::time::Timer::new(deadline))
+    fn new_timer(&self, deadline: web_time::Instant) -> Pin<Box<dyn AsyncTimer>> {
+        Box::pin(crate::time::Timer::new(from_quinn_instant(deadline)))
     }
 
     #[cfg(not(target_family = "wasm"))]
     fn wrap_udp_socket(&self, _socket: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "use new_with_abstract_socket for QuinnUdpSocket",
+            "use Endpoint::new_with_abstract_socket for QuinnUdpSocket",
         ))
     }
 
-    fn now(&self) -> Instant {
-        Instant::now()
+    fn now(&self) -> web_time::Instant {
+        let i = crate::time::Instant::now();
+        let d = std::time::Duration::from_nanos(i.as_nanos());
+        web_time::Instant::from(d)
     }
 }
 
@@ -219,51 +248,13 @@ impl Debug for QuinnUdpSender {
     }
 }
 
-impl quinn::RuntimeInstant for Instant {
-    type Duration = Duration;
-
-    fn now() -> Self {
-        Instant::now()
+#[cfg(target_arch = "wasm32")]
+impl quinn::AsyncTimer for crate::time::Timer {
+    fn reset(self: Pin<&mut Self>, deadline: web_time::Instant) {
+        self.get_mut().set_deadline(from_quinn_instant(deadline));
     }
 
-    fn duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::duration_since(self, earlier)
-    }
-
-    fn checked_duration_since(&self, earlier: Self) -> Option<Self::Duration> {
-        Instant::checked_duration_since(self, earlier)
-    }
-
-    fn saturating_duration_since(&self, earlier: Self) -> Self::Duration {
-        Instant::saturating_duration_since(self, earlier)
-    }
-
-    fn elapsed(&self) -> Self::Duration {
-        Instant::elapsed(self)
-    }
-
-    fn checked_add(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_add(self, duration)
-    }
-
-    fn checked_sub(&self, duration: Self::Duration) -> Option<Self> {
-        Instant::checked_sub(self, duration)
-    }
-}
-
-impl quinn::AsyncTimer for Timer {
-    type Instant = Instant;
-
-    fn reset(self: std::pin::Pin<&mut Self>, deadline: Instant) {
-        let this = self.get_mut();
-        this.cancel_wait();
-        this.deadline = deadline;
-    }
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         std::future::Future::poll(self, cx)
     }
 }

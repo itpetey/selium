@@ -25,8 +25,7 @@ keywords = ["data", "etl", "streaming", "wasm", "webassembly"]
 categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
-# axum = { version = "0.8", default-features = false }
-axum = { path = "../../axum/axum", default-features = false }
+axum = { git = "https://github.com/tokio-rs/axum", default-features = false }
 blake3 = { version = "1.8", default-features = false }
 bytes = { version = "1.10", default-features = false }
 flatbuffers = { version = "25.12", default-features = false }
@@ -35,7 +34,6 @@ flatc-fork = { version = "0.6.0", default-features = false }
 futures = { version = "0.3", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
-# quinn = { version = "0.11", default-features = false }
 quinn = { path = "../../quinn/quinn", default-features = false }
 quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
@@ -52,6 +50,7 @@ tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", default-features = false }
 wasmtiny = { path = "../../../wasmtiny" }
 wat = { version = "1.251", default-features = false }
+web-time = { path = "../../web-time/", default-features = false }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"

@@ -22,15 +22,22 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"], optional = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["registry"], optional = true }
+tracing-subscriber = {
+  workspace = true,
+  features = ["registry"],
+  optional = true
+}
+
+[dev-dependencies]
+flatbuffers.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [build-dependencies]
 flatbuffers-build.workspace = true
 flatc-fork.workspace = true
 
-[dev-dependencies]
-flatbuffers.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+web-time = { workspace = true }
 
 [features]
 default = ["io", "logging"]

@@ -174,6 +174,12 @@ impl Timer {
     pub fn cancel_wait(&mut self) {
         self.sleep_future = None;
     }
+
+    /// Updates the deadline, cancelling any in-flight sleep.
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+        self.cancel_wait();
+    }
 }
 
 impl std::fmt::Debug for Timer {
