@@ -14,11 +14,11 @@ use wasmtiny::{WasmApplication, WasmValue};
 use crate::{config::ProcessAuthority, error::Result, mailbox::GuestMailbox};
 
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-/// URIs registered in discovery per process (for revocation on termination).
-pub(crate) type ProcessDiscoveryUris = HashMap<ProcessId, Vec<String>>;
 /// Queue of pending discovery operations to be flushed asynchronously.
 pub(crate) type PendingDiscoveryOps = VecDeque<DiscoveryRequest>;
+/// URIs registered in discovery per process (for revocation on termination).
+pub(crate) type ProcessDiscoveryUris = HashMap<ProcessId, Vec<String>>;
+pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]

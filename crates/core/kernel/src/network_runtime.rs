@@ -30,6 +30,8 @@ const GENERATION_COUNTER_OFFSET: u64 = 0;
 const KERNEL_READER_SLOT: u32 = 0;
 /// Maximum number of blocking reader slots.
 const MAX_READER_SLOTS: u32 = 128;
+/// Maximum number of blocking writer slots.
+const MAX_WRITER_SLOTS: u32 = 128;
 /// Offset of the shared `next_tail` cursor (u64) in page 0.
 const NEXT_TAIL_OFFSET: u64 = 8;
 /// Offset of the shared `next_writer_id` counter (u64).
@@ -51,8 +53,6 @@ const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 const WRITER_COUNT_OFFSET: u64 = 16;
 /// Offset where the shared `writer_slots` array begins (128 × u64).
 const WRITER_SLOTS_OFFSET: u64 = 1080;
-/// Maximum number of blocking writer slots.
-const MAX_WRITER_SLOTS: u32 = 128;
 /// Offset of the shared `writer_slot_counter` (u64).
 const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
 

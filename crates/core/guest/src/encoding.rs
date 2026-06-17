@@ -346,16 +346,15 @@ impl From<DiscoveryRequestWire> for selium_abi::DiscoveryRequest {
         match wire.variant {
             0 => selium_abi::DiscoveryRequest::Resolve(wire.uri),
             1 => {
-                let target = wire
-                    .target
-                    .map(selium_abi::ResourceTarget::from)
-                    .unwrap_or(selium_abi::ResourceTarget {
+                let target = wire.target.map(selium_abi::ResourceTarget::from).unwrap_or(
+                    selium_abi::ResourceTarget {
                         uri: String::new(),
                         host_id: String::new(),
                         resource_id: 0,
                         interface: None,
                         tenant: None,
-                    });
+                    },
+                );
                 selium_abi::DiscoveryRequest::Register {
                     uri: wire.uri,
                     target,

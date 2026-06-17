@@ -423,6 +423,22 @@ pub enum ResourceKind {
     SharedMemory,
 }
 
+/// Target resource returned by discovery resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ResourceTarget {
+    /// URI of the resource.
+    pub uri: String,
+    /// Host id where the resource resides.
+    pub host_id: String,
+    /// Resource identifier.
+    pub resource_id: u64,
+    /// Optional interface metadata.
+    pub interface: Option<InterfaceMetadata>,
+    /// Optional tenant identifier for multi-tenant isolation.
+    pub tenant: Option<String>,
+}
+
 /// Request sent to the discovery service.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -441,22 +457,6 @@ pub enum DiscoveryRequest {
         /// URI to revoke.
         uri: String,
     },
-}
-
-/// Target resource returned by discovery resolution.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct ResourceTarget {
-    /// URI of the resource.
-    pub uri: String,
-    /// Host id where the resource resides.
-    pub host_id: String,
-    /// Resource identifier.
-    pub resource_id: u64,
-    /// Optional interface metadata.
-    pub interface: Option<InterfaceMetadata>,
-    /// Optional tenant identifier for multi-tenant isolation.
-    pub tenant: Option<String>,
 }
 
 /// Response from the discovery service.

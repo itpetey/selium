@@ -137,7 +137,11 @@ impl Runtime {
         }
 
         match request {
-            HostcallRequest::AllocRegion { pages, prot, purpose } => {
+            HostcallRequest::AllocRegion {
+                pages,
+                prot,
+                purpose,
+            } => {
                 // Ignore unused `prot` field; `purpose` is informational and used
                 // for Tier-1 discovery registration.
                 let _prot = prot;
@@ -179,12 +183,12 @@ impl Runtime {
                         interface: None,
                         tenant: None, // TODO: populate from process authority when tenant tracking is added
                     };
-                    self.pending_discovery_ops.lock().push_back(
-                        DiscoveryRequest::Register {
+                    self.pending_discovery_ops
+                        .lock()
+                        .push_back(DiscoveryRequest::Register {
                             uri: uri.clone(),
                             target,
-                        },
-                    );
+                        });
                 }
 
                 crate::discovery::record_uris(&self.process_discovery_uris, process_id, uris);
@@ -803,7 +807,9 @@ impl Runtime {
                 if !owns {
                     return Err(AbiError::new(
                         AbiErrorCode::DetachedResource,
-                        format!("GuestLogRegister: shared_id {shared_id} not owned by process {process_id}"),
+                        format!(
+                            "GuestLogRegister: shared_id {shared_id} not owned by process {process_id}"
+                        ),
                     ));
                 }
 
@@ -1409,8 +1415,7 @@ mod tests {
                 purpose: selium_abi::ResourceKind::LogChannel,
             },
         );
-        let HostcallOutput::RegionAlloc(alloc) =
-            ready(&runtime, bootstrapped.process_id, alloc_op)
+        let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, bootstrapped.process_id, alloc_op)
         else {
             panic!("expected RegionAlloc");
         };

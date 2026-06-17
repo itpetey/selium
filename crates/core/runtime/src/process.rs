@@ -146,9 +146,9 @@ impl Runtime {
 
         // Enqueue Revoke operations for each URI.
         for uri in revoked_uris {
-            self.pending_discovery_ops.lock().push_back(
-                selium_abi::DiscoveryRequest::Revoke { uri },
-            );
+            self.pending_discovery_ops
+                .lock()
+                .push_back(selium_abi::DiscoveryRequest::Revoke { uri });
         }
 
         let owned_handles = self

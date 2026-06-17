@@ -694,8 +694,7 @@ mod tests {
         rep_region.initialise()?;
 
         // Client: writer on request ring, reader on reply ring
-        let client_req_backpressure =
-            ChannelBackpressure::from_u8(req_region.load_backpressure()?);
+        let client_req_backpressure = ChannelBackpressure::from_u8(req_region.load_backpressure()?);
         let client_req_writer = BlockingWriter::new(req_region.clone(), client_req_backpressure)?;
         let client_req_writer = FramedWrite::new(client_req_writer);
 

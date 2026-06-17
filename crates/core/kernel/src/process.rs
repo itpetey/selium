@@ -148,7 +148,10 @@ impl Kernel {
     }
 
     /// Returns the log channel shared region id for a process, if registered.
-    pub fn log_channel_shared_id(&self, process_id: ProcessId) -> Option<selium_abi::SharedResourceId> {
+    pub fn log_channel_shared_id(
+        &self,
+        process_id: ProcessId,
+    ) -> Option<selium_abi::SharedResourceId> {
         self.inner
             .processes
             .lock()
@@ -209,14 +212,22 @@ impl Kernel {
             let raw_pos = read_pos & mask;
 
             // Read the 12-byte header.
-            let header_bytes =
-                self.read_shared_memory(local_mapping_id, DATA_OFFSET + raw_pos, HEADER_SIZE as usize)?;
+            let header_bytes = self.read_shared_memory(
+                local_mapping_id,
+                DATA_OFFSET + raw_pos,
+                HEADER_SIZE as usize,
+            )?;
 
             if header_bytes.len() < HEADER_SIZE as usize {
                 break;
             }
 
-            let len = u32::from_le_bytes([header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3]]);
+            let len = u32::from_le_bytes([
+                header_bytes[0],
+                header_bytes[1],
+                header_bytes[2],
+                header_bytes[3],
+            ]);
             let flags = header_bytes[8];
 
             // Check READY flag.
@@ -245,14 +256,14 @@ impl Kernel {
                 payload.copy_from_slice(&data);
             } else {
                 // Payload wraps around.
-                let tail_data =
-                    self.read_shared_memory(local_mapping_id, DATA_OFFSET + payload_start, tail_len)?;
-                payload[..tail_len].copy_from_slice(&tail_data);
-                let head_data = self.read_shared_memory(
+                let tail_data = self.read_shared_memory(
                     local_mapping_id,
-                    DATA_OFFSET,
-                    payload_len - tail_len,
+                    DATA_OFFSET + payload_start,
+                    tail_len,
                 )?;
+                payload[..tail_len].copy_from_slice(&tail_data);
+                let head_data =
+                    self.read_shared_memory(local_mapping_id, DATA_OFFSET, payload_len - tail_len)?;
                 payload[tail_len..].copy_from_slice(&head_data);
             }
 

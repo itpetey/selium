@@ -26,19 +26,6 @@ pub fn purpose_alias(purpose: ResourceKind) -> Option<&'static str> {
     }
 }
 
-/// Generates the URIs to register for a given allocation.
-///
-/// Always returns `sel://process/<process_id>/regions/<region_id>`.
-/// If the purpose maps to a known alias, also returns
-/// `sel://process/<process_id>/<alias>`.
-pub fn registration_uris(process_id: ProcessId, region_id: u64, purpose: ResourceKind) -> Vec<String> {
-    let mut uris = vec![format!("sel://process/{process_id}/regions/{region_id}")];
-    if let Some(alias) = purpose_alias(purpose) {
-        uris.push(format!("sel://process/{process_id}/{alias}"));
-    }
-    uris
-}
-
 /// Records URIs registered for a process.
 pub fn record_uris(
     process_discovery_uris: &parking_lot::Mutex<std::collections::HashMap<ProcessId, Vec<String>>>,
@@ -50,6 +37,23 @@ pub fn record_uris(
         .entry(process_id)
         .or_default()
         .extend(uris);
+}
+
+/// Generates the URIs to register for a given allocation.
+///
+/// Always returns `sel://process/<process_id>/regions/<region_id>`.
+/// If the purpose maps to a known alias, also returns
+/// `sel://process/<process_id>/<alias>`.
+pub fn registration_uris(
+    process_id: ProcessId,
+    region_id: u64,
+    purpose: ResourceKind,
+) -> Vec<String> {
+    let mut uris = vec![format!("sel://process/{process_id}/regions/{region_id}")];
+    if let Some(alias) = purpose_alias(purpose) {
+        uris.push(format!("sel://process/{process_id}/{alias}"));
+    }
+    uris
 }
 
 /// Returns and removes all URIs registered for a process.
@@ -78,10 +82,7 @@ mod tests {
         let uris = registration_uris(42, 7, ResourceKind::LogChannel);
         assert_eq!(
             uris,
-            vec![
-                "sel://process/42/regions/7",
-                "sel://process/42/logs",
-            ]
+            vec!["sel://process/42/regions/7", "sel://process/42/logs",]
         );
     }
 
@@ -90,10 +91,7 @@ mod tests {
         let uris = registration_uris(99, 3, ResourceKind::LiveTable);
         assert_eq!(
             uris,
-            vec![
-                "sel://process/99/regions/3",
-                "sel://process/99/tables",
-            ]
+            vec!["sel://process/99/regions/3", "sel://process/99/tables",]
         );
     }
 
@@ -110,7 +108,11 @@ mod tests {
     #[test]
     fn record_and_take_uris() {
         let uris_map = parking_lot::Mutex::new(std::collections::HashMap::new());
-        record_uris(&uris_map, 42, vec!["sel://process/42/regions/7".to_string()]);
+        record_uris(
+            &uris_map,
+            42,
+            vec!["sel://process/42/regions/7".to_string()],
+        );
         record_uris(&uris_map, 42, vec!["sel://process/42/logs".to_string()]);
 
         let taken = take_uris(&uris_map, 42);

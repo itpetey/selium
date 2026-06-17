@@ -3,7 +3,11 @@ use std::{ffi::OsStr, fs, path::Path};
 use flatbuffers_build::BuilderOptions;
 use flatc_fork::flatc;
 
-const SCHEMAS: [&str; 3] = ["schemas/live_table.fbs", "schemas/discovery.fbs", "schemas/logging.fbs"];
+const SCHEMAS: [&str; 3] = [
+    "schemas/live_table.fbs",
+    "schemas/discovery.fbs",
+    "schemas/logging.fbs",
+];
 
 fn main() {
     // Don't run on docs.rs infrastructure to avoid kersplosions

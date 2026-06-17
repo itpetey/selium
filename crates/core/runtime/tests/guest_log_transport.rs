@@ -16,37 +16,6 @@ use selium_abi::{
 use selium_guest::io::channels::ChannelBackpressure;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
-}
-
-fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {
-    runtime
-        .spawn_system_guest(SystemGuestDescriptor {
-            name: name.to_string(),
-            module_id: format!("{name}-module"),
-            module_bytes: module_with_entrypoint("boot"),
-            entrypoint: "boot".to_string(),
-            arguments: Vec::new(),
-            grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
-        })
-        .expect("spawn guest")
-        .process_id
-}
-
-fn spawn_shared_memory_guest(runtime: &Runtime, name: &str) -> ProcessId {
-    spawn_guest(
-        runtime,
-        name,
-        vec![CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        )],
-    )
-}
-
 fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind) -> u64 {
     let (status, op_id) = runtime.begin_hostcall(
         process_id,
@@ -106,31 +75,6 @@ fn alloc_region_with_shared_memory_tracks_only_region_uri() {
     );
     // SharedMemory has no purpose alias.
     assert_eq!(uris.len(), 1, "expected only one URI for SharedMemory");
-}
-
-#[test]
-fn process_termination_revokes_discovery_uris() {
-    let runtime = Runtime::default();
-    let process_id = spawn_shared_memory_guest(&runtime, "terminating-guest");
-
-    // Allocate regions to generate discovery URIs.
-    let _r1 = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
-    let _r2 = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
-
-    // Verify URIs are tracked.
-    assert!(
-        runtime.process_discovery_uris().contains_key(&process_id),
-        "expected URIs to be tracked before termination"
-    );
-
-    // Stop the process — this should revoke all URIs.
-    runtime.stop_process(process_id).expect("stop process");
-
-    // Verify URIs are removed.
-    assert!(
-        !runtime.process_discovery_uris().contains_key(&process_id),
-        "expected URIs to be revoked after termination"
-    );
 }
 
 #[test]
@@ -214,21 +158,6 @@ fn drop_backpressure_channel_writer_never_blocks() {
 }
 
 #[test]
-fn park_backpressure_channel_accepts_blocking_writer() {
-    use selium_abi::ResourceKind;
-    use selium_guest::io::channels::Channel;
-
-    let channel =
-        Channel::create_with_backpressure(64, ChannelBackpressure::Park, ResourceKind::RpcRing)
-            .expect("create park channel");
-
-    // blocking_writer should succeed.
-    let _bw = channel
-        .blocking_writer()
-        .expect("blocking writer on Park channel");
-}
-
-#[test]
 fn guest_log_register_end_to_end() {
     let runtime = Runtime::default();
     let process_id = spawn_shared_memory_guest(&runtime, "log-register-e2e");
@@ -259,6 +188,50 @@ fn guest_log_register_end_to_end() {
     );
 }
 
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
+}
+
+#[test]
+fn park_backpressure_channel_accepts_blocking_writer() {
+    use selium_abi::ResourceKind;
+    use selium_guest::io::channels::Channel;
+
+    let channel =
+        Channel::create_with_backpressure(64, ChannelBackpressure::Park, ResourceKind::RpcRing)
+            .expect("create park channel");
+
+    // blocking_writer should succeed.
+    let _bw = channel
+        .blocking_writer()
+        .expect("blocking writer on Park channel");
+}
+
+#[test]
+fn process_termination_revokes_discovery_uris() {
+    let runtime = Runtime::default();
+    let process_id = spawn_shared_memory_guest(&runtime, "terminating-guest");
+
+    // Allocate regions to generate discovery URIs.
+    let _r1 = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
+    let _r2 = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
+
+    // Verify URIs are tracked.
+    assert!(
+        runtime.process_discovery_uris().contains_key(&process_id),
+        "expected URIs to be tracked before termination"
+    );
+
+    // Stop the process — this should revoke all URIs.
+    runtime.stop_process(process_id).expect("stop process");
+
+    // Verify URIs are removed.
+    assert!(
+        !runtime.process_discovery_uris().contains_key(&process_id),
+        "expected URIs to be revoked after termination"
+    );
+}
+
 #[test]
 fn purpose_alias_mapping_table() {
     use selium_runtime::discovery;
@@ -280,4 +253,31 @@ fn purpose_alias_mapping_table() {
     assert_eq!(discovery::purpose_alias(ResourceKind::DurableLog), None);
     assert_eq!(discovery::purpose_alias(ResourceKind::BlobStore), None);
     assert_eq!(discovery::purpose_alias(ResourceKind::SharedMemory), None);
+}
+
+fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {
+    runtime
+        .spawn_system_guest(SystemGuestDescriptor {
+            name: name.to_string(),
+            module_id: format!("{name}-module"),
+            module_bytes: module_with_entrypoint("boot"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants,
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+        })
+        .expect("spawn guest")
+        .process_id
+}
+
+fn spawn_shared_memory_guest(runtime: &Runtime, name: &str) -> ProcessId {
+    spawn_guest(
+        runtime,
+        name,
+        vec![CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        )],
+    )
 }

@@ -220,7 +220,11 @@ impl Drop for BlockingReader {
 }
 
 impl Reader {
-    pub(crate) fn new(region: ChannelRegion, start_pos: u64, backpressure: ChannelBackpressure) -> Self {
+    pub(crate) fn new(
+        region: ChannelRegion,
+        start_pos: u64,
+        backpressure: ChannelBackpressure,
+    ) -> Self {
         Self {
             region,
             pos: start_pos,

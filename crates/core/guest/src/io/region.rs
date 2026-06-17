@@ -8,14 +8,21 @@ use selium_abi::ResourceKind;
 
 use crate::io::error::{Error, Result};
 
+/// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
+pub const BACKPRESSURE_OFFSET: u64 = 1064;
 /// Byte offset where ring buffer data begins (page 1).
 pub const DATA_OFFSET: u64 = PAGE_SIZE;
 /// Byte offset of the generation counter within the shared region.
 pub const GENERATION_COUNTER_OFFSET: u64 = 0;
 /// Maximum number of blocking reader slots available in the shared region.
 pub const MAX_READER_SLOTS: usize = 128;
+/// Maximum number of blocking writer slots available in the shared region.
+pub const MAX_WRITER_SLOTS: usize = 128;
 /// Minimum region size that can hold a ring buffer (header page + one data page).
 pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
+static NATIVE_REGION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static NATIVE_REGION_REGISTRY: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 /// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
 pub const NEXT_TAIL_OFFSET: u64 = 8;
 /// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
@@ -26,54 +33,14 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const READER_SLOTS_OFFSET: u64 = 24;
 /// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
 pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
-/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
-pub const WRITER_COUNT_OFFSET: u64 = 16;
-/// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
-pub const BACKPRESSURE_OFFSET: u64 = 1064;
 /// Byte offset of the shared ring buffer capacity in bytes.
 pub const SHARED_CAPACITY_OFFSET: u64 = 1072;
+/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
+pub const WRITER_COUNT_OFFSET: u64 = 16;
 /// Byte offset where the shared `writer_slots` array begins (128 × u64).
 pub const WRITER_SLOTS_OFFSET: u64 = 1080;
-/// Maximum number of blocking writer slots available in the shared region.
-pub const MAX_WRITER_SLOTS: usize = 128;
 /// Byte offset of the shared `writer_slot_counter` (fetch_add for unique writer slot indices).
 pub const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
-
-// In WASM mode, shared regions are managed by the runtime kernel and mapped
-// via hostcalls. In native mode (tests), we simulate this with a global
-// registry that maps region_id → backing store, so that `create` and `attach`
-// share the same underlying memory.
-
-static NATIVE_REGION_COUNTER: AtomicU64 = AtomicU64::new(1);
-static NATIVE_REGION_REGISTRY: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-/// Registers a backing store in the native registry, returning a unique region_id.
-fn native_register_region(backing: Arc<Vec<u8>>) -> u64 {
-    let region_id = NATIVE_REGION_COUNTER.fetch_add(1, Ordering::SeqCst);
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .insert(region_id, backing);
-    region_id
-}
-
-/// Looks up a backing store by region_id. Returns `None` if not found.
-fn native_lookup_region(region_id: u64) -> Option<Arc<Vec<u8>>> {
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .get(&region_id)
-        .cloned()
-}
-
-/// Removes a region from the native registry.
-fn native_unregister_region(region_id: u64) {
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .remove(&region_id);
-}
 
 /// A direct-memory mapping of a shared region.
 ///
@@ -819,6 +786,33 @@ fn encode_reader_position(position: u64) -> Result<u64> {
 
 fn encode_writer_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
+}
+
+/// Looks up a backing store by region_id. Returns `None` if not found.
+fn native_lookup_region(region_id: u64) -> Option<Arc<Vec<u8>>> {
+    NATIVE_REGION_REGISTRY
+        .lock()
+        .expect("native registry poisoned")
+        .get(&region_id)
+        .cloned()
+}
+
+/// Registers a backing store in the native registry, returning a unique region_id.
+fn native_register_region(backing: Arc<Vec<u8>>) -> u64 {
+    let region_id = NATIVE_REGION_COUNTER.fetch_add(1, Ordering::SeqCst);
+    NATIVE_REGION_REGISTRY
+        .lock()
+        .expect("native registry poisoned")
+        .insert(region_id, backing);
+    region_id
+}
+
+/// Removes a region from the native registry.
+fn native_unregister_region(region_id: u64) {
+    NATIVE_REGION_REGISTRY
+        .lock()
+        .expect("native registry poisoned")
+        .remove(&region_id);
 }
 
 fn reserve_tail_next(

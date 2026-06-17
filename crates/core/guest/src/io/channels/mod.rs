@@ -13,6 +13,21 @@ pub use self::{
 pub mod reader;
 pub mod writer;
 
+/// Backpressure strategy for channel writers.
+///
+/// Determines how writers respond to slow blocking readers and slow blocking writers:
+/// - `Park`: writers block (return Pending) when the ring is full
+/// - `Drop`: writers silently drop data (return Ok without writing) when the ring is full
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelBackpressure {
+    /// Writers respect blocking reader and writer positions; writes block when consumers
+    /// or other blocking writers fall behind.
+    Park,
+    /// Writers never block; slow blocking consumers or blocking writers cause data to be
+    /// silently dropped.
+    Drop,
+}
+
 /// A shared-memory-backed channel with [non-]blocking reader and writer semantics.
 ///
 /// The channel stores framed messages in a lock-free ring buffer. Blocking readers
@@ -39,21 +54,6 @@ pub mod writer;
 pub struct Channel {
     ring: RingBuf,
     backpressure: ChannelBackpressure,
-}
-
-/// Backpressure strategy for channel writers.
-///
-/// Determines how writers respond to slow blocking readers and slow blocking writers:
-/// - `Park`: writers block (return Pending) when the ring is full
-/// - `Drop`: writers silently drop data (return Ok without writing) when the ring is full
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelBackpressure {
-    /// Writers respect blocking reader and writer positions; writes block when consumers
-    /// or other blocking writers fall behind.
-    Park,
-    /// Writers never block; slow blocking consumers or blocking writers cause data to be
-    /// silently dropped.
-    Drop,
 }
 
 impl ChannelBackpressure {

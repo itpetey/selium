@@ -10,6 +10,8 @@ use selium_guest::{
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
+/// Prefix for process-scoped URIs registered by the runtime (Tier 1).
+const PROCESS_URI_PREFIX: &str = "sel://process/";
 pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
@@ -29,9 +31,6 @@ pub struct DiscoveryStore {
     /// URI registrations.
     ownership: HashMap<(u64, u64), ()>,
 }
-
-/// Prefix for process-scoped URIs registered by the runtime (Tier 1).
-const PROCESS_URI_PREFIX: &str = "sel://process/";
 
 impl DiscoveryStore {
     pub fn register(&mut self, target: ResourceTarget) -> Option<ResourceTarget> {
@@ -84,7 +83,8 @@ impl DiscoveryStore {
     /// Removes all registrations and ownership entries for a process.
     pub fn revoke_process(&mut self, process_id: u64) {
         let prefix = format!("sel://process/{process_id}/");
-        self.registrations.retain(|uri, _| !uri.starts_with(&prefix));
+        self.registrations
+            .retain(|uri, _| !uri.starts_with(&prefix));
         self.ownership.retain(|(pid, _), _| *pid != process_id);
     }
 
@@ -96,9 +96,13 @@ impl DiscoveryStore {
     /// (`sel://process/<id>/...`), only returns `Found` if the caller's tenant
     /// matches the target's tenant. If either tenant is None, the check is skipped
     /// (backward compatible with non-tenant-aware registrations).
-    pub fn resolve_exact_scoped(&self, uri: &str, caller_tenant: Option<&str>) -> Option<ResourceTarget> {
+    pub fn resolve_exact_scoped(
+        &self,
+        uri: &str,
+        caller_tenant: Option<&str>,
+    ) -> Option<ResourceTarget> {
         let target = self.resolve_exact(uri)?;
-        
+
         // Only enforce tenant scoping for process-scoped URIs
         if uri.starts_with(PROCESS_URI_PREFIX) {
             // If caller provides a tenant and target has a tenant, they must match
@@ -108,7 +112,7 @@ impl DiscoveryStore {
                 }
             }
         }
-        
+
         Some(target)
     }
 
@@ -132,13 +136,6 @@ impl DiscoveryStore {
         target.interface = Some(metadata);
         true
     }
-}
-
-/// Extracts the process id from a `sel://process/<id>/...` URI, if present.
-fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
-    let rest = uri.strip_prefix(PROCESS_URI_PREFIX)?;
-    let id_str = rest.split('/').next()?;
-    id_str.parse().ok()
 }
 
 pub fn interface_metadata() -> InterfaceMetadata {
@@ -181,6 +178,13 @@ async fn discovery_main(listener_shared_id: u64) {
         let store = store.clone();
         selium_guest::spawn(handler(store, connection));
     }
+}
+
+/// Extracts the process id from a `sel://process/<id>/...` URI, if present.
+fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
+    let rest = uri.strip_prefix(PROCESS_URI_PREFIX)?;
+    let id_str = rest.split('/').next()?;
+    id_str.parse().ok()
 }
 
 async fn handler(
@@ -421,8 +425,14 @@ mod tests {
 
     #[test]
     fn extract_process_id_from_uri_works() {
-        assert_eq!(extract_process_id_from_uri("sel://process/42/regions/7"), Some(42));
-        assert_eq!(extract_process_id_from_uri("sel://process/99/logs"), Some(99));
+        assert_eq!(
+            extract_process_id_from_uri("sel://process/42/regions/7"),
+            Some(42)
+        );
+        assert_eq!(
+            extract_process_id_from_uri("sel://process/99/logs"),
+            Some(99)
+        );
         assert_eq!(extract_process_id_from_uri("sel://my-app/logs"), None);
         assert_eq!(extract_process_id_from_uri("not-a-uri"), None);
     }

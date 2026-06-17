@@ -10,12 +10,17 @@ use std::{
     task::{Context, Poll},
 };
 
-use quinn::{AsyncUdpSocket, UdpSender, udp::RecvMeta};
 // AsyncTimer and Runtime are used in #[cfg(target_arch = "wasm32")] blocks
 #[cfg(target_arch = "wasm32")]
 use quinn::{AsyncTimer, Runtime};
+use quinn::{AsyncUdpSocket, UdpSender, udp::RecvMeta};
 
 use crate::{io::FrameHeader, net::udp::UdpSocket};
+
+pub struct QuinnUdpSocket {
+    inner: Arc<UdpSocketInner>,
+    read_pos: u64,
+}
 
 /// Shared socket state that can be cheaply cloned between the async socket
 /// and any number of senders.
@@ -29,36 +34,11 @@ struct UdpSocketInner {
     send_ring: crate::io::RingBuf,
 }
 
-pub struct QuinnUdpSocket {
-    inner: Arc<UdpSocketInner>,
-    read_pos: u64,
-}
-
 #[derive(Debug)]
 pub struct SeliumQuinnRuntime;
 
 struct QuinnUdpSender {
     inner: Arc<UdpSocketInner>,
-}
-
-#[cfg(target_arch = "wasm32")]
-fn from_quinn_instant(qi: web_time::Instant) -> crate::time::Instant {
-    let zero = web_time::Instant::from(std::time::Duration::ZERO);
-    let duration = qi.duration_since(zero);
-    crate::time::Instant::from_nanos(duration.as_nanos() as u64)
-}
-
-impl From<UdpSocket> for QuinnUdpSocket {
-    fn from(socket: UdpSocket) -> Self {
-        Self {
-            inner: Arc::new(UdpSocketInner {
-                local_addr: socket.local_addr,
-                recv_ring: socket.recv_ring,
-                send_ring: socket.send_ring,
-            }),
-            read_pos: socket.read_pos,
-        }
-    }
 }
 
 impl AsyncUdpSocket for QuinnUdpSocket {
@@ -168,6 +148,19 @@ impl AsyncUdpSocket for QuinnUdpSocket {
     }
 }
 
+impl From<UdpSocket> for QuinnUdpSocket {
+    fn from(socket: UdpSocket) -> Self {
+        Self {
+            inner: Arc::new(UdpSocketInner {
+                local_addr: socket.local_addr,
+                recv_ring: socket.recv_ring,
+                send_ring: socket.send_ring,
+            }),
+            read_pos: socket.read_pos,
+        }
+    }
+}
+
 impl Debug for QuinnUdpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuinnUdpSocket")
@@ -257,4 +250,11 @@ impl quinn::AsyncTimer for crate::time::Timer {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         std::future::Future::poll(self, cx)
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn from_quinn_instant(qi: web_time::Instant) -> crate::time::Instant {
+    let zero = web_time::Instant::from(std::time::Duration::ZERO);
+    let duration = qi.duration_since(zero);
+    crate::time::Instant::from_nanos(duration.as_nanos() as u64)
 }

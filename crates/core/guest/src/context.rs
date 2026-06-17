@@ -74,9 +74,11 @@ impl Context {
         match response {
             DiscoveryResponse::Found(target) => Ok(Some(target)),
             DiscoveryResponse::NotFound => Ok(None),
-            DiscoveryResponse::Registered | DiscoveryResponse::Revoked | DiscoveryResponse::Forbidden => {
-                Err(GuestError::Host("unexpected discovery response variant".to_string()))
-            }
+            DiscoveryResponse::Registered
+            | DiscoveryResponse::Revoked
+            | DiscoveryResponse::Forbidden => Err(GuestError::Host(
+                "unexpected discovery response variant".to_string(),
+            )),
         }
     }
 
@@ -100,9 +102,9 @@ impl Context {
 
         match response {
             DiscoveryResponse::Registered => Ok(()),
-            DiscoveryResponse::Forbidden => {
-                Err(GuestError::Host("registration forbidden: process does not own resource".to_string()))
-            }
+            DiscoveryResponse::Forbidden => Err(GuestError::Host(
+                "registration forbidden: process does not own resource".to_string(),
+            )),
             other => Err(GuestError::Host(format!(
                 "unexpected discovery response: {other:?}"
             ))),
