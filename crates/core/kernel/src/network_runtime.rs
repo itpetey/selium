@@ -49,6 +49,12 @@ const SHARED_REGION_HEADER_ENTRY_SIZE: u32 = 8;
 const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 /// Offset of the shared `writer_count` (u64) in page 0.
 const WRITER_COUNT_OFFSET: u64 = 16;
+/// Offset where the shared `writer_slots` array begins (128 × u64).
+const WRITER_SLOTS_OFFSET: u64 = 1080;
+/// Maximum number of blocking writer slots.
+const MAX_WRITER_SLOTS: u32 = 128;
+/// Offset of the shared `writer_slot_counter` (u64).
+const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
 
 #[derive(Debug, Clone, Copy)]
 struct FrameHeader {
@@ -377,6 +383,8 @@ fn create_stream_region(kernel: &Kernel) -> Result<(SharedRegionDescriptor, u64,
 /// - reader_slots[128] (offset 24..1048)
 /// - next_writer_id (offset 1048)
 /// - reader_slot_counter (offset 1056)
+/// - writer_slots[128] (offset 1080..2104)
+/// - writer_slot_counter (offset 2104)
 fn init_ring_buffer(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<()> {
     let zero_u64 = 0u64.to_le_bytes();
 
@@ -393,6 +401,14 @@ fn init_ring_buffer(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<()>
     kernel.write_shared_memory(mapping_id, offset + NEXT_WRITER_ID_OFFSET, &zero_u64)?;
     kernel.write_shared_memory(mapping_id, offset + READER_SLOT_COUNTER_OFFSET, &zero_u64)?;
 
+    // Zero out writer slots (128 × u64).
+    for i in 0..MAX_WRITER_SLOTS {
+        let slot_offset = offset + WRITER_SLOTS_OFFSET + i as u64 * 8;
+        kernel.write_shared_memory(mapping_id, slot_offset, &zero_u64)?;
+    }
+
+    kernel.write_shared_memory(mapping_id, offset + WRITER_SLOT_COUNTER_OFFSET, &zero_u64)?;
+
     Ok(())
 }
 
@@ -401,6 +417,21 @@ fn minimum_reader_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Res
     let mut minimum = None;
     for slot in 0..MAX_READER_SLOTS {
         let slot_offset = offset + READER_SLOTS_OFFSET + slot as u64 * 8;
+        let encoded = read_u64(kernel, mapping_id, slot_offset)?;
+        if encoded == 0 {
+            continue;
+        }
+        let position = encoded - 1;
+        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
+    }
+    Ok(minimum)
+}
+
+/// Returns the minimum active writer position from the shared writer_slots array.
+fn minimum_writer_position(kernel: &Kernel, mapping_id: u64, offset: u64) -> Result<Option<u64>> {
+    let mut minimum = None;
+    for slot in 0..MAX_WRITER_SLOTS {
+        let slot_offset = offset + WRITER_SLOTS_OFFSET + slot as u64 * 8;
         let encoded = read_u64(kernel, mapping_id, slot_offset)?;
         if encoded == 0 {
             continue;
@@ -665,7 +696,7 @@ fn release_kernel_reader_slot(
 /// Reserves `len` bytes at the tail via CAS on the shared `next_tail` field.
 ///
 /// Uses exponential backoff on contention and checks backpressure against
-/// the shared `reader_slots` array.
+/// the shared `reader_slots` and `writer_slots` arrays.
 fn reserve_tail(
     kernel: &Kernel,
     mapping_id: u64,
@@ -681,15 +712,21 @@ fn reserve_tail(
     loop {
         let tail = read_u64(kernel, mapping_id, offset + NEXT_TAIL_OFFSET)?;
 
-        // Check backpressure.
+        // Check backpressure against readers and writers.
         let min_reader_pos = minimum_reader_position(kernel, mapping_id, offset)?;
+        let min_writer_pos = minimum_writer_position(kernel, mapping_id, offset)?;
         let next = tail
             .checked_add(len)
             .ok_or_else(|| Error::Wasm("tail reservation overflow".to_string()))?;
 
-        if let Some(min_pos) = min_reader_pos
-            && next.saturating_sub(min_pos) > capacity
-        {
+        let blocked_by_reader = min_reader_pos
+            .map(|min_pos| next.saturating_sub(min_pos) > capacity)
+            .unwrap_or(false);
+        let blocked_by_writer = min_writer_pos
+            .map(|min_pos| next.saturating_sub(min_pos) > capacity)
+            .unwrap_or(false);
+
+        if blocked_by_reader || blocked_by_writer {
             // Backpressure: ring is full. Use spin_loop for consistency
             // with guest-side reserve_tail.
             for _ in 0..delay {

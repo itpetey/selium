@@ -276,8 +276,14 @@ impl Runtime {
                     .attach_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::SharedMapping, local_id);
+
+                let len = self
+                    .kernel
+                    .shared_region_len(region_id)
+                    .map_err(kernel_error)?;
+
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAttach(
-                    selium_abi::RegionAttachment { page_offset },
+                    selium_abi::RegionAttachment { page_offset, len },
                 )))
             }
             HostcallRequest::TcpBind { address } => {

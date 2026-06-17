@@ -17,7 +17,22 @@ pub mod writer;
 ///
 /// The channel stores framed messages in a lock-free ring buffer. Blocking readers
 /// prevent buffer overwrite until they have consumed data; non-blocking readers may lose
-/// data if they fall behind.
+/// data if they fall behind. Blocking writers register a writer slot that prevents
+/// other writers from overwriting their data; non-blocking writers may be starved.
+///
+/// # Backpressure Strategies
+///
+/// ## Park (default)
+/// - Slow blocking reader → all writers backpressure (block)
+/// - Slow blocking writer → all other writers backpressure (round-robin)
+/// - Slow non-blocking reader → loses data
+/// - Slow non-blocking writer → may be starved by other writers
+///
+/// ## Drop
+/// - Slow blocking reader → all writers silently drop data
+/// - Slow blocking writer → all other writers silently drop data
+/// - Slow non-blocking reader → loses data
+/// - Slow non-blocking writer → may be starved by other writers
 ///
 /// Notification uses the generation counter in the shared region with native
 /// atomic wait/notify instead of signals.
@@ -27,12 +42,38 @@ pub struct Channel {
 }
 
 /// Backpressure strategy for channel writers.
+///
+/// Determines how writers respond to slow blocking readers and slow blocking writers:
+/// - `Park`: writers block (return Pending) when the ring is full
+/// - `Drop`: writers silently drop data (return Ok without writing) when the ring is full
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelBackpressure {
-    /// Writers respect blocking reader positions; writes block when consumers fall behind.
+    /// Writers respect blocking reader and writer positions; writes block when consumers
+    /// or other blocking writers fall behind.
     Park,
-    /// Writers never block; slow consumers may lose data.
+    /// Writers never block; slow blocking consumers or blocking writers cause data to be
+    /// silently dropped.
     Drop,
+}
+
+impl ChannelBackpressure {
+    /// Converts to the shared-memory wire format (0 = Park, 1 = Drop).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Park => 0,
+            Self::Drop => 1,
+        }
+    }
+
+    /// Converts from the shared-memory wire format.
+    ///
+    /// Unrecognised values default to `Park`.
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Drop,
+            _ => Self::Park,
+        }
+    }
 }
 
 impl Channel {
@@ -57,27 +98,27 @@ impl Channel {
     ) -> Result<Self> {
         let capacity = round_capacity(capacity)?;
         let ring = RingBuf::create(capacity, purpose)?;
+        ring.region().store_backpressure(backpressure.to_u8())?;
         Ok(Self { ring, backpressure })
     }
 
     /// Attaches to an existing channel by shared region id.
-    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
-        let capacity = round_capacity(capacity)?;
-        let ring = RingBuf::attach(region_id, capacity)?;
-        Ok(Self {
-            ring,
-            backpressure: ChannelBackpressure::Park,
-        })
+    ///
+    /// Reads the backpressure strategy and capacity from the shared channel header.
+    pub fn attach(region_id: u64) -> Result<Self> {
+        let ring = RingBuf::attach(region_id)?;
+        let backpressure = ChannelBackpressure::from_u8(ring.region().load_backpressure()?);
+        Ok(Self { ring, backpressure })
     }
 
     /// Creates a blocking writer for this channel.
     ///
-    /// Returns `Err(Error::BackpressureNotSupported)` on Drop channels.
+    /// The blocking writer registers a writer slot in shared memory. Other writers
+    /// cannot advance past the blocking writer's position, preventing a single
+    /// busy writer from starving the blocking writer. On Park channels this causes
+    /// backpressure; on Drop channels other writers silently drop data.
     pub fn blocking_writer(&self) -> Result<BlockingWriter> {
-        if self.backpressure == ChannelBackpressure::Drop {
-            return Err(Error::BackpressureNotSupported);
-        }
-        BlockingWriter::new(self.ring.region().clone())
+        BlockingWriter::new(self.ring.region().clone(), self.backpressure)
     }
 
     /// Creates a non-blocking writer that does not contribute to `writer_count`.
@@ -93,10 +134,13 @@ impl Channel {
     /// Creates a non-blocking reader that may lose data if slow.
     pub fn reader(&self) -> Reader {
         let tail = self.ring.read_next_tail().unwrap_or(0);
-        Reader::new(self.ring.region().clone(), tail)
+        Reader::new(self.ring.region().clone(), tail, self.backpressure)
     }
 
     /// Creates a blocking reader that prevents buffer overwrite.
+    ///
+    /// On Park channels, writers backpressure when the blocking reader is slow.
+    /// On Drop channels, writers silently drop data when the blocking reader is slow.
     pub fn blocking_reader(&self) -> Result<BlockingReader> {
         let tail = self.ring.read_next_tail()?;
         let reader_id = self.ring.region().allocate_reader_slot(tail)?;
@@ -128,16 +172,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_channel_rejects_blocking_writer() {
+    fn drop_channel_accepts_blocking_writer() {
         let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
         let result = channel.blocking_writer();
-        assert!(matches!(result, Err(Error::BackpressureNotSupported)));
+        assert!(result.is_ok());
     }
 
     #[test]
     fn park_channel_accepts_blocking_writer() {
         let channel = Channel::create(64, ChannelBackpressure::Park).expect("create");
         let result = channel.blocking_writer();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn drop_channel_accepts_blocking_reader() {
+        let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
+        let result = channel.blocking_reader();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn park_channel_accepts_blocking_reader() {
+        let channel = Channel::create(64, ChannelBackpressure::Park).expect("create");
+        let result = channel.blocking_reader();
         assert!(result.is_ok());
     }
 
@@ -164,5 +222,66 @@ mod tests {
         )
         .expect("create");
         assert_eq!(channel.backpressure(), ChannelBackpressure::Drop);
+    }
+
+    #[test]
+    fn backpressure_wire_format_round_trip() {
+        assert_eq!(ChannelBackpressure::Park.to_u8(), 0);
+        assert_eq!(ChannelBackpressure::Drop.to_u8(), 1);
+        assert_eq!(ChannelBackpressure::from_u8(0), ChannelBackpressure::Park);
+        assert_eq!(ChannelBackpressure::from_u8(1), ChannelBackpressure::Drop);
+        // Unknown values default to Park.
+        assert_eq!(ChannelBackpressure::from_u8(255), ChannelBackpressure::Park);
+    }
+
+    #[test]
+    fn create_writes_backpressure_to_shared_header() {
+        let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
+        let bp = channel.ring().region().load_backpressure().expect("load");
+        assert_eq!(bp, ChannelBackpressure::Drop.to_u8());
+    }
+
+    #[test]
+    fn create_writes_capacity_to_shared_header() {
+        let channel = Channel::create(128, ChannelBackpressure::Park).expect("create");
+        let cap = channel
+            .ring()
+            .region()
+            .load_shared_capacity()
+            .expect("load");
+        assert_eq!(cap, 128);
+    }
+
+    #[test]
+    fn attach_reads_backpressure_from_shared_header() {
+        // Create a Drop channel — backpressure and capacity are written to the
+        // shared header.
+        let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
+        let region_id = channel.region_id();
+
+        // Verify the shared header contains the wire-format backpressure.
+        assert_eq!(
+            channel.ring().region().load_backpressure().expect("load"),
+            1
+        );
+
+        // Attach by region_id — should read backpressure from the shared header.
+        let attached = Channel::attach(region_id).expect("attach");
+        assert_eq!(attached.backpressure(), ChannelBackpressure::Drop);
+        assert_eq!(attached.ring().capacity(), 64);
+
+        crate::io::RegionBuilder::free(region_id);
+    }
+
+    #[test]
+    fn attach_park_channel_from_shared_header() {
+        let channel = Channel::create(128, ChannelBackpressure::Park).expect("create");
+        let region_id = channel.region_id();
+
+        let attached = Channel::attach(region_id).expect("attach");
+        assert_eq!(attached.backpressure(), ChannelBackpressure::Park);
+        assert_eq!(attached.ring().capacity(), 128);
+
+        crate::io::RegionBuilder::free(region_id);
     }
 }

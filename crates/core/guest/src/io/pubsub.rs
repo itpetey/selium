@@ -44,8 +44,8 @@ impl<T> Publisher<T, Writer> {
         })
     }
 
-    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
-        let ring = attach_topic(region_id, capacity)?;
+    pub fn attach(region_id: u64) -> Result<Self> {
+        let ring = attach_topic(region_id)?;
         let writer = writer_from_ring(&ring)?;
         Ok(Self {
             writer,
@@ -163,8 +163,8 @@ impl<T> Subscriber<T, Reader> {
         })
     }
 
-    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
-        let ring = attach_topic(region_id, capacity)?;
+    pub fn attach(region_id: u64) -> Result<Self> {
+        let ring = attach_topic(region_id)?;
         let reader = reader_from_ring(&ring)?;
         let last_generation = ring.generation().unwrap_or(0);
         Ok(Self {
@@ -279,20 +279,20 @@ where
     }
 }
 
-pub fn attach_pair<T>(region_id: u64, capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
-    let publisher = Publisher::attach(region_id, capacity)?;
-    let subscriber = Subscriber::attach(region_id, capacity)?;
+pub fn attach_pair<T>(region_id: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
+    let publisher = Publisher::attach(region_id)?;
+    let subscriber = Subscriber::attach(region_id)?;
     Ok((publisher, subscriber))
 }
 
 pub fn create_pair<T>(capacity: u64) -> Result<(Publisher<T>, Subscriber<T>)> {
     let publisher = Publisher::create(capacity)?;
-    let subscriber = Subscriber::attach(publisher.region_id(), publisher.capacity())?;
+    let subscriber = Subscriber::attach(publisher.region_id())?;
     Ok((publisher, subscriber))
 }
 
-fn attach_topic(region_id: u64, capacity: u64) -> Result<RingBuf> {
-    RingBuf::attach(region_id, capacity)
+fn attach_topic(region_id: u64) -> Result<RingBuf> {
+    RingBuf::attach(region_id)
 }
 
 fn create_topic(capacity: u64) -> Result<RingBuf> {
@@ -302,7 +302,7 @@ fn create_topic(capacity: u64) -> Result<RingBuf> {
 
 fn reader_from_ring(ring: &RingBuf) -> Result<FramedRead<Reader>> {
     let tail = ring.read_next_tail()?;
-    let reader = Reader::new(ring.region().clone(), tail);
+    let reader = Reader::new(ring.region().clone(), tail, ChannelBackpressure::Park);
     Ok(FramedRead::new(reader))
 }
 

@@ -7,7 +7,7 @@ use std::{
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::io::{
-    channels::{Error, Result},
+    channels::{ChannelBackpressure, Error, Result},
     frame::FrameHeader,
     region::ChannelRegion,
 };
@@ -48,6 +48,7 @@ pub struct BlockingReader {
 pub struct Reader {
     region: ChannelRegion,
     pos: u64,
+    backpressure: ChannelBackpressure,
     terminated: bool,
     last_generation: u64,
     /// Buffered frame bytes from a read partially copied to the caller.
@@ -90,6 +91,7 @@ impl BlockingReader {
         let reader = Reader {
             region: self.region.clone(),
             pos: self.pos,
+            backpressure: ChannelBackpressure::Park,
             terminated: self.terminated,
             last_generation: self.last_generation,
             pending_frame: std::mem::take(&mut self.pending_frame),
@@ -218,10 +220,11 @@ impl Drop for BlockingReader {
 }
 
 impl Reader {
-    pub(crate) fn new(region: ChannelRegion, start_pos: u64) -> Self {
+    pub(crate) fn new(region: ChannelRegion, start_pos: u64, backpressure: ChannelBackpressure) -> Self {
         Self {
             region,
             pos: start_pos,
+            backpressure,
             terminated: false,
             last_generation: 0,
             pending_frame: Vec::new(),
@@ -244,7 +247,15 @@ impl Reader {
         &self.region
     }
 
+    /// Returns the backpressure strategy for this reader's channel.
+    pub fn backpressure(&self) -> ChannelBackpressure {
+        self.backpressure
+    }
+
     /// Upgrade this non-blocking reader to a blocking reader, allocating a reader slot.
+    ///
+    /// On Park channels, writers backpressure when the blocking reader is slow.
+    /// On Drop channels, writers silently drop data when the blocking reader is slow.
     pub fn upgrade(self) -> Result<BlockingReader> {
         let reader_id = self.region.allocate_reader_slot(self.pos)?;
         let mut reader = BlockingReader::new(self.region, self.pos, reader_id);

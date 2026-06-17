@@ -30,7 +30,7 @@ use crate::{
     encoding::FlatMsg,
     io::{
         ChannelRegion, Error, PAGE_SIZE, RegionMapping, RingBuf,
-        channels::{BlockingReader, BlockingWriter},
+        channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
         framed::{FramedRead, FramedWrite},
     },
 };
@@ -307,7 +307,8 @@ where
         let request_reader = FramedRead::new(request_reader);
 
         // Create writer for reply ring (server writes replies)
-        let reply_writer = BlockingWriter::new(reply_writer_region)?;
+        let backpressure = ChannelBackpressure::from_u8(reply_writer_region.load_backpressure()?);
+        let reply_writer = BlockingWriter::new(reply_writer_region, backpressure)?;
         let reply_writer = FramedWrite::new(reply_writer);
 
         Ok(Self {
@@ -510,7 +511,8 @@ fn attach_rpc_region(
 
     // Server writes to reply ring (needs a BlockingWriter)
     let rep_region = reply_ring.region().clone();
-    let reply_writer = BlockingWriter::new(rep_region)?;
+    let backpressure = ChannelBackpressure::from_u8(rep_region.load_backpressure()?);
+    let reply_writer = BlockingWriter::new(rep_region, backpressure)?;
     let reply_writer = FramedWrite::new(reply_writer);
 
     Ok((request_reader, reply_writer))
@@ -578,7 +580,8 @@ fn create_rpc_region(
     rep_region.initialise()?;
 
     // Client writes to request ring (needs a BlockingWriter)
-    let request_writer = BlockingWriter::new(req_region.clone())?;
+    let backpressure = ChannelBackpressure::from_u8(req_region.load_backpressure()?);
+    let request_writer = BlockingWriter::new(req_region.clone(), backpressure)?;
     let request_writer = FramedWrite::new(request_writer);
 
     // Client reads from reply ring (needs a Reader)
@@ -691,7 +694,9 @@ mod tests {
         rep_region.initialise()?;
 
         // Client: writer on request ring, reader on reply ring
-        let client_req_writer = BlockingWriter::new(req_region.clone())?;
+        let client_req_backpressure =
+            ChannelBackpressure::from_u8(req_region.load_backpressure()?);
+        let client_req_writer = BlockingWriter::new(req_region.clone(), client_req_backpressure)?;
         let client_req_writer = FramedWrite::new(client_req_writer);
 
         let tail = rep_region.load_next_tail()?;
@@ -705,7 +710,9 @@ mod tests {
         let server_req_reader = BlockingReader::new(req_region, tail, reader_id);
         let server_req_reader = FramedRead::new(server_req_reader);
 
-        let server_reply_writer = BlockingWriter::new(rep_region)?;
+        let server_reply_backpressure =
+            ChannelBackpressure::from_u8(rep_region.load_backpressure()?);
+        let server_reply_writer = BlockingWriter::new(rep_region, server_reply_backpressure)?;
         let server_reply_writer = FramedWrite::new(server_reply_writer);
 
         let client = RpcClient {

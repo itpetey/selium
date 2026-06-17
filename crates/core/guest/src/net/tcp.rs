@@ -15,7 +15,7 @@ use crate::{
     hostcall::hostcall_async,
     io::{
         ChannelRegion, PAGE_SIZE, RegionMapping, RingBuf,
-        channels::{BlockingReader, BlockingWriter},
+        channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
     },
     resource::{Accept, IncomingConnection, ResourceListener},
 };
@@ -112,7 +112,12 @@ impl TcpStream {
 
         // Create Writer for outbound ring (guest writes to kernel)
         let outbound_region = outbound.region().clone();
-        let writer = BlockingWriter::new(outbound_region)
+        let backpressure = ChannelBackpressure::from_u8(
+            outbound_region
+                .load_backpressure()
+                .map_err(|e| GuestError::Host(format!("load backpressure: {e}")))?,
+        );
+        let writer = BlockingWriter::new(outbound_region, backpressure)
             .map_err(|e| GuestError::Host(format!("create writer: {e}")))?;
 
         Ok(Self { reader, writer })

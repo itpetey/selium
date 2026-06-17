@@ -92,11 +92,11 @@ where
     /// Replays all existing messages to build the local materialised view
     /// before returning. Returns [`Error::ReaderBehind`] if the ring no longer
     /// retains the full mutation history required to rebuild the table.
-    pub fn attach(shared_id: u64, capacity: u64) -> Result<Self>
+    pub fn attach(shared_id: u64) -> Result<Self>
     where
         K: Eq + Hash,
     {
-        let (publisher, subscriber) = pubsub::attach_pair(shared_id, capacity)?;
+        let (publisher, subscriber) = pubsub::attach_pair(shared_id)?;
         let table = Self {
             publisher: RefCell::new(publisher),
             subscriber: RefCell::new(subscriber),

@@ -290,6 +290,8 @@ pub struct RegionAllocation {
 pub struct RegionAttachment {
     /// Page offset within guest linear memory where the region is mapped.
     pub page_offset: u32,
+    /// Total size of the attached region in bytes.
+    pub len: u32,
 }
 
 /// Descriptor for a host-mediated connection queue handle.

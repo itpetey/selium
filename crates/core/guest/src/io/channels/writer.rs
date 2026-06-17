@@ -12,8 +12,12 @@ use crate::io::{
     region::ChannelRegion,
 };
 
-/// Non-blocking byte-stream writer not tracked in channel metadata; may overwrite
-/// slow readers. Implements [`AsyncWrite`].
+/// Non-blocking byte-stream writer not tracked in channel metadata; may be starved
+/// by other writers. Implements [`AsyncWrite`].
+///
+/// On Park channels, writes block when a blocking reader or blocking writer is slow.
+/// On Drop channels, writes silently drop data when a blocking reader or blocking
+/// writer is slow.
 pub struct Writer {
     region: ChannelRegion,
     writer_id: u32,
@@ -28,11 +32,18 @@ pub struct Writer {
 /// and writes them to the ring buffer using a two-phase protocol (payload
 /// first, release fence, header) to guarantee reader consistency.
 ///
+/// The blocking writer registers a writer slot in shared memory. Other writers
+/// cannot advance past the blocking writer's position, preventing a single
+/// busy writer from starving the blocking writer. On Park channels this causes
+/// backpressure; on Drop channels other writers silently drop data.
+///
 /// Use [`FramedWrite`](crate::io::framed::FramedWrite) for frame-level
 /// operations with automatic header encoding.
 pub struct BlockingWriter {
     region: ChannelRegion,
     writer_id: u32,
+    writer_slot: u32,
+    backpressure: ChannelBackpressure,
 }
 
 impl Writer {
@@ -68,10 +79,23 @@ impl Writer {
         &self.region
     }
 
-    /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count.
+    /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count
+    /// and allocates a writer slot for position tracking.
     pub fn upgrade(self) -> Result<BlockingWriter> {
         self.region.increment_writer_count()?;
-        Ok(BlockingWriter::from_writer_id(self.region, self.writer_id))
+        let writer_slot = match self.region.allocate_writer_slot(0) {
+            Ok(slot) => slot,
+            Err(error) => {
+                let _ = self.region.decrement_writer_count();
+                return Err(error);
+            }
+        };
+        Ok(BlockingWriter {
+            region: self.region,
+            writer_id: self.writer_id,
+            writer_slot,
+            backpressure: self.backpressure,
+        })
     }
 }
 
@@ -89,11 +113,17 @@ impl AsyncWrite for Writer {
             return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
 
-        // On Drop channels, never protect readers (fire-and-forget).
-        let protect_readers = self.backpressure == ChannelBackpressure::Park;
-        let pos = match self.region.reserve_tail(len, protect_readers) {
+        // All writers check both reader and writer positions.
+        // On Park channels, BufferFull causes backpressure (Pending).
+        // On Drop channels, BufferFull causes silent drop (Ok without writing).
+        let pos = match self.region.reserve_tail(len, true, true) {
             Ok(p) => p,
-            Err(Error::BufferFull) => return Poll::Pending,
+            Err(Error::BufferFull) => {
+                if self.backpressure == ChannelBackpressure::Drop {
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                return Poll::Pending;
+            }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
         };
 
@@ -114,8 +144,9 @@ impl AsyncWrite for Writer {
 }
 
 impl BlockingWriter {
-    /// Creates a new blocking writer. Increments writer_count and allocates a writer_id.
-    pub(crate) fn new(region: ChannelRegion) -> Result<Self> {
+    /// Creates a new blocking writer. Increments writer_count, allocates a writer_id,
+    /// and allocates a writer slot for position tracking.
+    pub(crate) fn new(region: ChannelRegion, backpressure: ChannelBackpressure) -> Result<Self> {
         region.increment_writer_count()?;
         let writer_id = match region.allocate_writer_id() {
             Ok(id) => id,
@@ -124,13 +155,35 @@ impl BlockingWriter {
                 return Err(error);
             }
         };
-        Ok(Self { region, writer_id })
+        let writer_slot = match region.allocate_writer_slot(0) {
+            Ok(slot) => slot,
+            Err(error) => {
+                let _ = region.decrement_writer_count();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            region,
+            writer_id,
+            writer_slot,
+            backpressure,
+        })
     }
 
-    /// Creates a blocking writer from a pre-allocated writer_id.
+    /// Creates a blocking writer from a pre-allocated writer_id and writer_slot.
     /// Caller is responsible for having already incremented writer_count.
-    pub(crate) fn from_writer_id(region: ChannelRegion, writer_id: u32) -> Self {
-        Self { region, writer_id }
+    pub(crate) fn from_writer_id(
+        region: ChannelRegion,
+        writer_id: u32,
+        writer_slot: u32,
+        backpressure: ChannelBackpressure,
+    ) -> Self {
+        Self {
+            region,
+            writer_id,
+            writer_slot,
+            backpressure,
+        }
     }
 
     /// Returns a reference to the underlying channel region.
@@ -143,19 +196,26 @@ impl BlockingWriter {
         self.writer_id
     }
 
+    /// Returns the backpressure strategy for this writer's channel.
+    pub fn backpressure(&self) -> ChannelBackpressure {
+        self.backpressure
+    }
+
     /// Allocates a globally unique mutation id for this writer's channel.
     pub fn allocate_mutation_id(&self) -> Result<u64> {
         self.region.allocate_mutation_id()
     }
 
     /// Downgrade this blocking writer to a non-blocking writer.
-    /// Decrements writer_count to compensate for the lost Drop decrement.
+    /// Decrements writer_count and releases the writer slot to compensate
+    /// for the lost Drop decrement.
     pub fn downgrade(self) -> Writer {
         let _ = self.region.decrement_writer_count();
+        let _ = self.region.release_writer_slot(self.writer_slot);
         let writer = Writer {
             region: self.region.clone(),
             writer_id: self.writer_id,
-            backpressure: ChannelBackpressure::Park,
+            backpressure: self.backpressure,
         };
         // Prevent Drop from decrementing again (we already did it).
         std::mem::forget(self);
@@ -177,11 +237,25 @@ impl AsyncWrite for BlockingWriter {
             return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
 
-        let pos = match self.region.reserve_tail(len, true) {
+        // Blocking writers check both reader and writer positions.
+        // On Park channels, BufferFull causes backpressure (Pending).
+        // On Drop channels, BufferFull causes silent drop (Ok without writing).
+        let pos = match self.region.reserve_tail(len, true, true) {
             Ok(p) => p,
-            Err(Error::BufferFull) => return Poll::Pending,
+            Err(Error::BufferFull) => {
+                if self.backpressure == ChannelBackpressure::Drop {
+                    return Poll::Ready(Ok(buf.len()));
+                }
+                return Poll::Pending;
+            }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
         };
+
+        // Update writer slot to this position so other writers cannot
+        // overwrite our data until we write again.
+        if let Err(e) = self.region.update_writer_slot(self.writer_slot, pos) {
+            return Poll::Ready(Err(std::io::Error::other(e)));
+        }
 
         if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
             return Poll::Ready(Err(std::io::Error::other(e)));
@@ -202,6 +276,7 @@ impl AsyncWrite for BlockingWriter {
 impl Drop for BlockingWriter {
     fn drop(&mut self) {
         let _ = self.region.decrement_writer_count();
+        let _ = self.region.release_writer_slot(self.writer_slot);
     }
 }
 
@@ -285,7 +360,7 @@ mod tests {
         buf.extend_from_slice(b"hello");
 
         let pos = region
-            .reserve_tail(buf.len() as u64, true)
+            .reserve_tail(buf.len() as u64, true, false)
             .expect("reserve");
         write_frame_bytes(&region, pos, &buf).expect("write");
 

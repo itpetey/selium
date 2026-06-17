@@ -38,6 +38,7 @@ impl RingBuf {
         let region = RegionBuilder::create(capacity, purpose)?;
         let mask = mask_for_capacity(capacity)?;
         region.initialise()?;
+        region.store_shared_capacity(capacity)?;
         Ok(Self {
             region,
             mask,
@@ -46,8 +47,10 @@ impl RingBuf {
     }
 
     /// Attaches to an existing ring buffer by shared region id.
-    pub fn attach(region_id: u64, capacity: u64) -> Result<Self> {
-        let region = RegionBuilder::attach(region_id, capacity)?;
+    ///
+    /// Reads the capacity from the shared channel header.
+    pub fn attach(region_id: u64) -> Result<Self> {
+        let region = RegionBuilder::attach(region_id)?;
         Self::wrap_region(region)
     }
 
@@ -93,8 +96,11 @@ impl RingBuf {
     }
 
     /// Atomically reserves space at the write tail. Returns the start position.
+    ///
+    /// Protects readers from overwrite but does not check writer slots (the
+    /// ring buffer is a lower-level abstraction that does not manage writer slots).
     pub fn reserve(&self, len: u64) -> Result<u64> {
-        self.region.reserve_tail(len, true)
+        self.region.reserve_tail(len, true, false)
     }
 
     /// Writes data at a logical position, handling wraparound.

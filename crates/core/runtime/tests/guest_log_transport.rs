@@ -202,15 +202,15 @@ fn drop_backpressure_channel_writer_never_blocks() {
     let writer = channel.writer().expect("writer");
     assert_eq!(writer.backpressure(), ChannelBackpressure::Drop);
 
-    // blocking_writer should be rejected.
-    let result = channel.blocking_writer();
-    assert!(
-        matches!(
-            result,
-            Err(selium_guest::io::Error::BackpressureNotSupported)
-        ),
-        "expected BackpressureNotSupported on Drop channel"
-    );
+    // blocking_writer should succeed (it protects readers and other blocking writers).
+    let _bw = channel
+        .blocking_writer()
+        .expect("blocking writer on Drop channel");
+
+    // blocking_reader should succeed (writers drop data when it's slow).
+    let _br = channel
+        .blocking_reader()
+        .expect("blocking reader on Drop channel");
 }
 
 #[test]
