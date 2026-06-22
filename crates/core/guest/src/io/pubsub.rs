@@ -318,7 +318,7 @@ mod tests {
 
     /// Creates a publisher/subscriber pair sharing the same underlying ring.
     /// In native test mode, `create_pair` doesn't share memory because
-    /// `RegionBuilder::attach` allocates a new heap region. This helper
+    /// `ChannelRegion::attach` looks up the native registry. This helper
     /// constructs both from the same ring directly.
     fn test_pair<T>(capacity: u64) -> Result<(Publisher<T, Writer>, Subscriber<T, Reader>)> {
         let capacity = round_capacity(capacity)?;

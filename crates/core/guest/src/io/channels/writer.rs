@@ -339,13 +339,13 @@ fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::RegionBuilder;
+    use crate::io::ChannelRegion;
     use crate::io::channels::reader::read_raw;
 
     #[test]
     fn two_phase_write_produces_ready_frame() {
         let region =
-            RegionBuilder::create(64, selium_abi::ResourceKind::SharedMemory).expect("create");
+            ChannelRegion::create(64, selium_abi::ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Encode a frame manually: header + payload.

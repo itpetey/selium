@@ -1,10 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use selium_abi::ResourceKind;
+use selium_abi::{RegionProt, ResourceKind};
+
+use crate::memory::{PAGE_SIZE, RegionMapping, SharedRegion};
 
 use crate::io::error::{Error, Result};
 
@@ -20,15 +19,10 @@ pub const MAX_READER_SLOTS: usize = 128;
 pub const MAX_WRITER_SLOTS: usize = 128;
 /// Minimum region size that can hold a ring buffer (header page + one data page).
 pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
-static NATIVE_REGION_COUNTER: AtomicU64 = AtomicU64::new(1);
-static NATIVE_REGION_REGISTRY: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 /// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
 pub const NEXT_TAIL_OFFSET: u64 = 8;
 /// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
 pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
-/// WASM page size used for region layout (4 KiB).
-pub const PAGE_SIZE: u64 = 4096;
 /// Byte offset where the shared `reader_slots` array begins (128 × u64).
 pub const READER_SLOTS_OFFSET: u64 = 24;
 /// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
@@ -41,27 +35,6 @@ pub const WRITER_COUNT_OFFSET: u64 = 16;
 pub const WRITER_SLOTS_OFFSET: u64 = 1080;
 /// Byte offset of the shared `writer_slot_counter` (fetch_add for unique writer slot indices).
 pub const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
-
-/// A direct-memory mapping of a shared region.
-///
-/// In WASM mode the pointer is derived from the page offset returned by
-/// `alloc_region` / `attach_region`. In native mode a heap allocation is used
-/// for testing.
-#[derive(Clone)]
-pub struct RegionMapping {
-    inner: Arc<RegionMappingInner>,
-}
-
-struct RegionMappingInner {
-    base: *mut u8,
-    size: u64,
-    /// Heap-allocated backing store (native mode only). `None` for WASM mappings
-    /// whose lifetime is managed by the runtime.
-    _backing: Option<Arc<Vec<u8>>>,
-}
-
-/// A builder for creating or attaching to a shared memory ring buffer region.
-pub struct RegionBuilder;
 
 /// A shared memory region allocated for ring buffer I/O.
 ///
@@ -79,6 +52,11 @@ pub struct RegionBuilder;
 pub struct ChannelRegion {
     region_id: u64,
     mapping: RegionMapping,
+    /// The underlying shared region. Retained so that hostcall-mediated slot
+    /// operations (e.g. `SharedRegion::write_table_slot`) can be delegated
+    /// through `ChannelRegion` for consumer guests with read-only mappings.
+    /// `None` for sub-mappings carved from a parent (e.g. RPC multi-memory).
+    shared: Option<Arc<SharedRegion>>,
     private: Arc<ChannelPrivateState>,
     capacity: u64,
     size: u64,
@@ -94,266 +72,38 @@ struct ChannelPrivateState {
     next_mutation_id: AtomicU64,
 }
 
-impl RegionMapping {
-    /// Creates a mapping backed by a heap allocation (for native testing).
-    pub fn allocate(size: u64) -> Result<Self> {
-        let backing = Arc::new(vec![0u8; size as usize]);
-        // Get pointer to the actual data buffer, not the Vec struct.
-        let base = backing.as_ptr() as *mut u8;
-        Ok(Self {
-            inner: Arc::new(RegionMappingInner {
-                base,
-                size,
-                _backing: Some(backing),
-            }),
-        })
-    }
-
-    /// Creates a mapping that shares an existing backing store.
+impl ChannelRegion {
+    /// Creates a new channel region by allocating a shared region via
+    /// [`SharedRegion::allocate`].
     ///
-    /// The returned mapping points to the same memory as the original,
-    /// enabling cross-process-style sharing in native test mode.
-    fn from_shared_backing(backing: Arc<Vec<u8>>, size: u64) -> Self {
-        let base = backing.as_ptr() as *mut u8;
-        Self {
-            inner: Arc::new(RegionMappingInner {
-                base,
-                size,
-                _backing: Some(backing),
-            }),
-        }
-    }
-
-    /// Creates a mapping from a raw pointer (for WASM linear memory).
-    ///
-    /// # Safety
-    ///
-    /// The pointer must be valid for reads and writes of `size` bytes and must
-    /// remain valid for the lifetime of the returned mapping.
-    pub unsafe fn from_raw(base: *mut u8, size: u64) -> Self {
-        Self {
-            inner: Arc::new(RegionMappingInner {
-                base,
-                size,
-                _backing: None,
-            }),
-        }
-    }
-
-    /// Returns the base pointer.
-    pub fn base(&self) -> *mut u8 {
-        self.inner.base
-    }
-
-    /// Returns the mapping size in bytes.
-    pub fn size(&self) -> u64 {
-        self.inner.size
-    }
-
-    /// Creates a sub-mapping that points to a sub-region of this mapping.
-    ///
-    /// The sub-mapping shares the same underlying memory (via Arc) but has
-    /// a different base pointer and size. This is useful for multi-memory
-    /// regions where each sub-memory has its own offset and length.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that `offset + size` does not exceed the
-    /// parent mapping's size.
-    pub fn sub_region(&self, offset: u64, size: u64) -> Result<Self> {
-        if offset.checked_add(size).ok_or(Error::CapacityExceeded)? > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let new_base = unsafe { self.inner.base.add(offset as usize) };
-        Ok(Self {
-            inner: Arc::new(RegionMappingInner {
-                base: new_base,
-                size,
-                // Share the parent's backing to keep the memory alive.
-                _backing: self.inner._backing.clone(),
-            }),
-        })
-    }
-
-    /// Reads bytes at the given offset.
-    pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let end = offset.checked_add(len).ok_or(Error::CapacityExceeded)?;
-        if end > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let mut buf = vec![0u8; len as usize];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.inner.base.add(offset as usize),
-                buf.as_mut_ptr(),
-                len as usize,
-            );
-        }
-        Ok(buf)
-    }
-
-    /// Writes bytes at the given offset.
-    pub fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or(Error::CapacityExceeded)?;
-        if end > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.inner.base.add(offset as usize),
-                bytes.len(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Reads a little-endian `u64` at the given offset.
-    pub fn read_u64(&self, offset: u64) -> Result<u64> {
-        let bytes = self.read(offset, 8)?;
-        Ok(u64::from_le_bytes(
-            bytes.try_into().map_err(|_invalid| Error::InvalidLayout)?,
-        ))
-    }
-
-    /// Writes a little-endian `u64` at the given offset.
-    pub fn write_u64(&self, offset: u64, value: u64) -> Result<()> {
-        self.write(offset, &value.to_le_bytes())
-    }
-
-    /// Reads a single byte at the given offset.
-    pub fn read_u8(&self, offset: u64) -> Result<u8> {
-        let bytes = self.read(offset, 1)?;
-        Ok(bytes[0])
-    }
-
-    /// Writes a single byte at the given offset.
-    pub fn write_u8(&self, offset: u64, value: u8) -> Result<()> {
-        self.write(offset, &[value])
-    }
-
-    /// Atomically loads a `u64` at the given offset.
-    pub fn atomic_load_u64(&self, offset: u64, ordering: Ordering) -> Result<u64> {
-        if offset + 8 > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let ptr = unsafe { self.inner.base.add(offset as usize) as *const AtomicU64 };
-        Ok(unsafe { (*ptr).load(ordering) })
-    }
-
-    /// Atomically stores a `u64` at the given offset.
-    pub fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()> {
-        if offset + 8 > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let ptr = unsafe { self.inner.base.add(offset as usize) as *const AtomicU64 };
-        unsafe {
-            (*ptr).store(value, ordering);
-        }
-        Ok(())
-    }
-
-    /// Atomically adds to a `u64` at the given offset, returning the previous value.
-    pub fn fetch_add_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<u64> {
-        if offset + 8 > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let ptr = unsafe { self.inner.base.add(offset as usize) as *const AtomicU64 };
-        Ok(unsafe { (*ptr).fetch_add(value, ordering) })
-    }
-
-    /// Atomically compares and exchanges a `u64` at the given offset.
-    /// Returns the previous value (equals `current` on success).
-    pub fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64> {
-        if offset + 8 > self.inner.size {
-            return Err(Error::IndexOutOfBounds);
-        }
-        let ptr = unsafe { self.inner.base.add(offset as usize) as *const AtomicU64 };
-        let result = unsafe {
-            (*ptr).compare_exchange_weak(current, new, Ordering::SeqCst, Ordering::SeqCst)
-        };
-        match result {
-            Ok(prev) => Ok(prev),
-            Err(prev) => Ok(prev),
-        }
-    }
-
-    /// Notifies waiters on an address within this mapping.
-    ///
-    /// In WASM mode this lowers to `memory.atomic.notify`. In native mode this
-    /// is a no-op (tests use tokio notification instead).
-    pub fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32> {
-        let _ = (offset, count);
-        Ok(0)
-    }
-
-    /// Waits on an address within this mapping.
-    ///
-    /// In WASM mode this lowers to `memory.atomic.wait32`. In native mode this
-    /// is a no-op.
-    pub fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
-        let _ = (offset, expected, timeout_ms);
-        Ok(())
-    }
-}
-
-// SAFETY (Send): RegionMappingInner contains a `base: *mut u8` raw pointer.
-// In WASM mode, this pointer references shared linear memory that remains valid
-// for the guest's entire lifetime, so moving it across threads is safe.
-// In native mode, the pointer points into an `Arc<Vec<u8>>` held by `_backing`,
-// which keeps the allocation alive for as long as this struct exists.
-// All access to the pointed-to memory goes through atomic operations at
-// well-known offsets, so concurrent access from different threads is sound.
-unsafe impl Send for RegionMappingInner {}
-
-// SAFETY (Sync): See the Send rationale above. In both WASM and native modes,
-// the raw pointer is stable and all mutations go through atomic operations
-// (load/store/CAS with appropriate ordering), so sharing `&RegionMappingInner`
-// across threads is safe.
-unsafe impl Sync for RegionMappingInner {}
-
-impl RegionBuilder {
-    /// Creates a new shared memory region for a ring buffer of the given capacity.
-    ///
-    /// In native mode this uses a heap allocation and registers it in the
-    /// native region registry so that `attach` can share the same memory.
-    /// In WASM mode it would call the `alloc_region` hostcall with the given
-    /// `purpose` tag.
-    pub fn create(capacity: u64, _purpose: ResourceKind) -> Result<ChannelRegion> {
+    /// The region is sized to hold a ring buffer of the given `capacity`
+    /// bytes (plus the coordination header page). The shared header fields
+    /// are **not** initialised — call [`initialise`](Self::initialise) and
+    /// [`store_shared_capacity`](Self::store_shared_capacity) afterwards.
+    pub fn create(capacity: u64, purpose: ResourceKind) -> Result<Self> {
         let total_aligned = aligned_region_size(capacity)?;
-        let mapping = RegionMapping::allocate(total_aligned)?;
-
-        // Register in native registry so attach can find it.
-        let backing = mapping
-            .inner
-            ._backing
-            .clone()
-            .expect("native mapping must have backing");
-        let region_id = native_register_region(backing);
-
-        Ok(ChannelRegion {
-            region_id,
+        let pages = pages_for_bytes(total_aligned);
+        let shared = SharedRegion::allocate(pages, RegionProt::ReadWrite, purpose)
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        let mapping = shared.mapping();
+        Ok(Self {
+            region_id: shared.region_id(),
             mapping,
+            shared: Some(Arc::new(shared)),
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size: total_aligned,
         })
     }
 
-    /// Attaches to an existing shared memory region by its region id.
+    /// Attaches to an existing channel region by its shared region id.
     ///
-    /// In native mode this looks up the region in the native registry and
-    /// shares the same backing memory. The capacity is read from the shared
-    /// channel header at `SHARED_CAPACITY_OFFSET`.
-    ///
-    /// In WASM mode it would call the `attach_region` hostcall and read the
-    /// capacity from the shared header after mapping.
-    pub fn attach(region_id: u64) -> Result<ChannelRegion> {
-        let backing = native_lookup_region(region_id).ok_or(Error::InvalidRegion)?;
-        let size = backing.len() as u64;
-        let mapping = RegionMapping::from_shared_backing(backing, size);
+    /// The capacity is read from the shared channel header at
+    /// [`SHARED_CAPACITY_OFFSET`].
+    pub fn attach(region_id: u64) -> Result<Self> {
+        let shared = SharedRegion::attach(region_id, None, RegionProt::ReadWrite)
+            .map_err(|e| Error::Guest(e.to_string()))?;
+        let mapping = shared.mapping();
 
         // Read capacity from the shared channel header.
         let capacity = mapping.read_u64(SHARED_CAPACITY_OFFSET)?;
@@ -361,35 +111,38 @@ impl RegionBuilder {
             return Err(Error::InvalidLayout);
         }
 
-        Ok(ChannelRegion {
+        let size = shared.size();
+        Ok(Self {
             region_id,
             mapping,
+            shared: Some(Arc::new(shared)),
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size,
         })
     }
 
-    /// Removes a region from the native registry.
-    ///
-    /// In native mode this cleans up the global registry entry. In WASM mode
-    /// this would be a no-op (the runtime handles cleanup via `FreeRegion`).
-    pub fn free(region_id: u64) {
-        native_unregister_region(region_id);
-    }
-}
-
-impl ChannelRegion {
     /// Wraps an existing region mapping as a channel region.
+    ///
+    /// This is useful for multi-memory regions where sub-mappings are
+    /// carved out of a parent mapping (e.g. RPC request/reply rings).
     pub fn from_mapping(mapping: RegionMapping, capacity: u64) -> Self {
         let size = DATA_OFFSET + capacity;
         Self {
             region_id: 0,
             mapping,
+            shared: None,
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size,
         }
+    }
+
+    /// Returns a reference to the underlying shared region, if available.
+    ///
+    /// Returns `None` for sub-mappings created via `from_mapping()`.
+    pub fn shared_region(&self) -> Option<&SharedRegion> {
+        self.shared.as_deref()
     }
 
     /// Returns the shared region id.
@@ -780,39 +533,17 @@ fn aligned_region_size(capacity: u64) -> Result<u64> {
         .max(MIN_REGION_BYTES))
 }
 
+/// Computes the number of WASM pages needed to hold `bytes`.
+fn pages_for_bytes(bytes: u64) -> u32 {
+    ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) as u32
+}
+
 fn encode_reader_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
 }
 
 fn encode_writer_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
-}
-
-/// Looks up a backing store by region_id. Returns `None` if not found.
-fn native_lookup_region(region_id: u64) -> Option<Arc<Vec<u8>>> {
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .get(&region_id)
-        .cloned()
-}
-
-/// Registers a backing store in the native registry, returning a unique region_id.
-fn native_register_region(backing: Arc<Vec<u8>>) -> u64 {
-    let region_id = NATIVE_REGION_COUNTER.fetch_add(1, Ordering::SeqCst);
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .insert(region_id, backing);
-    region_id
-}
-
-/// Removes a region from the native registry.
-fn native_unregister_region(region_id: u64) {
-    NATIVE_REGION_REGISTRY
-        .lock()
-        .expect("native registry poisoned")
-        .remove(&region_id);
 }
 
 fn reserve_tail_next(
@@ -914,43 +645,8 @@ mod tests {
     }
 
     #[test]
-    fn region_mapping_read_write_round_trip() {
-        let mapping = RegionMapping::allocate(256).expect("allocate");
-        mapping.write(0, &[1, 2, 3, 4]).expect("write");
-        let data = mapping.read(0, 4).expect("read");
-        assert_eq!(data, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn region_mapping_u64_round_trip() {
-        let mapping = RegionMapping::allocate(64).expect("allocate");
-        mapping.write_u64(0, 0xDEAD_BEEF_CAFE_BABE).expect("write");
-        assert_eq!(mapping.read_u64(0).expect("read"), 0xDEAD_BEEF_CAFE_BABE);
-    }
-
-    #[test]
-    fn region_mapping_atomic_operations() {
-        let mapping = RegionMapping::allocate(64).expect("allocate");
-        mapping
-            .atomic_store_u64(0, 10, Ordering::Release)
-            .expect("store");
-        assert_eq!(
-            mapping.atomic_load_u64(0, Ordering::Acquire).expect("load"),
-            10
-        );
-        let prev = mapping
-            .fetch_add_u64(0, 5, Ordering::SeqCst)
-            .expect("fetch_add");
-        assert_eq!(prev, 10);
-        assert_eq!(
-            mapping.atomic_load_u64(0, Ordering::Acquire).expect("load"),
-            15
-        );
-    }
-
-    #[test]
     fn channel_region_reserve_tail_with_backoff() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
         let pos = region.reserve_tail(8, false, false).expect("reserve");
         assert_eq!(pos, 0);
@@ -961,7 +657,7 @@ mod tests {
     #[test]
     fn exponential_backoff_under_concurrent_contention() {
         let region = std::sync::Arc::new(
-            RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create"),
+            ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create"),
         );
         region.initialise().expect("init");
 
@@ -992,7 +688,7 @@ mod tests {
     fn two_writers_coordinate_on_shared_next_tail() {
         // Two ChannelRegion clones sharing the same underlying mapping
         // simulate cross-process writers.
-        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1015,7 +711,7 @@ mod tests {
 
     #[test]
     fn reader_sees_writer_count_from_cloned_region() {
-        let region_a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1030,7 +726,7 @@ mod tests {
 
     #[test]
     fn writer_backpressure_from_shared_reader_slots() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Allocate a reader slot at position 0.
@@ -1066,7 +762,7 @@ mod tests {
 
     #[test]
     fn reader_detects_eof_when_writer_count_reaches_zero() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Initially no writers.
@@ -1083,7 +779,7 @@ mod tests {
 
     #[test]
     fn shared_reader_slot_counter_allocates_unique_indices() {
-        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1095,7 +791,7 @@ mod tests {
 
     #[test]
     fn shared_writer_id_allocation() {
-        let region_a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1107,7 +803,7 @@ mod tests {
 
     #[test]
     fn shared_header_capacity_round_trip() {
-        let region = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Initially zero after initialise.
@@ -1120,7 +816,7 @@ mod tests {
 
     #[test]
     fn shared_header_backpressure_round_trip() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Initially zero (Park) after initialise.
@@ -1137,7 +833,7 @@ mod tests {
 
     #[test]
     fn shared_header_visible_across_cloned_regions() {
-        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1149,19 +845,17 @@ mod tests {
     }
 
     #[test]
-    fn native_create_assigns_unique_region_ids() {
-        let a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create a");
-        let b = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create b");
+    fn create_assigns_unique_region_ids() {
+        let a = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create a");
+        let b = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create b");
         assert_ne!(a.region_id(), 0);
         assert_ne!(b.region_id(), 0);
         assert_ne!(a.region_id(), b.region_id());
-        RegionBuilder::free(a.region_id());
-        RegionBuilder::free(b.region_id());
     }
 
     #[test]
-    fn native_attach_shares_memory_and_reads_capacity() {
-        let original = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+    fn attach_shares_memory_and_reads_capacity() {
+        let original = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         original.initialise().expect("init");
         original.store_shared_capacity(4096).expect("store cap");
 
@@ -1171,7 +865,7 @@ mod tests {
         original.write_data(0, b"shared!").expect("write");
 
         // Attach by region_id — should share the same backing memory.
-        let attached = RegionBuilder::attach(region_id).expect("attach");
+        let attached = ChannelRegion::attach(region_id).expect("attach");
         assert_eq!(attached.capacity(), 4096);
 
         // Read back the data through the attached region.
@@ -1182,27 +876,23 @@ mod tests {
         attached.write_data(8, b"hello").expect("write via attach");
         let data = original.read_data(8, 5).expect("read original");
         assert_eq!(data, b"hello");
-
-        RegionBuilder::free(region_id);
     }
 
     #[test]
-    fn native_attach_unknown_region_fails() {
-        let result = RegionBuilder::attach(999_999_999);
-        assert!(matches!(result, Err(Error::InvalidRegion)));
+    fn attach_unknown_region_fails() {
+        let result = ChannelRegion::attach(999_999_999);
+        assert!(matches!(result, Err(Error::Guest(_))));
     }
 
     #[test]
-    fn native_attach_zero_capacity_fails() {
+    fn attach_zero_capacity_fails() {
         // Create a region but don't store capacity (it stays 0 from initialise).
-        let original = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let original = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         original.initialise().expect("init");
         // Don't call store_shared_capacity — capacity stays 0.
 
-        let result = RegionBuilder::attach(original.region_id());
+        let result = ChannelRegion::attach(original.region_id());
         assert!(matches!(result, Err(Error::InvalidLayout)));
-
-        RegionBuilder::free(original.region_id());
     }
 
     #[test]
@@ -1216,7 +906,7 @@ mod tests {
 
     #[test]
     fn writer_slot_allocate_update_release() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Allocate a writer slot at position 0.
@@ -1240,7 +930,7 @@ mod tests {
 
     #[test]
     fn minimum_writer_position_scans_slots() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // No slots allocated — None.
@@ -1268,7 +958,7 @@ mod tests {
 
     #[test]
     fn writer_slot_counter_allocates_unique_indices() {
-        let region_a = RegionBuilder::create(4096, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(4096, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 
@@ -1280,7 +970,7 @@ mod tests {
 
     #[test]
     fn writer_backpressure_from_shared_writer_slots() {
-        let region = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region.initialise().expect("init");
 
         // Allocate a writer slot at position 0 (simulates a slow blocking writer).
@@ -1316,7 +1006,7 @@ mod tests {
 
     #[test]
     fn writer_slots_visible_across_cloned_regions() {
-        let region_a = RegionBuilder::create(64, ResourceKind::SharedMemory).expect("create");
+        let region_a = ChannelRegion::create(64, ResourceKind::SharedMemory).expect("create");
         region_a.initialise().expect("init");
         let region_b = region_a.clone();
 

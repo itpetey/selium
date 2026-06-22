@@ -15,9 +15,11 @@ pub use frame::FrameHeader;
 pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use region::{
     ChannelRegion, DATA_OFFSET, MAX_READER_SLOTS, NEXT_TAIL_OFFSET, NEXT_WRITER_ID_OFFSET,
-    PAGE_SIZE, READER_SLOT_COUNTER_OFFSET, READER_SLOTS_OFFSET, RegionBuilder, RegionMapping,
-    WRITER_COUNT_OFFSET,
+    READER_SLOT_COUNTER_OFFSET, READER_SLOTS_OFFSET, WRITER_COUNT_OFFSET,
 };
+// Re-export RegionMapping and PAGE_SIZE from the memory module for backward
+// compatibility with callers that imported them via `crate::io`.
+pub use crate::memory::{PAGE_SIZE, RegionMapping};
 pub use ring_buf::RingBuf;
 
 pub mod channels;

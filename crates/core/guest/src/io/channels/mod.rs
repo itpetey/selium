@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Drop);
         assert_eq!(attached.ring().capacity(), 64);
 
-        crate::io::RegionBuilder::free(region_id);
+        crate::memory::free_region(region_id).ok();
     }
 
     #[test]
@@ -282,6 +282,6 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Park);
         assert_eq!(attached.ring().capacity(), 128);
 
-        crate::io::RegionBuilder::free(region_id);
+        crate::memory::free_region(region_id).ok();
     }
 }

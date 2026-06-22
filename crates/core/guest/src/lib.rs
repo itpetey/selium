@@ -10,7 +10,7 @@ pub use crate::{
     context::Context,
     encoding::{FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor},
     error::{GuestError, Result},
-    memory::{SHARED_REGION_MAGIC, SharedRegion, attach_region, free_region},
+    memory::{PAGE_SIZE, SHARED_REGION_MAGIC, SharedRegion, RegionMapping, free_region},
     net::tcp::{TcpAccept, TcpListener, TcpStream},
     net::udp::UdpSocket,
     platform::{mark_ready, process_id},

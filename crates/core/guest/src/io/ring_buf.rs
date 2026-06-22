@@ -3,7 +3,7 @@ use std::sync::atomic::{Ordering, fence};
 use selium_abi::ResourceKind;
 
 use crate::io::{
-    ChannelRegion, Cursor, RegionBuilder,
+    ChannelRegion, Cursor,
     cursor::mask_for_capacity,
     error::{Error, Result},
     frame::FrameHeader,
@@ -35,7 +35,7 @@ impl RingBuf {
     /// The `purpose` tag is threaded through to the `AllocRegion` hostcall for
     /// runtime discovery registration (informational only, not used for AAA).
     pub fn create(capacity: u64, purpose: ResourceKind) -> Result<Self> {
-        let region = RegionBuilder::create(capacity, purpose)?;
+        let region = ChannelRegion::create(capacity, purpose)?;
         let mask = mask_for_capacity(capacity)?;
         region.initialise()?;
         region.store_shared_capacity(capacity)?;
@@ -50,7 +50,7 @@ impl RingBuf {
     ///
     /// Reads the capacity from the shared channel header.
     pub fn attach(region_id: u64) -> Result<Self> {
-        let region = RegionBuilder::attach(region_id)?;
+        let region = ChannelRegion::attach(region_id)?;
         Self::wrap_region(region)
     }
 
