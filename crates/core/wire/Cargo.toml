@@ -10,20 +10,23 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.cargo-shear]
+ignored = ["flatbuffers"]
+
 [dependencies]
 bytes.workspace = true
+flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
 selium-abi.workspace = true
 selium-encoding.workspace = true
 selium-guest-macros.workspace = true
 selium-memory.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = {
+  workspace = true,
+  features = ["io-util", "macros", "rt-multi-thread"]
+}
 tokio-util = { workspace = true, features = ["codec"] }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
-flatbuffers.workspace = true
 
 [lints]
 workspace = true
