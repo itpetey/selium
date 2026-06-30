@@ -184,7 +184,8 @@ impl Runtime for SeliumQuinnRuntime {
     }
 
     fn now(&self) -> web_time::Instant {
-        let i = crate::time::Instant::now();
+        let i = crate::time::Instant::now()
+            .expect("failed to get monotonic time from host");
         let d = std::time::Duration::from_nanos(i.as_nanos());
         web_time::Instant::from(d)
     }

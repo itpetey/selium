@@ -56,23 +56,13 @@ impl Instant {
 
     /// Returns an `Instant` corresponding to "now" according to the
     /// hostcall monotonic clock.
-    ///
-    /// # Panics
-    ///
-    /// Panics on native (non-WASM) targets where the hostcall is not
-    /// available. On WASM this always succeeds.
-    #[expect(
-        clippy::panic,
-        reason = "native targets have no WASM hostcall; panic is documented"
-    )]
-    pub fn now() -> Self {
-        let nanos = match hostcall_ready(HostcallRequest::TimeMonotonic) {
-            Ok(HostcallOutput::U64(nanos)) => nanos,
-            Ok(_) => panic!("unexpected hostcall output for TimeMonotonic"),
-            Err(e) => panic!("failed to get monotonic time from host: {e}"),
-        };
-
-        Self { nanos }
+    #[expect(clippy::unreachable, reason = "native targets have no WASM hostcall")]
+    pub fn now() -> Result<Self> {
+        match hostcall_ready(HostcallRequest::TimeMonotonic) {
+            Ok(HostcallOutput::U64(nanos)) => Ok(Self { nanos }),
+            Err(e) => Err(e),
+            Ok(_) => unreachable!(), // only reached when consumed in non-wasm context
+        }
     }
 
     /// Returns the amount of time elapsed from `earlier` to `self`.
@@ -100,8 +90,8 @@ impl Instant {
     }
 
     /// Returns the amount of time elapsed since this `Instant` was created.
-    pub fn elapsed(&self) -> Duration {
-        Self::now().saturating_duration_since(*self)
+    pub fn elapsed(&self) -> Result<Duration> {
+        Ok(Self::now()?.saturating_duration_since(*self))
     }
 
     /// Returns `Some(t)` where `t` is the time `self + duration`, or `None`
@@ -201,7 +191,9 @@ impl std::future::Future for Timer {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        let now = Instant::now();
+        let Ok(now) = Instant::now() else {
+            return std::task::Poll::Pending;
+        };
         if now >= self.deadline {
             self.sleep_future = None;
             return std::task::Poll::Ready(());
