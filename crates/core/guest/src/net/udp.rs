@@ -10,11 +10,10 @@ use std::{
 use futures::{Sink, Stream};
 use selium_abi::{HostcallOutput, HostcallRequest};
 
-use crate::{
-    GuestError, Result,
-    hostcall::hostcall_async,
-    io::{ChannelRegion, FrameHeader, PAGE_SIZE, RegionMapping, RingBuf},
-};
+use crate::{GuestError, Result, hostcall::hostcall_async};
+use selium_memory::RegionMapping;
+use selium_shm::{ChannelRegion, PAGE_SIZE, RingBuf};
+use selium_wire::frame::FrameHeader;
 
 const HEADER_COUNT_OFFSET: u64 = 16;
 const HEADER_ENTRY_OFFSET: u64 = 24;
@@ -125,19 +124,26 @@ impl UdpSocket {
     ///
     /// Returns `(source_address, payload)`.
     pub fn decode_datagram(frame: &[u8]) -> Result<(SocketAddr, Vec<u8>)> {
-        if frame.len() < 2 {
-            return Err(GuestError::Host("frame too short".to_string()));
-        }
-        let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
-        if frame.len() < 2 + addr_len {
-            return Err(GuestError::Host("frame too short for address".to_string()));
-        }
-        let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
+        let prefix = frame
+            .get(0..2)
+            .ok_or_else(|| GuestError::Host("frame too short".to_string()))?;
+        let addr_len = u16::from_le_bytes(
+            prefix
+                .try_into()
+                .map_err(|_| GuestError::Host("frame too short".to_string()))?,
+        ) as usize;
+        let addr_bytes = frame
+            .get(2..2 + addr_len)
+            .ok_or_else(|| GuestError::Host("frame too short for address".to_string()))?;
+        let addr_str = std::str::from_utf8(addr_bytes)
             .map_err(|e| GuestError::Host(format!("invalid address bytes: {e}")))?;
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| GuestError::Host(format!("invalid address: {e}")))?;
-        let payload = frame[2 + addr_len..].to_vec();
+        let payload = frame
+            .get(2 + addr_len..)
+            .ok_or_else(|| GuestError::Host("frame too short for payload".to_string()))?
+            .to_vec();
         Ok((addr, payload))
     }
 }

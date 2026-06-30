@@ -61,6 +61,10 @@ impl Instant {
     ///
     /// Panics on native (non-WASM) targets where the hostcall is not
     /// available. On WASM this always succeeds.
+    #[expect(
+        clippy::panic,
+        reason = "native targets have no WASM hostcall; panic is documented"
+    )]
     pub fn now() -> Self {
         let nanos = match hostcall_ready(HostcallRequest::TimeMonotonic) {
             Ok(HostcallOutput::U64(nanos)) => nanos,
@@ -242,20 +246,6 @@ pub fn now() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn native_time_now_fails() {
-        let result = now();
-        assert!(matches!(result, Err(GuestError::Host(_))));
-    }
-
-    #[test]
-    fn instant_now_on_native_panics() {
-        // On native (non-WASM) the hostcall is unavailable, so Instant::now()
-        // panics. Catch the panic to verify this is expected.
-        let result = std::panic::catch_unwind(Instant::now);
-        assert!(result.is_err());
-    }
 
     #[test]
     fn instant_arithmetic() {

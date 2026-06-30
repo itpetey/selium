@@ -2,9 +2,8 @@ use std::sync::atomic::{Ordering, fence};
 
 use selium_abi::ResourceKind;
 
-use crate::io::{
-    ChannelRegion, Cursor,
-    cursor::mask_for_capacity,
+use crate::{ChannelRegion, Cursor, cursor::mask_for_capacity};
+use selium_wire::{
     error::{Error, Result},
     frame::FrameHeader,
 };

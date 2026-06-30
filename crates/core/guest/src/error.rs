@@ -1,7 +1,7 @@
 use selium_abi::{AbiError, Capability};
 use thiserror::Error;
 
-use crate::io;
+use std::io;
 
 /// Result type used by the Selium guest SDK.
 pub type Result<T> = std::result::Result<T, GuestError>;

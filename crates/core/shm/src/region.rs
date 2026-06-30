@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use selium_abi::{RegionProt, ResourceKind};
 
-use crate::memory::{PAGE_SIZE, RegionMapping, SharedRegion};
+use selium_memory::{Region, RegionMapping, PAGE_SIZE};
 
-use crate::io::error::{Error, Result};
+use selium_wire::error::{Error, Result};
 
 /// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
 pub const BACKPRESSURE_OFFSET: u64 = 1064;
@@ -53,10 +53,10 @@ pub struct ChannelRegion {
     region_id: u64,
     mapping: RegionMapping,
     /// The underlying shared region. Retained so that hostcall-mediated slot
-    /// operations (e.g. `SharedRegion::write_table_slot`) can be delegated
+    /// operations (e.g. `Region::write_table_slot`) can be delegated
     /// through `ChannelRegion` for consumer guests with read-only mappings.
     /// `None` for sub-mappings carved from a parent (e.g. RPC multi-memory).
-    shared: Option<Arc<SharedRegion>>,
+    region: Option<Arc<Region>>,
     private: Arc<ChannelPrivateState>,
     capacity: u64,
     size: u64,
@@ -74,22 +74,23 @@ struct ChannelPrivateState {
 
 impl ChannelRegion {
     /// Creates a new channel region by allocating a shared region via
-    /// [`SharedRegion::allocate`].
+    /// [`Region::allocate`].
     ///
     /// The region is sized to hold a ring buffer of the given `capacity`
     /// bytes (plus the coordination header page). The shared header fields
     /// are **not** initialised — call [`initialise`](Self::initialise) and
     /// [`store_shared_capacity`](Self::store_shared_capacity) afterwards.
     pub fn create(capacity: u64, purpose: ResourceKind) -> Result<Self> {
+        #[cfg(test)]
+        crate::ensure_heap_provider();
         let total_aligned = aligned_region_size(capacity)?;
         let pages = pages_for_bytes(total_aligned);
-        let shared = SharedRegion::allocate(pages, RegionProt::ReadWrite, purpose)
-            .map_err(|e| Error::Guest(e.to_string()))?;
-        let mapping = shared.mapping();
+        let region = crate::allocate_region(pages, RegionProt::ReadWrite, purpose)?;
+        let mapping = region.mapping();
         Ok(Self {
-            region_id: shared.region_id(),
+            region_id: region.region_id(),
             mapping,
-            shared: Some(Arc::new(shared)),
+            region: Some(Arc::new(region)),
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size: total_aligned,
@@ -101,9 +102,10 @@ impl ChannelRegion {
     /// The capacity is read from the shared channel header at
     /// [`SHARED_CAPACITY_OFFSET`].
     pub fn attach(region_id: u64) -> Result<Self> {
-        let shared = SharedRegion::attach(region_id, None, RegionProt::ReadWrite)
-            .map_err(|e| Error::Guest(e.to_string()))?;
-        let mapping = shared.mapping();
+        #[cfg(test)]
+        crate::ensure_heap_provider();
+        let region = crate::attach_region(region_id, None, RegionProt::ReadWrite)?;
+        let mapping = region.mapping();
 
         // Read capacity from the shared channel header.
         let capacity = mapping.read_u64(SHARED_CAPACITY_OFFSET)?;
@@ -111,11 +113,11 @@ impl ChannelRegion {
             return Err(Error::InvalidLayout);
         }
 
-        let size = shared.size();
+        let size = region.size();
         Ok(Self {
             region_id,
             mapping,
-            shared: Some(Arc::new(shared)),
+            region: Some(Arc::new(region)),
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size,
@@ -131,7 +133,7 @@ impl ChannelRegion {
         Self {
             region_id: 0,
             mapping,
-            shared: None,
+            region: None,
             private: Arc::new(ChannelPrivateState::default()),
             capacity,
             size,
@@ -141,8 +143,8 @@ impl ChannelRegion {
     /// Returns a reference to the underlying shared region, if available.
     ///
     /// Returns `None` for sub-mappings created via `from_mapping()`.
-    pub fn shared_region(&self) -> Option<&SharedRegion> {
-        self.shared.as_deref()
+    pub fn shared_region(&self) -> Option<&Region> {
+        self.region.as_deref()
     }
 
     /// Returns the shared region id.
@@ -174,6 +176,7 @@ impl ChannelRegion {
     pub fn load_generation(&self) -> Result<u64> {
         self.mapping
             .atomic_load_u64(GENERATION_COUNTER_OFFSET, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Increments the generation counter in shared memory and notifies waiters.
@@ -181,9 +184,7 @@ impl ChannelRegion {
         let new_gen =
             self.mapping
                 .fetch_add_u64(GENERATION_COUNTER_OFFSET, 1, Ordering::Release)?;
-        let _ = self
-            .mapping
-            .atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX);
+        drop(self.mapping.atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX));
         Ok(new_gen + 1)
     }
 
@@ -191,6 +192,7 @@ impl ChannelRegion {
     pub fn load_next_tail(&self) -> Result<u64> {
         self.mapping
             .atomic_load_u64(NEXT_TAIL_OFFSET, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Atomically CAS on the shared `next_tail` cursor.
@@ -198,6 +200,7 @@ impl ChannelRegion {
     pub fn cas_next_tail(&self, current: u64, new: u64) -> Result<u64> {
         self.mapping
             .compare_exchange_u64(NEXT_TAIL_OFFSET, current, new)
+            .map_err(Error::from)
     }
 
     /// Reads the next_tail cursor from shared memory (alias for `load_next_tail`).
@@ -209,6 +212,7 @@ impl ChannelRegion {
     pub fn write_next_tail(&self, value: u64) -> Result<()> {
         self.mapping
             .atomic_store_u64(NEXT_TAIL_OFFSET, value, Ordering::Release)
+            .map_err(Error::from)
     }
 
     /// Reads the tail_cache from private state.
@@ -220,12 +224,14 @@ impl ChannelRegion {
     pub fn load_writer_count(&self) -> Result<u64> {
         self.mapping
             .atomic_load_u64(WRITER_COUNT_OFFSET, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Atomically adds to the shared `writer_count`, returning the previous value.
     pub fn fetch_add_writer_count(&self, delta: u64) -> Result<u64> {
         self.mapping
             .fetch_add_u64(WRITER_COUNT_OFFSET, delta, Ordering::SeqCst)
+            .map_err(Error::from)
     }
 
     /// Reads the writer count from shared memory.
@@ -250,7 +256,9 @@ impl ChannelRegion {
             return Err(Error::InvalidLayout);
         }
         let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
-        self.mapping.atomic_load_u64(offset, Ordering::Acquire)
+        self.mapping
+            .atomic_load_u64(offset, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Stores a value into a reader slot in the shared `reader_slots` array.
@@ -261,18 +269,21 @@ impl ChannelRegion {
         let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
         self.mapping
             .atomic_store_u64(offset, value, Ordering::Release)
+            .map_err(Error::from)
     }
 
     /// Atomically increments the shared `next_writer_id` counter, returning the previous value.
     pub fn fetch_add_next_writer_id(&self) -> Result<u64> {
         self.mapping
             .fetch_add_u64(NEXT_WRITER_ID_OFFSET, 1, Ordering::SeqCst)
+            .map_err(Error::from)
     }
 
     /// Atomically increments the shared `reader_slot_counter`, returning the previous value.
     pub fn fetch_add_reader_slot_counter(&self) -> Result<u64> {
         self.mapping
             .fetch_add_u64(READER_SLOT_COUNTER_OFFSET, 1, Ordering::SeqCst)
+            .map_err(Error::from)
     }
 
     /// Allocates a stable writer id from the shared counter.
@@ -343,7 +354,9 @@ impl ChannelRegion {
             return Err(Error::InvalidLayout);
         }
         let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
-        self.mapping.atomic_load_u64(offset, Ordering::Acquire)
+        self.mapping
+            .atomic_load_u64(offset, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Stores a value into a writer slot in the shared `writer_slots` array.
@@ -354,12 +367,14 @@ impl ChannelRegion {
         let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
         self.mapping
             .atomic_store_u64(offset, value, Ordering::Release)
+            .map_err(Error::from)
     }
 
     /// Atomically increments the shared `writer_slot_counter`, returning the previous value.
     pub fn fetch_add_writer_slot_counter(&self) -> Result<u64> {
         self.mapping
             .fetch_add_u64(WRITER_SLOT_COUNTER_OFFSET, 1, Ordering::SeqCst)
+            .map_err(Error::from)
     }
 
     /// Allocates a writer cursor slot via the shared `writer_slot_counter`
@@ -456,39 +471,43 @@ impl ChannelRegion {
     /// Reads bytes from the ring data area.
     pub fn read_data(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let data_offset = DATA_OFFSET + offset;
-        self.mapping.read(data_offset, len)
+        self.mapping.read(data_offset, len).map_err(Error::from)
     }
 
     /// Writes bytes to the ring data area.
     pub fn write_data(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         let data_offset = DATA_OFFSET + offset;
-        self.mapping.write(data_offset, bytes)
+        self.mapping.write(data_offset, bytes).map_err(Error::from)
     }
 
     /// Loads the shared backpressure strategy from the channel header.
     ///
     /// Returns 0 for Park, 1 for Drop. Any unrecognised value defaults to Park.
     pub fn load_backpressure(&self) -> Result<u8> {
-        self.mapping.read_u8(BACKPRESSURE_OFFSET)
+        self.mapping.read_u8(BACKPRESSURE_OFFSET).map_err(Error::from)
     }
 
     /// Stores the shared backpressure strategy into the channel header.
     ///
     /// Use 0 for Park, 1 for Drop.
     pub fn store_backpressure(&self, value: u8) -> Result<()> {
-        self.mapping.write_u8(BACKPRESSURE_OFFSET, value)
+        self.mapping
+            .write_u8(BACKPRESSURE_OFFSET, value)
+            .map_err(Error::from)
     }
 
     /// Loads the shared ring buffer capacity from the channel header.
     pub fn load_shared_capacity(&self) -> Result<u64> {
         self.mapping
             .atomic_load_u64(SHARED_CAPACITY_OFFSET, Ordering::Acquire)
+            .map_err(Error::from)
     }
 
     /// Stores the ring buffer capacity into the channel header.
     pub fn store_shared_capacity(&self, capacity: u64) -> Result<()> {
         self.mapping
             .atomic_store_u64(SHARED_CAPACITY_OFFSET, capacity, Ordering::Release)
+            .map_err(Error::from)
     }
 
     /// Initialises a fresh region with all shared coordination fields zeroed.
@@ -511,6 +530,7 @@ impl ChannelRegion {
         }
         self.mapping
             .atomic_store_u64(WRITER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)
+            .map_err(Error::from)
     }
 }
 
@@ -535,7 +555,7 @@ fn aligned_region_size(capacity: u64) -> Result<u64> {
 
 /// Computes the number of WASM pages needed to hold `bytes`.
 fn pages_for_bytes(bytes: u64) -> u32 {
-    ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) as u32
+    bytes.div_ceil(PAGE_SIZE) as u32
 }
 
 fn encode_reader_position(position: u64) -> Result<u64> {
@@ -881,7 +901,7 @@ mod tests {
     #[test]
     fn attach_unknown_region_fails() {
         let result = ChannelRegion::attach(999_999_999);
-        assert!(matches!(result, Err(Error::Guest(_))));
+        assert!(matches!(result, Err(Error::InvalidRegion)));
     }
 
     #[test]

@@ -1,3 +1,8 @@
+#![expect(
+    clippy::indexing_slicing,
+    reason = "pending_frame offsets are bounds-checked before access"
+)]
+
 use std::{
     pin::Pin,
     sync::atomic::{Ordering, fence},
@@ -6,10 +11,10 @@ use std::{
 
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::io::{
-    channels::{ChannelBackpressure, Error, Result},
+use crate::{channels::ChannelBackpressure, region::ChannelRegion};
+use selium_wire::{
+    error::{Error, Result},
     frame::FrameHeader,
-    region::ChannelRegion,
 };
 
 /// Trait for reader types that can report their ring buffer generation counter.
@@ -58,7 +63,8 @@ pub struct Reader {
 }
 
 impl BlockingReader {
-    pub(crate) fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
+    /// Creates a new blocking reader at `start_pos` with the given `reader_id`.
+    pub fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
         Self {
             region,
             pos: start_pos,
@@ -87,7 +93,7 @@ impl BlockingReader {
 
     /// Downgrade this blocking reader to a non-blocking reader, releasing the reader slot.
     pub fn downgrade(mut self) -> Reader {
-        let _ = self.region.release_reader_slot(self.reader_id);
+        drop(self.region.release_reader_slot(self.reader_id));
         let reader = Reader {
             region: self.region.clone(),
             pos: self.pos,
@@ -104,7 +110,7 @@ impl BlockingReader {
     /// Close this reader and release its reader slot.
     pub fn close(&mut self) {
         if !self.terminated {
-            let _ = self.region.release_reader_slot(self.reader_id);
+            drop(self.region.release_reader_slot(self.reader_id));
             self.terminated = true;
         }
     }
@@ -371,7 +377,7 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
     let ring_end = region.data_offset() + region.capacity();
     let wrap = raw_pos + len > ring_end;
     if !wrap {
-        return region.mapping().read(raw_pos, len);
+        return region.mapping().read(raw_pos, len).map_err(Error::from);
     }
 
     let tail_len = ring_end.saturating_sub(raw_pos);

@@ -1,22 +1,22 @@
 use selium_abi::{deframe_bytes, frame_bytes};
 
-use crate::{Result, encoding::FlatMsg, error::abi_error_to_guest_error};
+use crate::{EncodingError, FlatMsg};
 
 /// Decodes a framed Flatbuffers value received by a guest interface.
-pub fn decode_typed<T>(bytes: &[u8]) -> Result<T>
+pub fn decode_typed<T>(bytes: &[u8]) -> Result<T, EncodingError>
 where
     T: FlatMsg,
 {
-    let payload = deframe_bytes(bytes).map_err(abi_error_to_guest_error)?;
-    FlatMsg::decode(payload).map_err(|e| crate::GuestError::Host(format!("FlatMsg decode: {e}")))
+    let payload = deframe_bytes(bytes)?;
+    FlatMsg::decode(payload).map_err(EncodingError::Decode)
 }
 
 /// Encodes a value as framed Flatbuffers bytes for a guest interface.
-pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>>
+pub fn encode_typed<T>(value: &T) -> Result<Vec<u8>, EncodingError>
 where
     T: FlatMsg,
 {
-    frame_bytes(&FlatMsg::encode(value)).map_err(abi_error_to_guest_error)
+    frame_bytes(&FlatMsg::encode(value)).map_err(EncodingError::Framing)
 }
 
 #[cfg(test)]

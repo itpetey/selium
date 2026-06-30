@@ -62,6 +62,48 @@ impl ResourceSender {
     }
 }
 
+impl From<IncomingConnection> for selium_wire::rpc::IncomingConnection {
+    fn from(connection: IncomingConnection) -> Self {
+        Self {
+            client_process_id: connection.client_process_id,
+            shared_id: connection.shared_id,
+        }
+    }
+}
+
+impl selium_wire::Rendezvous for ResourceSender {
+    async fn send(&self, shared_id: u64) -> selium_wire::error::Result<()> {
+        Self::send(self, shared_id)
+            .await
+            .map_err(|error| selium_wire::error::Error::Guest(error.to_string()))
+    }
+
+    async fn recv(&self) -> selium_wire::error::Result<selium_wire::rpc::IncomingConnection> {
+        Err(selium_wire::error::Error::Guest(
+            "ResourceSender cannot receive connections".to_string(),
+        ))
+    }
+}
+
+impl selium_wire::Rendezvous for ResourceListener {
+    async fn send(&self, _shared_id: u64) -> selium_wire::error::Result<()> {
+        Err(selium_wire::error::Error::Guest(
+            "ResourceListener cannot send connections".to_string(),
+        ))
+    }
+
+    async fn recv(&self) -> selium_wire::error::Result<selium_wire::rpc::IncomingConnection> {
+        let connection = self
+            .recv()
+            .await
+            .map_err(|error| selium_wire::error::Error::Guest(error.to_string()))?;
+        Ok(selium_wire::rpc::IncomingConnection {
+            client_process_id: connection.client_process_id,
+            shared_id: connection.shared_id,
+        })
+    }
+}
+
 impl ResourceListener {
     /// Creates a new host-mediated connection queue.
     pub fn create() -> Result<Self> {

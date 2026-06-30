@@ -13,8 +13,11 @@ categories.workspace = true
 [dependencies]
 parking_lot.workspace = true
 selium-abi.workspace = true
-selium-guest = { workspace = true, features = ["io"] }
+selium-encoding.workspace = true
 selium-kernel.workspace = true
+selium-memory.workspace = true
+selium-shm.workspace = true
+selium-wire.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmtiny.workspace = true

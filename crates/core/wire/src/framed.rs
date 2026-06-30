@@ -1,10 +1,7 @@
-//! Framed read/write wrappers for raw byte-stream readers and writers.
+//! Framed read/write wrappers over a [`MessageTransport`].
 //!
 //! Uses `tokio_util::codec::FramedRead` / `FramedWrite` internally, with a
-//! [`FrameCodec`] that handles [`FrameHeader`](crate::io::FrameHeader) encoding
-//! and decoding. `FramedRead<R>` and `FramedWrite<W>` add convenience methods
-//! (`read_frame`, `write_frame`, `poll_ready`, `generation`) and upgrade/downgrade
-//! support for [non-]blocking channel types.
+//! [`FrameCodec`] that handles [`FrameHeader`] encoding and decoding.
 
 use std::{
     pin::Pin,
@@ -17,8 +14,8 @@ use tokio_util::codec::{
     Decoder, Encoder, FramedRead as TokioFramedRead, FramedWrite as TokioFramedWrite,
 };
 
-use crate::io::{
-    channels::{BlockingReader, BlockingWriter, Reader, Writer},
+use crate::{
+    MessageTransport,
     error::{Error, Result},
     frame::FrameHeader,
 };
@@ -27,26 +24,21 @@ use crate::io::{
 /// byte stream.
 ///
 /// Implements [`tokio_util::codec::Decoder`] and [`Encoder`] so that
-/// [`FramedRead`] and [`FramedWrite`] can wrap any [`tokio::io::AsyncRead`]
-/// or [`tokio::io::AsyncWrite`] that transports raw frame bytes.
+/// [`FramedRead`] and [`FramedWrite`] can wrap any [`MessageTransport`].
 pub struct FrameCodec;
 
-/// A framed reader that wraps a raw byte-stream reader to provide frame-level
+/// A framed reader that wraps a [`MessageTransport`] to provide frame-level
 /// read operations with [`FrameHeader`] decoding and tag extraction.
-///
-/// Internally uses `tokio_util::codec::FramedRead<R, FrameCodec>`.
-pub struct FramedRead<R> {
-    inner: TokioFramedRead<R, FrameCodec>,
+pub struct FramedRead<M> {
+    inner: TokioFramedRead<M, FrameCodec>,
     /// A frame that was peeked by `poll_ready` but not yet consumed.
     peeked: Option<(Vec<u8>, u32)>,
 }
 
-/// A framed writer that wraps a raw byte-stream writer to provide frame-level
+/// A framed writer that wraps a [`MessageTransport`] to provide frame-level
 /// write operations with [`FrameHeader`] encoding.
-///
-/// Internally uses `tokio_util::codec::FramedWrite<W, FrameCodec>`.
-pub struct FramedWrite<W> {
-    inner: TokioFramedWrite<W, FrameCodec>,
+pub struct FramedWrite<M> {
+    inner: TokioFramedWrite<M, FrameCodec>,
 }
 
 impl Decoder for FrameCodec {
@@ -58,7 +50,9 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
 
-        let header_bytes = &src[..FrameHeader::ENCODED_SIZE];
+        let header_bytes = src
+            .get(..FrameHeader::ENCODED_SIZE)
+            .ok_or(Error::InvalidFrame)?;
         let header = FrameHeader::decode(header_bytes)?;
 
         let frame_size = FrameHeader::ENCODED_SIZE + header.len as usize;
@@ -71,7 +65,10 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
 
-        let payload = src[FrameHeader::ENCODED_SIZE..frame_size].to_vec();
+        let payload = src
+            .get(FrameHeader::ENCODED_SIZE..frame_size)
+            .ok_or(Error::InvalidFrame)?
+            .to_vec();
         src.advance(frame_size);
 
         Ok(Some((payload, header.tag)))
@@ -96,33 +93,31 @@ impl Encoder<(Vec<u8>, u32)> for FrameCodec {
     }
 }
 
-impl<R> FramedRead<R> {
-    /// Creates a new `FramedRead` wrapping the given raw reader.
-    pub fn new(reader: R) -> Self {
+impl<M: MessageTransport> FramedRead<M> {
+    /// Creates a new `FramedRead` wrapping the given transport.
+    pub fn new(transport: M) -> Self {
         Self {
-            inner: TokioFramedRead::new(reader, FrameCodec),
+            inner: TokioFramedRead::new(transport, FrameCodec),
             peeked: None,
         }
     }
 
-    /// Returns a reference to the inner reader.
-    pub fn inner(&self) -> &R {
+    /// Returns a reference to the inner transport.
+    pub fn inner(&self) -> &M {
         self.inner.get_ref()
     }
 
-    /// Returns a mutable reference to the inner reader.
-    pub fn inner_mut(&mut self) -> &mut R {
+    /// Returns a mutable reference to the inner transport.
+    pub fn inner_mut(&mut self) -> &mut M {
         self.inner.get_mut()
     }
 
-    /// Consumes this `FramedRead` and returns the inner reader.
-    pub fn into_inner(self) -> R {
+    /// Consumes this `FramedRead` and returns the inner transport.
+    pub fn into_inner(self) -> M {
         self.inner.into_inner()
     }
-}
 
-impl<R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpin> FramedRead<R> {
-    /// Returns the current generation counter from the underlying ring buffer.
+    /// Returns the current generation counter from the underlying transport.
     pub fn generation(&self) -> Result<u64> {
         self.inner.get_ref().generation()
     }
@@ -165,58 +160,47 @@ impl<R: crate::io::channels::reader::HasGeneration + tokio::io::AsyncRead + Unpi
             Poll::Pending => Ok(false),
         }
     }
-}
 
-// Upgrade/downgrade support
-impl FramedRead<Reader> {
-    /// Upgrade the inner non-blocking reader to a blocking reader.
-    pub fn upgrade(self) -> Result<FramedRead<BlockingReader>> {
-        let nonb = self.into_inner();
-        let blocking = nonb.upgrade()?;
-        Ok(FramedRead::new(blocking))
+    /// Non-blocking check for peer-closed state.
+    pub fn poll_peer_closed(&mut self) -> Result<bool> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(self.inner.get_mut()).poll_peer_closed(&mut cx) {
+            Poll::Ready(Ok(closed)) => Ok(closed),
+            Poll::Ready(Err(e)) => Err(map_transport_error(e)),
+            Poll::Pending => Ok(false),
+        }
     }
 }
 
-impl FramedRead<BlockingReader> {
-    /// Downgrade the inner blocking reader to a non-blocking reader.
-    pub fn downgrade(self) -> FramedRead<Reader> {
-        let blocking = self.into_inner();
-        let nonb = blocking.downgrade();
-        FramedRead::new(nonb)
-    }
-}
-
-impl<W> FramedWrite<W> {
-    /// Creates a new `FramedWrite` wrapping the given raw writer.
-    pub fn new(writer: W) -> Self {
+impl<M: MessageTransport> FramedWrite<M> {
+    /// Creates a new `FramedWrite` wrapping the given transport.
+    pub fn new(transport: M) -> Self {
         Self {
-            inner: TokioFramedWrite::new(writer, FrameCodec),
+            inner: TokioFramedWrite::new(transport, FrameCodec),
         }
     }
 
-    /// Returns a reference to the inner writer.
-    pub fn inner(&self) -> &W {
+    /// Returns a reference to the inner transport.
+    pub fn inner(&self) -> &M {
         self.inner.get_ref()
     }
 
-    /// Returns a mutable reference to the inner writer.
-    pub fn inner_mut(&mut self) -> &mut W {
+    /// Returns a mutable reference to the inner transport.
+    pub fn inner_mut(&mut self) -> &mut M {
         self.inner.get_mut()
     }
 
-    /// Consumes this `FramedWrite` and returns the inner writer.
-    pub fn into_inner(self) -> W {
+    /// Consumes this `FramedWrite` and returns the inner transport.
+    pub fn into_inner(self) -> M {
         self.inner.into_inner()
     }
 
     /// Writes a framed payload with the given correlation tag synchronously.
     ///
     /// Encodes a [`FrameHeader`] with the payload length and tag, writes
-    /// the frame to the underlying writer.
-    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()>
-    where
-        W: tokio::io::AsyncWrite + Unpin,
-    {
+    /// the frame to the underlying transport.
+    pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
         if payload.len() > u32::MAX as usize {
             return Err(Error::InvalidFrame);
         }
@@ -224,51 +208,38 @@ impl<W> FramedWrite<W> {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // Poll readiness (should always be ready since our writers don't
-        // have backpressure at the codec level).
+        // Poll readiness.
         match Pin::new(&mut self.inner).poll_ready(&mut cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Err(e),
+            Poll::Ready(Err(e)) => return Err(map_transport_error(e)),
             Poll::Pending => return Err(Error::BufferFull),
         }
 
         // Encode the item into the internal buffer.
         Pin::new(&mut self.inner).start_send((payload.to_vec(), tag))?;
 
-        // Flush to the underlying writer.
+        // Flush to the underlying transport.
         match Pin::new(&mut self.inner).poll_flush(&mut cx) {
             Poll::Ready(Ok(())) => Ok(()),
-            Poll::Ready(Err(e)) => Err(e),
+            Poll::Ready(Err(e)) => Err(map_transport_error(e)),
             Poll::Pending => Err(Error::BufferFull),
         }
     }
 }
 
-// Upgrade/downgrade support
-impl FramedWrite<Writer> {
-    /// Upgrade the inner non-blocking writer to a blocking writer.
-    pub fn upgrade(self) -> Result<FramedWrite<BlockingWriter>> {
-        let nonb = self.into_inner();
-        let blocking = nonb.upgrade()?;
-        Ok(FramedWrite::new(blocking))
+fn map_transport_error<E: std::error::Error>(err: E) -> Error {
+    if let Some(our_err) = err.source().and_then(|e| e.downcast_ref::<Error>()) {
+        return our_err.clone();
     }
+    Error::Transport(err.to_string())
 }
 
-impl FramedWrite<BlockingWriter> {
-    /// Downgrade the inner blocking writer to a non-blocking writer.
-    pub fn downgrade(self) -> FramedWrite<Writer> {
-        let blocking = self.into_inner();
-        let nonb = blocking.downgrade();
-        FramedWrite::new(nonb)
-    }
-}
+type FramePollResult = Poll<Option<Result<(Vec<u8>, u32)>>>;
 
 /// Polls a `TokioFramedRead` once with a noop waker for synchronous use.
-fn poll_framed_read<R>(
-    framed: &mut TokioFramedRead<R, FrameCodec>,
-) -> Poll<Option<Result<(Vec<u8>, u32)>>>
+fn poll_framed_read<M>(framed: &mut TokioFramedRead<M, FrameCodec>) -> FramePollResult
 where
-    R: tokio::io::AsyncRead + Unpin,
+    M: MessageTransport,
 {
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);

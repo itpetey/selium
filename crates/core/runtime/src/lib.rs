@@ -15,5 +15,6 @@ mod host_functions;
 mod hostcall;
 mod mailbox;
 mod process;
+mod region_provider;
 mod state;
 mod wasm;

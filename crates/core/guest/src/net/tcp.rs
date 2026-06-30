@@ -13,11 +13,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
     GuestError, Result,
     hostcall::hostcall_async,
-    io::{
-        ChannelRegion, PAGE_SIZE, RegionMapping, RingBuf,
-        channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
-    },
     resource::{Accept, IncomingConnection, ResourceListener},
+};
+use selium_memory::RegionMapping;
+use selium_shm::{
+    ChannelRegion, PAGE_SIZE, RingBuf,
+    channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
 };
 
 const HEADER_COUNT_OFFSET: u64 = 16;

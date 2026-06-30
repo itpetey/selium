@@ -1,9 +1,7 @@
 use selium_abi::ResourceKind;
 
-use crate::io::{
-    error::{Error, Result},
-    ring_buf::{RingBuf, round_capacity},
-};
+use crate::ring_buf::{RingBuf, round_capacity};
+use selium_wire::error::Result;
 
 pub use self::{
     reader::{BlockingReader, HasGeneration, Reader},
@@ -165,6 +163,14 @@ impl Channel {
     pub fn region_id(&self) -> u64 {
         self.ring.region_id()
     }
+
+    /// Wraps an existing ring buffer as a channel.
+    ///
+    /// Used by higher-level patterns (e.g. RPC) that allocate their own ring
+    /// regions and need a `Channel` handle for blocking readers/writers.
+    pub(crate) fn from_ring(ring: RingBuf, backpressure: ChannelBackpressure) -> Self {
+        Self { ring, backpressure }
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +276,7 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Drop);
         assert_eq!(attached.ring().capacity(), 64);
 
-        crate::memory::free_region(region_id).ok();
+        crate::free_region(region_id).ok();
     }
 
     #[test]
@@ -282,6 +288,6 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Park);
         assert_eq!(attached.ring().capacity(), 128);
 
-        crate::memory::free_region(region_id).ok();
+        crate::free_region(region_id).ok();
     }
 }

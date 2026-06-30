@@ -73,7 +73,6 @@ pub enum ApiError {
 /// TODO: Move to `selium_abi` alongside `DiscoveryRequest`/`DiscoveryResponse`
 /// once the scheduler guest crate is implemented.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SchedulerRequest {
     Place { workload_id: String, replicas: u32 },
     Stop { workload_id: String },
@@ -85,7 +84,6 @@ pub enum SchedulerRequest {
 /// TODO: Move to `selium_abi` alongside `DiscoveryRequest`/`DiscoveryResponse`
 /// once the scheduler guest crate is implemented.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SchedulerResponse {
     Ok,
     Error(String),
@@ -258,7 +256,7 @@ fn delegation_error(step: impl Into<String>, context: impl Into<String>) -> ApiE
 
 #[entrypoint]
 async fn external_api_main(ctx: Context) {
-    let _ = selium_guest::log::init();
+    drop(selium_guest::log::init());
     let _api_ctx = ApiContext::from_context(ctx);
     selium_guest::info!(
         guest = "selium-external-api",

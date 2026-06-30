@@ -6,10 +6,10 @@ use std::{
 
 use tokio::io::AsyncWrite;
 
-use crate::io::{
-    channels::{ChannelBackpressure, Error, Result},
+use crate::{channels::ChannelBackpressure, region::ChannelRegion};
+use selium_wire::{
+    error::{Error, Result},
     frame::FrameHeader,
-    region::ChannelRegion,
 };
 
 /// Non-blocking byte-stream writer not tracked in channel metadata; may be starved
@@ -44,6 +44,7 @@ pub struct BlockingWriter {
     writer_id: u32,
     writer_slot: u32,
     backpressure: ChannelBackpressure,
+    closed: bool,
 }
 
 impl Writer {
@@ -86,7 +87,7 @@ impl Writer {
         let writer_slot = match self.region.allocate_writer_slot(0) {
             Ok(slot) => slot,
             Err(error) => {
-                let _ = self.region.decrement_writer_count();
+                drop(self.region.decrement_writer_count());
                 return Err(error);
             }
         };
@@ -95,6 +96,7 @@ impl Writer {
             writer_id: self.writer_id,
             writer_slot,
             backpressure: self.backpressure,
+            closed: false,
         })
     }
 }
@@ -146,19 +148,19 @@ impl AsyncWrite for Writer {
 impl BlockingWriter {
     /// Creates a new blocking writer. Increments writer_count, allocates a writer_id,
     /// and allocates a writer slot for position tracking.
-    pub(crate) fn new(region: ChannelRegion, backpressure: ChannelBackpressure) -> Result<Self> {
+    pub fn new(region: ChannelRegion, backpressure: ChannelBackpressure) -> Result<Self> {
         region.increment_writer_count()?;
         let writer_id = match region.allocate_writer_id() {
             Ok(id) => id,
             Err(error) => {
-                let _ = region.decrement_writer_count();
+                drop(region.decrement_writer_count());
                 return Err(error);
             }
         };
         let writer_slot = match region.allocate_writer_slot(0) {
             Ok(slot) => slot,
             Err(error) => {
-                let _ = region.decrement_writer_count();
+                drop(region.decrement_writer_count());
                 return Err(error);
             }
         };
@@ -167,23 +169,8 @@ impl BlockingWriter {
             writer_id,
             writer_slot,
             backpressure,
+            closed: false,
         })
-    }
-
-    /// Creates a blocking writer from a pre-allocated writer_id and writer_slot.
-    /// Caller is responsible for having already incremented writer_count.
-    pub(crate) fn from_writer_id(
-        region: ChannelRegion,
-        writer_id: u32,
-        writer_slot: u32,
-        backpressure: ChannelBackpressure,
-    ) -> Self {
-        Self {
-            region,
-            writer_id,
-            writer_slot,
-            backpressure,
-        }
     }
 
     /// Returns a reference to the underlying channel region.
@@ -209,17 +196,15 @@ impl BlockingWriter {
     /// Downgrade this blocking writer to a non-blocking writer.
     /// Decrements writer_count and releases the writer slot to compensate
     /// for the lost Drop decrement.
-    pub fn downgrade(self) -> Writer {
-        let _ = self.region.decrement_writer_count();
-        let _ = self.region.release_writer_slot(self.writer_slot);
-        let writer = Writer {
+    pub fn downgrade(mut self) -> Writer {
+        drop(self.region.decrement_writer_count());
+        drop(self.region.release_writer_slot(self.writer_slot));
+        self.closed = true;
+        Writer {
             region: self.region.clone(),
             writer_id: self.writer_id,
             backpressure: self.backpressure,
-        };
-        // Prevent Drop from decrementing again (we already did it).
-        std::mem::forget(self);
-        writer
+        }
     }
 }
 
@@ -275,8 +260,11 @@ impl AsyncWrite for BlockingWriter {
 
 impl Drop for BlockingWriter {
     fn drop(&mut self) {
-        let _ = self.region.decrement_writer_count();
-        let _ = self.region.release_writer_slot(self.writer_slot);
+        if self.closed {
+            return;
+        }
+        drop(self.region.decrement_writer_count());
+        drop(self.region.release_writer_slot(self.writer_slot));
     }
 }
 
@@ -339,8 +327,8 @@ fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::ChannelRegion;
-    use crate::io::channels::reader::read_raw;
+    use crate::ChannelRegion;
+    use crate::channels::reader::read_raw;
 
     #[test]
     fn two_phase_write_produces_ready_frame() {

@@ -6,9 +6,9 @@ use std::{
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
     GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId,
+    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
 };
-use selium_guest::FlatMsg;
+use selium_encoding::{FlatMsg, log::LogRecord};
 use wasmtiny::RegionProt as WasmProt;
 
 use crate::{
@@ -171,10 +171,8 @@ impl Runtime {
 
                 self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
 
-                // Tier-1 discovery registration: generate URIs and track them.
+                // Tier-1 discovery registration: publish Register operations for each URI.
                 let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
-
-                // Enqueue Register operations for each URI.
                 for uri in &uris {
                     let target = ResourceTarget {
                         uri: uri.clone(),
@@ -183,15 +181,28 @@ impl Runtime {
                         interface: None,
                         tenant: None, // TODO: populate from process authority when tenant tracking is added
                     };
-                    self.pending_discovery_ops
-                        .lock()
-                        .push_back(DiscoveryRequest::Register {
-                            uri: uri.clone(),
-                            target,
-                        });
+                    let request = DiscoveryRequest::Register {
+                        uri: uri.clone(),
+                        target,
+                    };
+                    let bytes = encode_rkyv(&request).map_err(|error| {
+                        AbiError::new(
+                            AbiErrorCode::Internal,
+                            format!("discovery encode failed: {error}"),
+                        )
+                    })?;
+                    if let Err(error) = self.publish_discovery_event(bytes) {
+                        return Err(AbiError::new(
+                            AbiErrorCode::Internal,
+                            format!("discovery publish failed: {error}"),
+                        ));
+                    }
                 }
 
-                crate::discovery::record_uris(&self.process_discovery_uris, process_id, uris);
+                // Remember the purpose so FreeRegion can revoke aliases without caching all URIs.
+                self.region_purposes
+                    .lock()
+                    .insert((process_id, shared_id), purpose);
 
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAlloc(
                     selium_abi::RegionAllocation {
@@ -217,9 +228,11 @@ impl Runtime {
                 let to_detach: Vec<ProcessId> = guests.keys().copied().collect();
                 for pid in to_detach {
                     if let Some(guest) = guests.get_mut(&pid) {
-                        let _ = guest
-                            .app
-                            .detach_shared_region(guest.module_index, wasm_region_id);
+                        drop(
+                            guest
+                                .app
+                                .detach_shared_region(guest.module_index, wasm_region_id),
+                        );
                     }
                 }
                 drop(guests);
@@ -231,6 +244,28 @@ impl Runtime {
                     .destroy_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
+
+                // Tier-1 discovery revocation: publish Revoke operations for each URI.
+                if let Some(purpose) = self.region_purposes.lock().remove(&(process_id, region_id))
+                {
+                    let uris = crate::discovery::registration_uris(process_id, region_id, purpose);
+                    for uri in uris {
+                        let request = DiscoveryRequest::Revoke { uri };
+                        let bytes = encode_rkyv(&request).map_err(|error| {
+                            AbiError::new(
+                                AbiErrorCode::Internal,
+                                format!("discovery encode failed: {error}"),
+                            )
+                        })?;
+                        if let Err(error) = self.publish_discovery_event(bytes) {
+                            return Err(AbiError::new(
+                                AbiErrorCode::Internal,
+                                format!("discovery publish failed: {error}"),
+                            ));
+                        }
+                    }
+                }
+
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
             HostcallRequest::AttachRegion {
@@ -760,18 +795,18 @@ impl Runtime {
                     .collect();
 
                 // Also drain from log channels if target process has one.
-                if let Some(target_pid) = target_process_id {
-                    if let Ok(frames) = self.kernel.drain_log_channel(target_pid) {
-                        for frame in frames {
-                            // Decode FlatBuffer LogRecord into GuestLogEntry.
-                            if let Ok(record) = selium_guest::log::LogRecord::decode(&frame) {
-                                logs.push(GuestLogEntry {
-                                    process_id: Some(target_pid),
-                                    level: format!("{:?}", record.level),
-                                    target: record.target,
-                                    message: record.message,
-                                });
-                            }
+                if let Some(target_pid) = target_process_id
+                    && let Ok(frames) = self.kernel.drain_log_channel(target_pid)
+                {
+                    for frame in frames {
+                        // Decode FlatBuffer LogRecord into GuestLogEntry.
+                        if let Ok(record) = LogRecord::decode(&frame) {
+                            logs.push(GuestLogEntry {
+                                process_id: Some(target_pid),
+                                level: format!("{:?}", record.level),
+                                target: record.target,
+                                message: record.message,
+                            });
                         }
                     }
                 }

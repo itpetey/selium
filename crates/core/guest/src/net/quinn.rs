@@ -10,12 +10,11 @@ use std::{
     task::{Context, Poll},
 };
 
-// AsyncTimer and Runtime are used in #[cfg(target_arch = "wasm32")] blocks
-#[cfg(target_arch = "wasm32")]
-use quinn::{AsyncTimer, Runtime};
-use quinn::{AsyncUdpSocket, UdpSender, udp::RecvMeta};
+use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, udp::RecvMeta};
 
-use crate::{io::FrameHeader, net::udp::UdpSocket};
+use crate::net::udp::UdpSocket;
+use selium_shm::RingBuf;
+use selium_wire::{error::Error, frame::FrameHeader};
 
 pub struct QuinnUdpSocket {
     inner: Arc<UdpSocketInner>,
@@ -30,8 +29,8 @@ pub struct QuinnUdpSocket {
 /// `poll_recv`.
 struct UdpSocketInner {
     local_addr: SocketAddr,
-    recv_ring: crate::io::RingBuf,
-    send_ring: crate::io::RingBuf,
+    recv_ring: RingBuf,
+    send_ring: RingBuf,
 }
 
 #[derive(Debug)]
@@ -169,7 +168,6 @@ impl Debug for QuinnUdpSocket {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 impl Runtime for SeliumQuinnRuntime {
     fn spawn(&self, future: Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
         // Bridge Send-bound future to the guest's single-threaded runtime.
@@ -183,14 +181,6 @@ impl Runtime for SeliumQuinnRuntime {
 
     fn new_timer(&self, deadline: web_time::Instant) -> Pin<Box<dyn AsyncTimer>> {
         Box::pin(crate::time::Timer::new(from_quinn_instant(deadline)))
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    fn wrap_udp_socket(&self, _socket: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "use Endpoint::new_with_abstract_socket for QuinnUdpSocket",
-        ))
     }
 
     fn now(&self) -> web_time::Instant {
@@ -215,7 +205,7 @@ impl UdpSender for QuinnUdpSender {
         // Reserve space on send ring
         let pos = match send_ring.reserve(frame_size) {
             Ok(p) => p,
-            Err(crate::io::Error::BufferFull) => {
+            Err(Error::BufferFull) => {
                 return Poll::Pending;
             }
             Err(e) => {
@@ -241,7 +231,6 @@ impl Debug for QuinnUdpSender {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 impl quinn::AsyncTimer for crate::time::Timer {
     fn reset(self: Pin<&mut Self>, deadline: web_time::Instant) {
         self.get_mut().set_deadline(from_quinn_instant(deadline));
@@ -252,7 +241,6 @@ impl quinn::AsyncTimer for crate::time::Timer {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn from_quinn_instant(qi: web_time::Instant) -> crate::time::Instant {
     let zero = web_time::Instant::from(std::time::Duration::ZERO);
     let duration = qi.duration_since(zero);

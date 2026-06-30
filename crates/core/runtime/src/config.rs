@@ -35,6 +35,9 @@ pub struct SystemGuestDescriptor {
 pub struct RuntimeConfig {
     /// System guests to start during bootstrap.
     pub system_guests: Vec<SystemGuestDescriptor>,
+    /// When true, the runtime creates the discovery pub/sub feed ring and
+    /// discovery listener, and wires them into the discovery system guest.
+    pub start_discovery: bool,
 }
 
 /// Guest successfully started during bootstrap.
@@ -110,5 +113,17 @@ impl SystemGuestDescriptor {
     pub fn set_discovery_handle(&mut self, shared_id: u64) {
         // Encode the shared_id as a little-endian u64 argument.
         self.arguments = vec![shared_id.to_le_bytes().to_vec()];
+    }
+
+    /// Sets both the discovery feed ring region id and the discovery RPC
+    /// listener shared id for the discovery system guest itself.
+    ///
+    /// The feed ring id is passed as the first entrypoint argument and the
+    /// listener shared id as the second.
+    pub fn set_discovery_feed_and_handle(&mut self, feed_region_id: u64, listener_shared_id: u64) {
+        self.arguments = vec![
+            feed_region_id.to_le_bytes().to_vec(),
+            listener_shared_id.to_le_bytes().to_vec(),
+        ];
     }
 }

@@ -1,4 +1,4 @@
-use crate::io::{Error, Result};
+use selium_wire::error::{Error, Result};
 
 /// A monotonic cursor over a shared-memory ring buffer.
 ///

@@ -10,11 +10,88 @@
 //! - Drop backpressure channel semantics
 
 use selium_abi::{
-    Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
-    RegionProt, ResourceClass, ResourceKind, ResourceSelector,
+    Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
+    HostcallRequest, ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
+    decode_rkyv,
 };
-use selium_guest::io::channels::ChannelBackpressure;
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
+use selium_wire::{framed::FramedRead, pubsub::Subscriber};
+
+fn ensure_heap_provider() {
+    if selium_memory::region_provider().is_err() {
+        let _ =
+            selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new()));
+    }
+}
+
+/// Creates a runtime with the discovery pub/sub feed enabled and returns a
+/// subscriber attached to the feed ring. The runtime installs its own
+/// kernel-backed region provider, so this helper does not install the heap
+/// provider first.
+fn runtime_with_discovery_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>) {
+    let runtime = Runtime::default();
+    let report = runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: true,
+            system_guests: vec![],
+        })
+        .expect("bootstrap discovery");
+    assert!(report.guests.is_empty());
+
+    let feed_region_id = runtime
+        .discovery_feed_region_id()
+        .expect("discovery feed region id");
+    let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
+    let capacity = channel.ring().capacity();
+    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
+    let subscriber = Subscriber::new(FramedRead::new(transport), Some(capacity));
+    (runtime, subscriber)
+}
+
+/// Drains all currently available Register events from the discovery feed and
+/// returns the set of URI strings they contain.
+fn drain_register_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Register { uri, .. } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
+
+/// Drains all currently available Revoke events from the discovery feed and
+/// returns the set of URI strings they contain.
+fn drain_revoke_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Revoke { uri } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
 
 fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind) -> u64 {
     let (status, op_id) = runtime.begin_hostcall(
@@ -33,48 +110,22 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
 }
 
 #[test]
-fn alloc_region_with_log_channel_tracks_discovery_uris() {
-    let runtime = Runtime::default();
+fn alloc_region_with_log_channel_publishes_discovery_register_events() {
+    let (runtime, mut subscriber) = runtime_with_discovery_feed();
     let process_id = spawn_shared_memory_guest(&runtime, "log-channel-guest");
 
     let region_id = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
 
-    // Verify the runtime tracked discovery URIs for this process.
-    let uris = runtime
-        .process_discovery_uris()
-        .get(&process_id)
-        .cloned()
-        .unwrap_or_default();
+    let uris = drain_register_uris(&mut subscriber);
 
     assert!(
         uris.contains(&format!("sel://process/{process_id}/regions/{region_id}")),
-        "expected region URI to be tracked"
+        "expected region URI to be published"
     );
     assert!(
         uris.contains(&format!("sel://process/{process_id}/logs")),
-        "expected log alias URI to be tracked"
+        "expected log alias URI to be published"
     );
-}
-
-#[test]
-fn alloc_region_with_shared_memory_tracks_only_region_uri() {
-    let runtime = Runtime::default();
-    let process_id = spawn_shared_memory_guest(&runtime, "generic-guest");
-
-    let region_id = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
-
-    let uris = runtime
-        .process_discovery_uris()
-        .get(&process_id)
-        .cloned()
-        .unwrap_or_default();
-
-    assert!(
-        uris.contains(&format!("sel://process/{process_id}/regions/{region_id}")),
-        "expected region URI to be tracked"
-    );
-    // SharedMemory has no purpose alias.
-    assert_eq!(uris.len(), 1, "expected only one URI for SharedMemory");
 }
 
 #[test]
@@ -135,8 +186,8 @@ fn deprecated_guest_log_write_still_functions() {
 
 #[test]
 fn drop_backpressure_channel_writer_never_blocks() {
+    ensure_heap_provider();
     use selium_abi::ResourceKind;
-    use selium_guest::io::channels::Channel;
 
     let channel =
         Channel::create_with_backpressure(64, ChannelBackpressure::Drop, ResourceKind::LogChannel)
@@ -194,8 +245,8 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
 
 #[test]
 fn park_backpressure_channel_accepts_blocking_writer() {
+    ensure_heap_provider();
     use selium_abi::ResourceKind;
-    use selium_guest::io::channels::Channel;
 
     let channel =
         Channel::create_with_backpressure(64, ChannelBackpressure::Park, ResourceKind::RpcRing)
@@ -208,51 +259,34 @@ fn park_backpressure_channel_accepts_blocking_writer() {
 }
 
 #[test]
-fn process_termination_revokes_discovery_uris() {
-    let runtime = Runtime::default();
+fn process_termination_publishes_discovery_revoke_events() {
+    let (runtime, mut subscriber) = runtime_with_discovery_feed();
     let process_id = spawn_shared_memory_guest(&runtime, "terminating-guest");
 
     // Allocate regions to generate discovery URIs.
     let _r1 = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
     let _r2 = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
 
-    // Verify URIs are tracked.
+    // Drain the Register events published during allocation.
+    let registered = drain_register_uris(&mut subscriber);
     assert!(
-        runtime.process_discovery_uris().contains_key(&process_id),
-        "expected URIs to be tracked before termination"
+        !registered.is_empty(),
+        "expected Register events to be published before termination"
     );
 
-    // Stop the process — this should revoke all URIs.
+    // Stop the process — this should publish Revoke operations.
     runtime.stop_process(process_id).expect("stop process");
 
-    // Verify URIs are removed.
+    let revoked = drain_revoke_uris(&mut subscriber);
     assert!(
-        !runtime.process_discovery_uris().contains_key(&process_id),
-        "expected URIs to be revoked after termination"
+        !revoked.is_empty(),
+        "expected Revoke events to be published after termination"
     );
-}
 
-#[test]
-fn purpose_alias_mapping_table() {
-    use selium_runtime::discovery;
-
-    assert_eq!(
-        discovery::purpose_alias(ResourceKind::LogChannel),
-        Some("logs")
-    );
-    assert_eq!(
-        discovery::purpose_alias(ResourceKind::LiveTable),
-        Some("tables")
-    );
-    assert_eq!(discovery::purpose_alias(ResourceKind::RpcRing), Some("rpc"));
-    assert_eq!(
-        discovery::purpose_alias(ResourceKind::PubSubTopic),
-        Some("pubsub")
-    );
-    assert_eq!(discovery::purpose_alias(ResourceKind::NetworkBuffer), None);
-    assert_eq!(discovery::purpose_alias(ResourceKind::DurableLog), None);
-    assert_eq!(discovery::purpose_alias(ResourceKind::BlobStore), None);
-    assert_eq!(discovery::purpose_alias(ResourceKind::SharedMemory), None);
+    // Every previously registered URI should have a matching revocation.
+    for uri in &registered {
+        assert!(revoked.contains(uri), "expected revocation for {uri}");
+    }
 }
 
 fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {

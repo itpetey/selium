@@ -1,9 +1,7 @@
-#[cfg(target_arch = "wasm32")]
 use crate::async_runtime::wake_task;
 
-#[cfg(target_arch = "wasm32")]
 static mut MAILBOX: [u32; MAILBOX_WORDS] = [0; MAILBOX_WORDS];
-#[cfg(target_arch = "wasm32")]
+
 const MAILBOX_WORDS: usize = selium_abi::mailbox::BYTE_LEN / 4;
 
 #[cfg(target_arch = "wasm32")]
@@ -27,6 +25,27 @@ unsafe extern "C" {
     fn selium_mailbox_register(mailbox_ptr: *mut u8, mailbox_len: usize);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_process_id() -> u64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_mark_ready() {}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_create(_: *const u8, _: usize) -> u64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_poll(_: u64, _: *mut u8, _: usize) -> u64 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_drop(_: u64) -> u32 {
+    0
+}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_mailbox_register(_: *mut u8, _: usize) {}
+
 /// Marks the current guest as ready for runtime readiness checks.
 pub fn mark_ready() {
     // SAFETY: `selium_mark_ready` is a host import with no safety invariants.
@@ -39,7 +58,6 @@ pub fn process_id() -> u64 {
     unsafe { selium_process_id() }
 }
 
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn drain_mailbox() {
     unsafe {
         if (*mailbox_cell(selium_abi::mailbox::FLAG_OFFSET))
@@ -66,10 +84,6 @@ pub(crate) fn drain_mailbox() {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn drain_mailbox() {}
-
-#[cfg(target_arch = "wasm32")]
 pub(crate) fn register_mailbox() {
     unsafe {
         (*mailbox_cell(selium_abi::mailbox::CAPACITY_OFFSET)).store(
@@ -80,46 +94,14 @@ pub(crate) fn register_mailbox() {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn register_mailbox() {}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_create(_request_ptr: *const u8, _request_len: usize) -> u64 {
-    selium_abi::pack_hostcall_status(selium_abi::HOSTCALL_STATUS_FAILED, 0)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_drop(_operation_id: u64) -> u32 {
-    0
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_poll(
-    _operation_id: u64,
-    _out_ptr: *mut u8,
-    _out_capacity: usize,
-) -> u64 {
-    selium_abi::pack_hostcall_status(selium_abi::HOSTCALL_STATUS_FAILED, 0)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn mailbox_base() -> *mut u8 {
     core::ptr::addr_of_mut!(MAILBOX).cast::<u8>()
 }
 
-#[cfg(target_arch = "wasm32")]
 unsafe fn mailbox_cell(offset: usize) -> *mut core::sync::atomic::AtomicU32 {
     unsafe {
         mailbox_base()
             .add(offset)
             .cast::<core::sync::atomic::AtomicU32>()
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_mark_ready() {}
-
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_process_id() -> u64 {
-    0
 }

@@ -1,16 +1,12 @@
 use thiserror::Error;
 
-/// Result type for selium-io operations.
+/// Result type for selium-wire operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Single flat error type covering all messaging failure modes.
-///
-/// Replaces the previous three-layer hierarchy (`io::Error` → `channels::Error`
-/// → `RpcError`) with one enum. Each variant maps directly to a distinct failure
-/// mode — no `From` chains or nested wrapping.
 #[derive(Debug, Clone, Error, PartialEq)]
 pub enum Error {
-    #[error("invalid ring buffer layout")]
+    #[error("invalid layout")]
     InvalidLayout,
     #[error("buffer full")]
     BufferFull,
@@ -49,8 +45,10 @@ pub enum Error {
     IndexOutOfBounds,
     #[error("subscriber data was overwritten: publisher advanced past ring capacity")]
     Overwritten,
-    #[error("backpressure not supported on this channel")]
+    #[error("backpressure not supported on this transport")]
     BackpressureNotSupported,
+    #[error("transport error: {0}")]
+    Transport(String),
 }
 
 impl From<std::io::Error> for Error {
@@ -59,7 +57,20 @@ impl From<std::io::Error> for Error {
         if let Some(our_err) = err.get_ref().and_then(|e| e.downcast_ref::<Error>()) {
             return our_err.clone();
         }
-        Self::Guest(format!("IO error: {err}"))
+        Self::Transport(err.to_string())
+    }
+}
+
+impl From<selium_memory::MemoryError> for Error {
+    fn from(err: selium_memory::MemoryError) -> Self {
+        match err {
+            selium_memory::MemoryError::CapacityExceeded => Self::CapacityExceeded,
+            selium_memory::MemoryError::IndexOutOfBounds => Self::IndexOutOfBounds,
+            selium_memory::MemoryError::InvalidLayout => Self::InvalidLayout,
+            selium_memory::MemoryError::ProviderNotSet => Self::InvalidRegion,
+            selium_memory::MemoryError::RegionNotFound(_) => Self::InvalidRegion,
+            selium_memory::MemoryError::Other(msg) => Self::Guest(msg),
+        }
     }
 }
 
@@ -69,10 +80,7 @@ mod tests {
 
     #[test]
     fn display_covers_core_error_variants() {
-        assert_eq!(
-            Error::InvalidLayout.to_string(),
-            "invalid ring buffer layout"
-        );
+        assert_eq!(Error::InvalidLayout.to_string(), "invalid layout");
         assert_eq!(Error::BufferFull.to_string(), "buffer full");
         assert_eq!(Error::BufferEmpty.to_string(), "buffer empty");
         assert_eq!(
@@ -105,7 +113,7 @@ mod tests {
     fn flat_error_matching() {
         let err = Error::BufferFull;
         match err {
-            Error::BufferFull => {} // direct match, no unwrapping
+            Error::BufferFull => {}
             _ => panic!("expected BufferFull"),
         }
     }

@@ -2,10 +2,14 @@
 resolver = "3"
 members = [
   "crates/core/abi",
+  "crates/core/encoding",
   "crates/core/guest",
   "crates/core/guest/macros",
   "crates/core/kernel",
+  "crates/core/memory",
   "crates/core/runtime",
+  "crates/core/shm",
+  "crates/core/wire",
   "crates/guests/cluster",
   "crates/guests/discovery",
   "crates/guests/external-api",
@@ -38,8 +42,13 @@ quinn = { path = "../../quinn/quinn", default-features = false }
 quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 selium-abi = { path = "crates/core/abi" }
+selium-encoding = { path = "crates/core/encoding" }
 selium-guest = { path = "crates/core/guest" }
+selium-guest-macros = { path = "crates/core/guest/macros" }
 selium-kernel = { path = "crates/core/kernel" }
+selium-memory = { path = "crates/core/memory" }
+selium-shm = { path = "crates/core/shm" }
+selium-wire = { path = "crates/core/wire" }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "2.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }

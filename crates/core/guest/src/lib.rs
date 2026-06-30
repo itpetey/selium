@@ -6,11 +6,8 @@ pub use crate::{
     async_runtime::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
     },
-    codec::{decode_typed, encode_typed},
     context::Context,
-    encoding::{FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor},
     error::{GuestError, Result},
-    memory::{PAGE_SIZE, SHARED_REGION_MAGIC, SharedRegion, RegionMapping, free_region},
     net::tcp::{TcpAccept, TcpListener, TcpStream},
     net::udp::UdpSocket,
     platform::{mark_ready, process_id},
@@ -27,22 +24,42 @@ pub use selium_abi::{
 pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
 pub use tracing::{debug, error, info, trace, warn};
 
+// Re-export transport-agnostic memory primitives.
+pub use selium_memory::{RegionMapping, PAGE_SIZE, SHARED_REGION_MAGIC};
+
+// Re-export encoding types.
+pub use selium_encoding::{
+    FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor,
+    codec::{decode_typed, encode_typed},
+    log::{LogField, LogLevel, LogRecord, LogSpan},
+};
+
 mod async_runtime;
-mod codec;
 mod context;
-pub mod encoding;
 mod error;
-#[allow(warnings)]
-#[rustfmt::skip]
-pub mod fbs;
+mod hostcall_region_provider;
 mod hostcall;
-#[cfg(feature = "io")]
-pub mod io;
 pub mod log;
-mod memory;
 mod net;
 mod platform;
 mod process;
 mod resource;
 mod storage;
 pub mod time;
+
+use crate::hostcall_region_provider::HostcallRegionProvider;
+
+/// Installs the hostcall-backed region provider and registers the mailbox
+/// reactor so the guest can allocate and share memory regions.
+///
+/// This should be called once per guest process, typically from an
+/// entrypoint before any I/O patterns are used. It is safe to call multiple
+/// times; subsequent calls are no-ops.
+pub fn init() -> Result<()> {
+    if selium_memory::region_provider().is_err() {
+        selium_memory::set_region_provider(Box::new(HostcallRegionProvider::new()))
+            .map_err(|error| GuestError::Host(error.to_string()))?;
+    }
+    crate::platform::register_mailbox();
+    Ok(())
+}

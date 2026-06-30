@@ -48,6 +48,7 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
 
     let runtime = Runtime::default();
     let config = RuntimeConfig {
+        start_discovery: false,
         system_guests: vec![SystemGuestDescriptor::from_entrypoint_metadata(
             "demo",
             "demo-module",

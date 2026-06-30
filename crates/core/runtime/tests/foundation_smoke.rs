@@ -9,6 +9,7 @@ fn foundation_crates_work_together_through_hostcalls() {
     let runtime = Runtime::default();
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
             system_guests: vec![SystemGuestDescriptor {
                 name: "cluster".to_string(),
                 module_id: "cluster-module".to_string(),
@@ -49,6 +50,7 @@ fn hostcalls_enforce_session_grants() {
     let runtime = Runtime::default();
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
             system_guests: vec![SystemGuestDescriptor {
                 name: "restricted".to_string(),
                 module_id: "restricted-module".to_string(),

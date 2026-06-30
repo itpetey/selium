@@ -5,6 +5,8 @@ use std::{
 };
 
 use selium_abi::ActivityEvent;
+use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
+use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
 use wasmtiny::WasmApplication;
 
@@ -15,7 +17,7 @@ use crate::{
         SystemGuestDescriptor,
     },
     error::map_wasm_error,
-    state::{LoadedGuest, Runtime},
+    state::{DiscoveryPublisher, LoadedGuest, Runtime},
     wasm::decode_wasm_arguments,
 };
 
@@ -24,7 +26,28 @@ const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 
 impl Runtime {
     /// Boots all configured system guests in dependency order.
-    pub fn bootstrap_system_guests(&self, config: RuntimeConfig) -> Result<BootstrapReport> {
+    pub fn bootstrap_system_guests(&self, mut config: RuntimeConfig) -> Result<BootstrapReport> {
+        let (discovery_feed_region_id, discovery_listener_shared_id) = if config.start_discovery {
+            let (feed_region_id, listener_shared_id) = self.setup_discovery()?;
+            (Some(feed_region_id), Some(listener_shared_id))
+        } else {
+            (None, None)
+        };
+
+        if let Some(listener_shared_id) = discovery_listener_shared_id {
+            for descriptor in &mut config.system_guests {
+                if descriptor.name == "discovery" {
+                    descriptor.set_discovery_feed_and_handle(
+                        discovery_feed_region_id
+                            .expect("discovery feed region id must be present"),
+                        listener_shared_id,
+                    );
+                } else if descriptor.arguments.is_empty() {
+                    descriptor.set_discovery_handle(listener_shared_id);
+                }
+            }
+        }
+
         let mut pending = BTreeMap::new();
         for descriptor in config.system_guests {
             let name = descriptor.name.clone();
@@ -79,6 +102,40 @@ impl Runtime {
         }
 
         Ok(report)
+    }
+
+    /// Creates the discovery pub/sub feed ring and RPC listener.
+    ///
+    /// Stores the publisher and listener shared id in runtime state, and returns
+    /// the feed region id and listener shared id so bootstrap can wire them into
+    /// the discovery guest descriptor.
+    fn setup_discovery(&self) -> Result<(u64, u64)> {
+        let feed_channel = Channel::create_with_backpressure(
+            64 * 1024,
+            ChannelBackpressure::Drop,
+            selium_abi::ResourceKind::PubSubTopic,
+        )
+        .map_err(|error| Error::Host(format!("failed to create discovery feed channel: {error}")))?;
+        let feed_region_id = feed_channel.region_id();
+
+        let transport = ShmTransport::new(&feed_channel, &feed_channel)
+            .map_err(|error| Error::Host(format!("failed to create discovery feed transport: {error}")))?;
+        let publisher: DiscoveryPublisher = Publisher::new(FramedWrite::new(transport));
+        *self.discovery_publisher.lock() = Some(publisher);
+
+        let listener = self.kernel.create_host_queue();
+        *self.discovery_listener_shared_id.lock() = Some(listener.shared_id);
+
+        self.kernel.record_activity(ActivityEvent {
+            kind: selium_abi::ActivityKind::GuestBootstrapped,
+            process_id: None,
+            message: format!(
+                "discovery feed region={feed_region_id} listener={}",
+                listener.shared_id
+            ),
+        });
+
+        Ok((feed_region_id, listener.shared_id))
     }
 
     /// Starts and records a single system guest.
@@ -245,6 +302,7 @@ mod tests {
     fn runtime_bootstraps_guests_from_config() {
         let runtime = Runtime::default();
         let config = RuntimeConfig {
+            start_discovery: false,
             system_guests: vec![SystemGuestDescriptor {
                 name: "cluster".to_string(),
                 module_id: "cluster-module".to_string(),

@@ -115,7 +115,7 @@ pub fn interface_metadata() -> selium_guest::InterfaceMetadata {
 
 #[entrypoint]
 async fn cluster_main() {
-    let _ = selium_guest::log::init();
+    drop(selium_guest::log::init());
     selium_guest::info!(guest = "selium-cluster", "system guest booting");
     selium_guest::mark_ready();
 }

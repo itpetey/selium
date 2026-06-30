@@ -1,6 +1,6 @@
 use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, LocalityScope, ProcessId, ResourceClass,
-    ResourceIdentity, ScopeContext,
+    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, LocalityScope, ProcessId,
+    ResourceClass, ResourceIdentity, ScopeContext, encode_rkyv,
 };
 use tracing::debug;
 use wasmtiny::WasmValue;
@@ -123,6 +123,9 @@ impl Runtime {
     }
 
     pub(crate) fn cleanup_failed_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
+        // Best-effort teardown: the process has already failed, so there's no
+        // recovery path for individual cleanup steps. We discard each error and
+        // continue with the remaining work to reclaim as much as possible.
         drop(self.kernel.stop_process(process_id));
         self.operations
             .lock()
@@ -141,14 +144,27 @@ impl Runtime {
     }
 
     pub(crate) fn cleanup_process_resources(&self, process_id: ProcessId) -> Result<()> {
-        // Revoke all discovery URIs registered for this process.
-        let revoked_uris = crate::discovery::take_uris(&self.process_discovery_uris, process_id);
-
-        // Enqueue Revoke operations for each URI.
-        for uri in revoked_uris {
-            self.pending_discovery_ops
-                .lock()
-                .push_back(selium_abi::DiscoveryRequest::Revoke { uri });
+        // Revoke all discovery URIs registered for this process by publishing
+        // Revoke operations to the discovery feed.
+        let region_purposes: Vec<(u64, selium_abi::ResourceKind)> = {
+            let mut map = self.region_purposes.lock();
+            let keys: Vec<(ProcessId, u64)> = map
+                .keys()
+                .filter(|(pid, _)| *pid == process_id)
+                .copied()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| map.remove(&key).map(|purpose| (key.1, purpose)))
+                .collect()
+        };
+        for (shared_id, purpose) in region_purposes {
+            let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
+            for uri in uris {
+                let request = DiscoveryRequest::Revoke { uri };
+                let bytes = encode_rkyv(&request)
+                    .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
+                self.publish_discovery_event(bytes)?;
+            }
         }
 
         let owned_handles = self
@@ -167,6 +183,9 @@ impl Runtime {
             if !should_reclaim {
                 continue;
             }
+            // Best-effort kernel resource cleanup: the process is terminating so
+            // failures to detach/close individual kernel handles can't be recovered.
+            // Each drop discards the Result — we move on and reclaim what we can.
             match resource_class {
                 ResourceClass::SharedMapping => {
                     drop(self.kernel.detach_shared_region(local_id));
@@ -208,7 +227,10 @@ impl Runtime {
         for shared_id in owned_regions {
             self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
             if self.kernel.shared_region_mapping_count(shared_id) == 0 {
-                let _ = self.kernel.destroy_shared_region(shared_id);
+                // Best-effort: the region has no remaining mappings, but if
+                // destruction fails the region will be reclaimed by the kernel
+                // on process exit anyway.
+                drop(self.kernel.destroy_shared_region(shared_id));
             }
         }
 

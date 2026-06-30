@@ -1,23 +1,22 @@
+//! Transport-agnostic live table projected from a pub/sub stream.
+
 use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
+use selium_encoding::FlatMsg;
+use selium_guest_macros::schema;
+
 use crate::{
-    encoding::FlatMsg,
-    io::{
-        error::{Error, Result},
-        pubsub::{self, Publisher, Subscriber},
-    },
-    schema,
+    MessageTransport,
+    error::{Error, Result},
+    pubsub::{Publisher, Subscriber},
 };
 
 /// A table mutation published over a pub/sub topic.
-///
-/// Every `set` publishes one of these messages. All processes attached to
-/// the same topic replay the stream to build their local materialised view.
 #[derive(Debug, Clone, PartialEq)]
 #[schema(
-    path = "schemas/live_table.fbs",
+    path = concat!(env!("CARGO_MANIFEST_DIR"), "/../encoding/schemas/live_table.fbs"),
     ty = "selium.live_table.LiveTableMessage",
-    binding = "crate::fbs::selium::live_table::LiveTableMessage",
+    binding = "selium_encoding::fbs::selium::live_table::LiveTableMessage",
     wire = LiveTableMessageWire
 )]
 pub struct LiveTableMessage<K, V> {
@@ -32,9 +31,6 @@ pub struct LiveTableMessage<K, V> {
 }
 
 /// A materialised live table record.
-///
-/// A `None` value represents a tombstone — the key was deleted but its
-/// version is still tracked for CAS consistency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTableRecord<V> {
     /// The entry value, or `None` for deleted entries (tombstones).
@@ -52,51 +48,27 @@ enum ApplyOutcome {
 
 /// A live table projected from a pub/sub topic stream.
 ///
-/// # How it works
-///
 /// Writes are published as `LiveTableMessage`s to the underlying topic.
 /// Reads are served from a local materialised `HashMap<K, V>`. Remote
 /// writes from other processes attached to the same topic are picked up
 /// by calling [`sync`](Self::sync).
-///
-/// On [`attach`](Self::attach), the subscriber starts at position 0 of
-/// the ring buffer and replays every retained message to build the local
-/// view before returning. If the topic has already overwritten its prefix,
-/// attach fails with [`Error::ReaderBehind`]; callers that need indefinite
-/// attachability must retain a large enough topic or restore from an
-/// application snapshot before following the live stream.
-pub struct LiveTable<K, V> {
-    publisher: RefCell<Publisher<LiveTableMessage<K, V>>>,
-    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>>>,
+pub struct LiveTable<K, V, M> {
+    publisher: RefCell<Publisher<LiveTableMessage<K, V>, M>>,
+    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>, M>>,
     local: RefCell<HashMap<K, LiveTableRecord<V>>>,
 }
 
-impl<K, V> LiveTable<K, V>
+impl<K, V, M> LiveTable<K, V, M>
 where
     K: FlatMsg + Clone + Eq + Hash,
     V: FlatMsg + Clone,
+    M: MessageTransport,
 {
-    /// Creates a new live table with its own pub/sub topic.
-    pub fn create(capacity: u64) -> Result<Self> {
-        let (publisher, subscriber) = pubsub::create_pair(capacity)?;
-
-        Ok(Self {
-            publisher: RefCell::new(publisher),
-            subscriber: RefCell::new(subscriber),
-            local: RefCell::new(HashMap::new()),
-        })
-    }
-
-    /// Attaches to an existing live table topic.
-    ///
-    /// Replays all existing messages to build the local materialised view
-    /// before returning. Returns [`Error::ReaderBehind`] if the ring no longer
-    /// retains the full mutation history required to rebuild the table.
-    pub fn attach(shared_id: u64) -> Result<Self>
-    where
-        K: Eq + Hash,
-    {
-        let (publisher, subscriber) = pubsub::attach_pair(shared_id)?;
+    /// Creates a live table from an existing publisher/subscriber pair.
+    pub fn new(
+        publisher: Publisher<LiveTableMessage<K, V>, M>,
+        subscriber: Subscriber<LiveTableMessage<K, V>, M>,
+    ) -> Result<Self> {
         let table = Self {
             publisher: RefCell::new(publisher),
             subscriber: RefCell::new(subscriber),
@@ -107,13 +79,9 @@ where
     }
 
     /// Inserts or updates a value, publishing the change to the topic.
-    pub fn set(&self, key: K, value: V) -> Result<()>
-    where
-        K: Clone + Eq + Hash,
-        V: Clone,
-    {
+    pub fn set(&self, key: K, value: V) -> Result<()> {
         let mut publisher = self.publisher.borrow_mut();
-        let mutation_id = publisher.allocate_mutation_id()?;
+        let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
             key,
@@ -127,11 +95,7 @@ where
     }
 
     /// Inserts or updates a value only when the current version matches `expected_version`.
-    pub fn compare_and_set(&self, key: K, expected_version: u64, value: V) -> Result<u64>
-    where
-        K: Clone + Eq + Hash,
-        V: Clone,
-    {
+    pub fn compare_and_set(&self, key: K, expected_version: u64, value: V) -> Result<u64> {
         self.sync()?;
         let actual = self.local.borrow().get(&key).map(|record| record.version);
         if actual.unwrap_or(0) != expected_version {
@@ -142,7 +106,7 @@ where
         }
 
         let mut publisher = self.publisher.borrow_mut();
-        let mutation_id = publisher.allocate_mutation_id()?;
+        let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
             key,
@@ -162,13 +126,9 @@ where
     }
 
     /// Deletes a value, publishing the deletion to the topic.
-    pub fn delete(&self, key: K) -> Result<()>
-    where
-        K: Clone + Eq + Hash,
-        V: Clone,
-    {
+    pub fn delete(&self, key: K) -> Result<()> {
         let mut publisher = self.publisher.borrow_mut();
-        let mutation_id = publisher.allocate_mutation_id()?;
+        let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
             key,
@@ -182,13 +142,9 @@ where
     }
 
     /// Returns the value for a key from the local materialised view.
-    ///
-    /// This is instant — no I/O. Call [`sync`](Self::sync) first if you
-    /// want the latest cross-process state.
     pub fn get(&self, key: &K) -> Result<Option<V>>
     where
         K: Eq + Hash,
-        V: Clone,
     {
         Ok(self
             .local
@@ -198,13 +154,9 @@ where
     }
 
     /// Returns the record for a key, including its version.
-    ///
-    /// Returns the record even for tombstones (deleted keys). Check
-    /// `record.value` to determine whether the entry is live.
     pub fn get_record(&self, key: &K) -> Result<Option<LiveTableRecord<V>>>
     where
         K: Eq + Hash,
-        V: Clone,
     {
         Ok(self.local.borrow().get(key).cloned())
     }
@@ -221,23 +173,16 @@ where
     pub fn scan(&self, limit: usize) -> Result<Vec<(K, LiveTableRecord<V>)>>
     where
         K: Clone + Eq + Hash,
-        V: Clone,
     {
         Ok(scan_entries(&self.local.borrow(), limit))
     }
 
     /// Drains the subscriber to pick up remote writes.
-    ///
-    /// Call this before `get` to synchronise with other processes
-    /// attached to the same topic.
-    pub fn sync(&self) -> Result<()>
-    where
-        K: Eq + Hash,
-    {
+    pub fn sync(&self) -> Result<()> {
         let mut subscriber = self.subscriber.borrow_mut();
         let mut local = self.local.borrow_mut();
         loop {
-            match subscriber.read_with_writer_id() {
+            match subscriber.read_with_tag() {
                 Ok((msg, _writer_id)) => {
                     apply_message_to(&mut local, msg);
                 }
@@ -247,15 +192,12 @@ where
         }
     }
 
-    fn sync_until_own_mutation(&self, mutation_id: u64) -> Result<ApplyOutcome>
-    where
-        K: Eq + Hash,
-    {
+    fn sync_until_own_mutation(&self, mutation_id: u64) -> Result<ApplyOutcome> {
         let own_writer_id = self.publisher.borrow().writer_id();
         let mut subscriber = self.subscriber.borrow_mut();
         let mut local = self.local.borrow_mut();
         loop {
-            match subscriber.read_with_writer_id() {
+            match subscriber.read_with_tag() {
                 Ok((msg, writer_id)) => {
                     let is_own_mutation =
                         writer_id == own_writer_id && msg.mutation_id == mutation_id;

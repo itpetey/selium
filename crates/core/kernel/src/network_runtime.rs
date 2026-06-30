@@ -752,10 +752,6 @@ fn reserve_tail(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal proxy function needs many params"
-)]
 fn run_proxy(
     kernel: &Kernel,
     stream: TcpStream,
@@ -949,7 +945,10 @@ fn udp_proxy_recv(
                 let mut frame = Vec::with_capacity(frame_len);
                 frame.extend_from_slice(&addr_len.to_le_bytes());
                 frame.extend_from_slice(&addr_bytes);
-                frame.extend_from_slice(&buf[..payload_len]);
+                frame.extend_from_slice(
+                    buf.get(..payload_len)
+                        .ok_or_else(|| Error::Wasm("payload exceeds buffer".to_string()))?,
+                );
 
                 if let Err(_e) = write_frame(kernel, mapping_id, offset, capacity, &frame) {
                     thread::sleep(Duration::from_millis(10));
@@ -1023,16 +1022,25 @@ fn udp_proxy_send(
                     if frame.len() < 2 {
                         continue;
                     }
-                    let addr_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
-                    if frame.len() < 2 + addr_len {
-                        continue;
-                    }
-                    let addr_str = std::str::from_utf8(&frame[2..2 + addr_len])
+                    let prefix = frame
+                        .get(0..2)
+                        .ok_or_else(|| Error::Wasm("short udp frame".to_string()))?;
+                    let addr_len = u16::from_le_bytes(
+                        prefix
+                            .try_into()
+                            .map_err(|_error| Error::Wasm("short udp frame".to_string()))?,
+                    ) as usize;
+                    let addr_bytes = frame
+                        .get(2..2 + addr_len)
+                        .ok_or_else(|| Error::Wasm("udp frame missing address".to_string()))?;
+                    let addr_str = std::str::from_utf8(addr_bytes)
                         .map_err(|e| Error::Wasm(format!("invalid address bytes: {e}")))?;
                     let addr: SocketAddr = addr_str
                         .parse()
                         .map_err(|e| Error::Wasm(format!("invalid address: {e}")))?;
-                    let payload = &frame[2 + addr_len..];
+                    let payload = frame
+                        .get(2 + addr_len..)
+                        .ok_or_else(|| Error::Wasm("udp frame missing payload".to_string()))?;
 
                     if let Err(_e) = socket.send_to(payload, addr) {
                         running.store(false, Ordering::Relaxed);

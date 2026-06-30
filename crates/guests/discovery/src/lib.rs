@@ -2,11 +2,14 @@
 
 use std::{cell::RefCell, collections::BTreeMap, collections::HashMap, rc::Rc};
 
+use selium_abi::{DiscoveryRequest, DiscoveryResponse, decode_rkyv};
 use selium_guest::{
-    DiscoveryRequest, DiscoveryResponse, InterfaceMetadata, ResourceTarget, entrypoint,
-    io::rpc::{RpcAccept, RpcConnection, RpcError},
-    pattern_interface,
+    InterfaceMetadata, ResourceTarget, entrypoint, pattern_interface,
 };
+use selium_shm::{
+    Channel, transport::ShmTransport,
+};
+use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
@@ -50,6 +53,7 @@ impl DiscoveryStore {
 
     /// Tier-2 registration: validate that `client_process_id` owns
     /// `target.resource_id` before storing the mapping.
+    #[expect(clippy::result_unit_err, reason = "tier2 registration uses unit error for boolean failure")]
     pub fn register_tier2(
         &mut self,
         client_process_id: u64,
@@ -106,10 +110,10 @@ impl DiscoveryStore {
         // Only enforce tenant scoping for process-scoped URIs
         if uri.starts_with(PROCESS_URI_PREFIX) {
             // If caller provides a tenant and target has a tenant, they must match
-            if let (Some(caller), Some(target_tenant)) = (caller_tenant, &target.tenant) {
-                if caller != target_tenant {
-                    return None; // Tenant mismatch - deny access
-                }
+            if let (Some(caller), Some(target_tenant)) = (caller_tenant, &target.tenant)
+                && caller != target_tenant
+            {
+                return None; // Tenant mismatch - deny access
             }
         }
 
@@ -136,6 +140,27 @@ impl DiscoveryStore {
         target.interface = Some(metadata);
         true
     }
+
+    /// Applies a volatile Tier-1 event from the runtime feed.
+    fn apply_tier1_event(&mut self, request: DiscoveryRequest) {
+        match request {
+            DiscoveryRequest::Register { uri: _, target } => {
+                if let Some(process_id) = extract_process_id_from_uri(&target.uri) {
+                    self.register_tier1(process_id, target);
+                } else {
+                    // Runtime should only publish process-scoped Tier-1 registrations.
+                    selium_guest::warn!(
+                        uri = target.uri,
+                        "ignoring non-process-scoped Tier-1 registration"
+                    );
+                }
+            }
+            DiscoveryRequest::Revoke { uri } => {
+                self.remove(&uri);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn interface_metadata() -> InterfaceMetadata {
@@ -143,9 +168,17 @@ pub fn interface_metadata() -> InterfaceMetadata {
 }
 
 #[entrypoint]
-async fn discovery_main(listener_shared_id: u64) {
-    let _ = selium_guest::log::init();
+async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
+    drop(selium_guest::log::init());
     selium_guest::info!(guest = "selium-discovery", "system guest booting");
+
+    let feed_subscriber = match attach_feed_subscriber(feed_region_id) {
+        Ok(s) => s,
+        Err(error) => {
+            selium_guest::error!("failed to attach discovery feed subscriber: {error}");
+            return;
+        }
+    };
 
     let listener = match selium_guest::ResourceListener::attach(listener_shared_id) {
         Ok(l) => l,
@@ -156,27 +189,74 @@ async fn discovery_main(listener_shared_id: u64) {
     };
 
     selium_guest::info!(
+        feed_region_id,
         shared_id = listener.descriptor().shared_id,
-        "discovery listener attached"
+        "discovery feed and listener attached"
     );
     selium_guest::mark_ready();
 
     let store = Rc::new(RefCell::new(DiscoveryStore::default()));
 
+    // Spawn the feed processing loop.
+    selium_guest::spawn(feed_loop(store.clone(), feed_subscriber));
+
+    // Accept incoming RPC connections forever.
     loop {
-        let connection = match listener
-            .accept::<RpcAccept<DiscoveryRequest, DiscoveryResponse>>()
-            .await
-        {
-            Ok(c) => c,
+        let incoming = match listener.recv().await {
+            Ok(connection) => connection,
             Err(error) => {
                 selium_guest::warn!("discovery accept failed: {error}");
                 continue;
             }
         };
 
+        let connection =
+            match selium_shm::rpc::accept::<DiscoveryRequest, DiscoveryResponse>(incoming.into()) {
+                Ok(c) => c,
+                Err(error) => {
+                    selium_guest::warn!("discovery rpc accept failed: {error}");
+                    continue;
+                }
+            };
+
         let store = store.clone();
         selium_guest::spawn(handler(store, connection));
+    }
+}
+
+fn attach_feed_subscriber(
+    feed_region_id: u64,
+) -> selium_guest::Result<Subscriber<Vec<u8>, ShmTransport>> {
+    let channel = Channel::attach(feed_region_id)
+        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
+    let transport = ShmTransport::new(&channel, &channel)
+        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
+    let framed = FramedRead::new(transport);
+    // Disable overwrite detection: the discovery feed is volatile and the guest
+    // reads whatever is currently available, accepting that events may be lost.
+    Ok(Subscriber::new(framed, None))
+}
+
+async fn feed_loop(
+    store: Rc<RefCell<DiscoveryStore>>,
+    mut subscriber: Subscriber<Vec<u8>, ShmTransport>,
+) {
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => match decode_rkyv::<DiscoveryRequest>(&bytes) {
+                Ok(request) => store.borrow_mut().apply_tier1_event(request),
+                Err(error) => {
+                    selium_guest::warn!("discovery feed decode failed: {error}");
+                }
+            },
+            Err(selium_wire::error::Error::BufferEmpty) => {
+                selium_guest::yield_now().await;
+            }
+            Err(error) => {
+                selium_guest::warn!("discovery feed read failed: {error}");
+                break;
+            }
+        }
     }
 }
 
@@ -189,7 +269,7 @@ fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
 
 async fn handler(
     store: Rc<RefCell<DiscoveryStore>>,
-    mut conn: RpcConnection<DiscoveryRequest, DiscoveryResponse>,
+    mut conn: selium_shm::rpc::RpcConnection<DiscoveryRequest, DiscoveryResponse>,
 ) {
     let client_process_id = conn.client_process_id();
     loop {
@@ -238,7 +318,7 @@ async fn handler(
                     break;
                 }
             }
-            Err(RpcError::ConnectionClosed) => break,
+            Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
             Err(error) => {
                 selium_guest::warn!("discovery recv failed: {error}");
                 break;
@@ -435,5 +515,29 @@ mod tests {
         );
         assert_eq!(extract_process_id_from_uri("sel://my-app/logs"), None);
         assert_eq!(extract_process_id_from_uri("not-a-uri"), None);
+    }
+
+    #[test]
+    fn apply_tier1_register_event() {
+        let mut store = DiscoveryStore::default();
+        let t = target("sel://process/42/regions/7", 7);
+        store.apply_tier1_event(DiscoveryRequest::Register { uri: t.uri.clone(), target: t });
+
+        assert!(store.owns_resource(42, 7));
+        assert!(store.resolve_exact("sel://process/42/regions/7").is_some());
+    }
+
+    #[test]
+    fn apply_tier1_revoke_event() {
+        let mut store = DiscoveryStore::default();
+        store.register_tier1(42, target("sel://process/42/regions/7", 7));
+        assert!(store.owns_resource(42, 7));
+
+        store.apply_tier1_event(DiscoveryRequest::Revoke {
+            uri: "sel://process/42/regions/7".to_string(),
+        });
+
+        assert!(store.resolve_exact("sel://process/42/regions/7").is_none());
+        assert!(!store.owns_resource(42, 7));
     }
 }

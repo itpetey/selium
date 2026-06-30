@@ -222,13 +222,16 @@ impl Kernel {
                 break;
             }
 
-            let len = u32::from_le_bytes([
-                header_bytes[0],
-                header_bytes[1],
-                header_bytes[2],
-                header_bytes[3],
-            ]);
-            let flags = header_bytes[8];
+            let len = u32::from_le_bytes(
+                header_bytes
+                    .get(0..4)
+                    .ok_or_else(|| Error::Wasm("short log header".to_string()))?
+                    .try_into()
+                    .map_err(|_error| Error::Wasm("invalid log header len".to_string()))?,
+            );
+            let flags = *header_bytes
+                .get(8)
+                .ok_or_else(|| Error::Wasm("short log header".to_string()))?;
 
             // Check READY flag.
             if flags & FLAG_READY == 0 {
@@ -261,10 +264,16 @@ impl Kernel {
                     DATA_OFFSET + payload_start,
                     tail_len,
                 )?;
-                payload[..tail_len].copy_from_slice(&tail_data);
+                payload
+                    .get_mut(..tail_data.len())
+                    .ok_or_else(|| Error::Wasm("short payload buffer".to_string()))?
+                    .copy_from_slice(tail_data.as_slice());
                 let head_data =
                     self.read_shared_memory(local_mapping_id, DATA_OFFSET, payload_len - tail_len)?;
-                payload[tail_len..].copy_from_slice(&head_data);
+                payload
+                    .get_mut(tail_data.len()..)
+                    .ok_or_else(|| Error::Wasm("short payload buffer".to_string()))?
+                    .copy_from_slice(head_data.as_slice());
             }
 
             frames.push(payload);

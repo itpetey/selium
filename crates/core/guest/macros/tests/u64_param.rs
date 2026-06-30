@@ -23,6 +23,7 @@ fn entrypoint_with_u64_param_receives_argument() {
     descriptor.arguments = vec![encode_u64_argument(42)];
 
     let config = RuntimeConfig {
+        start_discovery: false,
         system_guests: vec![descriptor],
     };
 

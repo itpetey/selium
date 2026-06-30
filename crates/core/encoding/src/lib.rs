@@ -4,8 +4,41 @@
 //! between idiomatic Rust types and Flatbuffers payloads.
 
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
+use thiserror::Error;
 
-use crate::schema;
+pub mod codec;
+#[allow(warnings)]
+#[rustfmt::skip]
+pub mod fbs;
+pub mod log;
+
+use selium_guest_macros::schema;
+
+// Allow generated schema bindings to refer to this crate by name.
+extern crate self as selium_encoding;
+
+/// Error type for encoding/framing operations.
+#[derive(Debug, Error)]
+pub enum EncodingError {
+    /// ABI framing error.
+    #[error("framing error: {0:?}")]
+    Framing(selium_abi::AbiError),
+    /// Flatbuffers decode error.
+    #[error("flatbuffer decode error: {0}")]
+    Decode(flatbuffers::InvalidFlatbuffer),
+}
+
+impl From<selium_abi::AbiError> for EncodingError {
+    fn from(error: selium_abi::AbiError) -> Self {
+        Self::Framing(error)
+    }
+}
+
+impl From<flatbuffers::InvalidFlatbuffer> for EncodingError {
+    fn from(error: flatbuffers::InvalidFlatbuffer) -> Self {
+        Self::Decode(error)
+    }
+}
 
 /// Helper for encoding schema fields into Flatbuffers-ready values.
 pub trait FieldEncoder {
@@ -53,7 +86,7 @@ pub struct SchemaDescriptor {
 #[schema(
     path = "schemas/discovery.fbs",
     ty = "selium.discovery.InterfaceMetadata",
-    binding = "crate::fbs::selium::discovery::InterfaceMetadata"
+    binding = "selium_encoding::fbs::selium::discovery::InterfaceMetadata"
 )]
 pub struct InterfaceMetadataWire {
     /// Interface name.
@@ -67,7 +100,7 @@ pub struct InterfaceMetadataWire {
 #[schema(
     path = "schemas/discovery.fbs",
     ty = "selium.discovery.ResourceTarget",
-    binding = "crate::fbs::selium::discovery::ResourceTarget"
+    binding = "selium_encoding::fbs::selium::discovery::ResourceTarget"
 )]
 pub struct ResourceTargetWire {
     /// URI of the resource.
@@ -87,7 +120,7 @@ pub struct ResourceTargetWire {
 #[schema(
     path = "schemas/discovery.fbs",
     ty = "selium.discovery.DiscoveryRequest",
-    binding = "crate::fbs::selium::discovery::DiscoveryRequest"
+    binding = "selium_encoding::fbs::selium::discovery::DiscoveryRequest"
 )]
 pub struct DiscoveryRequestWire {
     /// Variant discriminator (0 = Resolve, 1 = Register, 2 = Revoke).
@@ -103,7 +136,7 @@ pub struct DiscoveryRequestWire {
 #[schema(
     path = "schemas/discovery.fbs",
     ty = "selium.discovery.DiscoveryResponse",
-    binding = "crate::fbs::selium::discovery::DiscoveryResponse"
+    binding = "selium_encoding::fbs::selium::discovery::DiscoveryResponse"
 )]
 pub struct DiscoveryResponseWire {
     /// Variant discriminator (0 = Found, 1 = NotFound, 2 = Registered, 3 = Revoked, 4 = Forbidden).
@@ -182,7 +215,7 @@ impl FlatMsg for u32 {
         Ok(u32::from_le_bytes(
             bytes
                 .try_into()
-                .map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_e| InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }
@@ -203,7 +236,7 @@ impl FlatMsg for i32 {
         Ok(i32::from_le_bytes(
             bytes
                 .try_into()
-                .map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_e| InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }
@@ -224,7 +257,7 @@ impl FlatMsg for u64 {
         Ok(u64::from_le_bytes(
             bytes
                 .try_into()
-                .map_err(|_| InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_e| InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }

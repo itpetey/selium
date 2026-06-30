@@ -138,7 +138,7 @@ fn attach_region(
 /// Tests the selium-io frame header wire format through kernel shared memory.
 #[test]
 fn frame_header_round_trip() {
-    use selium_guest::io::FrameHeader;
+    use selium_wire::frame::FrameHeader;
 
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "frame");
@@ -237,6 +237,7 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
 fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
     let report = runtime
         .bootstrap_system_guests(selium_runtime::RuntimeConfig {
+            start_discovery: false,
             system_guests: vec![SystemGuestDescriptor {
                 name: name.to_string(),
                 module_id: format!("{name}-module"),

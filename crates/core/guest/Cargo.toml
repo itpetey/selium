@@ -17,7 +17,11 @@ flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
 quinn = { workspace = true, optional = true }
 selium-abi.workspace = true
+selium-encoding.workspace = true
 selium-guest-macros = { path = "macros" }
+selium-memory.workspace = true
+selium-shm = { workspace = true, optional = true }
+selium-wire = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"], optional = true }
 tokio-util = { workspace = true, features = ["codec"] }
@@ -30,11 +34,8 @@ tracing-subscriber = {
 
 [dev-dependencies]
 flatbuffers.workspace = true
+selium-memory.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-
-[build-dependencies]
-flatbuffers-build.workspace = true
-flatc-fork.workspace = true
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 web-time = { workspace = true }
@@ -42,7 +43,7 @@ web-time = { workspace = true }
 [features]
 default = ["io", "logging"]
 axum = ["dep:axum", "io", "tokio/time"]
-io = ["dep:tokio"]
+io = ["dep:selium-shm", "dep:selium-wire", "dep:tokio"]
 logging = ["dep:tracing-subscriber"]
 quinn = ["dep:quinn", "io"]
 

@@ -1,12 +1,10 @@
 #[cfg(feature = "io")]
 use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
+#[cfg(feature = "io")]
+use selium_shm::rpc::{self, RpcClient};
 
 #[cfg(feature = "io")]
-use crate::GuestError;
-#[cfg(feature = "io")]
-use crate::io::rpc::RpcClient;
-#[cfg(feature = "io")]
-use crate::resource::ResourceSender;
+use crate::{GuestError, resource::ResourceSender};
 
 /// RPC ring capacity for discovery replies.
 #[cfg(feature = "io")]
@@ -46,7 +44,7 @@ impl Context {
         let sender = ResourceSender::attach(discovery_handle)?;
 
         // Create RPC client for discovery.
-        let client = RpcClient::connect(sender, RPC_REQ_CAPACITY, RPC_REP_CAPACITY)
+        let client = rpc::connect(sender, RPC_REQ_CAPACITY, RPC_REP_CAPACITY)
             .await
             .map_err(|e| GuestError::Host(format!("create RPC client: {e}")))?;
 

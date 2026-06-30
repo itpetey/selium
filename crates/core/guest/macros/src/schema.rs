@@ -341,12 +341,16 @@ fn encode_vec_field(
 /// Returns the path prefix for encoding types.
 ///
 /// When the macro is used inside `selium-guest` itself, we need `crate::encoding`
-/// instead of `selium_guest::encoding`. We detect this via `CARGO_CRATE_NAME`.
+/// instead of `selium_guest::encoding`. When used inside `selium-encoding`, the
+/// types live at the crate root. When used inside `selium-wire`, the types are
+/// provided by the `selium-encoding` dependency. We detect this via
+/// `CARGO_CRATE_NAME`.
 fn encoding_path() -> proc_macro2::TokenStream {
-    if std::env::var("CARGO_CRATE_NAME").as_deref() == Ok("selium_guest") {
-        quote! { crate::encoding }
-    } else {
-        quote! { selium_guest::encoding }
+    match std::env::var("CARGO_CRATE_NAME").as_deref() {
+        Ok("selium_guest") => quote! { crate::encoding },
+        Ok("selium_encoding") => quote! { crate },
+        Ok("selium_wire") => quote! { selium_encoding },
+        _ => quote! { selium_guest::encoding },
     }
 }
 
