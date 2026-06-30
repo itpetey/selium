@@ -12,7 +12,6 @@ categories.workspace = true
 
 [dependencies]
 bytes.workspace = true
-flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
 selium-abi.workspace = true
 selium-encoding.workspace = true
@@ -24,6 +23,7 @@ tokio-util = { workspace = true, features = ["codec"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+flatbuffers.workspace = true
 
 [lints]
 workspace = true

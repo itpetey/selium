@@ -10,10 +10,11 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.cargo-shear]
+ignored-paths = ["macros/tests/ui/*.rs"]
+
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"], optional = true }
-bytes.workspace = true
-flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
 quinn = { workspace = true, optional = true }
 selium-abi.workspace = true
@@ -24,7 +25,6 @@ selium-shm = { workspace = true, optional = true }
 selium-wire = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"], optional = true }
-tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
 tracing-subscriber = {
   workspace = true,
@@ -33,7 +33,6 @@ tracing-subscriber = {
 }
 
 [dev-dependencies]
-flatbuffers.workspace = true
 selium-memory.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
