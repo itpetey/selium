@@ -212,7 +212,7 @@ fn parse_dual_ring_region(parent_mapping: &RegionMapping) -> Result<(RingBuf, Ri
     let magic = u64::from_le_bytes(
         magic_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid magic bytes".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid magic bytes".to_string()))?,
     );
     if magic != SHARED_REGION_MAGIC {
         return Err(GuestError::Host("invalid region magic".to_string()));
@@ -225,7 +225,7 @@ fn parse_dual_ring_region(parent_mapping: &RegionMapping) -> Result<(RingBuf, Ri
     let count = u32::from_le_bytes(
         count_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid count bytes".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid count bytes".to_string()))?,
     );
     if count < 2 {
         return Err(GuestError::Host(format!(
@@ -243,12 +243,12 @@ fn parse_dual_ring_region(parent_mapping: &RegionMapping) -> Result<(RingBuf, Ri
     let inbound_offset = u32::from_le_bytes(
         entry0_offset_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid entry0 offset".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid entry0 offset".to_string()))?,
     ) as u64;
     let inbound_len = u32::from_le_bytes(
         entry0_len_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid entry0 len".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid entry0 len".to_string()))?,
     ) as u64;
 
     // Read entry[1]: outbound ring.
@@ -261,12 +261,12 @@ fn parse_dual_ring_region(parent_mapping: &RegionMapping) -> Result<(RingBuf, Ri
     let outbound_offset = u32::from_le_bytes(
         entry1_offset_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid entry1 offset".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid entry1 offset".to_string()))?,
     ) as u64;
     let outbound_len = u32::from_le_bytes(
         entry1_len_bytes
             .try_into()
-            .map_err(|_| GuestError::Host("invalid entry1 len".to_string()))?,
+            .map_err(|_error| GuestError::Host("invalid entry1 len".to_string()))?,
     ) as u64;
 
     // Calculate ring capacities (sub-memory length minus page 0).

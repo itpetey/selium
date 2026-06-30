@@ -198,7 +198,7 @@ impl Kernel {
         let next_tail = u64::from_le_bytes(
             next_tail_bytes
                 .try_into()
-                .map_err(|_| Error::Wasm("invalid next_tail".to_string()))?,
+                .map_err(|_error| Error::Wasm("invalid next_tail".to_string()))?,
         );
 
         // If read_pos has been overtaken, skip to next_tail - capacity.

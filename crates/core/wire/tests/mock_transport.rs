@@ -79,7 +79,7 @@ impl FlatMsg for Greeting {
     fn decode(bytes: &[u8]) -> std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
         Ok(Self(
             String::from_utf8(bytes.to_vec())
-                .map_err(|_| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }

@@ -59,37 +59,61 @@ pub fn process_id() -> u64 {
 }
 
 pub(crate) fn drain_mailbox() {
-    unsafe {
-        if (*mailbox_cell(selium_abi::mailbox::FLAG_OFFSET))
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
-        {
-            return;
-        }
-        let mut head = (*mailbox_cell(selium_abi::mailbox::HEAD_OFFSET))
-            .load(std::sync::atomic::Ordering::Acquire);
-        let tail = (*mailbox_cell(selium_abi::mailbox::TAIL_OFFSET))
-            .load(std::sync::atomic::Ordering::Acquire);
-        while head != tail {
-            let slot = selium_abi::mailbox::RING_OFFSET
-                + (head as usize % selium_abi::mailbox::CAPACITY) * selium_abi::mailbox::SLOT_SIZE;
-            let task_id = (*mailbox_cell(slot)).load(std::sync::atomic::Ordering::Relaxed);
-            wake_task(task_id);
-            head = head.wrapping_add(1);
-        }
-        (*mailbox_cell(selium_abi::mailbox::HEAD_OFFSET))
-            .store(head, std::sync::atomic::Ordering::Release);
-        (*mailbox_cell(selium_abi::mailbox::FLAG_OFFSET))
-            .store(0, std::sync::atomic::Ordering::Release);
+    // SAFETY: The mailbox is a static mutable array. Access is serialised by the
+    // flag/head/tail handshake and atomic operations. This function is called
+    // from the guest event-loop context where no other code concurrently
+    // accesses the mailbox.
+    let flag_ptr = unsafe { mailbox_cell(selium_abi::mailbox::FLAG_OFFSET) };
+    // SAFETY: `flag_ptr` points to a valid AtomicU32 within the mailbox.
+    if unsafe { (*flag_ptr).load(std::sync::atomic::Ordering::Acquire) } == 0 {
+        return;
     }
+
+    // SAFETY: Same single-threaded mailbox access.
+    let head_ptr = unsafe { mailbox_cell(selium_abi::mailbox::HEAD_OFFSET) };
+    // SAFETY: Same as above.
+    let mut head = unsafe { (*head_ptr).load(std::sync::atomic::Ordering::Acquire) };
+
+    // SAFETY: Same as above.
+    let tail_ptr = unsafe { mailbox_cell(selium_abi::mailbox::TAIL_OFFSET) };
+    // SAFETY: Same as above.
+    let tail = unsafe { (*tail_ptr).load(std::sync::atomic::Ordering::Acquire) };
+
+    while head != tail {
+        let slot = selium_abi::mailbox::RING_OFFSET
+            + (head as usize % selium_abi::mailbox::CAPACITY) * selium_abi::mailbox::SLOT_SIZE;
+        // SAFETY: `slot` has been bounds-checked against the mailbox capacity.
+        let slot_ptr = unsafe { mailbox_cell(slot) };
+        // SAFETY: `slot_ptr` points to a valid AtomicU32 within the mailbox.
+        let task_id = unsafe { (*slot_ptr).load(std::sync::atomic::Ordering::Relaxed) };
+        wake_task(task_id);
+        head = head.wrapping_add(1);
+    }
+    // SAFETY: Same single-threaded mailbox access.
+    let head_ptr = unsafe { mailbox_cell(selium_abi::mailbox::HEAD_OFFSET) };
+    // SAFETY: Same as above.
+    unsafe { (*head_ptr).store(head, std::sync::atomic::Ordering::Release) };
+
+    // SAFETY: Same single-threaded mailbox access.
+    let flag_ptr = unsafe { mailbox_cell(selium_abi::mailbox::FLAG_OFFSET) };
+    // SAFETY: Same as above.
+    unsafe { (*flag_ptr).store(0, std::sync::atomic::Ordering::Release) };
 }
 
 pub(crate) fn register_mailbox() {
+    // SAFETY: The mailbox is a static mutable array. This function is called
+    // once during guest initialisation before any concurrent access occurs.
+    let capacity_ptr = unsafe { mailbox_cell(selium_abi::mailbox::CAPACITY_OFFSET) };
+    // SAFETY: `capacity_ptr` points to a valid AtomicU32 within the mailbox.
     unsafe {
-        (*mailbox_cell(selium_abi::mailbox::CAPACITY_OFFSET)).store(
+        (*capacity_ptr).store(
             selium_abi::mailbox::CAPACITY as u32,
             std::sync::atomic::Ordering::Release,
         );
+    }
+    // SAFETY: `selium_mailbox_register` is a host import that registers the
+    // mailbox with the runtime. It is safe to call once during initialisation.
+    unsafe {
         selium_mailbox_register(mailbox_base(), selium_abi::mailbox::BYTE_LEN);
     }
 }
@@ -99,6 +123,7 @@ fn mailbox_base() -> *mut u8 {
 }
 
 unsafe fn mailbox_cell(offset: usize) -> *mut core::sync::atomic::AtomicU32 {
+    // SAFETY: `offset` is a known mailbox constant within the MAILBOX bounds.
     unsafe {
         mailbox_base()
             .add(offset)

@@ -149,32 +149,4 @@ mod tests {
         // In native mode, ResourceSender::attach(0) fails because there's
         // no host queue infrastructure.
     }
-
-    /// Verifies that Context::register and Context::revoke methods exist
-    /// with the correct signatures. Full RPC-based testing requires the
-    /// runtime infrastructure and is covered by integration tests.
-    #[cfg(feature = "io")]
-    #[test]
-    fn register_and_revoke_method_signatures() {
-        // Verify the methods exist with correct signatures by checking
-        // that they would compile if called on a Context.
-        fn _assert_register_signature(ctx: &mut Context) {
-            let _ = async {
-                let target = ResourceTarget {
-                    uri: "sel://test".to_string(),
-                    host_id: "host".to_string(),
-                    resource_id: 1,
-                    interface: None,
-                    tenant: None,
-                };
-                let _: Result<(), GuestError> = ctx.register("sel://test", target).await;
-            };
-        }
-
-        fn _assert_revoke_signature(ctx: &mut Context) {
-            let _ = async {
-                let _: Result<(), GuestError> = ctx.revoke("sel://test").await;
-            };
-        }
-    }
 }

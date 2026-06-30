@@ -22,7 +22,7 @@ impl FlatMsg for Ping {
     fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
         Ok(Self(
             String::from_utf8(bytes.to_vec())
-                .map_err(|_| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }
@@ -35,13 +35,13 @@ impl FlatMsg for Pong {
     fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
         Ok(Self(
             String::from_utf8(bytes.to_vec())
-                .map_err(|_| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
+                .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
         ))
     }
 }
 
 fn install_heap_provider() {
-    let _ = selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new()));
+    drop(selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
 }
 
 fn make_channel(capacity: u64) -> Channel {

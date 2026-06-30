@@ -55,7 +55,7 @@ pub(crate) fn free_region(region_id: u64) -> Result<(), Error> {
 /// Convenience helper to install the heap provider for tests.
 #[cfg(test)]
 pub(crate) fn install_heap_provider() {
-    let _ = selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new()));
+    drop(selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
 }
 
 /// Ensures a heap provider is installed when running under `cfg(test)`.

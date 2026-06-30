@@ -470,7 +470,7 @@ mod tests {
         // Process 99 does not own resource 7
         let custom = target("sel://evil/logs", 7);
         let result = store.register_tier2(99, custom);
-        assert!(result.is_err());
+        result.unwrap_err();
         assert!(store.resolve_exact("sel://evil/logs").is_none());
     }
 

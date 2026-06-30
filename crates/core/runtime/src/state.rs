@@ -72,9 +72,9 @@ impl Runtime {
         // Install the runtime's kernel-backed region provider so that the
         // runtime can use selium-shm directly (e.g. for discovery pub/sub).
         if selium_memory::region_provider().is_err() {
-            let _ = selium_memory::set_region_provider(Box::new(
+            drop(selium_memory::set_region_provider(Box::new(
                 RuntimeRegionProvider::new(kernel.clone()),
-            ));
+            )));
         }
         Self {
             kernel,

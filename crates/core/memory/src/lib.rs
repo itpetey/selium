@@ -291,6 +291,12 @@ pub struct PointerBackend {
 // and the ptr points to a shared mapping that the kernel serialises. All
 // mutation of attachment_count is atomic.
 unsafe impl Send for PointerBackend {}
+// SAFETY: `PointerBackend` accesses shared memory through a raw pointer, and
+// all mutation of the underlying data is serialised by the kernel or by atomic
+// operations. Immutable references to `PointerBackend` can safely share access
+// to the mapped memory because all read/write paths either use atomic operations
+// or go through the `MappingBackend` trait methods which perform internal
+// synchronisation.
 unsafe impl Sync for PointerBackend {}
 
 impl PointerBackend {
@@ -663,6 +669,6 @@ mod tests {
 
     fn set_provider_for_test() {
         // Ignore errors from repeated test installs.
-        let _ = set_region_provider(Box::new(HeapRegionProvider::new()));
+        drop(set_region_provider(Box::new(HeapRegionProvider::new())));
     }
 }

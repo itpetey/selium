@@ -153,7 +153,7 @@ impl Runtime {
                     None,
                 )?;
                 let size_bytes = (pages as u64) * 65536; // WASM page size
-                let size_u32 = u32::try_from(size_bytes).map_err(|_| {
+                let size_u32 = u32::try_from(size_bytes).map_err(|_error| {
                     AbiError::new(AbiErrorCode::MalformedPayload, "region size exceeds u32")
                 })?;
 

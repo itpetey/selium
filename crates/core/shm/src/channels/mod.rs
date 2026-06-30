@@ -181,28 +181,28 @@ mod tests {
     fn drop_channel_accepts_blocking_writer() {
         let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
         let result = channel.blocking_writer();
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
     fn park_channel_accepts_blocking_writer() {
         let channel = Channel::create(64, ChannelBackpressure::Park).expect("create");
         let result = channel.blocking_writer();
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
     fn drop_channel_accepts_blocking_reader() {
         let channel = Channel::create(64, ChannelBackpressure::Drop).expect("create");
         let result = channel.blocking_reader();
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
     fn park_channel_accepts_blocking_reader() {
         let channel = Channel::create(64, ChannelBackpressure::Park).expect("create");
         let result = channel.blocking_reader();
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Drop);
         assert_eq!(attached.ring().capacity(), 64);
 
-        crate::free_region(region_id).ok();
+        drop(crate::free_region(region_id));
     }
 
     #[test]
@@ -288,6 +288,6 @@ mod tests {
         assert_eq!(attached.backpressure(), ChannelBackpressure::Park);
         assert_eq!(attached.ring().capacity(), 128);
 
-        crate::free_region(region_id).ok();
+        drop(crate::free_region(region_id));
     }
 }

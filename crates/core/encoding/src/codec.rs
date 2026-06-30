@@ -41,7 +41,11 @@ mod tests {
             if bytes.len() < 4 {
                 return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
             }
-            let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(
+                bytes[0..4]
+                    .try_into()
+                    .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
+            ) as usize;
             if bytes.len() < 4 + len {
                 return Err(flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge);
             }

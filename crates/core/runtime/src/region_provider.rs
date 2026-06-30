@@ -44,7 +44,7 @@ impl RegionProvider for RuntimeRegionProvider {
     fn allocate(&self, pages: u32, _prot: RegionProt, _purpose: ResourceKind) -> Result<Region> {
         let size_bytes = pages as u64 * selium_memory::PAGE_SIZE;
         let size_u32 = u32::try_from(size_bytes)
-            .map_err(|_| MemoryError::Other("region size exceeds u32".to_string()))?;
+            .map_err(|_error| MemoryError::Other("region size exceeds u32".to_string()))?;
         let (shared_id, len) = self
             .kernel
             .allocate_shared_region(size_u32)
@@ -53,7 +53,10 @@ impl RegionProvider for RuntimeRegionProvider {
             .kernel
             .attach_shared_region(shared_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        self.local_ids.lock().unwrap().insert(shared_id, local_id);
+        self.local_ids
+            .lock()
+            .map_err(|error| MemoryError::Other(error.to_string()))?
+            .insert(shared_id, local_id);
         let backend = Arc::new(KernelBackend::new(self.kernel.clone(), local_id, shared_id, len as u64));
         Ok(Region::with_backend(
             RegionAllocation {
@@ -89,8 +92,13 @@ impl RegionProvider for RuntimeRegionProvider {
     }
 
     fn free(&self, region_id: u64) -> Result<()> {
-        if let Some(local_id) = self.local_ids.lock().unwrap().remove(&region_id) {
-            let _ = self.kernel.detach_shared_region(local_id);
+        if let Some(local_id) = self
+            .local_ids
+            .lock()
+            .map_err(|error| MemoryError::Other(error.to_string()))?
+            .remove(&region_id)
+        {
+            drop(self.kernel.detach_shared_region(local_id));
         }
         self.kernel
             .destroy_shared_region(region_id)
@@ -165,7 +173,7 @@ impl MappingBackend for KernelBackend {
         Ok(u64::from_le_bytes(
             bytes
                 .try_into()
-                .map_err(|_| MemoryError::InvalidLayout)?,
+                .map_err(|_error| MemoryError::InvalidLayout)?,
         ))
     }
 

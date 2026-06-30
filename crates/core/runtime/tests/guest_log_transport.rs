@@ -20,8 +20,8 @@ use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
 fn ensure_heap_provider() {
     if selium_memory::region_provider().is_err() {
-        let _ =
-            selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new()));
+        drop(
+            selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
     }
 }
 

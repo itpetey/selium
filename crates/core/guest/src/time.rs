@@ -273,7 +273,7 @@ mod tests {
         let t0 = Instant::from_nanos(1_000_000);
         let t1 = Instant::from_nanos(2_000_000);
         let result = std::panic::catch_unwind(|| t0.duration_since(t1));
-        assert!(result.is_err()); // panics because t0 < t1
+        result.unwrap_err(); // panics because t0 < t1
     }
 
     #[test]
