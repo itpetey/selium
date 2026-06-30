@@ -18,12 +18,12 @@ use crate::{
     region_provider::RuntimeRegionProvider,
 };
 
-pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
+pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
 pub(crate) type RegionPurposes = HashMap<(ProcessId, u64), ResourceKind>;
+pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]

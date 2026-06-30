@@ -1,12 +1,12 @@
 use std::sync::atomic::{Ordering, fence};
 
 use selium_abi::ResourceKind;
-
-use crate::{ChannelRegion, Cursor, cursor::mask_for_capacity};
 use selium_wire::{
     error::{Error, Result},
     frame::FrameHeader,
 };
+
+use crate::{ChannelRegion, Cursor, cursor::mask_for_capacity};
 
 /// Minimum ring buffer data capacity (in bytes).
 /// Must hold at least one frame header (12 bytes) plus a small payload.

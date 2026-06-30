@@ -10,21 +10,28 @@
 
 use selium_abi::{RegionProt, ResourceKind};
 use selium_encoding::FlatMsg;
-use selium_memory::{RegionMapping, PAGE_SIZE};
+use selium_memory::{PAGE_SIZE, RegionMapping};
 use selium_wire::{
     error::{Error, Result},
     framed::{FramedRead, FramedWrite},
-    rpc::{IncomingConnection, Rendezvous, RpcClient as WireRpcClient, RpcConnection as WireRpcConnection, RpcRequest as WireRpcRequest},
+    rpc::{
+        IncomingConnection, Rendezvous, RpcClient as WireRpcClient,
+        RpcConnection as WireRpcConnection, RpcRequest as WireRpcRequest,
+    },
+};
+
+use crate::{
+    Channel, ChannelBackpressure, ChannelRegion, ring_buf::RingBuf, transport::ShmTransport,
 };
 
 pub use selium_wire::rpc::RpcError;
 
-use crate::{
-    Channel, ChannelBackpressure,
-    ring_buf::RingBuf,
-    transport::ShmTransport,
-    ChannelRegion,
-};
+/// Client-side handle for typed RPC requests over shared memory.
+pub type RpcClient<Req, Rep> = WireRpcClient<Req, Rep, ShmTransport>;
+/// Server-side handle for an established shared-memory RPC session.
+pub type RpcConnection<Req, Rep> = WireRpcConnection<Req, Rep, ShmTransport>;
+/// A single request received by the server, with the ability to reply.
+pub type RpcRequest<'a, Req, Rep> = WireRpcRequest<'a, Req, Rep, ShmTransport>;
 
 /// Default reply ring capacity in bytes.
 const DEFAULT_REP_CAPACITY: u64 = 4096;
@@ -41,14 +48,31 @@ const HEADER_SIZE: u64 = HEADER_ENTRY_OFFSET + 2 * HEADER_ENTRY_SIZE;
 /// Magic value for multi-memory shared region layout header.
 const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
-/// Client-side handle for typed RPC requests over shared memory.
-pub type RpcClient<Req, Rep> = WireRpcClient<Req, Rep, ShmTransport>;
+/// Accepts an incoming shared-memory RPC session.
+///
+/// Attaches to the multi-memory region identified by `connection.shared_id`,
+/// parses the request/reply ring layout, and returns a typed
+/// [`RpcConnection`] for the server side.
+pub fn accept<Req, Rep>(
+    connection: IncomingConnection,
+) -> std::result::Result<RpcConnection<Req, Rep>, RpcError>
+where
+    Req: FlatMsg,
+    Rep: FlatMsg,
+{
+    let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
 
-/// Server-side handle for an established shared-memory RPC session.
-pub type RpcConnection<Req, Rep> = WireRpcConnection<Req, Rep, ShmTransport>;
+    let request_transport =
+        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
 
-/// A single request received by the server, with the ability to reply.
-pub type RpcRequest<'a, Req, Rep> = WireRpcRequest<'a, Req, Rep, ShmTransport>;
+    Ok(RpcConnection::new(
+        FramedRead::new(request_transport),
+        FramedWrite::new(reply_transport),
+        connection.client_process_id,
+    ))
+}
 
 /// Creates a new shared-memory RPC client.
 ///
@@ -83,10 +107,10 @@ where
         .await
         .map_err(|error| RpcError::Serialization(format!("rendezvous send failed: {error}")))?;
 
-    let request_transport = ShmTransport::new(&request_channel, &request_channel)
-        .map_err(map_transport_error)?;
-    let reply_transport = ShmTransport::new(&reply_channel, &reply_channel)
-        .map_err(map_transport_error)?;
+    let request_transport =
+        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
 
     Ok(RpcClient::new(
         FramedWrite::new(request_transport),
@@ -94,39 +118,76 @@ where
     ))
 }
 
-/// Accepts an incoming shared-memory RPC session.
-///
-/// Attaches to the multi-memory region identified by `connection.shared_id`,
-/// parses the request/reply ring layout, and returns a typed
-/// [`RpcConnection`] for the server side.
-pub fn accept<Req, Rep>(
-    connection: IncomingConnection,
-) -> std::result::Result<RpcConnection<Req, Rep>, RpcError>
-where
-    Req: FlatMsg,
-    Rep: FlatMsg,
-{
-    let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
+/// Aligns a value up to the given alignment.
+fn align_up(value: u64, alignment: u64) -> u64 {
+    let rem = value % alignment;
+    if rem == 0 {
+        value
+    } else {
+        value + alignment - rem
+    }
+}
 
-    let request_transport = ShmTransport::new(&request_channel, &request_channel)
-        .map_err(map_transport_error)?;
-    let reply_transport = ShmTransport::new(&reply_channel, &reply_channel)
-        .map_err(map_transport_error)?;
+/// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
+fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
+    let region = selium_memory::region_provider()?
+        .attach(shared_id, None, RegionProt::ReadWrite)
+        .map_err(Error::from)?;
+    let parent_mapping = region.mapping();
 
-    Ok(RpcConnection::new(
-        FramedRead::new(request_transport),
-        FramedWrite::new(reply_transport),
-        connection.client_process_id,
-    ))
+    // Read and validate magic.
+    let magic_bytes = parent_mapping.read(HEADER_MAGIC_OFFSET, 8)?;
+    let magic = u64::from_le_bytes(
+        magic_bytes
+            .try_into()
+            .map_err(|_error| Error::InvalidLayout)?,
+    );
+    if magic != SHARED_REGION_MAGIC {
+        return Err(Error::InvalidLayout);
+    }
+
+    // Read count.
+    let count_bytes = parent_mapping.read(HEADER_COUNT_OFFSET, 4)?;
+    let count = u32::from_le_bytes(
+        count_bytes
+            .try_into()
+            .map_err(|_error| Error::InvalidLayout)?,
+    );
+    if count < 2 {
+        return Err(Error::InvalidLayout);
+    }
+
+    let (req_offset, req_len) = read_entry(&parent_mapping, 0)?;
+    let (rep_offset, rep_len) = read_entry(&parent_mapping, 1)?;
+
+    let req_capacity = req_len.checked_sub(PAGE_SIZE).ok_or(Error::InvalidLayout)?;
+    let rep_capacity = rep_len.checked_sub(PAGE_SIZE).ok_or(Error::InvalidLayout)?;
+
+    let request_channel =
+        channel_from_sub_mapping(&parent_mapping, req_offset, req_len, req_capacity)?;
+    let reply_channel =
+        channel_from_sub_mapping(&parent_mapping, rep_offset, rep_len, rep_capacity)?;
+
+    Ok((request_channel, reply_channel))
+}
+
+/// Wraps an existing sub-mapping as a channel without initialising it.
+fn channel_from_sub_mapping(
+    parent_mapping: &RegionMapping,
+    offset: u64,
+    len: u64,
+    capacity: u64,
+) -> Result<Channel> {
+    let mapping = parent_mapping.sub_region(offset, len)?;
+    let region = ChannelRegion::from_mapping(mapping, capacity);
+    let ring = RingBuf::wrap_region(region)?;
+    Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
 }
 
 /// Creates a multi-memory region with two ring buffers for RPC.
 ///
 /// Returns the request channel, reply channel, and parent `shared_id`.
-fn create_rpc_region(
-    req_capacity: u64,
-    rep_capacity: u64,
-) -> Result<(Channel, Channel, u64)> {
+fn create_rpc_region(req_capacity: u64, rep_capacity: u64) -> Result<(Channel, Channel, u64)> {
     // Each sub-memory: page 0 (coordination) + data pages.
     let req_region_len = PAGE_SIZE + req_capacity;
     let rep_region_len = PAGE_SIZE + rep_capacity;
@@ -165,73 +226,20 @@ fn create_rpc_region(
         &(rep_region_len as u32).to_le_bytes(),
     )?;
 
-    let request_channel = initialise_sub_channel(&parent_mapping, sub_memory_0_offset, req_region_len, req_capacity)?;
-    let reply_channel = initialise_sub_channel(&parent_mapping, sub_memory_1_offset, rep_region_len, rep_capacity)?;
+    let request_channel = initialise_sub_channel(
+        &parent_mapping,
+        sub_memory_0_offset,
+        req_region_len,
+        req_capacity,
+    )?;
+    let reply_channel = initialise_sub_channel(
+        &parent_mapping,
+        sub_memory_1_offset,
+        rep_region_len,
+        rep_capacity,
+    )?;
 
     Ok((request_channel, reply_channel, shared_id))
-}
-
-/// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
-fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
-    let region = selium_memory::region_provider()?
-        .attach(shared_id, None, RegionProt::ReadWrite)
-        .map_err(Error::from)?;
-    let parent_mapping = region.mapping();
-
-    // Read and validate magic.
-    let magic_bytes = parent_mapping.read(HEADER_MAGIC_OFFSET, 8)?;
-    let magic = u64::from_le_bytes(
-        magic_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    );
-    if magic != SHARED_REGION_MAGIC {
-        return Err(Error::InvalidLayout);
-    }
-
-    // Read count.
-    let count_bytes = parent_mapping.read(HEADER_COUNT_OFFSET, 4)?;
-    let count = u32::from_le_bytes(
-        count_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    );
-    if count < 2 {
-        return Err(Error::InvalidLayout);
-    }
-
-    let (req_offset, req_len) = read_entry(&parent_mapping, 0)?;
-    let (rep_offset, rep_len) = read_entry(&parent_mapping, 1)?;
-
-    let req_capacity = req_len
-        .checked_sub(PAGE_SIZE)
-        .ok_or(Error::InvalidLayout)?;
-    let rep_capacity = rep_len
-        .checked_sub(PAGE_SIZE)
-        .ok_or(Error::InvalidLayout)?;
-
-    let request_channel = channel_from_sub_mapping(&parent_mapping, req_offset, req_len, req_capacity)?;
-    let reply_channel = channel_from_sub_mapping(&parent_mapping, rep_offset, rep_len, rep_capacity)?;
-
-    Ok((request_channel, reply_channel))
-}
-
-/// Reads entry `index` from the multi-memory header.
-fn read_entry(parent_mapping: &RegionMapping, index: u32) -> Result<(u64, u64)> {
-    let offset = HEADER_ENTRY_OFFSET + u64::from(index) * HEADER_ENTRY_SIZE;
-    let offset_bytes = parent_mapping.read(offset, 4)?;
-    let len_bytes = parent_mapping.read(offset + 4, 4)?;
-    let entry_offset = u32::from_le_bytes(
-        offset_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    ) as u64;
-    let entry_len = u32::from_le_bytes(
-        len_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    ) as u64;
-    Ok((entry_offset, entry_len))
 }
 
 /// Initialises a sub-region for a freshly-allocated RPC channel.
@@ -250,34 +258,6 @@ fn initialise_sub_channel(
     Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
 }
 
-/// Wraps an existing sub-mapping as a channel without initialising it.
-fn channel_from_sub_mapping(
-    parent_mapping: &RegionMapping,
-    offset: u64,
-    len: u64,
-    capacity: u64,
-) -> Result<Channel> {
-    let mapping = parent_mapping.sub_region(offset, len)?;
-    let region = ChannelRegion::from_mapping(mapping, capacity);
-    let ring = RingBuf::wrap_region(region)?;
-    Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
-}
-
-/// Aligns a value up to the given alignment.
-fn align_up(value: u64, alignment: u64) -> u64 {
-    let rem = value % alignment;
-    if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
-    }
-}
-
-/// Computes the number of WASM pages needed to hold `bytes`.
-fn pages_for_bytes(bytes: u64) -> u32 {
-    bytes.div_ceil(PAGE_SIZE) as u32
-}
-
 /// Maps a transport error to an [`RpcError`].
 fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
     match error {
@@ -292,4 +272,27 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
         }
         other => RpcError::Serialization(other.to_string()),
     }
+}
+
+/// Computes the number of WASM pages needed to hold `bytes`.
+fn pages_for_bytes(bytes: u64) -> u32 {
+    bytes.div_ceil(PAGE_SIZE) as u32
+}
+
+/// Reads entry `index` from the multi-memory header.
+fn read_entry(parent_mapping: &RegionMapping, index: u32) -> Result<(u64, u64)> {
+    let offset = HEADER_ENTRY_OFFSET + u64::from(index) * HEADER_ENTRY_SIZE;
+    let offset_bytes = parent_mapping.read(offset, 4)?;
+    let len_bytes = parent_mapping.read(offset + 4, 4)?;
+    let entry_offset = u32::from_le_bytes(
+        offset_bytes
+            .try_into()
+            .map_err(|_error| Error::InvalidLayout)?,
+    ) as u64;
+    let entry_len = u32::from_le_bytes(
+        len_bytes
+            .try_into()
+            .map_err(|_error| Error::InvalidLayout)?,
+    ) as u64;
+    Ok((entry_offset, entry_len))
 }

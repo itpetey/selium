@@ -9,13 +9,13 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, ReadBuf};
-
-use crate::{channels::ChannelBackpressure, region::ChannelRegion};
 use selium_wire::{
     error::{Error, Result},
     frame::FrameHeader,
 };
+use tokio::io::{AsyncRead, ReadBuf};
+
+use crate::{channels::ChannelBackpressure, region::ChannelRegion};
 
 /// Trait for reader types that can report their ring buffer generation counter.
 ///

@@ -20,10 +20,9 @@ impl FlatMsg for Ping {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
-        Ok(Self(
-            String::from_utf8(bytes.to_vec())
-                .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
-        ))
+        Ok(Self(String::from_utf8(bytes.to_vec()).map_err(
+            |_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge,
+        )?))
     }
 }
 
@@ -33,15 +32,34 @@ impl FlatMsg for Pong {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, flatbuffers::InvalidFlatbuffer> {
-        Ok(Self(
-            String::from_utf8(bytes.to_vec())
-                .map_err(|_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge)?,
-        ))
+        Ok(Self(String::from_utf8(bytes.to_vec()).map_err(
+            |_error| flatbuffers::InvalidFlatbuffer::ApparentSizeTooLarge,
+        )?))
     }
 }
 
+#[test]
+fn framed_write_read_round_trip_over_shm_transport() {
+    install_heap_provider();
+
+    let channel = make_channel(1024);
+    let dummy = make_channel(64);
+
+    let mut writer =
+        FramedWrite::<ShmTransport>::new(ShmTransport::new(&dummy, &channel).expect("writer"));
+    let mut reader =
+        FramedRead::<ShmTransport>::new(ShmTransport::new(&channel, &dummy).expect("reader"));
+
+    writer.write_frame(b"hello", 42).expect("write frame");
+    let (payload, tag) = reader.read_frame().expect("read frame");
+    assert_eq!(payload, b"hello");
+    assert_eq!(tag, 42);
+}
+
 fn install_heap_provider() {
-    drop(selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
+    drop(selium_memory::set_region_provider(Box::new(
+        selium_memory::HeapRegionProvider::new(),
+    )));
 }
 
 fn make_channel(capacity: u64) -> Channel {
@@ -51,6 +69,44 @@ fn make_channel(capacity: u64) -> Channel {
         ResourceKind::SharedMemory,
     )
     .expect("create channel")
+}
+
+#[tokio::test]
+async fn pubsub_round_trip_over_shm_transport() {
+    install_heap_provider();
+
+    let channel = make_channel(1024);
+
+    // Dummy channels: each transport only uses one real direction for this test.
+    let dummy = make_channel(64);
+
+    let mut publisher = selium_wire::Publisher::<Ping, ShmTransport>::new(FramedWrite::new(
+        ShmTransport::new(&dummy, &channel).expect("publisher tx"),
+    ));
+    let mut subscriber = selium_wire::Subscriber::<Ping, ShmTransport>::new(
+        FramedRead::new(ShmTransport::new(&channel, &dummy).expect("subscriber rx")),
+        None,
+    );
+
+    publisher
+        .publish(&Ping("broadcast".to_string()))
+        .expect("publish");
+
+    let (received, _writer_id) = subscriber.read_with_tag().expect("receive");
+    assert_eq!(received, Ping("broadcast".to_string()));
+}
+
+#[test]
+fn rendezvous_passes_region_ids() {
+    use selium_shm::ShmRendezvous;
+    let rendezvous = ShmRendezvous::new();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        rendezvous.send(12345).await.expect("send");
+        let conn = rendezvous.recv().await.expect("recv");
+        assert_eq!(conn.shared_id, 12345);
+    });
 }
 
 #[tokio::test]
@@ -84,66 +140,11 @@ async fn rpc_round_trip_over_shm_transport() {
     });
 
     let mut client = client;
-    let pong = client.request(Ping("hello".to_string())).await.expect("request");
+    let pong = client
+        .request(Ping("hello".to_string()))
+        .await
+        .expect("request");
     assert_eq!(pong, Pong("reply to hello".to_string()));
 
     server_handle.await.expect("server task");
-}
-
-#[tokio::test]
-async fn pubsub_round_trip_over_shm_transport() {
-    install_heap_provider();
-
-    let channel = make_channel(1024);
-
-    // Dummy channels: each transport only uses one real direction for this test.
-    let dummy = make_channel(64);
-
-    let mut publisher = selium_wire::Publisher::<Ping, ShmTransport>::new(
-        FramedWrite::new(ShmTransport::new(&dummy, &channel).expect("publisher tx")),
-    );
-    let mut subscriber = selium_wire::Subscriber::<Ping, ShmTransport>::new(
-        FramedRead::new(ShmTransport::new(&channel, &dummy).expect("subscriber rx")),
-        None,
-    );
-
-    publisher
-        .publish(&Ping("broadcast".to_string()))
-        .expect("publish");
-
-    let (received, _writer_id) = subscriber.read_with_tag().expect("receive");
-    assert_eq!(received, Ping("broadcast".to_string()));
-}
-
-#[test]
-fn framed_write_read_round_trip_over_shm_transport() {
-    install_heap_provider();
-
-    let channel = make_channel(1024);
-    let dummy = make_channel(64);
-
-    let mut writer = FramedWrite::<ShmTransport>::new(
-        ShmTransport::new(&dummy, &channel).expect("writer"),
-    );
-    let mut reader = FramedRead::<ShmTransport>::new(
-        ShmTransport::new(&channel, &dummy).expect("reader"),
-    );
-
-    writer.write_frame(b"hello", 42).expect("write frame");
-    let (payload, tag) = reader.read_frame().expect("read frame");
-    assert_eq!(payload, b"hello");
-    assert_eq!(tag, 42);
-}
-
-#[test]
-fn rendezvous_passes_region_ids() {
-    use selium_shm::ShmRendezvous;
-    let rendezvous = ShmRendezvous::new();
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        rendezvous.send(12345).await.expect("send");
-        let conn = rendezvous.recv().await.expect("recv");
-        assert_eq!(conn.shared_id, 12345);
-    });
 }

@@ -20,6 +20,8 @@ use crate::{
     frame::FrameHeader,
 };
 
+type FramePollResult = Poll<Option<Result<(Vec<u8>, u32)>>>;
+
 /// Codec that decodes/encodes [`FrameHeader`] + payload frames over a raw
 /// byte stream.
 ///
@@ -233,8 +235,6 @@ fn map_transport_error<E: std::error::Error>(err: E) -> Error {
     }
     Error::Transport(err.to_string())
 }
-
-type FramePollResult = Poll<Option<Result<(Vec<u8>, u32)>>>;
 
 /// Polls a `TokioFramedRead` once with a noop waker for synchronous use.
 fn poll_framed_read<M>(framed: &mut TokioFramedRead<M, FrameCodec>) -> FramePollResult

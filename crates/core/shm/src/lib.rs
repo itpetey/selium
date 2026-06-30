@@ -4,23 +4,23 @@
 //! process-local and cross-process shared-memory channels, plus a
 //! [`MessageTransport`] implementation over those channels.
 
+use selium_memory::Region;
+use selium_wire::error::Error;
+
+pub use channels::{Channel, ChannelBackpressure};
+pub use cursor::{Cursor, mask_for_capacity};
+pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
+pub use ring_buf::{RingBuf, round_capacity};
+pub use rpc::{RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
+pub use selium_memory::PAGE_SIZE;
+pub use transport::{ShmRendezvous, ShmTransport};
+
 pub mod channels;
 pub mod cursor;
 pub mod region;
 pub mod ring_buf;
 pub mod rpc;
 pub mod transport;
-
-pub use channels::{Channel, ChannelBackpressure};
-pub use cursor::{Cursor, mask_for_capacity};
-pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
-pub use ring_buf::{RingBuf, round_capacity};
-pub use rpc::{accept, connect, RpcClient, RpcConnection, RpcError, RpcRequest};
-pub use selium_memory::PAGE_SIZE;
-pub use transport::{ShmRendezvous, ShmTransport};
-
-use selium_memory::Region;
-use selium_wire::error::Error;
 
 /// Allocates a shared memory region via the global provider.
 pub(crate) fn allocate_region(
@@ -44,6 +44,14 @@ pub(crate) fn attach_region(
         .map_err(Error::from)
 }
 
+/// Ensures a heap provider is installed when running under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn ensure_heap_provider() {
+    if selium_memory::region_provider().is_err() {
+        install_heap_provider();
+    }
+}
+
 /// Frees a shared memory region via the global provider.
 #[cfg(test)]
 pub(crate) fn free_region(region_id: u64) -> Result<(), Error> {
@@ -55,15 +63,7 @@ pub(crate) fn free_region(region_id: u64) -> Result<(), Error> {
 /// Convenience helper to install the heap provider for tests.
 #[cfg(test)]
 pub(crate) fn install_heap_provider() {
-    drop(selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
+    drop(selium_memory::set_region_provider(Box::new(
+        selium_memory::HeapRegionProvider::new(),
+    )));
 }
-
-/// Ensures a heap provider is installed when running under `cfg(test)`.
-#[cfg(test)]
-pub(crate) fn ensure_heap_provider() {
-    if selium_memory::region_provider().is_err() {
-        install_heap_provider();
-    }
-}
-
-

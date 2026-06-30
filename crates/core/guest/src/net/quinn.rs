@@ -11,10 +11,10 @@ use std::{
 };
 
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, udp::RecvMeta};
-
-use crate::net::udp::UdpSocket;
 use selium_shm::RingBuf;
 use selium_wire::{error::Error, frame::FrameHeader};
+
+use crate::net::udp::UdpSocket;
 
 pub struct QuinnUdpSocket {
     inner: Arc<UdpSocketInner>,
@@ -184,8 +184,7 @@ impl Runtime for SeliumQuinnRuntime {
     }
 
     fn now(&self) -> web_time::Instant {
-        let i = crate::time::Instant::now()
-            .expect("failed to get monotonic time from host");
+        let i = crate::time::Instant::now().expect("failed to get monotonic time from host");
         let d = std::time::Duration::from_nanos(i.as_nanos());
         web_time::Instant::from(d)
     }

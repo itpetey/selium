@@ -3,12 +3,8 @@
 use std::{cell::RefCell, collections::BTreeMap, collections::HashMap, rc::Rc};
 
 use selium_abi::{DiscoveryRequest, DiscoveryResponse, decode_rkyv};
-use selium_guest::{
-    InterfaceMetadata, ResourceTarget, entrypoint, pattern_interface,
-};
-use selium_shm::{
-    Channel, transport::ShmTransport,
-};
+use selium_guest::{InterfaceMetadata, ResourceTarget, entrypoint, pattern_interface};
+use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
@@ -53,7 +49,10 @@ impl DiscoveryStore {
 
     /// Tier-2 registration: validate that `client_process_id` owns
     /// `target.resource_id` before storing the mapping.
-    #[expect(clippy::result_unit_err, reason = "tier2 registration uses unit error for boolean failure")]
+    #[expect(
+        clippy::result_unit_err,
+        reason = "tier2 registration uses unit error for boolean failure"
+    )]
     pub fn register_tier2(
         &mut self,
         client_process_id: u64,
@@ -167,6 +166,19 @@ pub fn interface_metadata() -> InterfaceMetadata {
     discoverycontrol_pattern_metadata()
 }
 
+fn attach_feed_subscriber(
+    feed_region_id: u64,
+) -> selium_guest::Result<Subscriber<Vec<u8>, ShmTransport>> {
+    let channel = Channel::attach(feed_region_id)
+        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
+    let transport = ShmTransport::new(&channel, &channel)
+        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
+    let framed = FramedRead::new(transport);
+    // Disable overwrite detection: the discovery feed is volatile and the guest
+    // reads whatever is currently available, accepting that events may be lost.
+    Ok(Subscriber::new(framed, None))
+}
+
 #[entrypoint]
 async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
     drop(selium_guest::log::init());
@@ -224,17 +236,11 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
     }
 }
 
-fn attach_feed_subscriber(
-    feed_region_id: u64,
-) -> selium_guest::Result<Subscriber<Vec<u8>, ShmTransport>> {
-    let channel = Channel::attach(feed_region_id)
-        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
-    let transport = ShmTransport::new(&channel, &channel)
-        .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
-    let framed = FramedRead::new(transport);
-    // Disable overwrite detection: the discovery feed is volatile and the guest
-    // reads whatever is currently available, accepting that events may be lost.
-    Ok(Subscriber::new(framed, None))
+/// Extracts the process id from a `sel://process/<id>/...` URI, if present.
+fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
+    let rest = uri.strip_prefix(PROCESS_URI_PREFIX)?;
+    let id_str = rest.split('/').next()?;
+    id_str.parse().ok()
 }
 
 async fn feed_loop(
@@ -258,13 +264,6 @@ async fn feed_loop(
             }
         }
     }
-}
-
-/// Extracts the process id from a `sel://process/<id>/...` URI, if present.
-fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
-    let rest = uri.strip_prefix(PROCESS_URI_PREFIX)?;
-    let id_str = rest.split('/').next()?;
-    id_str.parse().ok()
 }
 
 async fn handler(
@@ -521,7 +520,10 @@ mod tests {
     fn apply_tier1_register_event() {
         let mut store = DiscoveryStore::default();
         let t = target("sel://process/42/regions/7", 7);
-        store.apply_tier1_event(DiscoveryRequest::Register { uri: t.uri.clone(), target: t });
+        store.apply_tier1_event(DiscoveryRequest::Register {
+            uri: t.uri.clone(),
+            target: t,
+        });
 
         assert!(store.owns_resource(42, 7));
         assert!(store.resolve_exact("sel://process/42/regions/7").is_some());

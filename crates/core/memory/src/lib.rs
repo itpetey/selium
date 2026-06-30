@@ -17,21 +17,79 @@ use std::{
     any::Any,
     collections::HashMap,
     fmt::Debug,
-    sync::{Arc, OnceLock, atomic::AtomicU64},
     sync::atomic::Ordering,
+    sync::{Arc, OnceLock, atomic::AtomicU64},
 };
 
 use selium_abi::{RegionAllocation, RegionProt, ResourceKind};
 use thiserror::Error;
 
+/// Result type for selium-memory operations.
+pub type Result<T> = std::result::Result<T, MemoryError>;
+
+static GLOBAL_REGION_PROVIDER: OnceLock<Box<dyn RegionProvider>> = OnceLock::new();
+/// WASM page size used for region layout (4 KiB).
+pub const PAGE_SIZE: u64 = 4096;
 /// Magic value for multi-memory shared region layout headers.
 pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
-/// WASM page size used for region layout (4 KiB).
-pub const PAGE_SIZE: u64 = 4096;
+/// Backend abstraction for [`RegionMapping`].
+///
+/// A backend implements the actual read/write/atomic operations for a shared
+/// memory region. This lets the same [`RegionMapping`] API be used by WASM
+/// guests (raw pointer into linear memory), the runtime (delegated kernel
+/// accessor), and native tests (heap allocation).
+pub trait MappingBackend: Send + Sync + Any {
+    /// Returns the size of the mapped region in bytes.
+    fn size(&self) -> u64;
 
-/// Result type for selium-memory operations.
-pub type Result<T> = std::result::Result<T, MemoryError>;
+    /// Reads `len` bytes starting at `offset`.
+    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// Writes `bytes` starting at `offset`.
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()>;
+
+    /// Atomically loads a little-endian `u64` at `offset`.
+    fn atomic_load_u64(&self, offset: u64, ordering: Ordering) -> Result<u64>;
+
+    /// Atomically stores a little-endian `u64` at `offset`.
+    fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()>;
+
+    /// Atomically adds `value` to the little-endian `u64` at `offset`, returning
+    /// the previous value.
+    fn fetch_add_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<u64>;
+
+    /// Atomically compares and exchanges the little-endian `u64` at `offset`.
+    fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64>;
+
+    /// Notifies waiters on an address within this mapping.
+    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32>;
+
+    /// Waits on an address within this mapping.
+    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()>;
+
+    /// Creates a sub-mapping backend covering `size` bytes starting at
+    /// `offset` within this mapping.
+    fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>>;
+
+    /// Returns a debug representation of this backend.
+    fn as_debug(&self) -> &dyn Debug;
+}
+
+/// Abstraction over shared-memory region lifecycle.
+///
+/// Implementations may be backed by host hostcalls (WASM guests), a runtime
+/// region table (native runtime), or a heap allocation map (native tests).
+pub trait RegionProvider: Send + Sync {
+    /// Allocates a shared memory region.
+    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region>;
+
+    /// Attaches an existing shared region.
+    fn attach(&self, region_id: u64, reader_slot: Option<u32>, prot: RegionProt) -> Result<Region>;
+
+    /// Frees a previously allocated region.
+    fn free(&self, region_id: u64) -> Result<()>;
+}
 
 /// Error type for selium-memory operations.
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -50,17 +108,47 @@ pub enum MemoryError {
     Other(String),
 }
 
-impl From<std::io::Error> for MemoryError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Other(err.to_string())
-    }
-}
-
 /// An allocated or attached shared memory region handle.
 #[derive(Clone)]
 pub struct Region {
     allocation: RegionAllocation,
     backend: Arc<dyn MappingBackend>,
+}
+
+/// Default, heap-backed region provider for native tests and in-process use.
+///
+/// Regions are backed by `Arc<Vec<u8>>` and registered in a process-local map
+/// so that [`RegionProvider::attach`] can share the same memory.
+#[derive(Default, Debug)]
+pub struct HeapRegionProvider {
+    counter: AtomicU64,
+    registry: std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+}
+
+/// A raw-pointer backend used by WASM guests and native tests.
+///
+/// The pointer must remain valid for the lifetime of the backend. For heap
+/// allocations, `backing` keeps the allocation alive. For WASM linear memory,
+/// the host guarantees validity.
+#[derive(Debug)]
+pub struct PointerBackend {
+    base: *mut u8,
+    size: u64,
+    /// Heap-allocated backing store (native mode only). `None` for WASM
+    /// mappings whose lifetime is managed by the runtime.
+    backing: Option<Arc<Vec<u8>>>,
+}
+
+/// A direct-memory mapping of a shared region.
+#[derive(Clone)]
+pub struct RegionMapping {
+    inner: Arc<dyn MappingBackend>,
+}
+
+impl From<std::io::Error> for MemoryError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Other(err.to_string())
+    }
 }
 
 impl Region {
@@ -119,31 +207,6 @@ impl Region {
     pub fn mapping(&self) -> RegionMapping {
         RegionMapping::new(self.backend.clone())
     }
-}
-
-/// Abstraction over shared-memory region lifecycle.
-///
-/// Implementations may be backed by host hostcalls (WASM guests), a runtime
-/// region table (native runtime), or a heap allocation map (native tests).
-pub trait RegionProvider: Send + Sync {
-    /// Allocates a shared memory region.
-    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region>;
-
-    /// Attaches an existing shared region.
-    fn attach(&self, region_id: u64, reader_slot: Option<u32>, prot: RegionProt) -> Result<Region>;
-
-    /// Frees a previously allocated region.
-    fn free(&self, region_id: u64) -> Result<()>;
-}
-
-/// Default, heap-backed region provider for native tests and in-process use.
-///
-/// Regions are backed by `Arc<Vec<u8>>` and registered in a process-local map
-/// so that [`RegionProvider::attach`] can share the same memory.
-#[derive(Default, Debug)]
-pub struct HeapRegionProvider {
-    counter: AtomicU64,
-    registry: std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
 }
 
 impl HeapRegionProvider {
@@ -208,97 +271,6 @@ impl RegionProvider for HeapRegionProvider {
     }
 }
 
-/// Installs a global region provider.
-///
-/// This should be called once per process, typically during guest or runtime
-/// initialization. Subsequent calls return an error.
-pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
-    GLOBAL_REGION_PROVIDER
-        .set(provider)
-        .map_err(|_error| MemoryError::Other("region provider already installed".to_string()))
-}
-
-/// Returns the currently installed global region provider.
-///
-/// Returns an error if no provider has been installed.
-pub fn region_provider() -> Result<&'static dyn RegionProvider> {
-    GLOBAL_REGION_PROVIDER
-        .get()
-        .map(|p| p.as_ref())
-        .ok_or(MemoryError::ProviderNotSet)
-}
-
-static GLOBAL_REGION_PROVIDER: OnceLock<Box<dyn RegionProvider>> = OnceLock::new();
-
-/// Backend abstraction for [`RegionMapping`].
-///
-/// A backend implements the actual read/write/atomic operations for a shared
-/// memory region. This lets the same [`RegionMapping`] API be used by WASM
-/// guests (raw pointer into linear memory), the runtime (delegated kernel
-/// accessor), and native tests (heap allocation).
-pub trait MappingBackend: Send + Sync + Any {
-    /// Returns the size of the mapped region in bytes.
-    fn size(&self) -> u64;
-
-    /// Reads `len` bytes starting at `offset`.
-    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
-
-    /// Writes `bytes` starting at `offset`.
-    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()>;
-
-    /// Atomically loads a little-endian `u64` at `offset`.
-    fn atomic_load_u64(&self, offset: u64, ordering: Ordering) -> Result<u64>;
-
-    /// Atomically stores a little-endian `u64` at `offset`.
-    fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()>;
-
-    /// Atomically adds `value` to the little-endian `u64` at `offset`, returning
-    /// the previous value.
-    fn fetch_add_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<u64>;
-
-    /// Atomically compares and exchanges the little-endian `u64` at `offset`.
-    fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64>;
-
-    /// Notifies waiters on an address within this mapping.
-    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32>;
-
-    /// Waits on an address within this mapping.
-    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()>;
-
-    /// Creates a sub-mapping backend covering `size` bytes starting at
-    /// `offset` within this mapping.
-    fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>>;
-
-    /// Returns a debug representation of this backend.
-    fn as_debug(&self) -> &dyn Debug;
-}
-
-/// A raw-pointer backend used by WASM guests and native tests.
-///
-/// The pointer must remain valid for the lifetime of the backend. For heap
-/// allocations, `backing` keeps the allocation alive. For WASM linear memory,
-/// the host guarantees validity.
-#[derive(Debug)]
-pub struct PointerBackend {
-    base: *mut u8,
-    size: u64,
-    /// Heap-allocated backing store (native mode only). `None` for WASM
-    /// mappings whose lifetime is managed by the runtime.
-    backing: Option<Arc<Vec<u8>>>,
-}
-
-// SAFETY: The fd and ptr are process-wide resources. The fd is a plain integer
-// and the ptr points to a shared mapping that the kernel serialises. All
-// mutation of attachment_count is atomic.
-unsafe impl Send for PointerBackend {}
-// SAFETY: `PointerBackend` accesses shared memory through a raw pointer, and
-// all mutation of the underlying data is serialised by the kernel or by atomic
-// operations. Immutable references to `PointerBackend` can safely share access
-// to the mapped memory because all read/write paths either use atomic operations
-// or go through the `MappingBackend` trait methods which perform internal
-// synchronisation.
-unsafe impl Sync for PointerBackend {}
-
 impl PointerBackend {
     /// Creates a backend backed by a heap allocation.
     pub fn allocate(size: u64) -> Result<Self> {
@@ -342,7 +314,9 @@ impl MappingBackend for PointerBackend {
     }
 
     fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let end = offset.checked_add(len).ok_or(MemoryError::CapacityExceeded)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(MemoryError::CapacityExceeded)?;
         if end > self.size {
             return Err(MemoryError::IndexOutOfBounds);
         }
@@ -432,7 +406,11 @@ impl MappingBackend for PointerBackend {
     }
 
     fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>> {
-        if offset.checked_add(size).ok_or(MemoryError::CapacityExceeded)? > self.size {
+        if offset
+            .checked_add(size)
+            .ok_or(MemoryError::CapacityExceeded)?
+            > self.size
+        {
             return Err(MemoryError::IndexOutOfBounds);
         }
         // SAFETY: bounds checked above.
@@ -450,20 +428,18 @@ impl MappingBackend for PointerBackend {
     }
 }
 
-/// A direct-memory mapping of a shared region.
-#[derive(Clone)]
-pub struct RegionMapping {
-    inner: Arc<dyn MappingBackend>,
-}
+// SAFETY: The fd and ptr are process-wide resources. The fd is a plain integer
+// and the ptr points to a shared mapping that the kernel serialises. All
+// mutation of attachment_count is atomic.
+unsafe impl Send for PointerBackend {}
 
-impl std::fmt::Debug for RegionMapping {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegionMapping")
-            .field("size", &self.inner.size())
-            .field("backend", &self.inner.as_debug())
-            .finish()
-    }
-}
+// SAFETY: `PointerBackend` accesses shared memory through a raw pointer, and
+// all mutation of the underlying data is serialised by the kernel or by atomic
+// operations. Immutable references to `PointerBackend` can safely share access
+// to the mapped memory because all read/write paths either use atomic operations
+// or go through the `MappingBackend` trait methods which perform internal
+// synchronisation.
+unsafe impl Sync for PointerBackend {}
 
 impl RegionMapping {
     /// Creates a mapping wrapping the given backend.
@@ -530,10 +506,7 @@ impl RegionMapping {
     /// Reads a single byte at the given offset.
     pub fn read_u8(&self, offset: u64) -> Result<u8> {
         let bytes = self.read(offset, 1)?;
-        bytes
-            .first()
-            .copied()
-            .ok_or(MemoryError::InvalidLayout)
+        bytes.first().copied().ok_or(MemoryError::InvalidLayout)
     }
 
     /// Writes a single byte at the given offset.
@@ -547,12 +520,7 @@ impl RegionMapping {
     }
 
     /// Atomically stores a `u64` at the given offset.
-    pub fn atomic_store_u64(
-        &self,
-        offset: u64,
-        value: u64,
-        ordering: Ordering,
-    ) -> Result<()> {
+    pub fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()> {
         self.inner.atomic_store_u64(offset, value, ordering)
     }
 
@@ -576,6 +544,35 @@ impl RegionMapping {
     pub fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
         self.inner.atomic_wait32(offset, expected, timeout_ms)
     }
+}
+
+impl std::fmt::Debug for RegionMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegionMapping")
+            .field("size", &self.inner.size())
+            .field("backend", &self.inner.as_debug())
+            .finish()
+    }
+}
+
+/// Returns the currently installed global region provider.
+///
+/// Returns an error if no provider has been installed.
+pub fn region_provider() -> Result<&'static dyn RegionProvider> {
+    GLOBAL_REGION_PROVIDER
+        .get()
+        .map(|p| p.as_ref())
+        .ok_or(MemoryError::ProviderNotSet)
+}
+
+/// Installs a global region provider.
+///
+/// This should be called once per process, typically during guest or runtime
+/// initialization. Subsequent calls return an error.
+pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
+    GLOBAL_REGION_PROVIDER
+        .set(provider)
+        .map_err(|_error| MemoryError::Other("region provider already installed".to_string()))
 }
 
 #[cfg(test)]
@@ -611,12 +608,16 @@ mod tests {
         let mapping = original.mapping();
         mapping.write(0, b"shared!").expect("write");
 
-        let attached = provider.attach(region_id, None, RegionProt::ReadWrite).expect("attach");
+        let attached = provider
+            .attach(region_id, None, RegionProt::ReadWrite)
+            .expect("attach");
         let attached_mapping = attached.mapping();
         let data = attached_mapping.read(0, 7).expect("read");
         assert_eq!(data, b"shared!");
 
-        attached_mapping.write(8, b"hello").expect("write via attach");
+        attached_mapping
+            .write(8, b"hello")
+            .expect("write via attach");
         let data = mapping.read(8, 5).expect("read original");
         assert_eq!(data, b"hello");
 

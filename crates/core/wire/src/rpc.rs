@@ -10,15 +10,6 @@ use crate::{
     framed::{FramedRead, FramedWrite},
 };
 
-/// Information about an incoming connection delivered by a [`Rendezvous`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IncomingConnection {
-    /// Process id of the connecting peer.
-    pub client_process_id: u64,
-    /// Connection identifier passed through the rendezvous (e.g. shared region id).
-    pub shared_id: u64,
-}
-
 /// Abstraction over the mechanism used to pass connection identifiers from
 /// client to server.
 pub trait Rendezvous: Send + Sync {
@@ -37,6 +28,15 @@ pub trait Rendezvous: Send + Sync {
     fn recv(&self) -> impl std::future::Future<Output = Result<IncomingConnection>> + Send;
 }
 
+/// Information about an incoming connection delivered by a [`Rendezvous`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncomingConnection {
+    /// Process id of the connecting peer.
+    pub client_process_id: u64,
+    /// Connection identifier passed through the rendezvous (e.g. shared region id).
+    pub shared_id: u64,
+}
+
 /// Error type for RPC operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
@@ -52,6 +52,30 @@ pub enum RpcError {
     BufferEmpty,
     /// Encoding or decoding failed.
     Serialization(String),
+}
+
+/// Client-side handle for making typed RPC requests over a [`MessageTransport`].
+pub struct RpcClient<Req, Rep, M> {
+    request_writer: FramedWrite<M>,
+    reply_reader: FramedRead<M>,
+    next_correlation: u32,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// Server-side handle for an established RPC session.
+pub struct RpcConnection<Req, Rep, M> {
+    request_reader: FramedRead<M>,
+    reply_writer: FramedWrite<M>,
+    client_process_id: u64,
+    _phantom: PhantomData<(Req, Rep)>,
+}
+
+/// A single request received by the server, with the ability to reply.
+pub struct RpcRequest<'a, Req, Rep, M> {
+    reply_writer: &'a mut FramedWrite<M>,
+    payload_bytes: Vec<u8>,
+    correlation: u32,
+    _phantom: PhantomData<(Req, Rep)>,
 }
 
 impl fmt::Display for RpcError {
@@ -82,30 +106,6 @@ impl From<Error> for RpcError {
             other => Self::Serialization(other.to_string()),
         }
     }
-}
-
-/// Client-side handle for making typed RPC requests over a [`MessageTransport`].
-pub struct RpcClient<Req, Rep, M> {
-    request_writer: FramedWrite<M>,
-    reply_reader: FramedRead<M>,
-    next_correlation: u32,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
-/// Server-side handle for an established RPC session.
-pub struct RpcConnection<Req, Rep, M> {
-    request_reader: FramedRead<M>,
-    reply_writer: FramedWrite<M>,
-    client_process_id: u64,
-    _phantom: PhantomData<(Req, Rep)>,
-}
-
-/// A single request received by the server, with the ability to reply.
-pub struct RpcRequest<'a, Req, Rep, M> {
-    reply_writer: &'a mut FramedWrite<M>,
-    payload_bytes: Vec<u8>,
-    correlation: u32,
-    _phantom: PhantomData<(Req, Rep)>,
 }
 
 impl<Req, Rep, M> RpcClient<Req, Rep, M>
@@ -183,10 +183,12 @@ where
     }
 
     /// Receives the next request from the client.
-    pub async fn recv(
-        &mut self,
-    ) -> std::result::Result<RpcRequest<'_, Req, Rep, M>, RpcError> {
-        let mut last_generation = self.request_reader.generation().unwrap_or(0).wrapping_sub(1);
+    pub async fn recv(&mut self) -> std::result::Result<RpcRequest<'_, Req, Rep, M>, RpcError> {
+        let mut last_generation = self
+            .request_reader
+            .generation()
+            .unwrap_or(0)
+            .wrapping_sub(1);
 
         loop {
             let current_generation = self.request_reader.generation().unwrap_or(0);

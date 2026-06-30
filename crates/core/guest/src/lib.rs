@@ -1,5 +1,7 @@
 //! Selium guest SDK.
 
+use crate::hostcall_region_provider::HostcallRegionProvider;
+
 #[cfg(feature = "quinn")]
 pub use crate::net::quinn::{QuinnUdpSocket, SeliumQuinnRuntime};
 pub use crate::{
@@ -21,24 +23,22 @@ pub use selium_abi::{
     InterfaceMetadata, LocalityScope, RegionProt, ResourceClass, ResourceIdentity,
     ResourceSelector, ResourceTarget, ScopeContext,
 };
-pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
-pub use tracing::{debug, error, info, trace, warn};
-
-// Re-export transport-agnostic memory primitives.
-pub use selium_memory::{RegionMapping, PAGE_SIZE, SHARED_REGION_MAGIC};
-
 // Re-export encoding types.
 pub use selium_encoding::{
     FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor,
     codec::{decode_typed, encode_typed},
     log::{LogField, LogLevel, LogRecord, LogSpan},
 };
+pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
+// Re-export transport-agnostic memory primitives.
+pub use selium_memory::{PAGE_SIZE, RegionMapping, SHARED_REGION_MAGIC};
+pub use tracing::{debug, error, info, trace, warn};
 
 mod async_runtime;
 mod context;
 mod error;
-mod hostcall_region_provider;
 mod hostcall;
+mod hostcall_region_provider;
 pub mod log;
 mod net;
 mod platform;
@@ -46,8 +46,6 @@ mod process;
 mod resource;
 mod storage;
 pub mod time;
-
-use crate::hostcall_region_provider::HostcallRegionProvider;
 
 /// Installs the hostcall-backed region provider and registers the mailbox
 /// reactor so the guest can allocate and share memory regions.

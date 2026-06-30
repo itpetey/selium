@@ -18,6 +18,9 @@ use crate::{
     channels::{BlockingWriter, Reader},
 };
 
+/// Type alias matching the OpenSpec task name.
+pub type ShmRendezvous = MemoryRendezvous;
+
 /// A duplex shared-memory transport wrapping a read channel and a write channel.
 ///
 /// The `reader` channel is the direction from which this transport receives
@@ -28,6 +31,12 @@ pub struct ShmTransport {
     reader: Reader,
     writer: BlockingWriter,
     last_generation: u64,
+}
+
+/// In-memory rendezvous for tests, passing region ids between client and server.
+#[derive(Clone)]
+pub struct MemoryRendezvous {
+    inner: Arc<Mutex<VecDeque<u64>>>,
 }
 
 impl ShmTransport {
@@ -91,10 +100,7 @@ impl AsyncWrite for ShmTransport {
         Pin::new(&mut self.writer).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
@@ -102,10 +108,7 @@ impl AsyncWrite for ShmTransport {
 impl MessageTransport for ShmTransport {
     type Error = std::io::Error;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<bool>> {
+    fn poll_ready(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
         match self.reader.generation() {
             Ok(generation) => {
                 let ready = generation != self.last_generation;
@@ -118,10 +121,7 @@ impl MessageTransport for ShmTransport {
         }
     }
 
-    fn poll_peer_closed(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<bool>> {
+    fn poll_peer_closed(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
         match self.reader.region().load_writer_count() {
             Ok(0) => Poll::Ready(Ok(true)),
             Ok(_) => Poll::Ready(Ok(false)),
@@ -134,12 +134,6 @@ impl MessageTransport for ShmTransport {
     }
 }
 
-/// In-memory rendezvous for tests, passing region ids between client and server.
-#[derive(Clone)]
-pub struct MemoryRendezvous {
-    inner: Arc<Mutex<VecDeque<u64>>>,
-}
-
 impl MemoryRendezvous {
     /// Creates a new empty in-memory rendezvous queue.
     pub fn new() -> Self {
@@ -149,22 +143,22 @@ impl MemoryRendezvous {
     }
 }
 
-impl Default for MemoryRendezvous {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl selium_wire::Rendezvous for MemoryRendezvous {
     fn send(&self, shared_id: u64) -> impl std::future::Future<Output = Result<()>> + Send {
         let inner = self.inner.clone();
         async move {
-            inner.lock().map_err(|_e| Error::ChannelClosed)?.push_back(shared_id);
+            inner
+                .lock()
+                .map_err(|_e| Error::ChannelClosed)?
+                .push_back(shared_id);
             Ok(())
         }
     }
 
-    fn recv(&self) -> impl std::future::Future<Output = Result<selium_wire::rpc::IncomingConnection>> + Send {
+    fn recv(
+        &self,
+    ) -> impl std::future::Future<Output = Result<selium_wire::rpc::IncomingConnection>> + Send
+    {
         let inner = self.inner.clone();
         async move {
             let shared_id = inner
@@ -180,8 +174,11 @@ impl selium_wire::Rendezvous for MemoryRendezvous {
     }
 }
 
-/// Type alias matching the OpenSpec task name.
-pub type ShmRendezvous = MemoryRendezvous;
+impl Default for MemoryRendezvous {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {

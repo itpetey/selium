@@ -8,17 +8,17 @@ use std::{
 };
 
 use selium_abi::{HostcallOutput, HostcallRequest};
+use selium_memory::RegionMapping;
+use selium_shm::{
+    ChannelRegion, PAGE_SIZE, RingBuf,
+    channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     GuestError, Result,
     hostcall::hostcall_async,
     resource::{Accept, IncomingConnection, ResourceListener},
-};
-use selium_memory::RegionMapping;
-use selium_shm::{
-    ChannelRegion, PAGE_SIZE, RingBuf,
-    channels::{BlockingReader, BlockingWriter, ChannelBackpressure},
 };
 
 const HEADER_COUNT_OFFSET: u64 = 16;

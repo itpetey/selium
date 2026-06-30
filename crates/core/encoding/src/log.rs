@@ -76,18 +76,6 @@ impl From<tracing::Level> for LogLevel {
     }
 }
 
-impl From<LogLevel> for tracing::Level {
-    fn from(level: LogLevel) -> Self {
-        match level {
-            LogLevel::Trace => tracing::Level::TRACE,
-            LogLevel::Debug => tracing::Level::DEBUG,
-            LogLevel::Info => tracing::Level::INFO,
-            LogLevel::Warn => tracing::Level::WARN,
-            LogLevel::Error => tracing::Level::ERROR,
-        }
-    }
-}
-
 impl FlatMsg for LogRecord {
     fn encode(value: &Self) -> Vec<u8> {
         let mut fbb = FlatBufferBuilder::new();
@@ -196,6 +184,18 @@ impl HasSchema for LogRecord {
             0x00, 0x00,
         ],
     };
+}
+
+impl From<LogLevel> for tracing::Level {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => tracing::Level::TRACE,
+            LogLevel::Debug => tracing::Level::DEBUG,
+            LogLevel::Info => tracing::Level::INFO,
+            LogLevel::Warn => tracing::Level::WARN,
+            LogLevel::Error => tracing::Level::ERROR,
+        }
+    }
 }
 
 fn encode_field<'a>(fbb: &mut FlatBufferBuilder<'a>, field: &LogField) -> WIPOffset<Field<'a>> {

@@ -5,7 +5,6 @@
 //! and published to a Drop-backpressure channel.
 
 pub use selium_encoding::log::{LogField, LogLevel, LogRecord, LogSpan};
-
 #[cfg(feature = "logging")]
 pub use subscriber::{channel, init, init_with_capacity};
 

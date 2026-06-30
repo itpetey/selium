@@ -18,81 +18,6 @@ use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDesc
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
-fn ensure_heap_provider() {
-    if selium_memory::region_provider().is_err() {
-        drop(
-            selium_memory::set_region_provider(Box::new(selium_memory::HeapRegionProvider::new())));
-    }
-}
-
-/// Creates a runtime with the discovery pub/sub feed enabled and returns a
-/// subscriber attached to the feed ring. The runtime installs its own
-/// kernel-backed region provider, so this helper does not install the heap
-/// provider first.
-fn runtime_with_discovery_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>) {
-    let runtime = Runtime::default();
-    let report = runtime
-        .bootstrap_system_guests(RuntimeConfig {
-            start_discovery: true,
-            system_guests: vec![],
-        })
-        .expect("bootstrap discovery");
-    assert!(report.guests.is_empty());
-
-    let feed_region_id = runtime
-        .discovery_feed_region_id()
-        .expect("discovery feed region id");
-    let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
-    let capacity = channel.ring().capacity();
-    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
-    let subscriber = Subscriber::new(FramedRead::new(transport), Some(capacity));
-    (runtime, subscriber)
-}
-
-/// Drains all currently available Register events from the discovery feed and
-/// returns the set of URI strings they contain.
-fn drain_register_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
-) -> std::collections::HashSet<String> {
-    let mut uris = std::collections::HashSet::new();
-    loop {
-        match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
-                if let DiscoveryRequest::Register { uri, .. } = request {
-                    uris.insert(uri);
-                }
-            }
-            Err(selium_wire::error::Error::BufferEmpty) => break,
-            Err(error) => panic!("feed read failed: {error}"),
-        }
-    }
-    uris
-}
-
-/// Drains all currently available Revoke events from the discovery feed and
-/// returns the set of URI strings they contain.
-fn drain_revoke_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
-) -> std::collections::HashSet<String> {
-    let mut uris = std::collections::HashSet::new();
-    loop {
-        match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
-                if let DiscoveryRequest::Revoke { uri } = request {
-                    uris.insert(uri);
-                }
-            }
-            Err(selium_wire::error::Error::BufferEmpty) => break,
-            Err(error) => panic!("feed read failed: {error}"),
-        }
-    }
-    uris
-}
-
 fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind) -> u64 {
     let (status, op_id) = runtime.begin_hostcall(
         process_id,
@@ -184,6 +109,50 @@ fn deprecated_guest_log_write_still_functions() {
     assert_eq!(entries[0].message, "legacy log entry");
 }
 
+/// Drains all currently available Register events from the discovery feed and
+/// returns the set of URI strings they contain.
+fn drain_register_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Register { uri, .. } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
+
+/// Drains all currently available Revoke events from the discovery feed and
+/// returns the set of URI strings they contain.
+fn drain_revoke_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Revoke { uri } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
+
 #[test]
 fn drop_backpressure_channel_writer_never_blocks() {
     ensure_heap_provider();
@@ -206,6 +175,14 @@ fn drop_backpressure_channel_writer_never_blocks() {
     let _br = channel
         .blocking_reader()
         .expect("blocking reader on Drop channel");
+}
+
+fn ensure_heap_provider() {
+    if selium_memory::region_provider().is_err() {
+        drop(selium_memory::set_region_provider(Box::new(
+            selium_memory::HeapRegionProvider::new(),
+        )));
+    }
 }
 
 #[test]
@@ -287,6 +264,30 @@ fn process_termination_publishes_discovery_revoke_events() {
     for uri in &registered {
         assert!(revoked.contains(uri), "expected revocation for {uri}");
     }
+}
+
+/// Creates a runtime with the discovery pub/sub feed enabled and returns a
+/// subscriber attached to the feed ring. The runtime installs its own
+/// kernel-backed region provider, so this helper does not install the heap
+/// provider first.
+fn runtime_with_discovery_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>) {
+    let runtime = Runtime::default();
+    let report = runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: true,
+            system_guests: vec![],
+        })
+        .expect("bootstrap discovery");
+    assert!(report.guests.is_empty());
+
+    let feed_region_id = runtime
+        .discovery_feed_region_id()
+        .expect("discovery feed region id");
+    let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
+    let capacity = channel.ring().capacity();
+    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
+    let subscriber = Subscriber::new(FramedRead::new(transport), Some(capacity));
+    (runtime, subscriber)
 }
 
 fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {

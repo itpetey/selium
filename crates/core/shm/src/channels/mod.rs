@@ -1,7 +1,7 @@
 use selium_abi::ResourceKind;
+use selium_wire::error::Result;
 
 use crate::ring_buf::{RingBuf, round_capacity};
-use selium_wire::error::Result;
 
 pub use self::{
     reader::{BlockingReader, HasGeneration, Reader},

@@ -1,7 +1,6 @@
 use crate::async_runtime::wake_task;
 
 static mut MAILBOX: [u32; MAILBOX_WORDS] = [0; MAILBOX_WORDS];
-
 const MAILBOX_WORDS: usize = selium_abi::mailbox::BYTE_LEN / 4;
 
 #[cfg(target_arch = "wasm32")]
@@ -24,27 +23,6 @@ unsafe extern "C" {
     #[link_name = "mailbox_register"]
     fn selium_mailbox_register(mailbox_ptr: *mut u8, mailbox_len: usize);
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_process_id() -> u64 {
-    0
-}
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_mark_ready() {}
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_create(_: *const u8, _: usize) -> u64 {
-    0
-}
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_poll(_: u64, _: *mut u8, _: usize) -> u64 {
-    0
-}
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) unsafe fn selium_hostcall_drop(_: u64) -> u32 {
-    0
-}
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_mailbox_register(_: *mut u8, _: usize) {}
 
 /// Marks the current guest as ready for runtime readiness checks.
 pub fn mark_ready() {
@@ -118,6 +96,21 @@ pub(crate) fn register_mailbox() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_create(_: *const u8, _: usize) -> u64 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_drop(_: u64) -> u32 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) unsafe fn selium_hostcall_poll(_: u64, _: *mut u8, _: usize) -> u64 {
+    0
+}
+
 fn mailbox_base() -> *mut u8 {
     core::ptr::addr_of_mut!(MAILBOX).cast::<u8>()
 }
@@ -129,4 +122,15 @@ unsafe fn mailbox_cell(offset: usize) -> *mut core::sync::atomic::AtomicU32 {
             .add(offset)
             .cast::<core::sync::atomic::AtomicU32>()
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_mailbox_register(_: *mut u8, _: usize) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_mark_ready() {}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn selium_process_id() -> u64 {
+    0
 }

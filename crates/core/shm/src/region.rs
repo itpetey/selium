@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use selium_abi::{RegionProt, ResourceKind};
-
-use selium_memory::{Region, RegionMapping, PAGE_SIZE};
-
+use selium_memory::{PAGE_SIZE, Region, RegionMapping};
 use selium_wire::error::{Error, Result};
 
 /// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
@@ -184,7 +184,10 @@ impl ChannelRegion {
         let new_gen =
             self.mapping
                 .fetch_add_u64(GENERATION_COUNTER_OFFSET, 1, Ordering::Release)?;
-        drop(self.mapping.atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX));
+        drop(
+            self.mapping
+                .atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX),
+        );
         Ok(new_gen + 1)
     }
 
@@ -484,7 +487,9 @@ impl ChannelRegion {
     ///
     /// Returns 0 for Park, 1 for Drop. Any unrecognised value defaults to Park.
     pub fn load_backpressure(&self) -> Result<u8> {
-        self.mapping.read_u8(BACKPRESSURE_OFFSET).map_err(Error::from)
+        self.mapping
+            .read_u8(BACKPRESSURE_OFFSET)
+            .map_err(Error::from)
     }
 
     /// Stores the shared backpressure strategy into the channel header.
@@ -553,17 +558,17 @@ fn aligned_region_size(capacity: u64) -> Result<u64> {
         .max(MIN_REGION_BYTES))
 }
 
-/// Computes the number of WASM pages needed to hold `bytes`.
-fn pages_for_bytes(bytes: u64) -> u32 {
-    bytes.div_ceil(PAGE_SIZE) as u32
-}
-
 fn encode_reader_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
 }
 
 fn encode_writer_position(position: u64) -> Result<u64> {
     position.checked_add(1).ok_or(Error::CapacityExceeded)
+}
+
+/// Computes the number of WASM pages needed to hold `bytes`.
+fn pages_for_bytes(bytes: u64) -> u32 {
+    bytes.div_ceil(PAGE_SIZE) as u32
 }
 
 fn reserve_tail_next(

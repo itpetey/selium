@@ -9,11 +9,11 @@ use std::{
 
 use futures::{Sink, Stream};
 use selium_abi::{HostcallOutput, HostcallRequest};
-
-use crate::{GuestError, Result, hostcall::hostcall_async};
 use selium_memory::RegionMapping;
 use selium_shm::{ChannelRegion, PAGE_SIZE, RingBuf};
 use selium_wire::frame::FrameHeader;
+
+use crate::{GuestError, Result, hostcall::hostcall_async};
 
 const HEADER_COUNT_OFFSET: u64 = 16;
 const HEADER_ENTRY_OFFSET: u64 = 24;

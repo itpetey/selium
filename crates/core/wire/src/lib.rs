@@ -14,12 +14,11 @@
 //! - [`Rendezvous`]: connection-establishment abstraction.
 //! - [`LiveTable`]: a materialised table projected from a pub/sub stream.
 
-pub mod error;
-pub mod frame;
-pub mod framed;
-pub mod pubsub;
-pub mod rpc;
-pub mod tables;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub use error::{Error, Result};
 pub use frame::FrameHeader;
@@ -28,11 +27,12 @@ pub use pubsub::{Publisher, Subscriber};
 pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcRequest};
 pub use tables::LiveTable;
 
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+pub mod error;
+pub mod frame;
+pub mod framed;
+pub mod pubsub;
+pub mod rpc;
+pub mod tables;
 
 /// A duplex framed I/O transport.
 ///

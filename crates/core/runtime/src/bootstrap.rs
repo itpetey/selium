@@ -38,8 +38,7 @@ impl Runtime {
             for descriptor in &mut config.system_guests {
                 if descriptor.name == "discovery" {
                     descriptor.set_discovery_feed_and_handle(
-                        discovery_feed_region_id
-                            .expect("discovery feed region id must be present"),
+                        discovery_feed_region_id.expect("discovery feed region id must be present"),
                         listener_shared_id,
                     );
                 } else if descriptor.arguments.is_empty() {
@@ -115,11 +114,16 @@ impl Runtime {
             ChannelBackpressure::Drop,
             selium_abi::ResourceKind::PubSubTopic,
         )
-        .map_err(|error| Error::Host(format!("failed to create discovery feed channel: {error}")))?;
+        .map_err(|error| {
+            Error::Host(format!("failed to create discovery feed channel: {error}"))
+        })?;
         let feed_region_id = feed_channel.region_id();
 
-        let transport = ShmTransport::new(&feed_channel, &feed_channel)
-            .map_err(|error| Error::Host(format!("failed to create discovery feed transport: {error}")))?;
+        let transport = ShmTransport::new(&feed_channel, &feed_channel).map_err(|error| {
+            Error::Host(format!(
+                "failed to create discovery feed transport: {error}"
+            ))
+        })?;
         let publisher: DiscoveryPublisher = Publisher::new(FramedWrite::new(transport));
         *self.discovery_publisher.lock() = Some(publisher);
 

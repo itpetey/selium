@@ -4,13 +4,13 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::AsyncWrite;
-
-use crate::{channels::ChannelBackpressure, region::ChannelRegion};
 use selium_wire::{
     error::{Error, Result},
     frame::FrameHeader,
 };
+use tokio::io::AsyncWrite;
+
+use crate::{channels::ChannelBackpressure, region::ChannelRegion};
 
 /// Non-blocking byte-stream writer not tracked in channel metadata; may be starved
 /// by other writers. Implements [`AsyncWrite`].

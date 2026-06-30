@@ -6,6 +6,22 @@
 
 use selium_abi::{ProcessId, ResourceKind};
 
+/// Generates the URIs to register for a given allocation.
+///
+/// Always returns `sel://process/<process_id>/regions/<region_id>`.
+/// If the purpose maps to a known alias, also returns
+/// `sel://process/<process_id>/<alias>`.
+pub fn registration_uris(
+    process_id: ProcessId,
+    region_id: u64,
+    purpose: ResourceKind,
+) -> Vec<String> {
+    vec![
+        format!("sel://process/{process_id}/regions/{region_id}"),
+        format!("sel://process/{process_id}/{}", purpose_alias(purpose)),
+    ]
+}
+
 /// Returns the purpose-specific URI alias suffix for a `ResourceKind`, if any.
 ///
 /// Initially:
@@ -25,22 +41,6 @@ fn purpose_alias(purpose: ResourceKind) -> &'static str {
         ResourceKind::BlobStore => "blobs",
         ResourceKind::SharedMemory => "shm",
     }
-}
-
-/// Generates the URIs to register for a given allocation.
-///
-/// Always returns `sel://process/<process_id>/regions/<region_id>`.
-/// If the purpose maps to a known alias, also returns
-/// `sel://process/<process_id>/<alias>`.
-pub fn registration_uris(
-    process_id: ProcessId,
-    region_id: u64,
-    purpose: ResourceKind,
-) -> Vec<String> {
-    vec![
-        format!("sel://process/{process_id}/regions/{region_id}"),
-        format!("sel://process/{process_id}/{}", purpose_alias(purpose)),
-    ]
 }
 
 #[cfg(test)]

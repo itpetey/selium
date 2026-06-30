@@ -161,8 +161,9 @@ impl Runtime {
             let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
             for uri in uris {
                 let request = DiscoveryRequest::Revoke { uri };
-                let bytes = encode_rkyv(&request)
-                    .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
+                let bytes = encode_rkyv(&request).map_err(|error| {
+                    crate::Error::Host(format!("discovery encode failed: {error}"))
+                })?;
                 self.publish_discovery_event(bytes)?;
             }
         }

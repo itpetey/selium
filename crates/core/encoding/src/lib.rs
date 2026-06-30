@@ -4,6 +4,7 @@
 //! between idiomatic Rust types and Flatbuffers payloads.
 
 use flatbuffers::{FlatBufferBuilder, InvalidFlatbuffer};
+use selium_guest_macros::schema;
 use thiserror::Error;
 
 pub mod codec;
@@ -12,33 +13,8 @@ pub mod codec;
 pub mod fbs;
 pub mod log;
 
-use selium_guest_macros::schema;
-
 // Allow generated schema bindings to refer to this crate by name.
 extern crate self as selium_encoding;
-
-/// Error type for encoding/framing operations.
-#[derive(Debug, Error)]
-pub enum EncodingError {
-    /// ABI framing error.
-    #[error("framing error: {0:?}")]
-    Framing(selium_abi::AbiError),
-    /// Flatbuffers decode error.
-    #[error("flatbuffer decode error: {0}")]
-    Decode(flatbuffers::InvalidFlatbuffer),
-}
-
-impl From<selium_abi::AbiError> for EncodingError {
-    fn from(error: selium_abi::AbiError) -> Self {
-        Self::Framing(error)
-    }
-}
-
-impl From<flatbuffers::InvalidFlatbuffer> for EncodingError {
-    fn from(error: flatbuffers::InvalidFlatbuffer) -> Self {
-        Self::Decode(error)
-    }
-}
 
 /// Helper for encoding schema fields into Flatbuffers-ready values.
 pub trait FieldEncoder {
@@ -70,6 +46,17 @@ pub trait HasSchema {
 pub trait StringFieldValue {
     /// Convert the accessor into an owned `String`.
     fn into_owned(self) -> String;
+}
+
+/// Error type for encoding/framing operations.
+#[derive(Debug, Error)]
+pub enum EncodingError {
+    /// ABI framing error.
+    #[error("framing error: {0:?}")]
+    Framing(selium_abi::AbiError),
+    /// Flatbuffers decode error.
+    #[error("flatbuffer decode error: {0}")]
+    Decode(flatbuffers::InvalidFlatbuffer),
 }
 
 /// Static descriptor describing the schema carried by an endpoint.
@@ -143,6 +130,18 @@ pub struct DiscoveryResponseWire {
     pub variant: u8,
     /// The discovered resource (used by Found variant).
     pub target: Option<ResourceTargetWire>,
+}
+
+impl From<selium_abi::AbiError> for EncodingError {
+    fn from(error: selium_abi::AbiError) -> Self {
+        Self::Framing(error)
+    }
+}
+
+impl From<flatbuffers::InvalidFlatbuffer> for EncodingError {
+    fn from(error: flatbuffers::InvalidFlatbuffer) -> Self {
+        Self::Decode(error)
+    }
 }
 
 impl From<&selium_abi::InterfaceMetadata> for InterfaceMetadataWire {

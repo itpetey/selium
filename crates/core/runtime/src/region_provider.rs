@@ -13,7 +13,7 @@ use std::{
 
 use selium_abi::{RegionAllocation, RegionProt, ResourceKind};
 use selium_kernel::Kernel;
-use selium_memory::{MemoryError, MappingBackend, Region, RegionProvider, Result};
+use selium_memory::{MappingBackend, MemoryError, Region, RegionProvider, Result};
 
 /// Region provider backed by the runtime kernel's shared region table.
 #[derive(Clone)]
@@ -24,10 +24,18 @@ pub struct RuntimeRegionProvider {
     local_ids: Arc<Mutex<HashMap<u64, u64>>>,
 }
 
-impl Debug for RuntimeRegionProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeRegionProvider").finish()
-    }
+/// Mapping backend that delegates reads, writes, and atomics to the kernel.
+#[derive(Clone)]
+struct KernelBackend {
+    kernel: Kernel,
+    /// Kernel local mapping id used for read/write/atomic calls.
+    local_id: u64,
+    /// Selium shared region id.
+    shared_id: u64,
+    /// Byte offset within the shared region that this mapping starts at.
+    base_offset: u64,
+    /// Size of this mapping in bytes.
+    size: u64,
 }
 
 impl RuntimeRegionProvider {
@@ -57,7 +65,12 @@ impl RegionProvider for RuntimeRegionProvider {
             .lock()
             .map_err(|error| MemoryError::Other(error.to_string()))?
             .insert(shared_id, local_id);
-        let backend = Arc::new(KernelBackend::new(self.kernel.clone(), local_id, shared_id, len as u64));
+        let backend = Arc::new(KernelBackend::new(
+            self.kernel.clone(),
+            local_id,
+            shared_id,
+            len as u64,
+        ));
         Ok(Region::with_backend(
             RegionAllocation {
                 region_id: shared_id,
@@ -81,7 +94,12 @@ impl RegionProvider for RuntimeRegionProvider {
             .kernel
             .shared_region_len(region_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let backend = Arc::new(KernelBackend::new(self.kernel.clone(), local_id, region_id, len as u64));
+        let backend = Arc::new(KernelBackend::new(
+            self.kernel.clone(),
+            local_id,
+            region_id,
+            len as u64,
+        ));
         Ok(Region::with_backend(
             RegionAllocation {
                 region_id,
@@ -106,28 +124,9 @@ impl RegionProvider for RuntimeRegionProvider {
     }
 }
 
-/// Mapping backend that delegates reads, writes, and atomics to the kernel.
-#[derive(Clone)]
-struct KernelBackend {
-    kernel: Kernel,
-    /// Kernel local mapping id used for read/write/atomic calls.
-    local_id: u64,
-    /// Selium shared region id.
-    shared_id: u64,
-    /// Byte offset within the shared region that this mapping starts at.
-    base_offset: u64,
-    /// Size of this mapping in bytes.
-    size: u64,
-}
-
-impl Debug for KernelBackend {
+impl Debug for RuntimeRegionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KernelBackend")
-            .field("local_id", &self.local_id)
-            .field("shared_id", &self.shared_id)
-            .field("base_offset", &self.base_offset)
-            .field("size", &self.size)
-            .finish()
+        f.debug_struct("RuntimeRegionProvider").finish()
     }
 }
 
@@ -206,7 +205,11 @@ impl MappingBackend for KernelBackend {
     }
 
     fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>> {
-        if offset.checked_add(size).ok_or(MemoryError::CapacityExceeded)? > self.size {
+        if offset
+            .checked_add(size)
+            .ok_or(MemoryError::CapacityExceeded)?
+            > self.size
+        {
             return Err(MemoryError::IndexOutOfBounds);
         }
         let base_offset = self.offset(offset)?;
@@ -224,3 +227,13 @@ impl MappingBackend for KernelBackend {
     }
 }
 
+impl Debug for KernelBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KernelBackend")
+            .field("local_id", &self.local_id)
+            .field("shared_id", &self.shared_id)
+            .field("base_offset", &self.base_offset)
+            .field("size", &self.size)
+            .finish()
+    }
+}
