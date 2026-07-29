@@ -1,8 +1,8 @@
 [package]
-name = "selium-bridge-guest"
+name = "selium-quic"
 version.workspace = true
 edition.workspace = true
-description = "Reference QUIC-to-shared-memory bridge guest"
+description = "Selium QUIC stream transport implementing MessageTransport"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -10,14 +10,8 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[lib]
-crate-type = ["cdylib"]
-
 [dependencies]
-quinn = { workspace = true, features = ["rustls-ring"] }
-selium-guest = { workspace = true, features = ["io", "quinn"] }
-selium-quic = { path = "../../core/quic" }
-selium-shm.workspace = true
+quinn.workspace = true
 selium-wire.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 

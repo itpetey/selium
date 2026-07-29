@@ -2,8 +2,8 @@
 
 use crate::hostcall_region_provider::HostcallRegionProvider;
 
-#[cfg(feature = "quinn")]
-pub use crate::net::quinn::{QuinnUdpSocket, SeliumQuinnRuntime};
+#[cfg(all(feature = "quinn", target_arch = "wasm32"))]
+pub use crate::net::quinn::{QuinnRuntime, QuinnUdpSocket};
 pub use crate::{
     async_runtime::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,

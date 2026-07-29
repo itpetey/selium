@@ -1,58 +1,56 @@
 ## Purpose
 
-`selium-guest` is the primary SDK crate for Selium guest Wasm modules, providing safe, ergonomic handle types over shared memory ABI primitives (ring buffers, readers, writers) and higher-level messaging patterns (pub/sub, RPC, live tables, structured logging) so guest code does not manipulate raw hostcall payloads directly.
+`selium-guest` is the primary SDK crate for Selium guest Wasm modules, providing safe, ergonomic handle types over shared memory ABI primitives (ring buffers, readers, writers) and re-exporting the lower crates (`selium-wire`, `selium-shm`, `selium-encoding`, `selium-memory`) so that guest code sees a single unified API surface.
 
 ## Requirements
 
 ### Requirement: Safe Guest Handles
-`selium-guest` SHALL provide safe, ergonomic handle types over the shared memory ABI primitives (`alloc_region`, `free_region`, `attach_region`) so guest code does not manipulate raw hostcall payloads directly for common operations.
-
-Handles SHALL include `Reader` (strong byte-stream reader), `WeakReader` (weak byte-stream reader), `Writer` (strong byte-stream writer), `WeakWriter` (weak byte-stream writer), `FramedRead<R>` (frame-level reader), `FramedWrite<W>` (frame-level writer), `Subscriber<T>` (typed pub/sub subscriber), `Publisher<T>` (typed pub/sub publisher), `RpcClient<Req, Rep>` (typed RPC client), `RpcConnection<Req, Rep>` (typed RPC server), `LiveTable<K, V>` (materialised live table), and `LogRecord`/`LogField`/`LogSpan`/`LogLevel` (structured log types from `log` module).
+`selium-guest` SHALL be the WASM guest SDK, providing safe, ergonomic handle types for the host ABI and re-exporting the lower crates (`selium-wire`, `selium-shm`, `selium-encoding`, `selium-memory`) so that guest code sees a single unified API surface. Handles SHALL include `Reader`, `Writer`, `FramedRead`, `FramedWrite`, `Subscriber<T>`, `Publisher<T>`, `RpcClient<Req, Rep>`, `RpcConnection<Req, Rep>`, `LiveTable<K, V>`, and `LogRecord`/`LogField`/`LogSpan`/`LogLevel`.
 
 #### Scenario: Guest opens primitive through SDK handle
 - **WHEN** guest code acquires a shared memory, channel, or pub/sub resource through the SDK
 - **THEN** the SDK SHALL expose a typed handle rather than requiring direct ABI framing code
 
 ### Requirement: Messaging-Pattern Layer
-`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronization without signal hostcalls. The pattern layer SHALL use `FramedRead`/`FramedWrite` wrappers over byte-stream `Reader`/`Writer` types rather than reimplementing `FrameHeader` encoding/decoding in each pattern.
+`selium-guest` SHALL re-export the messaging-pattern layer from `selium-wire` (pub/sub, RPC, live tables). The pattern layer SHALL be generic over `MessageTransport`. For WASM guests, `selium-guest` SHALL install the `ShmTransport` backed by the hostcall `RegionProvider` as the default transport.
 
 #### Scenario: Guest selects messaging pattern
 - **WHEN** guest code needs pub/sub, fanout, request/reply, stream, or live-table semantics
-- **THEN** the SDK SHALL provide those semantics through the pattern layer rather than through guest-specific boilerplate
+- **THEN** the SDK SHALL provide those semantics through the re-exported `selium-wire` pattern types
 
 #### Scenario: Prototype-local pattern composition
 - **WHEN** the current arch3 prototype uses the messaging-pattern layer in native tests or single-process guest logic
 - **THEN** the SDK MAY satisfy those semantics through local in-memory composition while the host-backed inter-guest fabric remains future work
 
 ### Requirement: Pub/Sub Generation-Change Detection
-`Subscriber<T, R>` SHALL detect when the publisher's generation counter has advanced past the subscriber's last-read position by more than the ring buffer capacity, indicating that unread data has been overwritten. Detection SHALL delegate to the underlying `Reader`'s `read_frame` or `poll_read` method, which returns `Error::Overwritten` (or `io::Error` with `ErrorKind::Other` containing `Error::Overwritten` for `poll_read`).
+`Subscriber<T, M>` SHALL detect when the publisher has overwritten unread data. For transports that support generation tracking (e.g., `ShmTransport`), detection SHALL use the generation counter delta. For transports that do not (e.g., `QuicTransport`), overwrite SHALL NOT be reported.
 
-#### Scenario: Publisher overwrites unread data
-- **WHEN** a subscriber calls `Stream::poll_next()` and the underlying `Reader::read_frame` returns an overwrite error
+#### Scenario: Publisher overwrites unread data (shm)
+- **WHEN** a subscriber calls `Stream::poll_next()` over shm and the underlying `Reader::read_frame` returns an overwrite error
 - **THEN** the subscriber SHALL surface `Error::Overwritten` through the stream
 
 #### Scenario: Normal publishing within capacity
-- **WHEN** a subscriber calls `Stream::poll_next()` and the generation counter delta is less than or equal to the ring buffer capacity
-- **THEN** the subscriber SHALL read the next available frame normally without returning `Error::Overwritten`
+- **WHEN** a subscriber calls `Stream::poll_next()` and the generation counter delta is within capacity
+- **THEN** the subscriber SHALL read the next available frame normally
 
 #### Scenario: First read after subscription
 - **WHEN** a subscriber calls `Stream::poll_next()` for the first time (no prior `last_generation`)
 - **THEN** the subscriber SHALL set `last_generation` to the current generation counter after a successful read
 
 ### Requirement: Non-Blocking Reader Poll
-`Reader` and `WeakReader` SHALL implement `tokio::io::AsyncRead`. The `poll_read` method SHALL check whether a frame is immediately readable without blocking, and SHALL return `Poll::Ready(Ok(()))` with bytes copied to the provided buffer when data is available, or `Poll::Pending` when the ring is empty and writers are still connected.
+`Reader` and `WeakReader` SHALL implement `tokio::io::AsyncRead`. `selium-shm`'s `ShmTransport` SHALL wrap these to implement `MessageTransport`.
 
 #### Scenario: Frame is ready
-- **WHEN** a caller invokes `poll_read()` and a frame with the READY flag set is at the current read position
-- **THEN** the method SHALL copy frame payload bytes to the caller's buffer and return `Poll::Ready(Ok(()))`
+- **WHEN** a caller invokes `poll_ready()` on an `ShmTransport` and a frame with the READY flag is at the current read position
+- **THEN** the method SHALL return `Ok(true)`
 
 #### Scenario: No frame ready, writers connected
 - **WHEN** a caller invokes `poll_read()` and no frame is available but writer_count > 0
-- **THEN** the method SHALL return `Poll::Pending`
+- **THEN** the transport SHALL return `Poll::Pending`
 
 #### Scenario: No frame ready, all writers disconnected
-- **WHEN** a caller invokes `poll_read()` and no frame is available and writer_count == 0
-- **THEN** the method SHALL return `Poll::Ready(Ok(()))` with zero bytes copied (EOF)
+- **WHEN** a caller invokes `poll_peer_closed()` and writer_count == 0
+- **THEN** the method SHALL return `Ok(true)`
 
 #### Scenario: Reader detects overwrite
 - **WHEN** a caller invokes `poll_read()` and the generation counter delta (current generation minus last known generation) exceeds ring capacity
@@ -91,17 +89,15 @@ Handles SHALL include `Reader` (strong byte-stream reader), `WeakReader` (weak b
 - **THEN** the writer count SHALL be incremented and a `Writer` with the same writer ID SHALL be returned
 
 ### Requirement: Subscriber/Publisher Upgrade and Downgrade
-`Subscriber<T, R>` SHALL provide `upgrade(self) -> Result<Subscriber<T, Reader>>` when `R = WeakReader` and `downgrade(self) -> Subscriber<T, WeakReader>` when `R = Reader`. These methods upgrade or downgrade the underlying `FramedRead`'s inner reader between strong and weak variants. The return type changes to reflect the new backing handle at compile time.
+`Subscriber<T, M>` SHALL support upgrade/downgrade when `M = ShmTransport` by delegating to the inner transport's strong/weak conversion.
 
-`Publisher<T, W>` SHALL provide `upgrade(self) -> Result<Publisher<T, Writer>>` when `W = WeakWriter` and `downgrade(self) -> Publisher<T, WeakWriter>` when `W = Writer`. These methods upgrade or downgrade the underlying `FramedWrite`'s inner writer between strong and weak variants.
+#### Scenario: Subscriber upgrades from weak to strong (shm)
+- **WHEN** a caller invokes `subscriber.upgrade()` on an shm-backed subscriber using a weak reader
+- **THEN** a new `Subscriber<T, ShmTransport>` SHALL be returned with strong-reader backpressure
 
-#### Scenario: Subscriber upgrades from weak to strong
-- **WHEN** a caller invokes `subscriber.upgrade()` on a subscriber backed by a weak reader
-- **THEN** a new `Subscriber<T, Reader>` SHALL be returned whose inner `FramedRead` wraps a strong `Reader`, providing backpressure protection
-
-#### Scenario: Publisher upgrades from weak to strong
-- **WHEN** a caller invokes `publisher.upgrade()` on a publisher backed by a weak writer
-- **THEN** a new `Publisher<T, Writer>` SHALL be returned whose inner `FramedWrite` wraps a strong `Writer`, providing backpressure protection to readers
+#### Scenario: Publisher upgrades from weak to strong (shm)
+- **WHEN** a caller invokes `publisher.upgrade()` on an shm-backed publisher using a weak writer
+- **THEN** a new `Publisher<T, ShmTransport>` SHALL be returned providing backpressure protection to readers
 
 ### Requirement: Safety Comments on Unsafe Impls
 The `unsafe impl Send for RegionMappingInner` and `unsafe impl Sync for RegionMappingInner` blocks SHALL include safety comments explaining why the raw-pointer-bearing struct satisfies these auto-traits in both WASM and native modes.
@@ -110,42 +106,41 @@ The `unsafe impl Send for RegionMappingInner` and `unsafe impl Sync for RegionMa
 - **WHEN** a developer reads the `unsafe impl` blocks in `region.rs`
 - **THEN** they SHALL find comments explaining that in WASM mode the pointer references shared linear memory valid for the guest's lifetime, and in native mode the pointer is into an `Arc<Vec<u8>>` kept alive by `_backing`
 
-### Requirement: LiveTable in selium-guest
-`LiveTable<K, V>` SHALL reside in `selium-guest::io::tables` as the single canonical implementation. `LiveTableMessage<K, V>` SHALL derive `rkyv::Archive`, `rkyv::Serialize`, and `rkyv::Deserialize` with `#[rkyv(bytecheck())]`.
+### Requirement: LiveTable in selium-wire
+`LiveTable<K, V>` SHALL reside in `selium-wire::tables` as the single canonical implementation, generic over `MessageTransport`.
 
-#### Scenario: LiveTable is importable from selium-guest
-- **WHEN** a guest crate imports `selium_guest::io::tables::LiveTable`
+#### Scenario: LiveTable is importable from selium-wire
+- **WHEN** a crate imports `selium_wire::tables::LiveTable`
 - **THEN** the import SHALL resolve to the canonical `LiveTable` type
 
-### Requirement: RPC Types in selium-guest
-`selium-guest` SHALL provide `RpcClient<Req, Rep>`, `RpcConnection<Req, Rep>`, `RpcRequest<Req, Rep>`, and `RpcAccept<Req, Rep>` types in the `io::rpc` module. These types SHALL be built on `FramedRead`/`FramedWrite` rather than working with `RingBuf` directly. The `selium-rpc` crate SHALL be removed.
+#### Scenario: LiveTable is re-exported from selium-guest
+- **WHEN** a guest crate imports `selium_guest::io::tables::LiveTable`
+- **THEN** the import SHALL resolve to `selium_wire::tables::LiveTable` via re-export
 
-#### Scenario: RpcClient is importable from selium-guest
-- **WHEN** a guest crate imports `selium_guest::io::rpc::RpcClient`
+### Requirement: RPC Types in selium-wire
+`selium-wire` SHALL provide `RpcClient<Req, Rep, M>`, `RpcConnection<Req, Rep, M>`, `RpcRequest<Req, Rep, M>`, and `RpcAccept<Req, Rep>` types. These types SHALL be built on `FramedRead<M>`/`FramedWrite<M>` over `MessageTransport`.
+
+#### Scenario: RpcClient is importable from selium-wire
+- **WHEN** a crate imports `selium_wire::rpc::RpcClient`
 - **THEN** the import SHALL resolve to the canonical `RpcClient` type
 
-#### Scenario: RpcClient uses FramedRead/FramedWrite
-- **WHEN** an `RpcClient` sends a request and receives a reply
-- **THEN** it SHALL use `FramedWrite` to write the request frame and `FramedRead` to read the reply frame, rather than manipulating `FrameHeader` and `RingBuf` directly
+#### Scenario: RpcClient is re-exported from selium-guest
+- **WHEN** a guest crate imports `selium_guest::io::rpc::RpcClient`
+- **THEN** the import SHALL resolve to `selium_wire::rpc::RpcClient` via re-export
 
 ### Requirement: Guest log transport module
-`selium-guest` SHALL provide a `log` module behind `feature = "logging"` (default on) containing:
-- `init() -> Result<(), InitError>` — creates a Drop-backpressure log channel, installs the tracing subscriber, and registers the channel with the kernel
-- `init_with_capacity(capacity: u64) -> Result<(), InitError>` — same as `init()` with a custom channel capacity
-- `channel() -> Option<Channel>` — returns the log channel handle if initialised
+`selium-guest` SHALL provide a `log` module behind `feature = "logging"` containing `init()` and `init_with_capacity()`. The module SHALL use `selium-shm` channels (Drop backpressure) for log transport.
 
 #### Scenario: Guest initialises logging
 - **WHEN** a guest calls `selium_guest::log::init()`
-- **THEN** a `tracing_subscriber::Layer` SHALL be installed
-- **AND** `tracing::info!("hello")` SHALL publish a `LogRecord` to the log channel
-- **AND** the runtime SHALL auto-register the log channel under `sel://process/<id>/logs`
+- **THEN** a tracing subscriber SHALL be installed and `tracing::info!(...)` SHALL publish to the log channel
 
 #### Scenario: Logging not initialised
 - **WHEN** a guest calls `tracing::info!("hello")` before calling `log::init()`
 - **THEN** the event SHALL be silently discarded (no subscriber installed)
 
-### Requirement: Log record types
-`selium-guest::log` SHALL export `LogRecord`, `LogField`, `LogSpan`, and `LogLevel` types derived from the `logging.fbs` FlatBuffers schema via the `#[schema]` proc macro.
+### Requirement: Log record types re-exported
+`selium-guest::log` SHALL re-export `LogRecord`, `LogField`, `LogSpan`, and `LogLevel` from `selium-encoding`.
 
 #### Scenario: Log record fields are accessible
 - **WHEN** a subscriber decodes a `LogRecord` from the channel
@@ -164,11 +159,11 @@ The `unsafe impl Send for RegionMappingInner` and `unsafe impl Sync for RegionMa
 - **THEN** the returned `InitError` SHALL implement `Display` and `Error` with a human-readable message
 
 ### Requirement: ResourceKind threading in RingBuf
-`RingBuf::create` SHALL accept a `ResourceKind` parameter and thread it through to the `AllocRegion` hostcall as the `purpose` field.
+`RingBuf::create` (in `selium-shm`) SHALL accept a `ResourceKind` parameter and thread it through to the `RegionProvider::allocate` call as the `purpose` field.
 
 #### Scenario: RingBuf created with LogChannel purpose
 - **WHEN** `RingBuf::create(capacity, ResourceKind::LogChannel)` is called
-- **THEN** the underlying `AllocRegion` hostcall SHALL carry `purpose: ResourceKind::LogChannel`
+- **THEN** the `RegionProvider::allocate` call SHALL carry `purpose: ResourceKind::LogChannel`
 
 ### Requirement: Guest log handle deprecation
 `GuestLog::write` and `GuestLog::read_from` SHALL be marked `#[deprecated]` with a note pointing users to `selium_guest::log::init()` for channel-based log transport.

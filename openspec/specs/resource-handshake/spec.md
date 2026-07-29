@@ -1,45 +1,55 @@
 ## Purpose
 
-Define the host-mediated connection queue, typed `Accept` trait, and backpressure semantics for establishing shared-memory sessions between guests.
+Define the `Rendezvous` trait and host-mediated connection queue for establishing shared-memory sessions between clients and servers, abstracting the mechanism for passing connection identifiers while preserving capability validation and backpressure.
 
 ## Requirements
 
-### Requirement: Host-mediated connection queue
-The system SHALL provide a host-mediated queue for establishing shared memory connections between guests. The queue SHALL be accessed through `ResourceSender` (client side) and `ResourceListener` (server side). The host SHALL validate capability before enqueuing connections.
+### Requirement: Rendezvous Trait for Connection Establishment
+`selium-wire` SHALL provide a `Rendezvous` trait that abstracts the mechanism for passing connection identifiers from client to server. The trait SHALL define:
 
-#### Scenario: Client sends connection request
-- **WHEN** a client calls `ResourceSender::send(handle, shared_id)`
-- **THEN** the system SHALL invoke the `HostQueueSend` hostcall, which validates the client's capability to reach the target server and enqueues the connection information
+- `async fn send(&self, shared_id: u64) -> Result<()>`
+- `async fn recv(&self) -> Result<IncomingConnection>`
+- `fn attach_sender(shared_id: u64) -> Result<Self>` (for clients)
+- `fn create_listener() -> Result<Self>` (for servers)
 
-#### Scenario: Server accepts connection
-- **WHEN** a server calls `listener.accept::<T>().await`
-- **THEN** the system SHALL return an `IncomingConnection` containing the `client_process_id` and `shared_id`, which the `Accept` implementation uses to construct the typed connection
+The existing `ResourceSender`/`ResourceListener` hostcall-backed mechanism SHALL be one concrete `Rendezvous` implementation for WASM guests. The runtime MAY provide its own `Rendezvous` implementation for native-to-guest RPC without using hostcalls.
 
-### Requirement: Typed Accept trait
-The system SHALL provide an `Accept` trait that maps raw incoming connections to typed resources. The trait SHALL have a single associated type `Item` and a fallible `accept` function.
+#### Scenario: Client sends connection via rendezvous
+- **WHEN** a client calls `rendezvous.send(shared_id)`
+- **THEN** the implementation SHALL deliver the `shared_id` to the server's `recv()` endpoint
 
-#### Scenario: Accepting an RPC connection
+#### Scenario: Server accepts connection via rendezvous
+- **WHEN** a server calls `rendezvous.recv().await`
+- **THEN** it SHALL receive an `IncomingConnection` containing `client_process_id` and `shared_id`
+
+### Requirement: Host-mediated Connection Queue (ResourceSender/ResourceListener)
+The `ResourceSender` and `ResourceListener` types in `selium-guest` SHALL implement the `Rendezvous` trait. The host SHALL continue to validate capability before enqueuing connections.
+
+#### Scenario: Client sends connection request via ResourceSender
+- **WHEN** a client calls `sender.send(shared_id).await`
+- **THEN** the system SHALL invoke the `HostQueueSend` hostcall with capability validation
+
+#### Scenario: Server accepts connection via ResourceListener
+- **WHEN** a server calls `listener.recv().await`
+- **THEN** the system SHALL return an `IncomingConnection` with `client_process_id` and `shared_id`
+
+### Requirement: Typed Accept Trait
+The `Accept` trait SHALL remain in `selium-guest`, mapping raw `IncomingConnection` values to typed resources. RPC acceptance MAY also be implemented via direct `Rendezvous` usage without the `Accept` trait for non-guest consumers.
+
+#### Scenario: Accepting an RPC connection via Accept trait
 - **WHEN** a server calls `listener.accept::<RpcAccept<Req, Rep>>().await`
-- **THEN** the system SHALL invoke `RpcAccept::accept` which validates the region layout and constructs an `RpcConnection<Req, Rep>`
+- **THEN** `RpcAccept::accept` SHALL construct an `RpcConnection<_, _, ShmTransport>`
 
-#### Scenario: Accepting a different resource type
-- **WHEN** a future resource type (e.g. process) defines its own `Accept` implementation
-- **THEN** the same `ResourceListener` SHALL be usable with `listener.accept::<ProcessAccept>()` to accept process connections
-
-#### Scenario: Malformed connection rejected
-- **WHEN** an incoming connection has an invalid region (bad magic, wrong memory count, unreadable layout)
-- **THEN** `Accept::accept` SHALL return `AcceptError::InvalidRegion` or `AcceptError::LayoutMismatch`
-
-### Requirement: Backpressure on send
-`ResourceSender::send` SHALL be async and MAY block if the server has not consumed previous connection entries. The future SHALL resolve when the host has successfully enqueued the connection.
+### Requirement: Backpressure on Send
+`Rendezvous::send` SHALL be async and MAY block if the server has not consumed previous entries. The future SHALL resolve when the connection has been enqueued.
 
 #### Scenario: Server is slow to accept
-- **WHEN** a client calls `send` and the server's connection queue is full
-- **THEN** the future SHALL not resolve until the server accepts a connection and frees space in the queue
+- **WHEN** a client calls `send` and the server's queue is full
+- **THEN** the future SHALL not resolve until the server accepts a connection
 
-### Requirement: ResourceListener receives client identity
-When a connection is dequeued via `ResourceListener::accept`, the system SHALL provide the `ProcessId` of the connecting client alongside the `shared_id` of the session region.
+### Requirement: Connection Identity
+When a connection is received via `Rendezvous::recv`, the `IncomingConnection` SHALL contain the `client_process_id` (or equivalent peer identity) alongside the `shared_id`.
 
 #### Scenario: Server receives client identity
 - **WHEN** a server accepts a connection
-- **THEN** the `IncomingConnection` SHALL contain `client_process_id` and `session_shared_id`
+- **THEN** the `IncomingConnection` SHALL contain the peer identity and `shared_id`

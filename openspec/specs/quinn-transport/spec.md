@@ -1,23 +1,39 @@
-## MODIFIED Requirements
+## Purpose
+
+Define the QUIC transport stack for Selium, comprising the shared-memory-backed UDP datagram I/O (`QuinnUdpSocket` in `selium-guest`) that feeds quinn's protocol engine, and the `QuicTransport` in `selium-quic` that wraps quinn streams as `MessageTransport` implementors for use by bridge guests and external clients.
+
+## Requirements
+
+### Requirement: Quinn Transport as MessageTransport
+`selium-quic` SHALL provide a `QuicTransport` type that implements `MessageTransport` over quinn `SendStream`/`RecvStream`. The type SHALL be usable by both the external client library and bridge guests. The existing UDP datagram send/recv infrastructure (`QuinnUdpSocket`, `SeliumQuinnRuntime`) SHALL remain in `selium-guest` as the datagram-level transport feeding quinn.
+
+#### Scenario: Quinn stream read via QuicTransport
+- **WHEN** `QuicTransport::poll_read` is called and data is available on the quinn `RecvStream`
+- **THEN** bytes SHALL be copied into the provided buffer, matching `AsyncRead` semantics
+
+#### Scenario: Quinn stream write via QuicTransport
+- **WHEN** `QuicTransport::poll_write` is called with frame bytes
+- **THEN** bytes SHALL be written to the quinn `SendStream`
+
+#### Scenario: QuicTransport signals peer closed
+- **WHEN** the remote peer closes the QUIC stream (FIN or RESET)
+- **THEN** `QuicTransport::poll_peer_closed` SHALL return `Ok(true)`
 
 ### Requirement: UdpSender Implementation
-`selium-guest` SHALL implement `quinn::UdpSender` that writes framed datagrams to the shared-memory send channel. The `poll_send` method SHALL be fully implemented using `RingBuf::reserve` and `RingBuf::write_frame`.
+`selium-guest` SHALL continue to implement `quinn::UdpSender` and `quinn::AsyncUdpSocket` over shared-memory send/recv channels for WASM guests that need QUIC. These types SHALL use `selium-shm` ring buffers for datagram I/O between the guest's quinn stack and the host's UDP socket.
 
-#### Scenario: Quinn sends a datagram
-- **WHEN** Quinn calls `poll_send` with a `Transmit` containing a destination address and payload
-- **THEN** the implementation SHALL encode the destination and payload into a frame, reserve space atomically on the send ring, write the frame with release fencing, and return `Poll::Ready(Ok(()))`
-
-#### Scenario: Quinn sends with full send channel
-- **WHEN** Quinn calls `poll_send` and the send channel is full
-- **THEN** the implementation SHALL return `Poll::Pending`
-
-### Requirement: AsyncUdpSocket Recv Implementation
-`selium-guest` SHALL implement `QuinnUdpSocket::poll_recv` to read framed datagrams from the shared-memory recv channel. The `poll_recv` method SHALL be fully implemented using `RingBuf` read operations with acquire fencing and `FrameHeader` validation.
+#### Scenario: Quinn sends a datagram via shared-memory
+- **WHEN** Quinn calls `poll_send` with a `Transmit`
+- **THEN** the implementation SHALL encode the destination and payload into a frame on the send ring
 
 #### Scenario: Quinn polls for received datagrams
-- **WHEN** Quinn's `EndpointDriver` calls `poll_recv` on the socket and a frame with the READY flag set is available in the recv channel
-- **THEN** the implementation SHALL read the frame, decode the source address and payload, copy the payload into the provided buffer, populate `RecvMeta` with the source address and length, and return `Poll::Ready(Ok(1))`
+- **WHEN** Quinn's endpoint driver calls `poll_recv` and a frame is available in the recv channel
+- **THEN** the implementation SHALL decode the source address and payload, populating `RecvMeta`
 
-#### Scenario: Quinn polls with empty recv channel
-- **WHEN** Quinn's `EndpointDriver` calls `poll_recv` on the socket and the recv channel is empty
-- **THEN** the implementation SHALL return `Poll::Pending`
+### Requirement: Stream Framing Separated from Datagram Transport
+The stream-level frame handling (`QuicTransport` implementing `MessageTransport`) SHALL reside in `selium-quic`. The datagram transport (`QuinnUdpSocket` with shared-memory rings) SHALL remain in `selium-guest`. Bridge guests SHALL use both: the datagram transport to run quinn, and `selium-quic` to wrap streams.
+
+#### Scenario: Bridge guest composes datagram transport + stream transport
+- **WHEN** a bridge guest initializes quinn with `QuinnUdpSocket` (from `selium-guest`)
+- **AND** wraps accepted streams in `QuicTransport` (from `selium-quic`)
+- **THEN** the bridge SHALL have full QUIC connectivity and stream-level `MessageTransport` semantics

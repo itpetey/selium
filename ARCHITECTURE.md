@@ -59,15 +59,41 @@ Core technologies and design choices:
 - Capability and session enforcement at spawn time
 - Bridging external network protocols and TLS offload where required
 
+`selium-memory` library (crates/core/memory/) is responsible for:
+- The `RegionMapping` abstraction (raw shared-memory mappings, atomics, sub-regions)
+- The `RegionProvider` trait that abstracts allocation/attach/free backends
+- `HeapRegionProvider` for in-process and test use
+
+`selium-encoding` library (crates/core/encoding/) is responsible for:
+- FlatBuffers message encoding (`FlatMsg`, `HasSchema`, `SchemaDescriptor`)
+- The `codec` module and generated `fbs/` types
+- Log record types (`LogRecord`, `LogLevel`, `LogField`, `LogSpan`)
+
+`selium-wire` library (crates/core/wire/) is responsible for:
+- Transport-agnostic wire framing (`FrameHeader`, `FrameCodec`)
+- The `MessageTransport` trait composing `AsyncRead` + `AsyncWrite` with readiness, peer-closed, and generation side-channels
+- Messaging patterns generic over the transport: pub/sub (`Publisher`/`Subscriber`), RPC (`RpcClient`/`RpcConnection`), and `LiveTable`
+- The `Rendezvous` trait used to pass connection identifiers between peers
+
+`selium-shm` library (crates/core/shm/) is responsible for:
+- Shared-memory ring channels (`RingBuf`, `Channel`, `Reader`/`Writer`)
+- `ShmTransport: MessageTransport`, the co-located shared-memory transport implementation
+- In-memory `Rendezvous` helpers for tests
+
+`selium-quic` library (crates/core/quic/) is responsible for:
+- `QuicTransport: MessageTransport` over a single QUIC bidirectional stream
+- Shared by external client libraries and bridge guests
+
 `selium-guest` library (crates/core/guest/) is responsible for:
-- Wrapping the ABI and kernel primitives
-- Providing ergonomic handles for guests to consume host resources
-- Providing primitive handles, typed codecs, logging, platform calls, and macro-facing SDK support
+- The WASM guest SDK: hostcalls, mailbox reactor, process/storage/time/network handles
+- Installing the hostcall-backed `RegionProvider` and the guest async runtime
+- Re-exporting the lower crates (`selium-memory`, `selium-encoding`, `selium-wire`, `selium-shm`) so guest code sees a single unified API surface
 - Re-exporting tracing macros: `info!()`, `warn!()`, etc.
 
-`selium-io` library (crates/libs/io/) is responsible for:
-- Providing guest-side messaging-pattern overlays, e.g. channels, pub/sub, fanout seams, request/reply seams, streams, and live tables
-- Building those patterns on shared memory, signalling, durable logs, and network request exchanges
+`selium-bridge-guest` guest (crates/guests/bridge/) is responsible for:
+- Terminating a QUIC connection from an external client
+- Transparently relaying `selium-wire` frames between QUIC streams and shared-memory rings
+- Enforcing the user's capability grants on the channels it attaches to
 
 `selium-guest-macros` library (crates/core/guest/macros/) is responsible for:
 - Defining procedural macros to assist with guest entrypoint function boilerplate

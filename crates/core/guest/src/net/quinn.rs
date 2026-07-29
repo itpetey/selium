@@ -13,6 +13,7 @@ use std::{
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, udp::RecvMeta};
 use selium_shm::RingBuf;
 use selium_wire::{error::Error, frame::FrameHeader};
+use web_time::web::InstantExt;
 
 use crate::net::udp::UdpSocket;
 
@@ -34,7 +35,7 @@ struct UdpSocketInner {
 }
 
 #[derive(Debug)]
-pub struct SeliumQuinnRuntime;
+pub struct QuinnRuntime;
 
 struct QuinnUdpSender {
     inner: Arc<UdpSocketInner>,
@@ -168,7 +169,20 @@ impl Debug for QuinnUdpSocket {
     }
 }
 
-impl Runtime for SeliumQuinnRuntime {
+impl Runtime for QuinnRuntime {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wrap_udp_socket(
+        &self,
+        _socket: std::net::UdpSocket,
+    ) -> std::io::Result<Box<dyn quinn::AsyncUdpSocket>> {
+        // The guest runtime does not wrap native UDP sockets. Guests receive
+        // UDP sockets as shared-memory ring regions via the host ABI.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SeliumQuinnRuntime does not wrap native UDP sockets",
+        ))
+    }
+
     fn spawn(&self, future: Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
         // Bridge Send-bound future to the guest's single-threaded runtime.
         // SAFETY: The guest runtime is single-threaded and cooperative.
@@ -186,7 +200,7 @@ impl Runtime for SeliumQuinnRuntime {
     fn now(&self) -> web_time::Instant {
         let i = crate::time::Instant::now().expect("failed to get monotonic time from host");
         let d = std::time::Duration::from_nanos(i.as_nanos());
-        web_time::Instant::from(d)
+        web_time::Instant::from_duration(d)
     }
 }
 
@@ -242,7 +256,5 @@ impl quinn::AsyncTimer for crate::time::Timer {
 }
 
 fn from_quinn_instant(qi: web_time::Instant) -> crate::time::Instant {
-    let zero = web_time::Instant::from(std::time::Duration::ZERO);
-    let duration = qi.duration_since(zero);
-    crate::time::Instant::from_nanos(duration.as_nanos() as u64)
+    crate::time::Instant::from_nanos(qi.as_duration().as_nanos() as u64)
 }

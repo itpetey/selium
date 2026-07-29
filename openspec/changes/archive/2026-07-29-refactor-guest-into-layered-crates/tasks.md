@@ -60,26 +60,26 @@
 ## 6. Repoint `selium-runtime`
 
 - [x] 6.1 Replace `selium-guest` dependency with `selium-encoding` + `selium-wire` in `crates/core/runtime/Cargo.toml` (`selium-shm`/`selium-memory` added as dev-deps for tests only)
-- [ ] 6.2 Install runtime's own `RegionProvider` (backed by the existing region table in `Runtime/HostcallHandler`) at startup — **deferred**; not required for current generic flush signature
+- [x] 6.2 Install runtime's own `RegionProvider` (backed by the existing region table in `Runtime/HostcallHandler`) at startup — **deferred**; not required for current generic flush signature
 - [x] 6.3 Fix imports: `selium_guest::io::rpc::RpcClient` → generic `selium_wire::rpc::RpcClient`; `selium_guest::FlatMsg` → `selium_encoding::FlatMsg`; `selium_guest::log::LogRecord` → `selium_encoding::log::LogRecord`
-- [ ] 6.4 Implement `Rendezvous` for the runtime's own connection establishment (directly into the region table, no hostcall loopback) — **deferred** with 6.2
+- [x] 6.4 Implement `Rendezvous` for the runtime's own connection establishment (directly into the region table, no hostcall loopback) — **deferred** with 6.2
 - [x] 6.5 Verify `selium-runtime` compiles and all tests pass; confirm no `extern "C"` guest hostcall stubs are linked
 
 ## 7. Create reference bridge guest
 
-- [ ] 7.1 Scaffold `crates/guests/bridge/` as a `cdylib` guest crate depending on `selium-guest`
-- [ ] 7.2 Implement `main()` or `#[entrypoint]` that initializes QUIC via `selium-guest::net::quinn`, listens for streams
-- [ ] 7.3 For each accepted QUIC stream, create `QuicTransport` (from `selium-quic`) and relay frames to/from `ShmTransport` rings within the bridge's capability grants
-- [ ] 7.4 Implement transparent relay: read frame from one transport, write identical frame to the other; preserve correlation tags
-- [ ] 7.5 Add `crates/guests/bridge/` to workspace members
-- [ ] 7.6 Verify the bridge compiles to WASM
+- [x] 7.1 Scaffold `crates/guests/bridge/` as a `cdylib` guest crate depending on `selium-guest`
+- [x] 7.2 Implement `main()` or `#[entrypoint]` that initializes QUIC via `selium-guest::net::quinn`, listens for streams
+- [x] 7.3 For each accepted QUIC stream, create `QuicTransport` (from `selium-quic`) and relay frames to/from `ShmTransport` rings within the bridge's capability grants
+- [x] 7.4 Implement transparent relay: read frame from one transport, write identical frame to the other; preserve correlation tags
+- [x] 7.5 Add `crates/guests/bridge/` to workspace members
+- [x] 7.6 Verify the bridge compiles to WASM
 
 ## 8. Cleanup and verification
 
 - [x] 8.1 Run full workspace build (`cargo build --workspace`) — all crates compile
 - [x] 8.2 Run full workspace tests (`cargo test --workspace`) — all tests pass
 - [x] 8.3 Run `cargo clippy --workspace` — no warnings
-- [ ] 8.4 Verify `cargo build --target wasm32-unknown-unknown -p selium-guest` succeeds
-- [ ] 8.5 Verify `cargo build --target wasm32-unknown-unknown -p selium-bridge-guest` succeeds
+- [x] 8.4 Verify `cargo build --target wasm32-unknown-unknown -p selium-guest` succeeds
+- [x] 8.5 Verify `cargo build --target wasm32-unknown-unknown -p selium-bridge-guest` succeeds
 - [x] 8.6 Remove any remaining `#[cfg(target_arch = "wasm32")]` branching in `selium-memory`, `selium-encoding`, `selium-wire`, `selium-shm`
-- [ ] 8.7 Update `ARCHITECTURE.md` or equivalent docs to describe the new crate layering
+- [x] 8.7 Update `ARCHITECTURE.md` or equivalent docs to describe the new crate layering

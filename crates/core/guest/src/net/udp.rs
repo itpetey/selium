@@ -67,6 +67,27 @@ impl UdpSocket {
         )))
     }
 
+    /// Attaches to an existing UDP socket shared region by `shared_id`.
+    ///
+    /// The caller must supply the local address because it is not stored in
+    /// the shared region header. This is intended for guests (such as the
+    /// bridge) that receive a UDP socket handle from the runtime or an
+    /// acceptor guest.
+    pub fn attach(shared_id: u64, local_addr: SocketAddr) -> Result<Self> {
+        let region = selium_memory::region_provider()
+            .map_err(|e| GuestError::Host(format!("region provider unavailable: {e}")))?
+            .attach(shared_id, None, selium_abi::RegionProt::ReadWrite)
+            .map_err(|e| GuestError::Host(format!("attach UDP socket region: {e}")))?;
+        let parent_mapping = region.mapping();
+        let (recv_ring, send_ring) = parse_dual_ring_region(&parent_mapping)?;
+        Ok(Self {
+            local_addr,
+            recv_ring,
+            send_ring,
+            read_pos: 0,
+        })
+    }
+
     /// Creates a `UdpSocket` from a pre-attached region mapping.
     ///
     /// Parses the multi-memory header to discover the recv and send

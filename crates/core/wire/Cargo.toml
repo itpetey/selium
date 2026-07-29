@@ -22,11 +22,11 @@ selium-encoding.workspace = true
 selium-guest-macros.workspace = true
 selium-memory.workspace = true
 thiserror.workspace = true
-tokio = {
-  workspace = true,
-  features = ["io-util", "macros", "rt-multi-thread"]
-}
+tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
