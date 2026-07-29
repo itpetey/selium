@@ -12,7 +12,6 @@ pub use cursor::{Cursor, mask_for_capacity};
 pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
 pub use ring_buf::{RingBuf, round_capacity};
 pub use rpc::{RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
-pub use selium_memory::PAGE_SIZE;
 pub use transport::{ShmRendezvous, ShmTransport};
 
 pub mod channels;

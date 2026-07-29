@@ -2,32 +2,29 @@
 //!
 //! Provides structured log transport over shared-memory channels with
 //! tracing subscriber integration. Log records are encoded as FlatBuffers
-//! and published to a Drop-backpressure channel.
+//! and published to a Drop-backpressure channel as ready frames.
 
 pub use selium_encoding::log::{LogField, LogLevel, LogRecord, LogSpan};
-#[cfg(feature = "logging")]
 pub use subscriber::{channel, init, init_with_capacity};
 
-#[cfg(feature = "logging")]
 mod subscriber {
     use super::*;
-    use crate::hostcall::hostcall_ready;
     use selium_abi::{HostcallRequest, ResourceKind};
     use selium_encoding::FlatMsg;
-    use selium_shm::channels::{Channel, ChannelBackpressure, Writer};
+    use selium_shm::channels::{Channel, ChannelBackpressure};
     use std::cell::Cell;
-    use std::sync::{Mutex, OnceLock};
-    use tokio::io::AsyncWrite;
+    use std::sync::OnceLock;
     use tracing::field::{Field, Visit};
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::Context;
     use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt as SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    use crate::hostcall::hostcall_ready;
+
     /// Global logging state, initialised once via `init()`.
     struct LoggingState {
         channel: Channel,
-        writer: Mutex<Writer>,
     }
 
     static LOGGING_STATE: OnceLock<LoggingState> = OnceLock::new();
@@ -131,7 +128,17 @@ mod subscriber {
         }
     }
 
-    /// Forwards a tracing event to the log channel as a FlatBuffer-encoded LogRecord.
+    /// Returns the current wall-clock time in milliseconds, using the host
+    /// clock (`std::time::SystemTime::now()` panics on
+    /// `wasm32-unknown-unknown`). Falls back to 0 when the host clock is
+    /// unavailable (native test contexts).
+    fn timestamp_ms() -> u64 {
+        crate::time::now()
+            .map(|nanos| nanos / 1_000_000)
+            .unwrap_or(0)
+    }
+
+    /// Forwards a tracing event to the log channel as a framed FlatBuffer LogRecord.
     fn forward_event(event: &tracing::Event<'_>) {
         let _guard = match ForwardingGuard::enter() {
             Some(g) => g,
@@ -152,30 +159,25 @@ mod subscriber {
         // Collect span stack.
         let spans = Vec::new(); // TODO: walk span stack via event.parent()
 
-        let timestamp_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         let record = LogRecord {
             level,
             target,
             message: visitor.message,
             fields: visitor.fields,
             spans,
-            timestamp_ms,
+            timestamp_ms: timestamp_ms(),
         };
 
         let encoded = FlatMsg::encode(&record);
 
-        // Write to the channel writer (non-blocking, Drop backpressure).
-        if let Ok(mut writer) = state.writer.lock() {
-            let waker = futures::task::noop_waker();
-            let mut cx = std::task::Context::from_waker(&waker);
-            // Discard the Poll result: the channel uses Drop backpressure, so a
-            // full buffer silently drops the write rather than blocking. Logging
-            // is best-effort and must never stall the caller.
-            drop(std::pin::Pin::new(&mut *writer).poll_write(&mut cx, &encoded));
+        // Write a ready frame to the channel ring. The log channel uses Drop
+        // backpressure: if the ring is full the record is silently dropped
+        // rather than blocking the caller. Logging is best-effort.
+        let ring = state.channel.ring();
+        if let Ok(pos) = ring
+            .reserve(selium_wire::frame::FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64)
+        {
+            drop(ring.write_frame(pos, &encoded, 0, 0));
         }
     }
 
@@ -191,8 +193,6 @@ mod subscriber {
 
     /// Initialises the guest log transport with a custom channel capacity.
     pub fn init_with_capacity(capacity: u64) -> Result<(), InitError> {
-        // Use get_or_try_init pattern: attempt to create state and install it atomically.
-        // If another thread already initialised, return Ok without creating a channel.
         if LOGGING_STATE.get().is_some() {
             return Ok(());
         }
@@ -215,32 +215,15 @@ mod subscriber {
             shared_id,
         }));
 
-        let writer = channel
-            .writer()
-            .map_err(|e| InitError::Publisher(e.to_string()))?;
-
-        let state = LoggingState {
-            channel,
-            writer: Mutex::new(writer),
-        };
+        let state = LoggingState { channel };
 
         // Atomically install state. If another thread won the race, discard ours.
-        let installed = LOGGING_STATE.get_or_init(|| state);
+        drop(LOGGING_STATE.set(state));
 
-        // Only install the subscriber if we were the thread that installed the state.
-        // (If another thread installed first, they already installed the subscriber.)
-        if std::ptr::eq(
-            installed,
-            LOGGING_STATE.get().expect("state just initialized"),
-        ) {
-            // We may or may not be the installer — but try_init is idempotent-safe:
-            // it returns Err if a subscriber is already installed, which we can ignore.
-            let subscriber = tracing_subscriber::registry().with(LogLayer);
-            // Discard the try_init result: Err means a subscriber was already
-            // installed by a concurrent initialiser (harmless — ours is identical).
-            // We use try_init instead of init precisely to make this safe.
-            drop(subscriber.try_init());
-        }
+        // Install the subscriber. try_init returns Err if a subscriber is
+        // already installed (harmless — the existing one is equivalent).
+        let subscriber = tracing_subscriber::registry().with(LogLayer);
+        drop(subscriber.try_init());
 
         Ok(())
     }
@@ -257,26 +240,14 @@ const DEFAULT_LOG_CAPACITY: u64 = 512 * 1024;
 /// Error type for log initialisation.
 #[derive(Debug)]
 pub enum InitError {
-    /// Tracing subscriber installation failed.
-    Subscriber(String),
     /// Log channel creation failed.
     Channel(String),
-    /// Channel registration with kernel failed.
-    Register(String),
-    /// Log publisher creation failed.
-    Publisher(String),
-    /// Internal mutex poisoned.
-    Poisoned,
 }
 
 impl std::fmt::Display for InitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Subscriber(msg) => write!(f, "subscriber init failed: {msg}"),
             Self::Channel(msg) => write!(f, "channel creation failed: {msg}"),
-            Self::Register(msg) => write!(f, "kernel registration failed: {msg}"),
-            Self::Publisher(msg) => write!(f, "publisher creation failed: {msg}"),
-            Self::Poisoned => write!(f, "internal mutex poisoned"),
         }
     }
 }

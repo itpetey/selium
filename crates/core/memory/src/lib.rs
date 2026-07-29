@@ -28,8 +28,12 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
 static GLOBAL_REGION_PROVIDER: OnceLock<Box<dyn RegionProvider>> = OnceLock::new();
-/// WASM page size used for region layout (4 KiB).
-pub const PAGE_SIZE: u64 = 4096;
+/// WASM linear-memory page size (64 KiB). Region page offsets returned by the
+/// host are in units of this size.
+pub const WASM_PAGE_SIZE: u64 = 65536;
+/// Size of the coordination header that precedes ring buffer data inside a
+/// shared region (4 KiB). This is a ring layout constant, **not** a page size.
+pub const RING_HEADER_SIZE: u64 = 4096;
 /// Magic value for multi-memory shared region layout headers.
 pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
@@ -162,7 +166,7 @@ impl Region {
         let backend: Arc<dyn MappingBackend> = match backing {
             Some(backing) => Arc::new(PointerBackend::from_backing(backing, size)),
             None => {
-                let base = (allocation.page_offset as u64 * PAGE_SIZE) as *mut u8;
+                let base = (allocation.page_offset as u64 * WASM_PAGE_SIZE) as *mut u8;
                 // SAFETY: The caller (region provider) guarantees that the
                 // region is mapped at the returned page offset for the lifetime
                 // of the region.
@@ -221,7 +225,7 @@ impl HeapRegionProvider {
 
 impl RegionProvider for HeapRegionProvider {
     fn allocate(&self, _pages: u32, _prot: RegionProt, _purpose: ResourceKind) -> Result<Region> {
-        let size = _pages as u64 * PAGE_SIZE;
+        let size = _pages as u64 * WASM_PAGE_SIZE;
         let backing = Arc::new(vec![0u8; size as usize]);
         let region_id = self.counter.fetch_add(1, Ordering::SeqCst);
         self.registry
@@ -587,7 +591,7 @@ mod tests {
             .allocate(2, RegionProt::ReadWrite, ResourceKind::SharedMemory)
             .expect("allocate");
         assert_ne!(region.region_id(), 0);
-        assert_eq!(region.size(), 2 * PAGE_SIZE);
+        assert_eq!(region.size(), 2 * WASM_PAGE_SIZE);
         let region_id = region.region_id();
         region_provider().unwrap().free(region_id).expect("free");
         let result = region_provider()

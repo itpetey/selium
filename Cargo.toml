@@ -7,17 +7,19 @@ members = [
   "crates/core/guest/macros",
   "crates/core/kernel",
   "crates/core/memory",
-  "crates/core/quic",
   "crates/core/runtime",
   "crates/core/shm",
   "crates/core/wire",
-  "crates/guests/bridge",
-  "crates/guests/cluster",
   "crates/guests/discovery",
-  "crates/guests/external-api",
-  "crates/guests/scheduler",
-  "crates/guests/supervisor",
+  "crates/guests/spine-demo",
 ]
+# Frozen during the spine rebuild (kept in-tree for later increments):
+#   "crates/core/quic"
+#   "crates/guests/bridge"
+#   "crates/guests/cluster"
+#   "crates/guests/external-api"
+#   "crates/guests/scheduler"
+#   "crates/guests/supervisor"
 
 [workspace.package]
 version = "1.0.0-alpha.6"
@@ -31,14 +33,12 @@ keywords = ["data", "etl", "streaming", "wasm", "webassembly"]
 categories = ["development-tools", "virtualization", "wasm"]
 
 [workspace.dependencies]
-axum = { version = "0.8", default-features = false }
 blake3 = { version = "1.8", default-features = false }
 bytes = { version = "1.12", default-features = false }
 flatbuffers = { version = "25.12", default-features = false }
 futures = { version = "0.3", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
-quinn = { version = "0.12", default-features = false }
 quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 selium-abi = { path = "crates/core/abi", default-features = false }
@@ -62,7 +62,6 @@ tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", default-features = false }
 wasmtiny = { version = "0.1", default-features = false }
 wat = { version = "1.254", default-features = false }
-web-time = { version = "1.1", default-features = false }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
@@ -104,7 +103,4 @@ unwrap_in_result = "warn"
 unwrap_used = "warn"
 
 [patch.crates-io]
-axum = { git = "https://github.com/tokio-rs/axum" }
-quinn = { git = "https://github.com/quinn-rs/quinn" }
 wasmtiny = { path = "../../wasmtiny" }
-web-time = { git = "https://github.com/itpetey/web-time" }

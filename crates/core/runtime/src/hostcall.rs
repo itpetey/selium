@@ -9,7 +9,7 @@ use selium_abi::{
     ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
 };
 use selium_encoding::{FlatMsg, log::LogRecord};
-use wasmtiny::RegionProt as WasmProt;
+use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
 
 use crate::{
     ReadinessCondition, SystemGuestDescriptor,
@@ -24,7 +24,7 @@ impl Runtime {
         process_id: ProcessId,
         request: HostcallRequest,
     ) -> (u32, OperationId) {
-        self.begin_hostcall_with_task(process_id, request, None)
+        self.begin_hostcall_with_task(process_id, request, None, None)
     }
 
     pub(crate) fn begin_hostcall_with_task(
@@ -32,8 +32,9 @@ impl Runtime {
         process_id: ProcessId,
         request: HostcallRequest,
         task_id: Option<TaskId>,
+        guest_memory: Option<SharedMemory>,
     ) -> (u32, OperationId) {
-        let state = match self.dispatch_hostcall(process_id, request) {
+        let state = match self.dispatch_hostcall(process_id, request, guest_memory.as_ref()) {
             Ok(state) => state,
             Err(error) => HostOperationState::Failed(error),
         };
@@ -128,6 +129,7 @@ impl Runtime {
         &self,
         process_id: ProcessId,
         request: HostcallRequest,
+        guest_memory: Option<&SharedMemory>,
     ) -> std::result::Result<HostOperationState, AbiError> {
         if !self.process_authorities.lock().contains_key(&process_id) {
             return Err(AbiError::new(
@@ -280,35 +282,62 @@ impl Runtime {
                     Some(ResourceIdentity::Shared(region_id)),
                 )?;
 
-                // Look up the wasmtiny region id backing this selium region.
-                let wasm_region_id = self
-                    .kernel
-                    .wasmtiny_region_id(region_id)
-                    .map_err(kernel_error)?;
-
-                // Map into the attaching guest's memory with requested protection.
-                let mut guests = self.loaded_guests.lock();
-                let guest = guests.get_mut(&process_id).ok_or_else(|| {
-                    AbiError::new(
-                        AbiErrorCode::InvalidHandle,
-                        "process not found for AttachRegion",
-                    )
-                })?;
-                let page_offset = guest
-                    .app
-                    .attach_shared_region(
-                        guest.module_index,
-                        wasm_region_id,
-                        to_wasm_prot(prot),
-                        reader_slot,
-                    )
-                    .map_err(|e| {
+                let page_offset = if let Some(memory) = &guest_memory {
+                    // Attach directly into the calling guest's memory. This
+                    // works while the guest is mid-execution (e.g. inside its
+                    // entrypoint), when its `WasmApplication` is borrowed by
+                    // the executor and unavailable through the loaded-guest
+                    // table.
+                    let mut memory = memory.lock().map_err(|_lock_err| {
                         AbiError::new(
                             AbiErrorCode::Internal,
-                            format!("attach shared region failed: {e}"),
+                            "guest memory lock poisoned".to_string(),
                         )
                     })?;
-                drop(guests);
+                    self.kernel
+                        .attach_shared_region_to_memory(
+                            &mut memory,
+                            region_id,
+                            to_wasm_prot(prot),
+                            reader_slot,
+                        )
+                        .map_err(|e| {
+                            AbiError::new(
+                                AbiErrorCode::Internal,
+                                format!("attach shared region failed: {e}"),
+                            )
+                        })?
+                } else {
+                    // Host-driven path (tests and tooling): map through the
+                    // guest's `WasmApplication` in the loaded-guest table.
+                    let wasm_region_id = self
+                        .kernel
+                        .wasmtiny_region_id(region_id)
+                        .map_err(kernel_error)?;
+                    let mut guests = self.loaded_guests.lock();
+                    let guest = guests.get_mut(&process_id).ok_or_else(|| {
+                        AbiError::new(
+                            AbiErrorCode::InvalidHandle,
+                            "process not found for AttachRegion",
+                        )
+                    })?;
+                    let page_offset = guest
+                        .app
+                        .attach_shared_region(
+                            guest.module_index,
+                            wasm_region_id,
+                            to_wasm_prot(prot),
+                            reader_slot,
+                        )
+                        .map_err(|e| {
+                            AbiError::new(
+                                AbiErrorCode::Internal,
+                                format!("attach shared region failed: {e}"),
+                            )
+                        })?;
+                    drop(guests);
+                    page_offset
+                };
 
                 let local_id = self
                     .kernel

@@ -180,17 +180,29 @@ impl Kernel {
         let local_mapping_id = state.local_mapping_id;
         let mut read_pos = state.read_position;
 
-        // Ring buffer layout constants (must match selium-guest's io::region).
-        const DATA_OFFSET: u64 = 4096; // PAGE_SIZE
+        // Ring buffer layout constants (must match selium-shm's region layout).
+        const DATA_OFFSET: u64 = 4096; // coordination header size
         const HEADER_SIZE: u64 = 12;
         const FLAG_READY: u8 = 0x01;
+        /// Offset of the shared ring capacity in the coordination header
+        /// (must match `SHARED_CAPACITY_OFFSET` in selium-shm).
+        const SHARED_CAPACITY_OFFSET: u64 = 1072;
 
-        // Read the shared region length to compute the mask.
-        let shared_id = process
-            .log_channel_shared_id
-            .ok_or_else(|| Error::NotFound("no log channel".to_string()))?;
-        let region_len = self.shared_region_len(shared_id)? as u64;
-        let data_capacity = region_len - DATA_OFFSET;
+        // Read the ring data capacity from the shared channel header. The
+        // region allocation is larger than the ring (page-aligned), so the
+        // capacity cannot be derived from the region length.
+        let capacity_bytes =
+            self.read_shared_memory(local_mapping_id, SHARED_CAPACITY_OFFSET, 8)?;
+        let data_capacity = u64::from_le_bytes(
+            capacity_bytes
+                .try_into()
+                .map_err(|_error| Error::Wasm("invalid shared capacity".to_string()))?,
+        );
+        if data_capacity == 0 || !data_capacity.is_power_of_two() {
+            return Err(Error::Wasm(format!(
+                "log channel has invalid capacity {data_capacity}"
+            )));
+        }
         let mask = data_capacity - 1; // power-of-two capacity
 
         // Read next_tail from shared memory (offset 8 in the coordination area).

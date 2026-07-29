@@ -23,6 +23,7 @@ tracing.workspace = true
 wasmtiny.workspace = true
 
 [dev-dependencies]
+selium-encoding.workspace = true
 wat.workspace = true
 
 [lints]

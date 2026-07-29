@@ -4,7 +4,11 @@ use std::{
 };
 
 use selium_abi::SharedResourceId;
-use wasmtiny::runtime::{SharedRegionId, Store};
+use wasmtiny::{
+    RegionProt,
+    memory::Memory,
+    runtime::{SharedRegionId, Store},
+};
 
 use crate::{
     Error, Result,
@@ -217,6 +221,28 @@ impl Kernel {
         // Validate the mapping exists and return the same id.
         let _ = self.shared_mapping(local_id)?;
         Ok(local_id)
+    }
+
+    /// Maps a shared region into a guest's linear memory, returning the page
+    /// offset where it was mapped.
+    ///
+    /// This operates directly on the calling guest's memory, so it works while
+    /// the guest is mid-execution (e.g. inside its entrypoint), when the
+    /// guest's `WasmApplication` is not available through the runtime's
+    /// loaded-guest table.
+    pub fn attach_shared_region_to_memory(
+        &self,
+        memory: &mut Memory,
+        shared_id: SharedResourceId,
+        prot: RegionProt,
+        reader_slot: Option<u32>,
+    ) -> Result<u32> {
+        let region_id = self.wasmtiny_region_id(shared_id)?;
+        let registry = self.inner.store.lock().shared_memory_registry();
+        registry
+            .lock()
+            .attach_region(memory, region_id, prot, reader_slot)
+            .map_err(map_wasm_error)
     }
 
     /// Registers a shared region that was already allocated (e.g. by WasmApplication)

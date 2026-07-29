@@ -100,6 +100,7 @@ impl HostFunc for HostcallCreateHostFunc {
             self.process_id,
             envelope.request,
             envelope.task_id,
+            guest_memory(caller).ok(),
         );
         Ok(vec![WasmValue::I64(
             pack_hostcall_status(status, operation_id as u32) as i64,

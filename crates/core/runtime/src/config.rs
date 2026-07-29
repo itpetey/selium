@@ -1,4 +1,13 @@
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
+use wasmtiny::WasmValue;
+
+/// Encodes a `u64` as a WASM `i64` entrypoint argument, using the runtime's
+/// tagged `WasmValue` serialisation expected by `decode_wasm_arguments`.
+fn encode_u64_argument(value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    WasmValue::I64(value as i64).to_bytes(&mut bytes);
+    bytes
+}
 
 /// Condition used to decide when a bootstrapped system guest is ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,8 +120,7 @@ impl SystemGuestDescriptor {
     /// app_guest.dependencies.push("discovery".to_string());
     /// ```
     pub fn set_discovery_handle(&mut self, shared_id: u64) {
-        // Encode the shared_id as a little-endian u64 argument.
-        self.arguments = vec![shared_id.to_le_bytes().to_vec()];
+        self.arguments = vec![encode_u64_argument(shared_id)];
     }
 
     /// Sets both the discovery feed ring region id and the discovery RPC
@@ -122,8 +130,25 @@ impl SystemGuestDescriptor {
     /// listener shared id as the second.
     pub fn set_discovery_feed_and_handle(&mut self, feed_region_id: u64, listener_shared_id: u64) {
         self.arguments = vec![
-            feed_region_id.to_le_bytes().to_vec(),
-            listener_shared_id.to_le_bytes().to_vec(),
+            encode_u64_argument(feed_region_id),
+            encode_u64_argument(listener_shared_id),
         ];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_arguments_round_trip_through_wasm_value_codecs() {
+        for value in [0_u64, 1, 7, u32::MAX as u64, u64::MAX] {
+            let bytes = encode_u64_argument(value);
+            let Some((decoded, used)) = WasmValue::from_bytes(&bytes) else {
+                panic!("failed to decode argument {value}");
+            };
+            assert_eq!(used, bytes.len(), "trailing bytes for {value}");
+            assert_eq!(decoded, WasmValue::I64(value as i64));
+        }
     }
 }

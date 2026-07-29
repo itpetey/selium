@@ -8,13 +8,11 @@ Agentic coding guidelines for this Rust workspace.
 # Build all crates
 cargo build --workspace
 
-# Build specific crate
-cargo build -p selium-host
-cargo build -p selium-guest --target wasm32-unknown-unknown
+# Build the guest SDK and system guests for WASM
+cargo build --target wasm32-unknown-unknown -p selium-guest -p selium-discovery -p selium-spine-demo
 
 # Release build
 cargo build --release --workspace
-cargo build --release --target wasm32-unknown-unknown -p selium-guest
 ```
 
 ## Lint Commands
@@ -33,15 +31,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Run all tests (workspace, all targets including doc tests)
 cargo test --workspace --all-targets
 
+# Run the golden-path spine test (requires the wasm32 guest build first)
+cargo build --target wasm32-unknown-unknown -p selium-spine-demo
+cargo test -p selium-runtime --test spine -- --ignored
+
 # Run single test by name
 cargo test test_name_here -- --nocapture
 
 # Run tests for specific crate
-cargo test -p selium-host
+cargo test -p selium-runtime
 cargo test -p selium-guest
-
-# Run tests with output visible
-cargo test -- --nocapture
 ```
 
 ## CRITICAL IMPERATIVES
@@ -52,8 +51,12 @@ cargo test -- --nocapture
   1. `cargo fmt --all`
   2. `cargo clippy --workspace --all-targets -- -D warnings`
   3. `cargo test --workspace --all-targets`
+  4. `cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery`
+  5. `cargo test -p selium-runtime --test spine -- --ignored`
 - **Workspace dependencies** - Use `[workspace.dependencies]` in root `Cargo.toml`. Do not pin different versions.
+- **wasmtiny sibling checkout** - The workspace patches `wasmtiny` from `../../wasmtiny`. Keep the two repos side-by-side, and keep changes to the engine minimal and spec-driven.
 - **International English only** - Do not use American English anywhere in the project unless required for calling third party APIs.
+- **WASM page size is 64 KiB** - `WASM_PAGE_SIZE` (65536) is the page unit for region offsets; `RING_HEADER_SIZE` (4096) is the ring coordination-header layout constant. Never conflate them.
 
 ## Code Style
 
@@ -66,7 +69,6 @@ cargo test -- --nocapture
 ```rust
 // External crates first, then crate modules
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -84,7 +86,7 @@ use crate::error::{Error, Result};
 
 ### Error Handling
 
-**Library crates** (selium-host, selium-guest): Use `thiserror`
+**Library crates**: Use `thiserror`
 ```rust
 use thiserror::Error;
 
@@ -98,16 +100,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-```
-
-**Generic errors**: Implement `Display`, `Debug`, `std::error::Error`
-```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GuestError {
-    Error(String),
-    HotSwap,
-    Restart,
-}
 ```
 
 - Use `#[from]` for automatic error conversion
@@ -140,18 +132,18 @@ pub enum GuestError {
 
 ## Architecture Notes
 
-### selium-host
-- Runs on native target (x86_64/aarch64)
-- Provides WASM runtime via wasmtime
-- Handles capability enforcement, process lifecycle, async I/O
+### Crate roles
+- `selium-abi`: canonical host/guest contract (capabilities, scopes, hostcalls, framing)
+- `selium-kernel`: primitive host-side resources (shared memory, network, storage, processes, activity, metering)
+- `selium-runtime`: wasmtiny-backed execution, sessions, capability enforcement, config-driven bootstrap of system guests
+- `selium-guest`: ergonomic guest SDK (typed handles, codecs, tracing, async reactor)
+- `selium-guest-macros`: procedural macros for entrypoints and interface metadata
+- `selium-memory` / `selium-shm` / `selium-wire`: shared-memory substrate, ring channels, and transport-agnostic messaging patterns
 
-### selium-guest
-- Targets `wasm32-unknown-unknown`
-- Provides utilities for WASM guests
-- Contains scheduler, consensus, routing, discovery modules
-
-## Linting Allowances
-Some lints are intentionally allowed:
-- `#[allow(clippy::type_complexity)]` - Complex types are sometimes necessary
-- `#[allow(dead_code)]` - Public items may be unused initially
-- `#[allow(unused_variables)]` - Callback parameters sometimes unused
+### Design rules
+- Keep `selium-kernel` primitive. Do not move guest policy or orchestration logic into it.
+- Keep `selium-runtime` generic. It bootstraps guests from descriptors and readiness rules rather than hard-coded guest names.
+- Keep `selium-abi` stable and explicit. Host and guest meet there first.
+- Guest I/O is shared-memory-first; hostcalls are for control, not data.
+- `AttachRegion` maps regions into the **calling guest's own memory** (via `HostCaller`), so guests can attach mid-entrypoint.
+```

@@ -1,7 +1,7 @@
 //! Region provider backed by guest hostcalls.
 
 use selium_abi::{HostcallOutput, HostcallRequest, RegionAllocation, RegionProt, ResourceKind};
-use selium_memory::{MemoryError, PAGE_SIZE, Region, RegionProvider};
+use selium_memory::{MemoryError, Region, RegionProvider};
 
 use crate::hostcall::hostcall_ready;
 
@@ -23,20 +23,25 @@ impl RegionProvider for HostcallRegionProvider {
         prot: RegionProt,
         purpose: ResourceKind,
     ) -> Result<Region, MemoryError> {
-        match hostcall_ready(HostcallRequest::AllocRegion {
+        // AllocRegion only reserves the region in the host; it does not map it
+        // into this guest's linear memory. Attach immediately so the returned
+        // `Region` is usable.
+        let allocation = match hostcall_ready(HostcallRequest::AllocRegion {
             pages,
             prot,
             purpose,
         })
         .map_err(|error| MemoryError::Other(error.to_string()))?
         {
-            HostcallOutput::RegionAlloc(allocation) => {
-                Ok(Region::new(allocation, pages as u64 * PAGE_SIZE, None))
+            HostcallOutput::RegionAlloc(allocation) => allocation,
+            _ => {
+                return Err(MemoryError::Other(
+                    "unexpected hostcall output for AllocRegion".to_string(),
+                ));
             }
-            _ => Err(MemoryError::Other(
-                "unexpected hostcall output for AllocRegion".to_string(),
-            )),
-        }
+        };
+
+        self.attach(allocation.region_id, None, prot)
     }
 
     fn attach(
@@ -57,7 +62,7 @@ impl RegionProvider for HostcallRegionProvider {
                     region_id,
                     page_offset: attachment.page_offset,
                 },
-                0,
+                u64::from(attachment.len),
                 None,
             )),
             _ => Err(MemoryError::Other(

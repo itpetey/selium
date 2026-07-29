@@ -1,6 +1,6 @@
 use std::io;
 
-use selium_abi::{AbiError, Capability};
+use selium_abi::{AbiError, AbiErrorCode};
 use thiserror::Error;
 
 /// Result type used by the Selium guest SDK.
@@ -15,9 +15,9 @@ pub enum GuestError {
     #[error("codec error: {0}")]
     /// Encoding or decoding failed.
     Codec(#[from] selium_abi::RkyvError),
-    #[error("permission denied for capability {0:?}")]
-    /// The host denied access to a capability.
-    PermissionDenied(Capability),
+    #[error("permission denied: {0}")]
+    /// The host denied access to a capability, with the host-supplied detail.
+    PermissionDenied(String),
     #[error("unexpected hostcall output")]
     /// The host returned a response variant that did not match the request.
     UnexpectedHostcallOutput,
@@ -32,8 +32,8 @@ pub enum GuestError {
 }
 
 pub(crate) fn abi_error_to_guest_error(error: AbiError) -> GuestError {
-    if error.code == selium_abi::AbiErrorCode::PermissionDenied {
-        GuestError::PermissionDenied(Capability::SharedMemory)
+    if error.code == AbiErrorCode::PermissionDenied {
+        GuestError::PermissionDenied(error.message)
     } else {
         GuestError::Host(format!("{:?}: {}", error.code, error.message))
     }

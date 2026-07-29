@@ -2,18 +2,14 @@
 
 use crate::hostcall_region_provider::HostcallRegionProvider;
 
-#[cfg(all(feature = "quinn", target_arch = "wasm32"))]
-pub use crate::net::quinn::{QuinnRuntime, QuinnUdpSocket};
 pub use crate::{
     async_runtime::{
         JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
     },
     context::Context,
     error::{GuestError, Result},
-    net::tcp::{TcpAccept, TcpListener, TcpStream},
-    net::udp::UdpSocket,
     platform::{mark_ready, process_id},
-    process::{ActivityLog, GuestLog, Metering, Process},
+    process::{ActivityLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     storage::{BlobStore, DurableLog},
     time::{Instant, Timer, now},
@@ -31,7 +27,7 @@ pub use selium_encoding::{
 };
 pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
 // Re-export transport-agnostic memory primitives.
-pub use selium_memory::{PAGE_SIZE, RegionMapping, SHARED_REGION_MAGIC};
+pub use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
 pub use tracing::{debug, error, info, trace, warn};
 
 mod async_runtime;
@@ -40,7 +36,6 @@ mod error;
 mod hostcall;
 mod hostcall_region_provider;
 pub mod log;
-mod net;
 mod platform;
 mod process;
 mod resource;

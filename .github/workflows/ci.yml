@@ -7,10 +7,12 @@ on:
   push:
     branches:
       - main
+      - spine
 
   pull_request:
     branches:
       - main
+      - spine
 
 jobs:
   check:
@@ -20,7 +22,15 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
+      # The workspace pins wasmtiny via a path dependency at ../../wasmtiny,
+      # so the repos are checked out side-by-side to preserve that layout.
       - uses: actions/checkout@v6
+        with:
+          path: proto/arch3
+      - uses: actions/checkout@v6
+        with:
+          repository: itpetey/wasmtiny
+          path: wasmtiny
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
         with:
           toolchain: stable
@@ -29,12 +39,15 @@ jobs:
 
       - name: cargo check
         run: cargo check --workspace --all-targets
+        working-directory: proto/arch3
 
       - name: cargo fmt
         run: cargo fmt --all --check
+        working-directory: proto/arch3
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: proto/arch3
 
   test:
     name: Cargo tests
@@ -44,6 +57,12 @@ jobs:
       RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v6
+        with:
+          path: proto/arch3
+      - uses: actions/checkout@v6
+        with:
+          repository: itpetey/wasmtiny
+          path: wasmtiny
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
         with:
           toolchain: stable
@@ -51,56 +70,34 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+        working-directory: proto/arch3
 
-  ignored:
-    name: Cargo ignored tests
+  spine:
+    name: Golden-path spine (WASM guest)
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v6
+        with:
+          path: proto/arch3
+      - uses: actions/checkout@v6
+        with:
+          repository: itpetey/wasmtiny
+          path: wasmtiny
       - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
-      - name: cargo test --ignored
-        run: cargo test -- --ignored
+      # Every system guest must compile to wasm32; regressions here are
+      # invisible to the native test suite.
+      - name: build guests for wasm32
+        run: cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery -p selium-guest
+        working-directory: proto/arch3
 
-  docs:
-    name: docs.rs test build
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -Dwarnings
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
-        with:
-          toolchain: nightly
-      - uses: dtolnay/install@97c306b4fb754e1dbe18619415cf4a90ae0aa6a2
-        with:
-          crate: cargo-docs-rs
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: cargo docs-rs
-        run: cargo +nightly docs-rs -p selium-userland
-
-  loom:
-    name: Loom tests
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
-        with:
-          toolchain: stable
-      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-
-      - name: selium-messaging loom tests
-        run: cargo test -p selium-messaging --features loom --tests
+      - name: golden-path spine test
+        run: cargo test -p selium-runtime --test spine -- --ignored
+        working-directory: proto/arch3

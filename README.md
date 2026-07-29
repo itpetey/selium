@@ -1,49 +1,87 @@
 # Selium
 
-[![Crates.io][crates-badge]][crates-url]
-[![MPL2 licensed][mpl-badge]][mpl-url]
-[![Build Status][build-badge]][build-url]
-[![Audit Status][audit-badge]][audit-url]
+Selium is a software-defined cloud infrastructure platform: application
+stacks are composed entirely in code — typed I/O channels, strict
+capabilities, and zero external configuration — and executed as WebAssembly
+guests on a minimal host.
 
-[crates-badge]: https://img.shields.io/crates/v/selium-kernel.svg
-[crates-url]: https://crates.io/crates/selium-kernel
-[mpl-badge]: https://img.shields.io/badge/licence-MPL2-blue.svg
-[mpl-url]: https://github.com/seliumlabs/selium/blob/main/LICENCE
-[build-badge]: https://github.com/seliumlabs/selium/actions/workflows/ci.yml/badge.svg
-[build-url]: https://github.com/seliumlabs/selium/actions/workflows/ci.yml
-[audit-badge]: https://github.com/seliumlabs/selium/actions/workflows/audit.yml/badge.svg
-[audit-url]: https://github.com/seliumlabs/selium/actions/workflows/audit.yml
+The design intention, in one sentence: **developers should build and own the
+whole stack without touching traditional infrastructure or networking.**
 
-Selium is a software framework and runtime for building scalable, connected applications. With Selium, you can compose entire application stacks with **strict capabilities**, **typed I/O**, and **zero infrastructure**.
+## What runs today
 
-You get the ergonomics of an application platform, with the safety properties of a capability system:
+The **spine** of the platform works and is continuously tested:
 
-- **Zero DevOps**: a batteries-included platform that is entirely composable in code.
-- **Ergonomic I/O everywhere**: first class composable messaging, even when interacting with network protocols.
-- **End-to-end type safety**: seamless type support across process and network boundaries.
-- **No ambient authority**: guests only receive the capabilities you grant them at runtime.
+- Real WASM guests (`wasm32-unknown-unknown`, no WASI) executing on wasmtiny
+- The hostcall ABI (`selium-abi`, rkyv-encoded): capability-gated shared
+  memory alloc/attach, host queues, storage, process lifecycle, activity and
+  guest logs
+- Shared-memory channels (`selium-shm`): lock-free ring buffers with typed
+  pub/sub, RPC, and live-table overlays (`selium-wire`)
+- Structured guest logging over a shared-memory channel, drained by the host
+- Config-driven bootstrap of WASM system guests with per-process capability
+  grants
 
-**Status:** alpha (APIs and project structure are still evolving).
+The proof is the **golden-path test**: a real guest
+(`crates/guests/spine-demo`) is compiled to WASM, bootstrapped by the
+runtime, creates shared-memory channels, completes a typed pub/sub round
+trip, and streams structured logs back to the host. Run it:
 
----
+```sh
+cargo build --target wasm32-unknown-unknown -p selium-spine-demo
+cargo test -p selium-runtime --test spine -- --ignored
+```
 
-## Getting started
+## Deferred (explicitly not working yet)
 
-The fastest way to orient yourself is by [checking out an example](examples/).
+- Networking (TCP/UDP bridges, QUIC, external clients)
+- Discovery service wiring and AAA (capability grants exist; tenant/URI
+  enforcement is not implemented)
+- Multi-host clustering, scheduling, supervision, external API
+- Durable storage (current logs/blob stores are in-memory)
+- Guest wake/wait for channel I/O (currently spin/poll based)
 
-You can also find [Selium modules in their own repo](https://github.com/seliumlabs/selium-modules). These modules add significant extra functionality on top of the core platform.
+Frozen crates retained in-tree for later increments: `crates/core/quic`,
+`crates/guests/{bridge,cluster,scheduler,supervisor,external-api}` — these
+are not in the workspace and do not build.
 
----
+## Repository layout
+
+| Crate | Role |
+| --- | --- |
+| `crates/core/abi` | Canonical host↔guest contract: capabilities, scopes, hostcall payloads, framing |
+| `crates/core/encoding` | FlatBuffers message encoding, log record types, schema bindings |
+| `crates/core/memory` | `RegionMapping`/`RegionProvider` shared-memory abstraction |
+| `crates/core/shm` | Shared-memory ring channels (`Channel`, `RingBuf`, blocking/non-blocking readers/writers) |
+| `crates/core/wire` | Transport-agnostic framing + pub/sub, RPC, live-table patterns |
+| `crates/core/kernel` | Primitive host resources: shared memory, network, storage, processes, activity, metering |
+| `crates/core/runtime` | Wasmtiny-backed execution, capability enforcement, system-guest bootstrap, hostcall dispatch |
+| `crates/core/guest` | The guest SDK: hostcalls, async reactor, typed handles, tracing integration |
+| `crates/core/guest/macros` | `#[entrypoint]`, `#[pattern_interface]`, `#[schema]` proc macros |
+| `crates/guests/discovery` | Discovery system guest (URI registration/resolution store + wiring) |
+| `crates/guests/spine-demo` | Golden-path demo guest used by the spine test |
+
+## Building
+
+Requires stable Rust and the `wasm32-unknown-unknown` target:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --workspace
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+**Note:** the workspace depends on a sibling checkout of
+[`wasmtiny`](https://github.com/itpetey/wasmtiny) via a path patch
+(`../../wasmtiny`). Both repos must sit side-by-side for the build to
+resolve.
 
 ## Contributing
 
-We'd love your help! Check out the issue log or join in a discussion to get started.
-
-See `AGENTS.md` for contribution rules, including: stable Rust only, `tracing` logging, and International English.
-
-For the current foundation split between ABI, kernel, runtime, guest SDK, and macros, see `docs/foundation-boundaries.md`.
-
----
+See `AGENTS.md` for rules: stable Rust, edition 2024, no WASI, `tracing`
+for logging, International English, and the pre-commit gate (fmt, clippy,
+tests, wasm32 guest builds, spine test).
 
 ## Licence
 

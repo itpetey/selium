@@ -19,10 +19,6 @@ pub struct ActivityLog;
 #[derive(Clone, Copy, Debug)]
 pub struct Metering;
 
-/// Accessor for guest log entries.
-#[derive(Clone, Copy, Debug)]
-pub struct GuestLog;
-
 impl Process {
     /// Starts a process from a module, entrypoint, arguments, and grants.
     pub fn start(

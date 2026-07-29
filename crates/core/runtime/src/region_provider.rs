@@ -50,7 +50,7 @@ impl RuntimeRegionProvider {
 
 impl RegionProvider for RuntimeRegionProvider {
     fn allocate(&self, pages: u32, _prot: RegionProt, _purpose: ResourceKind) -> Result<Region> {
-        let size_bytes = pages as u64 * selium_memory::PAGE_SIZE;
+        let size_bytes = pages as u64 * selium_memory::WASM_PAGE_SIZE;
         let size_u32 = u32::try_from(size_bytes)
             .map_err(|_error| MemoryError::Other("region size exceeds u32".to_string()))?;
         let (shared_id, len) = self

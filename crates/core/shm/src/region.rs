@@ -4,21 +4,22 @@ use std::{
 };
 
 use selium_abi::{RegionProt, ResourceKind};
-use selium_memory::{PAGE_SIZE, Region, RegionMapping};
+use selium_memory::{RING_HEADER_SIZE, Region, RegionMapping, WASM_PAGE_SIZE};
 use selium_wire::error::{Error, Result};
 
 /// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
 pub const BACKPRESSURE_OFFSET: u64 = 1064;
-/// Byte offset where ring buffer data begins (page 1).
-pub const DATA_OFFSET: u64 = PAGE_SIZE;
+/// Byte offset where ring buffer data begins (after the coordination header).
+pub const DATA_OFFSET: u64 = RING_HEADER_SIZE;
 /// Byte offset of the generation counter within the shared region.
 pub const GENERATION_COUNTER_OFFSET: u64 = 0;
 /// Maximum number of blocking reader slots available in the shared region.
 pub const MAX_READER_SLOTS: usize = 128;
 /// Maximum number of blocking writer slots available in the shared region.
 pub const MAX_WRITER_SLOTS: usize = 128;
-/// Minimum region size that can hold a ring buffer (header page + one data page).
-pub const MIN_REGION_BYTES: u64 = PAGE_SIZE * 2;
+/// Minimum region size that can hold a ring buffer (coordination header + one
+/// header-sized data area).
+pub const MIN_REGION_BYTES: u64 = RING_HEADER_SIZE * 2;
 /// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
 pub const NEXT_TAIL_OFFSET: u64 = 8;
 /// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
@@ -568,7 +569,7 @@ fn encode_writer_position(position: u64) -> Result<u64> {
 
 /// Computes the number of WASM pages needed to hold `bytes`.
 fn pages_for_bytes(bytes: u64) -> u32 {
-    bytes.div_ceil(PAGE_SIZE) as u32
+    bytes.div_ceil(WASM_PAGE_SIZE) as u32
 }
 
 fn reserve_tail_next(
