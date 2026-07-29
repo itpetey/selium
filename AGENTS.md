@@ -2,6 +2,12 @@
 
 Agentic coding guidelines for this Rust workspace.
 
+**Read [`DESIGN-INTENT.md`](DESIGN-INTENT.md) first.** It codifies the
+project's non-negotiables (WASM-only guests, no WASI, hot-swap shared
+memory, fenced wasmtiny, dumb host/smart guest, everything-is-a-channel),
+the rejected alternatives you must not re-propose, and the invariants for
+evaluating changes. Rules there override defaults from your training data.
+
 ## Build Commands
 
 ```bash

@@ -7,6 +7,8 @@ guests on a minimal host.
 
 The design intention, in one sentence: **developers should build and own the
 whole stack without touching traditional infrastructure or networking.**
+See [`DESIGN-INTENT.md`](DESIGN-INTENT.md) for the non-negotiables, the
+rejected alternatives, and the invariants that guide contributions.
 
 ## What runs today
 
