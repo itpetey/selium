@@ -11,9 +11,10 @@ fn main() -> Result<()> {
     let runtime = Runtime::new(kernel);
 
     // Bootstrap system guests
-    let mut config = RuntimeConfig::default();
-    config.start_discovery = false;
-    config.system_guests = vec![spine_demo()?];
+    let config = RuntimeConfig {
+        start_discovery: false,
+        system_guests: vec![spine_demo()?],
+    };
     let report = runtime.bootstrap_system_guests(config)?;
 
     let process_id = report
@@ -26,7 +27,12 @@ fn main() -> Result<()> {
     let activity = runtime.activity_log();
     println!("=== Activity Log ===");
     for event in &activity {
-        println!("  [{:?}] {}: {}", event.kind, event.process_id.unwrap_or(0), event.message);
+        println!(
+            "  [{:?}] {}: {}",
+            event.kind,
+            event.process_id.unwrap_or(0),
+            event.message
+        );
     }
 
     // Drain and print guest log messages
@@ -34,17 +40,19 @@ fn main() -> Result<()> {
     let frames = runtime
         .kernel()
         .drain_log_channel(process_id)
-        .expect("drain log channel");
+        .map_err(|error| anyhow::anyhow!("drain log channel: {error}"))?;
     for frame in &frames {
         let record = selium_encoding::log::LogRecord::decode(frame)
-            .expect("decode log record");
+            .map_err(|error| anyhow::anyhow!("decode log record: {error}"))?;
         println!("  {}", record.message);
     }
 
     // Stop the process and clean up
     println!("\n--- stopping process ---");
     runtime.stop_process(process_id)?;
-    assert_eq!(runtime.loaded_guest_count(), 0);
+    if runtime.loaded_guest_count() != 0 {
+        anyhow::bail!("expected 0 loaded guests after stop");
+    }
 
     Ok(())
 }

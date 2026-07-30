@@ -676,6 +676,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-discovery-probe"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-shm",
+ "selium-wire",
+]
+
+[[package]]
 name = "selium-encoding"
 version = "1.0.0-alpha.6"
 dependencies = [

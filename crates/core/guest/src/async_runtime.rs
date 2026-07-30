@@ -254,8 +254,13 @@ fn poll_backgrounds() -> bool {
             }
         }
     });
-    // Apply any wakeups or spawns that tasks queued while being polled above.
-    progressed | apply_wake_queue() | merge_spawn_queue()
+    // Drain wakes/spawns that tasks generated while being polled.
+    // These are applied for the next iteration but do not by themselves
+    // keep the reactor alive — only task completions and new spawns
+    // constitute forward progress.
+    apply_wake_queue();
+    merge_spawn_queue();
+    progressed
 }
 
 #[cfg(test)]
@@ -271,6 +276,13 @@ mod tests {
             yield_now().await;
             *value_for_task.borrow_mut() = 7;
         });
+        // First pass: task runs, hits yield_now (Pending + self-wake), parks.
+        // The self-wake marks the task runnable for the next pass.
+        poll_reactor();
+        assert_eq!(*value.borrow(), 0);
+
+        // Second pass: task is runnable, yield_now completes (Ready), task sets
+        // value and finishes.
         poll_reactor();
 
         assert_eq!(*value.borrow(), 7);

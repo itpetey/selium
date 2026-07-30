@@ -12,7 +12,8 @@ rejected alternatives, and the invariants that guide contributions.
 
 ## What runs today
 
-The **spine** of the platform works and is continuously tested:
+The **spine** and **discovery control-plane** of the platform work and are
+continuously tested:
 
 - Real WASM guests (`wasm32-unknown-unknown`, no WASI) executing on wasmtiny
 - The hostcall ABI (`selium-abi`, rkyv-encoded): capability-gated shared
@@ -23,21 +24,37 @@ The **spine** of the platform works and is continuously tested:
 - Structured guest logging over a shared-memory channel, drained by the host
 - Config-driven bootstrap of WASM system guests with per-process capability
   grants
+- Discovery system guest (`crates/guests/discovery`): Tier-1 runtime feed
+  registration, Tier-2 guest-driven URI resolution over shm RPC, and
+  revocation on process exit
 
-The proof is the **golden-path test**: a real guest
-(`crates/guests/spine-demo`) is compiled to WASM, bootstrapped by the
-runtime, creates shared-memory channels, completes a typed pub/sub round
-trip, and streams structured logs back to the host. Run it:
+The proof is two integration tests:
+
+**Spine** — a real guest (`crates/guests/spine-demo`) is compiled to WASM,
+bootstrapped by the runtime, creates shared-memory channels, completes a
+typed pub/sub round trip, and streams structured logs back to the host:
 
 ```sh
 cargo build --target wasm32-unknown-unknown -p selium-spine-demo
 cargo test -p selium-runtime --test spine -- --ignored
 ```
 
+**Discovery** — the discovery system guest and a probe fixture guest
+(`crates/guests/discovery-probe`) are compiled to WASM and bootstrapped
+together: the runtime injects discovery wiring (feed ring + RPC listener),
+both guests reach readiness, Tier-1 region registration events flow through
+the feed, Tier-2 RPC resolution works between two real WASM guests, and URI
+revocation fires on process exit:
+
+```sh
+cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-discovery-probe
+cargo test -p selium-runtime --test discovery -- --ignored
+```
+
 ## Deferred (explicitly not working yet)
 
 - Networking (TCP/UDP bridges, QUIC, external clients)
-- Discovery service wiring and AAA (capability grants exist; tenant/URI
+- AAA / tenant enforcement (capability grants exist; tenant/URI
   enforcement is not implemented)
 - Multi-host clustering, scheduling, supervision, external API
 - Durable storage (current logs/blob stores are in-memory)
@@ -61,6 +78,7 @@ are not in the workspace and do not build.
 | `crates/core/guest` | The guest SDK: hostcalls, async reactor, typed handles, tracing integration |
 | `crates/core/guest/macros` | `#[entrypoint]`, `#[pattern_interface]`, `#[schema]` proc macros |
 | `crates/guests/discovery` | Discovery system guest (URI registration/resolution store + wiring) |
+| `crates/guests/discovery-probe` | Discovery probe test fixture guest (exercises Tier-2 RPC against discovery) |
 | `crates/guests/spine-demo` | Golden-path demo guest used by the spine test |
 
 ## Building

@@ -11,6 +11,7 @@ members = [
   "crates/core/shm",
   "crates/core/wire",
   "crates/guests/discovery",
+  "crates/guests/discovery-probe",
   "crates/guests/spine-demo",
 ]
 # Frozen during the spine rebuild (kept in-tree for later increments):

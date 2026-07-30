@@ -40,8 +40,19 @@ When a guest instance terminates, `selium-runtime` SHALL automatically call `fre
 - **WHEN** a guest with a `Network` capability invokes `UdpBind`
 - **THEN** the runtime SHALL validate the capability and delegate to the kernel, returning a `SharedRegionDescriptor` with the standard layout
 
-### Requirement: Discovery Bootstrap Integration
-`selium-runtime` SHALL pass the discovery host queue's `shared_id` to application guest entrypoints as the `discovery_handle` argument, enabling guests to construct a `Context` for URI resolution.
+### Requirement: Discovery-Enabled Bootstrap
+
+`selium-runtime` SHALL support `start_discovery` in `RuntimeConfig`, creating the Tier-1 feed ring and RPC listener, injecting tagged `WasmValue` entrypoint arguments (feed region id and listener handle into the discovery guest; listener handle into other guests with empty argument lists), and gating readiness per guest on `mark_ready()`.
+
+#### Scenario: Discovery wiring uses tagged argument encoding
+
+- **WHEN** the runtime injects discovery arguments into a guest descriptor
+- **THEN** `decode_wasm_arguments` decodes every injected value without error, for all possible u64 handle values
+
+#### Scenario: Readiness is per-guest
+
+- **WHEN** a bootstrapped guest does not call `mark_ready()` within the readiness window
+- **THEN** the runtime rolls back the bootstrap and reports `ReadinessUnsatisfied` naming that guest
 
 #### Scenario: Application guest receives discovery handle
 - **WHEN** the runtime bootstraps an application guest
@@ -67,8 +78,14 @@ When the runtime dispatches an `AllocRegion` hostcall, it SHALL send `DiscoveryR
 - **WHEN** a guest invokes `AllocRegion { purpose: SharedMemory, ... }` and the runtime allocates region 3 for process 42
 - **THEN** the runtime SHALL register `sel://process/42/regions/3` (no purpose alias for generic regions)
 
-### Requirement: Automatic resource revocation on process termination
-When a guest process terminates, the runtime SHALL send `DiscoveryRequest::Revoke` for every URI registered under `sel://process/<process_id>/`. This SHALL include both the `regions/<id>` entries and all purpose-specific aliases.
+### Requirement: Process Teardown Revocation
+
+When a process exits, the runtime SHALL publish Tier-1 revocation events for all URIs registered for that process's regions before reclaiming its resources.
+
+#### Scenario: Exit revokes before reclaim
+
+- **WHEN** a process with allocated regions is stopped
+- **THEN** revocation events for its region URIs are published to the discovery feed before its shared resources are reclaimed
 
 #### Scenario: Runtime revokes all process URIs on exit
 - **WHEN** process 42 terminates
