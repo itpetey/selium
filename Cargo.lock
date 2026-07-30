@@ -743,6 +743,7 @@ dependencies = [
 name = "selium-runtime"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "parking_lot",
  "selium-abi",
  "selium-encoding",

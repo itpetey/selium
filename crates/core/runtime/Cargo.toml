@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 parking_lot.workspace = true
 selium-abi.workspace = true
 selium-encoding.workspace = true
