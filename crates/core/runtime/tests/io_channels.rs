@@ -7,6 +7,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
     RegionProt,
 };
+use selium_memory::FrameHeader;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
 /// Tests AllocRegion and FreeRegion lifecycle.
@@ -138,8 +139,6 @@ fn attach_region(
 /// Tests the selium-io frame header wire format through kernel shared memory.
 #[test]
 fn frame_header_round_trip() {
-    use selium_wire::frame::FrameHeader;
-
     let runtime = Runtime::default();
     let process_id = spawn_guest(&runtime, "frame");
 

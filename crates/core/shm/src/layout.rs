@@ -25,95 +25,70 @@ use selium_wire::error::{Error, Result};
 // Re-export FrameHeader so the layout module is the canonical import path.
 pub use selium_memory::FrameHeader;
 
-// ── Offset constants ─────────────────────────────────────────────────
-
-/// Byte offset of the generation counter within the shared region.
-pub const GENERATION_COUNTER_OFFSET: u64 = 0;
-/// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
-pub const NEXT_TAIL_OFFSET: u64 = 8;
-/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
-pub const WRITER_COUNT_OFFSET: u64 = 16;
-/// Byte offset where the shared `reader_slots` array begins (128 × u64).
-pub const READER_SLOTS_OFFSET: u64 = 24;
-/// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
-pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
-/// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
-pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
 /// Byte offset of the shared backpressure strategy (0 = Park, 1 = Drop).
 pub const BACKPRESSURE_OFFSET: u64 = 1064;
+/// Byte offset where ring buffer data begins (after the coordination header).
+pub const DATA_OFFSET: u64 = RING_HEADER_SIZE;
+/// Byte offset of the generation counter within the shared region.
+pub const GENERATION_COUNTER_OFFSET: u64 = 0;
+/// Maximum number of blocking reader slots available in the shared region.
+pub const MAX_READER_SLOTS: usize = 128;
+/// Maximum number of blocking writer slots available in the shared region.
+pub const MAX_WRITER_SLOTS: usize = 128;
+/// Minimum region size that can hold a ring buffer (coordination header + one
+/// header-sized data area).
+pub const MIN_REGION_BYTES: u64 = RING_HEADER_SIZE * 2;
+/// Byte offset of the shared `next_tail` cursor (writers CAS to reserve space).
+pub const NEXT_TAIL_OFFSET: u64 = 8;
+/// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
+pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+/// Byte offset where the shared `reader_slots` array begins (128 × u64).
+pub const READER_SLOTS_OFFSET: u64 = 24;
+/// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
+pub const READER_SLOT_COUNTER_OFFSET: u64 = 1056;
 /// Byte offset of the shared ring buffer capacity in bytes.
 pub const SHARED_CAPACITY_OFFSET: u64 = 1072;
+/// Byte offset of the shared `writer_count` (incremented/decremented atomically).
+pub const WRITER_COUNT_OFFSET: u64 = 16;
 /// Byte offset where the shared `writer_slots` array begins (128 × u64).
 pub const WRITER_SLOTS_OFFSET: u64 = 1080;
 /// Byte offset of the shared `writer_slot_counter` (fetch_add for unique writer slot indices).
 pub const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
 
-/// Maximum number of blocking reader slots available in the shared region.
-pub const MAX_READER_SLOTS: usize = 128;
-/// Maximum number of blocking writer slots available in the shared region.
-pub const MAX_WRITER_SLOTS: usize = 128;
-
-/// Byte offset where ring buffer data begins (after the coordination header).
-pub const DATA_OFFSET: u64 = RING_HEADER_SIZE;
-/// Minimum region size that can hold a ring buffer (coordination header + one
-/// header-sized data area).
-pub const MIN_REGION_BYTES: u64 = RING_HEADER_SIZE * 2;
-
-// ── Slot encode / decode ────────────────────────────────────────────
-
-/// Encodes a reader position for storage in a shared slot (0 = unallocated).
-pub fn encode_reader_position(position: u64) -> Result<u64> {
-    position.checked_add(1).ok_or(Error::CapacityExceeded)
-}
-
-/// Encodes a writer position for storage in a shared slot (0 = unallocated).
-pub fn encode_writer_position(position: u64) -> Result<u64> {
-    position.checked_add(1).ok_or(Error::CapacityExceeded)
-}
-
-// ── Reservation ─────────────────────────────────────────────────────
-
-/// Computes the next `next_tail` value after reserving `len` bytes.
-///
-/// Returns an error if the reservation would overflow or if backpressure
-/// (reader/writer slot protection) prevents the reservation.
-pub fn reserve_tail_next(
-    tail: u64,
-    len: u64,
-    capacity: u64,
-    minimum_reader_position: Option<u64>,
-    minimum_writer_position: Option<u64>,
-    protect_readers: bool,
-    protect_writers: bool,
-) -> Result<u64> {
-    if len == 0 || len > capacity {
-        return Err(Error::CapacityExceeded);
-    }
-    let next = tail
-        .checked_add(len)
-        .filter(|next| *next < u64::MAX)
-        .ok_or(Error::CapacityExceeded)?;
-    if protect_readers {
-        let head = minimum_reader_position.unwrap_or(tail);
-        if next.saturating_sub(head) > capacity {
-            return Err(Error::BufferFull);
-        }
-    }
-    if protect_writers {
-        let head = minimum_writer_position.unwrap_or(tail);
-        if next.saturating_sub(head) > capacity {
-            return Err(Error::BufferFull);
-        }
-    }
-    Ok(next)
-}
-
-// ── Cursor & wraparound helpers ─────────────────────────────────────
-
 /// A monotonic cursor over a shared-memory ring buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Cursor {
     position: u64,
+}
+
+/// A reader over a shared-memory ring buffer, generic over [`MappingBackend`].
+///
+/// Tracks read position and optionally allocates a reader slot for
+/// backpressure. The `backend` must be scoped to the ring's sub-region
+/// (via `MappingBackend::sub_region` or equivalent).
+pub struct RingReader {
+    backend: Arc<dyn MappingBackend>,
+    capacity: u64,
+    mask: u64,
+    pos: u64,
+    reader_slot: Option<u32>,
+}
+
+/// A writer over a shared-memory ring buffer, generic over [`MappingBackend`].
+///
+/// The `backend` must be scoped to the ring's sub-region (via
+/// `MappingBackend::sub_region` or equivalent).
+///
+/// # Atomicity contract
+///
+/// Each ring is **single-writer-domain**: all writers on a given ring MUST
+/// operate within the same atomicity domain (guest hardware atomics OR host
+/// mutex-mediated atomics, never mixed). See the crate-level docs and
+/// `AGENTS.md` for details.
+pub struct RingWriter {
+    backend: Arc<dyn MappingBackend>,
+    capacity: u64,
+    mask: u64,
 }
 
 impl Cursor {
@@ -161,497 +136,6 @@ impl Cursor {
         let head_seg = len.wrapping_sub(tail_seg);
         (tail_seg, head_seg)
     }
-}
-
-/// Computes a mask for a given capacity (must be a power of two).
-pub fn mask_for_capacity(capacity: u64) -> Result<u64> {
-    if !capacity.is_power_of_two() {
-        return Err(Error::InvalidLayout);
-    }
-    Ok(capacity - 1)
-}
-
-/// Rounds a byte capacity to the next power of two for use as a ring buffer.
-pub fn round_capacity(capacity: u64) -> Result<u64> {
-    const MIN_RING_CAPACITY: u64 = 64;
-    capacity
-        .checked_next_power_of_two()
-        .map(|rounded| rounded.max(MIN_RING_CAPACITY))
-        .ok_or(Error::CapacityExceeded)
-}
-
-// ── Ring data I/O helpers ───────────────────────────────────────────
-
-/// Reads `len` bytes from the ring data area at logical position `pos`,
-/// handling wraparound.
-pub fn read_at(
-    backend: &dyn MappingBackend,
-    pos: u64,
-    len: u64,
-    mask: u64,
-    capacity: u64,
-) -> Result<Vec<u8>> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if len > capacity {
-        return Err(Error::InvalidFrame(format!(
-            "read length {len} exceeds capacity {capacity}"
-        )));
-    }
-    let raw_pos = DATA_OFFSET + (pos & mask);
-    let ring_end = DATA_OFFSET + capacity;
-    if raw_pos + len <= ring_end {
-        backend.read(raw_pos, len).map_err(Error::from)
-    } else {
-        let tail_len = ring_end - raw_pos;
-        let head_len = len - tail_len;
-        let mut result = Vec::with_capacity(len as usize);
-        let tail = backend.read(raw_pos, tail_len).map_err(Error::from)?;
-        result.extend_from_slice(&tail);
-        let head = backend.read(DATA_OFFSET, head_len).map_err(Error::from)?;
-        result.extend_from_slice(&head);
-        Ok(result)
-    }
-}
-
-/// Writes `data` at logical position `pos` in the ring data area, handling
-/// wraparound.
-pub fn write_at(
-    backend: &dyn MappingBackend,
-    pos: u64,
-    data: &[u8],
-    mask: u64,
-    capacity: u64,
-) -> Result<()> {
-    if data.len() as u64 > capacity {
-        return Err(Error::BufferFull);
-    }
-    let raw_start = (pos & mask) + DATA_OFFSET;
-    let ring_end = DATA_OFFSET + capacity;
-    let tail = (data.len() as u64).min(ring_end - raw_start) as usize;
-    let head = data.len() - tail;
-    if tail > 0 {
-        backend
-            .write(raw_start, data.get(..tail).unwrap_or_default())
-            .map_err(Error::from)?;
-    }
-    if head > 0 {
-        backend
-            .write(DATA_OFFSET, data.get(tail..).unwrap_or_default())
-            .map_err(Error::from)?;
-    }
-    Ok(())
-}
-
-// ── Slot scanning helpers ───────────────────────────────────────────
-
-/// Returns the minimum active reader position from the shared `reader_slots`
-/// array.
-pub fn minimum_reader_position(backend: &dyn MappingBackend) -> Result<Option<u64>> {
-    let mut minimum = None;
-    for slot in 0..MAX_READER_SLOTS as u32 {
-        let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
-        let encoded = backend.atomic_load_u64(offset, Ordering::Acquire)?;
-        if encoded == 0 {
-            continue;
-        }
-        let position = encoded - 1;
-        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
-    }
-    Ok(minimum)
-}
-
-/// Returns the minimum active writer position from the shared `writer_slots`
-/// array.
-pub fn minimum_writer_position(backend: &dyn MappingBackend) -> Result<Option<u64>> {
-    let mut minimum = None;
-    for slot in 0..MAX_WRITER_SLOTS as u32 {
-        let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
-        let encoded = backend.atomic_load_u64(offset, Ordering::Acquire)?;
-        if encoded == 0 {
-            continue;
-        }
-        let position = encoded - 1;
-        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
-    }
-    Ok(minimum)
-}
-
-// ── Coordination field helpers ──────────────────────────────────────
-
-/// Initialises all shared coordination fields to zero.
-pub fn init_ring(backend: &dyn MappingBackend) -> Result<()> {
-    backend.atomic_store_u64(GENERATION_COUNTER_OFFSET, 0, Ordering::Release)?;
-    backend.atomic_store_u64(NEXT_TAIL_OFFSET, 0, Ordering::Release)?;
-    backend.atomic_store_u64(WRITER_COUNT_OFFSET, 0, Ordering::Release)?;
-    for i in 0..MAX_READER_SLOTS as u32 {
-        let offset = READER_SLOTS_OFFSET + i as u64 * 8;
-        backend.atomic_store_u64(offset, 0, Ordering::Release)?;
-    }
-    backend.atomic_store_u64(NEXT_WRITER_ID_OFFSET, 0, Ordering::Release)?;
-    backend.atomic_store_u64(READER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)?;
-    for i in 0..MAX_WRITER_SLOTS as u32 {
-        let offset = WRITER_SLOTS_OFFSET + i as u64 * 8;
-        backend.atomic_store_u64(offset, 0, Ordering::Release)?;
-    }
-    backend.atomic_store_u64(WRITER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)?;
-    Ok(())
-}
-
-/// Loads the generation counter.
-pub fn load_generation(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .atomic_load_u64(GENERATION_COUNTER_OFFSET, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// Bumps the generation counter and returns the new value.
-pub fn bump_generation(backend: &dyn MappingBackend) -> Result<u64> {
-    let prev = backend
-        .fetch_add_u64(GENERATION_COUNTER_OFFSET, 1, Ordering::Release)
-        .map_err(Error::from)?;
-    Ok(prev + 1)
-}
-
-/// Loads the shared `next_tail` cursor.
-pub fn load_next_tail(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .atomic_load_u64(NEXT_TAIL_OFFSET, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// CAS on the shared `next_tail` cursor. Returns the previous value.
-pub fn cas_next_tail(backend: &dyn MappingBackend, current: u64, new: u64) -> Result<u64> {
-    backend
-        .compare_exchange_u64(NEXT_TAIL_OFFSET, current, new)
-        .map_err(Error::from)
-}
-
-/// Loads the shared `writer_count`.
-pub fn load_writer_count(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .atomic_load_u64(WRITER_COUNT_OFFSET, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// Increments the shared `writer_count`, returning the previous value.
-pub fn increment_writer_count(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .fetch_add_u64(WRITER_COUNT_OFFSET, 1, Ordering::SeqCst)
-        .map_err(Error::from)
-}
-
-/// Decrements the shared `writer_count`.
-pub fn decrement_writer_count(backend: &dyn MappingBackend) -> Result<()> {
-    backend
-        .fetch_add_u64(WRITER_COUNT_OFFSET, u64::MAX, Ordering::SeqCst)
-        .map_err(Error::from)?;
-    Ok(())
-}
-
-/// Allocates a writer id from the shared counter.
-pub fn allocate_writer_id(backend: &dyn MappingBackend) -> Result<u32> {
-    let id = backend
-        .fetch_add_u64(NEXT_WRITER_ID_OFFSET, 1, Ordering::SeqCst)
-        .map_err(Error::from)?;
-    if id > u64::from(u32::MAX) {
-        return Err(Error::CapacityExceeded);
-    }
-    Ok(id as u32)
-}
-
-/// Loads reader slot `slot`.
-pub fn load_reader_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> {
-    if slot as usize >= MAX_READER_SLOTS {
-        return Err(Error::InvalidLayout);
-    }
-    let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
-    backend
-        .atomic_load_u64(offset, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// Stores a value into reader slot `slot`.
-pub fn store_reader_slot(backend: &dyn MappingBackend, slot: u32, value: u64) -> Result<()> {
-    if slot as usize >= MAX_READER_SLOTS {
-        return Err(Error::InvalidLayout);
-    }
-    let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
-    backend
-        .atomic_store_u64(offset, value, Ordering::Release)
-        .map_err(Error::from)
-}
-
-/// Allocates a reader slot via the shared `reader_slot_counter` and initialises
-/// it to `position`.
-pub fn allocate_reader_slot(backend: &dyn MappingBackend, position: u64) -> Result<u32> {
-    let slot_index = backend
-        .fetch_add_u64(READER_SLOT_COUNTER_OFFSET, 1, Ordering::SeqCst)
-        .map_err(Error::from)?;
-    if slot_index >= MAX_READER_SLOTS as u64 {
-        return Err(Error::CapacityExceeded);
-    }
-    let encoded = encode_reader_position(position)?;
-    store_reader_slot(backend, slot_index as u32, encoded)?;
-    Ok(slot_index as u32)
-}
-
-/// Updates an allocated reader slot to `position`.
-pub fn update_reader_slot(backend: &dyn MappingBackend, slot: u32, position: u64) -> Result<()> {
-    let encoded = encode_reader_position(position)?;
-    store_reader_slot(backend, slot, encoded)
-}
-
-/// Releases a reader slot (sets it to 0).
-pub fn release_reader_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()> {
-    store_reader_slot(backend, slot, 0)
-}
-
-/// Loads writer slot `slot`.
-pub fn load_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> {
-    if slot as usize >= MAX_WRITER_SLOTS {
-        return Err(Error::InvalidLayout);
-    }
-    let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
-    backend
-        .atomic_load_u64(offset, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// Stores a value into writer slot `slot`.
-pub fn store_writer_slot(backend: &dyn MappingBackend, slot: u32, value: u64) -> Result<()> {
-    if slot as usize >= MAX_WRITER_SLOTS {
-        return Err(Error::InvalidLayout);
-    }
-    let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
-    backend
-        .atomic_store_u64(offset, value, Ordering::Release)
-        .map_err(Error::from)
-}
-
-/// Updates an allocated writer slot to `position`.
-pub fn update_writer_slot(backend: &dyn MappingBackend, slot: u32, position: u64) -> Result<()> {
-    let encoded = encode_writer_position(position)?;
-    store_writer_slot(backend, slot, encoded)
-}
-
-/// Releases a writer slot (sets it to 0).
-pub fn release_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()> {
-    store_writer_slot(backend, slot, 0)
-}
-
-/// Stores the shared capacity.
-pub fn store_shared_capacity(backend: &dyn MappingBackend, capacity: u64) -> Result<()> {
-    backend
-        .atomic_store_u64(SHARED_CAPACITY_OFFSET, capacity, Ordering::Release)
-        .map_err(Error::from)
-}
-
-/// Loads the shared capacity.
-pub fn load_shared_capacity(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .atomic_load_u64(SHARED_CAPACITY_OFFSET, Ordering::Acquire)
-        .map_err(Error::from)
-}
-
-/// Stores the backpressure strategy (0 = Park, 1 = Drop).
-pub fn store_backpressure(backend: &dyn MappingBackend, value: u8) -> Result<()> {
-    backend
-        .write(BACKPRESSURE_OFFSET, &[value])
-        .map_err(Error::from)
-}
-
-/// Loads the backpressure strategy.
-pub fn load_backpressure(backend: &dyn MappingBackend) -> Result<u8> {
-    let bytes = backend.read(BACKPRESSURE_OFFSET, 1).map_err(Error::from)?;
-    bytes.first().copied().ok_or(Error::InvalidLayout)
-}
-
-/// Atomically reserves `len` bytes at the tail via CAS on `next_tail`.
-///
-/// Uses exponential backoff on contention. Checks backpressure against reader
-/// and writer slots when `protect_readers` / `protect_writers` are set.
-pub fn reserve_tail(
-    backend: &dyn MappingBackend,
-    len: u64,
-    capacity: u64,
-    protect_readers: bool,
-    protect_writers: bool,
-) -> Result<u64> {
-    if len == 0 || len > capacity {
-        return Err(Error::CapacityExceeded);
-    }
-
-    let mut delay: usize = 1;
-    loop {
-        let tail = load_next_tail(backend)?;
-        let min_reader = if protect_readers {
-            minimum_reader_position(backend)?
-        } else {
-            None
-        };
-        let min_writer = if protect_writers {
-            minimum_writer_position(backend)?
-        } else {
-            None
-        };
-        let next = reserve_tail_next(
-            tail,
-            len,
-            capacity,
-            min_reader,
-            min_writer,
-            protect_readers,
-            protect_writers,
-        )?;
-
-        let prev = cas_next_tail(backend, tail, next)?;
-        if prev == tail {
-            return Ok(tail);
-        }
-
-        // Exponential backoff on contention.
-        for _ in 0..delay {
-            std::hint::spin_loop();
-        }
-        delay = (delay * 2).min(64);
-    }
-}
-
-/// Writes a framed message using single-phase write with release fencing.
-///
-/// 1. Reserve `frame_size` bytes at the tail.
-/// 2. Write payload at `pos + ENCODED_SIZE`.
-/// 3. Release fence.
-/// 4. Write header with READY flag at `pos`.
-/// 5. Bump generation counter.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "ring-protocol write primitive; arguments are inherent to the protocol"
-)]
-///
-/// 1. Reserve `frame_size` bytes at the tail.
-/// 2. Write payload at `pos + ENCODED_SIZE`.
-/// 3. Release fence.
-/// 4. Write header with READY flag at `pos`.
-/// 5. Bump generation counter.
-pub fn write_frame(
-    backend: &dyn MappingBackend,
-    payload: &[u8],
-    tag: u32,
-    flags: u8,
-    capacity: u64,
-    mask: u64,
-    protect_readers: bool,
-    protect_writers: bool,
-) -> Result<()> {
-    let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
-    if frame_size > capacity {
-        return Err(Error::CapacityExceeded);
-    }
-
-    let pos = reserve_tail(
-        backend,
-        frame_size,
-        capacity,
-        protect_readers,
-        protect_writers,
-    )?;
-
-    let payload_pos = pos
-        .checked_add(FrameHeader::ENCODED_SIZE as u64)
-        .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
-    write_at(backend, payload_pos, payload, mask, capacity)?;
-
-    // Release fence ensures payload is visible before the header.
-    fence(Ordering::Release);
-
-    let ready_header = FrameHeader {
-        len: payload.len() as u32,
-        tag,
-        flags: flags | FrameHeader::FLAG_READY,
-        _reserved: [0; 3],
-    };
-    write_at(backend, pos, &ready_header.encode(), mask, capacity)?;
-
-    bump_generation(backend)?;
-
-    Ok(())
-}
-
-/// Reads a frame header at `pos` with acquire fencing.
-pub fn read_frame_header(
-    backend: &dyn MappingBackend,
-    pos: u64,
-    mask: u64,
-    capacity: u64,
-) -> Result<FrameHeader> {
-    fence(Ordering::Acquire);
-    let bytes = read_at(
-        backend,
-        pos,
-        FrameHeader::ENCODED_SIZE as u64,
-        mask,
-        capacity,
-    )?;
-    FrameHeader::decode(&bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
-}
-
-/// Reads a full framed message from `pos` with acquire fencing.
-///
-/// Returns `Ok(Some((header, payload)))` if the frame is ready, `Ok(None)` if
-/// the frame is not yet committed (header not READY), or an error on invalid
-/// frames.
-pub fn read_frame(
-    backend: &dyn MappingBackend,
-    pos: u64,
-    mask: u64,
-    capacity: u64,
-) -> Result<Option<(FrameHeader, Vec<u8>)>> {
-    fence(Ordering::Acquire);
-    let header_bytes = read_at(
-        backend,
-        pos,
-        FrameHeader::ENCODED_SIZE as u64,
-        mask,
-        capacity,
-    )?;
-    let header =
-        FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))?;
-
-    if !header.is_ready() {
-        return Ok(None);
-    }
-
-    let frame_size = header.frame_size();
-    if frame_size > capacity {
-        return Err(Error::InvalidFrame(format!(
-            "frame size {frame_size} exceeds capacity {capacity}"
-        )));
-    }
-
-    let payload_pos = pos
-        .checked_add(FrameHeader::ENCODED_SIZE as u64)
-        .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
-    let payload = read_at(backend, payload_pos, header.len as u64, mask, capacity)?;
-
-    Ok(Some((header, payload)))
-}
-
-// ── RingReader ──────────────────────────────────────────────────────
-
-/// A reader over a shared-memory ring buffer, generic over [`MappingBackend`].
-///
-/// Tracks read position and optionally allocates a reader slot for
-/// backpressure. The `backend` must be scoped to the ring's sub-region
-/// (via `MappingBackend::sub_region` or equivalent).
-pub struct RingReader {
-    backend: Arc<dyn MappingBackend>,
-    capacity: u64,
-    mask: u64,
-    pos: u64,
-    reader_slot: Option<u32>,
 }
 
 impl RingReader {
@@ -728,15 +212,12 @@ impl RingReader {
         match read_frame(self.backend.as_ref(), self.pos, self.mask, self.capacity)? {
             Some((header, payload)) => {
                 let frame_size = header.frame_size();
-                self.pos = self
-                    .pos
-                    .checked_add(frame_size)
-                    .ok_or_else(|| {
-                        Error::InvalidFrame(format!(
-                            "reader position overflow: {self_pos} + {frame_size}",
-                            self_pos = self.pos
-                        ))
-                    })?;
+                self.pos = self.pos.checked_add(frame_size).ok_or_else(|| {
+                    Error::InvalidFrame(format!(
+                        "reader position overflow: {self_pos} + {frame_size}",
+                        self_pos = self.pos
+                    ))
+                })?;
                 if let Some(slot) = self.reader_slot {
                     update_reader_slot(self.backend.as_ref(), slot, self.pos)?;
                 }
@@ -761,25 +242,6 @@ impl Drop for RingReader {
     fn drop(&mut self) {
         drop(self.release());
     }
-}
-
-// ── RingWriter ──────────────────────────────────────────────────────
-
-/// A writer over a shared-memory ring buffer, generic over [`MappingBackend`].
-///
-/// The `backend` must be scoped to the ring's sub-region (via
-/// `MappingBackend::sub_region` or equivalent).
-///
-/// # Atomicity contract
-///
-/// Each ring is **single-writer-domain**: all writers on a given ring MUST
-/// operate within the same atomicity domain (guest hardware atomics OR host
-/// mutex-mediated atomics, never mixed). See the crate-level docs and
-/// `AGENTS.md` for details.
-pub struct RingWriter {
-    backend: Arc<dyn MappingBackend>,
-    capacity: u64,
-    mask: u64,
 }
 
 impl RingWriter {
@@ -872,14 +334,529 @@ impl RingWriter {
     }
 }
 
-/// Store the shared capacity on the ring's backend.
-pub fn store_capacity(backend: &dyn MappingBackend, capacity: u64) -> Result<()> {
-    store_shared_capacity(backend, capacity)
+/// Allocates a reader slot via the shared `reader_slot_counter` and initialises
+/// it to `position`.
+pub fn allocate_reader_slot(backend: &dyn MappingBackend, position: u64) -> Result<u32> {
+    let slot_index = backend
+        .fetch_add_u64(READER_SLOT_COUNTER_OFFSET, 1, Ordering::SeqCst)
+        .map_err(Error::from)?;
+    if slot_index >= MAX_READER_SLOTS as u64 {
+        return Err(Error::CapacityExceeded);
+    }
+    let encoded = encode_reader_position(position)?;
+    store_reader_slot(backend, slot_index as u32, encoded)?;
+    Ok(slot_index as u32)
+}
+
+/// Allocates a writer id from the shared counter.
+pub fn allocate_writer_id(backend: &dyn MappingBackend) -> Result<u32> {
+    let id = backend
+        .fetch_add_u64(NEXT_WRITER_ID_OFFSET, 1, Ordering::SeqCst)
+        .map_err(Error::from)?;
+    if id > u64::from(u32::MAX) {
+        return Err(Error::CapacityExceeded);
+    }
+    Ok(id as u32)
+}
+
+/// Bumps the generation counter and returns the new value.
+pub fn bump_generation(backend: &dyn MappingBackend) -> Result<u64> {
+    let prev = backend
+        .fetch_add_u64(GENERATION_COUNTER_OFFSET, 1, Ordering::Release)
+        .map_err(Error::from)?;
+    Ok(prev + 1)
+}
+
+/// CAS on the shared `next_tail` cursor. Returns the previous value.
+pub fn cas_next_tail(backend: &dyn MappingBackend, current: u64, new: u64) -> Result<u64> {
+    backend
+        .compare_exchange_u64(NEXT_TAIL_OFFSET, current, new)
+        .map_err(Error::from)
+}
+
+/// Decrements the shared `writer_count`.
+pub fn decrement_writer_count(backend: &dyn MappingBackend) -> Result<()> {
+    backend
+        .fetch_add_u64(WRITER_COUNT_OFFSET, u64::MAX, Ordering::SeqCst)
+        .map_err(Error::from)?;
+    Ok(())
+}
+
+/// Encodes a reader position for storage in a shared slot (0 = unallocated).
+pub fn encode_reader_position(position: u64) -> Result<u64> {
+    position.checked_add(1).ok_or(Error::CapacityExceeded)
+}
+
+/// Encodes a writer position for storage in a shared slot (0 = unallocated).
+pub fn encode_writer_position(position: u64) -> Result<u64> {
+    position.checked_add(1).ok_or(Error::CapacityExceeded)
+}
+
+/// Increments the shared `writer_count`, returning the previous value.
+pub fn increment_writer_count(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .fetch_add_u64(WRITER_COUNT_OFFSET, 1, Ordering::SeqCst)
+        .map_err(Error::from)
+}
+
+/// Initialises all shared coordination fields to zero.
+pub fn init_ring(backend: &dyn MappingBackend) -> Result<()> {
+    backend.atomic_store_u64(GENERATION_COUNTER_OFFSET, 0, Ordering::Release)?;
+    backend.atomic_store_u64(NEXT_TAIL_OFFSET, 0, Ordering::Release)?;
+    backend.atomic_store_u64(WRITER_COUNT_OFFSET, 0, Ordering::Release)?;
+    for i in 0..MAX_READER_SLOTS as u32 {
+        let offset = READER_SLOTS_OFFSET + i as u64 * 8;
+        backend.atomic_store_u64(offset, 0, Ordering::Release)?;
+    }
+    backend.atomic_store_u64(NEXT_WRITER_ID_OFFSET, 0, Ordering::Release)?;
+    backend.atomic_store_u64(READER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)?;
+    for i in 0..MAX_WRITER_SLOTS as u32 {
+        let offset = WRITER_SLOTS_OFFSET + i as u64 * 8;
+        backend.atomic_store_u64(offset, 0, Ordering::Release)?;
+    }
+    backend.atomic_store_u64(WRITER_SLOT_COUNTER_OFFSET, 0, Ordering::Release)?;
+    Ok(())
+}
+
+/// Loads the backpressure strategy.
+pub fn load_backpressure(backend: &dyn MappingBackend) -> Result<u8> {
+    let bytes = backend.read(BACKPRESSURE_OFFSET, 1).map_err(Error::from)?;
+    bytes.first().copied().ok_or(Error::InvalidLayout)
 }
 
 /// Load the shared capacity from the ring's backend.
 pub fn load_capacity(backend: &dyn MappingBackend) -> Result<u64> {
     load_shared_capacity(backend)
+}
+
+/// Loads the generation counter.
+pub fn load_generation(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_load_u64(GENERATION_COUNTER_OFFSET, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Loads the shared `next_tail` cursor.
+pub fn load_next_tail(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_load_u64(NEXT_TAIL_OFFSET, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Loads reader slot `slot`.
+pub fn load_reader_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> {
+    if slot as usize >= MAX_READER_SLOTS {
+        return Err(Error::InvalidLayout);
+    }
+    let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
+    backend
+        .atomic_load_u64(offset, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Loads the shared capacity.
+pub fn load_shared_capacity(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_load_u64(SHARED_CAPACITY_OFFSET, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Loads the shared `writer_count`.
+pub fn load_writer_count(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_load_u64(WRITER_COUNT_OFFSET, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Loads writer slot `slot`.
+pub fn load_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> {
+    if slot as usize >= MAX_WRITER_SLOTS {
+        return Err(Error::InvalidLayout);
+    }
+    let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
+    backend
+        .atomic_load_u64(offset, Ordering::Acquire)
+        .map_err(Error::from)
+}
+
+/// Computes a mask for a given capacity (must be a power of two).
+pub fn mask_for_capacity(capacity: u64) -> Result<u64> {
+    if !capacity.is_power_of_two() {
+        return Err(Error::InvalidLayout);
+    }
+    Ok(capacity - 1)
+}
+
+/// Returns the minimum active reader position from the shared `reader_slots`
+/// array.
+pub fn minimum_reader_position(backend: &dyn MappingBackend) -> Result<Option<u64>> {
+    let mut minimum = None;
+    for slot in 0..MAX_READER_SLOTS as u32 {
+        let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
+        let encoded = backend.atomic_load_u64(offset, Ordering::Acquire)?;
+        if encoded == 0 {
+            continue;
+        }
+        let position = encoded - 1;
+        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
+    }
+    Ok(minimum)
+}
+
+/// Returns the minimum active writer position from the shared `writer_slots`
+/// array.
+pub fn minimum_writer_position(backend: &dyn MappingBackend) -> Result<Option<u64>> {
+    let mut minimum = None;
+    for slot in 0..MAX_WRITER_SLOTS as u32 {
+        let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
+        let encoded = backend.atomic_load_u64(offset, Ordering::Acquire)?;
+        if encoded == 0 {
+            continue;
+        }
+        let position = encoded - 1;
+        minimum = Some(minimum.map_or(position, |current: u64| current.min(position)));
+    }
+    Ok(minimum)
+}
+
+/// Reads `len` bytes from the ring data area at logical position `pos`,
+/// handling wraparound.
+pub fn read_at(
+    backend: &dyn MappingBackend,
+    pos: u64,
+    len: u64,
+    mask: u64,
+    capacity: u64,
+) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len > capacity {
+        return Err(Error::InvalidFrame(format!(
+            "read length {len} exceeds capacity {capacity}"
+        )));
+    }
+    let raw_pos = DATA_OFFSET + (pos & mask);
+    let ring_end = DATA_OFFSET + capacity;
+    if raw_pos + len <= ring_end {
+        backend.read(raw_pos, len).map_err(Error::from)
+    } else {
+        let tail_len = ring_end - raw_pos;
+        let head_len = len - tail_len;
+        let mut result = Vec::with_capacity(len as usize);
+        let tail = backend.read(raw_pos, tail_len).map_err(Error::from)?;
+        result.extend_from_slice(&tail);
+        let head = backend.read(DATA_OFFSET, head_len).map_err(Error::from)?;
+        result.extend_from_slice(&head);
+        Ok(result)
+    }
+}
+
+/// Reads a full framed message from `pos` with acquire fencing.
+///
+/// Returns `Ok(Some((header, payload)))` if the frame is ready, `Ok(None)` if
+/// the frame is not yet committed (header not READY), or an error on invalid
+/// frames.
+pub fn read_frame(
+    backend: &dyn MappingBackend,
+    pos: u64,
+    mask: u64,
+    capacity: u64,
+) -> Result<Option<(FrameHeader, Vec<u8>)>> {
+    fence(Ordering::Acquire);
+    let header_bytes = read_at(
+        backend,
+        pos,
+        FrameHeader::ENCODED_SIZE as u64,
+        mask,
+        capacity,
+    )?;
+    let header =
+        FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))?;
+
+    if !header.is_ready() {
+        return Ok(None);
+    }
+
+    let frame_size = header.frame_size();
+    if frame_size > capacity {
+        return Err(Error::InvalidFrame(format!(
+            "frame size {frame_size} exceeds capacity {capacity}"
+        )));
+    }
+
+    let payload_pos = pos
+        .checked_add(FrameHeader::ENCODED_SIZE as u64)
+        .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
+    let payload = read_at(backend, payload_pos, header.len as u64, mask, capacity)?;
+
+    Ok(Some((header, payload)))
+}
+
+/// Reads a frame header at `pos` with acquire fencing.
+pub fn read_frame_header(
+    backend: &dyn MappingBackend,
+    pos: u64,
+    mask: u64,
+    capacity: u64,
+) -> Result<FrameHeader> {
+    fence(Ordering::Acquire);
+    let bytes = read_at(
+        backend,
+        pos,
+        FrameHeader::ENCODED_SIZE as u64,
+        mask,
+        capacity,
+    )?;
+    FrameHeader::decode(&bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
+}
+
+/// Releases a reader slot (sets it to 0).
+pub fn release_reader_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()> {
+    store_reader_slot(backend, slot, 0)
+}
+
+/// Releases a writer slot (sets it to 0).
+pub fn release_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()> {
+    store_writer_slot(backend, slot, 0)
+}
+
+/// Atomically reserves `len` bytes at the tail via CAS on `next_tail`.
+///
+/// Uses exponential backoff on contention. Checks backpressure against reader
+/// and writer slots when `protect_readers` / `protect_writers` are set.
+pub fn reserve_tail(
+    backend: &dyn MappingBackend,
+    len: u64,
+    capacity: u64,
+    protect_readers: bool,
+    protect_writers: bool,
+) -> Result<u64> {
+    if len == 0 || len > capacity {
+        return Err(Error::CapacityExceeded);
+    }
+
+    let mut delay: usize = 1;
+    loop {
+        let tail = load_next_tail(backend)?;
+        let min_reader = if protect_readers {
+            minimum_reader_position(backend)?
+        } else {
+            None
+        };
+        let min_writer = if protect_writers {
+            minimum_writer_position(backend)?
+        } else {
+            None
+        };
+        let next = reserve_tail_next(
+            tail,
+            len,
+            capacity,
+            min_reader,
+            min_writer,
+            protect_readers,
+            protect_writers,
+        )?;
+
+        let prev = cas_next_tail(backend, tail, next)?;
+        if prev == tail {
+            return Ok(tail);
+        }
+
+        // Exponential backoff on contention.
+        for _ in 0..delay {
+            std::hint::spin_loop();
+        }
+        delay = (delay * 2).min(64);
+    }
+}
+
+/// Computes the next `next_tail` value after reserving `len` bytes.
+///
+/// Returns an error if the reservation would overflow or if backpressure
+/// (reader/writer slot protection) prevents the reservation.
+pub fn reserve_tail_next(
+    tail: u64,
+    len: u64,
+    capacity: u64,
+    minimum_reader_position: Option<u64>,
+    minimum_writer_position: Option<u64>,
+    protect_readers: bool,
+    protect_writers: bool,
+) -> Result<u64> {
+    if len == 0 || len > capacity {
+        return Err(Error::CapacityExceeded);
+    }
+    let next = tail
+        .checked_add(len)
+        .filter(|next| *next < u64::MAX)
+        .ok_or(Error::CapacityExceeded)?;
+    if protect_readers {
+        let head = minimum_reader_position.unwrap_or(tail);
+        if next.saturating_sub(head) > capacity {
+            return Err(Error::BufferFull);
+        }
+    }
+    if protect_writers {
+        let head = minimum_writer_position.unwrap_or(tail);
+        if next.saturating_sub(head) > capacity {
+            return Err(Error::BufferFull);
+        }
+    }
+    Ok(next)
+}
+
+/// Rounds a byte capacity to the next power of two for use as a ring buffer.
+pub fn round_capacity(capacity: u64) -> Result<u64> {
+    const MIN_RING_CAPACITY: u64 = 64;
+    capacity
+        .checked_next_power_of_two()
+        .map(|rounded| rounded.max(MIN_RING_CAPACITY))
+        .ok_or(Error::CapacityExceeded)
+}
+
+/// Stores the backpressure strategy (0 = Park, 1 = Drop).
+pub fn store_backpressure(backend: &dyn MappingBackend, value: u8) -> Result<()> {
+    backend
+        .write(BACKPRESSURE_OFFSET, &[value])
+        .map_err(Error::from)
+}
+
+/// Store the shared capacity on the ring's backend.
+pub fn store_capacity(backend: &dyn MappingBackend, capacity: u64) -> Result<()> {
+    store_shared_capacity(backend, capacity)
+}
+
+/// Stores a value into reader slot `slot`.
+pub fn store_reader_slot(backend: &dyn MappingBackend, slot: u32, value: u64) -> Result<()> {
+    if slot as usize >= MAX_READER_SLOTS {
+        return Err(Error::InvalidLayout);
+    }
+    let offset = READER_SLOTS_OFFSET + slot as u64 * 8;
+    backend
+        .atomic_store_u64(offset, value, Ordering::Release)
+        .map_err(Error::from)
+}
+
+/// Stores the shared capacity.
+pub fn store_shared_capacity(backend: &dyn MappingBackend, capacity: u64) -> Result<()> {
+    backend
+        .atomic_store_u64(SHARED_CAPACITY_OFFSET, capacity, Ordering::Release)
+        .map_err(Error::from)
+}
+
+/// Stores a value into writer slot `slot`.
+pub fn store_writer_slot(backend: &dyn MappingBackend, slot: u32, value: u64) -> Result<()> {
+    if slot as usize >= MAX_WRITER_SLOTS {
+        return Err(Error::InvalidLayout);
+    }
+    let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
+    backend
+        .atomic_store_u64(offset, value, Ordering::Release)
+        .map_err(Error::from)
+}
+
+/// Updates an allocated reader slot to `position`.
+pub fn update_reader_slot(backend: &dyn MappingBackend, slot: u32, position: u64) -> Result<()> {
+    let encoded = encode_reader_position(position)?;
+    store_reader_slot(backend, slot, encoded)
+}
+
+/// Updates an allocated writer slot to `position`.
+pub fn update_writer_slot(backend: &dyn MappingBackend, slot: u32, position: u64) -> Result<()> {
+    let encoded = encode_writer_position(position)?;
+    store_writer_slot(backend, slot, encoded)
+}
+
+/// Writes `data` at logical position `pos` in the ring data area, handling
+/// wraparound.
+pub fn write_at(
+    backend: &dyn MappingBackend,
+    pos: u64,
+    data: &[u8],
+    mask: u64,
+    capacity: u64,
+) -> Result<()> {
+    if data.len() as u64 > capacity {
+        return Err(Error::BufferFull);
+    }
+    let raw_start = (pos & mask) + DATA_OFFSET;
+    let ring_end = DATA_OFFSET + capacity;
+    let tail = (data.len() as u64).min(ring_end - raw_start) as usize;
+    let head = data.len() - tail;
+    if tail > 0 {
+        backend
+            .write(raw_start, data.get(..tail).unwrap_or_default())
+            .map_err(Error::from)?;
+    }
+    if head > 0 {
+        backend
+            .write(DATA_OFFSET, data.get(tail..).unwrap_or_default())
+            .map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+/// Writes a framed message using single-phase write with release fencing.
+///
+/// 1. Reserve `frame_size` bytes at the tail.
+/// 2. Write payload at `pos + ENCODED_SIZE`.
+/// 3. Release fence.
+/// 4. Write header with READY flag at `pos`.
+/// 5. Bump generation counter.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ring-protocol write primitive; arguments are inherent to the protocol"
+)]
+///
+/// 1. Reserve `frame_size` bytes at the tail.
+/// 2. Write payload at `pos + ENCODED_SIZE`.
+/// 3. Release fence.
+/// 4. Write header with READY flag at `pos`.
+/// 5. Bump generation counter.
+pub fn write_frame(
+    backend: &dyn MappingBackend,
+    payload: &[u8],
+    tag: u32,
+    flags: u8,
+    capacity: u64,
+    mask: u64,
+    protect_readers: bool,
+    protect_writers: bool,
+) -> Result<()> {
+    let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
+    if frame_size > capacity {
+        return Err(Error::CapacityExceeded);
+    }
+
+    let pos = reserve_tail(
+        backend,
+        frame_size,
+        capacity,
+        protect_readers,
+        protect_writers,
+    )?;
+
+    let payload_pos = pos
+        .checked_add(FrameHeader::ENCODED_SIZE as u64)
+        .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
+    write_at(backend, payload_pos, payload, mask, capacity)?;
+
+    // Release fence ensures payload is visible before the header.
+    fence(Ordering::Release);
+
+    let ready_header = FrameHeader {
+        len: payload.len() as u32,
+        tag,
+        flags: flags | FrameHeader::FLAG_READY,
+        _reserved: [0; 3],
+    };
+    write_at(backend, pos, &ready_header.encode(), mask, capacity)?;
+
+    bump_generation(backend)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

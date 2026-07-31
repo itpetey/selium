@@ -7,6 +7,13 @@ use selium_abi::{RegionProt, ResourceKind};
 use selium_memory::{Region, RegionMapping, WASM_PAGE_SIZE};
 use selium_wire::error::{Error, Result};
 
+use crate::layout::{
+    self, allocate_reader_slot, allocate_writer_id, cas_next_tail, init_ring, load_generation,
+    load_next_tail, load_writer_count, minimum_reader_position, minimum_writer_position,
+    release_reader_slot, reserve_tail, store_backpressure, store_reader_slot,
+    store_shared_capacity, store_writer_slot, update_reader_slot, update_writer_slot,
+};
+
 // Re-export all layout constants for backward compatibility.
 pub use crate::layout::{
     BACKPRESSURE_OFFSET, DATA_OFFSET, GENERATION_COUNTER_OFFSET, MAX_READER_SLOTS,
@@ -14,13 +21,6 @@ pub use crate::layout::{
     READER_SLOT_COUNTER_OFFSET, READER_SLOTS_OFFSET, SHARED_CAPACITY_OFFSET, WRITER_COUNT_OFFSET,
     WRITER_SLOT_COUNTER_OFFSET, WRITER_SLOTS_OFFSET, encode_reader_position,
     encode_writer_position, reserve_tail_next,
-};
-
-use crate::layout::{
-    self, allocate_reader_slot, allocate_writer_id, cas_next_tail, init_ring, load_generation,
-    load_next_tail, load_writer_count, minimum_reader_position, minimum_writer_position,
-    release_reader_slot, reserve_tail, store_backpressure, store_reader_slot,
-    store_shared_capacity, store_writer_slot, update_reader_slot, update_writer_slot,
 };
 
 /// A shared memory region allocated for ring buffer I/O.

@@ -20,11 +20,8 @@ use crate::{
 
 /// Default ring buffer data capacity (64 KiB, power of two).
 const DEFAULT_RING_CAPACITY: u64 = 64 * 1024;
-
 /// Polling interval for proxy threads waiting on guest writes.
 const PROXY_POLL_INTERVAL_MS: u64 = 1;
-
-// ── Public network APIs ─────────────────────────────────────────────
 
 impl Kernel {
     pub fn tcp_bind(&self, address: impl Into<String>) -> Result<HostQueueDescriptor> {
@@ -175,8 +172,6 @@ impl Kernel {
     }
 }
 
-// ── Stream region creation ─────────────────────────────────────────
-
 /// Aligns a value up to the given alignment.
 fn align_up(value: u32, alignment: u32) -> u32 {
     let rem = value % alignment;
@@ -264,13 +259,6 @@ fn create_stream_region(
     };
     Ok((region, inbound_writer, outbound_reader, parent_local_id))
 }
-
-/// Maps a ring protocol error to a kernel error.
-fn ring_err<E: std::fmt::Display>(e: E) -> Error {
-    Error::Wasm(e.to_string())
-}
-
-// ── TCP proxy ──────────────────────────────────────────────────────
 
 /// Inbound proxy: reads from TCP socket, writes frames to the inbound ring.
 fn proxy_inbound(
@@ -365,6 +353,11 @@ fn proxy_outbound(
     Ok(())
 }
 
+/// Maps a ring protocol error to a kernel error.
+fn ring_err<E: std::fmt::Display>(e: E) -> Error {
+    Error::Wasm(e.to_string())
+}
+
 fn run_proxy(
     kernel: &Kernel,
     stream: TcpStream,
@@ -390,6 +383,42 @@ fn run_proxy(
 
     drop(inbound_handle.join());
     drop(outbound_handle.join());
+
+    let _ = kernel; // keep kernel alive for sub-backends
+    Ok(())
+}
+
+fn run_udp_proxy(
+    kernel: &Kernel,
+    socket: UdpSocket,
+    recv_writer: RingWriter,
+    send_reader: RingReader,
+    _capacity: u64,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let socket_recv = socket
+        .try_clone()
+        .map_err(|e| Error::Wasm(format!("udp socket clone failed: {e}")))?;
+    let socket_send = socket;
+
+    let running_recv = running.clone();
+
+    let recv_handle =
+        thread::spawn(
+            move || {
+                if let Err(_e) = udp_proxy_recv(socket_recv, recv_writer, running_recv) {}
+            },
+        );
+
+    let send_handle =
+        thread::spawn(
+            move || {
+                if let Err(_e) = udp_proxy_send(socket_send, send_reader, running) {}
+            },
+        );
+
+    drop(recv_handle.join());
+    drop(send_handle.join());
 
     let _ = kernel; // keep kernel alive for sub-backends
     Ok(())
@@ -457,8 +486,6 @@ fn tcp_accept_loop(
     }
     Ok(())
 }
-
-// ── UDP proxy ───────────────────────────────────────────────────────
 
 /// UDP recv proxy: reads datagrams from socket, writes frames to recv ring.
 fn udp_proxy_recv(socket: UdpSocket, writer: RingWriter, running: Arc<AtomicBool>) -> Result<()> {
@@ -569,42 +596,6 @@ fn udp_proxy_send(
     }
 
     running.store(false, Ordering::Relaxed);
-    Ok(())
-}
-
-fn run_udp_proxy(
-    kernel: &Kernel,
-    socket: UdpSocket,
-    recv_writer: RingWriter,
-    send_reader: RingReader,
-    _capacity: u64,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let socket_recv = socket
-        .try_clone()
-        .map_err(|e| Error::Wasm(format!("udp socket clone failed: {e}")))?;
-    let socket_send = socket;
-
-    let running_recv = running.clone();
-
-    let recv_handle =
-        thread::spawn(
-            move || {
-                if let Err(_e) = udp_proxy_recv(socket_recv, recv_writer, running_recv) {}
-            },
-        );
-
-    let send_handle =
-        thread::spawn(
-            move || {
-                if let Err(_e) = udp_proxy_send(socket_send, send_reader, running) {}
-            },
-        );
-
-    drop(recv_handle.join());
-    drop(send_handle.join());
-
-    let _ = kernel; // keep kernel alive for sub-backends
     Ok(())
 }
 

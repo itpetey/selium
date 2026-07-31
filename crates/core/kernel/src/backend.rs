@@ -156,11 +156,6 @@ impl Debug for KernelBackend {
     }
 }
 
-/// Creates a unique waiters key from a shared region id and offset.
-fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
-    ((shared_id as usize).wrapping_mul(31)) ^ (offset as usize)
-}
-
 /// Helper: allocates a shared region and creates a `KernelBackend` for it.
 impl Kernel {
     /// Allocates a shared region and returns a `KernelBackend` covering the
@@ -186,4 +181,9 @@ impl Kernel {
             len as u64,
         ))
     }
+}
+
+/// Creates a unique waiters key from a shared region id and offset.
+fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
+    ((shared_id as usize).wrapping_mul(31)) ^ (offset as usize)
 }

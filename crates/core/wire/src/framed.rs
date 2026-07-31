@@ -204,7 +204,10 @@ impl<M: MessageTransport> FramedWrite<M> {
     /// the frame to the underlying transport.
     pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
         if payload.len() > u32::MAX as usize {
-            return Err(Error::InvalidFrame(format!("payload length {} exceeds u32::MAX", payload.len())));
+            return Err(Error::InvalidFrame(format!(
+                "payload length {} exceeds u32::MAX",
+                payload.len()
+            )));
         }
 
         let waker = futures::task::noop_waker();
