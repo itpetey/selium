@@ -51,9 +51,18 @@ impl Runtime {
             HostOperation {
                 process_id,
                 task_id,
-                state,
+                state: state.clone(),
             },
         );
+
+        // Register SleepWait with the timer driver so the guest is
+        // woken via mailbox when the deadline arrives.
+        if let HostOperationState::SleepWait { deadline } = state
+            && let Some(tid) = task_id
+        {
+            self.register_timer(deadline, process_id, tid, operation_id);
+        }
+
         (status, operation_id)
     }
 

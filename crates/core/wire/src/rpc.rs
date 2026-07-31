@@ -132,6 +132,7 @@ where
         let encoded = FlatMsg::encode(&payload);
         self.request_writer.write_frame(&encoded, correlation)?;
 
+        let region_id = self.reply_reader.inner().region_id();
         let mut last_generation = self.reply_reader.generation().unwrap_or(0).wrapping_sub(1);
 
         loop {
@@ -152,7 +153,12 @@ where
                 return Err(RpcError::ConnectionClosed);
             }
 
-            crate::yield_now().await;
+            // Wait on generation change instead of busy-spinning.
+            if region_id != 0 {
+                crate::generation_wait(region_id, last_generation).await;
+            } else {
+                crate::yield_now().await;
+            }
         }
     }
 }
@@ -184,6 +190,7 @@ where
 
     /// Receives the next request from the client.
     pub async fn recv(&mut self) -> std::result::Result<RpcRequest<'_, Req, Rep, M>, RpcError> {
+        let region_id = self.request_reader.inner().region_id();
         let mut last_generation = self
             .request_reader
             .generation()
@@ -214,7 +221,12 @@ where
                 return Err(RpcError::ConnectionClosed);
             }
 
-            crate::yield_now().await;
+            // Wait on generation change instead of busy-spinning.
+            if region_id != 0 {
+                crate::generation_wait(region_id, last_generation).await;
+            } else {
+                crate::yield_now().await;
+            }
         }
     }
 }

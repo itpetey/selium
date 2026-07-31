@@ -197,8 +197,12 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
             let (payload, _tag) = match this.reader.read_frame() {
                 Ok(frame) => frame,
                 Err(Error::BufferEmpty) => {
-                    // Spurious readiness; yield and retry.
-                    cx.waker().wake_by_ref();
+                    // Spurious readiness; register wait instead of spinning.
+                    let region_id = this.reader.inner().region_id();
+                    if region_id != 0 {
+                        let cur_gen = this.reader.generation().unwrap_or(0);
+                        selium_memory::register_generation_wait(region_id, cur_gen, cx.waker());
+                    }
                     return Poll::Pending;
                 }
                 Err(e) => return Poll::Ready(Some(Err(e))),
@@ -211,8 +215,12 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
                 Err(e) => Poll::Ready(Some(Err(Error::SerializationFailed(format!("{e}"))))),
             }
         } else {
-            // No data available.
-            cx.waker().wake_by_ref();
+            // No data available — register a generation wait instead of spinning.
+            let region_id = this.reader.inner().region_id();
+            if region_id != 0 {
+                let cur_gen = this.reader.generation().unwrap_or(0);
+                selium_memory::register_generation_wait(region_id, cur_gen, cx.waker());
+            }
             Poll::Pending
         }
     }

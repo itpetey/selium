@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -85,17 +86,60 @@ impl futures::task::ArcWake for TaskWake {
     }
 }
 
+type WaitMap = HashMap<(u64, u64), Vec<Waker>>;
+
 thread_local! {
     static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static WAKE_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
     static CURRENT_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
     static NEXT_TASK_ID: RefCell<TaskId> = const { RefCell::new(1) };
+    /// (region_id, observed_generation) → list of wakers for tasks waiting
+    /// for the generation to advance past `observed_generation`.
+    /// Initialised lazily because HashMap::new is not const-stable.
+    static GEN_WAIT_MAP: RefCell<Option<WaitMap>> = const { RefCell::new(None) };
+}
+
+fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
+    GEN_WAIT_MAP.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let map = opt.get_or_insert_with(HashMap::new);
+        map.entry((region_id, observed_generation))
+            .or_default()
+            .push(waker.clone());
+    });
+}
+
+fn wake_gen_waiters(region_id: u64, new_generation: u64) {
+    GEN_WAIT_MAP.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let map = opt.get_or_insert_with(HashMap::new);
+        // Collect keys where region matches and generation < new_generation.
+        let to_wake: Vec<(u64, u64)> = map
+            .keys()
+            .filter(|(rid, cur_gen)| *rid == region_id && *cur_gen < new_generation)
+            .copied()
+            .collect();
+        for key in to_wake {
+            if let Some(wakers) = map.remove(&key) {
+                for waker in wakers {
+                    waker.wake();
+                }
+            }
+        }
+    });
+}
+
+/// Install the generation-wait callbacks so that channel types in
+/// `selium-shm` can park tasks on the reactor.
+pub fn install_generation_wait_callbacks() {
+    selium_memory::install_generation_callbacks(register_gen_wait, wake_gen_waiters);
 }
 
 /// Polls mailbox wakeups and runnable background tasks until no work remains.
 pub fn poll_reactor() {
     register_mailbox();
+    install_generation_wait_callbacks();
 
     loop {
         drain_mailbox();

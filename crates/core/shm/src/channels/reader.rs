@@ -165,7 +165,16 @@ impl AsyncRead for BlockingReader {
             // No data. Check if writers are still connected.
             match self.region.load_writer_count() {
                 Ok(0) => return Poll::Ready(Ok(())), // EOF
-                Ok(_) => return Poll::Pending,
+                Ok(_) => {
+                    // Register for generation wake before going to sleep.
+                    let cur_gen = self.region.load_generation().unwrap_or(0);
+                    selium_memory::register_generation_wait(
+                        self.region.region_id(),
+                        cur_gen,
+                        _cx.waker(),
+                    );
+                    return Poll::Pending;
+                }
                 Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
             }
         }
@@ -188,6 +197,9 @@ impl AsyncRead for BlockingReader {
         };
 
         if !header.is_ready() {
+            // Frame not yet committed; register for generation wake.
+            let cur_gen = self.region.load_generation().unwrap_or(0);
+            selium_memory::register_generation_wait(self.region.region_id(), cur_gen, _cx.waker());
             return Poll::Pending;
         }
 
@@ -314,7 +326,15 @@ impl AsyncRead for Reader {
         if self.pos >= tail {
             match self.region.load_writer_count() {
                 Ok(0) => return Poll::Ready(Ok(())), // EOF
-                Ok(_) => return Poll::Pending,
+                Ok(_) => {
+                    let cur_gen = self.region.load_generation().unwrap_or(0);
+                    selium_memory::register_generation_wait(
+                        self.region.region_id(),
+                        cur_gen,
+                        _cx.waker(),
+                    );
+                    return Poll::Pending;
+                }
                 Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
             }
         }
@@ -333,6 +353,8 @@ impl AsyncRead for Reader {
         };
 
         if !header.is_ready() {
+            let cur_gen = self.region.load_generation().unwrap_or(0);
+            selium_memory::register_generation_wait(self.region.region_id(), cur_gen, _cx.waker());
             return Poll::Pending;
         }
 

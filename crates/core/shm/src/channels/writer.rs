@@ -124,6 +124,13 @@ impl AsyncWrite for Writer {
                 if self.backpressure == ChannelBackpressure::Drop {
                     return Poll::Ready(Ok(buf.len()));
                 }
+                // Park: register for generation wake.
+                let cur_gen = self.region.load_generation().unwrap_or(0);
+                selium_memory::register_generation_wait(
+                    self.region.region_id(),
+                    cur_gen,
+                    _cx.waker(),
+                );
                 return Poll::Pending;
             }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
@@ -231,6 +238,13 @@ impl AsyncWrite for BlockingWriter {
                 if self.backpressure == ChannelBackpressure::Drop {
                     return Poll::Ready(Ok(buf.len()));
                 }
+                // Park: register for generation wake.
+                let cur_gen = self.region.load_generation().unwrap_or(0);
+                selium_memory::register_generation_wait(
+                    self.region.region_id(),
+                    cur_gen,
+                    _cx.waker(),
+                );
                 return Poll::Pending;
             }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),

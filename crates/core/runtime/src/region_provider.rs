@@ -194,14 +194,33 @@ impl MappingBackend for KernelBackend {
             .map_err(|error| MemoryError::Other(error.to_string()))
     }
 
-    fn atomic_notify(&self, _offset: u64, _count: u32) -> Result<u32> {
-        // The kernel does not expose host-side notify/wait; guests use native
-        // atomic instructions on the mapped memory.
-        Ok(0)
+    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32> {
+        let effective_offset = self.offset(offset)?;
+        // Use a unique key derived from shared_id + region offset.
+        // This is collocated with the global waiters registry so that
+        // all KernelBackend instances sharing a region use the same key.
+        let key = shared_offset_key(self.shared_id, effective_offset);
+        Ok(selium_memory::host_notify(key, count))
     }
 
-    fn atomic_wait32(&self, _offset: u64, _expected: u32, _timeout_ms: u64) -> Result<()> {
-        Ok(())
+    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
+        let effective_offset = self.offset(offset)?;
+        // Read the current value through the kernel before parking.
+        let bytes = self
+            .kernel
+            .read_shared_memory(self.local_id, effective_offset, 4)
+            .map_err(|error| MemoryError::Other(error.to_string()))?;
+        let actual = u32::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_error| MemoryError::InvalidLayout)?,
+        );
+        if actual != expected {
+            return Ok(());
+        }
+
+        let key = shared_offset_key(self.shared_id, effective_offset);
+        selium_memory::host_wait(key, timeout_ms)
     }
 
     fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>> {
@@ -236,4 +255,11 @@ impl Debug for KernelBackend {
             .field("size", &self.size)
             .finish()
     }
+}
+
+/// Creates a unique waiters key from a shared region id and offset.
+fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
+    // Mix the shared_id (unique per region) with the offset to get a
+    // key that is unique per (region, address) pair.
+    ((shared_id as usize).wrapping_mul(31)) ^ (offset as usize)
 }

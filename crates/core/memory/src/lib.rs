@@ -37,6 +37,55 @@ pub const RING_HEADER_SIZE: u64 = 4096;
 /// Magic value for multi-memory shared region layout headers.
 pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
 
+// ---------------------------------------------------------------------------
+// Generation-wait callback registry
+// ---------------------------------------------------------------------------
+// Higher-level crates (e.g. selium-guest) install callbacks here so that
+// channel reader/writer types (in selium-shm) can register task-level
+// interest in generation-counter bumps without depending on the guest crate.
+// ---------------------------------------------------------------------------
+
+/// Callback: store `waker` so it can be woken when `region_id`'s generation
+/// advances past `observed_generation`.
+pub type GenerationRegisterFn =
+    fn(region_id: u64, observed_generation: u64, waker: &std::task::Waker);
+
+/// Callback: wake all registered waiters for `region_id` whose observed
+/// generation is less than `new_generation`.
+pub type GenerationWakeFn = fn(region_id: u64, new_generation: u64);
+
+static ON_GENERATION_REGISTER: OnceLock<GenerationRegisterFn> = OnceLock::new();
+static ON_GENERATION_WAKE: OnceLock<GenerationWakeFn> = OnceLock::new();
+
+/// Install the generation-wait callbacks. Called once during reactor
+/// initialisation.
+#[expect(dropping_copy_types, reason = "Result<(), fn> is Copy; ignoring error is intentional")]
+pub fn install_generation_callbacks(register: GenerationRegisterFn, wake: GenerationWakeFn) {
+    drop(ON_GENERATION_REGISTER.set(register));
+    drop(ON_GENERATION_WAKE.set(wake));
+}
+
+/// Register interest in a generation bump on `region_id`.
+/// The caller's task will be woken when the generation exceeds
+/// `observed_generation`. No-op if no callback is installed.
+pub fn register_generation_wait(
+    region_id: u64,
+    observed_generation: u64,
+    waker: &std::task::Waker,
+) {
+    if let Some(cb) = ON_GENERATION_REGISTER.get() {
+        cb(region_id, observed_generation, waker);
+    }
+}
+
+/// Wake all tasks waiting on `region_id` for a generation ≤ `new_generation`.
+/// No-op if no callback is installed.
+pub fn wake_generation_waiters(region_id: u64, new_generation: u64) {
+    if let Some(cb) = ON_GENERATION_WAKE.get() {
+        cb(region_id, new_generation);
+    }
+}
+
 /// Backend abstraction for [`RegionMapping`].
 ///
 /// A backend implements the actual read/write/atomic operations for a shared
@@ -127,6 +176,111 @@ pub struct Region {
 pub struct HeapRegionProvider {
     counter: AtomicU64,
     registry: std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Global atomic-wait registry (native targets only)
+// ---------------------------------------------------------------------------
+// On native targets (non-WASM), PointerBackend and KernelBackend share a
+// global waiters table keyed by the effective memory address (base + offset).
+// Each address gets a Condvar + notified flag. On WASM targets this module is
+// unused — wait/notify uses core::arch::wasm32 instructions directly.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+mod waiters {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    use super::MemoryError;
+
+    pub(crate) struct Waiter {
+        pub(crate) condvar: Condvar,
+        pub(crate) notified: Mutex<bool>,
+    }
+
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<Waiter>>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Waiter>>> {
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Returns (or creates) the waiter entry for `key`.
+    pub(crate) fn get_waiter(key: usize) -> Arc<Waiter> {
+        let mut map = registry()
+            .lock()
+            .expect("waiters registry lock poisoned");
+        map.entry(key)
+            .or_insert_with(|| {
+                Arc::new(Waiter {
+                    condvar: Condvar::new(),
+                    notified: Mutex::new(false),
+                })
+            })
+            .clone()
+    }
+
+    /// Notify up to `count` waiters at `key`. Returns number notified.
+    /// Since the native implementation uses a single condvar per key,
+    /// we broadcast at most once.
+    pub fn notify(key: usize, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let waiter = get_waiter(key);
+        let mut flag = waiter
+            .notified
+            .lock()
+            .expect("waiter notified lock poisoned");
+        if !*flag {
+            *flag = true;
+            waiter.condvar.notify_one();
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Park the current thread at `key` until notified or `timeout_ms` elapses.
+    /// The caller MUST check the waited-on value before and after this call;
+    /// this function only handles the blocking/unblocking.
+    pub fn wait(key: usize, timeout_ms: u64) -> super::Result<()> {
+        let waiter = get_waiter(key);
+        let mut notified = waiter
+            .notified
+            .lock()
+            .map_err(|_e| MemoryError::Other("waiter notified lock poisoned".to_string()))?;
+
+        // Honour spurious / already-fired wakes.
+        if *notified {
+            *notified = false;
+            return Ok(());
+        }
+
+        if timeout_ms == u64::MAX {
+            let guard = waiter
+                .condvar
+                .wait(notified)
+                .map_err(|_e| MemoryError::Other("condvar wait poisoned".to_string()))?;
+            notified = guard;
+        } else {
+            let timeout = Duration::from_millis(timeout_ms);
+            let (guard, wait_result) = waiter
+                .condvar
+                .wait_timeout(notified, timeout)
+                .map_err(|_e| MemoryError::Other("condvar wait poisoned".to_string()))?;
+            notified = guard;
+            if wait_result.timed_out() {
+                return Err(MemoryError::Other("wait32 timed out".to_string()));
+            }
+        }
+
+        if *notified {
+            *notified = false;
+        }
+        Ok(())
+    }
 }
 
 /// A raw-pointer backend used by WASM guests and native tests.
@@ -310,6 +464,18 @@ impl PointerBackend {
             backing: None,
         }
     }
+
+    /// Bounds-check `offset` + `len` and return a pointer to the start.
+    fn checked_offset(&self, offset: u64, len: u64) -> Result<*mut u8> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(MemoryError::CapacityExceeded)?;
+        if end > self.size {
+            return Err(MemoryError::IndexOutOfBounds);
+        }
+        // SAFETY: bounds checked; offset is within the mapping.
+        Ok(unsafe { self.base.add(offset as usize) })
+    }
 }
 
 impl MappingBackend for PointerBackend {
@@ -401,12 +567,61 @@ impl MappingBackend for PointerBackend {
         }
     }
 
-    fn atomic_notify(&self, _offset: u64, _count: u32) -> Result<u32> {
-        Ok(0)
+    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32> {
+        let ptr = self.checked_offset(offset, 4)?;
+        let addr = ptr as usize;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let notified =
+                unsafe { core::arch::wasm32::memory_atomic_notify(addr as *mut i32, count) };
+            Ok(notified)
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Ok(waiters::notify(addr, count))
+        }
     }
 
-    fn atomic_wait32(&self, _offset: u64, _expected: u32, _timeout_ms: u64) -> Result<()> {
-        Ok(())
+    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
+        let ptr = self.checked_offset(offset, 4)?;
+        let addr = ptr as usize;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let timeout_ns: i64 = if timeout_ms == u64::MAX {
+                -1
+            } else {
+                (timeout_ms as i64).saturating_mul(1_000_000)
+            };
+
+            let result = unsafe {
+                core::arch::wasm32::memory_atomic_wait32(
+                    addr as *mut i32,
+                    expected as i32,
+                    timeout_ns,
+                )
+            };
+            match result {
+                0 => Ok(()),
+                1 => Ok(()),
+                2 => Err(MemoryError::Other("wait32 timed out".to_string())),
+                _ => Err(MemoryError::Other("wait32 unknown result".to_string())),
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // SAFETY: addr was computed from base+offset which is
+            // bounds-checked by checked_offset; the pointed-to memory
+            // is valid for reads of u32.
+            let actual = unsafe { (*(addr as *const u32)).to_le() };
+            if actual != expected {
+                return Ok(());
+            }
+            waiters::wait(addr, timeout_ms)
+        }
     }
 
     fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>> {
@@ -577,6 +792,28 @@ pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
     GLOBAL_REGION_PROVIDER
         .set(provider)
         .map_err(|_error| MemoryError::Other("region provider already installed".to_string()))
+}
+
+/// Notify up to `count` waiters at a host-side wait key.
+///
+/// On native targets this wakes threads parked via [`host_wait`]. On WASM
+/// targets this is a no-op — guests use `core::arch::wasm32` instructions.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_notify(key: usize, count: u32) -> u32 {
+    waiters::notify(key, count)
+}
+
+/// Park the current thread at a host-side wait key.
+///
+/// On native targets this blocks until [`host_notify`] is called or
+/// `timeout_ms` elapses. On WASM targets this is unavailable — guests use
+/// `core::arch::wasm32` instructions.
+///
+/// The caller MUST re-check the waited-on value after this returns, as
+/// spurious wakes may occur.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_wait(key: usize, timeout_ms: u64) -> Result<()> {
+    waiters::wait(key, timeout_ms)
 }
 
 #[cfg(test)]

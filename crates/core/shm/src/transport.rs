@@ -132,6 +132,10 @@ impl MessageTransport for ShmTransport {
     fn generation(&self) -> Result<u64> {
         self.reader.generation()
     }
+
+    fn region_id(&self) -> u64 {
+        self.read_region_id()
+    }
 }
 
 impl MemoryRendezvous {

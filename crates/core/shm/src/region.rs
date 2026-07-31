@@ -185,11 +185,14 @@ impl ChannelRegion {
         let new_gen =
             self.mapping
                 .fetch_add_u64(GENERATION_COUNTER_OFFSET, 1, Ordering::Release)?;
+        let new_gen = new_gen + 1;
         drop(
             self.mapping
                 .atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX),
         );
-        Ok(new_gen + 1)
+        // Wake any reactor-side tasks waiting on this region's generation.
+        selium_memory::wake_generation_waiters(self.region_id, new_gen);
+        Ok(new_gen)
     }
 
     /// Loads the shared `next_tail` cursor from shared memory.

@@ -52,6 +52,12 @@ pub trait MessageTransport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
 
     /// Returns the current generation counter, or zero if unsupported.
     fn generation(&self) -> Result<u64>;
+
+    /// Returns the shared region id for generation-wait registration, or 0
+    /// if this transport is not backed by a shared memory region.
+    fn region_id(&self) -> u64 {
+        0
+    }
 }
 
 /// Yields execution back to the current executor once.
@@ -71,4 +77,20 @@ pub(crate) async fn yield_now() {
         }
     })
     .await;
+}
+
+/// Waits until the generation counter for `region_id` advances past
+/// `observed_generation`, or parks the current task through the
+/// generation-wait callback installed by the reactor.
+///
+/// Falls back to [`yield_now`] if no callback is installed (e.g. when
+/// running on Tokio without the guest reactor).
+pub(crate) async fn generation_wait(region_id: u64, observed_generation: u64) {
+    std::future::poll_fn(move |cx| {
+        // Register interest in a generation bump. The reactor's callback
+        // stores the waker and wakes us when the generation advances.
+        selium_memory::register_generation_wait(region_id, observed_generation, cx.waker());
+        Poll::Pending
+    })
+    .await
 }
