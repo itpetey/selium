@@ -21,14 +21,12 @@ use std::{
 };
 
 pub use error::{Error, Result};
-pub use frame::FrameHeader;
 pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use pubsub::{Publisher, Subscriber};
 pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcRequest};
 pub use tables::LiveTable;
 
 pub mod error;
-pub mod frame;
 pub mod framed;
 pub mod pubsub;
 pub mod rpc;

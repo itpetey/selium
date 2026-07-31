@@ -14,8 +14,8 @@ pub enum Error {
     BufferEmpty,
     #[error("reader was overtaken by writers")]
     ReaderBehind,
-    #[error("invalid frame header")]
-    InvalidFrame,
+    #[error("invalid frame header: {0}")]
+    InvalidFrame(String),
     #[error("capacity exceeded")]
     CapacityExceeded,
     #[error("compare-and-set failed: expected {expected}, got {actual:?}")]
@@ -87,7 +87,10 @@ mod tests {
             Error::ReaderBehind.to_string(),
             "reader was overtaken by writers"
         );
-        assert_eq!(Error::InvalidFrame.to_string(), "invalid frame header");
+        assert_eq!(
+            Error::InvalidFrame("bad header".to_string()).to_string(),
+            "invalid frame header: bad header"
+        );
         assert_eq!(Error::CapacityExceeded.to_string(), "capacity exceeded");
         assert_eq!(Error::ChannelClosed.to_string(), "channel closed");
         assert_eq!(Error::ConnectionLost.to_string(), "connection lost");

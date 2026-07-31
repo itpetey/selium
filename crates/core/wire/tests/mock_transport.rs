@@ -3,9 +3,9 @@
 use std::pin::Pin;
 
 use selium_encoding::FlatMsg;
+use selium_memory::FrameHeader;
 use selium_wire::{
     FramedRead, FramedWrite, MessageTransport, Publisher, Subscriber, error::Result,
-    frame::FrameHeader,
 };
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 

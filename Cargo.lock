@@ -734,6 +734,8 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "parking_lot",
  "selium-abi",
+ "selium-memory",
+ "selium-shm",
  "sha2 0.11.0",
  "thiserror",
  "tokio",

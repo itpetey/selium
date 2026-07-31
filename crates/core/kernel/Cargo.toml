@@ -13,6 +13,8 @@ categories.workspace = true
 [dependencies]
 parking_lot.workspace = true
 selium-abi.workspace = true
+selium-memory.workspace = true
+selium-shm.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [

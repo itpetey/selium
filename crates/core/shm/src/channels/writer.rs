@@ -4,10 +4,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use selium_wire::{
-    error::{Error, Result},
-    frame::FrameHeader,
-};
+use selium_memory::FrameHeader;
+use selium_wire::error::{Error, Result};
 use tokio::io::AsyncWrite;
 
 use crate::{channels::ChannelBackpressure, region::ChannelRegion};
@@ -299,7 +297,9 @@ fn write_frame_bytes(region: &ChannelRegion, pos: u64, buf: &[u8]) -> Result<()>
     let payload = buf.get(FrameHeader::ENCODED_SIZE..).unwrap_or_default();
 
     // Step 1: Write payload at pos + ENCODED_SIZE.
-    let payload_pos = pos.checked_add(header_size).ok_or(Error::InvalidFrame)?;
+    let payload_pos = pos
+        .checked_add(header_size)
+        .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
     write_raw(region, payload_pos, payload, mask)?;
 
     // Step 2: Release fence ensures payload is visible before the header.
@@ -344,6 +344,8 @@ fn write_raw(region: &ChannelRegion, pos: u64, data: &[u8], mask: u64) -> Result
 
 #[cfg(test)]
 mod tests {
+    use selium_memory::FrameHeader;
+
     use super::*;
     use crate::ChannelRegion;
     use crate::channels::reader::read_raw;

@@ -10,7 +10,9 @@
 
 use selium_abi::{RegionProt, ResourceKind};
 use selium_encoding::FlatMsg;
-use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
+use selium_memory::{
+    HEADER_SIZE_TWO_ENTRIES, MultiMemoryHeader, RING_HEADER_SIZE, RegionMapping, WASM_PAGE_SIZE,
+};
 use selium_wire::{
     error::{Error, Result},
     framed::{FramedRead, FramedWrite},
@@ -37,14 +39,6 @@ pub type RpcRequest<'a, Req, Rep> = WireRpcRequest<'a, Req, Rep, ShmTransport>;
 const DEFAULT_REP_CAPACITY: u64 = 4096;
 /// Default request ring capacity in bytes.
 const DEFAULT_REQ_CAPACITY: u64 = 4096;
-const HEADER_CAPACITY_OFFSET: u64 = 8;
-const HEADER_COUNT_OFFSET: u64 = 16;
-const HEADER_ENTRY_OFFSET: u64 = 24;
-const HEADER_ENTRY_SIZE: u64 = 8;
-/// Multi-memory header offsets.
-const HEADER_MAGIC_OFFSET: u64 = 0;
-/// Header size (magic + capacity + count + 2 entries).
-const HEADER_SIZE: u64 = HEADER_ENTRY_OFFSET + 2 * HEADER_ENTRY_SIZE;
 
 /// Accepts an incoming shared-memory RPC session.
 ///
@@ -133,42 +127,36 @@ fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
         .map_err(Error::from)?;
     let parent_mapping = region.mapping();
 
-    // Read and validate magic.
-    let magic_bytes = parent_mapping.read(HEADER_MAGIC_OFFSET, 8)?;
-    let magic = u64::from_le_bytes(
-        magic_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    );
-    if magic != SHARED_REGION_MAGIC {
+    // Parse the multi-memory header using the shared definition.
+    let header = MultiMemoryHeader::parse(parent_mapping.backend(), 0).map_err(Error::from)?;
+    if header.count < 2 {
         return Err(Error::InvalidLayout);
     }
 
-    // Read count.
-    let count_bytes = parent_mapping.read(HEADER_COUNT_OFFSET, 4)?;
-    let count = u32::from_le_bytes(
-        count_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    );
-    if count < 2 {
-        return Err(Error::InvalidLayout);
-    }
+    let req_entry = header.entry(0)?;
+    let rep_entry = header.entry(1)?;
 
-    let (req_offset, req_len) = read_entry(&parent_mapping, 0)?;
-    let (rep_offset, rep_len) = read_entry(&parent_mapping, 1)?;
-
-    let req_capacity = req_len
+    let req_capacity = req_entry
+        .length
         .checked_sub(RING_HEADER_SIZE)
         .ok_or(Error::InvalidLayout)?;
-    let rep_capacity = rep_len
+    let rep_capacity = rep_entry
+        .length
         .checked_sub(RING_HEADER_SIZE)
         .ok_or(Error::InvalidLayout)?;
 
-    let request_channel =
-        channel_from_sub_mapping(&parent_mapping, req_offset, req_len, req_capacity)?;
-    let reply_channel =
-        channel_from_sub_mapping(&parent_mapping, rep_offset, rep_len, rep_capacity)?;
+    let request_channel = channel_from_sub_mapping(
+        &parent_mapping,
+        req_entry.offset,
+        req_entry.length,
+        req_capacity,
+    )?;
+    let reply_channel = channel_from_sub_mapping(
+        &parent_mapping,
+        rep_entry.offset,
+        rep_entry.length,
+        rep_capacity,
+    )?;
 
     Ok((request_channel, reply_channel))
 }
@@ -195,7 +183,7 @@ fn create_rpc_region(req_capacity: u64, rep_capacity: u64) -> Result<(Channel, C
     let rep_region_len = RING_HEADER_SIZE + rep_capacity;
 
     // Calculate offsets.
-    let sub_memory_0_offset = align_up(HEADER_SIZE, 8);
+    let sub_memory_0_offset = align_up(HEADER_SIZE_TWO_ENTRIES, 8);
     let sub_memory_1_offset = align_up(sub_memory_0_offset + req_region_len, 8);
     let total_capacity = align_up(sub_memory_1_offset + rep_region_len, WASM_PAGE_SIZE);
 
@@ -207,26 +195,17 @@ fn create_rpc_region(req_capacity: u64, rep_capacity: u64) -> Result<(Channel, C
     let shared_id = region.region_id();
     let parent_mapping = region.mapping();
 
-    // Write multi-memory header.
-    parent_mapping.write(HEADER_MAGIC_OFFSET, &SHARED_REGION_MAGIC.to_le_bytes())?;
-    parent_mapping.write(HEADER_CAPACITY_OFFSET, &total_capacity.to_le_bytes())?;
-    parent_mapping.write(HEADER_COUNT_OFFSET, &2u32.to_le_bytes())?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET,
-        &(sub_memory_0_offset as u32).to_le_bytes(),
-    )?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 4,
-        &(req_region_len as u32).to_le_bytes(),
-    )?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 8,
-        &(sub_memory_1_offset as u32).to_le_bytes(),
-    )?;
-    parent_mapping.write(
-        HEADER_ENTRY_OFFSET + 12,
-        &(rep_region_len as u32).to_le_bytes(),
-    )?;
+    // Write the multi-memory header using the shared definition.
+    MultiMemoryHeader::write_two_entries(
+        parent_mapping.backend(),
+        0,
+        total_capacity,
+        [
+            (sub_memory_0_offset, req_region_len),
+            (sub_memory_1_offset, rep_region_len),
+        ],
+    )
+    .map_err(Error::from)?;
 
     let request_channel = initialise_sub_channel(
         &parent_mapping,
@@ -279,22 +258,4 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
 /// Computes the number of WASM pages needed to hold `bytes`.
 fn pages_for_bytes(bytes: u64) -> u32 {
     bytes.div_ceil(WASM_PAGE_SIZE) as u32
-}
-
-/// Reads entry `index` from the multi-memory header.
-fn read_entry(parent_mapping: &RegionMapping, index: u32) -> Result<(u64, u64)> {
-    let offset = HEADER_ENTRY_OFFSET + u64::from(index) * HEADER_ENTRY_SIZE;
-    let offset_bytes = parent_mapping.read(offset, 4)?;
-    let len_bytes = parent_mapping.read(offset + 4, 4)?;
-    let entry_offset = u32::from_le_bytes(
-        offset_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    ) as u64;
-    let entry_len = u32::from_le_bytes(
-        len_bytes
-            .try_into()
-            .map_err(|_error| Error::InvalidLayout)?,
-    ) as u64;
-    Ok((entry_offset, entry_len))
 }

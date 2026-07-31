@@ -11,6 +11,7 @@ mod subscriber {
     use super::*;
     use selium_abi::{HostcallRequest, ResourceKind};
     use selium_encoding::FlatMsg;
+    use selium_memory::FrameHeader;
     use selium_shm::channels::{Channel, ChannelBackpressure};
     use std::cell::Cell;
     use std::sync::OnceLock;
@@ -174,9 +175,7 @@ mod subscriber {
         // backpressure: if the ring is full the record is silently dropped
         // rather than blocking the caller. Logging is best-effort.
         let ring = state.channel.ring();
-        if let Ok(pos) = ring
-            .reserve(selium_wire::frame::FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64)
-        {
+        if let Ok(pos) = ring.reserve(FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64) {
             drop(ring.write_frame(pos, &encoded, 0, 0));
         }
     }

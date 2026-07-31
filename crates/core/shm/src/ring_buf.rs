@@ -1,12 +1,13 @@
 use std::sync::atomic::{Ordering, fence};
 
 use selium_abi::ResourceKind;
-use selium_wire::{
-    error::{Error, Result},
-    frame::FrameHeader,
-};
+use selium_memory::FrameHeader;
+use selium_wire::error::{Error, Result};
 
-use crate::{ChannelRegion, Cursor, cursor::mask_for_capacity};
+use crate::{
+    ChannelRegion,
+    layout::{Cursor, mask_for_capacity},
+};
 
 /// Minimum ring buffer data capacity (in bytes).
 /// Must hold at least one frame header (12 bytes) plus a small payload.
@@ -150,7 +151,7 @@ impl RingBuf {
         // Step 1: Write payload first.
         let payload_pos = pos
             .checked_add(FrameHeader::ENCODED_SIZE as u64)
-            .ok_or(Error::InvalidFrame)?;
+            .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
         self.write_at(payload_pos, payload)?;
 
         // Step 2: Release fence ensures payload is visible before the header.
@@ -176,7 +177,7 @@ impl RingBuf {
         // Acquire fence ensures we see the writer's payload before the header.
         fence(Ordering::Acquire);
         let bytes = self.read_at(pos, FrameHeader::ENCODED_SIZE as u64)?;
-        FrameHeader::decode(&bytes)
+        FrameHeader::decode(&bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
     }
 
     /// Reads a full framed message from a position with acquire fencing.
@@ -185,14 +186,14 @@ impl RingBuf {
         fence(Ordering::Acquire);
         let header = {
             let bytes = self.read_at(pos, FrameHeader::ENCODED_SIZE as u64)?;
-            FrameHeader::decode(&bytes)?
+            FrameHeader::decode(&bytes).map_err(|e| Error::InvalidFrame(e.to_string()))?
         };
         if !header.is_ready() {
             return Err(Error::BufferEmpty);
         }
         let payload_pos = pos
             .checked_add(FrameHeader::ENCODED_SIZE as u64)
-            .ok_or(Error::InvalidFrame)?;
+            .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
         let payload = self.read_at(payload_pos, header.len as u64)?;
         Ok((header, payload))
     }

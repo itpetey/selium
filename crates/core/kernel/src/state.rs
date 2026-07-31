@@ -65,8 +65,8 @@ pub(crate) struct BlobStoreState {
 
 /// State for a log channel attached by a process via GuestLogRegister.
 pub(crate) struct LogChannelState {
-    /// Local mapping id for reading from the shared region.
-    pub(crate) local_mapping_id: u64,
+    /// Kernel backend for reading from the shared region.
+    pub(crate) backend: crate::KernelBackend,
     /// Current read position (tail cursor) in the ring buffer.
     pub(crate) read_position: u64,
 }

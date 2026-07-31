@@ -10,6 +10,7 @@ use std::{
 
 use bytes::{Buf, BytesMut};
 use futures::{Sink, Stream};
+use selium_memory::FrameHeader;
 use tokio_util::codec::{
     Decoder, Encoder, FramedRead as TokioFramedRead, FramedWrite as TokioFramedWrite,
 };
@@ -17,7 +18,6 @@ use tokio_util::codec::{
 use crate::{
     MessageTransport,
     error::{Error, Result},
-    frame::FrameHeader,
 };
 
 type FramePollResult = Poll<Option<Result<(Vec<u8>, u32)>>>;
@@ -54,7 +54,7 @@ impl Decoder for FrameCodec {
 
         let header_bytes = src
             .get(..FrameHeader::ENCODED_SIZE)
-            .ok_or(Error::InvalidFrame)?;
+            .ok_or_else(|| Error::InvalidFrame("header bytes slice out of bounds".to_string()))?;
         let header = FrameHeader::decode(header_bytes)?;
 
         let frame_size = FrameHeader::ENCODED_SIZE + header.len as usize;
@@ -69,7 +69,7 @@ impl Decoder for FrameCodec {
 
         let payload = src
             .get(FrameHeader::ENCODED_SIZE..frame_size)
-            .ok_or(Error::InvalidFrame)?
+            .ok_or_else(|| Error::InvalidFrame("payload bytes slice out of bounds".to_string()))?
             .to_vec();
         src.advance(frame_size);
 
@@ -204,7 +204,7 @@ impl<M: MessageTransport> FramedWrite<M> {
     /// the frame to the underlying transport.
     pub fn write_frame(&mut self, payload: &[u8], tag: u32) -> Result<()> {
         if payload.len() > u32::MAX as usize {
-            return Err(Error::InvalidFrame);
+            return Err(Error::InvalidFrame(format!("payload length {} exceeds u32::MAX", payload.len())));
         }
 
         let waker = futures::task::noop_waker();

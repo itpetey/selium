@@ -12,15 +12,34 @@ Expose Selium's low-level host primitives for shared memory, network, storage, p
 - **THEN** both guests SHALL be able to access the region according to the runtime memory model
 
 ### Requirement: Protocol-Neutral Network Primitives
-`selium-kernel` SHALL expose protocol-neutral listener, session, stream, and request/response network primitives. Network proxy threads SHALL coordinate with guests through the standard shared-memory ring buffer layout using atomic operations on the coordination fields in page 0.
+`selium-kernel` SHALL expose protocol-neutral listener, session, stream, and request/response network primitives. Network proxy threads SHALL coordinate with guests through the shared ring buffer implementation rather than kernel-local frame or slot logic.
 
 #### Scenario: Guest opens outbound stream
 - **WHEN** a guest with the required network capability opens an outbound stream
-- **THEN** the kernel SHALL provide a stream resource backed by a shared region with the standard ring buffer layout, and spawn proxy threads that use `fetch_add`/`compare_exchange` on shared-memory atomics
+- **THEN** the kernel SHALL provide a stream resource backed by a shared region with the standard ring buffer layout, and spawn proxy threads that read/write frames, reserve space, and update reader slots through the shared ring primitives
 
 #### Scenario: Guest opens a UDP socket
 - **WHEN** a guest with the required network capability opens a UDP socket
-- **THEN** the kernel SHALL provide a datagram socket resource backed by a shared region with the standard ring buffer layout, and spawn proxy threads that coordinate through shared-memory atomics
+- **THEN** the kernel SHALL provide a datagram socket resource backed by a shared region with the standard ring buffer layout, and spawn proxy threads that coordinate through the shared ring primitives
+
+### Requirement: Kernel Consumes the Shared Ring Implementation
+
+The kernel SHALL use the shared ring protocol implementation for network
+proxies and guest log drains. Bespoke frame codecs, reservation logic,
+slot scans, and multi-memory header handling SHALL NOT exist in the
+kernel.
+
+#### Scenario: Network proxy uses shared primitives
+
+- **WHEN** the kernel proxies a TCP/UDP stream to or from a guest ring
+- **THEN** frame reads/writes, reservations, and reader-slot updates go
+  through the shared ring primitives, not kernel-local copies
+
+#### Scenario: Log drain uses shared frame reader
+
+- **WHEN** the kernel drains a guest log channel
+- **THEN** it reads frames with the shared frame reader and ring geometry
+  from the channel header, with no local frame parsing
 
 ### Requirement: Durable Storage Primitives
 `selium-kernel` SHALL expose durable log and blob primitives with append, replay, checkpoint, put, and get operations.

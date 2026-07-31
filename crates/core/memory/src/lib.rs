@@ -13,6 +13,15 @@
 //! - Global provider installation so that higher-level crates can allocate
 //!   regions without threading a provider through every type.
 
+pub mod frame;
+pub mod multi_memory;
+
+pub use frame::FrameHeader;
+pub use multi_memory::{
+    HEADER_CAPACITY_OFFSET, HEADER_COUNT_OFFSET, HEADER_ENTRY_OFFSET, HEADER_ENTRY_SIZE,
+    HEADER_SIZE_TWO_ENTRIES, MultiMemoryEntry, MultiMemoryHeader,
+};
+
 use std::{
     any::Any,
     collections::HashMap,
@@ -649,6 +658,11 @@ impl RegionMapping {
     /// Creates a mapping wrapping the given backend.
     pub fn new(backend: Arc<dyn MappingBackend>) -> Self {
         Self { inner: backend }
+    }
+
+    /// Returns a reference to the underlying backend.
+    pub fn backend(&self) -> &dyn MappingBackend {
+        self.inner.as_ref()
     }
 
     /// Creates a mapping backed by a heap allocation (for native testing).

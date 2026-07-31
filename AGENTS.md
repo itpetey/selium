@@ -152,4 +152,5 @@ pub type Result<T> = std::result::Result<T, Error>;
 - Keep `selium-abi` stable and explicit. Host and guest meet there first.
 - Guest I/O is shared-memory-first; hostcalls are for control, not data.
 - `AttachRegion` maps regions into the **calling guest's own memory** (via `HostCaller`), so guests can attach mid-entrypoint.
+- **Ring protocol single-writer-domain rule**: the ring protocol (`selium-shm::layout`) is defined once and consumed by both guest-side and host-side code. Each ring MUST be single-writer-domain: all writers on a given ring operate within the same atomicity domain (guest hardware atomics OR host mutex-mediated atomics, never mixed). Mixed-domain writes are out-of-contract and may corrupt data. Readers may cross domains safely. This is asserted in debug builds where a domain tag is available.
 ```

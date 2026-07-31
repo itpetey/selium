@@ -9,10 +9,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use selium_wire::{
-    error::{Error, Result},
-    frame::FrameHeader,
-};
+use selium_memory::FrameHeader;
+use selium_wire::error::{Error, Result};
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{channels::ChannelBackpressure, region::ChannelRegion};
@@ -116,10 +114,12 @@ impl BlockingReader {
     }
 
     fn advance(&mut self, frame_size: u64) -> Result<()> {
-        self.pos = self
-            .pos
-            .checked_add(frame_size)
-            .ok_or(Error::InvalidFrame)?;
+        self.pos = self.pos.checked_add(frame_size).ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "advance position overflow: {} + {frame_size}",
+                self.pos
+            ))
+        })?;
         self.region.update_reader_slot(self.reader_id, self.pos)
     }
 }
@@ -213,7 +213,9 @@ impl AsyncRead for BlockingReader {
 
         let frame_size = header.frame_size();
         if frame_size > capacity {
-            return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
+            return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame(format!(
+                "frame size {frame_size} exceeds capacity {capacity}"
+            )))));
         }
 
         // Read the full frame (header + payload) from the ring buffer.
@@ -374,7 +376,9 @@ impl AsyncRead for Reader {
 
         let frame_size = header.frame_size();
         if frame_size > capacity {
-            return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame)));
+            return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame(format!(
+                "frame size {frame_size} exceeds capacity {capacity}"
+            )))));
         }
 
         // Read the full frame (header + payload) from the ring buffer.
@@ -385,7 +389,12 @@ impl AsyncRead for Reader {
 
         self.pos = match self.pos.checked_add(frame_size) {
             Some(p) => p,
-            None => return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame))),
+            None => {
+                return Poll::Ready(Err(std::io::Error::other(Error::InvalidFrame(format!(
+                    "reader position overflow: {} + {frame_size}",
+                    self.pos
+                )))));
+            }
         };
         self.last_generation = self.region.load_generation().unwrap_or(0);
 
@@ -406,7 +415,10 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
         return Ok(Vec::new());
     }
     if len > region.capacity() {
-        return Err(Error::InvalidFrame);
+        return Err(Error::InvalidFrame(format!(
+            "read length {len} exceeds ring capacity {}",
+            region.capacity()
+        )));
     }
 
     let raw_pos = region.data_offset() + (pos & mask);
@@ -432,5 +444,5 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
 
 fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
     let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
-    FrameHeader::decode(&header_bytes).map_err(|_invalid_frame| Error::InvalidFrame)
+    FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
 }

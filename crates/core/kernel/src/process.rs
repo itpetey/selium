@@ -4,6 +4,7 @@ use selium_abi::{
     ActivityEvent, ActivityKind, CapabilityGrant, GuestLogEntry, MeteringObservation,
     ProcessDescriptor, ProcessId,
 };
+use selium_shm::layout;
 
 use crate::{
     Error, Result,
@@ -132,8 +133,7 @@ impl Kernel {
         process_id: ProcessId,
         shared_id: selium_abi::SharedResourceId,
     ) -> Result<()> {
-        // Attach to the shared region for reading.
-        let local_mapping_id = self.attach_shared_region(shared_id)?;
+        let backend = self.attach_backend(shared_id)?;
 
         let mut processes = self.inner.processes.lock();
         let process = processes
@@ -141,7 +141,7 @@ impl Kernel {
             .ok_or_else(|| Error::NotFound(format!("process {process_id}")))?;
         process.log_channel_shared_id = Some(shared_id);
         process.log_channel_state = Some(crate::state::LogChannelState {
-            local_mapping_id,
+            backend,
             read_position: 0,
         });
         Ok(())
@@ -164,6 +164,7 @@ impl Kernel {
     /// Returns raw frame payloads (without the 12-byte header). The caller
     /// is responsible for decoding the payloads (e.g., as FlatBuffer LogRecords).
     ///
+    /// Uses the shared ring frame reader with caller-managed position.
     /// Handles `Overwritten` gracefully: if the read position has been overtaken
     /// by the writer, advances to the current tail and returns available frames.
     pub fn drain_log_channel(&self, process_id: ProcessId) -> Result<Vec<Vec<u8>>> {
@@ -177,41 +178,23 @@ impl Kernel {
             None => return Ok(Vec::new()),
         };
 
-        let local_mapping_id = state.local_mapping_id;
+        let backend_ref: &dyn selium_memory::MappingBackend = &state.backend;
         let mut read_pos = state.read_position;
 
-        // Ring buffer layout constants (must match selium-shm's region layout).
-        const DATA_OFFSET: u64 = 4096; // coordination header size
-        const HEADER_SIZE: u64 = 12;
-        const FLAG_READY: u8 = 0x01;
-        /// Offset of the shared ring capacity in the coordination header
-        /// (must match `SHARED_CAPACITY_OFFSET` in selium-shm).
-        const SHARED_CAPACITY_OFFSET: u64 = 1072;
-
-        // Read the ring data capacity from the shared channel header. The
-        // region allocation is larger than the ring (page-aligned), so the
-        // capacity cannot be derived from the region length.
-        let capacity_bytes =
-            self.read_shared_memory(local_mapping_id, SHARED_CAPACITY_OFFSET, 8)?;
-        let data_capacity = u64::from_le_bytes(
-            capacity_bytes
-                .try_into()
-                .map_err(|_error| Error::Wasm("invalid shared capacity".to_string()))?,
-        );
+        // Read the ring data capacity from the shared channel header.
+        let data_capacity =
+            layout::load_capacity(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
         if data_capacity == 0 || !data_capacity.is_power_of_two() {
             return Err(Error::Wasm(format!(
                 "log channel has invalid capacity {data_capacity}"
             )));
         }
-        let mask = data_capacity - 1; // power-of-two capacity
 
-        // Read next_tail from shared memory (offset 8 in the coordination area).
-        let next_tail_bytes = self.read_shared_memory(local_mapping_id, 8, 8)?;
-        let next_tail = u64::from_le_bytes(
-            next_tail_bytes
-                .try_into()
-                .map_err(|_error| Error::Wasm("invalid next_tail".to_string()))?,
-        );
+        let mask = data_capacity - 1;
+
+        // Read next_tail from the shared coordination area.
+        let next_tail =
+            layout::load_next_tail(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
 
         // If read_pos has been overtaken, skip to next_tail - capacity.
         if next_tail > read_pos + data_capacity {
@@ -221,75 +204,17 @@ impl Kernel {
         let mut frames = Vec::new();
 
         while read_pos < next_tail {
-            let raw_pos = read_pos & mask;
-
-            // Read the 12-byte header.
-            let header_bytes = self.read_shared_memory(
-                local_mapping_id,
-                DATA_OFFSET + raw_pos,
-                HEADER_SIZE as usize,
-            )?;
-
-            if header_bytes.len() < HEADER_SIZE as usize {
-                break;
+            match layout::read_frame(backend_ref, read_pos, mask, data_capacity) {
+                Ok(Some((header, payload))) => {
+                    let frame_size = header.frame_size();
+                    frames.push(payload);
+                    read_pos = read_pos
+                        .checked_add(frame_size)
+                        .ok_or_else(|| Error::Wasm("frame size overflow".to_string()))?;
+                }
+                Ok(None) => break, // Frame not yet ready.
+                Err(e) => return Err(Error::Wasm(e.to_string())),
             }
-
-            let len = u32::from_le_bytes(
-                header_bytes
-                    .get(0..4)
-                    .ok_or_else(|| Error::Wasm("short log header".to_string()))?
-                    .try_into()
-                    .map_err(|_error| Error::Wasm("invalid log header len".to_string()))?,
-            );
-            let flags = *header_bytes
-                .get(8)
-                .ok_or_else(|| Error::Wasm("short log header".to_string()))?;
-
-            // Check READY flag.
-            if flags & FLAG_READY == 0 {
-                break; // Frame not yet written.
-            }
-
-            let payload_len = len as usize;
-            if payload_len == 0 {
-                read_pos += HEADER_SIZE;
-                continue;
-            }
-
-            // Read the payload (may wrap around the ring).
-            let payload_start = (raw_pos + HEADER_SIZE) & mask;
-            let mut payload = vec![0u8; payload_len];
-
-            let tail_len = (data_capacity - payload_start) as usize;
-            if tail_len >= payload_len {
-                // Payload fits in one segment.
-                let data = self.read_shared_memory(
-                    local_mapping_id,
-                    DATA_OFFSET + payload_start,
-                    payload_len,
-                )?;
-                payload.copy_from_slice(&data);
-            } else {
-                // Payload wraps around.
-                let tail_data = self.read_shared_memory(
-                    local_mapping_id,
-                    DATA_OFFSET + payload_start,
-                    tail_len,
-                )?;
-                payload
-                    .get_mut(..tail_data.len())
-                    .ok_or_else(|| Error::Wasm("short payload buffer".to_string()))?
-                    .copy_from_slice(tail_data.as_slice());
-                let head_data =
-                    self.read_shared_memory(local_mapping_id, DATA_OFFSET, payload_len - tail_len)?;
-                payload
-                    .get_mut(tail_data.len()..)
-                    .ok_or_else(|| Error::Wasm("short payload buffer".to_string()))?
-                    .copy_from_slice(head_data.as_slice());
-            }
-
-            frames.push(payload);
-            read_pos += HEADER_SIZE + payload_len as u64;
         }
 
         // Update the read position.

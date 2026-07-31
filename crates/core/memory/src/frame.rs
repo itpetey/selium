@@ -1,8 +1,15 @@
-use crate::error::{Error, Result};
+//! Frame header for the shared-memory ring protocol.
+//!
+//! This is a ring-buffer concept, not a transport concept. It lives in
+//! `selium-memory` (the lowest common dependency) so both `selium-wire` and
+//! `selium-shm` can re-export a single definition without circular
+//! dependencies.
+
+use crate::MemoryError;
 
 /// A frame header stored at the start of each message in a ring buffer.
 ///
-/// Layout: [len: u32 little-endian] [tag: u32 little-endian] [flags: u8] [_reserved: [u8; 3]] = 12 bytes
+/// Layout: `[len: u32 little-endian] [tag: u32 little-endian] [flags: u8] [_reserved: [u8; 3]]` = 12 bytes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
     /// Payload length in bytes (not including the header).
@@ -34,30 +41,30 @@ impl FrameHeader {
     }
 
     /// Decodes a header from a byte array.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() < Self::ENCODED_SIZE {
-            return Err(Error::InvalidFrame);
+            return Err(MemoryError::InvalidLayout);
         }
         let len = u32::from_le_bytes(
             bytes
                 .get(..4)
-                .ok_or(Error::InvalidFrame)?
+                .ok_or(MemoryError::InvalidLayout)?
                 .try_into()
-                .map_err(|_invalid_layout| Error::InvalidFrame)?,
+                .map_err(|_invalid_layout| MemoryError::InvalidLayout)?,
         );
         let tag = u32::from_le_bytes(
             bytes
                 .get(4..8)
-                .ok_or(Error::InvalidFrame)?
+                .ok_or(MemoryError::InvalidLayout)?
                 .try_into()
-                .map_err(|_invalid_layout| Error::InvalidFrame)?,
+                .map_err(|_invalid_layout| MemoryError::InvalidLayout)?,
         );
-        let flags = bytes.get(8).copied().ok_or(Error::InvalidFrame)?;
+        let flags = bytes.get(8).copied().ok_or(MemoryError::InvalidLayout)?;
         let _reserved = bytes
             .get(9..12)
-            .ok_or(Error::InvalidFrame)?
+            .ok_or(MemoryError::InvalidLayout)?
             .try_into()
-            .map_err(|_invalid_layout| Error::InvalidFrame)?;
+            .map_err(|_invalid_layout| MemoryError::InvalidLayout)?;
         Ok(Self {
             len,
             tag,

@@ -1,18 +1,22 @@
-//! Runtime-backed [`RegionProvider`] and [`MappingBackend`].
+//! Runtime-backed [`RegionProvider`].
 //!
 //! The runtime manages shared memory regions through `wasmtiny` and the
 //! `selium-kernel` crate. This module lets the runtime itself participate in
 //! shared-memory I/O (e.g. discovery pub/sub) using the same `selium-shm` and
 //! `selium-memory` abstractions as guests.
+//!
+//! [`KernelBackend`] (the [`MappingBackend`] implementation) now lives in
+//! `selium-kernel` so that both the kernel and runtime can share it without
+//! creating a circular dependency.
 
 use std::{
     collections::HashMap,
     fmt::Debug,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
 };
 
 use selium_abi::{RegionAllocation, RegionProt, ResourceKind};
-use selium_kernel::Kernel;
+use selium_kernel::{Kernel, KernelBackend};
 use selium_memory::{MappingBackend, MemoryError, Region, RegionProvider, Result};
 
 /// Region provider backed by the runtime kernel's shared region table.
@@ -22,20 +26,6 @@ pub struct RuntimeRegionProvider {
     /// Local mapping ids created by this provider, keyed by shared region id.
     /// Detached in `free` so the kernel can destroy the region.
     local_ids: Arc<Mutex<HashMap<u64, u64>>>,
-}
-
-/// Mapping backend that delegates reads, writes, and atomics to the kernel.
-#[derive(Clone)]
-struct KernelBackend {
-    kernel: Kernel,
-    /// Kernel local mapping id used for read/write/atomic calls.
-    local_id: u64,
-    /// Selium shared region id.
-    shared_id: u64,
-    /// Byte offset within the shared region that this mapping starts at.
-    base_offset: u64,
-    /// Size of this mapping in bytes.
-    size: u64,
 }
 
 impl RuntimeRegionProvider {
@@ -65,7 +55,7 @@ impl RegionProvider for RuntimeRegionProvider {
             .lock()
             .map_err(|error| MemoryError::Other(error.to_string()))?
             .insert(shared_id, local_id);
-        let backend = Arc::new(KernelBackend::new(
+        let backend: Arc<dyn MappingBackend> = Arc::new(KernelBackend::new(
             self.kernel.clone(),
             local_id,
             shared_id,
@@ -94,7 +84,7 @@ impl RegionProvider for RuntimeRegionProvider {
             .kernel
             .shared_region_len(region_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let backend = Arc::new(KernelBackend::new(
+        let backend: Arc<dyn MappingBackend> = Arc::new(KernelBackend::new(
             self.kernel.clone(),
             local_id,
             region_id,
@@ -128,138 +118,4 @@ impl Debug for RuntimeRegionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeRegionProvider").finish()
     }
-}
-
-impl KernelBackend {
-    fn new(kernel: Kernel, local_id: u64, shared_id: u64, size: u64) -> Self {
-        Self {
-            kernel,
-            local_id,
-            shared_id,
-            base_offset: 0,
-            size,
-        }
-    }
-
-    fn offset(&self, offset: u64) -> Result<u64> {
-        offset
-            .checked_add(self.base_offset)
-            .ok_or(MemoryError::CapacityExceeded)
-    }
-}
-
-impl MappingBackend for KernelBackend {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let offset = self.offset(offset)?;
-        self.kernel
-            .read_shared_memory(self.local_id, offset, len as usize)
-            .map_err(|error| MemoryError::Other(error.to_string()))
-    }
-
-    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
-        let offset = self.offset(offset)?;
-        self.kernel
-            .write_shared_memory(self.local_id, offset, bytes)
-            .map_err(|error| MemoryError::Other(error.to_string()))
-    }
-
-    fn atomic_load_u64(&self, offset: u64, _ordering: Ordering) -> Result<u64> {
-        let bytes = self.read(offset, 8)?;
-        Ok(u64::from_le_bytes(
-            bytes
-                .try_into()
-                .map_err(|_error| MemoryError::InvalidLayout)?,
-        ))
-    }
-
-    fn atomic_store_u64(&self, offset: u64, value: u64, _ordering: Ordering) -> Result<()> {
-        self.write(offset, &value.to_le_bytes())
-    }
-
-    fn fetch_add_u64(&self, offset: u64, value: u64, _ordering: Ordering) -> Result<u64> {
-        let offset = self.offset(offset)?;
-        self.kernel
-            .fetch_add_shared_memory_u64(self.local_id, offset, value)
-            .map_err(|error| MemoryError::Other(error.to_string()))
-    }
-
-    fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64> {
-        let offset = self.offset(offset)?;
-        self.kernel
-            .compare_exchange_shared_memory_u64(self.local_id, offset, current, new)
-            .map_err(|error| MemoryError::Other(error.to_string()))
-    }
-
-    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32> {
-        let effective_offset = self.offset(offset)?;
-        // Use a unique key derived from shared_id + region offset.
-        // This is collocated with the global waiters registry so that
-        // all KernelBackend instances sharing a region use the same key.
-        let key = shared_offset_key(self.shared_id, effective_offset);
-        Ok(selium_memory::host_notify(key, count))
-    }
-
-    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
-        let effective_offset = self.offset(offset)?;
-        // Read the current value through the kernel before parking.
-        let bytes = self
-            .kernel
-            .read_shared_memory(self.local_id, effective_offset, 4)
-            .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let actual = u32::from_le_bytes(
-            bytes
-                .try_into()
-                .map_err(|_error| MemoryError::InvalidLayout)?,
-        );
-        if actual != expected {
-            return Ok(());
-        }
-
-        let key = shared_offset_key(self.shared_id, effective_offset);
-        selium_memory::host_wait(key, timeout_ms)
-    }
-
-    fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>> {
-        if offset
-            .checked_add(size)
-            .ok_or(MemoryError::CapacityExceeded)?
-            > self.size
-        {
-            return Err(MemoryError::IndexOutOfBounds);
-        }
-        let base_offset = self.offset(offset)?;
-        Ok(Arc::new(KernelBackend {
-            kernel: self.kernel.clone(),
-            local_id: self.local_id,
-            shared_id: self.shared_id,
-            base_offset,
-            size,
-        }))
-    }
-
-    fn as_debug(&self) -> &dyn Debug {
-        self
-    }
-}
-
-impl Debug for KernelBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KernelBackend")
-            .field("local_id", &self.local_id)
-            .field("shared_id", &self.shared_id)
-            .field("base_offset", &self.base_offset)
-            .field("size", &self.size)
-            .finish()
-    }
-}
-
-/// Creates a unique waiters key from a shared region id and offset.
-fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
-    // Mix the shared_id (unique per region) with the offset to get a
-    // key that is unique per (region, address) pair.
-    ((shared_id as usize).wrapping_mul(31)) ^ (offset as usize)
 }

@@ -3,19 +3,42 @@
 //! This crate builds on [`selium_memory`] and [`selium_wire`] to provide
 //! process-local and cross-process shared-memory channels, plus a
 //! [`MessageTransport`] implementation over those channels.
+//!
+//! # Ring protocol and the single-writer-domain rule
+//!
+//! The [`layout`] module defines the ring protocol once and is consumed by
+//! both guest-side code (hardware atomics via `PointerBackend`) and host-side
+//! code (mutex-mediated atomics via `KernelBackend`). The layout is
+//! backend-agnostic: all reservation, frame I/O, and slot operations go
+//! through the [`MappingBackend`] trait.
+//!
+//! **Atomicity contract**: each ring is **single-writer-domain**. All writers
+//! on a given ring MUST operate within the same atomicity domain — either
+//! guest-side hardware atomics OR host-side mutex-mediated atomics, never
+//! mixed. Mixing domains is out-of-contract and may corrupt data because the
+//! guest's `compare_exchange` and the host's mutex serialisation do not
+//! observe each other's ordering guarantees.
+//!
+//! Readers may cross domains safely (a guest writer + host reader, or vice
+//! versa, is fine) because reads use acquire semantics that are satisfied by
+//! any release fence in the same shared memory. The constraint applies only
+//! to concurrent *writers* on the same ring.
+//!
+//! This rule is documented in `AGENTS.md` and asserted in debug builds via
+//! `layout::reserve_tail` when a domain tag is available.
 
 use selium_memory::Region;
 use selium_wire::error::Error;
 
 pub use channels::{Channel, ChannelBackpressure};
-pub use cursor::{Cursor, mask_for_capacity};
+pub use layout::{RingReader, RingWriter, round_capacity as layout_round_capacity};
 pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
 pub use ring_buf::{RingBuf, round_capacity};
 pub use rpc::{RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
 pub use transport::{ShmRendezvous, ShmTransport};
 
 pub mod channels;
-pub mod cursor;
+pub mod layout;
 pub mod region;
 pub mod ring_buf;
 pub mod rpc;
