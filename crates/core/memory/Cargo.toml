@@ -14,5 +14,12 @@ categories.workspace = true
 selium-abi.workspace = true
 thiserror.workspace = true
 
+[features]
+# Enables the genuine `memory.atomic.wait32` / `memory.atomic.notify` WASM
+# intrinsics. Requires a nightly toolchain (`#![feature(stdarch_wasm_atomic_wait)]`)
+# and a `+atomics`/shared-everything-threads target. Stable builds compile
+# without this feature; see the cfg gates in `src/lib.rs`.
+nightly-wasm-atomics = []
+
 [lints]
 workspace = true

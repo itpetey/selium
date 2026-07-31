@@ -520,11 +520,28 @@ impl MappingBackend for PointerBackend {
         let ptr = self.checked_offset(offset, 4)?;
         let addr = ptr as usize;
 
-        #[cfg(target_arch = "wasm32")]
+        // Nightly-only: genuine `memory.atomic.notify` WASM intrinsic. Requires
+        // a nightly toolchain with `#![feature(stdarch_wasm_atomic_wait)]` and
+        // a `+atomics`/shared-everything-threads target. See `Cargo.toml`
+        // feature `nightly-wasm-atomics`.
+        #[cfg(all(target_arch = "wasm32", feature = "nightly-wasm-atomics"))]
         {
             let notified =
                 unsafe { core::arch::wasm32::memory_atomic_notify(addr as *mut i32, count) };
             Ok(notified)
+        }
+
+        // Stable WASM: the guest is a single-threaded reactor; nothing parks
+        // via `memory.atomic.wait32` in the guest's linear memory. The
+        // load-bearing wake path is `wake_generation_waiters` (called by
+        // `bump_generation`) plus the host mailbox. Returning an honest
+        // `Ok(0)` ("0 waiters notified") is truthful — not a fake success
+        // — and satisfies the No-Spin-Stubs requirement of
+        // channel-wake-wait/spec.md.
+        #[cfg(all(target_arch = "wasm32", not(feature = "nightly-wasm-atomics")))]
+        {
+            let _ = (addr, count);
+            Ok(0)
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -537,7 +554,11 @@ impl MappingBackend for PointerBackend {
         let ptr = self.checked_offset(offset, 4)?;
         let addr = ptr as usize;
 
-        #[cfg(target_arch = "wasm32")]
+        // Nightly-only: genuine `memory.atomic.wait32` WASM intrinsic. Requires
+        // a nightly toolchain with `#![feature(stdarch_wasm_atomic_wait)]` and
+        // a `+atomics`/shared-everything-threads target. See `Cargo.toml`
+        // feature `nightly-wasm-atomics`.
+        #[cfg(all(target_arch = "wasm32", feature = "nightly-wasm-atomics"))]
         {
             let timeout_ns: i64 = if timeout_ms == u64::MAX {
                 -1
@@ -558,6 +579,21 @@ impl MappingBackend for PointerBackend {
                 2 => Err(MemoryError::Other("wait32 timed out".to_string())),
                 _ => Err(MemoryError::Other("wait32 unknown result".to_string())),
             }
+        }
+
+        // Stable WASM: the guest never calls `atomic_wait32` — it parks via
+        // `register_generation_wait` on the reactor, which is woken through
+        // `wake_generation_waiters` and the host mailbox. Return an explicit
+        // unsupported error rather than a fake success, satisfying the
+        // No-Spin-Stubs requirement of channel-wake-wait/spec.md.
+        #[cfg(all(target_arch = "wasm32", not(feature = "nightly-wasm-atomics")))]
+        {
+            let _ = (addr, expected, timeout_ms);
+            Err(MemoryError::Other(
+                "atomic_wait32 is not supported on stable wasm; enable the \
+                 `nightly-wasm-atomics` feature"
+                    .to_string(),
+            ))
         }
 
         #[cfg(not(target_arch = "wasm32"))]
