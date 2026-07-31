@@ -201,7 +201,10 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
                     let region_id = this.reader.inner().region_id();
                     if region_id != 0 {
                         let cur_gen = this.reader.generation().unwrap_or(0);
-                        selium_memory::register_generation_wait(region_id, cur_gen, cx.waker());
+                        if !selium_memory::register_generation_wait(region_id, cur_gen, cx.waker())
+                        {
+                            cx.waker().wake_by_ref();
+                        }
                     }
                     return Poll::Pending;
                 }
@@ -219,7 +222,9 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
             let region_id = this.reader.inner().region_id();
             if region_id != 0 {
                 let cur_gen = this.reader.generation().unwrap_or(0);
-                selium_memory::register_generation_wait(region_id, cur_gen, cx.waker());
+                if !selium_memory::register_generation_wait(region_id, cur_gen, cx.waker()) {
+                    cx.waker().wake_by_ref();
+                }
             }
             Poll::Pending
         }

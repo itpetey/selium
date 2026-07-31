@@ -104,7 +104,7 @@ impl Writer {
 impl AsyncWrite for Writer {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
@@ -126,11 +126,13 @@ impl AsyncWrite for Writer {
                 }
                 // Park: register for generation wake.
                 let cur_gen = self.region.load_generation().unwrap_or(0);
-                selium_memory::register_generation_wait(
+                if !selium_memory::register_generation_wait(
                     self.region.region_id(),
                     cur_gen,
-                    _cx.waker(),
-                );
+                    cx.waker(),
+                ) {
+                    cx.waker().wake_by_ref();
+                }
                 return Poll::Pending;
             }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
@@ -218,7 +220,7 @@ impl BlockingWriter {
 impl AsyncWrite for BlockingWriter {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
@@ -240,11 +242,13 @@ impl AsyncWrite for BlockingWriter {
                 }
                 // Park: register for generation wake.
                 let cur_gen = self.region.load_generation().unwrap_or(0);
-                selium_memory::register_generation_wait(
+                if !selium_memory::register_generation_wait(
                     self.region.region_id(),
                     cur_gen,
-                    _cx.waker(),
-                );
+                    cx.waker(),
+                ) {
+                    cx.waker().wake_by_ref();
+                }
                 return Poll::Pending;
             }
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),

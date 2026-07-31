@@ -86,11 +86,18 @@ pub(crate) async fn yield_now() {
 /// Falls back to [`yield_now`] if no callback is installed (e.g. when
 /// running on Tokio without the guest reactor).
 pub(crate) async fn generation_wait(region_id: u64, observed_generation: u64) {
+    let mut yielded = false;
     std::future::poll_fn(move |cx| {
-        // Register interest in a generation bump. The reactor's callback
-        // stores the waker and wakes us when the generation advances.
-        selium_memory::register_generation_wait(region_id, observed_generation, cx.waker());
-        Poll::Pending
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            if !selium_memory::register_generation_wait(region_id, observed_generation, cx.waker())
+            {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
     })
     .await
 }

@@ -133,7 +133,7 @@ impl HasGeneration for BlockingReader {
 impl AsyncRead for BlockingReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         // Drain any buffered frame bytes from a previous partial read.
@@ -168,11 +168,13 @@ impl AsyncRead for BlockingReader {
                 Ok(_) => {
                     // Register for generation wake before going to sleep.
                     let cur_gen = self.region.load_generation().unwrap_or(0);
-                    selium_memory::register_generation_wait(
+                    if !selium_memory::register_generation_wait(
                         self.region.region_id(),
                         cur_gen,
-                        _cx.waker(),
-                    );
+                        cx.waker(),
+                    ) {
+                        cx.waker().wake_by_ref();
+                    }
                     return Poll::Pending;
                 }
                 Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
@@ -199,7 +201,13 @@ impl AsyncRead for BlockingReader {
         if !header.is_ready() {
             // Frame not yet committed; register for generation wake.
             let cur_gen = self.region.load_generation().unwrap_or(0);
-            selium_memory::register_generation_wait(self.region.region_id(), cur_gen, _cx.waker());
+            if !selium_memory::register_generation_wait(
+                self.region.region_id(),
+                cur_gen,
+                cx.waker(),
+            ) {
+                cx.waker().wake_by_ref();
+            }
             return Poll::Pending;
         }
 
@@ -295,7 +303,7 @@ impl HasGeneration for Reader {
 impl AsyncRead for Reader {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         // Drain any buffered frame bytes from a previous partial read.
@@ -331,7 +339,7 @@ impl AsyncRead for Reader {
                     selium_memory::register_generation_wait(
                         self.region.region_id(),
                         cur_gen,
-                        _cx.waker(),
+                        cx.waker(),
                     );
                     return Poll::Pending;
                 }
@@ -354,7 +362,13 @@ impl AsyncRead for Reader {
 
         if !header.is_ready() {
             let cur_gen = self.region.load_generation().unwrap_or(0);
-            selium_memory::register_generation_wait(self.region.region_id(), cur_gen, _cx.waker());
+            if !selium_memory::register_generation_wait(
+                self.region.region_id(),
+                cur_gen,
+                cx.waker(),
+            ) {
+                cx.waker().wake_by_ref();
+            }
             return Poll::Pending;
         }
 

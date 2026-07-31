@@ -59,7 +59,10 @@ static ON_GENERATION_WAKE: OnceLock<GenerationWakeFn> = OnceLock::new();
 
 /// Install the generation-wait callbacks. Called once during reactor
 /// initialisation.
-#[expect(dropping_copy_types, reason = "Result<(), fn> is Copy; ignoring error is intentional")]
+#[expect(
+    dropping_copy_types,
+    reason = "Result<(), fn> is Copy; ignoring error is intentional"
+)]
 pub fn install_generation_callbacks(register: GenerationRegisterFn, wake: GenerationWakeFn) {
     drop(ON_GENERATION_REGISTER.set(register));
     drop(ON_GENERATION_WAKE.set(wake));
@@ -67,14 +70,19 @@ pub fn install_generation_callbacks(register: GenerationRegisterFn, wake: Genera
 
 /// Register interest in a generation bump on `region_id`.
 /// The caller's task will be woken when the generation exceeds
-/// `observed_generation`. No-op if no callback is installed.
+/// `observed_generation`. Returns `true` if a callback was installed
+/// (and the waker was registered), or `false` if no callback is
+/// installed — in which case the caller MUST self-wake as a fallback.
 pub fn register_generation_wait(
     region_id: u64,
     observed_generation: u64,
     waker: &std::task::Waker,
-) {
+) -> bool {
     if let Some(cb) = ON_GENERATION_REGISTER.get() {
         cb(region_id, observed_generation, waker);
+        true
+    } else {
+        false
     }
 }
 
@@ -208,9 +216,7 @@ mod waiters {
 
     /// Returns (or creates) the waiter entry for `key`.
     pub(crate) fn get_waiter(key: usize) -> Arc<Waiter> {
-        let mut map = registry()
-            .lock()
-            .expect("waiters registry lock poisoned");
+        let mut map = registry().lock().expect("waiters registry lock poisoned");
         map.entry(key)
             .or_insert_with(|| {
                 Arc::new(Waiter {

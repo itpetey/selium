@@ -23,9 +23,9 @@
 ## 4. Sleep wakeups
 
 - [x] 4.1 Runtime timer wheel for `SleepWait` (single min-heap + one driver); mailbox wake at deadline.
-- [ ] 4.2 `Timer` integration test inside a WASM guest: sleep 50ms completes and measures >= deadline.
+- [x] 4.2 `Timer` integration test inside a WASM guest: sleep 50ms completes and measures >= deadline.
 
 ## 5. Stress and gates
 
-- [ ] 5.1 Stress: N writers × M readers on one channel with slot churn; assert no lost wakeups and no reactor hot-spin (measure reactor stall exits).
-- [ ] 5.2 Gates: fmt, clippy `-D warnings`, full suite, wasm32 builds, spine + discovery tests green.
+- [x] 5.1 Stress: N writers × M readers on one channel with slot churn; assert no lost wakeups and no reactor hot-spin (measure reactor stall exits).
+- [x] 5.2 Gates: fmt, clippy `-D warnings`, full suite, wasm32 builds, spine + discovery tests green.
