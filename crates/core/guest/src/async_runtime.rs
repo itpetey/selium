@@ -12,6 +12,8 @@ use selium_abi::TaskId;
 
 use crate::platform::{drain_mailbox, register_mailbox};
 
+type WaitMap = HashMap<(u64, u64), Vec<Waker>>;
+
 struct BackgroundTask {
     id: TaskId,
     future: Pin<Box<dyn Future<Output = ()>>>,
@@ -86,8 +88,6 @@ impl futures::task::ArcWake for TaskWake {
     }
 }
 
-type WaitMap = HashMap<(u64, u64), Vec<Waker>>;
-
 thread_local! {
     static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
@@ -98,36 +98,6 @@ thread_local! {
     /// for the generation to advance past `observed_generation`.
     /// Initialised lazily because HashMap::new is not const-stable.
     static GEN_WAIT_MAP: RefCell<Option<WaitMap>> = const { RefCell::new(None) };
-}
-
-fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
-    GEN_WAIT_MAP.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let map = opt.get_or_insert_with(HashMap::new);
-        map.entry((region_id, observed_generation))
-            .or_default()
-            .push(waker.clone());
-    });
-}
-
-fn wake_gen_waiters(region_id: u64, new_generation: u64) {
-    GEN_WAIT_MAP.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let map = opt.get_or_insert_with(HashMap::new);
-        // Collect keys where region matches and generation < new_generation.
-        let to_wake: Vec<(u64, u64)> = map
-            .keys()
-            .filter(|(rid, cur_gen)| *rid == region_id && *cur_gen < new_generation)
-            .copied()
-            .collect();
-        for key in to_wake {
-            if let Some(wakers) = map.remove(&key) {
-                for waker in wakers {
-                    waker.wake();
-                }
-            }
-        }
-    });
 }
 
 /// Install the generation-wait callbacks so that channel types in
@@ -305,6 +275,36 @@ fn poll_backgrounds() -> bool {
     apply_wake_queue();
     merge_spawn_queue();
     progressed
+}
+
+fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
+    GEN_WAIT_MAP.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let map = opt.get_or_insert_with(HashMap::new);
+        map.entry((region_id, observed_generation))
+            .or_default()
+            .push(waker.clone());
+    });
+}
+
+fn wake_gen_waiters(region_id: u64, new_generation: u64) {
+    GEN_WAIT_MAP.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        let map = opt.get_or_insert_with(HashMap::new);
+        // Collect keys where region matches and generation < new_generation.
+        let to_wake: Vec<(u64, u64)> = map
+            .keys()
+            .filter(|(rid, cur_gen)| *rid == region_id && *cur_gen < new_generation)
+            .copied()
+            .collect();
+        for key in to_wake {
+            if let Some(wakers) = map.remove(&key) {
+                for waker in wakers {
+                    waker.wake();
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

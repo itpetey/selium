@@ -1,14 +1,6 @@
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
 use wasmtiny::WasmValue;
 
-/// Encodes a `u64` as a WASM `i64` entrypoint argument, using the runtime's
-/// tagged `WasmValue` serialisation expected by `decode_wasm_arguments`.
-fn encode_u64_argument(value: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    WasmValue::I64(value as i64).to_bytes(&mut bytes);
-    bytes
-}
-
 /// Condition used to decide when a bootstrapped system guest is ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadinessCondition {
@@ -134,6 +126,14 @@ impl SystemGuestDescriptor {
             encode_u64_argument(listener_shared_id),
         ];
     }
+}
+
+/// Encodes a `u64` as a WASM `i64` entrypoint argument, using the runtime's
+/// tagged `WasmValue` serialisation expected by `decode_wasm_arguments`.
+fn encode_u64_argument(value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    WasmValue::I64(value as i64).to_bytes(&mut bytes);
+    bytes
 }
 
 #[cfg(test)]

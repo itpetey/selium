@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use selium_guest::{entrypoint, pattern_interface};
+use selium_guest::{
+    entrypoint,
+    pattern_interface,
+};
 
 pub const PROCESS_HEALTH_TABLE: &str = "selium.supervisor.health";
 pub const RECOVERY_INTENT_TOPIC: &str = "selium.supervisor.recovery";

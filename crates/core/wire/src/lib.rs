@@ -60,25 +60,6 @@ pub trait MessageTransport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     }
 }
 
-/// Yields execution back to the current executor once.
-///
-/// This is a generic, executor-agnostic yield that works on both Tokio and
-/// the guest cooperative task runner. It returns `Pending` once, allowing
-/// other runnable tasks to be polled before the current task is re-queued.
-pub(crate) async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(move |cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
 /// Waits until the generation counter for `region_id` advances past
 /// `observed_generation`, or parks the current task through the
 /// generation-wait callback installed by the reactor.
@@ -100,4 +81,23 @@ pub(crate) async fn generation_wait(region_id: u64, observed_generation: u64) {
         }
     })
     .await
+}
+
+/// Yields execution back to the current executor once.
+///
+/// This is a generic, executor-agnostic yield that works on both Tokio and
+/// the guest cooperative task runner. It returns `Pending` once, allowing
+/// other runnable tasks to be polled before the current task is re-queued.
+pub(crate) async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }

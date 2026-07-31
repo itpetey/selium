@@ -33,7 +33,10 @@
 //! The runtime bridge is currently stubbed; the parsing and dispatch pipeline is
 //! fully implemented and tested.
 
-use selium_guest::{Context, entrypoint};
+use selium_guest::{
+    Context,
+    entrypoint,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserIntent {

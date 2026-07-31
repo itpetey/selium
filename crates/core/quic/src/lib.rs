@@ -10,8 +10,15 @@ use std::{
     task::{Context, Poll},
 };
 
-use selium_wire::{MessageTransport, error::Result};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use selium_wire::{
+    MessageTransport,
+    error::Result,
+};
+use tokio::io::{
+    AsyncRead,
+    AsyncWrite,
+    ReadBuf,
+};
 
 /// A [`MessageTransport`] implementation over a single QUIC stream.
 ///

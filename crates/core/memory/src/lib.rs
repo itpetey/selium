@@ -24,177 +24,6 @@ use std::{
 use selium_abi::{RegionAllocation, RegionProt, ResourceKind};
 use thiserror::Error;
 
-/// Result type for selium-memory operations.
-pub type Result<T> = std::result::Result<T, MemoryError>;
-
-static GLOBAL_REGION_PROVIDER: OnceLock<Box<dyn RegionProvider>> = OnceLock::new();
-/// WASM linear-memory page size (64 KiB). Region page offsets returned by the
-/// host are in units of this size.
-pub const WASM_PAGE_SIZE: u64 = 65536;
-/// Size of the coordination header that precedes ring buffer data inside a
-/// shared region (4 KiB). This is a ring layout constant, **not** a page size.
-pub const RING_HEADER_SIZE: u64 = 4096;
-/// Magic value for multi-memory shared region layout headers.
-pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
-
-// ---------------------------------------------------------------------------
-// Generation-wait callback registry
-// ---------------------------------------------------------------------------
-// Higher-level crates (e.g. selium-guest) install callbacks here so that
-// channel reader/writer types (in selium-shm) can register task-level
-// interest in generation-counter bumps without depending on the guest crate.
-// ---------------------------------------------------------------------------
-
-/// Callback: store `waker` so it can be woken when `region_id`'s generation
-/// advances past `observed_generation`.
-pub type GenerationRegisterFn =
-    fn(region_id: u64, observed_generation: u64, waker: &std::task::Waker);
-
-/// Callback: wake all registered waiters for `region_id` whose observed
-/// generation is less than `new_generation`.
-pub type GenerationWakeFn = fn(region_id: u64, new_generation: u64);
-
-static ON_GENERATION_REGISTER: OnceLock<GenerationRegisterFn> = OnceLock::new();
-static ON_GENERATION_WAKE: OnceLock<GenerationWakeFn> = OnceLock::new();
-
-/// Install the generation-wait callbacks. Called once during reactor
-/// initialisation.
-#[expect(
-    dropping_copy_types,
-    reason = "Result<(), fn> is Copy; ignoring error is intentional"
-)]
-pub fn install_generation_callbacks(register: GenerationRegisterFn, wake: GenerationWakeFn) {
-    drop(ON_GENERATION_REGISTER.set(register));
-    drop(ON_GENERATION_WAKE.set(wake));
-}
-
-/// Register interest in a generation bump on `region_id`.
-/// The caller's task will be woken when the generation exceeds
-/// `observed_generation`. Returns `true` if a callback was installed
-/// (and the waker was registered), or `false` if no callback is
-/// installed — in which case the caller MUST self-wake as a fallback.
-pub fn register_generation_wait(
-    region_id: u64,
-    observed_generation: u64,
-    waker: &std::task::Waker,
-) -> bool {
-    if let Some(cb) = ON_GENERATION_REGISTER.get() {
-        cb(region_id, observed_generation, waker);
-        true
-    } else {
-        false
-    }
-}
-
-/// Wake all tasks waiting on `region_id` for a generation ≤ `new_generation`.
-/// No-op if no callback is installed.
-pub fn wake_generation_waiters(region_id: u64, new_generation: u64) {
-    if let Some(cb) = ON_GENERATION_WAKE.get() {
-        cb(region_id, new_generation);
-    }
-}
-
-/// Backend abstraction for [`RegionMapping`].
-///
-/// A backend implements the actual read/write/atomic operations for a shared
-/// memory region. This lets the same [`RegionMapping`] API be used by WASM
-/// guests (raw pointer into linear memory), the runtime (delegated kernel
-/// accessor), and native tests (heap allocation).
-pub trait MappingBackend: Send + Sync + Any {
-    /// Returns the size of the mapped region in bytes.
-    fn size(&self) -> u64;
-
-    /// Reads `len` bytes starting at `offset`.
-    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
-
-    /// Writes `bytes` starting at `offset`.
-    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()>;
-
-    /// Atomically loads a little-endian `u64` at `offset`.
-    fn atomic_load_u64(&self, offset: u64, ordering: Ordering) -> Result<u64>;
-
-    /// Atomically stores a little-endian `u64` at `offset`.
-    fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()>;
-
-    /// Atomically adds `value` to the little-endian `u64` at `offset`, returning
-    /// the previous value.
-    fn fetch_add_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<u64>;
-
-    /// Atomically compares and exchanges the little-endian `u64` at `offset`.
-    fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64>;
-
-    /// Notifies waiters on an address within this mapping.
-    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32>;
-
-    /// Waits on an address within this mapping.
-    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()>;
-
-    /// Creates a sub-mapping backend covering `size` bytes starting at
-    /// `offset` within this mapping.
-    fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>>;
-
-    /// Returns a debug representation of this backend.
-    fn as_debug(&self) -> &dyn Debug;
-}
-
-/// Abstraction over shared-memory region lifecycle.
-///
-/// Implementations may be backed by host hostcalls (WASM guests), a runtime
-/// region table (native runtime), or a heap allocation map (native tests).
-pub trait RegionProvider: Send + Sync {
-    /// Allocates a shared memory region.
-    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region>;
-
-    /// Attaches an existing shared region.
-    fn attach(&self, region_id: u64, reader_slot: Option<u32>, prot: RegionProt) -> Result<Region>;
-
-    /// Frees a previously allocated region.
-    fn free(&self, region_id: u64) -> Result<()>;
-}
-
-/// Error type for selium-memory operations.
-#[derive(Debug, Clone, Error, PartialEq)]
-pub enum MemoryError {
-    #[error("capacity exceeded")]
-    CapacityExceeded,
-    #[error("index out of bounds")]
-    IndexOutOfBounds,
-    #[error("invalid layout")]
-    InvalidLayout,
-    #[error("region provider is not configured")]
-    ProviderNotSet,
-    #[error("region not found: {0}")]
-    RegionNotFound(u64),
-    #[error("region operation failed: {0}")]
-    Other(String),
-}
-
-/// An allocated or attached shared memory region handle.
-#[derive(Clone)]
-pub struct Region {
-    allocation: RegionAllocation,
-    backend: Arc<dyn MappingBackend>,
-}
-
-/// Default, heap-backed region provider for native tests and in-process use.
-///
-/// Regions are backed by `Arc<Vec<u8>>` and registered in a process-local map
-/// so that [`RegionProvider::attach`] can share the same memory.
-#[derive(Default, Debug)]
-pub struct HeapRegionProvider {
-    counter: AtomicU64,
-    registry: std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
-}
-
-// ---------------------------------------------------------------------------
-// Global atomic-wait registry (native targets only)
-// ---------------------------------------------------------------------------
-// On native targets (non-WASM), PointerBackend and KernelBackend share a
-// global waiters table keyed by the effective memory address (base + offset).
-// Each address gets a Condvar + notified flag. On WASM targets this module is
-// unused — wait/notify uses core::arch::wasm32 instructions directly.
-// ---------------------------------------------------------------------------
-
 #[cfg(not(target_arch = "wasm32"))]
 mod waiters {
     use std::collections::HashMap;
@@ -287,6 +116,120 @@ mod waiters {
         }
         Ok(())
     }
+}
+
+/// Callback: store `waker` so it can be woken when `region_id`'s generation
+/// advances past `observed_generation`.
+pub type GenerationRegisterFn =
+    fn(region_id: u64, observed_generation: u64, waker: &std::task::Waker);
+/// Callback: wake all registered waiters for `region_id` whose observed
+/// generation is less than `new_generation`.
+pub type GenerationWakeFn = fn(region_id: u64, new_generation: u64);
+/// Result type for selium-memory operations.
+pub type Result<T> = std::result::Result<T, MemoryError>;
+
+static GLOBAL_REGION_PROVIDER: OnceLock<Box<dyn RegionProvider>> = OnceLock::new();
+static ON_GENERATION_REGISTER: OnceLock<GenerationRegisterFn> = OnceLock::new();
+static ON_GENERATION_WAKE: OnceLock<GenerationWakeFn> = OnceLock::new();
+/// Size of the coordination header that precedes ring buffer data inside a
+/// shared region (4 KiB). This is a ring layout constant, **not** a page size.
+pub const RING_HEADER_SIZE: u64 = 4096;
+/// Magic value for multi-memory shared region layout headers.
+pub const SHARED_REGION_MAGIC: u64 = 0x53454C49554D454D;
+/// WASM linear-memory page size (64 KiB). Region page offsets returned by the
+/// host are in units of this size.
+pub const WASM_PAGE_SIZE: u64 = 65536;
+
+/// Backend abstraction for [`RegionMapping`].
+///
+/// A backend implements the actual read/write/atomic operations for a shared
+/// memory region. This lets the same [`RegionMapping`] API be used by WASM
+/// guests (raw pointer into linear memory), the runtime (delegated kernel
+/// accessor), and native tests (heap allocation).
+pub trait MappingBackend: Send + Sync + Any {
+    /// Returns the size of the mapped region in bytes.
+    fn size(&self) -> u64;
+
+    /// Reads `len` bytes starting at `offset`.
+    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// Writes `bytes` starting at `offset`.
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<()>;
+
+    /// Atomically loads a little-endian `u64` at `offset`.
+    fn atomic_load_u64(&self, offset: u64, ordering: Ordering) -> Result<u64>;
+
+    /// Atomically stores a little-endian `u64` at `offset`.
+    fn atomic_store_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<()>;
+
+    /// Atomically adds `value` to the little-endian `u64` at `offset`, returning
+    /// the previous value.
+    fn fetch_add_u64(&self, offset: u64, value: u64, ordering: Ordering) -> Result<u64>;
+
+    /// Atomically compares and exchanges the little-endian `u64` at `offset`.
+    fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64>;
+
+    /// Notifies waiters on an address within this mapping.
+    fn atomic_notify(&self, offset: u64, count: u32) -> Result<u32>;
+
+    /// Waits on an address within this mapping.
+    fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()>;
+
+    /// Creates a sub-mapping backend covering `size` bytes starting at
+    /// `offset` within this mapping.
+    fn sub_region(&self, offset: u64, size: u64) -> Result<Arc<dyn MappingBackend>>;
+
+    /// Returns a debug representation of this backend.
+    fn as_debug(&self) -> &dyn Debug;
+}
+
+/// Abstraction over shared-memory region lifecycle.
+///
+/// Implementations may be backed by host hostcalls (WASM guests), a runtime
+/// region table (native runtime), or a heap allocation map (native tests).
+pub trait RegionProvider: Send + Sync {
+    /// Allocates a shared memory region.
+    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region>;
+
+    /// Attaches an existing shared region.
+    fn attach(&self, region_id: u64, reader_slot: Option<u32>, prot: RegionProt) -> Result<Region>;
+
+    /// Frees a previously allocated region.
+    fn free(&self, region_id: u64) -> Result<()>;
+}
+
+/// Error type for selium-memory operations.
+#[derive(Debug, Clone, Error, PartialEq)]
+pub enum MemoryError {
+    #[error("capacity exceeded")]
+    CapacityExceeded,
+    #[error("index out of bounds")]
+    IndexOutOfBounds,
+    #[error("invalid layout")]
+    InvalidLayout,
+    #[error("region provider is not configured")]
+    ProviderNotSet,
+    #[error("region not found: {0}")]
+    RegionNotFound(u64),
+    #[error("region operation failed: {0}")]
+    Other(String),
+}
+
+/// An allocated or attached shared memory region handle.
+#[derive(Clone)]
+pub struct Region {
+    allocation: RegionAllocation,
+    backend: Arc<dyn MappingBackend>,
+}
+
+/// Default, heap-backed region provider for native tests and in-process use.
+///
+/// Regions are backed by `Arc<Vec<u8>>` and registered in a process-local map
+/// so that [`RegionProvider::attach`] can share the same memory.
+#[derive(Default, Debug)]
+pub struct HeapRegionProvider {
+    counter: AtomicU64,
+    registry: std::sync::Mutex<HashMap<u64, Arc<Vec<u8>>>>,
 }
 
 /// A raw-pointer backend used by WASM guests and native tests.
@@ -780,26 +723,6 @@ impl std::fmt::Debug for RegionMapping {
     }
 }
 
-/// Returns the currently installed global region provider.
-///
-/// Returns an error if no provider has been installed.
-pub fn region_provider() -> Result<&'static dyn RegionProvider> {
-    GLOBAL_REGION_PROVIDER
-        .get()
-        .map(|p| p.as_ref())
-        .ok_or(MemoryError::ProviderNotSet)
-}
-
-/// Installs a global region provider.
-///
-/// This should be called once per process, typically during guest or runtime
-/// initialization. Subsequent calls return an error.
-pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
-    GLOBAL_REGION_PROVIDER
-        .set(provider)
-        .map_err(|_error| MemoryError::Other("region provider already installed".to_string()))
-}
-
 /// Notify up to `count` waiters at a host-side wait key.
 ///
 /// On native targets this wakes threads parked via [`host_wait`]. On WASM
@@ -820,6 +743,63 @@ pub fn host_notify(key: usize, count: u32) -> u32 {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn host_wait(key: usize, timeout_ms: u64) -> Result<()> {
     waiters::wait(key, timeout_ms)
+}
+
+/// Install the generation-wait callbacks. Called once during reactor
+/// initialisation.
+#[expect(
+    dropping_copy_types,
+    reason = "Result<(), fn> is Copy; ignoring error is intentional"
+)]
+pub fn install_generation_callbacks(register: GenerationRegisterFn, wake: GenerationWakeFn) {
+    drop(ON_GENERATION_REGISTER.set(register));
+    drop(ON_GENERATION_WAKE.set(wake));
+}
+
+/// Returns the currently installed global region provider.
+///
+/// Returns an error if no provider has been installed.
+pub fn region_provider() -> Result<&'static dyn RegionProvider> {
+    GLOBAL_REGION_PROVIDER
+        .get()
+        .map(|p| p.as_ref())
+        .ok_or(MemoryError::ProviderNotSet)
+}
+
+/// Register interest in a generation bump on `region_id`.
+/// The caller's task will be woken when the generation exceeds
+/// `observed_generation`. Returns `true` if a callback was installed
+/// (and the waker was registered), or `false` if no callback is
+/// installed — in which case the caller MUST self-wake as a fallback.
+pub fn register_generation_wait(
+    region_id: u64,
+    observed_generation: u64,
+    waker: &std::task::Waker,
+) -> bool {
+    if let Some(cb) = ON_GENERATION_REGISTER.get() {
+        cb(region_id, observed_generation, waker);
+        true
+    } else {
+        false
+    }
+}
+
+/// Installs a global region provider.
+///
+/// This should be called once per process, typically during guest or runtime
+/// initialization. Subsequent calls return an error.
+pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
+    GLOBAL_REGION_PROVIDER
+        .set(provider)
+        .map_err(|_error| MemoryError::Other("region provider already installed".to_string()))
+}
+
+/// Wake all tasks waiting on `region_id` for a generation ≤ `new_generation`.
+/// No-op if no callback is installed.
+pub fn wake_generation_waiters(region_id: u64, new_generation: u64) {
+    if let Some(cb) = ON_GENERATION_WAKE.get() {
+        cb(region_id, new_generation);
+    }
 }
 
 #[cfg(test)]

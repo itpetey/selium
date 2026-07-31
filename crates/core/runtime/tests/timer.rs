@@ -12,32 +12,68 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
-/// Spawns a minimal guest with shared-memory grants.
-#[expect(clippy::indexing_slicing, reason = "test helper: bootstrap always returns one guest")]
-fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
-    let module = wat::parse_str(format!("(module (memory 1) (func (export \"{name}\") ))"))
-        .expect("compile wat");
+/// Multiple concurrent sleep hostcalls should all complete independently.
+#[test]
+fn multiple_concurrent_sleeps_complete() {
+    let runtime = Runtime::default();
+    let pid = spawn_guest(&runtime, "timer-multi");
 
-    let report = runtime
-        .bootstrap_system_guests(selium_runtime::RuntimeConfig {
-            start_discovery: false,
-            system_guests: vec![SystemGuestDescriptor {
-                name: name.to_string(),
-                module_id: format!("{name}-module"),
-                module_bytes: module,
-                entrypoint: name.to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-                )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-            }],
-        })
-        .expect("bootstrap");
+    let start = Instant::now();
 
-    report.guests[0].process_id
+    // Start three sleep hostcalls with different durations.
+    let (_, op1) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 30 });
+    let (_, op2) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 60 });
+    let (_, op3) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 90 });
+
+    // All should be pending initially.
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op1),
+        CompletionState::Pending { .. }
+    ));
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op2),
+        CompletionState::Pending { .. }
+    ));
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op3),
+        CompletionState::Pending { .. }
+    ));
+
+    // Wait for the first to complete.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op1),
+        CompletionState::Ready(HostcallOutput::Empty)
+    ));
+
+    // The others should still be pending (60ms and 90ms).
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() < 60 {
+        assert!(matches!(
+            runtime.poll_hostcall(pid, op2),
+            CompletionState::Pending { .. }
+        ));
+    }
+
+    // Wait for the second to complete.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op2),
+        CompletionState::Ready(HostcallOutput::Empty)
+    ));
+
+    // Wait for the third to complete.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    assert!(matches!(
+        runtime.poll_hostcall(pid, op3),
+        CompletionState::Ready(HostcallOutput::Empty)
+    ));
+
+    let total = start.elapsed();
+    assert!(
+        total.as_millis() >= 90,
+        "all three sleeps should take at least 90ms total: {total:?}"
+    );
 }
 
 /// A 50 ms `Sleep` hostcall must return `Pending` immediately and `Ready`
@@ -116,66 +152,33 @@ fn sleep_zero_completes_immediately() {
     }
 }
 
-/// Multiple concurrent sleep hostcalls should all complete independently.
-#[test]
-fn multiple_concurrent_sleeps_complete() {
-    let runtime = Runtime::default();
-    let pid = spawn_guest(&runtime, "timer-multi");
+/// Spawns a minimal guest with shared-memory grants.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test helper: bootstrap always returns one guest"
+)]
+fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
+    let module = wat::parse_str(format!("(module (memory 1) (func (export \"{name}\") ))"))
+        .expect("compile wat");
 
-    let start = Instant::now();
+    let report = runtime
+        .bootstrap_system_guests(selium_runtime::RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module,
+                entrypoint: name.to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+            }],
+        })
+        .expect("bootstrap");
 
-    // Start three sleep hostcalls with different durations.
-    let (_, op1) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 30 });
-    let (_, op2) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 60 });
-    let (_, op3) = runtime.begin_hostcall(pid, HostcallRequest::Sleep { millis: 90 });
-
-    // All should be pending initially.
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op1),
-        CompletionState::Pending { .. }
-    ));
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op2),
-        CompletionState::Pending { .. }
-    ));
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op3),
-        CompletionState::Pending { .. }
-    ));
-
-    // Wait for the first to complete.
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op1),
-        CompletionState::Ready(HostcallOutput::Empty)
-    ));
-
-    // The others should still be pending (60ms and 90ms).
-    let elapsed = start.elapsed();
-    if elapsed.as_millis() < 60 {
-        assert!(matches!(
-            runtime.poll_hostcall(pid, op2),
-            CompletionState::Pending { .. }
-        ));
-    }
-
-    // Wait for the second to complete.
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op2),
-        CompletionState::Ready(HostcallOutput::Empty)
-    ));
-
-    // Wait for the third to complete.
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    assert!(matches!(
-        runtime.poll_hostcall(pid, op3),
-        CompletionState::Ready(HostcallOutput::Empty)
-    ));
-
-    let total = start.elapsed();
-    assert!(
-        total.as_millis() >= 90,
-        "all three sleeps should take at least 90ms total: {total:?}"
-    );
+    report.guests[0].process_id
 }

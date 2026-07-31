@@ -30,167 +30,6 @@ use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDesc
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
-// ---------------------------------------------------------------------------
-// WASM binary helpers
-// ---------------------------------------------------------------------------
-
-fn target_dir() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
-    });
-    PathBuf::from(target_dir)
-}
-
-fn discovery_wasm_path() -> PathBuf {
-    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery.wasm")
-}
-
-fn discovery_probe_wasm_path() -> PathBuf {
-    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery_probe.wasm")
-}
-
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
-fn read_wasm(path: &std::path::Path) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_else(|_error| {
-        panic!(
-            "guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-discovery-probe",
-            path.display()
-        )
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Guest descriptors
-// ---------------------------------------------------------------------------
-
-fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-    }
-}
-
-fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery-probe".to_string(),
-        module_id: "discovery-probe-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_probe".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Log helpers
-// ---------------------------------------------------------------------------
-
-fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let frames = runtime
-        .kernel()
-        .drain_log_channel(process_id)
-        .expect("drain log channel");
-    frames
-        .iter()
-        .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Discovery feed helpers
-// ---------------------------------------------------------------------------
-
-#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_register_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
-) -> std::collections::HashSet<String> {
-    let mut uris = std::collections::HashSet::new();
-    loop {
-        match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
-                if let DiscoveryRequest::Register { uri, .. } = request {
-                    uris.insert(uri);
-                }
-            }
-            Err(selium_wire::error::Error::BufferEmpty) => break,
-            Err(error) => panic!("feed read failed: {error}"),
-        }
-    }
-    uris
-}
-
-#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_revoke_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
-) -> std::collections::HashSet<String> {
-    let mut uris = std::collections::HashSet::new();
-    loop {
-        match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
-                if let DiscoveryRequest::Revoke { uri } = request {
-                    uris.insert(uri);
-                }
-            }
-            Err(selium_wire::error::Error::BufferEmpty) => break,
-            Err(error) => panic!("feed read failed: {error}"),
-        }
-    }
-    uris
-}
-
-fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<Vec<u8>, ShmTransport> {
-    let feed_region_id = runtime
-        .discovery_feed_region_id()
-        .expect("discovery feed region id");
-    let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
-    let capacity = channel.ring().capacity();
-    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
-    Subscriber::new(FramedRead::new(transport), Some(capacity))
-}
-
-// ---------------------------------------------------------------------------
-// Host-side region allocation
-// ---------------------------------------------------------------------------
-
 #[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
 fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind) -> u64 {
     let (status, op_id) = runtime.begin_hostcall(
@@ -208,9 +47,15 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test
-// ---------------------------------------------------------------------------
+fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<Vec<u8>, ShmTransport> {
+    let feed_region_id = runtime
+        .discovery_feed_region_id()
+        .expect("discovery feed region id");
+    let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
+    let capacity = channel.ring().capacity();
+    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
+    Subscriber::new(FramedRead::new(transport), Some(capacity))
+}
 
 #[test]
 #[ignore = "requires both discovery and discovery-probe guests built for wasm32-unknown-unknown"]
@@ -317,4 +162,135 @@ fn discovery_bootstrap_slice_end_to_end() {
         .stop_process(discovery_guest.process_id)
         .expect("stop discovery process");
     assert_eq!(runtime.loaded_guest_count(), 0);
+}
+
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+    }
+}
+
+fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery-probe".to_string(),
+        module_id: "discovery-probe-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_probe".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+    }
+}
+
+fn discovery_probe_wasm_path() -> PathBuf {
+    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery_probe.wasm")
+}
+
+fn discovery_wasm_path() -> PathBuf {
+    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery.wasm")
+}
+
+fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let frames = runtime
+        .kernel()
+        .drain_log_channel(process_id)
+        .expect("drain log channel");
+    frames
+        .iter()
+        .map(|frame| {
+            selium_encoding::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
+
+#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
+fn drain_register_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Register { uri, .. } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
+
+#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
+fn drain_revoke_uris(
+    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+) -> std::collections::HashSet<String> {
+    let mut uris = std::collections::HashSet::new();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((bytes, _tag)) => {
+                let request: DiscoveryRequest =
+                    decode_rkyv(&bytes).expect("decode discovery request");
+                if let DiscoveryRequest::Revoke { uri } = request {
+                    uris.insert(uri);
+                }
+            }
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    uris
+}
+
+#[expect(
+    clippy::panic,
+    reason = "missing build artifact is a hard test failure"
+)]
+fn read_wasm(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|_error| {
+        panic!(
+            "guest not found at {}.\n\
+             Build it first:\n  \
+             cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-discovery-probe",
+            path.display()
+        )
+    })
+}
+
+fn target_dir() -> PathBuf {
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
+    });
+    PathBuf::from(target_dir)
 }

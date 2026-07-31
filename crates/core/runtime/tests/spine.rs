@@ -20,12 +20,36 @@ use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
-/// Returns the path to the compiled spine-demo WASM module.
-fn spine_demo_wasm_path() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
-    });
-    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_spine_demo.wasm")
+/// Drains the guest's log channel and decodes each frame as a `LogRecord`.
+fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let frames = runtime
+        .kernel()
+        .drain_log_channel(process_id)
+        .expect("drain log channel");
+    frames
+        .iter()
+        .map(|frame| {
+            selium_encoding::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
+
+fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "spine-demo".to_string(),
+        module_id: "spine-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "spine_demo".to_string(),
+        arguments: Vec::new(),
+        grants: vec![CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        )],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+    }
 }
 
 /// Reads the spine-demo WASM module, with an actionable error if it is missing.
@@ -45,36 +69,12 @@ fn spine_demo_wasm() -> Vec<u8> {
     })
 }
 
-fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "spine-demo".to_string(),
-        module_id: "spine-demo-module".to_string(),
-        module_bytes,
-        entrypoint: "spine_demo".to_string(),
-        arguments: Vec::new(),
-        grants: vec![CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        )],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-    }
-}
-
-/// Drains the guest's log channel and decodes each frame as a `LogRecord`.
-fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let frames = runtime
-        .kernel()
-        .drain_log_channel(process_id)
-        .expect("drain log channel");
-    frames
-        .iter()
-        .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
+/// Returns the path to the compiled spine-demo WASM module.
+fn spine_demo_wasm_path() -> PathBuf {
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
+    });
+    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_spine_demo.wasm")
 }
 
 #[test]

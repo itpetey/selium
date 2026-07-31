@@ -136,31 +136,6 @@ fn n_writers_single_reader_no_lost_wakeups() {
     );
 }
 
-/// Two mappings of the same region (simulating two processes): writes via
-/// one mapping are visible in the other, and `bump_generation` notifies.
-#[test]
-fn two_mappings_share_generation_and_notify() {
-    install_heap_provider();
-
-    let channel = make_channel(256);
-    let region_a = channel.ring().region().clone();
-    let region_b = channel.ring().region().clone();
-
-    // Verify generation is shared.
-    let gen_before = region_a.load_generation().unwrap_or(0);
-    assert_eq!(region_b.load_generation().unwrap_or(0), gen_before);
-
-    // Bump via side A.
-    let gen_after = region_a.bump_generation().expect("bump");
-    assert_eq!(region_b.load_generation().expect("gen b"), gen_after);
-
-    // atomic_notify should return without error (no waiters registered).
-    let _ = region_b
-        .mapping()
-        .atomic_notify(selium_shm::region::GENERATION_COUNTER_OFFSET, 1)
-        .expect("notify");
-}
-
 /// Park backpressure: fill the ring, then verify `bump_generation` was
 /// called for each write (generation advances monotonically).
 #[test]
@@ -186,4 +161,29 @@ fn park_channel_generation_advances_on_write() {
     // Generation should have advanced by 5 (one bump per write).
     let gen5 = channel.ring().region().load_generation().unwrap_or(0);
     assert_eq!(gen5, 5, "generation should be 5 after 5 writes, got {gen5}");
+}
+
+/// Two mappings of the same region (simulating two processes): writes via
+/// one mapping are visible in the other, and `bump_generation` notifies.
+#[test]
+fn two_mappings_share_generation_and_notify() {
+    install_heap_provider();
+
+    let channel = make_channel(256);
+    let region_a = channel.ring().region().clone();
+    let region_b = channel.ring().region().clone();
+
+    // Verify generation is shared.
+    let gen_before = region_a.load_generation().unwrap_or(0);
+    assert_eq!(region_b.load_generation().unwrap_or(0), gen_before);
+
+    // Bump via side A.
+    let gen_after = region_a.bump_generation().expect("bump");
+    assert_eq!(region_b.load_generation().expect("gen b"), gen_after);
+
+    // atomic_notify should return without error (no waiters registered).
+    let _ = region_b
+        .mapping()
+        .atomic_notify(selium_shm::region::GENERATION_COUNTER_OFFSET, 1)
+        .expect("notify");
 }

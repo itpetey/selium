@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use selium_guest::{entrypoint, pattern_interface};
+use selium_guest::{
+    entrypoint,
+    pattern_interface,
+};
 
 pub const CLUSTER_COORDINATION_EXCHANGE: &str = "selium.cluster.coordination";
 pub const EXTERNAL_BOOTSTRAP_TOPIC: &str = "selium.cluster.external-bootstrap";

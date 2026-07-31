@@ -1,8 +1,14 @@
 //! Scheduler system guest.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
-use selium_guest::{entrypoint, pattern_interface};
+use selium_guest::{
+    entrypoint,
+    pattern_interface,
+};
 
 pub const DESIRED_WORKLOAD_TABLE: &str = "selium.scheduler.desired-workloads";
 pub const PLACEMENT_INTENT_EXCHANGE: &str = "selium.scheduler.placement";
