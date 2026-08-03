@@ -39,7 +39,9 @@ fn inspect_return_type(output: &ReturnType) -> Option<EntrypointReturn> {
     }
 }
 
-/// Returns true if `ty` is `Result<()>` (ignoring which error type is used).
+/// Returns true if `ty` is `Result<()>` or `Result<(), E>` (accepts both the
+/// two-argument form and single-argument aliases such as `anyhow::Result<()>`
+/// whose error type has a default).
 fn is_result_of_unit(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
         let segments = &type_path.path.segments;
@@ -48,7 +50,8 @@ fn is_result_of_unit(ty: &Type) -> bool {
                 return false;
             }
             if let PathArguments::AngleBracketed(args) = &last.arguments {
-                if args.args.len() == 2 {
+                // `Result<(), E>` (two args) or `Result<()>` (alias with default error)
+                if matches!(args.args.len(), 1 | 2) {
                     if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
                         return is_unit_tuple(inner_ty);
                     }
@@ -184,7 +187,7 @@ fn make_wrapper_body(
                 let result = ::selium_guest::run_entrypoint_with_result(async move {
                     #inner_block
                 });
-                fn __selium_guest_assert_error<E: ::std::error::Error>(_: &::core::result::Result<(), E>) {}
+                fn __selium_guest_assert_error<E: ::core::fmt::Display>(_: &::core::result::Result<(), E>) {}
                 __selium_guest_assert_error(&result);
                 match result {
                     ::core::result::Result::Ok(()) => 0,

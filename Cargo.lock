@@ -517,6 +517,7 @@ dependencies = [
 name = "selium-discovery-probe"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-guest",
  "selium-shm",
 ]
