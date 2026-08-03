@@ -519,7 +519,6 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "selium-guest",
  "selium-shm",
- "selium-wire",
 ]
 
 [[package]]

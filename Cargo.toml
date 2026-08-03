@@ -63,7 +63,7 @@ tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", default-features = false }
 wasmtiny = { version = "0.1", default-features = false }
-wat = { version = "1.254", default-features = false }
+wat = { version = "1.255", default-features = false }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
