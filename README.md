@@ -24,6 +24,9 @@ continuously tested:
 - Structured guest logging over a shared-memory channel, drained by the host
 - Config-driven bootstrap of WASM system guests with per-process capability
   grants
+- Capability enforcement: real scope contexts (tenant, resource class,
+  identity), grant-time selector admission, and an enforcement matrix — see
+  `selium-abi` docs for the capability × selector table
 - Discovery system guest (`crates/guests/discovery`): Tier-1 runtime feed
   registration, Tier-2 guest-driven URI resolution over shm RPC, and
   revocation on process exit
@@ -54,11 +57,11 @@ cargo test -p selium-runtime --test discovery -- --ignored
 ## Deferred (explicitly not working yet)
 
 - Networking (TCP/UDP bridges, QUIC, external clients)
-- AAA / tenant enforcement (capability grants exist; tenant/URI
-  enforcement is not implemented)
 - Multi-host clustering, scheduling, supervision, external API
 - Durable storage (current logs/blob stores are in-memory)
 - Guest wake/wait for channel I/O (currently spin/poll based)
+- `UriPrefix` selector enforcement (rejected at grant time; arrives with
+  discovery-driven attach)
 
 Frozen crates retained in-tree for later increments: `crates/core/quic`,
 `crates/guests/{bridge,cluster,scheduler,supervisor,external-api}` — these

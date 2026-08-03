@@ -19,7 +19,13 @@ impl Kernel {
         entrypoint: impl Into<String>,
         grants: Vec<CapabilityGrant>,
     ) -> ProcessDescriptor {
-        let local_id = self.inner.next_process_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let local_id = loop {
+            let counter = self.inner.next_process_id.fetch_add(1, Ordering::SeqCst);
+            let id = crate::state::hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                break id;
+            }
+        };
         let descriptor = ProcessDescriptor {
             local_id,
             module_id: module_id.into(),

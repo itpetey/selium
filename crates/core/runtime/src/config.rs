@@ -29,6 +29,9 @@ pub struct SystemGuestDescriptor {
     pub dependencies: Vec<String>,
     /// Readiness condition for this guest.
     pub readiness: ReadinessCondition,
+    /// Tenant identity for this guest. `None` means "platform tenant".
+    /// Children spawned by this guest inherit this tenant.
+    pub tenant: Option<String>,
 }
 
 /// Runtime bootstrap configuration.
@@ -62,6 +65,12 @@ pub struct BootstrapReport {
 pub struct ProcessAuthority {
     /// Grants assigned to the process.
     pub grants: Vec<CapabilityGrant>,
+    /// Tenant identity assigned at spawn (inherited from parent or explicit
+    /// host assignment for system guests). `None` means "platform tenant".
+    pub tenant: Option<String>,
+    /// Parent process id, if spawned by another process. `None` for
+    /// bootstrapped system guests. Used by the `Children` selector.
+    pub parent: Option<ProcessId>,
 }
 
 impl SystemGuestDescriptor {
@@ -82,6 +91,7 @@ impl SystemGuestDescriptor {
             grants,
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
+            tenant: None,
         }
     }
 

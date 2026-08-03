@@ -1,6 +1,6 @@
 use selium_abi::{
     ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, LocalityScope, ProcessId,
-    ResourceClass, ResourceIdentity, ScopeContext, encode_rkyv,
+    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, encode_rkyv,
 };
 use tracing::debug;
 use wasmtiny::WasmValue;
@@ -43,16 +43,57 @@ impl Runtime {
         capability: Capability,
         context: &ScopeContext,
     ) -> bool {
-        self.process_authorities
-            .lock()
-            .get(&process_id)
-            .map(|record| {
-                record
-                    .grants
-                    .iter()
-                    .any(|grant| grant.capability == capability && grant.allows(context))
+        // Clone the grants so we can release the lock before evaluating
+        // the Children selector, which itself needs process_authorities.
+        let grants = {
+            self.process_authorities
+                .lock()
+                .get(&process_id)
+                .map(|record| record.grants.clone())
+        };
+        grants
+            .map(|grants| {
+                grants.iter().any(|grant| {
+                    grant.capability == capability
+                        && grant.selectors.iter().all(|selector| match selector {
+                            ResourceSelector::Children => {
+                                self.selector_matches_children(process_id, context.resource_id)
+                            }
+                            _ => selector.matches(context),
+                        })
+                })
             })
             .unwrap_or(false)
+    }
+
+    /// Checks if `target` is a descendant of `ancestor` by walking the
+    /// parent chain in the process authority table.
+    pub fn is_descendant_of(&self, target: ProcessId, ancestor: ProcessId) -> bool {
+        let authorities = self.process_authorities.lock();
+        let mut current = target;
+        // Bound traversal to the number of processes (no cycles expected).
+        let max_depth = authorities.len();
+        for _ in 0..=max_depth {
+            match authorities.get(&current) {
+                Some(auth) if auth.parent == Some(ancestor) => return true,
+                Some(auth) if auth.parent.is_some() => {
+                    current = auth.parent.expect("parent is Some");
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn selector_matches_children(
+        &self,
+        grantee: ProcessId,
+        target: Option<ResourceIdentity>,
+    ) -> bool {
+        match target {
+            Some(ResourceIdentity::Local(target_pid)) => self.is_descendant_of(target_pid, grantee),
+            _ => false,
+        }
     }
 
     /// Projects a metering observation into the kernel.
@@ -107,16 +148,42 @@ impl Runtime {
         &self,
         process_id: ProcessId,
         grants: Vec<CapabilityGrant>,
+        tenant: Option<String>,
+        parent: Option<ProcessId>,
     ) {
-        self.process_authorities
-            .lock()
-            .insert(process_id, ProcessAuthority { grants });
+        self.process_authorities.lock().insert(
+            process_id,
+            ProcessAuthority {
+                grants,
+                tenant,
+                parent,
+            },
+        );
     }
 
+    /// Returns the tenant identity assigned to a process, if any.
+    pub fn process_tenant(&self, process_id: ProcessId) -> Option<String> {
+        self.process_authorities
+            .lock()
+            .get(&process_id)
+            .and_then(|authority| authority.tenant.clone())
+    }
+
+    /// Validates grants against the enforcement admission matrix.
+    ///
+    /// Admitted selectors: `ResourceClass`, `Locality`, `ExplicitResource`,
+    /// `Tenant`, `Children`.
+    /// Rejected: `UriPrefix` (until resource URIs populate scope contexts).
+    /// Empty selector list = unrestricted within the capability.
     pub(crate) fn validate_grants(&self, grants: &[CapabilityGrant]) -> Result<()> {
         for grant in grants {
-            if grant.selectors.is_empty() {
-                return Err(Error::InvalidGrant(grant.capability.clone()));
+            for selector in &grant.selectors {
+                if !selector.is_evaluatable() {
+                    return Err(Error::UnevaluatableSelector(
+                        grant.capability.clone(),
+                        format!("{selector:?}"),
+                    ));
+                }
             }
         }
         Ok(())
@@ -137,9 +204,16 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
-        self.shared_resource_owners
-            .lock()
-            .retain(|_, owners| !owners.contains(&process_id));
+        // Remove the failed process from all shared-resource owner sets,
+        // but preserve co-owners (fix: previously retain deleted entire
+        // owner sets when one co-owner failed).
+        {
+            let mut shared_resource_owners = self.shared_resource_owners.lock();
+            for owners in shared_resource_owners.values_mut() {
+                owners.remove(&process_id);
+            }
+            shared_resource_owners.retain(|_, owners| !owners.is_empty());
+        }
         Ok(())
     }
 
@@ -330,22 +404,24 @@ impl Runtime {
         resource_class: ResourceClass,
         resource_id: Option<ResourceIdentity>,
     ) -> std::result::Result<(), selium_abi::AbiError> {
-        let allowed = self.authorises(
-            process_id,
-            capability.clone(),
-            &ScopeContext {
-                locality: LocalityScope::Cluster,
-                resource_class: Some(resource_class),
-                resource_id,
-                ..ScopeContext::default()
-            },
-        );
+        let tenant = self.process_tenant(process_id);
+        let context = ScopeContext {
+            tenant: tenant.clone(),
+            uri: None, // Resource URI populated when known (discovery-driven attach)
+            locality: LocalityScope::Cluster,
+            resource_class: Some(resource_class),
+            resource_id,
+        };
+        let allowed = self.authorises(process_id, capability.clone(), &context);
         if allowed {
             Ok(())
         } else {
             Err(selium_abi::AbiError::new(
                 selium_abi::AbiErrorCode::PermissionDenied,
-                format!("permission denied for capability {capability:?}"),
+                format!(
+                    "permission denied for capability {capability:?} (tenant: {tenant:?}, class: {:?}, identity: {resource_id:?})",
+                    context.resource_class
+                ),
             ))
         }
     }
@@ -419,6 +495,7 @@ mod tests {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             })
             .expect("spawn guest");
         runtime.project_metering(
@@ -444,6 +521,70 @@ mod tests {
                 .expect("metering")
                 .cpu_micros,
             11
+        );
+    }
+
+    #[test]
+    fn cleanup_failed_process_preserves_co_owners() {
+        let runtime = Runtime::default();
+
+        let guest_a = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "owner-a".to_string(),
+                module_id: "owner-a-module".to_string(),
+                module_bytes: module_with_entrypoint("main", ""),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            })
+            .expect("spawn owner-a");
+
+        let guest_b = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "owner-b".to_string(),
+                module_id: "owner-b-module".to_string(),
+                module_bytes: module_with_entrypoint("main", ""),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            })
+            .expect("spawn owner-b");
+
+        // Allocate a shared region as guest_a.
+        let (shared_id, _len) = runtime
+            .kernel()
+            .allocate_shared_region(64)
+            .expect("allocate region");
+        runtime.claim_shared_resource(guest_a.process_id, ResourceClass::SharedRegion, shared_id);
+        // Simulate co-ownership: guest_b also owns the region.
+        runtime.claim_shared_resource(guest_b.process_id, ResourceClass::SharedRegion, shared_id);
+
+        // Cleanup guest_a (simulate failure).
+        runtime
+            .cleanup_failed_process(guest_a.process_id)
+            .expect("cleanup");
+
+        // guest_b should still own the region.
+        let still_owns = runtime
+            .shared_resource_owners
+            .lock()
+            .get(&(ResourceClass::SharedRegion, shared_id))
+            .is_some_and(|owners| owners.contains(&guest_b.process_id));
+        assert!(
+            still_owns,
+            "co-owner b should retain ownership after a fails"
         );
     }
 }

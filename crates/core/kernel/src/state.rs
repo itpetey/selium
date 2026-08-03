@@ -3,6 +3,7 @@ use std::{
     net::TcpListener,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::{Condvar, Mutex};
@@ -87,6 +88,8 @@ pub(crate) struct KernelInner {
     pub(crate) next_local_id: AtomicU64,
     pub(crate) next_shared_id: AtomicU64,
     pub(crate) next_process_id: AtomicU64,
+    /// Per-kernel seed for non-sequential id generation.
+    pub(crate) id_seed: u64,
     pub(crate) shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
     pub(crate) shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
     pub(crate) durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
@@ -107,19 +110,28 @@ pub(crate) struct KernelInner {
 
 impl Default for Kernel {
     fn default() -> Self {
+        Self::with_seed(random_seed())
+    }
+}
+
+impl Kernel {
+    /// Creates a kernel with a specific id-generation seed (for deterministic
+    /// tests).
+    pub fn with_seed(seed: u64) -> Self {
         Self {
-            inner: Arc::new(KernelInner::default()),
+            inner: Arc::new(KernelInner::with_seed(seed)),
         }
     }
 }
 
-impl Default for KernelInner {
-    fn default() -> Self {
+impl KernelInner {
+    fn with_seed(seed: u64) -> Self {
         Self {
             store: Mutex::new(Store::new()),
             next_local_id: AtomicU64::new(0),
             next_shared_id: AtomicU64::new(0),
             next_process_id: AtomicU64::new(0),
+            id_seed: seed,
             shared_regions: Mutex::new(HashMap::new()),
             shared_mappings: Mutex::new(HashMap::new()),
             durable_logs_by_shared: Mutex::new(HashMap::new()),
@@ -138,4 +150,24 @@ impl Default for KernelInner {
             metering: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// Generates a random seed from system entropy (time + pid).
+fn random_seed() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    time ^ pid.rotate_left(17)
+}
+
+/// Generates a non-sequential u64 id from a seed and counter using a
+/// splitmix64-based hash. Different counters produce different outputs
+/// (the function is a bijection for a fixed seed).
+pub(crate) fn hashed_id(seed: u64, counter: u64) -> u64 {
+    let mut z = seed.wrapping_add(counter);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }

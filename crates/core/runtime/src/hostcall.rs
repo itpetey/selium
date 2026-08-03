@@ -92,6 +92,12 @@ impl Runtime {
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
                 match self.kernel.try_host_queue_recv(local_id) {
                     Ok(Some((client_process_id, value))) => {
+                        // Queue handoff: share region ownership on recv.
+                        self.share_region_ownership_on_recv(
+                            operation.process_id,
+                            client_process_id,
+                            value,
+                        );
                         let output = HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
@@ -190,7 +196,7 @@ impl Runtime {
                         host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
                         resource_id: shared_id,
                         interface: None,
-                        tenant: None, // TODO: populate from process authority when tenant tracking is added
+                        tenant: self.process_tenant(process_id),
                     };
                     let request = DiscoveryRequest::Register {
                         uri: uri.clone(),
@@ -290,6 +296,7 @@ impl Runtime {
                     ResourceClass::SharedRegion,
                     Some(ResourceIdentity::Shared(region_id)),
                 )?;
+                self.ensure_attach_authorised(process_id, region_id)?;
 
                 let page_offset = if let Some(memory) = &guest_memory {
                     // Attach directly into the calling guest's memory. This
@@ -632,6 +639,7 @@ impl Runtime {
                     None,
                 )?;
                 self.validate_child_grants(process_id, &grants)?;
+                let tenant = self.process_tenant(process_id);
                 let module_bytes = self
                     .module_bytes(&module_id)
                     .map_err(|error| AbiError::new(AbiErrorCode::NotFound, error.to_string()))?;
@@ -644,10 +652,16 @@ impl Runtime {
                     grants,
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
+                    tenant,
                 };
                 let child = self
                     .spawn_system_guest(descriptor)
                     .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                // Record the parent relationship for the Children selector.
+                self.process_authorities
+                    .lock()
+                    .entry(child.process_id)
+                    .and_modify(|auth| auth.parent = Some(process_id));
                 self.claim_local_handle(process_id, ResourceClass::Process, child.process_id);
                 let process = self
                     .kernel
@@ -702,13 +716,28 @@ impl Runtime {
                 }
             }
             HostcallRequest::GuestLogWrite { entry } => {
-                self.authorise_guest_log_process(process_id, Capability::GuestLogWrite, &entry)?;
-                self.require(
-                    process_id,
-                    Capability::GuestLogWrite,
-                    ResourceClass::GuestLog,
-                    entry.process_id.map(ResourceIdentity::Local),
-                )?;
+                // GuestLogWrite treats the writer's own pid as owned: a
+                // process can always write a log entry for itself.
+                if entry.process_id == Some(process_id) {
+                    self.require(
+                        process_id,
+                        Capability::GuestLogWrite,
+                        ResourceClass::GuestLog,
+                        None,
+                    )?;
+                } else {
+                    self.authorise_guest_log_process(
+                        process_id,
+                        Capability::GuestLogWrite,
+                        &entry,
+                    )?;
+                    self.require(
+                        process_id,
+                        Capability::GuestLogWrite,
+                        ResourceClass::GuestLog,
+                        entry.process_id.map(ResourceIdentity::Local),
+                    )?;
+                }
                 self.kernel.write_guest_log(entry);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
@@ -792,6 +821,11 @@ impl Runtime {
                     .map_err(kernel_error)?
                 {
                     Some((client_process_id, value)) => {
+                        // Queue handoff: if the value matches a shared region
+                        // owned by the sender, share ownership with the receiver
+                        // (documented rendezvous pattern — the only place
+                        // ownership is granted implicitly, kernel-side).
+                        self.share_region_ownership_on_recv(process_id, client_process_id, value);
                         Ok(HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
@@ -979,6 +1013,73 @@ impl Runtime {
         }
     }
 
+    /// Checks that `process_id` may attach to `region_id`: either it owns the
+    /// shared region or it holds an `ExplicitResource(Shared(region_id))` grant.
+    fn ensure_attach_authorised(
+        &self,
+        process_id: ProcessId,
+        region_id: u64,
+    ) -> std::result::Result<(), AbiError> {
+        // Ownership check.
+        let owns = self
+            .shared_resource_owners
+            .lock()
+            .get(&(ResourceClass::SharedRegion, region_id))
+            .is_some_and(|owners| owners.contains(&process_id));
+        if owns {
+            return Ok(());
+        }
+
+        // ExplicitResource grant check.
+        let has_explicit = self
+            .process_authorities
+            .lock()
+            .get(&process_id)
+            .map(|auth| {
+                auth.grants.iter().any(|grant| {
+                    grant.capability == Capability::SharedMemory
+                        && grant.selectors.iter().any(|sel| {
+                            matches!(
+                                sel,
+                                ResourceSelector::ExplicitResource(
+                                    ResourceIdentity::Shared(id)
+                                ) if *id == region_id
+                            )
+                        })
+                })
+            })
+            .unwrap_or(false);
+        if has_explicit {
+            return Ok(());
+        }
+
+        Err(AbiError::new(
+            AbiErrorCode::PermissionDenied,
+            format!(
+                "AttachRegion denied: process {process_id} does not own region {region_id} and has no ExplicitResource grant",
+            ),
+        ))
+    }
+
+    /// Queue handoff ownership sharing: if `value` matches a shared region
+    /// owned by `sender_pid`, share ownership with `receiver_pid`. This is the
+    /// one place ownership is granted implicitly (kernel-side, documented).
+    fn share_region_ownership_on_recv(
+        &self,
+        receiver_pid: ProcessId,
+        sender_pid: ProcessId,
+        value: u64,
+    ) {
+        if self
+            .shared_resource_owners
+            .lock()
+            .get(&(ResourceClass::SharedRegion, value))
+            .is_some_and(|owners| owners.contains(&sender_pid))
+        {
+            self.claim_shared_resource(receiver_pid, ResourceClass::SharedRegion, value);
+        }
+    }
+
     fn log_shared_id(
         &self,
         process_id: ProcessId,
@@ -1085,6 +1186,9 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
                 matches!(selector, ResourceSelector::ExplicitResource(child_identity) if child_identity == parent_identity)
             })
         }
+        ResourceSelector::Children => child.selectors.iter().any(|selector| {
+            matches!(selector, ResourceSelector::Children)
+        }),
     })
 }
 
@@ -1129,6 +1233,7 @@ mod tests {
                 grants,
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             })
             .expect("spawn hostcall test guest")
     }
@@ -1160,6 +1265,7 @@ mod tests {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             })
             .expect("spawn rollover guest");
         *runtime.next_operation_id.lock() = OperationId::MAX;
@@ -1523,5 +1629,531 @@ mod tests {
             runtime.poll_hostcall(bootstrapped.process_id, foreign_op),
             CompletionState::Failed(_)
         ));
+    }
+
+    #[test]
+    fn tenant_scoped_grant_enforces_isolation() {
+        let runtime = Runtime::default();
+
+        // Process A: tenant "acme", grant scoped to Tenant("acme") + ResourceClass.
+        let guest_a = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "tenant-a".to_string(),
+                module_id: "tenant-a-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![
+                        ResourceSelector::Tenant("acme".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                    ],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some("acme".to_string()),
+            })
+            .expect("spawn tenant-a guest");
+
+        // Process B: tenant "beta", same grant scoped to Tenant("acme").
+        let guest_b = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "tenant-b".to_string(),
+                module_id: "tenant-b-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![
+                        ResourceSelector::Tenant("acme".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                    ],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some("beta".to_string()),
+            })
+            .expect("spawn tenant-b guest");
+
+        // Tenant "acme" process A: AllocRegion should succeed.
+        let (status_a, _op_a) = runtime.begin_hostcall(
+            guest_a.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+            },
+        );
+        assert_eq!(status_a, selium_abi::HOSTCALL_STATUS_READY);
+
+        // Tenant "beta" process B: AllocRegion should be denied.
+        let (status_b, op_b) = runtime.begin_hostcall(
+            guest_b.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+            },
+        );
+        assert_eq!(status_b, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        // Verify error attribution names the capability and tenant.
+        match runtime.poll_hostcall(guest_b.process_id, op_b) {
+            CompletionState::Failed(error) => {
+                assert!(
+                    error.message.contains("SharedMemory"),
+                    "error should name the denied capability: {error:?}"
+                );
+                assert!(
+                    error.message.contains("\"beta\""),
+                    "error should name the tenant: {error:?}"
+                );
+            }
+            other => panic!("expected failed hostcall for tenant-b, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unevaluatable_selector_rejected_at_spawn() {
+        let runtime = Runtime::default();
+
+        // A grant with UriPrefix should be rejected at spawn time — never
+        // accepted and then always denied at hostcall time.
+        let result = runtime.spawn_system_guest(SystemGuestDescriptor {
+            name: "uri-prefix-rejected".to_string(),
+            module_id: "uri-prefix-module".to_string(),
+            module_bytes: module_with_entrypoint("boot", ""),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::UriPrefix("sel://acme/".to_string())],
+            )],
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+        });
+
+        let error = result.expect_err("should reject UriPrefix grant at spawn");
+        assert!(
+            error.to_string().contains("UriPrefix"),
+            "error should name the rejected selector: {error}"
+        );
+    }
+
+    #[test]
+    fn accept_then_deny_trap_is_impossible() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                ),
+            ],
+        );
+
+        // ProcessStart with a UriPrefix grant must fail immediately at spawn,
+        // not pass validation and deny every subsequent hostcall.
+        let (status, op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::UriPrefix("sel://acme/".to_string())],
+                )],
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        match runtime.poll_hostcall(bootstrapped.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert!(
+                    error.message.contains("UriPrefix"),
+                    "error should name the rejected selector: {error:?}"
+                );
+                assert_eq!(error.code, AbiErrorCode::MalformedPayload);
+            }
+            other => panic!("expected failed hostcall for accept-then-deny trap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_selector_grant_is_unrestricted_within_capability() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "unrestricted".to_string(),
+                module_id: "unrestricted-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(Capability::SharedMemory, vec![])],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            })
+            .expect("empty selector grant should be accepted");
+
+        let (status, _) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    }
+
+    #[test]
+    fn attach_isolation_prevents_guessing() {
+        let runtime = Runtime::default();
+
+        // Process A: can allocate shared memory.
+        let guest_a = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+
+        // Process B: has SharedMemory capability but does not own A's regions.
+        let guest_b = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "guesser".to_string(),
+                module_id: "guesser-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            })
+            .expect("spawn guesser");
+
+        // A allocates a region.
+        let (_, alloc_op) = runtime.begin_hostcall(
+            guest_a.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+            },
+        );
+        let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, guest_a.process_id, alloc_op)
+        else {
+            panic!("expected RegionAlloc");
+        };
+        let region_id = alloc.region_id;
+
+        // B tries to attach to A's region → denied (no ownership, no explicit grant).
+        let (status, attach_op) = runtime.begin_hostcall(
+            guest_b.process_id,
+            HostcallRequest::AttachRegion {
+                region_id,
+                reader_slot: None,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        match runtime.poll_hostcall(guest_b.process_id, attach_op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+                assert!(
+                    error.message.contains("does not own"),
+                    "error should mention ownership: {error:?}"
+                );
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_succeeds_with_explicit_resource_grant() {
+        let runtime = Runtime::default();
+
+        // Process A: can allocate shared memory.
+        let guest_a = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+
+        // A allocates a region.
+        let (_, alloc_op) = runtime.begin_hostcall(
+            guest_a.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+            },
+        );
+        let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, guest_a.process_id, alloc_op)
+        else {
+            panic!("expected RegionAlloc");
+        };
+        let region_id = alloc.region_id;
+
+        // Process B: has ExplicitResource grant for the specific region.
+        let guest_b = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "explicit-b".to_string(),
+                module_id: "explicit-b-module".to_string(),
+                module_bytes: wat::parse_str("(module (memory 1) (func (export \"boot\")))")
+                    .expect("compile wat"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ExplicitResource(
+                        ResourceIdentity::Shared(region_id),
+                    )],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            })
+            .expect("spawn explicit-b");
+
+        // B attaches to A's region with the ExplicitResource grant → succeeds.
+        let (status, attach_op) = runtime.begin_hostcall(
+            guest_b.process_id,
+            HostcallRequest::AttachRegion {
+                region_id,
+                reader_slot: None,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
+        if status != selium_abi::HOSTCALL_STATUS_READY {
+            match runtime.poll_hostcall(guest_b.process_id, attach_op) {
+                CompletionState::Failed(error) => {
+                    panic!("attach with ExplicitResource grant should succeed: {error:?}");
+                }
+                other => panic!("expected ready, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn children_selector_allows_descendant_metering_read() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "meter-child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::MeteringRead,
+                    vec![ResourceSelector::ResourceClass(
+                        ResourceClass::MeteringStream,
+                    )],
+                ),
+                CapabilityGrant::new(Capability::MeteringRead, vec![ResourceSelector::Children]),
+            ],
+        );
+
+        let (_, start_op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "meter-child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![],
+            },
+        );
+        let HostcallOutput::Process(child) = ready(&runtime, parent.process_id, start_op) else {
+            panic!("expected child process");
+        };
+        runtime.project_metering(
+            child.local_id,
+            MeteringObservation {
+                cpu_micros: 42,
+                memory_bytes: 0,
+                storage_bytes: 0,
+                bandwidth_bytes: 0,
+            },
+        );
+
+        // Parent reads descendant metering with Children selector → succeeds.
+        let (status, meter_op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::MeteringRead {
+                process_id: child.local_id,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            ready(&runtime, parent.process_id, meter_op),
+            HostcallOutput::Metering(_)
+        ));
+
+        // Parent reads an UNrelated process's metering → Children grant does
+        // NOT match, but the ResourceClass grant DOES (so this succeeds).
+        // To test denial, we need a grant with ONLY Children (no class-level).
+    }
+
+    #[test]
+    fn children_selector_denies_unrelated_process() {
+        let runtime = Runtime::default();
+
+        // Parent has ONLY Children-scoped MeteringRead (no class-level).
+        let parent = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::MeteringRead,
+                vec![ResourceSelector::Children],
+            )],
+        );
+
+        // An unrelated process.
+        let unrelated = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+        runtime.project_metering(
+            unrelated.process_id,
+            MeteringObservation {
+                cpu_micros: 7,
+                memory_bytes: 0,
+                storage_bytes: 0,
+                bandwidth_bytes: 0,
+            },
+        );
+
+        // Parent reads unrelated process metering with Only Children → denied.
+        let (status, _) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::MeteringRead {
+                process_id: unrelated.process_id,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+    }
+
+    #[test]
+    fn guest_log_write_accepts_own_pid() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::GuestLogWrite,
+                vec![ResourceSelector::ResourceClass(ResourceClass::GuestLog)],
+            )],
+        );
+
+        let entry = GuestLogEntry {
+            process_id: Some(guest.process_id),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "self log".to_string(),
+        };
+        let (status, _) =
+            runtime.begin_hostcall(guest.process_id, HostcallRequest::GuestLogWrite { entry });
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    }
+
+    #[test]
+    fn child_grant_cannot_exceed_parent_authority() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "contain-child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        // Parent has tenant-scoped ProcessLifecycle.
+        let parent = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "contain-parent".to_string(),
+                module_id: "contain-parent-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![
+                    CapabilityGrant::new(
+                        Capability::ProcessLifecycle,
+                        vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                    ),
+                    CapabilityGrant::new(
+                        Capability::SharedMemory,
+                        vec![
+                            ResourceSelector::Tenant("acme".to_string()),
+                            ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                        ],
+                    ),
+                ],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some("acme".to_string()),
+            })
+            .expect("spawn contain-parent");
+
+        // Try to spawn a child with a Tenant("beta") grant that exceeds
+        // the parent's Tenant("acme") authority.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "contain-child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![
+                        ResourceSelector::Tenant("beta".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                    ],
+                )],
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+                assert!(
+                    error.message.contains("exceeds parent authority")
+                        || error.message.contains("child grant"),
+                    "error should mention parent authority: {error:?}"
+                );
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
     }
 }

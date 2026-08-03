@@ -23,6 +23,9 @@ pub enum Error {
     #[error("invalid grant for capability {0:?}")]
     /// Capability grant is invalid.
     InvalidGrant(Capability),
+    #[error("grant for capability {0:?} contains unevaluatable selector: {1}")]
+    /// Grant contains a selector the runtime cannot evaluate.
+    UnevaluatableSelector(Capability, String),
     #[error("duplicate system guest descriptor: {0}")]
     /// Duplicate system guest name was supplied.
     DuplicateDescriptor(String),

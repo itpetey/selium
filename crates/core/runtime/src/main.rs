@@ -76,5 +76,6 @@ fn spine_demo() -> Result<SystemGuestDescriptor> {
         grants,
         dependencies: Vec::new(),
         readiness: ReadinessCondition::Immediate,
+        tenant: None,
     })
 }

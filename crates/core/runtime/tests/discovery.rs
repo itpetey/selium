@@ -183,6 +183,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         ],
         dependencies: Vec::new(),
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
     }
 }
 
@@ -205,6 +206,7 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         ],
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
     }
 }
 

@@ -266,11 +266,26 @@ impl Kernel {
     }
 
     pub(crate) fn next_local_id(&self) -> u64 {
-        self.inner.next_local_id.fetch_add(1, Ordering::SeqCst) + 1
+        // splitmix64 is a bijection: each counter value produces a unique
+        // output for a given seed, so collisions within this id space are
+        // impossible. We only guard against id 0 (used as a sentinel).
+        loop {
+            let counter = self.inner.next_local_id.fetch_add(1, Ordering::SeqCst);
+            let id = crate::state::hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
     pub(crate) fn next_shared_id(&self) -> u64 {
-        self.inner.next_shared_id.fetch_add(1, Ordering::SeqCst) + 1
+        loop {
+            let counter = self.inner.next_shared_id.fetch_add(1, Ordering::SeqCst);
+            let id = crate::state::hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
     /// Creates a `Store` that shares the kernel's `SharedMemoryRegistry`.
@@ -301,5 +316,19 @@ mod tests {
             .expect("write left");
         let bytes = kernel.read_shared_memory(right, 0, 5).expect("read right");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn ids_are_non_sequential_and_deterministic() {
+        // Same seed must produce the same id sequence.
+        let kernel_a = Kernel::with_seed(42);
+        let kernel_b = Kernel::with_seed(42);
+
+        let ids_a: Vec<u64> = (0..5).map(|_| kernel_a.next_shared_id()).collect();
+        let ids_b: Vec<u64> = (0..5).map(|_| kernel_b.next_shared_id()).collect();
+
+        assert_eq!(ids_a, ids_b, "same seed must produce same ids");
+        assert_ne!(ids_a, vec![1, 2, 3, 4, 5], "ids must not be sequential");
+        assert!(ids_a.iter().all(|&id| id != 0), "ids must never be 0");
     }
 }

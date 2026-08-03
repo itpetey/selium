@@ -109,3 +109,23 @@ The runtime SHALL continue to pass the discovery host queue `shared_id` to guest
 #### Scenario: Application guest receives discovery handle (unchanged)
 - **WHEN** the runtime bootstraps an application guest
 - **THEN** the guest's entrypoint SHALL receive the discovery `shared_id` as a u64 argument for `Context::from_raw`
+
+### Requirement: Grant Admission and Evaluation
+`selium-runtime` SHALL reject, at spawn or `ProcessStart`, any grant
+whose selectors it cannot evaluate, and SHALL evaluate every accepted
+grant against authority-derived scope contexts. Empty selector lists
+SHALL mean "unrestricted within the capability" and be documented as such.
+
+#### Scenario: Accept-then-deny is impossible
+
+- **WHEN** a guest is spawned with a grant the runtime would never be
+  able to satisfy (unevaluatable selector)
+- **THEN** spawning fails immediately with the selector named — the
+  grant cannot enter the accept-then-always-deny state
+
+#### Scenario: Errors attribute correctly
+
+- **WHEN** any authorisation check fails
+- **THEN** the error identifies the denied capability and the relevant
+  scope values (tenant/class/identity) rather than a generic or
+  misattributed capability

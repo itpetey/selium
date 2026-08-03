@@ -1,4 +1,24 @@
 //! Selium ABI contracts shared by host and guest crates.
+//!
+//! # Capability Enforcement Matrix
+//!
+//! Grants are validated against an admission matrix at spawn time. A selector
+//! is either **enforced** (evaluated against the runtime-built `ScopeContext`)
+//! or **rejected** (the grant fails at spawn with a precise error naming the
+//! selector). This prevents the "accept-then-always-deny" trap.
+//!
+//! | Selector | Status | Scope context field |
+//! |---|---|---|
+//! | `ResourceClass` | **Enforced** | `resource_class` |
+//! | `Locality` | **Enforced** | `locality` |
+//! | `ExplicitResource` | **Enforced** | `resource_id` |
+//! | `Tenant` | **Enforced** | `tenant` (from process authority) |
+//! | `Children` | **Enforced** | requires process-tree access (runtime) |
+//! | `UriPrefix` | **Rejected** | `uri` not yet populated |
+//!
+//! An **empty** selector list means "unrestricted within the capability" and is
+//! explicitly accepted. Intersection semantics apply: all selectors in a grant
+//! must match for the grant to apply to a given scope context.
 
 use rkyv::{
     Archive, Deserialize, Serialize,
@@ -189,6 +209,10 @@ pub enum ResourceSelector {
     ResourceClass(ResourceClass),
     /// Match a concrete resource identity.
     ExplicitResource(ResourceIdentity),
+    /// Match processes that are descendants of the grantee (children,
+    /// grandchildren, etc.). Used by metering/activity/guest-log read
+    /// grants so supervisors can read their descendants' telemetry.
+    Children,
 }
 
 /// Grant allowing one capability within the intersection of its selectors.
@@ -819,7 +843,27 @@ impl Default for ScopeContext {
 }
 
 impl ResourceSelector {
+    /// Returns whether the runtime can evaluate this selector against a `ScopeContext`.
+    ///
+    /// The enforcement matrix is:
+    /// - `Tenant`, `Locality`, `ResourceClass`, `ExplicitResource`: evaluatable.
+    /// - `UriPrefix`: rejected until resource URIs populate scope contexts.
+    pub fn is_evaluatable(&self) -> bool {
+        match self {
+            Self::Tenant(_)
+            | Self::Locality(_)
+            | Self::ResourceClass(_)
+            | Self::ExplicitResource(_)
+            | Self::Children => true,
+            Self::UriPrefix(_) => false,
+        }
+    }
+
     /// Returns whether this selector matches the supplied scope context.
+    ///
+    /// `Children` is not evaluated here — it requires process-tree knowledge
+    /// only available to the runtime, so it returns `false` by default and the
+    /// runtime handles it specially in `Runtime::authorises`.
     pub fn matches(&self, context: &ScopeContext) -> bool {
         match self {
             Self::Tenant(expected) => context.tenant.as_ref() == Some(expected),
@@ -830,6 +874,8 @@ impl ResourceSelector {
             Self::Locality(expected) => expected.matches(&context.locality),
             Self::ResourceClass(expected) => context.resource_class.as_ref() == Some(expected),
             Self::ExplicitResource(expected) => context.resource_id == Some(*expected),
+            // Handled by the runtime with process-tree access.
+            Self::Children => false,
         }
     }
 }

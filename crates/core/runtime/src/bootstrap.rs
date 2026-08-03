@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::ActivityEvent;
+use selium_abi::{
+    ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, ResourceSelector,
+};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
@@ -35,14 +37,34 @@ impl Runtime {
         };
 
         if let Some(listener_shared_id) = discovery_listener_shared_id {
+            let feed_region_id = discovery_feed_region_id
+                .expect("discovery feed region id must be present");
             for descriptor in &mut config.system_guests {
                 if descriptor.name == "discovery" {
-                    descriptor.set_discovery_feed_and_handle(
-                        discovery_feed_region_id.expect("discovery feed region id must be present"),
-                        listener_shared_id,
-                    );
+                    descriptor.set_discovery_feed_and_handle(feed_region_id, listener_shared_id);
+                    // Add explicit resource grants so the discovery guest can attach
+                    // to the feed region and listener queue created by setup_discovery.
+                    descriptor.grants.push(CapabilityGrant::new(
+                        Capability::SharedMemory,
+                        vec![ResourceSelector::ExplicitResource(
+                            ResourceIdentity::Shared(feed_region_id),
+                        )],
+                    ));
+                    descriptor.grants.push(CapabilityGrant::new(
+                        Capability::HostQueue,
+                        vec![ResourceSelector::ExplicitResource(
+                            ResourceIdentity::Shared(listener_shared_id),
+                        )],
+                    ));
                 } else if descriptor.arguments.is_empty() {
                     descriptor.set_discovery_handle(listener_shared_id);
+                    // Other guests also need explicit grant for the discovery listener.
+                    descriptor.grants.push(CapabilityGrant::new(
+                        Capability::HostQueue,
+                        vec![ResourceSelector::ExplicitResource(
+                            ResourceIdentity::Shared(listener_shared_id),
+                        )],
+                    ));
                 }
             }
         }
@@ -153,7 +175,12 @@ impl Runtime {
             descriptor.entrypoint.clone(),
             descriptor.grants.clone(),
         );
-        self.persist_process_authority(process.local_id, descriptor.grants.clone());
+        self.persist_process_authority(
+            process.local_id,
+            descriptor.grants.clone(),
+            descriptor.tenant.clone(),
+            None,
+        );
 
         let loaded_guest = match self.load_guest_module(&descriptor.module_bytes, process.local_id)
         {
@@ -319,6 +346,7 @@ mod tests {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             }],
         };
 
@@ -351,6 +379,7 @@ mod tests {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+                tenant: None,
             })
             .expect("spawn bridged guest");
 

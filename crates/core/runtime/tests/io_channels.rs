@@ -84,7 +84,7 @@ fn attach_reads_and_writes_through_kernel() {
 
     // Attach the region via hostcall (returns page_offset).
     let attachment = attach_region(&runtime, process_id, region_id);
-    assert_eq!(attachment.page_offset, 1);
+    assert_ne!(attachment.page_offset, 0);
 
     // Use kernel internals to get a local mapping id for verification.
     let local_id = runtime
@@ -251,6 +251,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             }],
         })
         .expect("bootstrap");

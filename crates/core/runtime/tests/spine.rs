@@ -49,6 +49,7 @@ fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         )],
         dependencies: Vec::new(),
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
     }
 }
 

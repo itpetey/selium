@@ -22,6 +22,7 @@ fn foundation_crates_work_together_through_hostcalls() {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             }],
         })
         .expect("bootstrap runtime");
@@ -63,6 +64,7 @@ fn hostcalls_enforce_session_grants() {
                 )],
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
+                tenant: None,
             }],
         })
         .expect("bootstrap runtime");
