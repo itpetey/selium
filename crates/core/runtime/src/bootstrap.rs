@@ -8,7 +8,7 @@ use selium_abi::{ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, R
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
-use wasmtiny::WasmApplication;
+use wasmtiny::{WasmApplication, WasmValue};
 
 use crate::{
     Error, Result,
@@ -189,7 +189,21 @@ impl Runtime {
             }
         };
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
-            Ok(loaded_guest) => loaded_guest,
+            Ok(loaded_guest) => {
+                if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {
+                    self.kernel.record_activity(ActivityEvent {
+                        kind: selium_abi::ActivityKind::ProcessExited,
+                        process_id: Some(process.local_id),
+                        message: format!(
+                            "guest {} entrypoint returned error",
+                            descriptor.name
+                        ),
+                    });
+                    self.cleanup_failed_process(process.local_id)?;
+                    return Err(Error::EntrypointFailed(descriptor.name.clone()));
+                }
+                loaded_guest
+            }
             Err(error) => {
                 self.kernel.record_activity(ActivityEvent {
                     kind: selium_abi::ActivityKind::ProcessExited,
@@ -387,6 +401,69 @@ mod tests {
         assert_eq!(
             results,
             vec![WasmValue::I64(bootstrapped.process_id as i64)]
+        );
+    }
+
+    #[test]
+    fn guest_with_i32_zero_entrypoint_result_bootstraps_normally() {
+        let runtime = Runtime::default();
+        let config = RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![SystemGuestDescriptor {
+                name: "ok-guest".to_string(),
+                module_id: "ok-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", "(result i32) i32.const 0"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            }],
+        };
+
+        let report = runtime
+            .bootstrap_system_guests(config)
+            .expect("bootstrap guests");
+        assert_eq!(report.guests.len(), 1);
+        assert_eq!(
+            runtime
+                .entrypoint_results(report.guests[0].process_id)
+                .expect("entrypoint results"),
+            vec![WasmValue::I32(0)]
+        );
+    }
+
+    #[test]
+    fn guest_with_i32_one_entrypoint_result_fails_with_entrypoint_failed() {
+        let runtime = Runtime::default();
+        let config = RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![SystemGuestDescriptor {
+                name: "fail-guest".to_string(),
+                module_id: "fail-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", "(result i32) i32.const 1"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+            }],
+        };
+
+        let err = runtime
+            .bootstrap_system_guests(config)
+            .expect_err("should fail with EntrypointFailed");
+        assert!(
+            matches!(err, Error::EntrypointFailed(ref name) if name == "fail-guest"),
+            "expected EntrypointFailed, got {err:?}"
         );
     }
 }

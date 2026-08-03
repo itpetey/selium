@@ -25,6 +25,12 @@ pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
 }
 
+impl<T> JoinHandle<T> {
+    pub(crate) fn take_result(&self) -> Option<T> {
+        self.state.borrow_mut().result.take()
+    }
+}
+
 struct JoinState<T> {
     result: Option<T>,
     waker: Option<Waker>,
@@ -140,6 +146,23 @@ where
     if result.is_err() {
         std::process::abort();
     }
+}
+
+/// Runs an entrypoint future that produces a value and aborts the process
+/// if polling panics. Returns the future's output after the reactor parks.
+pub fn run_entrypoint_with_result<F, T>(future: F) -> T
+where
+    F: Future<Output = T> + 'static,
+{
+    let join = spawn(future);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        poll_safely();
+    }));
+    if result.is_err() {
+        std::process::abort();
+    }
+    join.take_result()
+        .expect("entrypoint task must have completed")
 }
 
 /// Spawns a future onto the cooperative guest task runner.

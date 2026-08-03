@@ -4,7 +4,8 @@ use crate::hostcall_region_provider::HostcallRegionProvider;
 
 pub use crate::{
     async_runtime::{
-        JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, spawn, yield_now,
+        JoinHandle, poll_reactor, poll_safely, run_entrypoint_safely, run_entrypoint_with_result,
+        spawn, yield_now,
     },
     context::Context,
     error::{GuestError, Result},

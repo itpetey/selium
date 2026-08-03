@@ -15,34 +15,42 @@ use selium_shm::{Channel, ChannelBackpressure};
 /// Channel capacity for the probe region.
 const PROBE_CHANNEL_CAPACITY: u64 = 4096;
 
+/// Error wrapper for the probe entrypoint.
+#[derive(Debug)]
+struct ProbeError(String);
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
+impl From<selium_guest::GuestError> for ProbeError {
+    fn from(e: selium_guest::GuestError) -> Self {
+        Self(e.to_string())
+    }
+}
+
 #[entrypoint]
-async fn discovery_probe(discovery_handle: u64) {
+async fn discovery_probe(discovery_handle: u64) -> Result<(), ProbeError> {
     drop(selium_guest::log::init());
     selium_guest::info!(guest = "discovery-probe", "booting");
 
     // Build a discovery context — this exercises the discovery rendezvous
     // (HostQueueAttach + HostQueueSend) and proves the runtime-injected
     // discovery handle is valid.
-    let _ctx = match Context::from_raw(discovery_handle).await {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            selium_guest::error!("failed to create discovery context: {error}");
-            return;
-        }
-    };
+    let _ctx = Context::from_raw(discovery_handle).await?;
 
     // Allocate a shared-memory channel — the runtime publishes Tier-1
     // registration events on the discovery feed for this region.
-    match Channel::create(PROBE_CHANNEL_CAPACITY, ChannelBackpressure::Park) {
-        Ok(channel) => {
-            selium_guest::info!(region_id = channel.region_id(), "probe: region allocated");
-        }
-        Err(error) => {
-            selium_guest::error!("probe: channel create failed: {error}");
-            return;
-        }
-    }
+    let channel = Channel::create(PROBE_CHANNEL_CAPACITY, ChannelBackpressure::Park)
+        .map_err(|e| ProbeError(e.to_string()))?;
+    selium_guest::info!(region_id = channel.region_id(), "probe: region allocated");
 
     selium_guest::info!("guest ready");
     selium_guest::mark_ready();
+
+    Ok(())
 }

@@ -41,6 +41,9 @@ pub enum Error {
     #[error("readiness condition not satisfied for guest `{0}`")]
     /// System guest did not satisfy its readiness condition.
     ReadinessUnsatisfied(String),
+    #[error("guest entrypoint returned an error: {0}")]
+    /// Guest entrypoint returned a non-zero exit code.
+    EntrypointFailed(String),
     #[error("kernel error: {0}")]
     /// Kernel operation failed.
     Kernel(#[from] selium_kernel::Error),
