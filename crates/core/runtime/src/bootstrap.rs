@@ -4,9 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, ResourceSelector,
-};
+use selium_abi::{ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, ResourceSelector};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
@@ -37,8 +35,8 @@ impl Runtime {
         };
 
         if let Some(listener_shared_id) = discovery_listener_shared_id {
-            let feed_region_id = discovery_feed_region_id
-                .expect("discovery feed region id must be present");
+            let feed_region_id =
+                discovery_feed_region_id.expect("discovery feed region id must be present");
             for descriptor in &mut config.system_guests {
                 if descriptor.name == "discovery" {
                     descriptor.set_discovery_feed_and_handle(feed_region_id, listener_shared_id);

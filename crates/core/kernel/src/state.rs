@@ -108,12 +108,6 @@ pub(crate) struct KernelInner {
     pub(crate) metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
 }
 
-impl Default for Kernel {
-    fn default() -> Self {
-        Self::with_seed(random_seed())
-    }
-}
-
 impl Kernel {
     /// Creates a kernel with a specific id-generation seed (for deterministic
     /// tests).
@@ -121,6 +115,12 @@ impl Kernel {
         Self {
             inner: Arc::new(KernelInner::with_seed(seed)),
         }
+    }
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self::with_seed(random_seed())
     }
 }
 
@@ -152,16 +152,6 @@ impl KernelInner {
     }
 }
 
-/// Generates a random seed from system entropy (time + pid).
-fn random_seed() -> u64 {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    time ^ pid.rotate_left(17)
-}
-
 /// Generates a non-sequential u64 id from a seed and counter using a
 /// splitmix64-based hash. Different counters produce different outputs
 /// (the function is a bijection for a fixed seed).
@@ -170,4 +160,14 @@ pub(crate) fn hashed_id(seed: u64, counter: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
+}
+
+/// Generates a random seed from system entropy (time + pid).
+fn random_seed() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    time ^ pid.rotate_left(17)
 }
