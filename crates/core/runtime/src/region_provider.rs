@@ -43,24 +43,19 @@ impl RegionProvider for RuntimeRegionProvider {
         let size_bytes = pages as u64 * selium_memory::WASM_PAGE_SIZE;
         let size_u32 = u32::try_from(size_bytes)
             .map_err(|_error| MemoryError::Other("region size exceeds u32".to_string()))?;
-        let (shared_id, len) = self
-            .kernel
+        let memory = self.kernel.memory();
+        let (shared_id, len) = memory
             .allocate_shared_region(size_u32)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let local_id = self
-            .kernel
+        let local_id = memory
             .attach_shared_region(shared_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
         self.local_ids
             .lock()
             .map_err(|error| MemoryError::Other(error.to_string()))?
             .insert(shared_id, local_id);
-        let backend: Arc<dyn MappingBackend> = Arc::new(KernelBackend::new(
-            self.kernel.clone(),
-            local_id,
-            shared_id,
-            len as u64,
-        ));
+        let backend: Arc<dyn MappingBackend> =
+            Arc::new(KernelBackend::new(memory, local_id, shared_id, len as u64));
         Ok(Region::with_backend(
             RegionAllocation {
                 region_id: shared_id,
@@ -76,20 +71,15 @@ impl RegionProvider for RuntimeRegionProvider {
         _reader_slot: Option<u32>,
         _prot: RegionProt,
     ) -> Result<Region> {
-        let local_id = self
-            .kernel
+        let memory = self.kernel.memory();
+        let local_id = memory
             .attach_shared_region(region_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let len = self
-            .kernel
+        let len = memory
             .shared_region_len(region_id)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
-        let backend: Arc<dyn MappingBackend> = Arc::new(KernelBackend::new(
-            self.kernel.clone(),
-            local_id,
-            region_id,
-            len as u64,
-        ));
+        let backend: Arc<dyn MappingBackend> =
+            Arc::new(KernelBackend::new(memory, local_id, region_id, len as u64));
         Ok(Region::with_backend(
             RegionAllocation {
                 region_id,
@@ -100,15 +90,16 @@ impl RegionProvider for RuntimeRegionProvider {
     }
 
     fn free(&self, region_id: u64) -> Result<()> {
+        let memory = self.kernel.memory();
         if let Some(local_id) = self
             .local_ids
             .lock()
             .map_err(|error| MemoryError::Other(error.to_string()))?
             .remove(&region_id)
         {
-            drop(self.kernel.detach_shared_region(local_id));
+            drop(memory.detach_shared_region(local_id));
         }
-        self.kernel
+        memory
             .destroy_shared_region(region_id)
             .map_err(|error| MemoryError::Other(error.to_string()))
     }

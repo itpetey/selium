@@ -1,14 +1,58 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use selium_abi::{BlobStoreDescriptor, DurableLogDescriptor, SharedResourceId, StorageRecord};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    Error, Result,
-    state::{BlobStoreState, DurableLogState, Kernel},
-};
+use crate::memory::MemoryRegistry;
+use crate::{Error, Result};
 
-impl Kernel {
+#[derive(Clone)]
+pub struct StorageRegistry {
+    pub(crate) inner: Arc<StorageRegistryInner>,
+}
+
+pub(crate) struct StorageRegistryInner {
+    pub(crate) durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
+    pub(crate) local_logs: Mutex<HashMap<u64, SharedResourceId>>,
+    pub(crate) blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
+    pub(crate) local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
+}
+
+#[derive(Default)]
+pub(crate) struct DurableLogState {
+    pub(crate) name: String,
+    pub(crate) next_sequence: u64,
+    pub(crate) records: Vec<StorageRecord>,
+    pub(crate) checkpoints: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct BlobStoreState {
+    pub(crate) name: String,
+    pub(crate) blobs: HashMap<String, Vec<u8>>,
+    pub(crate) manifests: HashMap<String, String>,
+}
+
+impl StorageRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(StorageRegistryInner {
+                durable_logs_by_shared: Mutex::new(HashMap::new()),
+                local_logs: Mutex::new(HashMap::new()),
+                blob_stores_by_shared: Mutex::new(HashMap::new()),
+                local_blob_stores: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
     /// Opens or creates a named durable log.
-    pub fn open_log(&self, name: impl Into<String>) -> DurableLogDescriptor {
+    pub fn open_log(
+        &self,
+        memory: &MemoryRegistry,
+        name: impl Into<String>,
+    ) -> DurableLogDescriptor {
         let name = name.into();
         let mut logs = self.inner.durable_logs_by_shared.lock();
         let mut local_logs = self.inner.local_logs.lock();
@@ -16,7 +60,7 @@ impl Kernel {
             if let Some((shared_id, _)) = logs.iter().find(|(_, state)| state.name == name) {
                 *shared_id
             } else {
-                let shared_id = self.next_shared_id();
+                let shared_id = memory.next_shared_id();
                 logs.insert(
                     shared_id,
                     DurableLogState {
@@ -27,7 +71,7 @@ impl Kernel {
                 );
                 shared_id
             };
-        let local_id = self.next_local_id();
+        let local_id = memory.next_local_id();
         local_logs.insert(local_id, shared_id);
         DurableLogDescriptor {
             local_id,
@@ -111,7 +155,11 @@ impl Kernel {
     }
 
     /// Opens or creates a named blob store.
-    pub fn open_blob_store(&self, name: impl Into<String>) -> BlobStoreDescriptor {
+    pub fn open_blob_store(
+        &self,
+        memory: &MemoryRegistry,
+        name: impl Into<String>,
+    ) -> BlobStoreDescriptor {
         let name = name.into();
         let mut stores = self.inner.blob_stores_by_shared.lock();
         let mut local_blob_stores = self.inner.local_blob_stores.lock();
@@ -119,7 +167,7 @@ impl Kernel {
             if let Some((shared_id, _)) = stores.iter().find(|(_, state)| state.name == name) {
                 *shared_id
             } else {
-                let shared_id = self.next_shared_id();
+                let shared_id = memory.next_shared_id();
                 stores.insert(
                     shared_id,
                     BlobStoreState {
@@ -129,7 +177,7 @@ impl Kernel {
                 );
                 shared_id
             };
-        let local_id = self.next_local_id();
+        let local_id = memory.next_local_id();
         local_blob_stores.insert(local_id, shared_id);
         BlobStoreDescriptor {
             local_id,
@@ -252,13 +300,17 @@ fn hex_char(value: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    use crate::kernel::Kernel;
+
     use super::*;
 
     #[test]
     fn durable_log_replay_and_checkpoint_work() {
         let kernel = Kernel::default();
-        let log = kernel.open_log("audit");
-        let sequence = kernel
+        let storage = kernel.storage();
+        let memory = kernel.memory();
+        let log = storage.open_log(&memory, "audit");
+        let sequence = storage
             .append_log(
                 log.local_id,
                 7,
@@ -266,23 +318,23 @@ mod tests {
                 b"hello".to_vec(),
             )
             .expect("append log");
-        kernel
+        storage
             .checkpoint_log(log.local_id, "boot", sequence)
             .expect("checkpoint log");
 
-        let replay = kernel
+        let replay = storage
             .replay_log(log.local_id, Some(sequence), 10)
             .expect("replay log");
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].payload, b"hello".to_vec());
         assert_eq!(
-            kernel
+            storage
                 .checkpoint_sequence(log.local_id, "boot")
                 .expect("checkpoint read"),
             Some(sequence)
         );
         assert!(matches!(
-            kernel.checkpoint_log(log.local_id, "missing", sequence + 1),
+            storage.checkpoint_log(log.local_id, "missing", sequence + 1),
             Err(Error::NotFound(_))
         ));
     }
@@ -290,26 +342,30 @@ mod tests {
     #[test]
     fn blob_store_put_get_and_manifest_work() {
         let kernel = Kernel::default();
-        let store = kernel.open_blob_store("assets");
-        let blob_id = kernel
+        let storage = kernel.storage();
+        let memory = kernel.memory();
+        let store = storage.open_blob_store(&memory, "assets");
+        let blob_id = storage
             .put_blob(store.local_id, b"blob".to_vec())
             .expect("put blob");
-        kernel
+        storage
             .set_manifest(store.local_id, "latest", blob_id.clone())
             .expect("set manifest");
 
         assert_eq!(
-            kernel.get_blob(store.local_id, &blob_id).expect("get blob"),
+            storage
+                .get_blob(store.local_id, &blob_id)
+                .expect("get blob"),
             Some(b"blob".to_vec())
         );
         assert_eq!(
-            kernel
+            storage
                 .get_manifest(store.local_id, "latest")
                 .expect("get manifest"),
             Some(blob_id)
         );
         assert!(matches!(
-            kernel.set_manifest(store.local_id, "broken", "missing"),
+            storage.set_manifest(store.local_id, "broken", "missing"),
             Err(Error::NotFound(_))
         ));
     }

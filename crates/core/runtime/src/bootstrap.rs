@@ -17,12 +17,18 @@ use crate::{
         SystemGuestDescriptor,
     },
     error::map_wasm_error,
-    state::{DiscoveryPublisher, LoadedGuest, Runtime},
+    runtime::{DiscoveryPublisher, Runtime},
     wasm::decode_wasm_arguments,
 };
 
 const DEFAULT_READINESS_POLL_MS: u64 = 10;
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
+
+pub(crate) struct LoadedGuest {
+    pub(crate) app: WasmApplication,
+    pub(crate) module_index: u32,
+    pub(crate) entrypoint_results: Vec<WasmValue>,
+}
 
 impl Runtime {
     /// Boots all configured system guests in dependency order.
@@ -147,10 +153,12 @@ impl Runtime {
         let publisher: DiscoveryPublisher = Publisher::new(FramedWrite::new(transport));
         *self.discovery_publisher.lock() = Some(publisher);
 
-        let listener = self.kernel.create_host_queue();
+        let queues = self.kernel.queues();
+        let memory = self.kernel.memory();
+        let listener = queues.create_host_queue(&memory);
         *self.discovery_listener_shared_id.lock() = Some(listener.shared_id);
 
-        self.kernel.record_activity(ActivityEvent {
+        self.kernel.processes().record_activity(ActivityEvent {
             kind: selium_abi::ActivityKind::GuestBootstrapped,
             process_id: None,
             message: format!(
@@ -168,7 +176,7 @@ impl Runtime {
         descriptor: SystemGuestDescriptor,
     ) -> Result<BootstrappedGuest> {
         self.validate_grants(&descriptor.grants)?;
-        let process = self.kernel.start_process(
+        let process = self.kernel.processes().start_process(
             descriptor.module_id.clone(),
             descriptor.entrypoint.clone(),
             descriptor.grants.clone(),
@@ -191,13 +199,10 @@ impl Runtime {
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
             Ok(loaded_guest) => {
                 if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {
-                    self.kernel.record_activity(ActivityEvent {
+                    self.kernel.processes().record_activity(ActivityEvent {
                         kind: selium_abi::ActivityKind::ProcessExited,
                         process_id: Some(process.local_id),
-                        message: format!(
-                            "guest {} entrypoint returned error",
-                            descriptor.name
-                        ),
+                        message: format!("guest {} entrypoint returned error", descriptor.name),
                     });
                     self.cleanup_failed_process(process.local_id)?;
                     return Err(Error::EntrypointFailed(descriptor.name.clone()));
@@ -205,7 +210,7 @@ impl Runtime {
                 loaded_guest
             }
             Err(error) => {
-                self.kernel.record_activity(ActivityEvent {
+                self.kernel.processes().record_activity(ActivityEvent {
                     kind: selium_abi::ActivityKind::ProcessExited,
                     process_id: Some(process.local_id),
                     message: format!("guest {} trapped: {error}", descriptor.name),
@@ -226,7 +231,7 @@ impl Runtime {
             descriptor.module_id.clone(),
             descriptor.module_bytes.clone(),
         )?;
-        self.kernel.record_activity(ActivityEvent {
+        self.kernel.processes().record_activity(ActivityEvent {
             kind: selium_abi::ActivityKind::GuestBootstrapped,
             process_id: Some(process.local_id),
             message: format!("guest {} bootstrapped", descriptor.name),
@@ -248,7 +253,7 @@ impl Runtime {
         module_bytes: &[u8],
         process_id: selium_abi::ProcessId,
     ) -> Result<LoadedGuest> {
-        let store = self.kernel.shared_store();
+        let store = self.kernel.memory().shared_store();
         let mut app = WasmApplication::with_store(store);
         let module_index = app
             .load_module_from_memory(module_bytes)
@@ -295,6 +300,7 @@ impl Runtime {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let events = self
                         .kernel
+                        .processes()
                         .wait_for_activity_from(cursor, remaining.as_millis() as u64);
                     cursor += events.len();
                     if events.iter().any(|event| {

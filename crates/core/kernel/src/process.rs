@@ -1,17 +1,73 @@
-use std::{sync::atomic::Ordering, time::Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use parking_lot::{Condvar, Mutex};
 use selium_abi::{
     ActivityEvent, ActivityKind, CapabilityGrant, GuestLogEntry, MeteringObservation,
-    ProcessDescriptor, ProcessId,
+    ProcessDescriptor, ProcessId, SharedResourceId,
 };
 use selium_shm::layout;
 
-use crate::{
-    Error, Result,
-    state::{Kernel, ProcessState},
-};
+use crate::kernel::hashed_id;
+use crate::memory::MemoryRegistry;
+use crate::{Error, Result};
 
-impl Kernel {
+#[derive(Clone)]
+pub struct ProcessTable {
+    pub(crate) inner: Arc<ProcessTableInner>,
+}
+
+pub(crate) struct ProcessTableInner {
+    pub(crate) processes: Mutex<HashMap<ProcessId, ProcessState>>,
+    pub(crate) activity_log: Mutex<Vec<ActivityEvent>>,
+    pub(crate) activity_log_changed: Condvar,
+    pub(crate) guest_logs: Mutex<Vec<GuestLogEntry>>,
+    pub(crate) metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
+    pub(crate) next_process_id: AtomicU64,
+    pub(crate) id_seed: u64,
+}
+
+pub(crate) struct LogChannelState {
+    pub(crate) backend: crate::KernelBackend,
+    pub(crate) read_position: u64,
+}
+
+pub(crate) struct ProcessState {
+    pub(crate) module_id: String,
+    pub(crate) entrypoint: String,
+    pub(crate) running: bool,
+    pub(crate) grants: Vec<CapabilityGrant>,
+    pub(crate) log_channel_shared_id: Option<SharedResourceId>,
+    pub(crate) log_channel_state: Option<LogChannelState>,
+}
+
+impl ProcessTable {
+    pub(crate) fn new(id_seed: u64) -> Self {
+        Self {
+            inner: Arc::new(ProcessTableInner {
+                processes: Mutex::new(HashMap::new()),
+                activity_log: Mutex::new(Vec::new()),
+                activity_log_changed: Condvar::new(),
+                guest_logs: Mutex::new(Vec::new()),
+                metering: Mutex::new(HashMap::new()),
+                next_process_id: AtomicU64::new(0),
+                id_seed,
+            }),
+        }
+    }
+
+    pub(crate) fn next_process_id(&self) -> u64 {
+        loop {
+            let counter = self.inner.next_process_id.fetch_add(1, Ordering::SeqCst);
+            let id = hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
     /// Starts a process record with the supplied module, entrypoint, and grants.
     pub fn start_process(
         &self,
@@ -19,13 +75,7 @@ impl Kernel {
         entrypoint: impl Into<String>,
         grants: Vec<CapabilityGrant>,
     ) -> ProcessDescriptor {
-        let local_id = loop {
-            let counter = self.inner.next_process_id.fetch_add(1, Ordering::SeqCst);
-            let id = crate::state::hashed_id(self.inner.id_seed, counter);
-            if id != 0 {
-                break id;
-            }
-        };
+        let local_id = self.next_process_id();
         let descriptor = ProcessDescriptor {
             local_id,
             module_id: module_id.into(),
@@ -136,17 +186,18 @@ impl Kernel {
     /// `write_guest_log` path (dual-path during transition).
     pub fn register_log_channel(
         &self,
+        memory: &MemoryRegistry,
         process_id: ProcessId,
         shared_id: selium_abi::SharedResourceId,
     ) -> Result<()> {
-        let backend = self.attach_backend(shared_id)?;
+        let backend = memory.attach_backend(shared_id)?;
 
         let mut processes = self.inner.processes.lock();
         let process = processes
             .get_mut(&process_id)
             .ok_or_else(|| Error::NotFound(format!("process {process_id}")))?;
         process.log_channel_shared_id = Some(shared_id);
-        process.log_channel_state = Some(crate::state::LogChannelState {
+        process.log_channel_state = Some(LogChannelState {
             backend,
             read_position: 0,
         });
@@ -187,7 +238,6 @@ impl Kernel {
         let backend_ref: &dyn selium_memory::MappingBackend = &state.backend;
         let mut read_pos = state.read_position;
 
-        // Read the ring data capacity from the shared channel header.
         let data_capacity =
             layout::load_capacity(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
         if data_capacity == 0 || !data_capacity.is_power_of_two() {
@@ -198,11 +248,9 @@ impl Kernel {
 
         let mask = data_capacity - 1;
 
-        // Read next_tail from the shared coordination area.
         let next_tail =
             layout::load_next_tail(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
 
-        // If read_pos has been overtaken, skip to next_tail - capacity.
         if next_tail > read_pos + data_capacity {
             read_pos = next_tail - data_capacity;
         }
@@ -218,12 +266,11 @@ impl Kernel {
                         .checked_add(frame_size)
                         .ok_or_else(|| Error::Wasm("frame size overflow".to_string()))?;
                 }
-                Ok(None) => break, // Frame not yet ready.
+                Ok(None) => break,
                 Err(e) => return Err(Error::Wasm(e.to_string())),
             }
         }
 
-        // Update the read position.
         state.read_position = read_pos;
 
         Ok(frames)
@@ -265,19 +312,22 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+    use crate::kernel::Kernel;
+
     use super::*;
 
     #[test]
     fn process_activity_and_metering_are_visible() {
         let kernel = Kernel::default();
+        let processes = kernel.processes();
         let grants = vec![CapabilityGrant::new(
             selium_abi::Capability::ProcessLifecycle,
             vec![selium_abi::ResourceSelector::Locality(
                 selium_abi::LocalityScope::Cluster,
             )],
         )];
-        let process = kernel.start_process("module", "main", grants.clone());
-        kernel.observe_metering(
+        let process = processes.start_process("module", "main", grants.clone());
+        processes.observe_metering(
             process.local_id,
             MeteringObservation {
                 cpu_micros: 10,
@@ -288,26 +338,26 @@ mod tests {
         );
 
         assert_eq!(
-            kernel
+            processes
                 .inspect_process(process.local_id)
                 .expect("inspect")
                 .entrypoint,
             "main"
         );
         assert_eq!(
-            kernel
+            processes
                 .metering_observation(process.local_id)
                 .expect("metering")
                 .cpu_micros,
             10
         );
         assert_eq!(
-            kernel
+            processes
                 .process_grants(process.local_id)
                 .expect("process grants"),
             grants
         );
-        assert!(kernel.read_activity_from(0).len() >= 2);
-        assert!(kernel.read_activity_from(usize::MAX).is_empty());
+        assert!(processes.read_activity_from(0).len() >= 2);
+        assert!(processes.read_activity_from(usize::MAX).is_empty());
     }
 }

@@ -5,7 +5,7 @@ pub use config::{
     SystemGuestDescriptor,
 };
 pub use error::{Error, Result};
-pub use state::Runtime;
+pub use runtime::Runtime;
 
 mod bootstrap;
 mod config;
@@ -14,7 +14,8 @@ mod error;
 mod host_functions;
 mod hostcall;
 mod mailbox;
+mod network;
 mod process;
 mod region_provider;
-mod state;
+mod runtime;
 mod wasm;

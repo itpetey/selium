@@ -1,17 +1,13 @@
-## Purpose
+## MODIFIED Requirements
 
-Expose Selium's low-level host primitives for shared memory, network, storage, process lifecycle, activity, and metering.
-
-## Requirements
-
-### Requirement: Shared Memory Regions
+### Requirement: Shared Memory Regions (modified)
 `selium-kernel` SHALL expose a `MemoryRegistry` sub-struct that manages shared memory regions as first-class primitive resources. Regions can be allocated, attached, detached, and accessed independently of a guest's private linear memory.
 
 #### Scenario: Shared region attached to two guests
 - **WHEN** two guests attach the same valid shared memory region
 - **THEN** both guests SHALL be able to access the region according to the runtime memory model
 
-### Requirement: Protocol-Neutral Network Primitives
+### Requirement: Protocol-Neutral Network Primitives (modified)
 `selium-kernel` SHALL expose a `NetworkState` sub-struct that tracks metadata for network resources (listeners, streams, sockets). The kernel SHALL NOT spawn I/O threads, perform socket I/O, or own live OS socket handles. Network I/O is the responsibility of `selium-runtime`.
 
 #### Scenario: Kernel tracks listener metadata
@@ -22,47 +18,35 @@ Expose Selium's low-level host primitives for shared memory, network, storage, p
 - **WHEN** any network operation is invoked on the kernel
 - **THEN** no `std::thread::spawn` call occurs in `selium-kernel`
 
-### Requirement: Kernel Consumes the Shared Ring Implementation
-
-The kernel SHALL use the shared ring protocol implementation for network
-proxies and guest log drains. Bespoke frame codecs, reservation logic,
-slot scans, and multi-memory header handling SHALL NOT exist in the
-kernel.
-
-#### Scenario: Network proxy uses shared primitives
-
-- **WHEN** the kernel proxies a TCP/UDP stream to or from a guest ring
-- **THEN** frame reads/writes, reservations, and reader-slot updates go
-  through the shared ring primitives, not kernel-local copies
-
-#### Scenario: Log drain uses shared frame reader
-
-- **WHEN** the kernel drains a guest log channel
-- **THEN** it reads frames with the shared frame reader and ring geometry
-  from the channel header, with no local frame parsing
-
-### Requirement: Durable Storage Primitives
+### Requirement: Durable Storage Primitives (unchanged)
 `selium-kernel` SHALL expose a `StorageRegistry` sub-struct with durable log and blob primitives: append, replay, checkpoint, put, and get operations.
 
 #### Scenario: Guest replays a durable log
 - **WHEN** a guest replays a durable log from a valid checkpoint or sequence
 - **THEN** the kernel SHALL return the retained records and bounds according to the storage contract
 
-### Requirement: Primitive Process Lifecycle
+### Requirement: Primitive Process Lifecycle (modified)
 `selium-kernel` SHALL expose a `ProcessTable` sub-struct for starting, stopping, and inspecting guest processes without embedding placement or orchestration policy.
 
 #### Scenario: Runtime starts configured guest process
 - **WHEN** the runtime requests a new guest process using a valid module and entrypoint
 - **THEN** the kernel SHALL create the process resource and return an inspectable process identity
 
-### Requirement: Activity and Metering Hooks
+### Requirement: Activity and Metering Hooks (unchanged)
 `selium-kernel` SHALL expose hooks in `ProcessTable` that allow the runtime to project lifecycle events and resource-usage observations into host-visible logs and metering streams.
 
 #### Scenario: Guest process consumes resources
 - **WHEN** a guest process uses CPU, memory, storage, or bandwidth
 - **THEN** the kernel SHALL make those observations available to the runtime through the metering hooks
 
-### Requirement: Host Queue Primitives
+### Requirement: Kernel Consumes the Shared Ring Implementation (unchanged)
+The kernel SHALL use the shared ring protocol implementation for network proxies and guest log drains. Bespoke frame codecs, reservation logic, slot scans, and multi-memory header handling SHALL NOT exist in the kernel.
+
+#### Scenario: Log drain uses shared frame reader
+- **WHEN** the kernel drains a guest log channel
+- **THEN** it reads frames with the shared frame reader and ring geometry from the channel header, with no local frame parsing
+
+### Requirement: Host Queue Primitives (modified)
 `selium-kernel` SHALL expose a `HostQueueRegistry` sub-struct for host-mediated connection queues. Queues support create, attach, send, and non-blocking receive. The kernel SHALL NOT provide async receive — polling is the runtime's responsibility.
 
 #### Scenario: Runtime sends value to queue
@@ -72,6 +56,8 @@ kernel.
 #### Scenario: Sync-only receive
 - **WHEN** `selium-kernel` is compiled
 - **THEN** it SHALL NOT contain any async functions
+
+## ADDED Requirements
 
 ### Requirement: Sub-Struct Architecture
 `selium-kernel` SHALL decompose `Kernel` into five public sub-structs, each with its own methods and no cross-subsystem field access:
@@ -97,16 +83,16 @@ kernel.
 - **WHEN** `selium-kernel` is built
 - **THEN** tokio SHALL NOT appear in its dependency tree
 
-### Requirement: Shared Region Layout Header
-`selium-kernel` shared memory regions SHALL support a layout header (magic, capacity, memory count, per-memory offset/length pairs) so that multiple parties can discover sub-memories after attaching via `shared_id`. Each sub-memory SHALL use the standard ring buffer coordination layout with generation counter, `next_tail`, `writer_count`, and `reader_slots` in page 0.
+## REMOVED Requirements
 
-#### Scenario: Two guests attach the same region and agree on layout
-- **WHEN** a guest seals a region built with `SharedRegionBuilder` and another guest attaches the same `shared_id`
-- **THEN** both parties SHALL read the identical layout header and enumerate the same sub-memories, each with the standard coordination fields
+### Requirement: Network I/O in Kernel (removed)
+The kernel no longer spawns network I/O threads. The following are removed:
 
-### Requirement: Per-Connection RPC Session Isolation
-`selium-kernel` SHALL enforce that a `SharedRegion` allocated for an RPC session is only accessible to the two authorised parties. No other guest SHALL be able to attach or read that region without possessing its `shared_id`.
+- ~~`Kernel::tcp_bind` spawning accept loop~~
+- ~~`Kernel::tcp_connect` spawning proxy threads~~
+- ~~`Kernel::udp_bind` spawning recv/send threads~~
+- ~~`proxy_inbound`, `proxy_outbound`, `run_proxy`, `run_udp_proxy`~~
+- ~~`tcp_accept_loop`, `udp_proxy_recv`, `udp_proxy_send`~~
 
-#### Scenario: Unauthorised guest attempts to attach a session region
-- **WHEN** a guest without the `shared_id` tries to attach a session region
-- **THEN** the kernel SHALL deny the attachment
+### Requirement: Async Host Queue Receive (removed)
+The async `host_queue_recv` method is dead code and SHALL be removed.

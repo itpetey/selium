@@ -87,29 +87,22 @@ fn attach_reads_and_writes_through_kernel() {
     assert_ne!(attachment.page_offset, 0);
 
     // Use kernel internals to get a local mapping id for verification.
-    let local_id = runtime
-        .kernel()
+    let memory = runtime.kernel().memory();
+    let local_id = memory
         .attach_shared_region(region_id)
         .expect("kernel attach");
 
     // Write via kernel.
-    runtime
-        .kernel()
+    memory
         .write_shared_memory(local_id, 0, b"hello region")
         .expect("write");
 
     // Read back via kernel.
-    let bytes = runtime
-        .kernel()
-        .read_shared_memory(local_id, 0, 12)
-        .expect("read");
+    let bytes = memory.read_shared_memory(local_id, 0, 12).expect("read");
     assert_eq!(bytes, b"hello region");
 
     // Detach the kernel mapping.
-    runtime
-        .kernel()
-        .detach_shared_region(local_id)
-        .expect("detach");
+    memory.detach_shared_region(local_id).expect("detach");
 
     free_region(&runtime, process_id, region_id);
 }
@@ -143,8 +136,8 @@ fn frame_header_round_trip() {
     let process_id = spawn_guest(&runtime, "frame");
 
     let region_id = alloc_region(&runtime, process_id, 1);
-    let mapping = runtime
-        .kernel()
+    let memory = runtime.kernel().memory();
+    let mapping = memory
         .attach_shared_region(region_id)
         .expect("kernel attach");
 
@@ -158,18 +151,15 @@ fn frame_header_round_trip() {
     let header_bytes = header.encode();
 
     // Write header and payload.
-    runtime
-        .kernel()
+    memory
         .write_shared_memory(mapping, 0, &header_bytes)
         .expect("write header");
-    runtime
-        .kernel()
+    memory
         .write_shared_memory(mapping, 12, payload)
         .expect("write payload");
 
     // Read back header.
-    let read_header = runtime
-        .kernel()
+    let read_header = memory
         .read_shared_memory(mapping, 0, 12)
         .expect("read header");
     let decoded = FrameHeader::decode(&read_header).expect("valid frame header");
@@ -177,10 +167,7 @@ fn frame_header_round_trip() {
     assert_eq!(decoded.tag, 1);
     assert_eq!(decoded.frame_size(), 17);
 
-    runtime
-        .kernel()
-        .detach_shared_region(mapping)
-        .expect("detach");
+    memory.detach_shared_region(mapping).expect("detach");
     free_region(&runtime, process_id, region_id);
 }
 
@@ -193,10 +180,8 @@ fn free_fails_when_mapped() {
     let region_id = alloc_region(&runtime, process_id, 1);
 
     // Attach via kernel (creates a mapping).
-    let local_id = runtime
-        .kernel()
-        .attach_shared_region(region_id)
-        .expect("attach");
+    let memory = runtime.kernel().memory();
+    let local_id = memory.attach_shared_region(region_id).expect("attach");
 
     // FreeRegion should succeed by cleaning up all kernel mappings first.
     let (_, op_id) = runtime.begin_hostcall(process_id, HostcallRequest::FreeRegion { region_id });
@@ -206,7 +191,7 @@ fn free_fails_when_mapped() {
     }
 
     // Kernel mapping should have been cleaned up — detach should fail.
-    let result = runtime.kernel().detach_shared_region(local_id);
+    let result = memory.detach_shared_region(local_id);
     assert!(
         result.is_err(),
         "detach should fail after FreeRegion cleaned up kernel mappings"
@@ -266,35 +251,23 @@ fn two_attachments_share_region() {
 
     let region_id = alloc_region(&runtime, process_id, 1);
 
+    let memory = runtime.kernel().memory();
+
     // First attachment via kernel.
-    let left = runtime
-        .kernel()
-        .attach_shared_region(region_id)
-        .expect("left attach");
-    runtime
-        .kernel()
+    let left = memory.attach_shared_region(region_id).expect("left attach");
+    memory
         .write_shared_memory(left, 0, b"shared!")
         .expect("left write");
 
     // Second attachment via kernel.
-    let right = runtime
-        .kernel()
+    let right = memory
         .attach_shared_region(region_id)
         .expect("right attach");
-    let bytes = runtime
-        .kernel()
-        .read_shared_memory(right, 0, 7)
-        .expect("right read");
+    let bytes = memory.read_shared_memory(right, 0, 7).expect("right read");
     assert_eq!(bytes, b"shared!");
 
-    runtime
-        .kernel()
-        .detach_shared_region(left)
-        .expect("detach left");
-    runtime
-        .kernel()
-        .detach_shared_region(right)
-        .expect("detach right");
+    memory.detach_shared_region(left).expect("detach left");
+    memory.detach_shared_region(right).expect("detach right");
 
     free_region(&runtime, process_id, region_id);
 }

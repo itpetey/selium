@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,11 +12,22 @@ use selium_abi::{
 use selium_encoding::{FlatMsg, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
 
-use crate::{
-    ReadinessCondition, SystemGuestDescriptor,
-    error::kernel_error,
-    state::{HostOperation, HostOperationState, Runtime},
-};
+use crate::{ReadinessCondition, SystemGuestDescriptor, error::kernel_error, runtime::Runtime};
+
+#[derive(Debug, Clone)]
+pub(crate) enum HostOperationState {
+    Ready(HostcallOutput),
+    Failed(AbiError),
+    HostQueueRecvWait { local_id: u64, deadline: Instant },
+    SleepWait { deadline: Instant },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostOperation {
+    pub(crate) process_id: ProcessId,
+    pub(crate) task_id: Option<TaskId>,
+    pub(crate) state: HostOperationState,
+}
 
 impl Runtime {
     /// Begins a hostcall for a process and returns its initial status and operation id.
@@ -55,12 +67,23 @@ impl Runtime {
             },
         );
 
-        // Register SleepWait with the timer driver so the guest is
+        // Register SleepWait timer via tokio::spawn so the guest is
         // woken via mailbox when the deadline arrives.
         if let HostOperationState::SleepWait { deadline } = state
             && let Some(tid) = task_id
         {
-            self.register_timer(deadline, process_id, tid, operation_id);
+            let duration = deadline.saturating_duration_since(Instant::now());
+            let operations = Arc::clone(&self.operations);
+            let mailboxes = Arc::clone(&self.mailboxes);
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+                if let Some(op) = operations.lock().get_mut(&operation_id) {
+                    op.state = HostOperationState::Ready(HostcallOutput::Empty);
+                }
+                if let Some(mailbox) = mailboxes.lock().get(&process_id) {
+                    drop(mailbox.enqueue(tid));
+                }
+            });
         }
 
         (status, operation_id)
@@ -90,7 +113,7 @@ impl Runtime {
             HostOperationState::Ready(output) => CompletionState::Ready(output.clone()),
             HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
-                match self.kernel.try_host_queue_recv(local_id) {
+                match self.kernel.queues().try_host_queue_recv(local_id) {
                     Ok(Some((client_process_id, value))) => {
                         // Queue handoff: share region ownership on recv.
                         self.share_region_ownership_on_recv(
@@ -177,6 +200,7 @@ impl Runtime {
                 // Allocate region in the shared registry (standalone, no guest mapping yet).
                 let (shared_id, _len) = self
                     .kernel
+                    .memory()
                     .allocate_shared_region(size_u32)
                     .map_err(kernel_error)?;
 
@@ -239,6 +263,7 @@ impl Runtime {
                 // Detach the region from ALL loaded guests' wasm memory.
                 let wasm_region_id = self
                     .kernel
+                    .memory()
                     .wasmtiny_region_id(region_id)
                     .map_err(kernel_error)?;
                 let mut guests = self.loaded_guests.lock();
@@ -255,9 +280,10 @@ impl Runtime {
                 drop(guests);
 
                 // Detach all kernel-level mappings for this region before destroying.
-                self.kernel.detach_all_shared_mappings(region_id);
+                self.kernel.memory().detach_all_shared_mappings(region_id);
 
                 self.kernel
+                    .memory()
                     .destroy_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
@@ -311,6 +337,7 @@ impl Runtime {
                         )
                     })?;
                     self.kernel
+                        .memory()
                         .attach_shared_region_to_memory(
                             &mut memory,
                             region_id,
@@ -328,6 +355,7 @@ impl Runtime {
                     // guest's `WasmApplication` in the loaded-guest table.
                     let wasm_region_id = self
                         .kernel
+                        .memory()
                         .wasmtiny_region_id(region_id)
                         .map_err(kernel_error)?;
                     let mut guests = self.loaded_guests.lock();
@@ -357,12 +385,14 @@ impl Runtime {
 
                 let local_id = self
                     .kernel
+                    .memory()
                     .attach_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::SharedMapping, local_id);
 
                 let len = self
                     .kernel
+                    .memory()
                     .shared_region_len(region_id)
                     .map_err(kernel_error)?;
 
@@ -377,9 +407,7 @@ impl Runtime {
                     ResourceClass::TcpListener,
                     None,
                 )?;
-                let descriptor = self
-                    .kernel
-                    .tcp_bind(address)
+                let descriptor = crate::network::tcp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(
                     process_id,
@@ -402,9 +430,7 @@ impl Runtime {
                     ResourceClass::TcpStream,
                     None,
                 )?;
-                let descriptor = self
-                    .kernel
-                    .tcp_connect(address)
+                let descriptor = crate::network::tcp_connect(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
                 self.claim_shared_resource(
@@ -423,9 +449,7 @@ impl Runtime {
                     ResourceClass::UdpSocket,
                     None,
                 )?;
-                let descriptor = self
-                    .kernel
-                    .udp_bind(address)
+                let descriptor = crate::network::udp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::UdpSocket, descriptor.shared_id);
                 self.claim_shared_resource(
@@ -444,7 +468,7 @@ impl Runtime {
                     ResourceClass::DurableLog,
                     None,
                 )?;
-                let descriptor = self.kernel.open_log(name);
+                let descriptor = self.kernel.storage().open_log(&self.kernel.memory(), name);
                 self.claim_local_handle(process_id, ResourceClass::DurableLog, descriptor.local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::DurableLog(
                     descriptor,
@@ -457,7 +481,10 @@ impl Runtime {
                     ResourceClass::DurableLog,
                     local_id,
                 )?;
-                self.kernel.close_log(local_id).map_err(kernel_error)?;
+                self.kernel
+                    .storage()
+                    .close_log(local_id)
+                    .map_err(kernel_error)?;
                 self.release_local_handle(process_id, &ResourceClass::DurableLog, local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
@@ -476,6 +503,7 @@ impl Runtime {
                 )?;
                 let sequence = self
                     .kernel
+                    .storage()
                     .append_log(local_id, timestamp_ms, headers, payload)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Sequence(Some(
@@ -496,6 +524,7 @@ impl Runtime {
                 )?;
                 let records = self
                     .kernel
+                    .storage()
                     .replay_log(local_id, from_sequence, limit as usize)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::StorageRecords(
@@ -515,6 +544,7 @@ impl Runtime {
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
                 self.kernel
+                    .storage()
                     .checkpoint_log(local_id, name, sequence)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
@@ -529,6 +559,7 @@ impl Runtime {
                 )?;
                 let sequence = self
                     .kernel
+                    .storage()
                     .checkpoint_sequence(local_id, &name)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Sequence(
@@ -542,7 +573,10 @@ impl Runtime {
                     ResourceClass::BlobStore,
                     None,
                 )?;
-                let descriptor = self.kernel.open_blob_store(name);
+                let descriptor = self
+                    .kernel
+                    .storage()
+                    .open_blob_store(&self.kernel.memory(), name);
                 self.claim_local_handle(process_id, ResourceClass::BlobStore, descriptor.local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::BlobStore(
                     descriptor,
@@ -556,6 +590,7 @@ impl Runtime {
                     local_id,
                 )?;
                 self.kernel
+                    .storage()
                     .close_blob_store(local_id)
                     .map_err(kernel_error)?;
                 self.release_local_handle(process_id, &ResourceClass::BlobStore, local_id);
@@ -571,6 +606,7 @@ impl Runtime {
                 )?;
                 let blob_id = self
                     .kernel
+                    .storage()
                     .put_blob(local_id, bytes)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id)))
@@ -585,6 +621,7 @@ impl Runtime {
                 )?;
                 match self
                     .kernel
+                    .storage()
                     .get_blob(local_id, &blob_id)
                     .map_err(kernel_error)?
                 {
@@ -605,6 +642,7 @@ impl Runtime {
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
                 self.kernel
+                    .storage()
                     .set_manifest(local_id, name, blob_id)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
@@ -619,6 +657,7 @@ impl Runtime {
                 )?;
                 match self
                     .kernel
+                    .storage()
                     .get_manifest(local_id, &name)
                     .map_err(kernel_error)?
                 {
@@ -665,6 +704,7 @@ impl Runtime {
                 self.claim_local_handle(process_id, ResourceClass::Process, child.process_id);
                 let process = self
                     .kernel
+                    .processes()
                     .inspect_process(child.process_id)
                     .map_err(kernel_error)?;
                 Ok(HostOperationState::Ready(HostcallOutput::Process(process)))
@@ -696,7 +736,7 @@ impl Runtime {
                     None,
                 )?;
                 Ok(HostOperationState::Ready(HostcallOutput::ActivityEvents(
-                    self.kernel.read_activity_from(cursor),
+                    self.kernel.processes().read_activity_from(cursor),
                 )))
             }
             HostcallRequest::MeteringRead {
@@ -708,7 +748,11 @@ impl Runtime {
                     ResourceClass::MeteringStream,
                     Some(ResourceIdentity::Local(target_process_id)),
                 )?;
-                match self.kernel.metering_observation(target_process_id) {
+                match self
+                    .kernel
+                    .processes()
+                    .metering_observation(target_process_id)
+                {
                     Some(observation) => Ok(HostOperationState::Ready(HostcallOutput::Metering(
                         observation,
                     ))),
@@ -738,7 +782,7 @@ impl Runtime {
                         entry.process_id.map(ResourceIdentity::Local),
                     )?;
                 }
-                self.kernel.write_guest_log(entry);
+                self.kernel.processes().write_guest_log(entry);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
             HostcallRequest::HostQueueCreate => {
@@ -748,7 +792,9 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     None,
                 )?;
-                let descriptor = self.kernel.create_host_queue();
+                let queues = self.kernel.queues();
+                let memory = self.kernel.memory();
+                let descriptor = queues.create_host_queue(&memory);
                 self.claim_local_handle(process_id, ResourceClass::HostQueue, descriptor.local_id);
                 self.claim_shared_resource(
                     process_id,
@@ -768,7 +814,8 @@ impl Runtime {
                 )?;
                 let descriptor = self
                     .kernel
-                    .attach_host_queue(shared_id)
+                    .queues()
+                    .attach_host_queue(&self.kernel.memory(), shared_id)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::HostQueue, descriptor.local_id);
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
@@ -784,6 +831,7 @@ impl Runtime {
                 )?;
                 let shared_id = self
                     .kernel
+                    .queues()
                     .host_queue_shared_id(local_id)
                     .map_err(kernel_error)?;
                 self.require(
@@ -793,6 +841,7 @@ impl Runtime {
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
                 self.kernel
+                    .queues()
                     .host_queue_send(local_id, process_id, value)
                     .map_err(kernel_error)?;
                 self.wake_host_queue_waiters(shared_id);
@@ -807,6 +856,7 @@ impl Runtime {
                 )?;
                 let shared_id = self
                     .kernel
+                    .queues()
                     .host_queue_shared_id(local_id)
                     .map_err(kernel_error)?;
                 self.require(
@@ -817,6 +867,7 @@ impl Runtime {
                 )?;
                 match self
                     .kernel
+                    .queues()
                     .try_host_queue_recv(local_id)
                     .map_err(kernel_error)?
                 {
@@ -859,6 +910,7 @@ impl Runtime {
                 // Read from the legacy guest_logs vec (existing path).
                 let mut logs: Vec<GuestLogEntry> = self
                     .kernel
+                    .processes()
                     .read_guest_logs_from(cursor)
                     .into_iter()
                     .filter(|entry| {
@@ -868,7 +920,7 @@ impl Runtime {
 
                 // Also drain from log channels if target process has one.
                 if let Some(target_pid) = target_process_id
-                    && let Ok(frames) = self.kernel.drain_log_channel(target_pid)
+                    && let Ok(frames) = self.kernel.processes().drain_log_channel(target_pid)
                 {
                     for frame in frames {
                         // Decode FlatBuffer LogRecord into GuestLogEntry.
@@ -924,7 +976,8 @@ impl Runtime {
                 // the shared_id per process; actual channel reading is done
                 // via the kernel's shared memory primitives.
                 self.kernel
-                    .register_log_channel(process_id, shared_id)
+                    .processes()
+                    .register_log_channel(&self.kernel.memory(), process_id, shared_id)
                     .map_err(kernel_error)?;
 
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
@@ -942,7 +995,7 @@ impl Runtime {
                     HostOperationState::HostQueueRecvWait {
                         local_id,
                         ..
-                    } if self.kernel.host_queue_shared_id(*local_id).ok() == Some(shared_id)
+                    } if self.kernel.queues().host_queue_shared_id(*local_id).ok() == Some(shared_id)
                 );
                 if should_wake {
                     let local_id = match &operation.state {
@@ -950,7 +1003,7 @@ impl Runtime {
                         _ => continue,
                     };
                     if let Ok(Some((client_process_id, value))) =
-                        self.kernel.try_host_queue_recv(local_id)
+                        self.kernel.queues().try_host_queue_recv(local_id)
                     {
                         operation.state =
                             HostOperationState::Ready(HostcallOutput::ConnectionInfo {
@@ -1092,6 +1145,7 @@ impl Runtime {
             local_id,
         )?;
         self.kernel
+            .storage()
             .log_shared_id_public(local_id)
             .map_err(kernel_error)
     }
@@ -1108,6 +1162,7 @@ impl Runtime {
             local_id,
         )?;
         self.kernel
+            .storage()
             .blob_store_shared_id_public(local_id)
             .map_err(kernel_error)
     }
@@ -1615,6 +1670,7 @@ mod tests {
         assert_eq!(
             runtime
                 .kernel()
+                .processes()
                 .log_channel_shared_id(bootstrapped.process_id),
             Some(alloc.region_id)
         );

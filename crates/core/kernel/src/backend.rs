@@ -13,7 +13,7 @@ use std::{
 
 use selium_memory::{MappingBackend, MemoryError, Result};
 
-use crate::Kernel;
+use crate::memory::MemoryRegistry;
 
 /// Mapping backend that delegates reads, writes, and atomics to the kernel's
 /// shared-memory store. All operations go through the kernel's mutex-protected
@@ -21,7 +21,7 @@ use crate::Kernel;
 /// domain for host-side ring operations.
 #[derive(Clone)]
 pub struct KernelBackend {
-    kernel: Kernel,
+    memory: MemoryRegistry,
     /// Kernel local mapping id used for read/write/atomic calls.
     pub(crate) local_id: u64,
     /// Selium shared region id.
@@ -34,14 +34,19 @@ pub struct KernelBackend {
 
 impl KernelBackend {
     /// Creates a new backend wrapping the given kernel mapping.
-    pub fn new(kernel: Kernel, local_id: u64, shared_id: u64, size: u64) -> Self {
+    pub fn new(memory: MemoryRegistry, local_id: u64, shared_id: u64, size: u64) -> Self {
         Self {
-            kernel,
+            memory,
             local_id,
             shared_id,
             base_offset: 0,
             size,
         }
+    }
+
+    /// Returns the local mapping id.
+    pub fn local_id(&self) -> u64 {
+        self.local_id
     }
 
     fn offset(&self, offset: u64) -> Result<u64> {
@@ -58,14 +63,14 @@ impl MappingBackend for KernelBackend {
 
     fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
         let offset = self.offset(offset)?;
-        self.kernel
+        self.memory
             .read_shared_memory(self.local_id, offset, len as usize)
             .map_err(|error| MemoryError::Other(error.to_string()))
     }
 
     fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         let offset = self.offset(offset)?;
-        self.kernel
+        self.memory
             .write_shared_memory(self.local_id, offset, bytes)
             .map_err(|error| MemoryError::Other(error.to_string()))
     }
@@ -85,14 +90,14 @@ impl MappingBackend for KernelBackend {
 
     fn fetch_add_u64(&self, offset: u64, value: u64, _ordering: Ordering) -> Result<u64> {
         let offset = self.offset(offset)?;
-        self.kernel
+        self.memory
             .fetch_add_shared_memory_u64(self.local_id, offset, value)
             .map_err(|error| MemoryError::Other(error.to_string()))
     }
 
     fn compare_exchange_u64(&self, offset: u64, current: u64, new: u64) -> Result<u64> {
         let offset = self.offset(offset)?;
-        self.kernel
+        self.memory
             .compare_exchange_shared_memory_u64(self.local_id, offset, current, new)
             .map_err(|error| MemoryError::Other(error.to_string()))
     }
@@ -106,7 +111,7 @@ impl MappingBackend for KernelBackend {
     fn atomic_wait32(&self, offset: u64, expected: u32, timeout_ms: u64) -> Result<()> {
         let effective_offset = self.offset(offset)?;
         let bytes = self
-            .kernel
+            .memory
             .read_shared_memory(self.local_id, effective_offset, 4)
             .map_err(|error| MemoryError::Other(error.to_string()))?;
         let actual = u32::from_le_bytes(
@@ -132,7 +137,7 @@ impl MappingBackend for KernelBackend {
         }
         let base_offset = self.offset(offset)?;
         Ok(Arc::new(KernelBackend {
-            kernel: self.kernel.clone(),
+            memory: self.memory.clone(),
             local_id: self.local_id,
             shared_id: self.shared_id,
             base_offset,
@@ -157,7 +162,7 @@ impl Debug for KernelBackend {
 }
 
 /// Helper: allocates a shared region and creates a `KernelBackend` for it.
-impl Kernel {
+impl MemoryRegistry {
     /// Allocates a shared region and returns a `KernelBackend` covering the
     /// full region, plus the shared region id.
     pub fn allocate_backend(&self, size: u32) -> crate::Result<(KernelBackend, u64)> {

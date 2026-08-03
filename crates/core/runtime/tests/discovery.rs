@@ -221,6 +221,7 @@ fn discovery_wasm_path() -> PathBuf {
 fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
     let frames = runtime
         .kernel()
+        .processes()
         .drain_log_channel(process_id)
         .expect("drain log channel");
     frames

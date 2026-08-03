@@ -13,10 +13,9 @@ use selium_abi::{HostQueueDescriptor, SharedRegionDescriptor};
 use selium_memory::{MappingBackend, MultiMemoryHeader};
 use selium_shm::layout::{self, RingReader, RingWriter};
 
-use crate::{
-    Error, Result,
-    state::{Kernel, TcpListenerState, TcpStreamState, UdpSocketState},
-};
+use crate::kernel::Kernel;
+use crate::network::{TcpListenerState, TcpStreamState, UdpSocketState};
+use crate::{Error, Result};
 
 /// Default ring buffer data capacity (64 KiB, power of two).
 const DEFAULT_RING_CAPACITY: u64 = 64 * 1024;
@@ -29,12 +28,14 @@ impl Kernel {
         let listener = TcpListener::bind(&address)
             .map_err(|e| Error::Wasm(format!("tcp bind failed: {e}")))?;
 
-        let descriptor = self.create_host_queue();
+        let queues = self.queues();
+        let memory = self.memory();
+        let descriptor = queues.create_host_queue(&memory);
         let local_id = descriptor.local_id;
         let shared_id = descriptor.shared_id;
         let running = Arc::new(AtomicBool::new(true));
 
-        self.inner.tcp_listeners.lock().insert(
+        self.inner.network.inner.tcp_listeners.lock().insert(
             local_id,
             TcpListenerState {
                 shared_id,
@@ -64,7 +65,7 @@ impl Kernel {
         let shared_id = descriptor.shared_id;
         let running = Arc::new(AtomicBool::new(true));
 
-        self.inner.tcp_streams.lock().insert(
+        self.inner.network.inner.tcp_streams.lock().insert(
             shared_id,
             TcpStreamState {
                 running: running.clone(),
@@ -74,14 +75,13 @@ impl Kernel {
         let kernel = self.clone();
         thread::spawn(move || {
             let result = run_proxy(
-                &kernel,
                 stream,
                 inbound_writer,
                 outbound_reader,
                 DEFAULT_RING_CAPACITY,
                 running,
             );
-            drop(kernel.detach_shared_region(parent_local_id));
+            drop(kernel.memory().detach_shared_region(parent_local_id));
             if let Err(_e) = result {}
         });
 
@@ -89,7 +89,7 @@ impl Kernel {
     }
 
     pub fn close_tcp_listener(&self, local_id: u64) -> Result<()> {
-        let mut listeners = self.inner.tcp_listeners.lock();
+        let mut listeners = self.inner.network.inner.tcp_listeners.lock();
         let state = listeners
             .remove(&local_id)
             .ok_or_else(|| Error::NotFound(format!("tcp listener {local_id}")))?;
@@ -99,21 +99,35 @@ impl Kernel {
 
         if let Some(queue) = self
             .inner
-            .host_queues_by_shared
+            .queues
+            .inner
+            .queues_by_shared
             .lock()
             .get(&shared_id)
             .cloned()
         {
-            queue.notify.notify_waiters();
+            queue.notify.notify_all();
         }
 
-        self.inner.host_queues_by_shared.lock().remove(&shared_id);
-        self.inner.local_host_queues.lock().remove(&local_id);
+        self.inner
+            .queues
+            .inner
+            .queues_by_shared
+            .lock()
+            .remove(&shared_id);
+        self.inner
+            .queues
+            .inner
+            .local_queues
+            .lock()
+            .remove(&local_id);
         Ok(())
     }
 
     pub fn close_tcp_stream(&self, shared_id: u64) -> Result<()> {
         let state = self
+            .inner
+            .network
             .inner
             .tcp_streams
             .lock()
@@ -136,7 +150,7 @@ impl Kernel {
         let shared_id = descriptor.shared_id;
         let running = Arc::new(AtomicBool::new(true));
 
-        self.inner.udp_sockets.lock().insert(
+        self.inner.network.inner.udp_sockets.lock().insert(
             shared_id,
             UdpSocketState {
                 running: running.clone(),
@@ -146,14 +160,13 @@ impl Kernel {
         let kernel = self.clone();
         thread::spawn(move || {
             let result = run_udp_proxy(
-                &kernel,
                 socket,
                 recv_writer,
                 send_reader,
                 DEFAULT_RING_CAPACITY,
                 running,
             );
-            drop(kernel.detach_shared_region(parent_local_id));
+            drop(kernel.memory().detach_shared_region(parent_local_id));
             if let Err(_e) = result {}
         });
 
@@ -162,6 +175,8 @@ impl Kernel {
 
     pub fn close_udp_socket(&self, shared_id: u64) -> Result<()> {
         let state = self
+            .inner
+            .network
             .inner
             .udp_sockets
             .lock()
@@ -200,19 +215,18 @@ fn create_stream_region(
         8,
     );
 
-    // Allocate the parent region and create a KernelBackend.
-    let (shared_id, _len) = kernel
+    let memory = kernel.memory();
+
+    let (shared_id, _len) = memory
         .allocate_shared_region(total_capacity)
         .map_err(|e| Error::Wasm(e.to_string()))?;
 
-    let parent_backend = kernel.attach_backend(shared_id)?;
+    let parent_backend = memory.attach_backend(shared_id)?;
     let parent_local_id = parent_backend.local_id;
 
-    // Compute sub-memory offsets.
     let sub_memory_0_offset = align_up(header_size, 8) as u64;
     let sub_memory_1_offset = align_up(sub_memory_0_offset as u32 + ring_region_len, 8) as u64;
 
-    // Write the multi-memory header using the shared definition.
     MultiMemoryHeader::write_two_entries(
         &parent_backend,
         0,
@@ -224,7 +238,6 @@ fn create_stream_region(
     )
     .map_err(|e| Error::Wasm(e.to_string()))?;
 
-    // Create sub-backends for each ring.
     let inbound_backend = parent_backend
         .sub_region(sub_memory_0_offset, ring_region_len as u64)
         .map_err(|e| Error::Wasm(e.to_string()))?;
@@ -232,26 +245,18 @@ fn create_stream_region(
         .sub_region(sub_memory_1_offset, ring_region_len as u64)
         .map_err(|e| Error::Wasm(e.to_string()))?;
 
-    // Initialise both ring coordination fields.
     layout::init_ring(inbound_backend.as_ref()).map_err(ring_err)?;
     layout::init_ring(outbound_backend.as_ref()).map_err(ring_err)?;
 
-    // Store the ring data capacity on both rings.
     layout::store_capacity(inbound_backend.as_ref(), DEFAULT_RING_CAPACITY).map_err(ring_err)?;
     layout::store_capacity(outbound_backend.as_ref(), DEFAULT_RING_CAPACITY).map_err(ring_err)?;
 
-    // Kernel is the sole writer on the inbound ring; register writer count.
     let inbound_writer =
         RingWriter::open(inbound_backend, DEFAULT_RING_CAPACITY).map_err(ring_err)?;
     inbound_writer.increment_writer_count().map_err(ring_err)?;
 
-    // Create a reader on the outbound ring, allocating a reader slot through
-    // the shared counter (no hard-coded slot 0).
     let outbound_reader =
         RingReader::open(outbound_backend, DEFAULT_RING_CAPACITY, true).map_err(ring_err)?;
-
-    // Parent backend is dropped here, but the local_id stays registered.
-    // The caller detaches it when the proxy threads finish.
 
     let region = SharedRegionDescriptor {
         shared_id,
@@ -271,7 +276,6 @@ fn proxy_inbound(
     while running.load(Ordering::Relaxed) {
         match stream.read(&mut buf) {
             Ok(0) => {
-                // EOF detected; decrement inbound writer count to 0.
                 drop(writer.decrement_writer_count());
                 break;
             }
@@ -305,14 +309,12 @@ fn proxy_outbound(
     let mut last_generation: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
-        // Poll the generation counter to detect new data.
         let current_generation = match reader.generation() {
             Ok(g) => g,
             Err(_) => break,
         };
 
         if current_generation == last_generation {
-            // No new data; check if all writers have disconnected.
             match reader.writer_count() {
                 Ok(0) => {
                     drop(stream.shutdown(std::net::Shutdown::Write));
@@ -327,7 +329,6 @@ fn proxy_outbound(
 
         last_generation = current_generation;
 
-        // Read all available frames.
         loop {
             match reader.read_frame() {
                 Ok(Some((_header, payload))) => {
@@ -359,7 +360,6 @@ fn ring_err<E: std::fmt::Display>(e: E) -> Error {
 }
 
 fn run_proxy(
-    kernel: &Kernel,
     stream: TcpStream,
     inbound_writer: RingWriter,
     outbound_reader: RingReader,
@@ -384,12 +384,10 @@ fn run_proxy(
     drop(inbound_handle.join());
     drop(outbound_handle.join());
 
-    let _ = kernel; // keep kernel alive for sub-backends
     Ok(())
 }
 
 fn run_udp_proxy(
-    kernel: &Kernel,
     socket: UdpSocket,
     recv_writer: RingWriter,
     send_reader: RingReader,
@@ -420,7 +418,6 @@ fn run_udp_proxy(
     drop(recv_handle.join());
     drop(send_handle.join());
 
-    let _ = kernel; // keep kernel alive for sub-backends
     Ok(())
 }
 
@@ -450,7 +447,7 @@ fn tcp_accept_loop(
                 let shared_id = region.shared_id;
                 let running = Arc::new(AtomicBool::new(true));
 
-                kernel.inner.tcp_streams.lock().insert(
+                kernel.inner.network.inner.tcp_streams.lock().insert(
                     shared_id,
                     TcpStreamState {
                         running: running.clone(),
@@ -461,18 +458,20 @@ fn tcp_accept_loop(
 
                 thread::spawn(move || {
                     let result = run_proxy(
-                        &k,
                         stream,
                         inbound_writer,
                         outbound_reader,
                         DEFAULT_RING_CAPACITY,
                         running,
                     );
-                    drop(k.detach_shared_region(parent_local_id));
+                    drop(k.memory().detach_shared_region(parent_local_id));
                     if let Err(_e) = result {}
                 });
 
-                if let Err(e) = kernel.host_queue_send(queue_local_id, 0, shared_id) {
+                if let Err(e) = kernel
+                    .queues()
+                    .host_queue_send(queue_local_id, 0, shared_id)
+                {
                     eprintln!("failed to enqueue connection: {e}");
                 }
             }
@@ -494,7 +493,6 @@ fn udp_proxy_recv(socket: UdpSocket, writer: RingWriter, running: Arc<AtomicBool
     while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                // Frame format: [addr_len u16][addr bytes][payload]
                 let addr_bytes = addr.to_string().into_bytes();
                 let addr_len = addr_bytes.len() as u16;
                 let payload_len = n;
@@ -557,7 +555,6 @@ fn udp_proxy_send(
         loop {
             match reader.read_frame() {
                 Ok(Some((_header, frame))) => {
-                    // Parse frame: [addr_len u16][addr bytes][payload]
                     if frame.len() < 2 {
                         continue;
                     }
@@ -602,7 +599,7 @@ fn udp_proxy_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Kernel;
+    use crate::kernel::Kernel;
     use selium_memory::MultiMemoryHeader;
     use std::time::Duration;
 
@@ -629,8 +626,8 @@ mod tests {
         assert!(descriptor.shared_id > 0);
         assert!(descriptor.len > 0);
 
-        // Verify the multi-memory header via the shared definition.
-        let backend = kernel.attach_backend(descriptor.shared_id).expect("attach");
+        let memory = kernel.memory();
+        let backend = memory.attach_backend(descriptor.shared_id).expect("attach");
         let header = MultiMemoryHeader::parse(&backend, 0).expect("parse header");
         assert_eq!(header.count, 2, "expected 2 sub-memories");
     }
@@ -641,7 +638,6 @@ mod tests {
         let helper = std::net::TcpListener::bind("127.0.0.1:0").expect("bind helper");
         let addr = helper.local_addr().expect("helper addr");
 
-        // Echo server.
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = helper.accept() {
                 let mut buf = [0u8; 256];
@@ -655,8 +651,8 @@ mod tests {
         let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
-        // Create a separate backend to simulate guest I/O on the rings.
-        let parent_backend = kernel.attach_backend(shared_id).expect("attach");
+        let memory = kernel.memory();
+        let parent_backend = memory.attach_backend(shared_id).expect("attach");
         let header = MultiMemoryHeader::parse(&parent_backend, 0).expect("parse");
         let outbound_entry = header.entry(1).expect("outbound entry");
 
@@ -664,7 +660,6 @@ mod tests {
             .sub_region(outbound_entry.offset, outbound_entry.length)
             .expect("outbound sub");
 
-        // Simulate a guest writer on the outbound ring.
         let guest_writer =
             RingWriter::open(outbound_backend, DEFAULT_RING_CAPACITY).expect("open writer");
         guest_writer.increment_writer_count().expect("inc wc");
@@ -672,7 +667,6 @@ mod tests {
             .write_frame(b"hello proxy", 0, 0)
             .expect("write frame");
 
-        // Wait for the echo to come back on the inbound ring.
         let inbound_entry = header.entry(0).expect("inbound entry");
         let inbound_backend = parent_backend
             .sub_region(inbound_entry.offset, inbound_entry.length)
@@ -692,7 +686,6 @@ mod tests {
         }
         assert!(found, "expected a frame on inbound ring");
 
-        // Simulate guest shutdown.
         drop(guest_writer);
         drop(kernel.close_tcp_stream(shared_id));
     }
@@ -717,7 +710,8 @@ mod tests {
         let descriptor = kernel.tcp_connect(addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
-        let parent_backend = kernel.attach_backend(shared_id).expect("attach");
+        let memory = kernel.memory();
+        let parent_backend = memory.attach_backend(shared_id).expect("attach");
         let header = MultiMemoryHeader::parse(&parent_backend, 0).expect("parse");
         let outbound_entry = header.entry(1).expect("outbound entry");
 
@@ -731,7 +725,6 @@ mod tests {
             .write_frame(b"hello proxy", 0, 0)
             .expect("write frame");
 
-        // Wait for echo.
         let inbound_entry = header.entry(0).expect("inbound entry");
         let inbound_backend = parent_backend
             .sub_region(inbound_entry.offset, inbound_entry.length)
@@ -751,11 +744,9 @@ mod tests {
         }
         assert!(found, "expected a frame on inbound ring");
 
-        // Simulate guest shutdown.
         drop(guest_writer);
         std::thread::sleep(Duration::from_millis(1000));
 
-        // Verify inbound ring writer_count is 0 (proxy_inbound decremented on EOF).
         let inbound_backend2 = parent_backend
             .sub_region(inbound_entry.offset, inbound_entry.length)
             .expect("inbound sub2");
@@ -782,13 +773,13 @@ mod tests {
         let (region, _inbound_writer, _outbound_reader, parent_local_id) =
             create_stream_region(&kernel).expect("create stream region");
 
-        // Verify multi-memory header via the shared definition.
-        let backend = kernel.attach_backend(region.shared_id).expect("attach");
+        let memory = kernel.memory();
+        let backend = memory.attach_backend(region.shared_id).expect("attach");
         let header = MultiMemoryHeader::parse(&backend, 0).expect("parse");
         assert_eq!(header.count, 2);
 
-        drop(kernel.detach_shared_region(backend.local_id));
-        drop(kernel.detach_shared_region(parent_local_id));
+        drop(memory.detach_shared_region(backend.local_id));
+        drop(memory.detach_shared_region(parent_local_id));
     }
 
     #[test]
@@ -797,19 +788,16 @@ mod tests {
         let (_region, inbound_writer, _outbound_reader, _parent_local_id) =
             create_stream_region(&kernel).expect("create stream region");
 
-        // Write a frame using the RingWriter.
         inbound_writer
             .write_frame(b"test payload", 0, 0)
             .expect("write frame");
 
-        // Read it back using a RingReader on the same backend.
         let backend = inbound_writer.backend();
         let mut reader =
             RingReader::open(backend, DEFAULT_RING_CAPACITY, false).expect("open reader");
         let (_header, payload) = reader.read_frame().expect("read frame").expect("got frame");
         assert_eq!(payload, b"test payload");
 
-        // Verify generation counter was bumped.
         let generation = reader.generation().expect("generation");
         assert!(
             generation > 0,
@@ -827,17 +815,15 @@ mod tests {
         let descriptor = kernel.udp_bind("127.0.0.1:0").expect("udp bind");
         let shared_id = descriptor.shared_id;
 
-        // Attach to the shared region and get sub-memory offsets.
-        let parent_backend = kernel.attach_backend(shared_id).expect("attach parent");
+        let memory = kernel.memory();
+        let parent_backend = memory.attach_backend(shared_id).expect("attach parent");
         let header = MultiMemoryHeader::parse(&parent_backend, 0).expect("parse header");
         let send_entry = header.entry(1).expect("send entry");
 
-        // Create a sub-backend for the send ring.
         let send_backend = parent_backend
             .sub_region(send_entry.offset, send_entry.length)
             .expect("sub region");
 
-        // Simulate a guest writer on the send ring.
         let writer = RingWriter::open(send_backend, DEFAULT_RING_CAPACITY).expect("open writer");
         writer.increment_writer_count().expect("inc wc");
 
@@ -850,7 +836,6 @@ mod tests {
 
         writer.write_frame(&frame, 0, 0).expect("write frame");
 
-        // Receive the datagram on the helper socket.
         let mut buf = [0u8; 256];
         helper
             .set_read_timeout(Some(Duration::from_secs(5)))

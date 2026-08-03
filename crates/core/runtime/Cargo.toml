@@ -20,6 +20,7 @@ selium-memory.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 wasmtiny.workspace = true
 

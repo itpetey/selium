@@ -211,7 +211,10 @@ fn guest_log_register_end_to_end() {
 
     // Verify the kernel recorded the log channel.
     assert_eq!(
-        runtime.kernel().log_channel_shared_id(process_id),
+        runtime
+            .kernel()
+            .processes()
+            .log_channel_shared_id(process_id),
         Some(region_id)
     );
 }

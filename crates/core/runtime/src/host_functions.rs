@@ -11,7 +11,7 @@ use wasmtiny::{
 use crate::{
     Result,
     mailbox::GuestMailbox,
-    state::Runtime,
+    runtime::Runtime,
     wasm::{
         guest_memory, read_guest_memory, register_optional_host_function, wasm_i32_arg,
         wasm_i64_arg, write_guest_memory,
@@ -53,11 +53,14 @@ impl HostFunc for MarkReadyHostFunc {
         _caller: &mut HostCaller<'_>,
         _args: &[WasmValue],
     ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        self.runtime.kernel.record_activity(ActivityEvent {
-            kind: selium_abi::ActivityKind::GuestReady,
-            process_id: Some(self.process_id),
-            message: "guest ready".to_string(),
-        });
+        self.runtime
+            .kernel
+            .processes()
+            .record_activity(ActivityEvent {
+                kind: selium_abi::ActivityKind::GuestReady,
+                process_id: Some(self.process_id),
+                message: "guest ready".to_string(),
+            });
         Ok(Vec::new())
     }
 

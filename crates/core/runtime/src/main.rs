@@ -6,7 +6,8 @@ use selium_encoding::FlatMsg;
 use selium_kernel::Kernel;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let kernel = Kernel::default();
     let runtime = Runtime::new(kernel);
 
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
     println!("\n=== Guest Logs ===");
     let frames = runtime
         .kernel()
+        .processes()
         .drain_log_channel(process_id)
         .map_err(|error| anyhow::anyhow!("drain log channel: {error}"))?;
     for frame in &frames {

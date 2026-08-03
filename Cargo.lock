@@ -576,7 +576,6 @@ dependencies = [
  "selium-shm",
  "sha2",
  "thiserror",
- "tokio",
  "wasmtiny",
 ]
 
@@ -601,6 +600,7 @@ dependencies = [
  "selium-shm",
  "selium-wire",
  "thiserror",
+ "tokio",
  "tracing",
  "wasmtiny",
  "wat",

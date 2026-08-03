@@ -5,12 +5,12 @@ use selium_abi::{
 use tracing::debug;
 use wasmtiny::WasmValue;
 
-use crate::{Error, Result, config::ProcessAuthority, state::Runtime};
+use crate::{Error, Result, config::ProcessAuthority, runtime::Runtime};
 
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
     pub fn stop_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
-        self.kernel.stop_process(process_id)?;
+        self.kernel.processes().stop_process(process_id)?;
         self.loaded_guests.lock().remove(&process_id);
         if self
             .process_authorities
@@ -27,7 +27,7 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
-        self.kernel.reap_process(process_id)?;
+        self.kernel.processes().reap_process(process_id)?;
         Ok(())
     }
 
@@ -102,12 +102,14 @@ impl Runtime {
         process_id: selium_abi::ProcessId,
         observation: selium_abi::MeteringObservation,
     ) {
-        self.kernel.observe_metering(process_id, observation);
+        self.kernel
+            .processes()
+            .observe_metering(process_id, observation);
     }
 
     /// Returns all activity log events currently held by the kernel.
     pub fn activity_log(&self) -> Vec<ActivityEvent> {
-        self.kernel.read_activity_from(0)
+        self.kernel.processes().read_activity_from(0)
     }
 
     /// Returns the loaded module index for a process entrypoint, if loaded.
@@ -193,12 +195,12 @@ impl Runtime {
         // Best-effort teardown: the process has already failed, so there's no
         // recovery path for individual cleanup steps. We discard each error and
         // continue with the remaining work to reclaim as much as possible.
-        drop(self.kernel.stop_process(process_id));
+        drop(self.kernel.processes().stop_process(process_id));
         self.operations
             .lock()
             .retain(|_, operation| operation.process_id != process_id);
         drop(self.cleanup_process_resources(process_id));
-        drop(self.kernel.reap_process(process_id));
+        drop(self.kernel.processes().reap_process(process_id));
         self.process_authorities.lock().remove(&process_id);
         self.mailboxes.lock().remove(&process_id);
         self.local_handle_owners
@@ -263,7 +265,7 @@ impl Runtime {
             // Each drop discards the Result — we move on and reclaim what we can.
             match resource_class {
                 ResourceClass::SharedMapping => {
-                    drop(self.kernel.detach_shared_region(local_id));
+                    drop(self.kernel.memory().detach_shared_region(local_id));
                 }
                 ResourceClass::TcpListener => {
                     drop(self.kernel.close_tcp_listener(local_id));
@@ -275,10 +277,10 @@ impl Runtime {
                     drop(self.kernel.close_udp_socket(local_id));
                 }
                 ResourceClass::DurableLog => {
-                    drop(self.kernel.close_log(local_id));
+                    drop(self.kernel.storage().close_log(local_id));
                 }
                 ResourceClass::BlobStore => {
-                    drop(self.kernel.close_blob_store(local_id));
+                    drop(self.kernel.storage().close_blob_store(local_id));
                 }
                 ResourceClass::Process => {}
                 _ => {}
@@ -301,11 +303,11 @@ impl Runtime {
 
         for shared_id in owned_regions {
             self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
-            if self.kernel.shared_region_mapping_count(shared_id) == 0 {
+            if self.kernel.memory().shared_region_mapping_count(shared_id) == 0 {
                 // Best-effort: the region has no remaining mappings, but if
                 // destruction fails the region will be reclaimed by the kernel
                 // on process exit anyway.
-                drop(self.kernel.destroy_shared_region(shared_id));
+                drop(self.kernel.memory().destroy_shared_region(shared_id));
             }
         }
 
@@ -517,6 +519,7 @@ mod tests {
         assert_eq!(
             runtime
                 .kernel()
+                .processes()
                 .metering_observation(bootstrapped.process_id)
                 .expect("metering")
                 .cpu_micros,
@@ -565,6 +568,7 @@ mod tests {
         // Allocate a shared region as guest_a.
         let (shared_id, _len) = runtime
             .kernel()
+            .memory()
             .allocate_shared_region(64)
             .expect("allocate region");
         runtime.claim_shared_resource(guest_a.process_id, ResourceClass::SharedRegion, shared_id);

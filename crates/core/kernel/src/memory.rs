@@ -1,8 +1,8 @@
-use std::{
-    sync::atomic::Ordering,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use selium_abi::SharedResourceId;
 use wasmtiny::{
     RegionProt,
@@ -10,13 +10,67 @@ use wasmtiny::{
     runtime::{SharedRegionId, Store},
 };
 
-use crate::{
-    Error, Result,
-    error::map_wasm_error,
-    state::{Kernel, SharedMappingState, SharedRegionRecord},
-};
+use crate::kernel::hashed_id;
+use crate::{Error, Result, error::map_wasm_error};
 
-impl Kernel {
+#[derive(Clone)]
+pub struct MemoryRegistry {
+    pub(crate) inner: Arc<MemoryRegistryInner>,
+}
+
+pub(crate) struct MemoryRegistryInner {
+    pub(crate) store: Mutex<Store>,
+    pub(crate) shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
+    pub(crate) shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
+    pub(crate) next_local_id: AtomicU64,
+    pub(crate) next_shared_id: AtomicU64,
+    pub(crate) id_seed: u64,
+}
+
+pub(crate) struct SharedRegionRecord {
+    pub(crate) region_id: SharedRegionId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SharedMappingState {
+    pub(crate) region_id: SharedRegionId,
+    pub(crate) shared_id: SharedResourceId,
+}
+
+impl MemoryRegistry {
+    pub(crate) fn new(id_seed: u64) -> Self {
+        Self {
+            inner: Arc::new(MemoryRegistryInner {
+                store: Mutex::new(Store::new()),
+                shared_regions: Mutex::new(HashMap::new()),
+                shared_mappings: Mutex::new(HashMap::new()),
+                next_local_id: AtomicU64::new(0),
+                next_shared_id: AtomicU64::new(0),
+                id_seed,
+            }),
+        }
+    }
+
+    pub(crate) fn next_local_id(&self) -> u64 {
+        loop {
+            let counter = self.inner.next_local_id.fetch_add(1, Ordering::SeqCst);
+            let id = hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    pub(crate) fn next_shared_id(&self) -> u64 {
+        loop {
+            let counter = self.inner.next_shared_id.fetch_add(1, Ordering::SeqCst);
+            let id = hashed_id(self.inner.id_seed, counter);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
     /// Allocates a shared memory region.
     pub fn allocate_shared_region(&self, size: u32) -> Result<(SharedResourceId, u32)> {
         let region_id = self
@@ -218,7 +272,6 @@ impl Kernel {
     }
 
     fn local_id_for(&self, local_id: u64) -> Result<u64> {
-        // Validate the mapping exists and return the same id.
         let _ = self.shared_mapping(local_id)?;
         Ok(local_id)
     }
@@ -265,67 +318,44 @@ impl Kernel {
         Ok((shared_id, len))
     }
 
-    pub(crate) fn next_local_id(&self) -> u64 {
-        // splitmix64 is a bijection: each counter value produces a unique
-        // output for a given seed, so collisions within this id space are
-        // impossible. We only guard against id 0 (used as a sentinel).
-        loop {
-            let counter = self.inner.next_local_id.fetch_add(1, Ordering::SeqCst);
-            let id = crate::state::hashed_id(self.inner.id_seed, counter);
-            if id != 0 {
-                return id;
-            }
-        }
-    }
-
-    pub(crate) fn next_shared_id(&self) -> u64 {
-        loop {
-            let counter = self.inner.next_shared_id.fetch_add(1, Ordering::SeqCst);
-            let id = crate::state::hashed_id(self.inner.id_seed, counter);
-            if id != 0 {
-                return id;
-            }
-        }
-    }
-
     /// Creates a `Store` that shares the kernel's `SharedMemoryRegistry`.
     ///
     /// This allows `WasmApplication` instances to access the same shared memory
     /// regions as the kernel, enabling direct mapping into guest linear memory.
-    pub fn shared_store(&self) -> Arc<Mutex<Store>> {
+    pub fn shared_store(&self) -> std::sync::Arc<std::sync::Mutex<Store>> {
         let registry = self.inner.store.lock().shared_memory_registry();
-        Arc::new(Mutex::new(Store::with_shared_registry(registry)))
+        std::sync::Arc::new(std::sync::Mutex::new(Store::with_shared_registry(registry)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::kernel::Kernel;
 
-    #[tokio::test]
-    async fn shared_memory_round_trips_between_attachments() {
+    #[test]
+    fn shared_memory_round_trips_between_attachments() {
         let kernel = Kernel::default();
-        let (shared_id, _len) = kernel.allocate_shared_region(64).expect("allocate region");
-        let left = kernel.attach_shared_region(shared_id).expect("attach left");
-        let right = kernel
+        let memory = kernel.memory();
+        let (shared_id, _len) = memory.allocate_shared_region(64).expect("allocate region");
+        let left = memory.attach_shared_region(shared_id).expect("attach left");
+        let right = memory
             .attach_shared_region(shared_id)
             .expect("attach right");
 
-        kernel
+        memory
             .write_shared_memory(left, 0, b"hello")
             .expect("write left");
-        let bytes = kernel.read_shared_memory(right, 0, 5).expect("read right");
+        let bytes = memory.read_shared_memory(right, 0, 5).expect("read right");
         assert_eq!(bytes, b"hello");
     }
 
     #[test]
     fn ids_are_non_sequential_and_deterministic() {
-        // Same seed must produce the same id sequence.
         let kernel_a = Kernel::with_seed(42);
         let kernel_b = Kernel::with_seed(42);
 
-        let ids_a: Vec<u64> = (0..5).map(|_| kernel_a.next_shared_id()).collect();
-        let ids_b: Vec<u64> = (0..5).map(|_| kernel_b.next_shared_id()).collect();
+        let ids_a: Vec<u64> = (0..5).map(|_| kernel_a.memory().next_shared_id()).collect();
+        let ids_b: Vec<u64> = (0..5).map(|_| kernel_b.memory().next_shared_id()).collect();
 
         assert_eq!(ids_a, ids_b, "same seed must produce same ids");
         assert_ne!(ids_a, vec![1, 2, 3, 4, 5], "ids must not be sequential");

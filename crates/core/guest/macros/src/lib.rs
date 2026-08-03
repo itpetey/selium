@@ -130,10 +130,42 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let generated = match (function.sig.inputs.len(), param_kind.as_deref()) {
-        (0, _) => generate_zero_param(&function, return_kind, is_async, &ident, &export_name, &export_ident, &init_call),
-        (1, Some("Context")) => generate_context_param(&function, return_kind, is_async, &ident, &export_name, &export_ident, &init_call),
-        (1, _) => generate_one_param(&function, return_kind, is_async, &ident, &export_name, &export_ident, &init_call),
-        (2, _) => generate_two_params(&function, return_kind, is_async, &ident, &export_name, &export_ident, &init_call),
+        (0, _) => generate_zero_param(
+            &function,
+            return_kind,
+            is_async,
+            &ident,
+            &export_name,
+            &export_ident,
+            &init_call,
+        ),
+        (1, Some("Context")) => generate_context_param(
+            &function,
+            return_kind,
+            is_async,
+            &ident,
+            &export_name,
+            &export_ident,
+            &init_call,
+        ),
+        (1, _) => generate_one_param(
+            &function,
+            return_kind,
+            is_async,
+            &ident,
+            &export_name,
+            &export_ident,
+            &init_call,
+        ),
+        (2, _) => generate_two_params(
+            &function,
+            return_kind,
+            is_async,
+            &ident,
+            &export_name,
+            &export_ident,
+            &init_call,
+        ),
         _ => {
             return syn::Error::new_spanned(
                 &function.sig.inputs,
@@ -161,7 +193,11 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Generates the call expression for the user function, optionally
 /// discarding the result (for `()` return) or returning it (for `Result<()>`).
-fn make_call(_is_async: bool, return_kind: EntrypointReturn, call_tokens: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+fn make_call(
+    _is_async: bool,
+    return_kind: EntrypointReturn,
+    call_tokens: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     match return_kind {
         EntrypointReturn::Unit => quote!(#call_tokens;),
         EntrypointReturn::ResultUnit => call_tokens,
