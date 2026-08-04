@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap = { workspace = true, features = ["derive", "help", "std"] }
 parking_lot.workspace = true
 selium-abi.workspace = true
 selium-encoding.workspace = true
@@ -20,7 +21,10 @@ selium-memory.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = {
+  workspace = true,
+  features = ["macros", "net", "rt-multi-thread", "sync", "time"]
+}
 tracing.workspace = true
 wasmtiny.workspace = true
 
