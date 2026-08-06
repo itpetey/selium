@@ -407,6 +407,13 @@ impl Runtime {
                     ResourceClass::TcpListener,
                     None,
                 )?;
+                // Reject hostnames — only IP literals are allowed.
+                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                    AbiError::new(
+                        AbiErrorCode::MalformedPayload,
+                        format!("address must be an IP literal, got: {address}"),
+                    )
+                })?;
                 let descriptor = crate::network::tcp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(
@@ -430,6 +437,13 @@ impl Runtime {
                     ResourceClass::TcpStream,
                     None,
                 )?;
+                // Reject hostnames — only IP literals are allowed.
+                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                    AbiError::new(
+                        AbiErrorCode::MalformedPayload,
+                        format!("address must be an IP literal, got: {address}"),
+                    )
+                })?;
                 let descriptor = crate::network::tcp_connect(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
@@ -449,6 +463,13 @@ impl Runtime {
                     ResourceClass::UdpSocket,
                     None,
                 )?;
+                // Reject hostnames — only IP literals are allowed.
+                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                    AbiError::new(
+                        AbiErrorCode::MalformedPayload,
+                        format!("address must be an IP literal, got: {address}"),
+                    )
+                })?;
                 let descriptor = crate::network::udp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::UdpSocket, descriptor.shared_id);
@@ -2210,6 +2231,162 @@ mod tests {
                 );
             }
             other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_connect_rejects_hostname_with_malformed_payload() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            )],
+        );
+
+        // "localhost:80" is a hostname, not an IP literal.
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::TcpConnect {
+                address: "localhost:80".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::MalformedPayload);
+                assert!(
+                    error.message.contains("IP literal"),
+                    "error should mention IP literal: {error:?}"
+                );
+            }
+            other => panic!("expected failed hostcall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_bind_rejects_hostname_with_malformed_payload() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+            )],
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::TcpBind {
+                address: "example.com:0".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::MalformedPayload);
+            }
+            other => panic!("expected failed hostcall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn udp_bind_rejects_hostname_with_malformed_payload() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
+            )],
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::UdpBind {
+                address: "myhost.local:8080".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::MalformedPayload);
+            }
+            other => panic!("expected failed hostcall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_connect_accepts_ip_literal() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            )],
+        );
+
+        // "127.0.0.1:1" is a valid IP literal. The OS connect will fail
+        // (connection refused), but it must NOT fail with MalformedPayload
+        // (which would indicate our address check rejected it).
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::TcpConnect {
+                address: "127.0.0.1:1".to_string(),
+            },
+        );
+        // Accept either ready or failed — the important thing is it wasn't
+        // rejected at the validation step.
+        if status == selium_abi::HOSTCALL_STATUS_FAILED {
+            match runtime.poll_hostcall(guest.process_id, op) {
+                CompletionState::Failed(error) => {
+                    assert_ne!(
+                        error.code,
+                        AbiErrorCode::MalformedPayload,
+                        "IP literal must not be rejected as MalformedPayload"
+                    );
+                }
+                other => panic!("expected failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_succeeds_with_ip_literal() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+            )],
+        );
+
+        // "127.0.0.1:0" is a valid IP literal and should bind successfully.
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::TcpBind {
+                address: "127.0.0.1:0".to_string(),
+            },
+        );
+        assert!(
+            status == selium_abi::HOSTCALL_STATUS_READY
+                || status == selium_abi::HOSTCALL_STATUS_PENDING,
+            "expected ready or pending for valid TcpBind, got status {status}"
+        );
+
+        let output = ready(&runtime, guest.process_id, op);
+        match output {
+            HostcallOutput::HostQueue(descriptor) => {
+                assert!(descriptor.shared_id > 0);
+                assert!(descriptor.local_id > 0);
+            }
+            other => panic!("expected HostQueue output, got {other:?}"),
         }
     }
 }

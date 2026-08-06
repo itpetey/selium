@@ -9,6 +9,7 @@ pub use crate::{
     },
     context::Context,
     error::{GuestError, Result},
+    net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::{mark_ready, process_id},
     process::{ActivityLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
@@ -37,6 +38,7 @@ mod error;
 mod hostcall;
 mod hostcall_region_provider;
 pub mod log;
+pub mod net;
 mod platform;
 mod process;
 mod resource;

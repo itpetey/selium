@@ -168,7 +168,7 @@ impl Channel {
     ///
     /// Used by higher-level patterns (e.g. RPC) that allocate their own ring
     /// regions and need a `Channel` handle for blocking readers/writers.
-    pub(crate) fn from_ring(ring: RingBuf, backpressure: ChannelBackpressure) -> Self {
+    pub fn from_ring(ring: RingBuf, backpressure: ChannelBackpressure) -> Self {
         Self { ring, backpressure }
     }
 }

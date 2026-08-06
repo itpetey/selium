@@ -638,6 +638,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-net-demo"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "tokio",
+]
+
+[[package]]
 name = "selium-runtime"
 version = "1.0.0-alpha.6"
 dependencies = [

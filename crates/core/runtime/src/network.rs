@@ -328,18 +328,11 @@ async fn udp_proxy_recv(
     while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf).await {
             Ok((n, addr)) => {
-                let addr_bytes = addr.to_string().into_bytes();
-                let addr_len = addr_bytes.len() as u16;
-                let payload_len = n;
-                let frame_len = 2 + addr_bytes.len() + payload_len;
+                let payload = buf
+                    .get(..n)
+                    .ok_or_else(|| crate::Error::Host("payload exceeds buffer".to_string()))?;
 
-                let mut frame = Vec::with_capacity(frame_len);
-                frame.extend_from_slice(&addr_len.to_le_bytes());
-                frame.extend_from_slice(&addr_bytes);
-                frame.extend_from_slice(
-                    buf.get(..payload_len)
-                        .ok_or_else(|| crate::Error::Host("payload exceeds buffer".to_string()))?,
-                );
+                let frame = encode_udp_frame(addr, payload);
 
                 if let Err(_e) = writer.write_frame(&frame, 0, 0) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -388,28 +381,10 @@ async fn udp_proxy_send(
         loop {
             match reader.read_frame() {
                 Ok(Some((_header, frame))) => {
-                    if frame.len() < 2 {
-                        continue;
-                    }
-                    let prefix = frame
-                        .get(0..2)
-                        .ok_or_else(|| crate::Error::Host("short udp frame".to_string()))?;
-                    let addr_len = u16::from_le_bytes(
-                        prefix
-                            .try_into()
-                            .map_err(|_error| crate::Error::Host("short udp frame".to_string()))?,
-                    ) as usize;
-                    let addr_bytes = frame.get(2..2 + addr_len).ok_or_else(|| {
-                        crate::Error::Host("udp frame missing address".to_string())
-                    })?;
-                    let addr_str = std::str::from_utf8(addr_bytes)
-                        .map_err(|e| crate::Error::Host(format!("invalid address bytes: {e}")))?;
-                    let addr: std::net::SocketAddr = addr_str
-                        .parse()
-                        .map_err(|e| crate::Error::Host(format!("invalid address: {e}")))?;
-                    let payload = frame.get(2 + addr_len..).ok_or_else(|| {
-                        crate::Error::Host("udp frame missing payload".to_string())
-                    })?;
+                    let (addr, payload) = match decode_udp_frame(&frame) {
+                        Some(d) => (d.0, d.1),
+                        None => continue,
+                    };
 
                     if let Err(_e) = socket.send_to(payload, addr).await {
                         running.store(false, Ordering::Relaxed);
@@ -507,6 +482,71 @@ fn create_stream_region(
         len: total_capacity as u64,
     };
     Ok((region, inbound_writer, outbound_reader, parent_local_id))
+}
+
+// ---------------------------------------------------------------------------
+// Binary datagram frame codec
+// ---------------------------------------------------------------------------
+
+/// Encodes a `SocketAddr` + payload into the binary datagram frame format:
+/// `[ver u8 = 1][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
+fn encode_udp_frame(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let addr_len = match addr {
+        std::net::SocketAddr::V4(_) => 4usize,
+        std::net::SocketAddr::V6(_) => 16usize,
+    };
+    let header_len = 2 + addr_len + 2;
+    let mut frame = Vec::with_capacity(header_len + payload.len());
+    frame.push(1u8); // version
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            frame.push(4u8);
+            frame.extend_from_slice(&v4.ip().octets());
+            frame.extend_from_slice(&v4.port().to_le_bytes());
+        }
+        std::net::SocketAddr::V6(v6) => {
+            frame.push(6u8);
+            frame.extend_from_slice(&v6.ip().octets());
+            frame.extend_from_slice(&v6.port().to_le_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Decodes a binary datagram frame into `(SocketAddr, payload_bytes)`.
+/// Returns `None` if the frame is malformed.
+fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
+    if frame.len() < 8 {
+        return None;
+    }
+    if frame[0] != 1 {
+        return None;
+    }
+    let family = frame[1];
+    match family {
+        4 => {
+            if frame.len() < 8 {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
+            let port = u16::from_le_bytes([frame[6], frame[7]]);
+            let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
+            Some((addr, &frame[8..]))
+        }
+        6 => {
+            if frame.len() < 20 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&frame[2..18]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_le_bytes([frame[18], frame[19]]);
+            let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
+            Some((addr, &frame[20..]))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,12 +691,8 @@ mod tests {
         let writer = RingWriter::open(send_backend, DEFAULT_RING_CAPACITY).expect("open writer");
         writer.increment_writer_count().expect("inc wc");
 
-        let addr_str = helper_addr.to_string();
-        let addr_bytes = addr_str.as_bytes();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&(addr_bytes.len() as u16).to_le_bytes());
-        frame.extend_from_slice(addr_bytes);
-        frame.extend_from_slice(b"loopback test");
+        // Build binary datagram frame
+        let frame = encode_udp_frame(helper_addr, b"loopback test");
 
         writer.write_frame(&frame, 0, 0).expect("write frame");
 

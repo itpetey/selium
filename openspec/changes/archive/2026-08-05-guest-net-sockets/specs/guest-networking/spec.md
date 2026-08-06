@@ -106,29 +106,3 @@ addresses SHALL be IP literals (see Literals-Only Network Addresses).
   arbitrary read-chunk frames
 - **THEN** `TcpStream` reads SHALL present a continuous byte stream and
   SHALL NOT expose frame boundaries as message boundaries
-
-### Requirement: Quinn UdpSender Implementation
-`selium-guest` SHALL implement `QuinnUdpSender::poll_send` to write framed datagrams to the shared-memory send channel using the ring buffer's atomic operations.
-
-#### Scenario: Quinn sends a datagram
-- **WHEN** Quinn calls `poll_send` with a `Transmit` containing a destination address and payload
-- **THEN** the implementation SHALL encode the destination and payload into a frame and write it to the send ring buffer via `RingBuf::reserve` and `RingBuf::write_frame`
-
-#### Scenario: Quinn sends with full send channel
-- **WHEN** Quinn calls `poll_send` and the send channel is full
-- **THEN** the implementation SHALL return `Poll::Pending`
-
-### Requirement: Quinn AsyncUdpSocket Recv Implementation
-`selium-guest` SHALL implement `QuinnUdpSocket::poll_recv` to read framed datagrams from the shared-memory recv channel using the ring buffer's atomic operations.
-
-#### Scenario: Quinn polls for received datagrams
-- **WHEN** Quinn's `EndpointDriver` calls `poll_recv` on the socket and a frame is available in the recv channel
-- **THEN** the implementation SHALL read the frame from the recv ring buffer, decode the source address and payload, copy the payload into the provided buffers, and populate the `RecvMeta` with the source address and length
-
-#### Scenario: Quinn polls with empty recv channel
-- **WHEN** Quinn's `EndpointDriver` calls `poll_recv` on the socket and the recv channel is empty but writers are still connected
-- **THEN** the implementation SHALL return `Poll::Pending`
-
-#### Scenario: Quinn polls with disconnected recv channel
-- **WHEN** Quinn's `EndpointDriver` calls `poll_recv` on the socket and the recv channel's `writer_count` is 0
-- **THEN** the implementation SHALL return an `io::Error` indicating the channel is closed

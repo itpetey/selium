@@ -51,6 +51,16 @@ impl NetworkState {
     pub fn remove_udp_socket(&self, shared_id: u64) -> Option<UdpSocketState> {
         self.inner.udp_sockets.lock().remove(&shared_id)
     }
+
+    /// Returns the local addresses of all active TCP listeners.
+    pub fn tcp_listener_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.inner
+            .tcp_listeners
+            .lock()
+            .values()
+            .filter_map(|state| state._listener.local_addr().ok())
+            .collect()
+    }
 }
 
 pub struct TcpListenerState {
