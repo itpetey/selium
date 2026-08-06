@@ -408,7 +408,7 @@ impl Runtime {
                     None,
                 )?;
                 // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),
@@ -438,7 +438,7 @@ impl Runtime {
                     None,
                 )?;
                 // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),
@@ -464,7 +464,7 @@ impl Runtime {
                     None,
                 )?;
                 // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_| {
+                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),

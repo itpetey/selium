@@ -255,30 +255,35 @@ fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
     if frame.len() < 8 {
         return None;
     }
-    if frame[0] != 1 {
+    if *frame.first()? != 1 {
         return None;
     }
-    let family = frame[1];
+    let family = *frame.get(1)?;
     match family {
         4 => {
             if frame.len() < 8 {
                 return None;
             }
-            let ip = std::net::Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
-            let port = u16::from_le_bytes([frame[6], frame[7]]);
+            let ip = std::net::Ipv4Addr::new(
+                *frame.get(2)?,
+                *frame.get(3)?,
+                *frame.get(4)?,
+                *frame.get(5)?,
+            );
+            let port = u16::from_le_bytes([*frame.get(6)?, *frame.get(7)?]);
             let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
-            Some((addr, &frame[8..]))
+            Some((addr, frame.get(8..)?))
         }
         6 => {
             if frame.len() < 20 {
                 return None;
             }
             let mut octets = [0u8; 16];
-            octets.copy_from_slice(&frame[2..18]);
+            octets.copy_from_slice(frame.get(2..18)?);
             let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_le_bytes([frame[18], frame[19]]);
+            let port = u16::from_le_bytes([*frame.get(18)?, *frame.get(19)?]);
             let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
-            Some((addr, &frame[20..]))
+            Some((addr, frame.get(20..)?))
         }
         _ => None,
     }

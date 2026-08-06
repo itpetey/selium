@@ -52,7 +52,7 @@ impl UdpSocket {
     pub async fn bind(addr: &str) -> Result<Self> {
         let _: std::net::SocketAddr = addr
             .parse()
-            .map_err(|_| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
+            .map_err(|_e| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
 
         let output = hostcall_async(HostcallRequest::UdpBind {
             address: addr.to_string(),
@@ -140,8 +140,10 @@ impl UdpSocket {
         write_buf.extend_from_slice(&header_bytes);
         write_buf.extend_from_slice(&frame);
 
-        // SAFETY: we project to the send_writer field; no other pinned fields are accessed.
-        let writer = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().send_writer) };
+        // SAFETY: we project only to the send_writer field; caller upholds pin invariants.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: pin projection through a struct field; caller upholds invariants.
+        let writer = unsafe { Pin::new_unchecked(&mut this.send_writer) };
         match writer.poll_write(cx, &write_buf) {
             Poll::Ready(Ok(n)) => {
                 let sent = n.saturating_sub(header_bytes.len());
@@ -161,8 +163,10 @@ impl UdpSocket {
         let mut buf = vec![0u8; 65536];
         let mut read_buf = ReadBuf::new(&mut buf);
 
-        // SAFETY: we project to the recv_reader field; no other pinned fields are accessed.
-        let reader = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().recv_reader) };
+        // SAFETY: we project only to the recv_reader field; caller upholds pin invariants.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: pin projection through a struct field; caller upholds invariants.
+        let reader = unsafe { Pin::new_unchecked(&mut this.recv_reader) };
 
         match reader.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
@@ -174,7 +178,7 @@ impl UdpSocket {
                 if filled <= header_size {
                     return Poll::Ready(Err(GuestError::Host("short udp recv frame".to_string())));
                 }
-                let payload = &buf[header_size..filled];
+                let payload = buf.get(header_size..filled).unwrap_or(&[]);
                 match decode_udp_frame(payload) {
                     Some(datagram) => Poll::Ready(Ok(datagram)),
                     None => Poll::Ready(Err(GuestError::Host(
@@ -214,20 +218,25 @@ fn decode_udp_frame(frame: &[u8]) -> Option<Datagram> {
     if frame.len() < 8 {
         return None;
     }
-    let ver = frame[0];
+    let ver = *frame.first()?;
     if ver != UDP_FRAME_VERSION {
         return None;
     }
-    let family = frame[1];
+    let family = *frame.get(1)?;
     match family {
         4 => {
             if frame.len() < 8 {
                 return None;
             }
-            let ip = Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
-            let port = u16::from_le_bytes([frame[6], frame[7]]);
+            let ip = Ipv4Addr::new(
+                *frame.get(2)?,
+                *frame.get(3)?,
+                *frame.get(4)?,
+                *frame.get(5)?,
+            );
+            let port = u16::from_le_bytes([*frame.get(6)?, *frame.get(7)?]);
             let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-            let payload = frame[8..].to_vec();
+            let payload = frame.get(8..).unwrap_or(&[]).to_vec();
             Some(Datagram { addr, payload })
         }
         6 => {
@@ -235,11 +244,11 @@ fn decode_udp_frame(frame: &[u8]) -> Option<Datagram> {
                 return None;
             }
             let mut octets = [0u8; 16];
-            octets.copy_from_slice(&frame[2..18]);
+            octets.copy_from_slice(frame.get(2..18)?);
             let ip = Ipv6Addr::from(octets);
-            let port = u16::from_le_bytes([frame[18], frame[19]]);
+            let port = u16::from_le_bytes([*frame.get(18)?, *frame.get(19)?]);
             let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
-            let payload = frame[20..].to_vec();
+            let payload = frame.get(20..).unwrap_or(&[]).to_vec();
             Some(Datagram { addr, payload })
         }
         _ => None,

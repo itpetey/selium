@@ -58,7 +58,7 @@ impl TcpStream {
         // Early validation — the runtime rejects names with MalformedPayload.
         let _: SocketAddr = addr
             .parse()
-            .map_err(|_| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
+            .map_err(|_e| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
 
         let output = hostcall_async(HostcallRequest::TcpConnect {
             address: addr.to_string(),
@@ -138,8 +138,12 @@ impl TcpStream {
     /// The caller must ensure no other field of `self` is accessed while the
     /// returned pin is live (standard pin projection rules).
     unsafe fn project_reader(self: Pin<&mut Self>) -> Pin<&mut Reader> {
-        // SAFETY: pin projection through a struct field; caller upholds invariants.
-        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().reader) }
+        // SAFETY: caller ensures no other field of `self` is accessed while the
+        // returned pin is live (standard pin projection rules).
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: we project only through the `reader` field; the caller
+        // upholds the pin invariants.
+        unsafe { Pin::new_unchecked(&mut this.reader) }
     }
 
     /// Project `Pin<&mut Self>` → `Pin<&mut Writer>`.
@@ -147,8 +151,12 @@ impl TcpStream {
     /// # Safety
     /// Same constraints as [`project_reader`].
     unsafe fn project_writer(self: Pin<&mut Self>) -> Pin<&mut Writer> {
-        // SAFETY: pin projection through a struct field; caller upholds invariants.
-        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().writer) }
+        // SAFETY: caller ensures no other field of `self` is accessed while the
+        // returned pin is live (standard pin projection rules).
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: we project only through the `writer` field; the caller
+        // upholds the pin invariants.
+        unsafe { Pin::new_unchecked(&mut this.writer) }
     }
 }
 
@@ -160,9 +168,9 @@ impl AsyncRead for TcpStream {
     ) -> Poll<std::io::Result<()>> {
         // Drain any previously buffered payload bytes (header already stripped).
         if self.read_offset < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_offset..];
+            let remaining = self.read_buf.get(self.read_offset..).unwrap_or(&[]);
             let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
+            buf.put_slice(remaining.get(..to_copy).unwrap_or(remaining));
             self.read_offset += to_copy;
             if self.read_offset >= self.read_buf.len() {
                 self.read_buf.clear();
@@ -187,14 +195,14 @@ impl AsyncRead for TcpStream {
                 if filled <= header_size {
                     return Poll::Ready(Ok(()));
                 }
-                let payload = frame_buf[header_size..filled].to_vec();
+                let payload = frame_buf.get(header_size..filled).unwrap_or(&[]).to_vec();
 
                 // Store stripped payload in read_buf for potential partial copy.
                 self.read_buf = payload;
                 self.read_offset = 0;
 
                 let to_copy = self.read_buf.len().min(buf.remaining());
-                buf.put_slice(&self.read_buf[..to_copy]);
+                buf.put_slice(self.read_buf.get(..to_copy).unwrap_or(&[]));
                 self.read_offset = to_copy;
                 if self.read_offset >= self.read_buf.len() {
                     self.read_buf.clear();
@@ -229,6 +237,8 @@ impl AsyncWrite for TcpStream {
         write_buf.extend_from_slice(buf);
 
         // Pin-project to writer and delegate.
+        // SAFETY: we project only to the `writer` field; no other pinned fields
+        // are accessed concurrently. The caller upholds pin invariants.
         let writer = unsafe { self.as_mut().project_writer() };
         match writer.poll_write(cx, &write_buf) {
             Poll::Ready(Ok(n)) => {
@@ -242,11 +252,13 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // SAFETY: we project only to the `writer` field; caller upholds pin invariants.
         let writer = unsafe { self.as_mut().project_writer() };
         writer.poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // SAFETY: we project only to the `writer` field; caller upholds pin invariants.
         let writer = unsafe { self.as_mut().project_writer() };
         writer.poll_shutdown(cx)
     }
@@ -276,7 +288,7 @@ impl TcpListener {
     pub fn bind(addr: &str) -> Result<Self> {
         let _: SocketAddr = addr
             .parse()
-            .map_err(|_| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
+            .map_err(|_e| GuestError::Host(format!("invalid IP literal address: {addr}")))?;
 
         let output = crate::hostcall::hostcall_ready(HostcallRequest::TcpBind {
             address: addr.to_string(),

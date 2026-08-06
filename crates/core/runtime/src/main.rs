@@ -117,8 +117,8 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
     let mut kvs: Vec<(String, String)> = Vec::new();
     for part in raw.split(',') {
         if let Some(eq) = part.find('=') {
-            let key = part[..eq].trim().to_owned();
-            let val = part[eq + 1..].trim().to_owned();
+            let key = part.get(..eq).unwrap_or("").trim().to_owned();
+            let val = part.get(eq + 1..).unwrap_or("").trim().to_owned();
             if key.is_empty() {
                 return Err(format!("empty key in '{}'", raw));
             }
