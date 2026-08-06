@@ -24,49 +24,6 @@ enum EntrypointReturn {
     ResultUnit,
 }
 
-/// Inspects the return type to determine whether it is `()`, `Result<()>`, or
-/// unsupported. Returns `None` for unsupported types.
-fn inspect_return_type(output: &ReturnType) -> Option<EntrypointReturn> {
-    match output {
-        ReturnType::Default => Some(EntrypointReturn::Unit),
-        ReturnType::Type(_, ty) => {
-            if is_result_of_unit(ty) {
-                Some(EntrypointReturn::ResultUnit)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Returns true if `ty` is `Result<()>` or `Result<(), E>` (accepts both the
-/// two-argument form and single-argument aliases such as `anyhow::Result<()>`
-/// whose error type has a default).
-fn is_result_of_unit(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        let segments = &type_path.path.segments;
-        if let Some(last) = segments.last() {
-            if last.ident != "Result" {
-                return false;
-            }
-            if let PathArguments::AngleBracketed(args) = &last.arguments {
-                // `Result<(), E>` (two args) or `Result<()>` (alias with default error)
-                if matches!(args.args.len(), 1 | 2) {
-                    if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return is_unit_tuple(inner_ty);
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Returns true if `ty` is the unit type `()`.
-fn is_unit_tuple(ty: &Type) -> bool {
-    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
-}
-
 /// Marks a function as an exported Selium guest entrypoint.
 ///
 /// Accepts entrypoints returning `()` or `Result<()>` with 0–2 `u64` parameters
@@ -191,6 +148,216 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Generates Selium pattern metadata for a trait interface.
+#[proc_macro_attribute]
+pub fn pattern_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let interface = parse_macro_input!(item as ItemTrait);
+    let ident = interface.ident.clone();
+    let metadata_fn = format_ident!("{}_pattern_metadata", ident.to_string().to_lowercase());
+    let methods = interface
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    quote! {
+        #interface
+
+        pub fn #metadata_fn() -> ::selium_guest::InterfaceMetadata {
+            ::selium_guest::InterfaceMetadata::new(
+                stringify!(#ident),
+                vec![#(::std::string::String::from(#methods)),*],
+            )
+        }
+    }
+    .into()
+}
+
+/// Struct-level schema annotation declaring a message type.
+#[proc_macro_attribute]
+pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
+    schema::expand(attr, item)
+}
+
+/// Returns the return type suffix for the extern "C" signature: nothing for
+/// `()`, `-> i32` for `Result<()>`.
+fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
+    match return_kind {
+        EntrypointReturn::Unit => quote!(),
+        EntrypointReturn::ResultUnit => quote!(-> i32),
+    }
+}
+
+fn generate_context_param(
+    function: &ItemFn,
+    return_kind: EntrypointReturn,
+    is_async: bool,
+    ident: &syn::Ident,
+    export_name: &str,
+    export_ident: &syn::Ident,
+    init_call: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let call_tokens = if is_async {
+        quote!(#ident(ctx).await)
+    } else {
+        quote!(#ident(ctx))
+    };
+    let call = make_call(is_async, return_kind, call_tokens);
+    let body = make_wrapper_body(
+        return_kind,
+        quote! {
+            let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
+                .await
+                .expect("failed to construct bootstrap context");
+            #call
+        },
+    );
+    let ret = extern_return_type(return_kind);
+
+    quote! {
+        #function
+
+        #[unsafe(export_name = #export_name)]
+        pub extern "C" fn #export_ident(discovery_handle: i64) #ret {
+            #init_call
+            #body
+        }
+    }
+}
+
+fn generate_one_param(
+    function: &ItemFn,
+    return_kind: EntrypointReturn,
+    is_async: bool,
+    ident: &syn::Ident,
+    export_name: &str,
+    export_ident: &syn::Ident,
+    init_call: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let call_tokens = if is_async {
+        quote!(#ident(handle as u64).await)
+    } else {
+        quote!(#ident(handle as u64))
+    };
+    let call = make_call(is_async, return_kind, call_tokens);
+    let body = make_wrapper_body(return_kind, call);
+    let ret = extern_return_type(return_kind);
+
+    quote! {
+        #function
+
+        #[unsafe(export_name = #export_name)]
+        pub extern "C" fn #export_ident(handle: i64) #ret {
+            #init_call
+            #body
+        }
+    }
+}
+
+fn generate_two_params(
+    function: &ItemFn,
+    return_kind: EntrypointReturn,
+    is_async: bool,
+    ident: &syn::Ident,
+    export_name: &str,
+    export_ident: &syn::Ident,
+    init_call: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let call_tokens = if is_async {
+        quote!(#ident(arg0 as u64, arg1 as u64).await)
+    } else {
+        quote!(#ident(arg0 as u64, arg1 as u64))
+    };
+    let call = make_call(is_async, return_kind, call_tokens);
+    let body = make_wrapper_body(return_kind, call);
+    let ret = extern_return_type(return_kind);
+
+    quote! {
+        #function
+
+        #[unsafe(export_name = #export_name)]
+        pub extern "C" fn #export_ident(arg0: i64, arg1: i64) #ret {
+            #init_call
+            #body
+        }
+    }
+}
+
+fn generate_zero_param(
+    function: &ItemFn,
+    return_kind: EntrypointReturn,
+    is_async: bool,
+    ident: &syn::Ident,
+    export_name: &str,
+    export_ident: &syn::Ident,
+    init_call: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let call_tokens = if is_async {
+        quote!(#ident().await)
+    } else {
+        quote!(#ident())
+    };
+    let call = make_call(is_async, return_kind, call_tokens);
+    let body = make_wrapper_body(return_kind, call);
+    let ret = extern_return_type(return_kind);
+
+    quote! {
+        #function
+
+        #[unsafe(export_name = #export_name)]
+        pub extern "C" fn #export_ident() #ret {
+            #init_call
+            #body
+        }
+    }
+}
+
+/// Inspects the return type to determine whether it is `()`, `Result<()>`, or
+/// unsupported. Returns `None` for unsupported types.
+fn inspect_return_type(output: &ReturnType) -> Option<EntrypointReturn> {
+    match output {
+        ReturnType::Default => Some(EntrypointReturn::Unit),
+        ReturnType::Type(_, ty) => {
+            if is_result_of_unit(ty) {
+                Some(EntrypointReturn::ResultUnit)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Returns true if `ty` is `Result<()>` or `Result<(), E>` (accepts both the
+/// two-argument form and single-argument aliases such as `anyhow::Result<()>`
+/// whose error type has a default).
+fn is_result_of_unit(ty: &Type) -> bool {
+    if let Type::Path(type_path) = ty {
+        let segments = &type_path.path.segments;
+        if let Some(last) = segments.last() {
+            if last.ident != "Result" {
+                return false;
+            }
+            if let PathArguments::AngleBracketed(args) = &last.arguments {
+                // `Result<(), E>` (two args) or `Result<()>` (alias with default error)
+                if matches!(args.args.len(), 1 | 2) {
+                    if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return is_unit_tuple(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if `ty` is the unit type `()`.
+fn is_unit_tuple(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
 /// Generates the call expression for the user function, optionally
 /// discarding the result (for `()` return) or returning it (for `Result<()>`).
 fn make_call(
@@ -235,171 +402,4 @@ fn make_wrapper_body(
             }
         }
     }
-}
-
-/// Returns the return type suffix for the extern "C" signature: nothing for
-/// `()`, `-> i32` for `Result<()>`.
-fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
-    match return_kind {
-        EntrypointReturn::Unit => quote!(),
-        EntrypointReturn::ResultUnit => quote!(-> i32),
-    }
-}
-
-fn generate_zero_param(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident().await)
-    } else {
-        quote!(#ident())
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident() #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-fn generate_one_param(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident(handle as u64).await)
-    } else {
-        quote!(#ident(handle as u64))
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(handle: i64) #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-fn generate_context_param(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident(ctx).await)
-    } else {
-        quote!(#ident(ctx))
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(
-        return_kind,
-        quote! {
-            let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
-                .await
-                .expect("failed to construct bootstrap context");
-            #call
-        },
-    );
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(discovery_handle: i64) #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-fn generate_two_params(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident(arg0 as u64, arg1 as u64).await)
-    } else {
-        quote!(#ident(arg0 as u64, arg1 as u64))
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(arg0: i64, arg1: i64) #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-/// Generates Selium pattern metadata for a trait interface.
-#[proc_macro_attribute]
-pub fn pattern_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let interface = parse_macro_input!(item as ItemTrait);
-    let ident = interface.ident.clone();
-    let metadata_fn = format_ident!("{}_pattern_metadata", ident.to_string().to_lowercase());
-    let methods = interface
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::TraitItem::Fn(method) => Some(method.sig.ident.to_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    quote! {
-        #interface
-
-        pub fn #metadata_fn() -> ::selium_guest::InterfaceMetadata {
-            ::selium_guest::InterfaceMetadata::new(
-                stringify!(#ident),
-                vec![#(::std::string::String::from(#methods)),*],
-            )
-        }
-    }
-    .into()
-}
-
-/// Struct-level schema annotation declaring a message type.
-#[proc_macro_attribute]
-pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
-    schema::expand(attr, item)
 }

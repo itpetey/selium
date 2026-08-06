@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-use std::net::TcpListener;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::{collections::HashMap, net::TcpListener, sync::Arc, sync::atomic::AtomicBool};
 
 use parking_lot::Mutex;
 use selium_abi::SharedResourceId;
@@ -9,6 +6,20 @@ use selium_abi::SharedResourceId;
 #[derive(Clone)]
 pub struct NetworkState {
     pub(crate) inner: Arc<NetworkStateInner>,
+}
+
+pub struct TcpListenerState {
+    pub shared_id: SharedResourceId,
+    pub running: Arc<AtomicBool>,
+    pub _listener: TcpListener,
+}
+
+pub struct TcpStreamState {
+    pub running: Arc<AtomicBool>,
+}
+
+pub struct UdpSocketState {
+    pub running: Arc<AtomicBool>,
 }
 
 pub(crate) struct NetworkStateInner {
@@ -61,18 +72,4 @@ impl NetworkState {
             .filter_map(|state| state._listener.local_addr().ok())
             .collect()
     }
-}
-
-pub struct TcpListenerState {
-    pub shared_id: SharedResourceId,
-    pub running: Arc<AtomicBool>,
-    pub _listener: TcpListener,
-}
-
-pub struct TcpStreamState {
-    pub running: Arc<AtomicBool>,
-}
-
-pub struct UdpSocketState {
-    pub running: Arc<AtomicBool>,
 }

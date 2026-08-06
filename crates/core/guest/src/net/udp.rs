@@ -18,10 +18,7 @@ use selium_shm::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    GuestError, Result,
-    hostcall::hostcall_async,
-};
+use crate::{GuestError, Result, hostcall::hostcall_async};
 
 /// UDP frame version byte.
 const UDP_FRAME_VERSION: u8 = 1;
@@ -35,83 +32,6 @@ pub struct Datagram {
     pub payload: Vec<u8>,
 }
 
-/// Encode a `Datagram` into the binary frame format.
-///
-/// Format: `[ver u8][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
-pub fn encode_datagram(datagram: &Datagram) -> Vec<u8> {
-    encode_udp_frame(datagram.addr, &datagram.payload)
-}
-
-/// Decode a binary frame into a `Datagram`, returning `None` if malformed.
-pub fn decode_datagram(frame: &[u8]) -> Option<Datagram> {
-    decode_udp_frame(frame)
-}
-
-fn encode_udp_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let addr_len = addr_bytes_len(&addr);
-    // ver(1) + family(1) + addr + port(2)
-    let header_len = 2 + addr_len + 2;
-    let mut frame = Vec::with_capacity(header_len + payload.len());
-    frame.push(UDP_FRAME_VERSION);
-    match addr {
-        SocketAddr::V4(v4) => {
-            frame.push(4u8);
-            frame.extend_from_slice(&v4.ip().octets());
-            frame.extend_from_slice(&v4.port().to_le_bytes());
-        }
-        SocketAddr::V6(v6) => {
-            frame.push(6u8);
-            frame.extend_from_slice(&v6.ip().octets());
-            frame.extend_from_slice(&v6.port().to_le_bytes());
-        }
-    }
-    frame.extend_from_slice(payload);
-    frame
-}
-
-fn decode_udp_frame(frame: &[u8]) -> Option<Datagram> {
-    if frame.len() < 8 {
-        return None;
-    }
-    let ver = frame[0];
-    if ver != UDP_FRAME_VERSION {
-        return None;
-    }
-    let family = frame[1];
-    match family {
-        4 => {
-            if frame.len() < 8 {
-                return None;
-            }
-            let ip = Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
-            let port = u16::from_le_bytes([frame[6], frame[7]]);
-            let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-            let payload = frame[8..].to_vec();
-            Some(Datagram { addr, payload })
-        }
-        6 => {
-            if frame.len() < 20 {
-                return None;
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&frame[2..18]);
-            let ip = Ipv6Addr::from(octets);
-            let port = u16::from_le_bytes([frame[18], frame[19]]);
-            let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
-            let payload = frame[20..].to_vec();
-            Some(Datagram { addr, payload })
-        }
-        _ => None,
-    }
-}
-
-fn addr_bytes_len(addr: &SocketAddr) -> usize {
-    match addr {
-        SocketAddr::V4(_) => 4,
-        SocketAddr::V6(_) => 16,
-    }
-}
-
 /// A UDP socket backed by shared-memory send/recv rings.
 ///
 /// Datagrams are encoded with the binary frame format
@@ -123,9 +43,6 @@ pub struct UdpSocket {
     /// Keeps the parent shared region alive while the socket is in use.
     _region: selium_memory::Region,
 }
-
-// SAFETY: Reader and Writer are backed by process-level shared memory mappings.
-unsafe impl Send for UdpSocket {}
 
 impl UdpSocket {
     /// Binds to an IP-literal address and returns a UDP socket.
@@ -174,7 +91,9 @@ impl UdpSocket {
             .sub_region(send_entry.offset, send_entry.length)
             .map_err(|e| GuestError::Host(format!("send sub-region failed: {e}")))?;
 
-        let ring_cap = recv_entry.length.saturating_sub(selium_shm::layout::DATA_OFFSET);
+        let ring_cap = recv_entry
+            .length
+            .saturating_sub(selium_shm::layout::DATA_OFFSET);
 
         let recv_region = ChannelRegion::from_mapping(recv_mapping, ring_cap);
         let send_region = ChannelRegion::from_mapping(send_mapping, ring_cap);
@@ -222,9 +141,7 @@ impl UdpSocket {
         write_buf.extend_from_slice(&frame);
 
         // SAFETY: we project to the send_writer field; no other pinned fields are accessed.
-        let writer = unsafe {
-            Pin::new_unchecked(&mut self.get_unchecked_mut().send_writer)
-        };
+        let writer = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().send_writer) };
         match writer.poll_write(cx, &write_buf) {
             Poll::Ready(Ok(n)) => {
                 let sent = n.saturating_sub(header_bytes.len());
@@ -238,33 +155,24 @@ impl UdpSocket {
     /// Attempts to receive a datagram. Returns `Poll::Pending` if the recv ring is
     /// empty but writers are still connected (after registering a generation wait).
     /// Returns an error if the channel is closed (`writer_count == 0`).
-    pub fn poll_recv(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Datagram>> {
+    pub fn poll_recv(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<Datagram>> {
         // Read a frame (header+payload) from the recv ring.
         // Then decode the binary datagram from the payload.
         let mut buf = vec![0u8; 65536];
         let mut read_buf = ReadBuf::new(&mut buf);
 
         // SAFETY: we project to the recv_reader field; no other pinned fields are accessed.
-        let reader = unsafe {
-            Pin::new_unchecked(&mut self.get_unchecked_mut().recv_reader)
-        };
+        let reader = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().recv_reader) };
 
         match reader.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let filled = read_buf.filled().len();
                 if filled == 0 {
-                    return Poll::Ready(Err(GuestError::Host(
-                        "udp recv ring closed".to_string(),
-                    )));
+                    return Poll::Ready(Err(GuestError::Host("udp recv ring closed".to_string())));
                 }
                 let header_size = selium_memory::FrameHeader::ENCODED_SIZE;
                 if filled <= header_size {
-                    return Poll::Ready(Err(GuestError::Host(
-                        "short udp recv frame".to_string(),
-                    )));
+                    return Poll::Ready(Err(GuestError::Host("short udp recv frame".to_string())));
                 }
                 let payload = &buf[header_size..filled];
                 match decode_udp_frame(payload) {
@@ -278,6 +186,86 @@ impl UdpSocket {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+// SAFETY: Reader and Writer are backed by process-level shared memory mappings.
+unsafe impl Send for UdpSocket {}
+
+/// Decode a binary frame into a `Datagram`, returning `None` if malformed.
+pub fn decode_datagram(frame: &[u8]) -> Option<Datagram> {
+    decode_udp_frame(frame)
+}
+
+/// Encode a `Datagram` into the binary frame format.
+///
+/// Format: `[ver u8][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
+pub fn encode_datagram(datagram: &Datagram) -> Vec<u8> {
+    encode_udp_frame(datagram.addr, &datagram.payload)
+}
+
+fn addr_bytes_len(addr: &SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    }
+}
+
+fn decode_udp_frame(frame: &[u8]) -> Option<Datagram> {
+    if frame.len() < 8 {
+        return None;
+    }
+    let ver = frame[0];
+    if ver != UDP_FRAME_VERSION {
+        return None;
+    }
+    let family = frame[1];
+    match family {
+        4 => {
+            if frame.len() < 8 {
+                return None;
+            }
+            let ip = Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
+            let port = u16::from_le_bytes([frame[6], frame[7]]);
+            let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+            let payload = frame[8..].to_vec();
+            Some(Datagram { addr, payload })
+        }
+        6 => {
+            if frame.len() < 20 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&frame[2..18]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_le_bytes([frame[18], frame[19]]);
+            let addr = SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0));
+            let payload = frame[20..].to_vec();
+            Some(Datagram { addr, payload })
+        }
+        _ => None,
+    }
+}
+
+fn encode_udp_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let addr_len = addr_bytes_len(&addr);
+    // ver(1) + family(1) + addr + port(2)
+    let header_len = 2 + addr_len + 2;
+    let mut frame = Vec::with_capacity(header_len + payload.len());
+    frame.push(UDP_FRAME_VERSION);
+    match addr {
+        SocketAddr::V4(v4) => {
+            frame.push(4u8);
+            frame.extend_from_slice(&v4.ip().octets());
+            frame.extend_from_slice(&v4.port().to_le_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            frame.push(6u8);
+            frame.extend_from_slice(&v6.ip().octets());
+            frame.extend_from_slice(&v6.port().to_le_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
 }
 
 #[cfg(test)]

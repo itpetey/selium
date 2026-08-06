@@ -21,10 +21,6 @@ use crate::error::Result;
 /// Default ring buffer data capacity (64 KiB, power of two).
 const DEFAULT_RING_CAPACITY: u64 = 64 * 1024;
 
-// ---------------------------------------------------------------------------
-// Public API (called from dispatch_hostcall)
-// ---------------------------------------------------------------------------
-
 /// Bind a TCP listener and spawn an async accept loop.
 pub fn tcp_bind(kernel: &Kernel, address: String) -> Result<HostQueueDescriptor> {
     let std_listener = std::net::TcpListener::bind(&address)
@@ -127,10 +123,6 @@ pub fn udp_bind(kernel: &Kernel, address: String) -> Result<SharedRegionDescript
     Ok(descriptor)
 }
 
-// ---------------------------------------------------------------------------
-// Async I/O helpers
-// ---------------------------------------------------------------------------
-
 async fn accept_loop(
     kernel: Kernel,
     listener: tokio::net::TcpListener,
@@ -181,27 +173,141 @@ async fn accept_loop(
     }
 }
 
-async fn run_tcp_proxy(
-    stream: tokio::net::TcpStream,
-    inbound_writer: RingWriter,
-    outbound_reader: RingReader,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let running_in = running.clone();
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+fn align_up(value: u32, alignment: u32) -> u32 {
+    let rem = value % alignment;
+    if rem == 0 {
+        value
+    } else {
+        value + alignment - rem
+    }
+}
 
-    let inbound = tokio::spawn(async move {
-        if let Err(_e) = proxy_inbound(&mut read_half, inbound_writer, running_in).await {}
-    });
+fn create_stream_region(
+    kernel: &Kernel,
+) -> Result<(SharedRegionDescriptor, RingWriter, RingReader, u64)> {
+    let ring_data_cap = DEFAULT_RING_CAPACITY as u32;
+    let ring_region_len = selium_memory::RING_HEADER_SIZE as u32 + ring_data_cap;
+    let header_size =
+        selium_memory::HEADER_ENTRY_OFFSET as u32 + 2 * selium_memory::HEADER_ENTRY_SIZE as u32;
+    let total_capacity = align_up(
+        header_size + align_up(header_size + ring_region_len, 8) + ring_region_len,
+        8,
+    );
 
-    let outbound = tokio::spawn(async move {
-        if let Err(_e) = proxy_outbound(&mut write_half, outbound_reader, running).await {}
-    });
+    let memory = kernel.memory();
+    let (shared_id, _len) = memory
+        .allocate_shared_region(total_capacity)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
 
-    drop(inbound.await);
-    drop(outbound.await);
+    let parent_backend = memory
+        .attach_backend(shared_id)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+    let parent_local_id = parent_backend.local_id();
 
-    Ok(())
+    let sub_memory_0_offset = align_up(header_size, 8) as u64;
+    let sub_memory_1_offset = align_up(sub_memory_0_offset as u32 + ring_region_len, 8) as u64;
+
+    MultiMemoryHeader::write_two_entries(
+        &parent_backend,
+        0,
+        total_capacity as u64,
+        [
+            (sub_memory_0_offset, ring_region_len as u64),
+            (sub_memory_1_offset, ring_region_len as u64),
+        ],
+    )
+    .map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    let inbound_backend = parent_backend
+        .sub_region(sub_memory_0_offset, ring_region_len as u64)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+    let outbound_backend = parent_backend
+        .sub_region(sub_memory_1_offset, ring_region_len as u64)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    layout::init_ring(inbound_backend.as_ref()).map_err(|e| crate::Error::Host(e.to_string()))?;
+    layout::init_ring(outbound_backend.as_ref()).map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    layout::store_capacity(inbound_backend.as_ref(), DEFAULT_RING_CAPACITY)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+    layout::store_capacity(outbound_backend.as_ref(), DEFAULT_RING_CAPACITY)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    let inbound_writer = RingWriter::open(inbound_backend, DEFAULT_RING_CAPACITY)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+    inbound_writer
+        .increment_writer_count()
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    let outbound_reader = RingReader::open(outbound_backend, DEFAULT_RING_CAPACITY, true)
+        .map_err(|e| crate::Error::Host(e.to_string()))?;
+
+    let region = SharedRegionDescriptor {
+        shared_id,
+        len: total_capacity as u64,
+    };
+    Ok((region, inbound_writer, outbound_reader, parent_local_id))
+}
+
+/// Decodes a binary datagram frame into `(SocketAddr, payload_bytes)`.
+/// Returns `None` if the frame is malformed.
+fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
+    if frame.len() < 8 {
+        return None;
+    }
+    if frame[0] != 1 {
+        return None;
+    }
+    let family = frame[1];
+    match family {
+        4 => {
+            if frame.len() < 8 {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
+            let port = u16::from_le_bytes([frame[6], frame[7]]);
+            let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
+            Some((addr, &frame[8..]))
+        }
+        6 => {
+            if frame.len() < 20 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&frame[2..18]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_le_bytes([frame[18], frame[19]]);
+            let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
+            Some((addr, &frame[20..]))
+        }
+        _ => None,
+    }
+}
+
+/// Encodes a `SocketAddr` + payload into the binary datagram frame format:
+/// `[ver u8 = 1][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
+fn encode_udp_frame(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let addr_len = match addr {
+        std::net::SocketAddr::V4(_) => 4usize,
+        std::net::SocketAddr::V6(_) => 16usize,
+    };
+    let header_len = 2 + addr_len + 2;
+    let mut frame = Vec::with_capacity(header_len + payload.len());
+    frame.push(1u8); // version
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            frame.push(4u8);
+            frame.extend_from_slice(&v4.ip().octets());
+            frame.extend_from_slice(&v4.port().to_le_bytes());
+        }
+        std::net::SocketAddr::V6(v6) => {
+            frame.push(6u8);
+            frame.extend_from_slice(&v6.ip().octets());
+            frame.extend_from_slice(&v6.port().to_le_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
 }
 
 async fn proxy_inbound(
@@ -289,6 +395,29 @@ async fn proxy_outbound(
     }
 
     running.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn run_tcp_proxy(
+    stream: tokio::net::TcpStream,
+    inbound_writer: RingWriter,
+    outbound_reader: RingReader,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let running_in = running.clone();
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+    let inbound = tokio::spawn(async move {
+        if let Err(_e) = proxy_inbound(&mut read_half, inbound_writer, running_in).await {}
+    });
+
+    let outbound = tokio::spawn(async move {
+        if let Err(_e) = proxy_outbound(&mut write_half, outbound_reader, running).await {}
+    });
+
+    drop(inbound.await);
+    drop(outbound.await);
+
     Ok(())
 }
 
@@ -403,155 +532,6 @@ async fn udp_proxy_send(
     running.store(false, Ordering::Relaxed);
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-fn align_up(value: u32, alignment: u32) -> u32 {
-    let rem = value % alignment;
-    if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
-    }
-}
-
-fn create_stream_region(
-    kernel: &Kernel,
-) -> Result<(SharedRegionDescriptor, RingWriter, RingReader, u64)> {
-    let ring_data_cap = DEFAULT_RING_CAPACITY as u32;
-    let ring_region_len = selium_memory::RING_HEADER_SIZE as u32 + ring_data_cap;
-    let header_size =
-        selium_memory::HEADER_ENTRY_OFFSET as u32 + 2 * selium_memory::HEADER_ENTRY_SIZE as u32;
-    let total_capacity = align_up(
-        header_size + align_up(header_size + ring_region_len, 8) + ring_region_len,
-        8,
-    );
-
-    let memory = kernel.memory();
-    let (shared_id, _len) = memory
-        .allocate_shared_region(total_capacity)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    let parent_backend = memory
-        .attach_backend(shared_id)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-    let parent_local_id = parent_backend.local_id();
-
-    let sub_memory_0_offset = align_up(header_size, 8) as u64;
-    let sub_memory_1_offset = align_up(sub_memory_0_offset as u32 + ring_region_len, 8) as u64;
-
-    MultiMemoryHeader::write_two_entries(
-        &parent_backend,
-        0,
-        total_capacity as u64,
-        [
-            (sub_memory_0_offset, ring_region_len as u64),
-            (sub_memory_1_offset, ring_region_len as u64),
-        ],
-    )
-    .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    let inbound_backend = parent_backend
-        .sub_region(sub_memory_0_offset, ring_region_len as u64)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-    let outbound_backend = parent_backend
-        .sub_region(sub_memory_1_offset, ring_region_len as u64)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    layout::init_ring(inbound_backend.as_ref()).map_err(|e| crate::Error::Host(e.to_string()))?;
-    layout::init_ring(outbound_backend.as_ref()).map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    layout::store_capacity(inbound_backend.as_ref(), DEFAULT_RING_CAPACITY)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-    layout::store_capacity(outbound_backend.as_ref(), DEFAULT_RING_CAPACITY)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    let inbound_writer = RingWriter::open(inbound_backend, DEFAULT_RING_CAPACITY)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-    inbound_writer
-        .increment_writer_count()
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    let outbound_reader = RingReader::open(outbound_backend, DEFAULT_RING_CAPACITY, true)
-        .map_err(|e| crate::Error::Host(e.to_string()))?;
-
-    let region = SharedRegionDescriptor {
-        shared_id,
-        len: total_capacity as u64,
-    };
-    Ok((region, inbound_writer, outbound_reader, parent_local_id))
-}
-
-// ---------------------------------------------------------------------------
-// Binary datagram frame codec
-// ---------------------------------------------------------------------------
-
-/// Encodes a `SocketAddr` + payload into the binary datagram frame format:
-/// `[ver u8 = 1][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
-fn encode_udp_frame(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let addr_len = match addr {
-        std::net::SocketAddr::V4(_) => 4usize,
-        std::net::SocketAddr::V6(_) => 16usize,
-    };
-    let header_len = 2 + addr_len + 2;
-    let mut frame = Vec::with_capacity(header_len + payload.len());
-    frame.push(1u8); // version
-    match addr {
-        std::net::SocketAddr::V4(v4) => {
-            frame.push(4u8);
-            frame.extend_from_slice(&v4.ip().octets());
-            frame.extend_from_slice(&v4.port().to_le_bytes());
-        }
-        std::net::SocketAddr::V6(v6) => {
-            frame.push(6u8);
-            frame.extend_from_slice(&v6.ip().octets());
-            frame.extend_from_slice(&v6.port().to_le_bytes());
-        }
-    }
-    frame.extend_from_slice(payload);
-    frame
-}
-
-/// Decodes a binary datagram frame into `(SocketAddr, payload_bytes)`.
-/// Returns `None` if the frame is malformed.
-fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
-    if frame.len() < 8 {
-        return None;
-    }
-    if frame[0] != 1 {
-        return None;
-    }
-    let family = frame[1];
-    match family {
-        4 => {
-            if frame.len() < 8 {
-                return None;
-            }
-            let ip = std::net::Ipv4Addr::new(frame[2], frame[3], frame[4], frame[5]);
-            let port = u16::from_le_bytes([frame[6], frame[7]]);
-            let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
-            Some((addr, &frame[8..]))
-        }
-        6 => {
-            if frame.len() < 20 {
-                return None;
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&frame[2..18]);
-            let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_le_bytes([frame[18], frame[19]]);
-            let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
-            Some((addr, &frame[20..]))
-        }
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests (ported from kernel)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -4,33 +4,10 @@
 //! via the runtime API path.
 
 use selium_abi::{
-    AbiErrorCode, Capability, CapabilityGrant, CompletionState, HostcallRequest,
-    ResourceClass, ResourceSelector,
+    AbiErrorCode, Capability, CapabilityGrant, CompletionState, HostcallRequest, ResourceClass,
+    ResourceSelector,
 };
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
-
-fn empty_module() -> Vec<u8> {
-    wat::parse_str("(module (func (export \"boot\")))").expect("compile wat")
-}
-
-fn spawn_with_grants(
-    runtime: &Runtime,
-    grants: Vec<CapabilityGrant>,
-) -> selium_runtime::BootstrappedGuest {
-    runtime
-        .spawn_system_guest(SystemGuestDescriptor {
-            name: "net-test".to_string(),
-            module_id: "net-test-module".to_string(),
-            module_bytes: empty_module(),
-            entrypoint: "boot".to_string(),
-            arguments: Vec::new(),
-            grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
-            tenant: None,
-        })
-        .expect("spawn net test guest")
-}
 
 fn assert_failed_with_code(
     runtime: &Runtime,
@@ -51,86 +28,8 @@ fn assert_failed_with_code(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hostname rejection tests (task 3.4)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn tcp_connect_rejects_hostname() {
-    let runtime = Runtime::default();
-    let guest = spawn_with_grants(
-        &runtime,
-        vec![CapabilityGrant::new(
-            Capability::Network,
-            vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
-        )],
-    );
-    let (status, op) = runtime.begin_hostcall(
-        guest.process_id,
-        HostcallRequest::TcpConnect {
-            address: "localhost:80".to_string(),
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
-    assert_failed_with_code(
-        &runtime,
-        guest.process_id,
-        op,
-        AbiErrorCode::MalformedPayload,
-        "hostname connect",
-    );
-}
-
-#[test]
-fn tcp_bind_rejects_hostname() {
-    let runtime = Runtime::default();
-    let guest = spawn_with_grants(
-        &runtime,
-        vec![CapabilityGrant::new(
-            Capability::Network,
-            vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
-        )],
-    );
-    let (status, op) = runtime.begin_hostcall(
-        guest.process_id,
-        HostcallRequest::TcpBind {
-            address: "example.com:0".to_string(),
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
-    assert_failed_with_code(
-        &runtime,
-        guest.process_id,
-        op,
-        AbiErrorCode::MalformedPayload,
-        "hostname bind",
-    );
-}
-
-#[test]
-fn udp_bind_rejects_hostname() {
-    let runtime = Runtime::default();
-    let guest = spawn_with_grants(
-        &runtime,
-        vec![CapabilityGrant::new(
-            Capability::Network,
-            vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
-        )],
-    );
-    let (status, op) = runtime.begin_hostcall(
-        guest.process_id,
-        HostcallRequest::UdpBind {
-            address: "myhost.local:8080".to_string(),
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
-    assert_failed_with_code(
-        &runtime,
-        guest.process_id,
-        op,
-        AbiErrorCode::MalformedPayload,
-        "hostname udp bind",
-    );
+fn empty_module() -> Vec<u8> {
+    wat::parse_str("(module (func (export \"boot\")))").expect("compile wat")
 }
 
 #[test]
@@ -161,4 +60,101 @@ fn ip_literal_passes_validation() {
             other => panic!("expected failed, got {other:?}"),
         }
     }
+}
+
+fn spawn_with_grants(
+    runtime: &Runtime,
+    grants: Vec<CapabilityGrant>,
+) -> selium_runtime::BootstrappedGuest {
+    runtime
+        .spawn_system_guest(SystemGuestDescriptor {
+            name: "net-test".to_string(),
+            module_id: "net-test-module".to_string(),
+            module_bytes: empty_module(),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants,
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+        })
+        .expect("spawn net test guest")
+}
+
+#[test]
+fn tcp_bind_rejects_hostname() {
+    let runtime = Runtime::default();
+    let guest = spawn_with_grants(
+        &runtime,
+        vec![CapabilityGrant::new(
+            Capability::Network,
+            vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+        )],
+    );
+    let (status, op) = runtime.begin_hostcall(
+        guest.process_id,
+        HostcallRequest::TcpBind {
+            address: "example.com:0".to_string(),
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+    assert_failed_with_code(
+        &runtime,
+        guest.process_id,
+        op,
+        AbiErrorCode::MalformedPayload,
+        "hostname bind",
+    );
+}
+
+#[test]
+fn tcp_connect_rejects_hostname() {
+    let runtime = Runtime::default();
+    let guest = spawn_with_grants(
+        &runtime,
+        vec![CapabilityGrant::new(
+            Capability::Network,
+            vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+        )],
+    );
+    let (status, op) = runtime.begin_hostcall(
+        guest.process_id,
+        HostcallRequest::TcpConnect {
+            address: "localhost:80".to_string(),
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+    assert_failed_with_code(
+        &runtime,
+        guest.process_id,
+        op,
+        AbiErrorCode::MalformedPayload,
+        "hostname connect",
+    );
+}
+
+#[test]
+fn udp_bind_rejects_hostname() {
+    let runtime = Runtime::default();
+    let guest = spawn_with_grants(
+        &runtime,
+        vec![CapabilityGrant::new(
+            Capability::Network,
+            vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
+        )],
+    );
+    let (status, op) = runtime.begin_hostcall(
+        guest.process_id,
+        HostcallRequest::UdpBind {
+            address: "myhost.local:8080".to_string(),
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+    assert_failed_with_code(
+        &runtime,
+        guest.process_id,
+        op,
+        AbiErrorCode::MalformedPayload,
+        "hostname udp bind",
+    );
 }

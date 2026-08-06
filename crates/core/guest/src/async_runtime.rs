@@ -25,12 +25,6 @@ pub struct JoinHandle<T> {
     state: Rc<RefCell<JoinState<T>>>,
 }
 
-impl<T> JoinHandle<T> {
-    pub(crate) fn take_result(&self) -> Option<T> {
-        self.state.borrow_mut().result.take()
-    }
-}
-
 struct JoinState<T> {
     result: Option<T>,
     waker: Option<Waker>,
@@ -42,6 +36,12 @@ struct YieldNow {
 
 struct TaskWake {
     task_id: TaskId,
+}
+
+impl<T> JoinHandle<T> {
+    pub(crate) fn take_result(&self) -> Option<T> {
+        self.state.borrow_mut().result.take()
+    }
 }
 
 impl<T> Future for JoinHandle<T> {

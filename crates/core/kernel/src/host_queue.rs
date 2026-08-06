@@ -1,25 +1,26 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use parking_lot::{Condvar, Mutex};
 use selium_abi::{HostQueueDescriptor, SharedResourceId};
 
-use crate::memory::MemoryRegistry;
-use crate::{Error, Result};
+use crate::{Error, Result, memory::MemoryRegistry};
 
 #[derive(Clone)]
 pub struct HostQueueRegistry {
     pub(crate) inner: Arc<HostQueueRegistryInner>,
 }
 
-pub(crate) struct HostQueueRegistryInner {
-    pub(crate) queues_by_shared: Mutex<HashMap<SharedResourceId, Arc<HostQueueState>>>,
-    pub(crate) local_queues: Mutex<HashMap<u64, SharedResourceId>>,
-}
-
 pub(crate) struct HostQueueState {
     pub(crate) entries: Mutex<VecDeque<(u64, u64)>>,
     pub(crate) notify: Condvar,
+}
+
+pub(crate) struct HostQueueRegistryInner {
+    pub(crate) queues_by_shared: Mutex<HashMap<SharedResourceId, Arc<HostQueueState>>>,
+    pub(crate) local_queues: Mutex<HashMap<u64, SharedResourceId>>,
 }
 
 impl HostQueueRegistry {

@@ -1,7 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use parking_lot::{Condvar, Mutex};
 use selium_abi::{
@@ -10,23 +12,11 @@ use selium_abi::{
 };
 use selium_shm::layout;
 
-use crate::kernel::hashed_id;
-use crate::memory::MemoryRegistry;
-use crate::{Error, Result};
+use crate::{Error, Result, kernel::hashed_id, memory::MemoryRegistry};
 
 #[derive(Clone)]
 pub struct ProcessTable {
     pub(crate) inner: Arc<ProcessTableInner>,
-}
-
-pub(crate) struct ProcessTableInner {
-    pub(crate) processes: Mutex<HashMap<ProcessId, ProcessState>>,
-    pub(crate) activity_log: Mutex<Vec<ActivityEvent>>,
-    pub(crate) activity_log_changed: Condvar,
-    pub(crate) guest_logs: Mutex<Vec<GuestLogEntry>>,
-    pub(crate) metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
-    pub(crate) next_process_id: AtomicU64,
-    pub(crate) id_seed: u64,
 }
 
 pub(crate) struct LogChannelState {
@@ -41,6 +31,16 @@ pub(crate) struct ProcessState {
     pub(crate) grants: Vec<CapabilityGrant>,
     pub(crate) log_channel_shared_id: Option<SharedResourceId>,
     pub(crate) log_channel_state: Option<LogChannelState>,
+}
+
+pub(crate) struct ProcessTableInner {
+    pub(crate) processes: Mutex<HashMap<ProcessId, ProcessState>>,
+    pub(crate) activity_log: Mutex<Vec<ActivityEvent>>,
+    pub(crate) activity_log_changed: Condvar,
+    pub(crate) guest_logs: Mutex<Vec<GuestLogEntry>>,
+    pub(crate) metering: Mutex<HashMap<ProcessId, MeteringObservation>>,
+    pub(crate) next_process_id: AtomicU64,
+    pub(crate) id_seed: u64,
 }
 
 impl ProcessTable {

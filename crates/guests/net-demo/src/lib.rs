@@ -1,6 +1,6 @@
 //! Network demo guest — smoke test for WASM hostcall path.
 
-use selium_guest::{entrypoint, info, TcpListener};
+use selium_guest::{TcpListener, entrypoint, info};
 
 #[entrypoint]
 async fn net_demo() {

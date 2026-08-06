@@ -7,8 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::kernel::Kernel;
-use crate::{Error, Result};
+use crate::{Error, Result, kernel::Kernel};
 
 impl Kernel {
     pub fn close_tcp_listener(&self, local_id: u64) -> Result<()> {

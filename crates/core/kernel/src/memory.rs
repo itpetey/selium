@@ -1,6 +1,8 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use parking_lot::Mutex;
 use selium_abi::SharedResourceId;
@@ -10,21 +12,11 @@ use wasmtiny::{
     runtime::{SharedRegionId, Store},
 };
 
-use crate::kernel::hashed_id;
-use crate::{Error, Result, error::map_wasm_error};
+use crate::{Error, Result, error::map_wasm_error, kernel::hashed_id};
 
 #[derive(Clone)]
 pub struct MemoryRegistry {
     pub(crate) inner: Arc<MemoryRegistryInner>,
-}
-
-pub(crate) struct MemoryRegistryInner {
-    pub(crate) store: Mutex<Store>,
-    pub(crate) shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
-    pub(crate) shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
-    pub(crate) next_local_id: AtomicU64,
-    pub(crate) next_shared_id: AtomicU64,
-    pub(crate) id_seed: u64,
 }
 
 pub(crate) struct SharedRegionRecord {
@@ -35,6 +27,15 @@ pub(crate) struct SharedRegionRecord {
 pub(crate) struct SharedMappingState {
     pub(crate) region_id: SharedRegionId,
     pub(crate) shared_id: SharedResourceId,
+}
+
+pub(crate) struct MemoryRegistryInner {
+    pub(crate) store: Mutex<Store>,
+    pub(crate) shared_regions: Mutex<HashMap<SharedResourceId, SharedRegionRecord>>,
+    pub(crate) shared_mappings: Mutex<HashMap<u64, SharedMappingState>>,
+    pub(crate) next_local_id: AtomicU64,
+    pub(crate) next_shared_id: AtomicU64,
+    pub(crate) id_seed: u64,
 }
 
 impl MemoryRegistry {

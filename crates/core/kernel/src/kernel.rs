@@ -1,11 +1,12 @@
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::host_queue::HostQueueRegistry;
-use crate::memory::MemoryRegistry;
-use crate::network::NetworkState;
-use crate::process::ProcessTable;
-use crate::storage::StorageRegistry;
+use crate::{
+    host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState,
+    process::ProcessTable, storage::StorageRegistry,
+};
 
 #[derive(Clone)]
 pub struct Kernel {

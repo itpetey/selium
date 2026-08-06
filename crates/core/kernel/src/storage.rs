@@ -1,23 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use selium_abi::{BlobStoreDescriptor, DurableLogDescriptor, SharedResourceId, StorageRecord};
 use sha2::{Digest, Sha256};
 
-use crate::memory::MemoryRegistry;
-use crate::{Error, Result};
+use crate::{Error, Result, memory::MemoryRegistry};
 
 #[derive(Clone)]
 pub struct StorageRegistry {
     pub(crate) inner: Arc<StorageRegistryInner>,
-}
-
-pub(crate) struct StorageRegistryInner {
-    pub(crate) durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
-    pub(crate) local_logs: Mutex<HashMap<u64, SharedResourceId>>,
-    pub(crate) blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
-    pub(crate) local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
 }
 
 #[derive(Default)]
@@ -33,6 +24,13 @@ pub(crate) struct BlobStoreState {
     pub(crate) name: String,
     pub(crate) blobs: HashMap<String, Vec<u8>>,
     pub(crate) manifests: HashMap<String, String>,
+}
+
+pub(crate) struct StorageRegistryInner {
+    pub(crate) durable_logs_by_shared: Mutex<HashMap<SharedResourceId, DurableLogState>>,
+    pub(crate) local_logs: Mutex<HashMap<u64, SharedResourceId>>,
+    pub(crate) blob_stores_by_shared: Mutex<HashMap<SharedResourceId, BlobStoreState>>,
+    pub(crate) local_blob_stores: Mutex<HashMap<u64, SharedResourceId>>,
 }
 
 impl StorageRegistry {

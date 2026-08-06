@@ -19,10 +19,7 @@ use selium_shm::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    Accept, GuestError, IncomingConnection, Result,
-    hostcall::hostcall_async,
-};
+use crate::{Accept, GuestError, IncomingConnection, Result, hostcall::hostcall_async};
 
 /// A TCP byte stream backed by shared-memory ring buffers.
 ///
@@ -44,9 +41,13 @@ pub struct TcpStream {
     _region: selium_memory::Region,
 }
 
-// SAFETY: Reader and Writer are safe to send across threads (they encapsulate
-// shared memory regions which are backed by process-level mappings).
-unsafe impl Send for TcpStream {}
+/// A TCP listener that yields [`TcpStream`] handles for incoming connections.
+///
+/// Wraps a [`ResourceListener`] over a host-mediated queue; the kernel accept
+/// loop pushes connection `shared_id`s onto this queue.
+pub struct TcpListener {
+    listener: crate::ResourceListener,
+}
 
 impl TcpStream {
     /// Connects to a remote TCP endpoint identified by an IP-literal address.
@@ -102,7 +103,9 @@ impl TcpStream {
             .map_err(|e| GuestError::Host(format!("outbound sub-region failed: {e}")))?;
 
         // Ring data capacity = region length minus header overhead.
-        let ring_cap = inbound.length.saturating_sub(selium_shm::layout::DATA_OFFSET);
+        let ring_cap = inbound
+            .length
+            .saturating_sub(selium_shm::layout::DATA_OFFSET);
 
         let inbound_region = ChannelRegion::from_mapping(inbound_mapping, ring_cap);
         let outbound_region = ChannelRegion::from_mapping(outbound_mapping, ring_cap);
@@ -238,26 +241,16 @@ impl AsyncWrite for TcpStream {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let writer = unsafe { self.as_mut().project_writer() };
         writer.poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let writer = unsafe { self.as_mut().project_writer() };
         writer.poll_shutdown(cx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Accept impl — builds a TcpStream from an incoming connection
-// ---------------------------------------------------------------------------
 
 impl Accept for TcpStream {
     type Item = Self;
@@ -271,17 +264,9 @@ impl Accept for TcpStream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TcpListener
-// ---------------------------------------------------------------------------
-
-/// A TCP listener that yields [`TcpStream`] handles for incoming connections.
-///
-/// Wraps a [`ResourceListener`] over a host-mediated queue; the kernel accept
-/// loop pushes connection `shared_id`s onto this queue.
-pub struct TcpListener {
-    listener: crate::ResourceListener,
-}
+// SAFETY: Reader and Writer are safe to send across threads (they encapsulate
+// shared memory regions which are backed by process-level mappings).
+unsafe impl Send for TcpStream {}
 
 impl TcpListener {
     /// Binds to an IP-literal address and returns a listener.
