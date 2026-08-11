@@ -14,7 +14,11 @@
 //! | `ExplicitResource` | **Enforced** | `resource_id` |
 //! | `Tenant` | **Enforced** | `tenant` (from process authority) |
 //! | `Children` | **Enforced** | requires process-tree access (runtime) |
-//! | `UriPrefix` | **Rejected** | `uri` not yet populated |
+//! | `UriPrefix` | **Enforced*** | `uri` (network endpoints only) |
+//! 
+//! \* `UriPrefix` is evaluatable only when the same grant also carries a
+//! network `ResourceClass` selector (`TcpListener`, `TcpStream`, or
+//! `UdpSocket`). Otherwise the grant is rejected at registration time.
 //!
 //! An **empty** selector list means "unrestricted within the capability" and is
 //! explicitly accepted. Intersection semantics apply: all selectors in a grant
@@ -846,16 +850,24 @@ impl ResourceSelector {
     /// Returns whether the runtime can evaluate this selector against a `ScopeContext`.
     ///
     /// The enforcement matrix is:
-    /// - `Tenant`, `Locality`, `ResourceClass`, `ExplicitResource`: evaluatable.
-    /// - `UriPrefix`: rejected until resource URIs populate scope contexts.
-    pub fn is_evaluatable(&self) -> bool {
+    /// - `Tenant`, `Locality`, `ResourceClass`, `ExplicitResource`, `Children`: evaluatable.
+    /// - `UriPrefix`: evaluatable only when the same grant also carries a network
+    ///   `ResourceClass` selector (`TcpListener`, `TcpStream`, or `UdpSocket`).
+    pub fn is_evaluatable(&self, grant_selectors: &[ResourceSelector]) -> bool {
         match self {
+            Self::UriPrefix(_) => grant_selectors.iter().any(|s| {
+                matches!(
+                    s,
+                    Self::ResourceClass(ResourceClass::TcpListener)
+                        | Self::ResourceClass(ResourceClass::TcpStream)
+                        | Self::ResourceClass(ResourceClass::UdpSocket)
+                )
+            }),
             Self::Tenant(_)
             | Self::Locality(_)
             | Self::ResourceClass(_)
             | Self::ExplicitResource(_)
             | Self::Children => true,
-            Self::UriPrefix(_) => false,
         }
     }
 
@@ -864,19 +876,124 @@ impl ResourceSelector {
     /// `Children` is not evaluated here — it requires process-tree knowledge
     /// only available to the runtime, so it returns `false` by default and the
     /// runtime handles it specially in `Runtime::authorises`.
+    ///
+    /// For `UriPrefix` on `tcp://` / `udp://` URIs, matching is component-aware
+    /// (scheme exact; host exact or `*.`-label-boundary wildcard; port exact,
+    /// list, or `*`). Non-network URIs keep plain `starts_with` semantics.
     pub fn matches(&self, context: &ScopeContext) -> bool {
         match self {
             Self::Tenant(expected) => context.tenant.as_ref() == Some(expected),
-            Self::UriPrefix(prefix) => context
-                .uri
-                .as_ref()
-                .is_some_and(|uri| uri.starts_with(prefix)),
+            Self::UriPrefix(prefix) => {
+                let context_uri = context.uri.as_ref();
+                match context_uri {
+                    Some(ctx_uri) => {
+                        // Component-aware matching for network URIs.
+                        if let (Some(grant_ep), Some(ctx_ep)) =
+                            (NetworkEndpoint::parse(prefix), NetworkEndpoint::parse(ctx_uri))
+                        {
+                            NetworkEndpoint::prefix_matches(&grant_ep, &ctx_ep)
+                        } else {
+                            // Plain string prefix for non-network URIs.
+                            ctx_uri.starts_with(prefix)
+                        }
+                    }
+                    None => false,
+                }
+            }
             Self::Locality(expected) => expected.matches(&context.locality),
             Self::ResourceClass(expected) => context.resource_class.as_ref() == Some(expected),
             Self::ExplicitResource(expected) => context.resource_id == Some(*expected),
             // Handled by the runtime with process-tree access.
             Self::Children => false,
         }
+    }
+}
+
+/// Parsed components of a network endpoint URI (`tcp://` or `udp://`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEndpoint {
+    /// Scheme: `"tcp"` or `"udp"`.
+    pub scheme: String,
+    /// Host: lowercase, trailing dot stripped, IPv6 bracketed.
+    pub host: String,
+    /// Port: explicit numeric string.
+    pub port: String,
+}
+
+impl NetworkEndpoint {
+    /// Parse a network endpoint URI like `tcp://127.0.0.1:8080` or `udp://[::1]:53`.
+    pub fn parse(uri: &str) -> Option<Self> {
+        let (scheme, rest) = uri.split_once("://")?;
+        if scheme != "tcp" && scheme != "udp" {
+            return None;
+        }
+        // Port is after the last colon.
+        let port_colon = rest.rfind(':')?;
+        let host_part = &rest[..port_colon];
+        let port = &rest[port_colon + 1..];
+
+        // Validate port: empty rejected; comma-separated digits accepted; bare * accepted.
+        if port.is_empty() {
+            return None;
+        }
+        if port == "*" {
+            // ok
+        } else if !port.chars().all(|c| c.is_ascii_digit() || c == ',' || c == ' ') {
+            return None;
+        }
+
+        let host = host_part.to_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(&host).to_string();
+
+        // Host must be non-empty.
+        if host.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            scheme: scheme.to_string(),
+            host,
+            port: port.to_string(),
+        })
+    }
+
+    /// Returns whether `grant` (the grant-side endpoint) matches `context`
+    /// (the runtime-side endpoint) using component-aware semantics.
+    pub fn prefix_matches(grant: &NetworkEndpoint, context: &NetworkEndpoint) -> bool {
+        // Scheme must match exactly.
+        if grant.scheme != context.scheme {
+            return false;
+        }
+        // Host: exact or wildcard label boundary.
+        if !Self::host_matches(&grant.host, &context.host) {
+            return false;
+        }
+        // Port: exact, *, or comma-separated list.
+        Self::port_matches(&grant.port, &context.port)
+    }
+
+    fn host_matches(grant_host: &str, context_host: &str) -> bool {
+        if grant_host == context_host {
+            return true;
+        }
+        // Wildcard: `*.example.com` matches `foo.example.com`, `bar.foo.example.com`, etc.
+        if let Some(suffix) = grant_host.strip_prefix("*.") {
+            // Must match at a label boundary and the context host must be longer.
+            if context_host.ends_with(suffix) && context_host.len() > suffix.len() {
+                // Ensure the character before the suffix is a dot (label boundary).
+                let dot_pos = context_host.len() - suffix.len() - 1;
+                return context_host.as_bytes()[dot_pos] == b'.';
+            }
+        }
+        false
+    }
+
+    fn port_matches(grant_port: &str, context_port: &str) -> bool {
+        if grant_port == "*" {
+            return true;
+        }
+        // Comma-separated list.
+        grant_port.split(',').any(|p| p.trim() == context_port)
     }
 }
 
@@ -1253,5 +1370,306 @@ mod tests {
         let encoded = encode_rkyv(&envelope).expect("encode");
         let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, envelope);
+    }
+
+    // --- Network endpoint URI tests ---
+
+    #[test]
+    fn parse_tcp_endpoint() {
+        let ep = NetworkEndpoint::parse("tcp://93.184.216.34:443").expect("parse");
+        assert_eq!(ep.scheme, "tcp");
+        assert_eq!(ep.host, "93.184.216.34");
+        assert_eq!(ep.port, "443");
+    }
+
+    #[test]
+    fn parse_udp_endpoint() {
+        let ep = NetworkEndpoint::parse("udp://10.0.0.5:53").expect("parse");
+        assert_eq!(ep.scheme, "udp");
+        assert_eq!(ep.host, "10.0.0.5");
+        assert_eq!(ep.port, "53");
+    }
+
+    #[test]
+    fn parse_ipv6_bracketed() {
+        let ep = NetworkEndpoint::parse("tcp://[2001:db8::1]:443").expect("parse");
+        assert_eq!(ep.scheme, "tcp");
+        assert_eq!(ep.host, "[2001:db8::1]");
+        assert_eq!(ep.port, "443");
+    }
+
+    #[test]
+    fn parse_lowercases_host() {
+        let ep = NetworkEndpoint::parse("tcp://EXAMPLE.COM:8080").expect("parse");
+        assert_eq!(ep.host, "example.com");
+    }
+
+    #[test]
+    fn parse_strips_trailing_dot() {
+        let ep = NetworkEndpoint::parse("tcp://example.com.:8080").expect("parse");
+        assert_eq!(ep.host, "example.com");
+    }
+
+    #[test]
+    fn parse_rejects_non_network_scheme() {
+        assert!(NetworkEndpoint::parse("sel://acme/payments/").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_missing_port() {
+        assert!(NetworkEndpoint::parse("tcp://127.0.0.1").is_none());
+    }
+
+    #[test]
+    fn socket_addr_format_ipv4() {
+        let addr: std::net::SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let uri = format!("tcp://{addr}");
+        assert_eq!(uri, "tcp://93.184.216.34:443");
+    }
+
+    #[test]
+    fn socket_addr_format_ipv6() {
+        let addr: std::net::SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let uri = format!("tcp://{addr}");
+        assert_eq!(uri, "tcp://[2001:db8::1]:53");
+    }
+
+    // --- Component-aware matching tests ---
+
+    #[test]
+    fn uri_prefix_exact_match_tcp() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://93.184.216.34:443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://93.184.216.34:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_wildcard_port() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://127.0.0.1:*".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://127.0.0.1:8080".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_wildcard_port_only_matches_127_0_0_1() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://127.0.0.1:*".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        // Different host — should NOT match.
+        let ctx = ScopeContext {
+            uri: Some("tcp://10.0.0.5:8080".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(!grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_wildcard_label_boundary() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://*.example.com:443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://foo.example.com:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_wildcard_multi_label() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://*.example.com:443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://bar.foo.example.com:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_rejects_label_suffix_attack() {
+        // `tcp://example.com:443` must NOT match `tcp://example.com.evil.com:443`.
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://example.com:443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://example.com.evil.com:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(!grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_rejects_wildcard_partial_label_prefix() {
+        // `*.example.com` must NOT match `badexample.com` (no dot before suffix).
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://*.example.com:443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx = ScopeContext {
+            uri: Some("tcp://badexample.com:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(!grant.allows(&ctx));
+    }
+
+    #[test]
+    fn uri_prefix_port_list() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("tcp://127.0.0.1:80,443".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx_80 = ScopeContext {
+            uri: Some("tcp://127.0.0.1:80".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        let ctx_443 = ScopeContext {
+            uri: Some("tcp://127.0.0.1:443".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        let ctx_8080 = ScopeContext {
+            uri: Some("tcp://127.0.0.1:8080".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx_80));
+        assert!(grant.allows(&ctx_443));
+        assert!(!grant.allows(&ctx_8080));
+    }
+
+    #[test]
+    fn uri_prefix_non_network_keeps_string_prefix() {
+        // Non-network URI keeps plain starts_with semantics.
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("sel://acme/payments/".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        );
+        let ctx_match = ScopeContext {
+            uri: Some("sel://acme/payments/worker".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        let ctx_no_match = ScopeContext {
+            uri: Some("sel://acme/other/worker".to_string()),
+            resource_class: Some(ResourceClass::TcpStream),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&ctx_match));
+        assert!(!grant.allows(&ctx_no_match));
+    }
+
+    // --- is_evaluatable tests ---
+
+    #[test]
+    fn uri_prefix_evaluatable_with_tcp_stream_class() {
+        let selectors = vec![
+            ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ResourceSelector::UriPrefix("tcp://127.0.0.1:443".to_string()),
+        ];
+        assert!(selectors[1].is_evaluatable(&selectors));
+    }
+
+    #[test]
+    fn uri_prefix_evaluatable_with_tcp_listener_class() {
+        let selectors = vec![
+            ResourceSelector::ResourceClass(ResourceClass::TcpListener),
+            ResourceSelector::UriPrefix("tcp://0.0.0.0:8080".to_string()),
+        ];
+        assert!(selectors[1].is_evaluatable(&selectors));
+    }
+
+    #[test]
+    fn uri_prefix_evaluatable_with_udp_socket_class() {
+        let selectors = vec![
+            ResourceSelector::ResourceClass(ResourceClass::UdpSocket),
+            ResourceSelector::UriPrefix("udp://10.0.0.5:53".to_string()),
+        ];
+        assert!(selectors[1].is_evaluatable(&selectors));
+    }
+
+    #[test]
+    fn uri_prefix_not_evaluatable_without_network_class() {
+        let selectors = vec![
+            ResourceSelector::ResourceClass(ResourceClass::DurableLog),
+            ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string()),
+        ];
+        assert!(!selectors[1].is_evaluatable(&selectors));
+    }
+
+    #[test]
+    fn uri_prefix_not_evaluatable_with_empty_selectors() {
+        let selectors = vec![
+            ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string()),
+        ];
+        assert!(!selectors[0].is_evaluatable(&selectors));
+    }
+
+    #[test]
+    fn other_selectors_always_evaluatable() {
+        let empty: &[ResourceSelector] = &[];
+        assert!(ResourceSelector::Tenant("acme".to_string()).is_evaluatable(empty));
+        assert!(
+            ResourceSelector::Locality(LocalityScope::Cluster).is_evaluatable(empty)
+        );
+        assert!(
+            ResourceSelector::ResourceClass(ResourceClass::SharedRegion).is_evaluatable(empty)
+        );
+        assert!(
+            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(1)).is_evaluatable(empty)
+        );
+        assert!(ResourceSelector::Children.is_evaluatable(empty));
     }
 }

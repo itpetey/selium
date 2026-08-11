@@ -6,8 +6,8 @@ use std::{
 
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
-    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
+    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId,
+    ResourceClass, ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
 };
 use selium_encoding::{FlatMsg, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
@@ -401,19 +401,20 @@ impl Runtime {
                 )))
             }
             HostcallRequest::TcpBind { address } => {
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::TcpListener,
-                    None,
-                )?;
-                // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
+                let addr: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),
                     )
                 })?;
+                let uri = format!("tcp://{addr}");
+                self.require_with_uri(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::TcpListener,
+                    None,
+                    uri,
+                )?;
                 let descriptor = crate::network::tcp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(
@@ -431,19 +432,20 @@ impl Runtime {
                 )))
             }
             HostcallRequest::TcpConnect { address } => {
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::TcpStream,
-                    None,
-                )?;
-                // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
+                let addr: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),
                     )
                 })?;
+                let uri = format!("tcp://{addr}");
+                self.require_with_uri(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::TcpStream,
+                    None,
+                    uri,
+                )?;
                 let descriptor = crate::network::tcp_connect(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
@@ -457,19 +459,20 @@ impl Runtime {
                 )))
             }
             HostcallRequest::UdpBind { address } => {
-                self.require(
-                    process_id,
-                    Capability::Network,
-                    ResourceClass::UdpSocket,
-                    None,
-                )?;
-                // Reject hostnames — only IP literals are allowed.
-                let _: std::net::SocketAddr = address.parse().map_err(|_e| {
+                let addr: std::net::SocketAddr = address.parse().map_err(|_e| {
                     AbiError::new(
                         AbiErrorCode::MalformedPayload,
                         format!("address must be an IP literal, got: {address}"),
                     )
                 })?;
+                let uri = format!("udp://{addr}");
+                self.require_with_uri(
+                    process_id,
+                    Capability::Network,
+                    ResourceClass::UdpSocket,
+                    None,
+                    uri,
+                )?;
                 let descriptor = crate::network::udp_bind(&self.kernel, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::UdpSocket, descriptor.shared_id);

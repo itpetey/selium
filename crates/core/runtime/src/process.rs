@@ -175,12 +175,13 @@ impl Runtime {
     ///
     /// Admitted selectors: `ResourceClass`, `Locality`, `ExplicitResource`,
     /// `Tenant`, `Children`.
-    /// Rejected: `UriPrefix` (until resource URIs populate scope contexts).
+    /// Admitted with constraints: `UriPrefix` (requires a network
+    /// `ResourceClass` selector in the same grant).
     /// Empty selector list = unrestricted within the capability.
     pub(crate) fn validate_grants(&self, grants: &[CapabilityGrant]) -> Result<()> {
         for grant in grants {
             for selector in &grant.selectors {
-                if !selector.is_evaluatable() {
+                if !selector.is_evaluatable(&grant.selectors) {
                     return Err(Error::UnevaluatableSelector(
                         grant.capability.clone(),
                         format!("{selector:?}"),
@@ -422,6 +423,36 @@ impl Runtime {
                 selium_abi::AbiErrorCode::PermissionDenied,
                 format!(
                     "permission denied for capability {capability:?} (tenant: {tenant:?}, class: {:?}, identity: {resource_id:?})",
+                    context.resource_class
+                ),
+            ))
+        }
+    }
+
+    pub(crate) fn require_with_uri(
+        &self,
+        process_id: ProcessId,
+        capability: Capability,
+        resource_class: ResourceClass,
+        resource_id: Option<ResourceIdentity>,
+        uri: String,
+    ) -> std::result::Result<(), selium_abi::AbiError> {
+        let tenant = self.process_tenant(process_id);
+        let context = ScopeContext {
+            tenant: tenant.clone(),
+            uri: Some(uri.clone()),
+            locality: LocalityScope::Cluster,
+            resource_class: Some(resource_class),
+            resource_id,
+        };
+        let allowed = self.authorises(process_id, capability.clone(), &context);
+        if allowed {
+            Ok(())
+        } else {
+            Err(selium_abi::AbiError::new(
+                selium_abi::AbiErrorCode::PermissionDenied,
+                format!(
+                    "permission denied for capability {capability:?} on {uri} (tenant: {tenant:?}, class: {:?}, identity: {resource_id:?})",
                     context.resource_class
                 ),
             ))
