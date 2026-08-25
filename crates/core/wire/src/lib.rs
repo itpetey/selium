@@ -25,9 +25,9 @@ pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use pubsub::{Publisher, Subscriber};
 pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcRequest};
 pub use stream::{
-    BidiReceiver, BidiRequestStream, BidiResponder, BidiSender, RpcBidiStream,
-    RpcBidiStreamClient, RpcBidiStreamConnection, RpcBidiStreamRequest, RpcServerStream,
-    RpcServerStreamClient, RpcServerStreamConnection, RpcServerStreamRequest,
+    BidiReceiver, BidiRequestStream, BidiResponder, BidiSender, RpcBidiStream, RpcBidiStreamClient,
+    RpcBidiStreamConnection, RpcBidiStreamRequest, RpcServerStream, RpcServerStreamClient,
+    RpcServerStreamConnection, RpcServerStreamRequest,
 };
 pub use tables::LiveTable;
 

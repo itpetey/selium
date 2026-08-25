@@ -41,6 +41,13 @@ pub struct FramedRead<M> {
     peeked: Option<(Vec<u8>, u32, u8)>,
 }
 
+/// A framed writer that wraps a [`MessageTransport`] to provide frame-level
+/// write operations with [`FrameHeader`] encoding.
+pub struct FramedWrite<M> {
+    inner: TokioFramedWrite<M, FrameCodec>,
+    write_state: WriteState,
+}
+
 /// State of an in-flight frame write across async polls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteState {
@@ -49,13 +56,6 @@ enum WriteState {
     /// A frame was buffered by `start_send` whose transport flush is still
     /// pending; the next poll must flush it and must NOT re-send it.
     Flushing,
-}
-
-/// A framed writer that wraps a [`MessageTransport`] to provide frame-level
-/// write operations with [`FrameHeader`] encoding.
-pub struct FramedWrite<M> {
-    inner: TokioFramedWrite<M, FrameCodec>,
-    write_state: WriteState,
 }
 
 impl Decoder for FrameCodec {

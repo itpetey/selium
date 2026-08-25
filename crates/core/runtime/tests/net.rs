@@ -28,6 +28,41 @@ fn assert_failed_with_code(
     }
 }
 
+#[test]
+fn class_only_network_grant_retains_allow_all_endpoints() {
+    let runtime = Runtime::default();
+    let guest = spawn_with_grants(
+        &runtime,
+        vec![CapabilityGrant::new(
+            Capability::Network,
+            vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+        )],
+    );
+
+    // Multiple loopback ports — none should be denied with PermissionDenied.
+    for port in &["1", "8080", "9999"] {
+        let address = format!("127.0.0.1:{port}");
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::TcpConnect {
+                address: address.clone(),
+            },
+        );
+        if status == selium_abi::HOSTCALL_STATUS_FAILED {
+            match runtime.poll_hostcall(guest.process_id, op) {
+                CompletionState::Failed(error) => {
+                    assert_ne!(
+                        error.code,
+                        AbiErrorCode::PermissionDenied,
+                        "class-only grant must not deny {address}"
+                    );
+                }
+                other => panic!("expected failed, got {other:?}"),
+            }
+        }
+    }
+}
+
 fn empty_module() -> Vec<u8> {
     wat::parse_str("(module (func (export \"boot\")))").expect("compile wat")
 }
@@ -159,8 +194,6 @@ fn udp_bind_rejects_hostname() {
     );
 }
 
-// --- URI-scoped capability grant tests ---
-
 #[test]
 fn uri_prefix_grant_allows_loopback_denies_other_hosts() {
     let runtime = Runtime::default();
@@ -231,7 +264,9 @@ fn uri_prefix_without_network_class_rejected_at_spawn() {
         arguments: Vec::new(),
         grants: vec![CapabilityGrant::new(
             Capability::Network,
-            vec![ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string())],
+            vec![ResourceSelector::UriPrefix(
+                "tcp://10.0.0.5:443".to_string(),
+            )],
         )],
         dependencies: Vec::new(),
         readiness: ReadinessCondition::Immediate,
@@ -247,39 +282,4 @@ fn uri_prefix_without_network_class_rejected_at_spawn() {
         err.to_string().contains("UriPrefix"),
         "error must mention UriPrefix, got: {err}"
     );
-}
-
-#[test]
-fn class_only_network_grant_retains_allow_all_endpoints() {
-    let runtime = Runtime::default();
-    let guest = spawn_with_grants(
-        &runtime,
-        vec![CapabilityGrant::new(
-            Capability::Network,
-            vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
-        )],
-    );
-
-    // Multiple loopback ports — none should be denied with PermissionDenied.
-    for port in &["1", "8080", "9999"] {
-        let address = format!("127.0.0.1:{port}");
-        let (status, op) = runtime.begin_hostcall(
-            guest.process_id,
-            HostcallRequest::TcpConnect {
-                address: address.clone(),
-            },
-        );
-        if status == selium_abi::HOSTCALL_STATUS_FAILED {
-            match runtime.poll_hostcall(guest.process_id, op) {
-                CompletionState::Failed(error) => {
-                    assert_ne!(
-                        error.code,
-                        AbiErrorCode::PermissionDenied,
-                        "class-only grant must not deny {address}"
-                    );
-                }
-                other => panic!("expected failed, got {other:?}"),
-            }
-        }
-    }
 }

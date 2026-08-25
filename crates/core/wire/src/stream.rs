@@ -22,10 +22,6 @@ use crate::{
     rpc::RpcError,
 };
 
-// ---------------------------------------------------------------------------
-// Server-streaming client
-// ---------------------------------------------------------------------------
-
 /// Client-side handle for server-streaming RPC: one request, ordered stream
 /// of reply items.
 pub struct RpcServerStreamClient<Req, Item, M> {
@@ -46,6 +42,106 @@ pub struct RpcServerStreamClient<Req, Item, M> {
 pub struct RpcServerStream<'a, Item, M: MessageTransport> {
     reply_reader: &'a mut FramedRead<M>,
     request_writer: &'a mut FramedWrite<M>,
+    correlation: u32,
+    done: bool,
+    _phantom: PhantomData<Item>,
+}
+
+/// Server-side handle for an established server-streaming RPC session.
+pub struct RpcServerStreamConnection<Req, Item, M> {
+    request_reader: FramedRead<M>,
+    reply_writer: FramedWrite<M>,
+    client_process_id: u64,
+    _phantom: PhantomData<(Req, Item)>,
+}
+
+/// A server-streaming request received from a client.
+///
+/// The server can [`send_item`](Self::send_item) repeatedly, then call
+/// [`finish`](Self::finish) to signal end-of-stream, or
+/// [`send_error`](Self::send_error) to terminate with an error.
+///
+/// Between items the server should call [`check_cancel`](Self::check_cancel)
+/// to see whether the client has cancelled the stream.
+pub struct RpcServerStreamRequest<'a, Req, Item, M: MessageTransport> {
+    reply_writer: &'a mut FramedWrite<M>,
+    request_reader: &'a mut FramedRead<M>,
+    payload_bytes: Vec<u8>,
+    correlation: u32,
+    finished: bool,
+    _phantom: PhantomData<(Req, Item)>,
+}
+
+/// Client-side handle for bidi-streaming RPC: one request, independent
+/// send and receive streams over a single correlation tag.
+pub struct RpcBidiStreamClient<Req, Item, Resp, M> {
+    request_writer: FramedWrite<M>,
+    reply_reader: FramedRead<M>,
+    next_correlation: u32,
+    _phantom: PhantomData<(Req, Item, Resp)>,
+}
+
+/// An established bidi-streaming session on the client side.
+///
+/// Provides independent send and receive halves that share one correlation
+/// tag. Each direction can be closed independently via its own end flag
+/// (half-close semantics, mirroring TCP half-close).
+pub struct RpcBidiStream<'a, Item, Resp, M: MessageTransport> {
+    request_writer: &'a mut FramedWrite<M>,
+    reply_reader: &'a mut FramedRead<M>,
+    correlation: u32,
+    send_done: bool,
+    recv_done: bool,
+    _phantom: PhantomData<(Item, Resp)>,
+}
+
+/// The send half of a bidi stream, obtained via [`RpcBidiStream::split`].
+pub struct BidiSender<'a, Item, M: MessageTransport> {
+    writer: &'a mut FramedWrite<M>,
+    correlation: u32,
+    done: bool,
+    _phantom: PhantomData<Item>,
+}
+
+/// The receive half of a bidi stream, obtained via [`RpcBidiStream::split`].
+pub struct BidiReceiver<'a, Resp, M: MessageTransport> {
+    reader: &'a mut FramedRead<M>,
+    correlation: u32,
+    done: bool,
+    _phantom: PhantomData<Resp>,
+}
+
+/// Server-side handle for an established bidi-streaming RPC session.
+pub struct RpcBidiStreamConnection<Req, Item, Resp, M> {
+    request_reader: FramedRead<M>,
+    reply_writer: FramedWrite<M>,
+    client_process_id: u64,
+    _phantom: PhantomData<(Req, Item, Resp)>,
+}
+
+/// A bidi-streaming request received from a client.
+///
+/// Provides a [`split`](Self::split) method to obtain independent send
+/// and receive halves, each of which can be closed independently.
+pub struct RpcBidiStreamRequest<'a, Req, Item, Resp, M: MessageTransport> {
+    reply_writer: &'a mut FramedWrite<M>,
+    request_reader: &'a mut FramedRead<M>,
+    payload_bytes: Vec<u8>,
+    correlation: u32,
+    _phantom: PhantomData<(Req, Item, Resp)>,
+}
+
+/// Server-side send half of a bidi stream.
+pub struct BidiResponder<'a, Resp, M: MessageTransport> {
+    writer: &'a mut FramedWrite<M>,
+    correlation: u32,
+    done: bool,
+    _phantom: PhantomData<Resp>,
+}
+
+/// Server-side receive half of a bidi stream.
+pub struct BidiRequestStream<'a, Item, M: MessageTransport> {
+    reader: &'a mut FramedRead<M>,
     correlation: u32,
     done: bool,
     _phantom: PhantomData<Item>,
@@ -115,7 +211,10 @@ where
             self.done = true;
             // Best-effort: if the write fails the stream is already terminating.
             let cancel_flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_CANCEL;
-            drop(self.request_writer.write_frame_with_flags(&[], self.correlation, cancel_flags));
+            drop(
+                self.request_writer
+                    .write_frame_with_flags(&[], self.correlation, cancel_flags),
+            );
         }
     }
 }
@@ -180,9 +279,9 @@ where
 
                         match FlatMsg::decode(&payload) {
                             Ok(item) => Poll::Ready(Some(Ok(item))),
-                            Err(e) => Poll::Ready(Some(Err(RpcError::Serialization(format!(
-                                "{e}"
-                            ))))),
+                            Err(e) => {
+                                Poll::Ready(Some(Err(RpcError::Serialization(format!("{e}")))))
+                            }
                         }
                     }
                     Err(Error::BufferEmpty) => {
@@ -207,35 +306,6 @@ impl<Item, M: MessageTransport> Drop for RpcServerStream<'_, Item, M> {
             self.cancel();
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Server-streaming server side
-// ---------------------------------------------------------------------------
-
-/// Server-side handle for an established server-streaming RPC session.
-pub struct RpcServerStreamConnection<Req, Item, M> {
-    request_reader: FramedRead<M>,
-    reply_writer: FramedWrite<M>,
-    client_process_id: u64,
-    _phantom: PhantomData<(Req, Item)>,
-}
-
-/// A server-streaming request received from a client.
-///
-/// The server can [`send_item`](Self::send_item) repeatedly, then call
-/// [`finish`](Self::finish) to signal end-of-stream, or
-/// [`send_error`](Self::send_error) to terminate with an error.
-///
-/// Between items the server should call [`check_cancel`](Self::check_cancel)
-/// to see whether the client has cancelled the stream.
-pub struct RpcServerStreamRequest<'a, Req, Item, M: MessageTransport> {
-    reply_writer: &'a mut FramedWrite<M>,
-    request_reader: &'a mut FramedRead<M>,
-    payload_bytes: Vec<u8>,
-    correlation: u32,
-    finished: bool,
-    _phantom: PhantomData<(Req, Item)>,
 }
 
 impl<Req, Item, M> RpcServerStreamConnection<Req, Item, M>
@@ -478,79 +548,13 @@ impl<Req, Item, M: MessageTransport> Drop for RpcServerStreamRequest<'_, Req, It
         // blocking inside drop; the client still terminates via peer-close.
         if !self.finished {
             let flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_CANCEL;
-            drop(self
-                .reply_writer.write_frame_with_flags(&[], self.correlation, flags));
+            drop(
+                self.reply_writer
+                    .write_frame_with_flags(&[], self.correlation, flags),
+            );
             self.finished = true;
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Non-panicking wrapper around `FramedRead::poll_ready`.
-fn try_poll_ready<M: MessageTransport>(reader: &mut FramedRead<M>) -> WireResult<bool> {
-    match reader.poll_ready() {
-        Ok(ready) => Ok(ready),
-        Err(Error::BufferEmpty) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Registers a generation wait on the reader's region for cooperative
-/// scheduling, falling back to a waker wake if no callback is installed.
-fn register_gen_wait<M: MessageTransport>(reader: &mut FramedRead<M>, cx: &mut Context<'_>) {
-    let region_id = reader.inner().region_id();
-    if region_id != 0 {
-        let cur_gen = reader.generation().unwrap_or(0);
-        if !selium_memory::register_generation_wait(region_id, cur_gen, cx.waker()) {
-            cx.waker().wake_by_ref();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bidi-streaming client
-// ---------------------------------------------------------------------------
-
-/// Client-side handle for bidi-streaming RPC: one request, independent
-/// send and receive streams over a single correlation tag.
-pub struct RpcBidiStreamClient<Req, Item, Resp, M> {
-    request_writer: FramedWrite<M>,
-    reply_reader: FramedRead<M>,
-    next_correlation: u32,
-    _phantom: PhantomData<(Req, Item, Resp)>,
-}
-
-/// An established bidi-streaming session on the client side.
-///
-/// Provides independent send and receive halves that share one correlation
-/// tag. Each direction can be closed independently via its own end flag
-/// (half-close semantics, mirroring TCP half-close).
-pub struct RpcBidiStream<'a, Item, Resp, M: MessageTransport> {
-    request_writer: &'a mut FramedWrite<M>,
-    reply_reader: &'a mut FramedRead<M>,
-    correlation: u32,
-    send_done: bool,
-    recv_done: bool,
-    _phantom: PhantomData<(Item, Resp)>,
-}
-
-/// The send half of a bidi stream, obtained via [`RpcBidiStream::split`].
-pub struct BidiSender<'a, Item, M: MessageTransport> {
-    writer: &'a mut FramedWrite<M>,
-    correlation: u32,
-    done: bool,
-    _phantom: PhantomData<Item>,
-}
-
-/// The receive half of a bidi stream, obtained via [`RpcBidiStream::split`].
-pub struct BidiReceiver<'a, Resp, M: MessageTransport> {
-    reader: &'a mut FramedRead<M>,
-    correlation: u32,
-    done: bool,
-    _phantom: PhantomData<Resp>,
 }
 
 impl<Req, Item, Resp, M> RpcBidiStreamClient<Req, Item, Resp, M>
@@ -637,13 +641,13 @@ impl<Item, Resp, M: MessageTransport> Drop for RpcBidiStream<'_, Item, Resp, M> 
         if !self.send_done {
             self.send_done = true;
             let flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_END;
-            drop(self
-                .request_writer.write_frame_with_flags(&[], self.correlation, flags));
+            drop(
+                self.request_writer
+                    .write_frame_with_flags(&[], self.correlation, flags),
+            );
         }
     }
 }
-
-// --- BidiSender ---
 
 impl<Item, M: MessageTransport> BidiSender<'_, Item, M> {
     /// Sends a stream item on the send direction.
@@ -685,9 +689,8 @@ impl<Item, M: MessageTransport> BidiSender<'_, Item, M> {
         self.done = true;
 
         let encoded = FlatMsg::encode(&item);
-        let flags = FrameHeader::FLAG_READY
-            | FrameHeader::FLAG_STREAM_ITEM
-            | FrameHeader::FLAG_STREAM_END;
+        let flags =
+            FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_ITEM | FrameHeader::FLAG_STREAM_END;
         self.writer
             .write_frame_with_flags_async(&encoded, self.correlation, flags)
             .await?;
@@ -722,13 +725,13 @@ impl<Item, M: MessageTransport> Drop for BidiSender<'_, Item, M> {
         if !self.done {
             self.done = true;
             let flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_END;
-            drop(self
-                .writer.write_frame_with_flags(&[], self.correlation, flags));
+            drop(
+                self.writer
+                    .write_frame_with_flags(&[], self.correlation, flags),
+            );
         }
     }
 }
-
-// --- BidiReceiver ---
 
 impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
     /// Receives the next stream item, or `None` if the receive direction
@@ -776,9 +779,7 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
                     self.done = true;
                 }
 
-                if payload.is_empty()
-                    && FrameHeader::FLAG_STREAM_END & flags != 0
-                {
+                if payload.is_empty() && FrameHeader::FLAG_STREAM_END & flags != 0 {
                     return Ok(None);
                 }
 
@@ -866,30 +867,6 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
     pub fn is_closed(&self) -> bool {
         self.done
     }
-}
-
-// ---------------------------------------------------------------------------
-// Bidi-streaming server side
-// ---------------------------------------------------------------------------
-
-/// Server-side handle for an established bidi-streaming RPC session.
-pub struct RpcBidiStreamConnection<Req, Item, Resp, M> {
-    request_reader: FramedRead<M>,
-    reply_writer: FramedWrite<M>,
-    client_process_id: u64,
-    _phantom: PhantomData<(Req, Item, Resp)>,
-}
-
-/// A bidi-streaming request received from a client.
-///
-/// Provides a [`split`](Self::split) method to obtain independent send
-/// and receive halves, each of which can be closed independently.
-pub struct RpcBidiStreamRequest<'a, Req, Item, Resp, M: MessageTransport> {
-    reply_writer: &'a mut FramedWrite<M>,
-    request_reader: &'a mut FramedRead<M>,
-    payload_bytes: Vec<u8>,
-    correlation: u32,
-    _phantom: PhantomData<(Req, Item, Resp)>,
 }
 
 impl<Req, Item, Resp, M> RpcBidiStreamConnection<Req, Item, Resp, M>
@@ -980,24 +957,6 @@ where
     }
 }
 
-// --- Server-side bidi session halves ---
-
-/// Server-side send half of a bidi stream.
-pub struct BidiResponder<'a, Resp, M: MessageTransport> {
-    writer: &'a mut FramedWrite<M>,
-    correlation: u32,
-    done: bool,
-    _phantom: PhantomData<Resp>,
-}
-
-/// Server-side receive half of a bidi stream.
-pub struct BidiRequestStream<'a, Item, M: MessageTransport> {
-    reader: &'a mut FramedRead<M>,
-    correlation: u32,
-    done: bool,
-    _phantom: PhantomData<Item>,
-}
-
 impl<'a, Req, Item, Resp, M: MessageTransport> RpcBidiStreamRequest<'a, Req, Item, Resp, M>
 where
     Req: FlatMsg,
@@ -1031,9 +990,7 @@ where
     /// concurrently receiving items from [`BidiRequestStream`]. Each
     /// half closes independently; the server may continue sending after
     /// the client has ended its send direction.
-    pub fn split(
-        &mut self,
-    ) -> (BidiResponder<'_, Resp, M>, BidiRequestStream<'_, Item, M>) {
+    pub fn split(&mut self) -> (BidiResponder<'_, Resp, M>, BidiRequestStream<'_, Item, M>) {
         (
             BidiResponder {
                 writer: self.reply_writer,
@@ -1050,8 +1007,6 @@ where
         )
     }
 }
-
-// --- BidiResponder ---
 
 impl<Resp, M: MessageTransport> BidiResponder<'_, Resp, M> {
     /// Sends a stream item to the client.
@@ -1085,9 +1040,8 @@ impl<Resp, M: MessageTransport> BidiResponder<'_, Resp, M> {
         self.done = true;
 
         let encoded = FlatMsg::encode(&item);
-        let flags = FrameHeader::FLAG_READY
-            | FrameHeader::FLAG_STREAM_ITEM
-            | FrameHeader::FLAG_STREAM_END;
+        let flags =
+            FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_ITEM | FrameHeader::FLAG_STREAM_END;
         self.writer
             .write_frame_with_flags_async(&encoded, self.correlation, flags)
             .await?;
@@ -1122,8 +1076,10 @@ impl<Resp, M: MessageTransport> BidiResponder<'_, Resp, M> {
         // Best-effort: on a full ring the write is skipped; the client then
         // terminates via peer-close detection instead.
         let flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_CANCEL;
-        drop(self
-            .writer.write_frame_with_flags(&[], self.correlation, flags));
+        drop(
+            self.writer
+                .write_frame_with_flags(&[], self.correlation, flags),
+        );
     }
 
     /// Returns `true` if the send direction has been closed.
@@ -1137,13 +1093,13 @@ impl<Resp, M: MessageTransport> Drop for BidiResponder<'_, Resp, M> {
         if !self.done {
             self.done = true;
             let flags = FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_END;
-            drop(self
-                .writer.write_frame_with_flags(&[], self.correlation, flags));
+            drop(
+                self.writer
+                    .write_frame_with_flags(&[], self.correlation, flags),
+            );
         }
     }
 }
-
-// --- BidiRequestStream ---
 
 impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
     /// Receives the next item from the client, or `None` if the client
@@ -1188,9 +1144,7 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
                     self.done = true;
                 }
 
-                if payload.is_empty()
-                    && FrameHeader::FLAG_STREAM_END & flags != 0
-                {
+                if payload.is_empty() && FrameHeader::FLAG_STREAM_END & flags != 0 {
                     return Ok(None);
                 }
 
@@ -1277,5 +1231,26 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
     /// Returns `true` if the receive direction has been closed.
     pub fn is_closed(&self) -> bool {
         self.done
+    }
+}
+
+/// Registers a generation wait on the reader's region for cooperative
+/// scheduling, falling back to a waker wake if no callback is installed.
+fn register_gen_wait<M: MessageTransport>(reader: &mut FramedRead<M>, cx: &mut Context<'_>) {
+    let region_id = reader.inner().region_id();
+    if region_id != 0 {
+        let cur_gen = reader.generation().unwrap_or(0);
+        if !selium_memory::register_generation_wait(region_id, cur_gen, cx.waker()) {
+            cx.waker().wake_by_ref();
+        }
+    }
+}
+
+/// Non-panicking wrapper around `FramedRead::poll_ready`.
+fn try_poll_ready<M: MessageTransport>(reader: &mut FramedRead<M>) -> WireResult<bool> {
+    match reader.poll_ready() {
+        Ok(ready) => Ok(ready),
+        Err(Error::BufferEmpty) => Ok(false),
+        Err(e) => Err(e),
     }
 }

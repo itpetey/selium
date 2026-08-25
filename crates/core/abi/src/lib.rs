@@ -15,7 +15,7 @@
 //! | `Tenant` | **Enforced** | `tenant` (from process authority) |
 //! | `Children` | **Enforced** | requires process-tree access (runtime) |
 //! | `UriPrefix` | **Enforced*** | `uri` (network endpoints only) |
-//! 
+//!
 //! \* `UriPrefix` is evaluatable only when the same grant also carries a
 //! network `ResourceClass` selector (`TcpListener`, `TcpStream`, or
 //! `UdpSocket`). Otherwise the grant is rejected at registration time.
@@ -804,6 +804,17 @@ pub enum RkyvError {
     Decode(String),
 }
 
+/// Parsed components of a network endpoint URI (`tcp://` or `udp://`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEndpoint {
+    /// Scheme: `"tcp"` or `"udp"`.
+    pub scheme: String,
+    /// Host: lowercase, trailing dot stripped, IPv6 bracketed.
+    pub host: String,
+    /// Port: explicit numeric string.
+    pub port: String,
+}
+
 impl EntrypointMetadata {
     /// Creates entrypoint metadata with the supplied export name.
     pub fn new(name: impl Into<String>) -> Self {
@@ -888,9 +899,10 @@ impl ResourceSelector {
                 match context_uri {
                     Some(ctx_uri) => {
                         // Component-aware matching for network URIs.
-                        if let (Some(grant_ep), Some(ctx_ep)) =
-                            (NetworkEndpoint::parse(prefix), NetworkEndpoint::parse(ctx_uri))
-                        {
+                        if let (Some(grant_ep), Some(ctx_ep)) = (
+                            NetworkEndpoint::parse(prefix),
+                            NetworkEndpoint::parse(ctx_uri),
+                        ) {
                             NetworkEndpoint::prefix_matches(&grant_ep, &ctx_ep)
                         } else {
                             // Plain string prefix for non-network URIs.
@@ -909,15 +921,31 @@ impl ResourceSelector {
     }
 }
 
-/// Parsed components of a network endpoint URI (`tcp://` or `udp://`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkEndpoint {
-    /// Scheme: `"tcp"` or `"udp"`.
-    pub scheme: String,
-    /// Host: lowercase, trailing dot stripped, IPv6 bracketed.
-    pub host: String,
-    /// Port: explicit numeric string.
-    pub port: String,
+impl CapabilityGrant {
+    /// Creates a capability grant with the supplied selectors.
+    pub fn new(capability: Capability, selectors: Vec<ResourceSelector>) -> Self {
+        Self {
+            capability,
+            selectors,
+        }
+    }
+
+    /// Returns whether all selectors admit the supplied context.
+    pub fn allows(&self, context: &ScopeContext) -> bool {
+        self.selectors
+            .iter()
+            .all(|selector| selector.matches(context))
+    }
+}
+
+impl AbiError {
+    /// Creates an ABI error with the supplied code and message.
+    pub fn new(code: AbiErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl NetworkEndpoint {
@@ -938,7 +966,10 @@ impl NetworkEndpoint {
         }
         if port == "*" {
             // ok
-        } else if !port.chars().all(|c| c.is_ascii_digit() || c == ',' || c == ' ') {
+        } else if !port
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ',' || c == ' ')
+        {
             return None;
         }
 
@@ -994,33 +1025,6 @@ impl NetworkEndpoint {
         }
         // Comma-separated list.
         grant_port.split(',').any(|p| p.trim() == context_port)
-    }
-}
-
-impl CapabilityGrant {
-    /// Creates a capability grant with the supplied selectors.
-    pub fn new(capability: Capability, selectors: Vec<ResourceSelector>) -> Self {
-        Self {
-            capability,
-            selectors,
-        }
-    }
-
-    /// Returns whether all selectors admit the supplied context.
-    pub fn allows(&self, context: &ScopeContext) -> bool {
-        self.selectors
-            .iter()
-            .all(|selector| selector.matches(context))
-    }
-}
-
-impl AbiError {
-    /// Creates an ABI error with the supplied code and message.
-    pub fn new(code: AbiErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
     }
 }
 
@@ -1651,9 +1655,9 @@ mod tests {
 
     #[test]
     fn uri_prefix_not_evaluatable_with_empty_selectors() {
-        let selectors = vec![
-            ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string()),
-        ];
+        let selectors = vec![ResourceSelector::UriPrefix(
+            "tcp://10.0.0.5:443".to_string(),
+        )];
         assert!(!selectors[0].is_evaluatable(&selectors));
     }
 
@@ -1661,12 +1665,8 @@ mod tests {
     fn other_selectors_always_evaluatable() {
         let empty: &[ResourceSelector] = &[];
         assert!(ResourceSelector::Tenant("acme".to_string()).is_evaluatable(empty));
-        assert!(
-            ResourceSelector::Locality(LocalityScope::Cluster).is_evaluatable(empty)
-        );
-        assert!(
-            ResourceSelector::ResourceClass(ResourceClass::SharedRegion).is_evaluatable(empty)
-        );
+        assert!(ResourceSelector::Locality(LocalityScope::Cluster).is_evaluatable(empty));
+        assert!(ResourceSelector::ResourceClass(ResourceClass::SharedRegion).is_evaluatable(empty));
         assert!(
             ResourceSelector::ExplicitResource(ResourceIdentity::Shared(1)).is_evaluatable(empty)
         );

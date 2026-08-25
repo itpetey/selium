@@ -13,48 +13,13 @@ use selium_wire::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{Channel, channels::{BlockingWriter, ChannelBackpressure}};
+use crate::{
+    Channel,
+    channels::{BlockingWriter, ChannelBackpressure},
+};
 
 /// Type alias matching the OpenSpec task name.
 pub type ShmRendezvous = MemoryRendezvous;
-
-/// The read side of a [`ShmTransport`].
-///
-/// Park channels use a blocking reader (slot-protected, enables writer
-/// backpressure); Drop channels use a non-blocking reader.
-enum Reader {
-    NonBlocking(crate::channels::Reader),
-    Blocking(crate::channels::BlockingReader),
-}
-
-impl tokio::io::AsyncRead for Reader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Reader::NonBlocking(r) => Pin::new(r).poll_read(cx, buf),
-            Reader::Blocking(r) => Pin::new(r).poll_read(cx, buf),
-        }
-    }
-}
-
-impl Reader {
-    fn region(&self) -> &crate::ChannelRegion {
-        match self {
-            Reader::NonBlocking(r) => r.region(),
-            Reader::Blocking(r) => r.region(),
-        }
-    }
-
-    fn generation(&self) -> selium_wire::error::Result<u64> {
-        match self {
-            Reader::NonBlocking(r) => r.generation(),
-            Reader::Blocking(r) => r.generation(),
-        }
-    }
-}
 
 /// A duplex shared-memory transport wrapping a read channel and a write channel.
 ///
@@ -67,6 +32,16 @@ pub struct ShmTransport {
     writer: BlockingWriter,
     last_generation: u64,
 }
+
+/// The read side of a [`ShmTransport`].
+///
+/// Park channels use a blocking reader (slot-protected, enables writer
+/// backpressure); Drop channels use a non-blocking reader.
+enum Reader {
+    NonBlocking(crate::channels::Reader),
+    Blocking(crate::channels::BlockingReader),
+}
+
 /// In-memory rendezvous for tests, passing region ids between client and server.
 #[derive(Clone)]
 pub struct MemoryRendezvous {
@@ -173,6 +148,35 @@ impl MessageTransport for ShmTransport {
 
     fn region_id(&self) -> u64 {
         self.read_region_id()
+    }
+}
+
+impl Reader {
+    fn region(&self) -> &crate::ChannelRegion {
+        match self {
+            Reader::NonBlocking(r) => r.region(),
+            Reader::Blocking(r) => r.region(),
+        }
+    }
+
+    fn generation(&self) -> selium_wire::error::Result<u64> {
+        match self {
+            Reader::NonBlocking(r) => r.generation(),
+            Reader::Blocking(r) => r.generation(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Reader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Reader::NonBlocking(r) => Pin::new(r).poll_read(cx, buf),
+            Reader::Blocking(r) => Pin::new(r).poll_read(cx, buf),
+        }
     }
 }
 

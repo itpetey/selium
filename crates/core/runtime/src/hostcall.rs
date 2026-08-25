@@ -6,8 +6,8 @@ use std::{
 
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
-    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId,
-    ResourceClass, ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
+    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
+    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
 };
 use selium_encoding::{FlatMsg, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};

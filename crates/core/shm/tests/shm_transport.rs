@@ -43,6 +43,215 @@ impl FlatMsg for Pong {
     }
 }
 
+#[tokio::test]
+async fn bidi_stream_backpressure_no_spin_no_loss() {
+    install_heap_provider();
+
+    // Ring smaller than the total stream bytes: the client's sender MUST
+    // park on the async write path until the server drains.
+    let request_channel = make_park_channel(128);
+    let reply_channel = make_channel(1024);
+    let dummy = make_channel(64);
+
+    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
+        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
+        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
+    );
+
+    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
+        RpcBidiStreamConnection::new(
+            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
+            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
+            42,
+        );
+
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        let (_responder, mut request_stream) = req.split();
+
+        // Receive all items from client.
+        let mut items = Vec::new();
+        loop {
+            match request_stream.recv().await.expect("recv") {
+                Some(item) => {
+                    items.push(item);
+                    if items.len() == 8 {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        assert_eq!(items.len(), 8);
+    });
+
+    let mut cl = client;
+    let mut session = cl
+        .connect(Ping("bp-bidi".to_string()))
+        .await
+        .expect("connect");
+
+    let (mut sender, _receiver) = session.split();
+
+    // Send 8 items — send parks on a full ring; no retry loops.
+    for i in 0..8 {
+        sender
+            .send(Ping(format!("bp{i}")))
+            .await
+            .expect("send parks until writable");
+    }
+    sender.close().await.expect("close");
+
+    server_handle.await.expect("server task");
+}
+
+#[tokio::test]
+async fn bidi_stream_half_close_server_continues_sending() {
+    install_heap_provider();
+
+    let request_channel = make_channel(1024);
+    let reply_channel = make_channel(1024);
+    let dummy = make_channel(64);
+
+    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
+        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
+        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
+    );
+
+    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
+        RpcBidiStreamConnection::new(
+            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
+            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
+            42,
+        );
+
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        let (mut responder, mut request_stream) = req.split();
+
+        // Client sends one item then closes its send direction.
+        let item0 = request_stream
+            .recv()
+            .await
+            .expect("recv item")
+            .expect("item 0");
+        assert_eq!(item0, Ping("half-close".to_string()));
+
+        // Client's send direction ends.
+        let end = request_stream.recv().await.expect("recv end");
+        assert!(end.is_none(), "client send end");
+
+        // Server can still send after client closed its direction.
+        responder
+            .send(Pong("still-sending".to_string()))
+            .await
+            .expect("send after client close");
+        responder.close().await.expect("close server");
+    });
+
+    let mut cl = client;
+    let mut session = cl.connect(Ping("hc".to_string())).await.expect("connect");
+
+    let (mut sender, mut receiver) = session.split();
+
+    sender
+        .send(Ping("half-close".to_string()))
+        .await
+        .expect("send");
+    sender.close().await.expect("close send");
+
+    // Client receives server's response after closing its own send.
+    let resp = receiver.recv().await.expect("recv resp").expect("resp");
+    assert_eq!(resp, Pong("still-sending".to_string()));
+
+    server_handle.await.expect("server task");
+}
+
+#[tokio::test]
+async fn bidi_stream_independent_send_receive() {
+    install_heap_provider();
+
+    let request_channel = make_channel(1024);
+    let reply_channel = make_channel(1024);
+    let dummy = make_channel(64);
+
+    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
+        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
+        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
+    );
+
+    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
+        RpcBidiStreamConnection::new(
+            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
+            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
+            42,
+        );
+
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        let ping: Ping = req.payload().expect("decode ping");
+        assert_eq!(ping, Ping("bidi-hello".to_string()));
+
+        let (mut responder, mut request_stream) = req.split();
+
+        // Receive two items from client.
+        let item0 = request_stream
+            .recv()
+            .await
+            .expect("recv item")
+            .expect("item 0");
+        let item1 = request_stream
+            .recv()
+            .await
+            .expect("recv item")
+            .expect("item 1");
+        assert_eq!(item0, Ping("client-0".to_string()));
+        assert_eq!(item1, Ping("client-1".to_string()));
+
+        // Send two items back.
+        responder
+            .send(Pong("server-0".to_string()))
+            .await
+            .expect("send 0");
+        responder
+            .send(Pong("server-1".to_string()))
+            .await
+            .expect("send 1");
+        responder.close().await.expect("close");
+    });
+
+    let mut cl = client;
+    let mut session = cl
+        .connect(Ping("bidi-hello".to_string()))
+        .await
+        .expect("connect");
+
+    let (mut sender, mut receiver) = session.split();
+
+    // Send two items.
+    sender
+        .send(Ping("client-0".to_string()))
+        .await
+        .expect("send 0");
+    sender
+        .send(Ping("client-1".to_string()))
+        .await
+        .expect("send 1");
+    sender.close().await.expect("close send");
+
+    // Receive two items from server.
+    let resp0 = receiver.recv().await.expect("recv resp").expect("resp 0");
+    let resp1 = receiver.recv().await.expect("recv resp").expect("resp 1");
+    assert_eq!(resp0, Pong("server-0".to_string()));
+    assert_eq!(resp1, Pong("server-1".to_string()));
+
+    // Receiver should see end-of-stream.
+    let end = receiver.recv().await.expect("recv end");
+    assert!(end.is_none(), "should be end-of-stream");
+
+    server_handle.await.expect("server task");
+}
+
 #[test]
 fn framed_write_read_round_trip_over_shm_transport() {
     install_heap_provider();
@@ -164,12 +373,8 @@ async fn rpc_round_trip_over_shm_transport() {
     server_handle.await.expect("server task");
 }
 
-// ---------------------------------------------------------------------------
-// Server-streaming tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn server_stream_ordered_delivery_and_end() {
+async fn server_drop_sends_cancel_to_client() {
     install_heap_provider();
 
     let request_channel = make_channel(1024);
@@ -188,51 +393,65 @@ async fn server_stream_ordered_delivery_and_end() {
             42,
         );
 
-    // Server task: recv request, send 3 items, finish
+    // Server keeps its connection alive after abandoning the stream — so the
+    // only way the client can observe termination is via the server's cancel
+    // frame (peer-close detection cannot fire).
+    let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        let ping: Ping = req.payload().expect("decode ping");
-        assert_eq!(ping, Ping("stream-please".to_string()));
-
-        req.send_item(Pong("item-0".to_string()))
-            .await
-            .expect("send item 0");
-        req.send_item(Pong("item-1".to_string()))
-            .await
-            .expect("send item 1");
-        req.send_final_item(Pong("item-2".to_string()))
-            .await
-            .expect("send final item");
+        let req = server.recv().await.expect("recv request");
+        drop(req); // abandon without finish/send_error
+        let _ = dropped_tx.send(());
+        // Hold the connection (and writers) open.
+        for _ in 0..2000 {
+            tokio::task::yield_now().await;
+        }
     });
 
     let mut client = client;
     {
         let mut stream = client
-            .call(Ping("stream-please".to_string()))
+            .call(Ping("abandon-me".to_string()))
             .await
             .expect("call");
 
-        use futures::StreamExt;
-        let mut items = Vec::new();
-        while let Some(result) = stream.next().await {
-            items.push(result.expect("item"));
+        use futures::Stream;
+        use std::pin::Pin;
+        // Stream terminates with None (cancel observed), not an error and not
+        // a hang waiting for peer close. Bounded by yield count so a
+        // regression fails the assertion instead of hanging forever.
+        let mut got_none = false;
+        for _ in 0..100_000 {
+            // Yield between polls so the server task gets scheduled; keeps
+            // this from being a tight spin while still bounding the wait.
+            tokio::task::yield_now().await;
+            match std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await {
+                Some(Ok(item)) => panic!("unexpected item from abandoned stream: {item:?}"),
+                Some(Err(e)) => panic!("unexpected error from abandoned stream: {e}"),
+                None => {
+                    got_none = true;
+                    break;
+                }
+            }
         }
-
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0], Pong("item-0".to_string()));
-        assert_eq!(items[1], Pong("item-1".to_string()));
-        assert_eq!(items[2], Pong("item-2".to_string()));
+        assert!(
+            got_none,
+            "abandoned stream should terminate via server cancel"
+        );
     }
 
+    dropped_rx.try_recv().ok();
     server_handle.await.expect("server task");
 }
 
 #[tokio::test]
-async fn server_stream_finish_without_final_payload() {
+async fn server_stream_backpressure_small_ring_no_item_loss() {
     install_heap_provider();
 
+    // Ring smaller than the total stream bytes: the producer MUST park on
+    // the async write path until the consumer drains. Park backpressure
+    // guarantees no item loss.
     let request_channel = make_channel(1024);
-    let reply_channel = make_channel(1024);
+    let reply_channel = make_park_channel(128);
     let dummy = make_channel(64);
 
     let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
@@ -249,16 +468,22 @@ async fn server_stream_finish_without_final_payload() {
 
     let server_handle = tokio::spawn(async move {
         let mut req = server.recv().await.expect("recv request");
-        req.send_item(Pong("only".to_string()))
-            .await
-            .expect("send item");
+
+        // No retry loops: send_item parks on a full ring and resolves when
+        // capacity frees. If parking regressed to BufferFull errors, these
+        // expects would fire.
+        for i in 0..10 {
+            req.send_item(Pong(format!("p{i:02}")))
+                .await
+                .expect("send item parks until writable");
+        }
         req.finish().await.expect("finish");
     });
 
     let mut client = client;
     {
         let mut stream = client
-            .call(Ping("q".to_string()))
+            .call(Ping("backpressure".to_string()))
             .await
             .expect("call");
 
@@ -268,8 +493,10 @@ async fn server_stream_finish_without_final_payload() {
             items.push(result.expect("item"));
         }
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0], Pong("only".to_string()));
+        assert_eq!(items.len(), 10, "all 10 items should be received");
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(item, &Pong(format!("p{i:02}")));
+        }
     }
 
     server_handle.await.expect("server task");
@@ -445,10 +672,7 @@ async fn server_stream_error_mid_stream() {
 
     let mut client = client;
     {
-        let mut stream = client
-            .call(Ping("err-me".to_string()))
-            .await
-            .expect("call");
+        let mut stream = client.call(Ping("err-me".to_string())).await.expect("call");
 
         use futures::StreamExt;
         let mut items = Vec::new();
@@ -478,188 +702,12 @@ async fn server_stream_error_mid_stream() {
     server_handle.await.expect("server task");
 }
 
-// ---------------------------------------------------------------------------
-// Bidi-streaming tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn bidi_stream_independent_send_receive() {
+async fn server_stream_finish_without_final_payload() {
     install_heap_provider();
 
     let request_channel = make_channel(1024);
     let reply_channel = make_channel(1024);
-    let dummy = make_channel(64);
-
-    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
-        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
-        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
-    );
-
-    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
-        RpcBidiStreamConnection::new(
-            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
-            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
-            42,
-        );
-
-    let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        let ping: Ping = req.payload().expect("decode ping");
-        assert_eq!(ping, Ping("bidi-hello".to_string()));
-
-        let (mut responder, mut request_stream) = req.split();
-
-        // Receive two items from client.
-        let item0 = request_stream
-            .recv()
-            .await
-            .expect("recv item")
-            .expect("item 0");
-        let item1 = request_stream
-            .recv()
-            .await
-            .expect("recv item")
-            .expect("item 1");
-        assert_eq!(item0, Ping("client-0".to_string()));
-        assert_eq!(item1, Ping("client-1".to_string()));
-
-        // Send two items back.
-        responder
-            .send(Pong("server-0".to_string()))
-            .await
-            .expect("send 0");
-        responder
-            .send(Pong("server-1".to_string()))
-            .await
-            .expect("send 1");
-        responder.close().await.expect("close");
-    });
-
-    let mut cl = client;
-    let mut session = cl
-        .connect(Ping("bidi-hello".to_string()))
-        .await
-        .expect("connect");
-
-    let (mut sender, mut receiver) = session.split();
-
-    // Send two items.
-    sender
-        .send(Ping("client-0".to_string()))
-        .await
-        .expect("send 0");
-    sender
-        .send(Ping("client-1".to_string()))
-        .await
-        .expect("send 1");
-    sender.close().await.expect("close send");
-
-    // Receive two items from server.
-    let resp0 = receiver
-        .recv()
-        .await
-        .expect("recv resp")
-        .expect("resp 0");
-    let resp1 = receiver
-        .recv()
-        .await
-        .expect("recv resp")
-        .expect("resp 1");
-    assert_eq!(resp0, Pong("server-0".to_string()));
-    assert_eq!(resp1, Pong("server-1".to_string()));
-
-    // Receiver should see end-of-stream.
-    let end = receiver.recv().await.expect("recv end");
-    assert!(end.is_none(), "should be end-of-stream");
-
-    server_handle.await.expect("server task");
-}
-
-#[tokio::test]
-async fn bidi_stream_half_close_server_continues_sending() {
-    install_heap_provider();
-
-    let request_channel = make_channel(1024);
-    let reply_channel = make_channel(1024);
-    let dummy = make_channel(64);
-
-    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
-        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
-        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
-    );
-
-    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
-        RpcBidiStreamConnection::new(
-            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
-            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
-            42,
-        );
-
-    let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        let (mut responder, mut request_stream) = req.split();
-
-        // Client sends one item then closes its send direction.
-        let item0 = request_stream
-            .recv()
-            .await
-            .expect("recv item")
-            .expect("item 0");
-        assert_eq!(item0, Ping("half-close".to_string()));
-
-        // Client's send direction ends.
-        let end = request_stream
-            .recv()
-            .await
-            .expect("recv end");
-        assert!(end.is_none(), "client send end");
-
-        // Server can still send after client closed its direction.
-        responder
-            .send(Pong("still-sending".to_string()))
-            .await
-            .expect("send after client close");
-        responder.close().await.expect("close server");
-    });
-
-    let mut cl = client;
-    let mut session = cl
-        .connect(Ping("hc".to_string()))
-        .await
-        .expect("connect");
-
-    let (mut sender, mut receiver) = session.split();
-
-    sender
-        .send(Ping("half-close".to_string()))
-        .await
-        .expect("send");
-    sender.close().await.expect("close send");
-
-    // Client receives server's response after closing its own send.
-    let resp = receiver
-        .recv()
-        .await
-        .expect("recv resp")
-        .expect("resp");
-    assert_eq!(resp, Pong("still-sending".to_string()));
-
-    server_handle.await.expect("server task");
-}
-
-// ---------------------------------------------------------------------------
-// Backpressure tests
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn server_stream_backpressure_small_ring_no_item_loss() {
-    install_heap_provider();
-
-    // Ring smaller than the total stream bytes: the producer MUST park on
-    // the async write path until the consumer drains. Park backpressure
-    // guarantees no item loss.
-    let request_channel = make_channel(1024);
-    let reply_channel = make_park_channel(128);
     let dummy = make_channel(64);
 
     let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
@@ -676,22 +724,70 @@ async fn server_stream_backpressure_small_ring_no_item_loss() {
 
     let server_handle = tokio::spawn(async move {
         let mut req = server.recv().await.expect("recv request");
-
-        // No retry loops: send_item parks on a full ring and resolves when
-        // capacity frees. If parking regressed to BufferFull errors, these
-        // expects would fire.
-        for i in 0..10 {
-            req.send_item(Pong(format!("p{i:02}")))
-                .await
-                .expect("send item parks until writable");
-        }
+        req.send_item(Pong("only".to_string()))
+            .await
+            .expect("send item");
         req.finish().await.expect("finish");
     });
 
     let mut client = client;
     {
+        let mut stream = client.call(Ping("q".to_string())).await.expect("call");
+
+        use futures::StreamExt;
+        let mut items = Vec::new();
+        while let Some(result) = stream.next().await {
+            items.push(result.expect("item"));
+        }
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0], Pong("only".to_string()));
+    }
+
+    server_handle.await.expect("server task");
+}
+
+#[tokio::test]
+async fn server_stream_ordered_delivery_and_end() {
+    install_heap_provider();
+
+    let request_channel = make_channel(1024);
+    let reply_channel = make_channel(1024);
+    let dummy = make_channel(64);
+
+    let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
+        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
+        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
+    );
+
+    let mut server: RpcServerStreamConnection<Ping, Pong, ShmTransport> =
+        RpcServerStreamConnection::new(
+            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
+            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
+            42,
+        );
+
+    // Server task: recv request, send 3 items, finish
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        let ping: Ping = req.payload().expect("decode ping");
+        assert_eq!(ping, Ping("stream-please".to_string()));
+
+        req.send_item(Pong("item-0".to_string()))
+            .await
+            .expect("send item 0");
+        req.send_item(Pong("item-1".to_string()))
+            .await
+            .expect("send item 1");
+        req.send_final_item(Pong("item-2".to_string()))
+            .await
+            .expect("send final item");
+    });
+
+    let mut client = client;
+    {
         let mut stream = client
-            .call(Ping("backpressure".to_string()))
+            .call(Ping("stream-please".to_string()))
             .await
             .expect("call");
 
@@ -701,80 +797,97 @@ async fn server_stream_backpressure_small_ring_no_item_loss() {
             items.push(result.expect("item"));
         }
 
-        assert_eq!(items.len(), 10, "all 10 items should be received");
-        for (i, item) in items.iter().enumerate() {
-            assert_eq!(item, &Pong(format!("p{i:02}")));
-        }
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], Pong("item-0".to_string()));
+        assert_eq!(items[1], Pong("item-1".to_string()));
+        assert_eq!(items[2], Pong("item-2".to_string()));
     }
 
     server_handle.await.expect("server task");
 }
 
 #[tokio::test]
-async fn bidi_stream_backpressure_no_spin_no_loss() {
+async fn stale_cancel_frame_skipped_for_next_request() {
     install_heap_provider();
 
-    // Ring smaller than the total stream bytes: the client's sender MUST
-    // park on the async write path until the server drains.
-    let request_channel = make_park_channel(128);
+    let request_channel = make_channel(1024);
     let reply_channel = make_channel(1024);
     let dummy = make_channel(64);
 
-    let client: RpcBidiStreamClient<Ping, Ping, Pong, ShmTransport> = RpcBidiStreamClient::new(
+    let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
         FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
         FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
     );
 
-    let mut server: RpcBidiStreamConnection<Ping, Ping, Pong, ShmTransport> =
-        RpcBidiStreamConnection::new(
+    let mut server: RpcServerStreamConnection<Ping, Pong, ShmTransport> =
+        RpcServerStreamConnection::new(
             FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
             FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
             42,
         );
 
     let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        let (_responder, mut request_stream) = req.split();
+        // First stream: abandoned by the client → stale cancel frame lands in
+        // the request ring.
+        let first = server.recv().await.expect("recv first request");
+        let correlation_a = first.correlation();
+        drop(first);
 
-        // Receive all items from client.
-        let mut items = Vec::new();
-        loop {
-            match request_stream.recv().await.expect("recv") {
-                Some(item) => {
-                    items.push(item);
-                    if items.len() == 8 {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-        assert_eq!(items.len(), 8);
+        // Second recv must skip the stale cancel frame and return the *new*
+        // request, not surface the cancel as a bogus empty-payload request.
+        let mut second = server.recv().await.expect("recv second request");
+        let ping: Ping = second.payload().expect("decode second request payload");
+        assert_eq!(ping, Ping("second".to_string()));
+        assert_ne!(
+            second.correlation(),
+            correlation_a,
+            "second request must be a fresh one"
+        );
+
+        second
+            .send_item(Pong("done".to_string()))
+            .await
+            .expect("send item");
+        second
+            .send_final_item(Pong("bye".to_string()))
+            .await
+            .expect("send final");
     });
 
-    let mut cl = client;
-    let mut session = cl
-        .connect(Ping("bp-bidi".to_string()))
-        .await
-        .expect("connect");
+    let mut client = client;
+    {
+        // Stream A: cancelled by the client right away (its cancel frame
+        // becomes stale traffic in the request ring).
+        {
+            let mut stream = client
+                .call(Ping("first".to_string()))
+                .await
+                .expect("call A");
+            stream.cancel();
+        }
 
-    let (mut sender, _receiver) = session.split();
+        // Give the server a moment to observe the cancel.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
 
-    // Send 8 items — send parks on a full ring; no retry loops.
-    for i in 0..8 {
-        sender
-            .send(Ping(format!("bp{i}")))
+        // Stream B: must work end-to-end despite the stale cancel frame.
+        let mut stream = client
+            .call(Ping("second".to_string()))
             .await
-            .expect("send parks until writable");
+            .expect("call B");
+        use futures::StreamExt;
+        let mut items = Vec::new();
+        while let Some(result) = stream.next().await {
+            items.push(result.expect("item"));
+        }
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], Pong("done".to_string()));
+        assert_eq!(items[1], Pong("bye".to_string()));
     }
-    sender.close().await.expect("close");
 
     server_handle.await.expect("server task");
 }
-
-// ---------------------------------------------------------------------------
-// Overwrite semantics test
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn streams_never_report_overwritten() {
@@ -854,155 +967,6 @@ async fn streams_never_report_overwritten() {
         for (i, item) in items.iter().enumerate() {
             assert_eq!(item, &Pong(format!("o{i:02}")));
         }
-    }
-
-    server_handle.await.expect("server task");
-}
-
-// ---------------------------------------------------------------------------
-// Server-side abandonment notification tests
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn server_drop_sends_cancel_to_client() {
-    install_heap_provider();
-
-    let request_channel = make_channel(1024);
-    let reply_channel = make_channel(1024);
-    let dummy = make_channel(64);
-
-    let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
-        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
-        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
-    );
-
-    let mut server: RpcServerStreamConnection<Ping, Pong, ShmTransport> =
-        RpcServerStreamConnection::new(
-            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
-            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
-            42,
-        );
-
-    // Server keeps its connection alive after abandoning the stream — so the
-    // only way the client can observe termination is via the server's cancel
-    // frame (peer-close detection cannot fire).
-    let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
-    let server_handle = tokio::spawn(async move {
-        let req = server.recv().await.expect("recv request");
-        drop(req); // abandon without finish/send_error
-        let _ = dropped_tx.send(());
-        // Hold the connection (and writers) open.
-        for _ in 0..2000 {
-            tokio::task::yield_now().await;
-        }
-    });
-
-    let mut client = client;
-    {
-        let mut stream = client
-            .call(Ping("abandon-me".to_string()))
-            .await
-            .expect("call");
-
-        use futures::{Stream, StreamExt};
-        use std::pin::Pin;
-        // Stream terminates with None (cancel observed), not an error and not
-        // a hang waiting for peer close. Bounded by yield count so a
-        // regression fails the assertion instead of hanging forever.
-        let mut got_none = false;
-        for _ in 0..100_000 {
-            match std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await {
-                Some(Ok(item)) => panic!("unexpected item from abandoned stream: {item:?}"),
-                Some(Err(e)) => panic!("unexpected error from abandoned stream: {e}"),
-                None => {
-                    got_none = true;
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            got_none,
-            "abandoned stream should terminate via server cancel"
-        );
-    }
-
-    dropped_rx.try_recv().ok();
-    server_handle.await.expect("server task");
-}
-
-#[tokio::test]
-async fn stale_cancel_frame_skipped_for_next_request() {
-    install_heap_provider();
-
-    let request_channel = make_channel(1024);
-    let reply_channel = make_channel(1024);
-    let dummy = make_channel(64);
-
-    let client: RpcServerStreamClient<Ping, Pong, ShmTransport> = RpcServerStreamClient::new(
-        FramedWrite::new(ShmTransport::new(&dummy, &request_channel).expect("client tx")),
-        FramedRead::new(ShmTransport::new(&reply_channel, &dummy).expect("client rx")),
-    );
-
-    let mut server: RpcServerStreamConnection<Ping, Pong, ShmTransport> =
-        RpcServerStreamConnection::new(
-            FramedRead::new(ShmTransport::new(&request_channel, &dummy).expect("server rx")),
-            FramedWrite::new(ShmTransport::new(&dummy, &reply_channel).expect("server tx")),
-            42,
-        );
-
-    let server_handle = tokio::spawn(async move {
-        // First stream: abandoned by the client → stale cancel frame lands in
-        // the request ring.
-        let first = server.recv().await.expect("recv first request");
-        let correlation_a = first.correlation();
-        drop(first);
-
-        // Second recv must skip the stale cancel frame and return the *new*
-        // request, not surface the cancel as a bogus empty-payload request.
-        let mut second = server.recv().await.expect("recv second request");
-        let ping: Ping = second.payload().expect("decode second request payload");
-        assert_eq!(ping, Ping("second".to_string()));
-        assert_ne!(
-            second.correlation(),
-            correlation_a,
-            "second request must be a fresh one"
-        );
-
-        second
-            .send_item(Pong("done".to_string()))
-            .await
-            .expect("send item");
-        second
-            .send_final_item(Pong("bye".to_string()))
-            .await
-            .expect("send final");
-    });
-
-    let mut client = client;
-    {
-        // Stream A: cancelled by the client right away (its cancel frame
-        // becomes stale traffic in the request ring).
-        {
-            let mut stream = client.call(Ping("first".to_string())).await.expect("call A");
-            stream.cancel();
-        }
-
-        // Give the server a moment to observe the cancel.
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-
-        // Stream B: must work end-to-end despite the stale cancel frame.
-        let mut stream = client.call(Ping("second".to_string())).await.expect("call B");
-        use futures::StreamExt;
-        let mut items = Vec::new();
-        while let Some(result) = stream.next().await {
-            items.push(result.expect("item"));
-        }
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], Pong("done".to_string()));
-        assert_eq!(items[1], Pong("bye".to_string()));
     }
 
     server_handle.await.expect("server task");
