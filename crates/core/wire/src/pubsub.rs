@@ -151,7 +151,7 @@ impl<T, M: MessageTransport> Subscriber<T, M> {
     where
         T: FlatMsg,
     {
-        let (payload, tag) = self.reader.read_frame()?;
+        let (payload, tag, _flags) = self.reader.read_frame()?;
         self.last_generation = self.reader.generation()?;
         let value: T =
             FlatMsg::decode(&payload).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
@@ -194,7 +194,7 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
                 }
             }
 
-            let (payload, _tag) = match this.reader.read_frame() {
+            let (payload, _tag, _flags) = match this.reader.read_frame() {
                 Ok(frame) => frame,
                 Err(Error::BufferEmpty) => {
                     // Spurious readiness; register wait instead of spinning.

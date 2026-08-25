@@ -74,7 +74,7 @@ fn n_writers_single_reader_no_lost_wakeups() {
                     break;
                 }
                 match framed.read_frame() {
-                    Ok((_payload, _tag)) => {
+                    Ok((_payload, _tag, _flags)) => {
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
                     Err(selium_wire::Error::BufferEmpty) => {

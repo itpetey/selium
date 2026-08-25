@@ -24,12 +24,18 @@ pub use error::{Error, Result};
 pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use pubsub::{Publisher, Subscriber};
 pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcRequest};
+pub use stream::{
+    BidiReceiver, BidiRequestStream, BidiResponder, BidiSender, RpcBidiStream,
+    RpcBidiStreamClient, RpcBidiStreamConnection, RpcBidiStreamRequest, RpcServerStream,
+    RpcServerStreamClient, RpcServerStreamConnection, RpcServerStreamRequest,
+};
 pub use tables::LiveTable;
 
 pub mod error;
 pub mod framed;
 pub mod pubsub;
 pub mod rpc;
+pub mod stream;
 pub mod tables;
 
 /// A duplex framed I/O transport.

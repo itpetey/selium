@@ -52,6 +52,10 @@ pub enum RpcError {
     BufferEmpty,
     /// Encoding or decoding failed.
     Serialization(String),
+    /// The remote peer terminated the stream with an application error.
+    ///
+    /// Carries the error message sent by the peer (stream-error frame).
+    Remote(String),
 }
 
 /// Client-side handle for making typed RPC requests over a [`MessageTransport`].
@@ -87,6 +91,7 @@ impl fmt::Display for RpcError {
             Self::BufferFull => write!(f, "RPC buffer full"),
             Self::BufferEmpty => write!(f, "RPC buffer empty"),
             Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
+            Self::Remote(msg) => write!(f, "remote stream error: {msg}"),
         }
     }
 }
@@ -204,7 +209,7 @@ where
                 last_generation = current_generation;
 
                 match self.request_reader.read_frame() {
-                    Ok((payload_bytes, correlation)) => {
+                    Ok((payload_bytes, correlation, _flags)) => {
                         return Ok(RpcRequest {
                             reply_writer: &mut self.reply_writer,
                             payload_bytes,
@@ -271,7 +276,7 @@ where
     M: MessageTransport,
 {
     match reply_reader.read_frame() {
-        Ok((payload_bytes, tag)) => {
+        Ok((payload_bytes, tag, _flags)) => {
             if tag != correlation {
                 return Ok(None);
             }

@@ -120,7 +120,17 @@ impl BlockingReader {
                 self.pos
             ))
         })?;
-        self.region.update_reader_slot(self.reader_id, self.pos)
+        let result = self.region.update_reader_slot(self.reader_id, self.pos);
+        if result.is_ok() {
+            // Consuming frees ring capacity, which may unblock writers parked
+            // on a full Park ring via generation-wait. The generation counter
+            // only bumps on writes, so notify waiters directly without
+            // bumping: spurious wakeups are benign (waiters re-poll and
+            // re-register), but skipping this notification deadlocks a sole
+            // producer waiting for capacity that only readers can free.
+            selium_memory::wake_generation_waiters(self.region.region_id(), u64::MAX);
+        }
+        result
     }
 }
 

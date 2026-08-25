@@ -40,10 +40,23 @@ and maps directly onto WebSocket close and HTTP body boundaries.
 
 ### Cancellation is a frame, not a drop
 
-Dropping a client stream handle sends a cancel frame — server resources
-are released deterministically rather than via peer-close detection
-(timeouts). Alternative considered: rely on `writer_count`/peer-closed —
-rejected because a cancelled stream is not a dead peer.
+Dropping a stream handle sends a cancel frame on both sides — client
+handles cancel the server's production; server request handles notify the
+client of abandonment. Resources are released deterministically rather
+than via peer-close detection (timeouts). Alternative considered: rely on
+`writer_count`/peer-closed — rejected because a cancelled stream is not a
+dead peer.
+
+### Writers park via an async write path
+
+Stream senders use `FramedWrite::write_frame_with_flags_async`, which
+propagates transport `Pending` to the awaiting task instead of collapsing
+it into `BufferFull` (the sync path keeps `BufferFull` semantics for
+unary RPC and pub/sub). This requires two transport-side properties:
+Park channels must expose a blocking reader (slot-protected, so writer
+backpressure engages at all), and reader consumption must wake parked
+writers (`wake_generation_waiters` on advance), since only writes bump
+the generation counter.
 
 ## Risks / Trade-offs
 

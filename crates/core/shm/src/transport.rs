@@ -13,13 +13,48 @@ use selium_wire::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{
-    Channel,
-    channels::{BlockingWriter, Reader},
-};
+use crate::{Channel, channels::{BlockingWriter, ChannelBackpressure}};
 
 /// Type alias matching the OpenSpec task name.
 pub type ShmRendezvous = MemoryRendezvous;
+
+/// The read side of a [`ShmTransport`].
+///
+/// Park channels use a blocking reader (slot-protected, enables writer
+/// backpressure); Drop channels use a non-blocking reader.
+enum Reader {
+    NonBlocking(crate::channels::Reader),
+    Blocking(crate::channels::BlockingReader),
+}
+
+impl tokio::io::AsyncRead for Reader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Reader::NonBlocking(r) => Pin::new(r).poll_read(cx, buf),
+            Reader::Blocking(r) => Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+impl Reader {
+    fn region(&self) -> &crate::ChannelRegion {
+        match self {
+            Reader::NonBlocking(r) => r.region(),
+            Reader::Blocking(r) => r.region(),
+        }
+    }
+
+    fn generation(&self) -> selium_wire::error::Result<u64> {
+        match self {
+            Reader::NonBlocking(r) => r.generation(),
+            Reader::Blocking(r) => r.generation(),
+        }
+    }
+}
 
 /// A duplex shared-memory transport wrapping a read channel and a write channel.
 ///
@@ -32,7 +67,6 @@ pub struct ShmTransport {
     writer: BlockingWriter,
     last_generation: u64,
 }
-
 /// In-memory rendezvous for tests, passing region ids between client and server.
 #[derive(Clone)]
 pub struct MemoryRendezvous {
@@ -42,23 +76,27 @@ pub struct MemoryRendezvous {
 impl ShmTransport {
     /// Creates a new transport from a read channel and a write channel.
     ///
+    /// On Park channels the read side uses a *blocking* reader that registers
+    /// a reader slot in shared memory; without that slot, writers never
+    /// observe reader progress and Park backpressure cannot engage. Drop
+    /// channels keep the non-blocking reader (jump-to-tail on overtaken).
+    ///
     /// # Errors
     ///
     /// Returns an error if the blocking reader or writer cannot be created
     /// (e.g. slot allocation failure).
     pub fn new(read_channel: &Channel, write_channel: &Channel) -> Result<Self> {
-        let reader = read_channel.reader();
+        let reader = if read_channel.backpressure() == ChannelBackpressure::Park {
+            Reader::Blocking(read_channel.blocking_reader()?)
+        } else {
+            Reader::NonBlocking(read_channel.reader())
+        };
         let writer = write_channel.blocking_writer()?;
         Ok(Self {
             reader,
             writer,
             last_generation: 0,
         })
-    }
-
-    /// Returns a reference to the underlying reader.
-    pub fn reader(&self) -> &Reader {
-        &self.reader
     }
 
     /// Returns a reference to the underlying writer.
