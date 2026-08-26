@@ -189,6 +189,11 @@ impl MemoryRegistry {
 }
 
 /// Creates a unique waiters key from a shared region id and offset.
-fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
+///
+/// This is the single source of truth for host-side wait keys. Host code
+/// that notifies waiters (e.g. runtime kicks on guest→host transitions)
+/// MUST derive keys through this function so they match the keys used by
+/// `atomic_wait32` internally.
+pub fn shared_offset_key(shared_id: u64, offset: u64) -> usize {
     ((shared_id as usize).wrapping_mul(31)) ^ (offset as usize)
 }

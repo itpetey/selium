@@ -1,8 +1,8 @@
 use std::{future::Future, pin::Pin, task::Poll};
 
 use selium_abi::{
-    CompletionState, HostcallEnvelope, HostcallOutput, HostcallRequest, OperationId, decode_rkyv,
-    encode_rkyv, unpack_hostcall_status,
+    CompletionState, HostcallEnvelope, HostcallOutput, HostcallRequest, OperationId, TaskId,
+    decode_rkyv, encode_rkyv, unpack_hostcall_status,
 };
 
 use crate::{
@@ -91,6 +91,46 @@ pub(crate) fn hostcall_ready(request: HostcallRequest) -> Result<HostcallOutput>
     let request = encode_rkyv(&envelope)?;
     // SAFETY: `request` is a valid byte buffer; the host validates the contents.
     let create_status = unsafe { selium_hostcall_create(request.as_ptr(), request.len()) };
+    let (status, operation_id) = unpack_hostcall_status(create_status);
+    if status == selium_abi::HOSTCALL_STATUS_FAILED {
+        return Err(GuestError::Host("hostcall create failed".to_string()));
+    }
+
+    match poll_operation(operation_id as OperationId) {
+        Ok(Some(output)) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
+            unsafe { selium_hostcall_drop(operation_id as OperationId) };
+            Ok(output)
+        }
+        Ok(None) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
+            unsafe { selium_hostcall_drop(operation_id as OperationId) };
+            Err(GuestError::Host(
+                "hostcall returned pending; await the async API instead".to_string(),
+            ))
+        }
+        Err(error) => {
+            // SAFETY: `operation_id` was returned by `selium_hostcall_create` and is still valid.
+            unsafe { selium_hostcall_drop(operation_id as OperationId) };
+            Err(error)
+        }
+    }
+}
+
+/// Synchronous hostcall that includes a task_id in the envelope.
+/// Used for WaitRegister where the host needs to know which guest
+/// task to wake on a generation advance.
+pub(crate) fn hostcall_ready_with_task(
+    request: HostcallRequest,
+    task_id: TaskId,
+) -> Result<HostcallOutput> {
+    let envelope = HostcallEnvelope {
+        request,
+        task_id: Some(task_id),
+    };
+    let encoded = encode_rkyv(&envelope)?;
+    // SAFETY: `encoded` is a valid byte buffer; the host validates the contents.
+    let create_status = unsafe { selium_hostcall_create(encoded.as_ptr(), encoded.len()) };
     let (status, operation_id) = unpack_hostcall_status(create_status);
     if status == selium_abi::HOSTCALL_STATUS_FAILED {
         return Err(GuestError::Host("hostcall create failed".to_string()));

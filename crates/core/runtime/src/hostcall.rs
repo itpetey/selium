@@ -46,6 +46,15 @@ impl Runtime {
         task_id: Option<TaskId>,
         guest_memory: Option<SharedMemory>,
     ) -> (u32, OperationId) {
+        // Extract WaitRegister fields before dispatch consumes the request.
+        let wait_register = match &request {
+            HostcallRequest::WaitRegister {
+                region_id,
+                generation,
+            } => Some((*region_id, *generation)),
+            _ => None,
+        };
+
         let state = match self.dispatch_hostcall(process_id, request, guest_memory.as_ref()) {
             Ok(state) => state,
             Err(error) => HostOperationState::Failed(error),
@@ -56,6 +65,17 @@ impl Runtime {
             HostOperationState::HostQueueRecvWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
             HostOperationState::SleepWait { .. } => selium_abi::HOSTCALL_STATUS_PENDING,
         };
+
+        // Register the wait if the guest parked on a host-writable ring.
+        // This is a fire-and-forget registration: the hostcall returns
+        // Ready immediately; the wake comes later via mailbox.
+        if let HostOperationState::Ready(_) = &state
+            && let Some(tid) = task_id
+            && let Some((region_id, generation)) = wait_register
+        {
+            self.register_wait(process_id, tid, region_id, generation);
+        }
+
         let mut operations = self.operations.lock();
         let operation_id = self.next_operation_id(&operations);
         operations.insert(
@@ -121,6 +141,18 @@ impl Runtime {
                             client_process_id,
                             value,
                         );
+                        if client_process_id == 0 {
+                            // Kernel-originated rendezvous (e.g. the network
+                            // poller enqueuing an accepted connection's
+                            // stream region): the kernel created and owns
+                            // the region outside `shared_resource_owners`,
+                            // so grant it to the receiver explicitly.
+                            self.claim_shared_resource(
+                                operation.process_id,
+                                ResourceClass::SharedRegion,
+                                value,
+                            );
+                        }
                         let output = HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
@@ -415,11 +447,18 @@ impl Runtime {
                     None,
                     uri,
                 )?;
-                let descriptor = crate::network::tcp_bind(&self.kernel, address)
+                let descriptor = crate::network::tcp_bind(self, process_id, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(
                     process_id,
                     ResourceClass::TcpListener,
+                    descriptor.local_id,
+                );
+                // The descriptor doubles as a connection queue: HostQueueRecv
+                // checks ownership under the HostQueue class, so claim both.
+                self.claim_local_handle(
+                    process_id,
+                    ResourceClass::HostQueue,
                     descriptor.local_id,
                 );
                 self.claim_shared_resource(
@@ -446,7 +485,7 @@ impl Runtime {
                     None,
                     uri,
                 )?;
-                let descriptor = crate::network::tcp_connect(&self.kernel, address)
+                let descriptor = crate::network::tcp_connect(self, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
                 self.claim_shared_resource(
@@ -473,7 +512,7 @@ impl Runtime {
                     None,
                     uri,
                 )?;
-                let descriptor = crate::network::udp_bind(&self.kernel, address)
+                let descriptor = crate::network::udp_bind(self, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::UdpSocket, descriptor.shared_id);
                 self.claim_shared_resource(
@@ -1004,6 +1043,30 @@ impl Runtime {
                     .register_log_channel(&self.kernel.memory(), process_id, shared_id)
                     .map_err(kernel_error)?;
 
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::WaitRegister {
+                region_id,
+                generation: _,
+            } => {
+                // Reject if the process has not attached this region.
+                let owns = self
+                    .shared_resource_owners
+                    .lock()
+                    .get(&(ResourceClass::SharedRegion, region_id))
+                    .is_some_and(|owners| owners.contains(&process_id));
+                if !owns {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "WaitRegister denied: process {process_id} has not attached region {region_id}"
+                        ),
+                    ));
+                }
+
+                // Client must supply a task_id in the envelope so the host
+                // can route the wake correctly. The hostcall itself returns
+                // Ready immediately — the wake comes later via mailbox.
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
         }

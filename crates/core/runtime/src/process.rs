@@ -1,11 +1,11 @@
 use selium_abi::{
     ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, LocalityScope, ProcessId,
-    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, encode_rkyv,
+    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, TaskId, encode_rkyv,
 };
 use tracing::debug;
 use wasmtiny::WasmValue;
 
-use crate::{Error, Result, config::ProcessAuthority, runtime::Runtime};
+use crate::{Error, Result, config::ProcessAuthority, hostcall::HostOperationState, runtime::Runtime};
 
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
@@ -474,6 +474,135 @@ impl Runtime {
         self.poll_guest_until_stalled(process_id);
     }
 
+    /// Records a guest task's interest in a generation advance on a region.
+    ///
+    /// Registrations are bounded: a parked task has exactly one outstanding
+    /// interest per region, so a re-registration for the same task replaces
+    /// its stale entry rather than accumulating duplicates.
+    pub(crate) fn register_wait(
+        &self,
+        process_id: ProcessId,
+        task_id: TaskId,
+        region_id: u64,
+        generation: u64,
+    ) {
+        let mut registry = self.wait_registry.lock();
+        registry
+            .entry((process_id, region_id))
+            .or_default()
+            .retain(|entry| entry.task_id != task_id);
+        registry
+            .entry((process_id, region_id))
+            .or_default()
+            .push(crate::runtime::WaitEntry {
+                process_id,
+                task_id,
+                region_id,
+                generation,
+            });
+    }
+
+    /// Drops all wait registrations for a task. Called when the task is
+    /// woken: a running task holds no park interests, and it re-registers
+    /// via `register_wait` if it parks again. Without this, entries for
+    /// regions the host never advances (guest-writable rings) would
+    /// accumulate forever.
+    fn cancel_waits_for_task(&self, process_id: ProcessId, task_id: TaskId) {
+        let mut registry = self.wait_registry.lock();
+        registry.retain(|_key, entries| {
+            // Task ids are guest-local: match on both process and task.
+            entries
+                .retain(|entry| !(entry.process_id == process_id && entry.task_id == task_id));
+            !entries.is_empty()
+        });
+    }
+
+    /// Kicks all active network outbound proxy threads by notifying their
+    /// condvar wait keys. Called on guest→host transitions to ensure the
+    /// outbound drain runs promptly after a guest write.
+    ///
+    /// Notified under the lock (no snapshot clone on this hot path): waiters
+    /// never take `network_wait_keys` when waking, so holding it across
+    /// `host_notify` cannot deadlock.
+    pub fn kick_network_waiters(&self) {
+        for (_shared_id, key) in self.network_wait_keys.lock().iter() {
+            selium_memory::host_notify(*key, 1);
+        }
+    }
+
+    /// Called when the host advances a region's generation. Checks the wait
+    /// registry and wakes any guest tasks whose registered generation has
+    /// been surpassed.
+    pub fn note_generation_advance(&self, region_id: u64, new_generation: u64) {
+        let mut wakeups: Vec<(ProcessId, TaskId)> = Vec::new();
+        {
+            let mut registry = self.wait_registry.lock();
+            registry.retain(|_key, entries| {
+                entries.retain(|entry| {
+                    if entry.region_id == region_id && entry.generation < new_generation {
+                        wakeups.push((entry.process_id, entry.task_id));
+                        false // remove matched entries
+                    } else {
+                        true
+                    }
+                });
+                !entries.is_empty()
+            });
+        }
+        // This may run on a kernel (poller) thread: the guest reactor's
+        // state is thread-local, so cross-thread wakes must only ENQUEUE
+        // mailbox entries here. Execution is deferred to the owning thread
+        // via `pending_exec` (see `drain_pending_exec`).
+        let mut seen = std::collections::HashSet::new();
+        for (process_id, task_id) in wakeups {
+            if !seen.insert((process_id, task_id)) {
+                continue;
+            }
+            self.cancel_waits_for_task(process_id, task_id);
+            self.enqueue_wake_deferred(process_id, task_id);
+        }
+    }
+
+    /// Enqueues a mailbox wake for a task WITHOUT executing its reactor.
+    ///
+    /// This is the CROSS-THREAD wake path (kernel poller callbacks): guest
+    /// reactor state is thread-local, so WASM must never be executed on the
+    /// waking thread. The marked process's reactor runs when the owning
+    /// thread next calls [`Self::drain_pending_exec`] — automatically at
+    /// every hostcall create/poll boundary, or explicitly from embedder/test
+    /// code that owns the guest.
+    pub(crate) fn enqueue_wake_deferred(&self, process_id: ProcessId, task_id: TaskId) {
+        self.pending_exec.lock().insert(process_id);
+        if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned()
+            && let Err(error) = mailbox.enqueue(task_id)
+        {
+            debug!(
+                process_id,
+                task_id,
+                error = %error,
+                "failed to enqueue guest task wake"
+            );
+        }
+    }
+
+    /// Executes deferred reactor polls for all processes marked by
+    /// cross-thread wakes (mailbox wakes enqueued by kernel poller threads).
+    ///
+    /// MUST be called from the thread that owns the target guests'
+    /// reactors — the hostcall boundary hooks do this automatically;
+    /// embedders and tests driving guests manually should call it after
+    /// operations that may have triggered cross-thread wakes.
+    pub fn drain_pending_exec(&self) {
+        let mut guard = self.pending_exec.lock();
+        let pending: Vec<ProcessId> = {
+            guard.drain().collect()
+        };
+        drop(guard);
+        for process_id in pending {
+            self.poll_guest_until_stalled(process_id);
+        }
+    }
+
     pub(crate) fn module_bytes(&self, module_id: &str) -> Result<Vec<u8>> {
         self.module_registry
             .lock()
@@ -482,7 +611,31 @@ impl Runtime {
             .ok_or_else(|| Error::UnknownModule(module_id.to_string()))
     }
 
-    fn poll_guest_until_stalled(&self, process_id: ProcessId) {
+    /// Executes the guest reactor until it stalls.
+    ///
+    /// Only one thread may execute a given guest's WASM store at a time.
+    /// Callers that lose the race (e.g. a mailbox wake delivered from the
+    /// network poller thread while the hostcall thread is already polling)
+    /// return immediately: the executing thread re-checks for pending
+    /// mailbox wakes *after* releasing the execution guard, so any wake
+    /// that raced with its pass either gets seen here or is picked up by
+    /// the waking thread itself. No wake is lost.
+    pub(crate) fn poll_guest_until_stalled(&self, process_id: ProcessId) {
+        loop {
+            if !self.try_begin_guest_exec(process_id) {
+                return;
+            }
+            self.poll_guest_once(process_id);
+            self.end_guest_exec(process_id);
+            // Check outside the guard: if a wake lands after this point,
+            // the waking thread acquires the free guard and polls itself.
+            if !self.has_pending_wake(process_id) {
+                return;
+            }
+        }
+    }
+
+    fn poll_guest_once(&self, process_id: ProcessId) {
         let Some(mut loaded_guest) = self.loaded_guests.lock().remove(&process_id) else {
             return;
         };
@@ -491,6 +644,9 @@ impl Runtime {
                 .app
                 .call_function(loaded_guest.module_index, "__selium_guest_poll", &[]);
         self.loaded_guests.lock().insert(process_id, loaded_guest);
+        // Kick outbound network proxies on reactor stall — the guest may
+        // have written outbound frames before parking.
+        self.kick_network_waiters();
         if let Err(error) = result {
             debug!(
                 process_id,
@@ -498,6 +654,73 @@ impl Runtime {
                 "guest poll after mailbox wake failed"
             );
         }
+    }
+
+    /// Registers the process that receives from a host queue, so kernel-side
+    /// sends can wake it (see `wake_queue_waiter`).
+    pub(crate) fn register_queue_waiter(&self, queue_local_id: u64, process_id: ProcessId) {
+        self.queue_waiters.lock().insert(queue_local_id, process_id);
+    }
+
+    /// Wakes the guest task(s) parked receiving from `queue_local_id`.
+    /// Called after a kernel-side `host_queue_send` (e.g. the network
+    /// poller enqueuing an accepted connection): without this the parked
+    /// `HostQueueRecvWait` would never be re-polled.
+    ///
+    /// Each waiter is woken through the mailbox so the exact parked guest
+    /// task re-polls its hostcall; a queued item is visible to that poll.
+    pub(crate) fn wake_queue_waiter(&self, queue_local_id: u64) {
+        let targets: Vec<(ProcessId, TaskId)> = {
+            let operations = self.operations.lock();
+            operations
+                .values()
+                .filter_map(|operation| match operation.state {
+                    HostOperationState::HostQueueRecvWait { local_id, .. }
+                        if local_id == queue_local_id =>
+                    {
+                        operation.task_id.map(|task_id| (operation.process_id, task_id))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            // No tracked per-task waiter: defer a plain reactor poll for the
+            // queue's owning process.
+            let process_id = self.queue_waiters.lock().get(&queue_local_id).copied();
+            if let Some(process_id) = process_id {
+                self.pending_exec.lock().insert(process_id);
+            }
+            return;
+        }
+        for (process_id, task_id) in targets {
+            self.enqueue_wake_deferred(process_id, task_id);
+        }
+    }
+
+    /// Marks a guest as being executed. Returns false if another thread is
+    /// currently inside this guest's reactor.
+    fn try_begin_guest_exec(&self, process_id: ProcessId) -> bool {
+        self.executing_guests.lock().insert(process_id)
+    }
+
+    fn end_guest_exec(&self, process_id: ProcessId) {
+        self.executing_guests.lock().remove(&process_id);
+    }
+
+    /// Returns true if the process's mailbox holds at least one undelivered
+    /// task wake (flag handshake: set by `enqueue`, cleared by guest drain).
+    /// A stopped/unknown process has no pending wakes.
+    fn has_pending_wake(&self, process_id: ProcessId) -> bool {
+        let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned() else {
+            return false;
+        };
+        let Ok(memory) = mailbox.memory.lock() else {
+            return false;
+        };
+        memory
+            .read_u32(mailbox.base + selium_abi::mailbox::FLAG_OFFSET as u32)
+            .is_ok_and(|flag| flag != 0)
     }
 }
 

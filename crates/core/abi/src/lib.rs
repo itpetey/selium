@@ -702,6 +702,15 @@ pub enum HostcallRequest {
         /// Shared region id of the log channel to register.
         shared_id: SharedResourceId,
     },
+    /// Register the calling task as waiting on a generation advance of a
+    /// host-writable shared-memory ring. The host will wake the task via
+    /// the mailbox when the region's generation advances past `generation`.
+    WaitRegister {
+        /// Shared region id of the ring to watch.
+        region_id: SharedResourceId,
+        /// Generation value that the task is waiting to see advanced.
+        generation: u64,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.
@@ -1671,5 +1680,19 @@ mod tests {
             ResourceSelector::ExplicitResource(ResourceIdentity::Shared(1)).is_evaluatable(empty)
         );
         assert!(ResourceSelector::Children.is_evaluatable(empty));
+    }
+
+    #[test]
+    fn wait_register_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::WaitRegister {
+                region_id: 42,
+                generation: 7,
+            },
+            task_id: Some(3),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
     }
 }

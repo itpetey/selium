@@ -1,11 +1,14 @@
 use std::{
+    io,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use parking_lot::Mutex;
+
 use crate::{
     host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState,
-    process::ProcessTable, storage::StorageRegistry,
+    poller::Poller, process::ProcessTable, storage::StorageRegistry,
 };
 
 #[derive(Clone)]
@@ -19,6 +22,7 @@ pub(crate) struct KernelInner {
     pub(crate) storage: StorageRegistry,
     pub(crate) network: NetworkState,
     pub(crate) queues: HostQueueRegistry,
+    pub(crate) poller: Mutex<Option<Poller>>,
 }
 
 impl Kernel {
@@ -30,8 +34,27 @@ impl Kernel {
                 storage: StorageRegistry::new(),
                 network: NetworkState::new(),
                 queues: HostQueueRegistry::new(),
+                poller: Mutex::new(None),
             }),
         }
+    }
+
+    /// Initialises the mio event poller if not already initialised and
+    /// returns it. Idempotent: repeated calls return the existing poller
+    /// rather than creating (and orphaning) another one.
+    pub fn init_poller(&self) -> io::Result<Poller> {
+        let mut guard = self.inner.poller.lock();
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        let poller = Poller::new()?;
+        *guard = Some(poller.clone());
+        Ok(poller)
+    }
+
+    /// Returns the poller if initialised.
+    pub fn poller(&self) -> Option<Poller> {
+        self.inner.poller.lock().clone()
     }
 
     pub fn memory(&self) -> MemoryRegistry {

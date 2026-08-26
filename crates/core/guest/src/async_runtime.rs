@@ -8,9 +8,12 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use selium_abi::TaskId;
+use selium_abi::{HostcallRequest, TaskId};
 
-use crate::platform::{drain_mailbox, register_mailbox};
+use crate::{
+    hostcall::hostcall_ready_with_task,
+    platform::{drain_mailbox, register_mailbox},
+};
 
 type WaitMap = HashMap<(u64, u64), Vec<Waker>>;
 
@@ -301,6 +304,7 @@ fn poll_backgrounds() -> bool {
 }
 
 fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
+    // Register with the guest's own gen-wait map (for guest-writable rings).
     GEN_WAIT_MAP.with(|cell| {
         let mut opt = cell.borrow_mut();
         let map = opt.get_or_insert_with(HashMap::new);
@@ -308,6 +312,22 @@ fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
             .or_default()
             .push(waker.clone());
     });
+
+    // Notify the host that this guest task is parked on a host-writable
+    // ring so the host can wake us when it advances the generation.
+    // If the region is guest-writable, the WaitRegister is harmless
+    // (the host will never advance it, so no wake comes from this path).
+    if let Some(task_id) = current_task_id() {
+        // Best-effort: if the hostcall fails, the gen-wait map still holds
+        // the waker, and the backstop wake path may still fire.
+        let _ = hostcall_ready_with_task(
+            HostcallRequest::WaitRegister {
+                region_id,
+                generation: observed_generation,
+            },
+            task_id,
+        );
+    }
 }
 
 fn wake_gen_waiters(region_id: u64, new_generation: u64) {

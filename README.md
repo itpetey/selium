@@ -54,6 +54,17 @@ cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-discov
 cargo test -p selium-runtime --test discovery -- --ignored
 ```
 
+**Network wake** — a real guest (`crates/guests/net-demo`) binds a listener
+and parks a read on an inbound ring; a host TCP client connects and writes.
+Verifies the event-driven proxy paths end-to-end: kernel-poller accept,
+`WaitRegister` → mailbox wake of the parked task, stall-kick outbound drain
+(well under the bounded backstop), and EOF propagation:
+
+```sh
+cargo build --target wasm32-unknown-unknown -p selium-net-demo
+cargo test -p selium-runtime --test net_wake -- --ignored
+```
+
 ## Deferred (explicitly not working yet)
 
 - Networking (TCP/UDP bridges, QUIC, external clients)
@@ -83,6 +94,7 @@ are not in the workspace and do not build.
 | `crates/guests/discovery` | Discovery system guest (URI registration/resolution store + wiring) |
 | `crates/guests/discovery-probe` | Discovery probe test fixture guest (exercises Tier-2 RPC against discovery) |
 | `crates/guests/spine-demo` | Golden-path demo guest used by the spine test |
+| `crates/guests/net-demo` | Network demo guest used by the event-driven proxy wake test |
 
 ## Building
 

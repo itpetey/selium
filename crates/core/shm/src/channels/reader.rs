@@ -184,6 +184,15 @@ impl AsyncRead for BlockingReader {
                         cx.waker(),
                     ) {
                         cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    // Check-after-register: a writer may have committed
+                    // between our empty check and the registration. Re-arm
+                    // so we are re-polled and observe the data.
+                    if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
+                        || self.region.load_generation().ok() != Some(cur_gen)
+                    {
+                        cx.waker().wake_by_ref();
                     }
                     return Poll::Pending;
                 }
@@ -216,6 +225,12 @@ impl AsyncRead for BlockingReader {
                 cur_gen,
                 cx.waker(),
             ) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            // Check-after-register: the frame may have been committed
+            // between our readiness check and the registration.
+            if self.region.load_generation().ok() != Some(cur_gen) {
                 cx.waker().wake_by_ref();
             }
             return Poll::Pending;
@@ -353,6 +368,15 @@ impl AsyncRead for Reader {
                         cur_gen,
                         cx.waker(),
                     );
+                    // Check-after-register: a writer may have committed
+                    // between our empty check and the registration, leaving
+                    // this registration permanently stale. Re-arm so we are
+                    // re-polled and observe the data.
+                    if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
+                        || self.region.load_generation().ok() != Some(cur_gen)
+                    {
+                        cx.waker().wake_by_ref();
+                    }
                     return Poll::Pending;
                 }
                 Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
@@ -379,6 +403,12 @@ impl AsyncRead for Reader {
                 cur_gen,
                 cx.waker(),
             ) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            // Check-after-register: the frame may have been committed
+            // between our readiness check and the registration.
+            if self.region.load_generation().ok() != Some(cur_gen) {
                 cx.waker().wake_by_ref();
             }
             return Poll::Pending;

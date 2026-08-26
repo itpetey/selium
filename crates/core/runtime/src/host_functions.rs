@@ -105,6 +105,11 @@ impl HostFunc for HostcallCreateHostFunc {
             envelope.task_id,
             guest_memory(caller).ok(),
         );
+        // Kick outbound network proxies after every guest→host transition,
+        // and run any reactor polls deferred by cross-thread wakes (this
+        // thread owns the guest's thread-local reactor state).
+        self.runtime.kick_network_waiters();
+        self.runtime.drain_pending_exec();
         Ok(vec![WasmValue::I64(
             pack_hostcall_status(status, operation_id as u32) as i64,
         )])
@@ -125,6 +130,10 @@ impl HostFunc for HostcallPollHostFunc {
         let out_ptr = wasm_i32_arg(args, 1)?.cast_unsigned();
         let out_capacity = wasm_i32_arg(args, 2)?.cast_unsigned() as usize;
         let state = self.runtime.poll_hostcall(self.process_id, operation_id);
+        // Kick outbound network proxies on every guest→host transition,
+        // and run any reactor polls deferred by cross-thread wakes.
+        self.runtime.kick_network_waiters();
+        self.runtime.drain_pending_exec();
         let status = match state {
             CompletionState::Ready(_) => selium_abi::HOSTCALL_STATUS_READY,
             CompletionState::Pending { .. } => selium_abi::HOSTCALL_STATUS_PENDING,

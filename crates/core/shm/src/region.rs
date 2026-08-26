@@ -100,9 +100,17 @@ impl ChannelRegion {
 
     /// Wraps an existing region mapping as a channel region.
     pub fn from_mapping(mapping: RegionMapping, capacity: u64) -> Self {
+        Self::from_mapping_with_id(mapping, capacity, 0)
+    }
+
+    /// Like [`Self::from_mapping`], but records the shared region id so
+    /// generation-wait registrations name the correct region. Callers that
+    /// attach a known shared region MUST supply its id; otherwise
+    /// `WaitRegister`-style wakeups cannot be routed.
+    pub fn from_mapping_with_id(mapping: RegionMapping, capacity: u64, region_id: u64) -> Self {
         let size = DATA_OFFSET + capacity;
         Self {
-            region_id: 0,
+            region_id,
             mapping,
             region: None,
             private: Arc::new(ChannelPrivateState::default()),

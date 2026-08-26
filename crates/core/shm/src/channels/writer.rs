@@ -305,13 +305,15 @@ fn write_frame_bytes(region: &ChannelRegion, pos: u64, buf: &[u8]) -> Result<()>
     // Step 2: Release fence ensures payload is visible before the header.
     fence(Ordering::Release);
 
-    // Step 3: Write header at pos (already has FLAG_READY from the codec).
-    write_raw(
-        region,
-        pos,
+    // Step 3: Write header at pos with FLAG_READY set. Readers gate on
+    // `is_ready()`; committing without it makes the frame permanently
+    // invisible to them (matches the canonical layout::write_frame).
+    let mut header = FrameHeader::decode(
         buf.get(..FrameHeader::ENCODED_SIZE).unwrap_or_default(),
-        mask,
-    )?;
+    )
+    .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+    header.flags |= FrameHeader::FLAG_READY;
+    write_raw(region, pos, &header.encode(), mask)?;
 
     // Step 4: Bump generation counter and notify waiters.
     region.bump_generation()?;

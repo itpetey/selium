@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use parking_lot::Mutex;
-use selium_abi::{OperationId, ProcessId, ResourceClass, ResourceKind};
+use selium_abi::{OperationId, ProcessId, ResourceClass, ResourceKind, TaskId};
 use selium_kernel::Kernel;
 use selium_shm::transport::ShmTransport;
 use selium_wire::pubsub::Publisher;
@@ -13,6 +13,20 @@ use crate::{
     bootstrap::LoadedGuest, config::ProcessAuthority, error::Result, hostcall::HostOperation,
     mailbox::GuestMailbox, region_provider::RuntimeRegionProvider,
 };
+
+/// Wait registry entry: (process_id, task_id, generation) for a region.
+/// When the host advances the generation on a region past a registered
+/// generation, the registered task is woken via the mailbox.
+#[derive(Debug, Clone)]
+pub(crate) struct WaitEntry {
+    pub(crate) process_id: ProcessId,
+    pub(crate) task_id: TaskId,
+    pub(crate) region_id: u64,
+    pub(crate) generation: u64,
+}
+
+/// Wait registry keyed by (process_id, region_id).
+pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
 
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
@@ -39,6 +53,25 @@ pub struct Runtime {
     pub(crate) discovery_listener_shared_id: Arc<Mutex<Option<u64>>>,
     /// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
     pub(crate) region_purposes: Arc<Mutex<RegionPurposes>>,
+    /// Wait registry: guest tasks parked on host-writable rings.
+    pub(crate) wait_registry: Arc<Mutex<WaitRegistry>>,
+    /// Wait keys for active network outbound proxy threads.
+    /// Each entry is `(shared_id, wait_key)` used to kick the proxy
+    /// on guest→host transitions.
+    pub(crate) network_wait_keys: Arc<Mutex<Vec<(u64, usize)>>>,
+    /// Process ids whose reactor has pending mailbox wakes delivered from
+    /// cross-thread (kernel poller) callbacks. Their reactors are polled by
+    /// `drain_pending_exec` on the owning thread.
+    pub(crate) pending_exec: Arc<Mutex<HashSet<ProcessId>>>,
+    /// Maps a host queue's local id to the process that owns its receiver,
+    /// so kernel-side sends (e.g. an accepted connection enqueued by the
+    /// network poller) can wake the parked receiving guest.
+    pub(crate) queue_waiters: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Process ids whose guest reactor is currently being executed by a
+    /// host thread. Guarantees at most one thread enters a guest's WASM
+    /// store; losers of the race return and rely on the winner's
+    /// pending-wake re-check (see `poll_guest_until_stalled`).
+    pub(crate) executing_guests: Arc<Mutex<HashSet<ProcessId>>>,
 }
 
 impl Runtime {
@@ -55,7 +88,7 @@ impl Runtime {
         let operations = Arc::new(Mutex::new(HashMap::<OperationId, HostOperation>::new()));
         let mailboxes = Arc::new(Mutex::new(HashMap::<ProcessId, Arc<GuestMailbox>>::new()));
 
-        Self {
+        let runtime = Self {
             kernel,
             process_authorities: Arc::new(Mutex::new(HashMap::new())),
             loaded_guests: Arc::new(Mutex::new(HashMap::new())),
@@ -68,7 +101,25 @@ impl Runtime {
             discovery_publisher: Arc::new(Mutex::new(None)),
             discovery_listener_shared_id: Arc::new(Mutex::new(None)),
             region_purposes: Arc::new(Mutex::new(HashMap::new())),
+            wait_registry: Arc::new(Mutex::new(HashMap::new())),
+            network_wait_keys: Arc::new(Mutex::new(Vec::new())),
+            queue_waiters: Arc::new(Mutex::new(HashMap::new())),
+            pending_exec: Arc::new(Mutex::new(HashSet::new())),
+            executing_guests: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        // Initialise the mio network poller if possible (best-effort).
+        // Tests that don't need networking can use Runtime::default()
+        // without a poller; it simply won't drive any sockets.
+        if let Ok(poller) = runtime.kernel.init_poller() {
+            let rt = runtime.clone();
+            poller.set_generation_advance(move |region_id, new_gen| {
+                rt.note_generation_advance(region_id, new_gen);
+            });
+            poller.start_background();
         }
+
+        runtime
     }
 
     /// Returns a clone of the runtime kernel handle.

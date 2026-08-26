@@ -107,8 +107,10 @@ impl TcpStream {
             .length
             .saturating_sub(selium_shm::layout::DATA_OFFSET);
 
-        let inbound_region = ChannelRegion::from_mapping(inbound_mapping, ring_cap);
-        let outbound_region = ChannelRegion::from_mapping(outbound_mapping, ring_cap);
+        let inbound_region =
+            ChannelRegion::from_mapping_with_id(inbound_mapping, ring_cap, shared_id);
+        let outbound_region =
+            ChannelRegion::from_mapping_with_id(outbound_mapping, ring_cap, shared_id);
 
         let inbound_ring = RingBuf::wrap_region(inbound_region)
             .map_err(|e| GuestError::Host(format!("wrap inbound ring failed: {e}")))?;

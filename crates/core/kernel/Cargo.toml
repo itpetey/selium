@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+mio = { version = "1", features = ["net", "os-poll"] }
 parking_lot.workspace = true
 selium-abi.workspace = true
 selium-memory.workspace = true
