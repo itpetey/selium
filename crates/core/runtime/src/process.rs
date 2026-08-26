@@ -550,17 +550,17 @@ impl Runtime {
                 !entries.is_empty()
             });
         }
-        // This may run on a kernel (poller) thread: the guest reactor's
-        // state is thread-local, so cross-thread wakes must only ENQUEUE
-        // mailbox entries here. Execution is deferred to the owning thread
-        // via `pending_exec` (see `drain_pending_exec`).
+        // SPIKE: deliver cross-thread wakes directly (mailbox + inline
+        // reactor poll under the execution guard) to test the
+        // thread-affinity hypothesis. See
+        // openspec/changes/guest-reactor-cross-thread-wakes.
         let mut seen = std::collections::HashSet::new();
         for (process_id, task_id) in wakeups {
             if !seen.insert((process_id, task_id)) {
                 continue;
             }
             self.cancel_waits_for_task(process_id, task_id);
-            self.enqueue_wake_deferred(process_id, task_id);
+            self.wake_process_task(process_id, task_id);
         }
     }
 
@@ -572,6 +572,7 @@ impl Runtime {
     /// thread next calls [`Self::drain_pending_exec`] — automatically at
     /// every hostcall create/poll boundary, or explicitly from embedder/test
     /// code that owns the guest.
+    #[expect(dead_code, reason = "spike: bypassed by direct wake_process_task")]
     pub(crate) fn enqueue_wake_deferred(&self, process_id: ProcessId, task_id: TaskId) {
         self.pending_exec.lock().insert(process_id);
         if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned()
@@ -686,16 +687,17 @@ impl Runtime {
                 .collect()
         };
         if targets.is_empty() {
-            // No tracked per-task waiter: defer a plain reactor poll for the
-            // queue's owning process.
+            // No tracked per-task waiter: poll the queue's owning process
+            // directly (SPIKE: inline, no deferral).
             let process_id = self.queue_waiters.lock().get(&queue_local_id).copied();
             if let Some(process_id) = process_id {
-                self.pending_exec.lock().insert(process_id);
+                self.poll_guest_until_stalled(process_id);
             }
             return;
         }
         for (process_id, task_id) in targets {
-            self.enqueue_wake_deferred(process_id, task_id);
+            // SPIKE: direct cross-thread wake (mailbox + inline poll).
+            self.wake_process_task(process_id, task_id);
         }
     }
 

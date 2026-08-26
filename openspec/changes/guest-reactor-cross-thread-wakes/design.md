@@ -56,8 +56,31 @@ path → implement Path A.
 `RefCell` borrow panics, instrument static addresses across threads);
 implement Path B.
 
-The spike result and evidence are recorded in this file before the
-implementation tasks are checked off.
+### Spike result: OUTCOME A (2025-08, branch `spike/reactor-cross-thread-wakes`)
+
+Changes: `note_generation_advance` and `wake_queue_waiter` route
+through `wake_process_task` directly — mailbox wake + inline reactor
+poll executed **on the kernel poller thread** whenever the execution
+guard is free. No deferral.
+
+Evidence:
+
+- `net_wake --ignored`: **10/10 consecutive passes** (~2.1 s each).
+  Every pass exercises poller-thread inline WASM execution three ways:
+  accept (`HostQueueRecvWait` wake), data arrival
+  (`WaitRegister`/generation wake), and EOF generation bump.
+- Full `selium-runtime` + `selium-kernel` suites: green (37 lib tests,
+  all integration tests).
+- Parallel stress: 4 concurrent test processes × 3 rounds = **12/12
+  passes**, scrambling poller/reactor/hostcall interleavings across
+  processes. (An initial parallel batch failed, but the cause was the
+  stress harness resolving the wasm fixture path relative to CWD — not
+  concurrency.)
+
+Conclusion: guest reactor state behaves as shared linear-memory statics
+on the wasm execution path, as predicted by TLS lowering for
+`wasm32-unknown-unknown`. Cross-thread reactor execution under the
+existing execution guard is correct. Implement **Path A**.
 
 ## Path A — Inline cross-thread wakes (expected)
 
