@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the guest-facing network SDK surface (`selium-guest` net module): TCP listener/stream and UDP datagram handles backed by shared-memory rings, literals-only addressing, raw-stream escape hatch, and the Quinn adapter implementations.
+
+## Requirements
 
 ### Requirement: Guest TCP Listener
 `selium-guest` SHALL provide a `TcpListener` whose `bind(address)` issues
@@ -65,8 +69,6 @@ regardless of any higher-level protocol overlays built on it.
 - **THEN** pending reads SHALL park the task until ring generation
   advances, and pending writes SHALL obey ring backpressure
 
-## MODIFIED Requirements
-
 ### Requirement: TCP Stream via Shared-Memory Ring Buffer
 `selium-guest` SHALL provide a `TcpStream` handle that uses `Reader` and
 `Writer` (strong byte-stream handles) over the shared-memory ring buffer
@@ -88,8 +90,7 @@ addresses SHALL be IP literals (see Literals-Only Network Addresses).
   buffer and copies payload bytes into the provided `ReadBuf`
 
 #### Scenario: Guest writes data to TCP stream
-- **WHEN** a guest calls `AsyncWrite::poll_write` on a connected
-  `TcpStream`
+- **WHEN** a guest calls `AsyncWrite::poll_write` on a connected `TcpStream`
 - **THEN** the implementation SHALL delegate to the inner
   `Writer::poll_write`, which writes the data as a framed message to the
   outbound ring buffer

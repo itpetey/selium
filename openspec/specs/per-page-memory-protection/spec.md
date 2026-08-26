@@ -1,19 +1,8 @@
-## ADDED Requirements
+## Purpose
 
-### Implementation Status (Active)
-Per-page memory protection enforcement via wasmtiny's `map_shared_region` is now implemented and active.
+Define per-page memory protection for shared-region attachments: reader-slot cursor pages are the only writable pages for consumers, producers get full access, and enforcement happens in the OS kernel via `mprotect` rather than runtime software checks.
 
-**How it works**:
-1. `AllocRegion` allocates a shared region in wasmtiny's `SharedMemoryRegistry` and returns a region id. The allocating guest must call `AttachRegion` to map the region into its linear memory.
-2. `AttachRegion` calls wasmtiny's `map_shared_region()` which uses `mmap(MAP_FIXED | MAP_SHARED)` with per-page `mprotect` based on the `prot` and `reader_slot` parameters. The real `page_offset` is returned to the caller.
-3. `FreeRegion` detaches the region from all loaded guests' wasm memory and cleans up all kernel-level mappings before destroying the region in wasmtiny.
-4. The kernel, runtime, and wasmtiny share a single `SharedMemoryRegistry` via `Store::shared_memory_registry()`, ensuring that regions allocated through one path are visible to all others.
-
-**Key components**:
-- `wasmtiny`: Added `WasmApplication::with_store()`, `AotRuntime::with_store()` — shares a `Store` (and its `SharedMemoryRegistry`) between kernel and guests. `Memory::map_shared_region()` applies `mprotect` per page.
-- `selium-kernel`: Added `shared_store()`, `wasmtiny_region_id()`, `detach_all_shared_mappings()`.
-- `selium-runtime`: `load_guest_module()` uses `kernel.shared_store()`. `AllocRegion`/`AttachRegion`/`FreeRegion` hostcalls route through wasmtiny with real protection parameters.
-- Integration test `attach_accepts_protection_and_reader_slot` verifies the hostcall succeeds, returns a non-zero `page_offset`, and cleanup completes without error.
+## Requirements
 
 ### Requirement: Per-Page Memory Protection on Attach
 When a guest attaches to a shared region with a `reader_slot` parameter, the host SHALL map the region such that only the designated reader cursor page is writable; all other pages SHALL be mapped read-only.
