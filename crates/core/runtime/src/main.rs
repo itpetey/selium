@@ -1,10 +1,16 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{PathBuf},
+    time::Duration,
+};
 
 use anyhow::Result;
 use clap::Parser;
+use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_kernel::Kernel;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
 struct AppDef {
@@ -23,6 +29,14 @@ struct Cli {
     /// Start the discovery subsystem
     #[arg(long, default_value_t = false)]
     start_discovery: bool,
+
+    /// Run the event-driven network wake demo: bootstraps the bundled
+    /// net-demo guest (built for wasm32-unknown-unknown) and serves until
+    /// Ctrl-C. Connect to the printed listener address and send a line —
+    /// the guest progresses purely on kernel-thread wakes; this process
+    /// contains no wake-delivery or reactor-pumping code.
+    #[arg(long, default_value_t = false)]
+    demo_net_wake: bool,
 
     /// One or more app definitions.
     ///
@@ -64,6 +78,10 @@ async fn main() -> Result<()> {
 
     let kernel = Kernel::default();
     let runtime = Runtime::new(kernel);
+
+    if cli.demo_net_wake {
+        return run_demo_net_wake(runtime).await;
+    }
 
     let config = RuntimeConfig {
         start_discovery: cli.start_discovery,
@@ -186,4 +204,109 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
         tenant,
         readiness,
     })
+}
+
+/// Path to the compiled net-demo WASM module.
+fn net_demo_wasm_path() -> PathBuf {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
+}
+
+fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "net-demo".to_string(),
+        module_id: "net-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "net_demo".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+            ),
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            // Receiving from the bind-created host queue needs HostQueue.
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+    }
+}
+
+/// Event-driven network wake demo (task 4.3): bootstraps the net-demo
+/// guest, then serves until Ctrl-C. The service loop below performs NO
+/// wake delivery and no reactor pumping — the guest's parked tasks are
+/// driven entirely by kernel threads (poller accept, WaitRegister/mailbox
+/// generation wakes, EOF bumps) under the runtime's execution guard. This
+/// is the proof that the deferred-exec footgun is gone: delete every line
+/// of this loop except the log printing and the guest still progresses.
+async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
+    let path = net_demo_wasm_path();
+    let module_bytes = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "net demo guest not found at {} ({error}).\nBuild it first:\n  \
+             cargo build --target wasm32-unknown-unknown -p selium-net-demo",
+            path.display()
+        )
+    });
+
+    let report = runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![net_demo_descriptor(module_bytes)],
+        })
+        .map_err(|error| anyhow::anyhow!("bootstrap: {error}"))?;
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "exactly one guest was bootstrapped above"
+    )]
+    let process_id = report.guests[0].process_id;
+
+    // Give the guest a moment to bind its listener before we print hints.
+    sleep(Duration::from_millis(300)).await;
+    let addrs = runtime.kernel().network().tcp_listener_addrs();
+    println!("=== net-wake demo running — press Ctrl-C to stop ===");
+    if let Some(addr) = addrs.first() {
+        println!("connect and send a line, e.g.:  nc {addr} <<< 'hello'");
+    } else {
+        println!("(no guest listeners registered yet)");
+    }
+
+    // Service phase: host-side cosmetics only (log printing). Everything
+    // that makes the guest progress happens on kernel threads.
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("--- ctrl-c received, stopping guests ---");
+                break;
+            }
+            _ = sleep(Duration::from_millis(500)) => {
+                let frames = runtime
+                    .kernel()
+                    .processes()
+                    .drain_log_channel(process_id)
+                    .map_err(|error| anyhow::anyhow!("drain log channel: {error}"))?;
+                for frame in &frames {
+                    let record = selium_encoding::log::LogRecord::decode(frame)
+                        .map_err(|error| anyhow::anyhow!("decode log record: {error}"))?;
+                    println!("  [guest] {}", record.message);
+                }
+            }
+        }
+    }
+
+    runtime.stop_process(process_id)?;
+    Ok(())
 }

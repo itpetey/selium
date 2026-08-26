@@ -23,5 +23,5 @@ Outcome A confirmed — Path B not needed; tasks cancelled.
 
 - [x] 4.1 `net_wake --ignored` passes **without any** `drain_pending_exec()` calls — idle parked guests progress purely on kernel-poller wakes
 - [x] 4.2 Concurrency stress test: N threads delivering wakes to one guest while it polls; no lost wakes, no panics, deterministic completion counts (`concurrent_wake_delivery_never_loses_wakes`; also hardened `poll_guest_until_stalled` against unbounded spinning when a poll cannot clear the mailbox)
-- [ ] 4.3 Long-running embedder example: `main.rs` demonstrates an idle guest progressing on socket data with no service loop (replaces the Phase-1 `Runtime::service` idea)
+- [x] 4.3 Long-running embedder example: `main.rs --demo-net-wake` bootstraps `net-demo`, prints its listener address, and serves until Ctrl-C — the service loop contains no wake-delivery or reactor-pumping code; idle guests progress purely on kernel-poller wakes
 - [x] 4.4 Full sweep green: `cargo test -p selium-{abi,shm,kernel,guest,runtime}`, wasm build of `net-demo`, clippy clean on touched crates
