@@ -350,6 +350,7 @@ fn encoding_path() -> proc_macro2::TokenStream {
         Ok("selium_guest") => quote! { crate::encoding },
         Ok("selium_encoding") => quote! { crate },
         Ok("selium_wire") => quote! { selium_encoding },
+        Ok("selium_proto_http") => quote! { selium_encoding },
         _ => quote! { selium_guest::encoding },
     }
 }

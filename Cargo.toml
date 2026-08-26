@@ -7,9 +7,11 @@ members = [
   "crates/core/guest/macros",
   "crates/core/kernel",
   "crates/core/memory",
+  "crates/core/proto-http",
   "crates/core/runtime",
   "crates/core/shm",
   "crates/core/wire",
+  "crates/guests/connector-http",
   "crates/guests/discovery",
   "crates/guests/discovery-probe",
   "crates/guests/net-demo",
@@ -46,7 +48,9 @@ proc-macro2 = { version = "1.0", default-features = false }
 quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 selium-abi = { path = "crates/core/abi", default-features = false }
+selium-connector-http = { path = "crates/guests/connector-http", default-features = false }
 selium-encoding = { path = "crates/core/encoding", default-features = false }
+selium-proto-http = { path = "crates/core/proto-http", default-features = false }
 selium-guest = { path = "crates/core/guest", default-features = false }
 selium-guest-macros = {
   path = "crates/core/guest/macros",

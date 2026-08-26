@@ -1,0 +1,33 @@
+// FlatBuffers schema for HTTP protocol wire types.
+// Used by the HTTP connector and http-served app guests.
+
+namespace selium.http;
+
+table HttpHeader {
+    name: string;
+    value: string;
+}
+
+table HttpRequest {
+    method: string;
+    uri: string;
+    headers: [HttpHeader];
+    body: [ubyte];          // inline body bytes (empty for streamed bodies)
+}
+
+table HttpResponse {
+    status: ushort;
+    headers: [HttpHeader];
+    body: [ubyte];          // inline body bytes (empty for streamed bodies)
+}
+
+table HttpBodyChunk {
+    data: [ubyte];          // a chunk of body data for streaming
+}
+
+table HttpTrailer {
+    name: string;
+    value: string;
+}
+
+root_type HttpRequest;
