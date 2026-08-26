@@ -7,8 +7,8 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
-    host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState,
-    poller::Poller, process::ProcessTable, storage::StorageRegistry,
+    host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState, poller::Poller,
+    process::ProcessTable, storage::StorageRegistry,
 };
 
 #[derive(Clone)]

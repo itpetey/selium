@@ -16,16 +16,18 @@ use std::{
     time::Duration,
 };
 
-use mio::{Events, Interest, Token};
-use mio::net::{TcpListener, TcpStream, UdpSocket};
+use mio::{
+    Events, Interest, Token,
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 use parking_lot::Mutex;
 use selium_shm::layout::RingWriter;
-/// Callback invoked when the host advances a ring generation.
-pub type GenerationAdvanceFn = Box<dyn Fn(u64, u64) + Send + Sync + 'static>;
 
 /// Callback invoked when a TCP listener accepts a new connection.
 /// Receives a freshly accepted std TcpStream.
 pub type AcceptFn = Box<dyn Fn(StdTcpStream) + Send + 'static>;
+/// Callback invoked when the host advances a ring generation.
+pub type GenerationAdvanceFn = Box<dyn Fn(u64, u64) + Send + Sync + 'static>;
 
 /// Poller entry for a registered socket.
 enum PollerEntry {
@@ -50,6 +52,12 @@ enum PollerEntry {
     },
 }
 
+/// Thread-safe mio poller for event-driven network I/O.
+#[derive(Clone)]
+pub struct Poller {
+    inner: Arc<PollerInner>,
+}
+
 /// Shared inner state for the poller.
 struct PollerInner {
     poll: Mutex<mio::Poll>,
@@ -57,12 +65,6 @@ struct PollerInner {
     next_token: Mutex<usize>,
     generation_advance: Mutex<Option<Arc<GenerationAdvanceFn>>>,
     running: AtomicBool,
-}
-
-/// Thread-safe mio poller for event-driven network I/O.
-#[derive(Clone)]
-pub struct Poller {
-    inner: Arc<PollerInner>,
 }
 
 impl Poller {
@@ -277,18 +279,24 @@ impl Poller {
                 if finished {
                     self.deregister(&mut stream, token);
                 } else {
-                    self.reinsert(token, PollerEntry::TcpStream {
-                        stream,
-                        inbound_writer,
-                        region_id,
-                        running,
-                    });
+                    self.reinsert(
+                        token,
+                        PollerEntry::TcpStream {
+                            stream,
+                            inbound_writer,
+                            region_id,
+                            running,
+                        },
+                    );
                 }
             }
             Some(mut entry @ PollerEntry::TcpListener { .. }) => {
                 // Split out the fields we mutate, keeping `_mio_listener`
                 // alive inside `entry` so the registration stays active.
-                #[expect(clippy::unreachable, reason = "variant matched above; irrefutable otherwise")]
+                #[expect(
+                    clippy::unreachable,
+                    reason = "variant matched above; irrefutable otherwise"
+                )]
                 let PollerEntry::TcpListener {
                     listener,
                     accept_fn,
@@ -334,9 +342,7 @@ impl Poller {
                         let payload = buf.get(..n).unwrap_or(&[]);
                         let frame = crate::network::encode_udp_frame(addr, payload);
                         if recv_writer.write_frame(&frame, 0, 0).is_err() {
-                            eprintln!(
-                                "inbound ring full for region {region_id}; dropped datagram"
-                            );
+                            eprintln!("inbound ring full for region {region_id}; dropped datagram");
                         } else if let Some(cb) = advance.as_ref()
                             && let Ok(new_gen) = recv_writer.generation()
                         {
@@ -354,12 +360,15 @@ impl Poller {
                     let mut socket = socket;
                     self.deregister_udp(&mut socket, token);
                 } else {
-                    self.reinsert(token, PollerEntry::UdpSocket {
-                        socket,
-                        recv_writer,
-                        region_id,
-                        running,
-                    });
+                    self.reinsert(
+                        token,
+                        PollerEntry::UdpSocket {
+                            socket,
+                            recv_writer,
+                            region_id,
+                            running,
+                        },
+                    );
                 }
             }
             None => {}
@@ -374,24 +383,14 @@ impl Poller {
     /// Removes a finished TCP stream's fd from the mio registry so the
     /// token/socket are not leaked.
     fn deregister(&self, stream: &mut mio::net::TcpStream, token: Token) {
-        let result = self
-            .inner
-            .poll
-            .lock()
-            .registry()
-            .deregister(stream);
+        let result = self.inner.poll.lock().registry().deregister(stream);
         if let Err(e) = result {
             eprintln!("poller deregister failed for token {:?}: {e}", token.0);
         }
     }
 
     fn deregister_udp(&self, socket: &mut mio::net::UdpSocket, token: Token) {
-        let result = self
-            .inner
-            .poll
-            .lock()
-            .registry()
-            .deregister(socket);
+        let result = self.inner.poll.lock().registry().deregister(socket);
         if let Err(e) = result {
             eprintln!("poller deregister failed for token {:?}: {e}", token.0);
         }
@@ -429,6 +428,9 @@ mod tests {
         while !accepted.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(accepted.load(Ordering::Relaxed), "accept callback never fired");
+        assert!(
+            accepted.load(Ordering::Relaxed),
+            "accept callback never fired"
+        );
     }
 }

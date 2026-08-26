@@ -1,6 +1,7 @@
 //! Selium kernel primitives.
 
 pub use backend::KernelBackend;
+pub use backend::shared_offset_key;
 pub use error::{Error, Result};
 pub use host_queue::HostQueueRegistry;
 pub use kernel::Kernel;
@@ -10,7 +11,6 @@ pub use network::{
     encode_udp_frame,
 };
 pub use poller::Poller;
-pub use backend::shared_offset_key;
 pub use process::ProcessTable;
 pub use storage::StorageRegistry;
 

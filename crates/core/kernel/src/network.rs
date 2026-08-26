@@ -3,72 +3,6 @@ use std::{collections::HashMap, net::TcpListener, sync::Arc, sync::atomic::Atomi
 use parking_lot::Mutex;
 use selium_abi::SharedResourceId;
 
-/// Encodes a `SocketAddr` + payload into the binary datagram frame format:
-/// `[ver u8 = 1][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
-pub fn encode_udp_frame(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
-    let addr_len = match addr {
-        std::net::SocketAddr::V4(_) => 4usize,
-        std::net::SocketAddr::V6(_) => 16usize,
-    };
-    let header_len = 2 + addr_len + 2;
-    let mut frame = Vec::with_capacity(header_len + payload.len());
-    frame.push(1u8); // version
-    match addr {
-        std::net::SocketAddr::V4(v4) => {
-            frame.push(4u8);
-            frame.extend_from_slice(&v4.ip().octets());
-            frame.extend_from_slice(&v4.port().to_le_bytes());
-        }
-        std::net::SocketAddr::V6(v6) => {
-            frame.push(6u8);
-            frame.extend_from_slice(&v6.ip().octets());
-            frame.extend_from_slice(&v6.port().to_le_bytes());
-        }
-    }
-    frame.extend_from_slice(payload);
-    frame
-}
-
-/// Decodes a binary datagram frame into `(SocketAddr, payload_bytes)`.
-/// Returns `None` if the frame is malformed.
-pub fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
-    if frame.len() < 8 {
-        return None;
-    }
-    if *frame.first()? != 1 {
-        return None;
-    }
-    let family = *frame.get(1)?;
-    match family {
-        4 => {
-            if frame.len() < 8 {
-                return None;
-            }
-            let ip = std::net::Ipv4Addr::new(
-                *frame.get(2)?,
-                *frame.get(3)?,
-                *frame.get(4)?,
-                *frame.get(5)?,
-            );
-            let port = u16::from_le_bytes([*frame.get(6)?, *frame.get(7)?]);
-            let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
-            Some((addr, frame.get(8..)?))
-        }
-        6 => {
-            if frame.len() < 20 {
-                return None;
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(frame.get(2..18)?);
-            let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_le_bytes([*frame.get(18)?, *frame.get(19)?]);
-            let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
-            Some((addr, frame.get(20..)?))
-        }
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
 pub struct NetworkState {
     pub(crate) inner: Arc<NetworkStateInner>,
@@ -156,4 +90,70 @@ impl NetworkState {
             .get(&shared_id)
             .map(|s| s.running.clone())
     }
+}
+
+/// Decodes a binary datagram frame into `(SocketAddr, payload_bytes)`.
+/// Returns `None` if the frame is malformed.
+pub fn decode_udp_frame(frame: &[u8]) -> Option<(std::net::SocketAddr, &[u8])> {
+    if frame.len() < 8 {
+        return None;
+    }
+    if *frame.first()? != 1 {
+        return None;
+    }
+    let family = *frame.get(1)?;
+    match family {
+        4 => {
+            if frame.len() < 8 {
+                return None;
+            }
+            let ip = std::net::Ipv4Addr::new(
+                *frame.get(2)?,
+                *frame.get(3)?,
+                *frame.get(4)?,
+                *frame.get(5)?,
+            );
+            let port = u16::from_le_bytes([*frame.get(6)?, *frame.get(7)?]);
+            let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port));
+            Some((addr, frame.get(8..)?))
+        }
+        6 => {
+            if frame.len() < 20 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(frame.get(2..18)?);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_le_bytes([*frame.get(18)?, *frame.get(19)?]);
+            let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0));
+            Some((addr, frame.get(20..)?))
+        }
+        _ => None,
+    }
+}
+
+/// Encodes a `SocketAddr` + payload into the binary datagram frame format:
+/// `[ver u8 = 1][family u8: 4|6][addr 4|16 bytes][port u16 LE][payload…]`
+pub fn encode_udp_frame(addr: std::net::SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let addr_len = match addr {
+        std::net::SocketAddr::V4(_) => 4usize,
+        std::net::SocketAddr::V6(_) => 16usize,
+    };
+    let header_len = 2 + addr_len + 2;
+    let mut frame = Vec::with_capacity(header_len + payload.len());
+    frame.push(1u8); // version
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            frame.push(4u8);
+            frame.extend_from_slice(&v4.ip().octets());
+            frame.extend_from_slice(&v4.port().to_le_bytes());
+        }
+        std::net::SocketAddr::V6(v6) => {
+            frame.push(6u8);
+            frame.extend_from_slice(&v6.ip().octets());
+            frame.extend_from_slice(&v6.port().to_le_bytes());
+        }
+    }
+    frame.extend_from_slice(payload);
+    frame
 }

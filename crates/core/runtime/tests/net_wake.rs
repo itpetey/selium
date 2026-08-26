@@ -17,65 +17,18 @@
 //! cargo test -p selium-runtime --test net_wake -- --ignored
 //! ```
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
-/// Returns the path to the compiled net-demo WASM module, with an
-/// actionable error if it is missing.
-#[expect(clippy::panic, reason = "missing build artifact is a hard test failure")]
-fn net_demo_wasm() -> Vec<u8> {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
-    let path = PathBuf::from(target_dir)
-        .join("wasm32-unknown-unknown/debug/selium_net_demo.wasm");
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "net demo guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p selium-net-demo",
-            path.display()
-        )
-    })
-}
-
-fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "net-demo".to_string(),
-        module_id: "net-demo-module".to_string(),
-        module_bytes,
-        entrypoint: "net_demo".to_string(),
-        arguments: Vec::new(),
-        grants: vec![
-            // Selectors within one grant are ANDed, so listener and stream
-            // access need separate grants.
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
-            ),
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            // Receiving from the bind-created host queue needs HostQueue.
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        // The test polls the guest log channel itself for phase markers.
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-    }
+fn all_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    drain_logs(runtime, process_id)
 }
 
 /// Drains the guest's log channel and decodes each frame as a `LogRecord`.
@@ -94,32 +47,6 @@ fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
         .collect()
 }
 
-fn all_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    drain_logs(runtime, process_id)
-}
-
-/// Polls the guest log channel until a message containing `needle` appears.
-#[expect(clippy::panic, reason = "test helper")]
-fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Duration) -> Duration {
-    let mut seen: Vec<String> = Vec::new();
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        // Run any deferred reactor polls (cross-thread wakes are enqueued by
-        // kernel poller threads; this thread owns the guest's reactor).
-        runtime.drain_pending_exec();
-        let fresh = drain_logs(runtime, process_id);
-        if !fresh.is_empty() {
-            eprintln!("TEST-LOG: {fresh:?}");
-        }
-        seen.extend(fresh);
-        if seen.iter().any(|message| message.contains(needle)) {
-            return start.elapsed();
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
-}
-
 /// Task 4.1 + 4.2: guest reader parked on an inbound ring wakes on socket
 /// data (WaitRegister → mailbox), echoes, and its post-write stall drains
 /// to the socket without waiting for the backstop timeout.
@@ -134,7 +61,12 @@ fn guest_park_wakes_on_socket_data_and_stall_drains_promptly() {
 
     // Wait until the guest has bound its listener, then discover the bound
     // port through the kernel's listener registry.
-    wait_for_log(&runtime, process_id, "net-demo: bound", Duration::from_secs(10));
+    wait_for_log(
+        &runtime,
+        process_id,
+        "net-demo: bound",
+        Duration::from_secs(10),
+    );
     let addrs = runtime.kernel().network().tcp_listener_addrs();
     assert!(!addrs.is_empty(), "no listener address registered");
 
@@ -144,7 +76,12 @@ fn guest_park_wakes_on_socket_data_and_stall_drains_promptly() {
 
     // Give the guest's accept task a chance to park its read on the inbound
     // ring (issuing WaitRegister) before writing request bytes.
-    wait_for_log(&runtime, process_id, "net-demo: accepted", Duration::from_secs(10));
+    wait_for_log(
+        &runtime,
+        process_id,
+        "net-demo: accepted",
+        Duration::from_secs(10),
+    );
 
     // Write request bytes while the guest task is parked on its inbound
     // ring. The poller thread enqueues a mailbox wake; this (owning) thread
@@ -200,4 +137,81 @@ fn guest_park_wakes_on_socket_data_and_stall_drains_promptly() {
     }
 
     runtime.stop_process(process_id).expect("stop process");
+}
+
+fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "net-demo".to_string(),
+        module_id: "net-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "net_demo".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            // Selectors within one grant are ANDed, so listener and stream
+            // access need separate grants.
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+            ),
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            // Receiving from the bind-created host queue needs HostQueue.
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        // The test polls the guest log channel itself for phase markers.
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+    }
+}
+
+/// Returns the path to the compiled net-demo WASM module, with an
+/// actionable error if it is missing.
+#[expect(
+    clippy::panic,
+    reason = "missing build artifact is a hard test failure"
+)]
+fn net_demo_wasm() -> Vec<u8> {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+    let path = PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm");
+    std::fs::read(&path).unwrap_or_else(|_error| {
+        panic!(
+            "net demo guest not found at {}.\n\
+             Build it first:\n  \
+             cargo build --target wasm32-unknown-unknown -p selium-net-demo",
+            path.display()
+        )
+    })
+}
+
+/// Polls the guest log channel until a message containing `needle` appears.
+#[expect(clippy::panic, reason = "test helper")]
+fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Duration) -> Duration {
+    let mut seen: Vec<String> = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        // Run any deferred reactor polls (cross-thread wakes are enqueued by
+        // kernel poller threads; this thread owns the guest's reactor).
+        runtime.drain_pending_exec();
+        let fresh = drain_logs(runtime, process_id);
+        if !fresh.is_empty() {
+            eprintln!("TEST-LOG: {fresh:?}");
+        }
+        seen.extend(fresh);
+        if seen.iter().any(|message| message.contains(needle)) {
+            return start.elapsed();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
 }

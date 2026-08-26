@@ -17,7 +17,7 @@ use std::{
 use selium_abi::{HostQueueDescriptor, SharedRegionDescriptor};
 use selium_kernel::Kernel;
 use selium_memory::{MappingBackend, MultiMemoryHeader};
-use selium_shm::layout::{self, RingReader, RingWriter, GENERATION_COUNTER_OFFSET};
+use selium_shm::layout::{self, GENERATION_COUNTER_OFFSET, RingReader, RingWriter};
 
 use crate::{error::Result, runtime::Runtime};
 
@@ -26,15 +26,6 @@ const DEFAULT_RING_CAPACITY: u64 = 64 * 1024;
 /// Maximum time to wait on a generation advance for outbound drain (ms).
 /// The backstop ensures correctness even if a runtime kick is missed.
 const OUTBOUND_WAIT_TIMEOUT_MS: u64 = 1000;
-
-/// Compute the waiters key for a ring's generation word, given the parent
-/// shared region id and the sub-memory offset of the ring.
-///
-/// Delegates to the kernel's canonical derivation so runtime kicks are
-/// guaranteed to match the keys `atomic_wait32` parks on.
-fn generation_wait_key(shared_id: u64, ring_offset: u64) -> usize {
-    selium_kernel::shared_offset_key(shared_id, ring_offset + GENERATION_COUNTER_OFFSET)
-}
 
 /// Bind a TCP listener and register it with the mio poller.
 pub fn tcp_bind(
@@ -64,7 +55,8 @@ pub fn tcp_bind(
         selium_kernel::TcpListenerState {
             shared_id: descriptor.shared_id,
             running: running.clone(),
-            _listener: std_listener.try_clone()
+            _listener: std_listener
+                .try_clone()
                 .map_err(|e| crate::Error::Host(format!("listener clone failed: {e}")))?,
         },
     );
@@ -74,100 +66,97 @@ pub fn tcp_bind(
         let k = kernel.clone();
         let rt = runtime.clone();
         let queue_local_id = local_id;
-        poller.register_tcp_listener(
-            std_listener,
-            Box::new(move |stream: std::net::TcpStream| {
-                drop(stream.set_nonblocking(true));
-                let (region, inbound_writer, outbound_reader, ring_offset, parent_local_id) =
-                    match create_stream_region(&k) {
-                        Ok(r) => r,
+        poller
+            .register_tcp_listener(
+                std_listener,
+                Box::new(move |stream: std::net::TcpStream| {
+                    drop(stream.set_nonblocking(true));
+                    let (region, inbound_writer, outbound_reader, ring_offset, parent_local_id) =
+                        match create_stream_region(&k) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("failed to create stream region: {e}");
+                                return;
+                            }
+                        };
+
+                    let shared_id = region.shared_id;
+                    let stream_running = Arc::new(AtomicBool::new(true));
+
+                    k.network().insert_tcp_stream(
+                        shared_id,
+                        selium_kernel::TcpStreamState {
+                            running: stream_running.clone(),
+                        },
+                    );
+
+                    // Clone the stream for outbound writes.
+                    let outbound_stream = match stream.try_clone() {
+                        Ok(s) => s,
                         Err(e) => {
-                            eprintln!("failed to create stream region: {e}");
+                            eprintln!("failed to clone accepted stream: {e}");
+                            let memory = k.memory();
+                            drop(memory.detach_shared_region(parent_local_id));
+                            k.network().remove_tcp_stream(shared_id);
                             return;
                         }
                     };
 
-                let shared_id = region.shared_id;
-                let stream_running = Arc::new(AtomicBool::new(true));
-
-                k.network().insert_tcp_stream(
-                    shared_id,
-                    selium_kernel::TcpStreamState {
-                        running: stream_running.clone(),
-                    },
-                );
-
-                // Clone the stream for outbound writes.
-                let outbound_stream = match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("failed to clone accepted stream: {e}");
+                    // Register the accepted stream for inbound reads with the
+                    // poller. Failure is fatal for this connection: without an
+                    // inbound pump the guest would wait forever for data that is
+                    // never delivered, so tear the connection down loudly rather
+                    // than letting it hang.
+                    let registration = match k.poller() {
+                        Some(p) => p.register_tcp_stream(
+                            stream,
+                            inbound_writer,
+                            shared_id,
+                            stream_running.clone(),
+                        ),
+                        None => Err(std::io::Error::other("network poller not initialised")),
+                    };
+                    if let Err(e) = registration {
+                        eprintln!(
+                            "accepted connection dropped: inbound poller registration failed: {e}"
+                        );
+                        drop(outbound_stream.shutdown(std::net::Shutdown::Both));
+                        stream_running.store(false, Ordering::Relaxed);
                         let memory = k.memory();
                         drop(memory.detach_shared_region(parent_local_id));
                         k.network().remove_tcp_stream(shared_id);
                         return;
                     }
-                };
 
-                // Register the accepted stream for inbound reads with the
-                // poller. Failure is fatal for this connection: without an
-                // inbound pump the guest would wait forever for data that is
-                // never delivered, so tear the connection down loudly rather
-                // than letting it hang.
-                let registration = match k.poller() {
-                    Some(p) => p.register_tcp_stream(
-                        stream,
-                        inbound_writer,
-                        shared_id,
-                        stream_running.clone(),
-                    ),
-                    None => Err(std::io::Error::other(
-                        "network poller not initialised",
-                    )),
-                };
-                if let Err(e) = registration {
-                    eprintln!(
-                        "accepted connection dropped: inbound poller registration failed: {e}"
-                    );
-                    drop(outbound_stream.shutdown(std::net::Shutdown::Both));
-                    stream_running.store(false, Ordering::Relaxed);
+                    // Register the wait key for runtime kicks.
+                    let wait_key = generation_wait_key(shared_id, ring_offset);
+                    rt.network_wait_keys.lock().push((shared_id, wait_key));
+
+                    // Spawn outbound drain on a dedicated thread.
                     let memory = k.memory();
-                    drop(memory.detach_shared_region(parent_local_id));
-                    k.network().remove_tcp_stream(shared_id);
-                    return;
-                }
+                    let rt2 = rt.clone();
+                    thread::spawn(move || {
+                        if let Err(_e) =
+                            proxy_outbound_tcp(outbound_stream, outbound_reader, stream_running)
+                        {
+                        }
+                        rt2.network_wait_keys
+                            .lock()
+                            .retain(|(sid, _)| *sid != shared_id);
+                        drop(memory.detach_shared_region(parent_local_id));
+                    });
 
-                // Register the wait key for runtime kicks.
-                let wait_key = generation_wait_key(shared_id, ring_offset);
-                rt.network_wait_keys.lock().push((shared_id, wait_key));
-
-                // Spawn outbound drain on a dedicated thread.
-                let memory = k.memory();
-                let rt2 = rt.clone();
-                thread::spawn(move || {
-                    if let Err(_e) = proxy_outbound_tcp(
-                        outbound_stream,
-                        outbound_reader,
-                        stream_running,
-                    ) {
+                    if let Err(e) = k.queues().host_queue_send(queue_local_id, 0, shared_id) {
+                        eprintln!("failed to enqueue connection: {e}");
+                    } else {
+                        // The connection is queued: wake the guest parked on
+                        // HostQueueRecv so it re-polls and completes its accept.
+                        rt.wake_queue_waiter(queue_local_id);
                     }
-                    rt2.network_wait_keys
-                        .lock()
-                        .retain(|(sid, _)| *sid != shared_id);
-                    drop(memory.detach_shared_region(parent_local_id));
-                });
-
-                if let Err(e) = k.queues().host_queue_send(queue_local_id, 0, shared_id) {
-                    eprintln!("failed to enqueue connection: {e}");
-                } else {
-                    // The connection is queued: wake the guest parked on
-                    // HostQueueRecv so it re-polls and completes its accept.
-                    rt.wake_queue_waiter(queue_local_id);
-                }
-            }),
-            running,
-        )
-        .map_err(|e| crate::Error::Host(format!("poller register listener: {e}")))?;
+                }),
+                running,
+            )
+            .map_err(|e| crate::Error::Host(format!("poller register listener: {e}")))?;
     }
 
     Ok(descriptor)
@@ -214,12 +203,7 @@ pub fn tcp_connect(runtime: &Runtime, address: String) -> Result<SharedRegionDes
     let memory = kernel.memory();
     let rt = runtime.clone();
     thread::spawn(move || {
-        if let Err(_e) = proxy_outbound_tcp(
-            outbound_stream,
-            outbound_reader,
-            running,
-        ) {
-        }
+        if let Err(_e) = proxy_outbound_tcp(outbound_stream, outbound_reader, running) {}
         // Cleanup: remove wait key on exit.
         rt.network_wait_keys
             .lock()
@@ -271,10 +255,7 @@ pub fn udp_bind(runtime: &Runtime, address: String) -> Result<SharedRegionDescri
     let memory = kernel.memory();
     let rt = runtime.clone();
     thread::spawn(move || {
-        if let Err(_e) =
-            proxy_outbound_udp(outbound_socket, send_reader, running)
-        {
-        }
+        if let Err(_e) = proxy_outbound_udp(outbound_socket, send_reader, running) {}
         rt.network_wait_keys
             .lock()
             .retain(|(sid, _)| *sid != shared_id);
@@ -358,7 +339,22 @@ fn create_stream_region(
         len: total_capacity as u64,
     };
     // Return the outbound ring's sub-memory offset for wait-key computation.
-    Ok((region, inbound_writer, outbound_reader, sub_memory_1_offset, parent_local_id))
+    Ok((
+        region,
+        inbound_writer,
+        outbound_reader,
+        sub_memory_1_offset,
+        parent_local_id,
+    ))
+}
+
+/// Compute the waiters key for a ring's generation word, given the parent
+/// shared region id and the sub-memory offset of the ring.
+///
+/// Delegates to the kernel's canonical derivation so runtime kicks are
+/// guaranteed to match the keys `atomic_wait32` parks on.
+fn generation_wait_key(shared_id: u64, ring_offset: u64) -> usize {
+    selium_kernel::shared_offset_key(shared_id, ring_offset + GENERATION_COUNTER_OFFSET)
 }
 
 /// Outbound drain for TCP: reads frames from the ring, writes to the socket.
@@ -512,7 +508,10 @@ mod tests {
         let descriptor = tcp_bind(&runtime, 1, "127.0.0.1:0".to_string()).expect("tcp bind");
         assert!(descriptor.shared_id > 0);
         assert!(descriptor.local_id > 0);
-        runtime.kernel.close_tcp_listener(descriptor.local_id).unwrap();
+        runtime
+            .kernel
+            .close_tcp_listener(descriptor.local_id)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -545,7 +544,10 @@ mod tests {
         let descriptor = udp_bind(&runtime, "127.0.0.1:0".to_string()).expect("udp bind");
         assert!(descriptor.shared_id > 0);
         assert!(descriptor.len > 0);
-        runtime.kernel.close_udp_socket(descriptor.shared_id).unwrap();
+        runtime
+            .kernel
+            .close_udp_socket(descriptor.shared_id)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -597,8 +599,8 @@ mod tests {
     /// End-to-end TCP echo test using the event-driven proxy infrastructure.
     #[tokio::test]
     async fn tcp_echo_via_event_driven_proxy() {
-        use std::io::{Read, Write};
         use selium_memory::MultiMemoryHeader;
+        use std::io::{Read, Write};
 
         let kernel = Kernel::default();
         let _ = kernel.init_poller().expect("init poller");
@@ -666,7 +668,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        assert!(found, "expected echo response on inbound ring within timeout");
+        assert!(
+            found,
+            "expected echo response on inbound ring within timeout"
+        );
 
         // Verify the response arrived without relying on the 1-second backstop
         // timeout — the poller should handle this in well under 1 second.
@@ -706,7 +711,9 @@ mod tests {
         let shared_id = descriptor.shared_id;
 
         // Wait for server to accept and close.
-        ready_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("server accepted");
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server accepted");
 
         // Read from the inbound ring — the poller should detect EOF and
         // decrement the writer count.
@@ -718,7 +725,8 @@ mod tests {
             .sub_region(inbound_entry.offset, inbound_entry.length)
             .expect("inbound sub");
         let inbound_reader =
-            RingReader::open(inbound_backend.clone(), DEFAULT_RING_CAPACITY, false).expect("open reader");
+            RingReader::open(inbound_backend.clone(), DEFAULT_RING_CAPACITY, false)
+                .expect("open reader");
 
         // Poll until writer_count reaches 0 (EOF).
         let start = std::time::Instant::now();

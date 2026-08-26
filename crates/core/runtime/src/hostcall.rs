@@ -456,11 +456,7 @@ impl Runtime {
                 );
                 // The descriptor doubles as a connection queue: HostQueueRecv
                 // checks ownership under the HostQueue class, so claim both.
-                self.claim_local_handle(
-                    process_id,
-                    ResourceClass::HostQueue,
-                    descriptor.local_id,
-                );
+                self.claim_local_handle(process_id, ResourceClass::HostQueue, descriptor.local_id);
                 self.claim_shared_resource(
                     process_id,
                     ResourceClass::TcpListener,

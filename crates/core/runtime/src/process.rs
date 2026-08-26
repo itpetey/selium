@@ -5,7 +5,9 @@ use selium_abi::{
 use tracing::debug;
 use wasmtiny::WasmValue;
 
-use crate::{Error, Result, config::ProcessAuthority, hostcall::HostOperationState, runtime::Runtime};
+use crate::{
+    Error, Result, config::ProcessAuthority, hostcall::HostOperationState, runtime::Runtime,
+};
 
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
@@ -511,8 +513,7 @@ impl Runtime {
         let mut registry = self.wait_registry.lock();
         registry.retain(|_key, entries| {
             // Task ids are guest-local: match on both process and task.
-            entries
-                .retain(|entry| !(entry.process_id == process_id && entry.task_id == task_id));
+            entries.retain(|entry| !(entry.process_id == process_id && entry.task_id == task_id));
             !entries.is_empty()
         });
     }
@@ -594,9 +595,7 @@ impl Runtime {
     /// operations that may have triggered cross-thread wakes.
     pub fn drain_pending_exec(&self) {
         let mut guard = self.pending_exec.lock();
-        let pending: Vec<ProcessId> = {
-            guard.drain().collect()
-        };
+        let pending: Vec<ProcessId> = { guard.drain().collect() };
         drop(guard);
         for process_id in pending {
             self.poll_guest_until_stalled(process_id);
@@ -678,7 +677,9 @@ impl Runtime {
                     HostOperationState::HostQueueRecvWait { local_id, .. }
                         if local_id == queue_local_id =>
                     {
-                        operation.task_id.map(|task_id| (operation.process_id, task_id))
+                        operation
+                            .task_id
+                            .map(|task_id| (operation.process_id, task_id))
                     }
                     _ => None,
                 })

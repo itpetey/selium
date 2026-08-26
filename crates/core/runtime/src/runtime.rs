@@ -14,6 +14,15 @@ use crate::{
     mailbox::GuestMailbox, region_provider::RuntimeRegionProvider,
 };
 
+/// Publisher for the runtime→discovery pub/sub feed.
+pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
+pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
+/// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
+pub(crate) type RegionPurposes = HashMap<(ProcessId, u64), ResourceKind>;
+pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
+/// Wait registry keyed by (process_id, region_id).
+pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
+
 /// Wait registry entry: (process_id, task_id, generation) for a region.
 /// When the host advances the generation on a region past a registered
 /// generation, the registered task is woken via the mailbox.
@@ -24,16 +33,6 @@ pub(crate) struct WaitEntry {
     pub(crate) region_id: u64,
     pub(crate) generation: u64,
 }
-
-/// Wait registry keyed by (process_id, region_id).
-pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
-
-/// Publisher for the runtime→discovery pub/sub feed.
-pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
-pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-/// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
-pub(crate) type RegionPurposes = HashMap<(ProcessId, u64), ResourceKind>;
-pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
