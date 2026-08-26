@@ -58,10 +58,6 @@ pub struct Runtime {
     /// Each entry is `(shared_id, wait_key)` used to kick the proxy
     /// on guest→host transitions.
     pub(crate) network_wait_keys: Arc<Mutex<Vec<(u64, usize)>>>,
-    /// Process ids whose reactor has pending mailbox wakes delivered from
-    /// cross-thread (kernel poller) callbacks. Their reactors are polled by
-    /// `drain_pending_exec` on the owning thread.
-    pub(crate) pending_exec: Arc<Mutex<HashSet<ProcessId>>>,
     /// Maps a host queue's local id to the process that owns its receiver,
     /// so kernel-side sends (e.g. an accepted connection enqueued by the
     /// network poller) can wake the parked receiving guest.
@@ -103,7 +99,6 @@ impl Runtime {
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
-            pending_exec: Arc::new(Mutex::new(HashSet::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
         };
 

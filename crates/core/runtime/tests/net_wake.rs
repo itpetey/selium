@@ -84,14 +84,12 @@ fn guest_park_wakes_on_socket_data_and_stall_drains_promptly() {
     );
 
     // Write request bytes while the guest task is parked on its inbound
-    // ring. The poller thread enqueues a mailbox wake; this (owning) thread
-    // then runs the deferred reactor poll — the WaitRegister/mailbox bridge
-    // delivers the wake with no sleep-based polling in either party.
+    // ring. The poller thread delivers the wake end-to-end (mailbox +
+    // inline reactor poll) — no embedder-side pumping involved.
     let request = b"ping event-driven";
     let t_write = Instant::now();
     client.write_all(request).expect("write request");
     client.flush().expect("flush request");
-    runtime.drain_pending_exec();
 
     wait_for_log(
         &runtime,
@@ -200,13 +198,7 @@ fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Durat
     let mut seen: Vec<String> = Vec::new();
     let start = Instant::now();
     while start.elapsed() < timeout {
-        // Run any deferred reactor polls (cross-thread wakes are enqueued by
-        // kernel poller threads; this thread owns the guest's reactor).
-        runtime.drain_pending_exec();
         let fresh = drain_logs(runtime, process_id);
-        if !fresh.is_empty() {
-            eprintln!("TEST-LOG: {fresh:?}");
-        }
         seen.extend(fresh);
         if seen.iter().any(|message| message.contains(needle)) {
             return start.elapsed();

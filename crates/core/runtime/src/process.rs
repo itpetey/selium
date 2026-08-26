@@ -550,56 +550,14 @@ impl Runtime {
                 !entries.is_empty()
             });
         }
-        // SPIKE: deliver cross-thread wakes directly (mailbox + inline
-        // reactor poll under the execution guard) to test the
-        // thread-affinity hypothesis. See
-        // openspec/changes/guest-reactor-cross-thread-wakes.
-        let mut seen = std::collections::HashSet::new();
-        for (process_id, task_id) in wakeups {
+        // Cross-thread wakes (kernel poller threads) are safe here: see the
+        // memory-model contract on `poll_guest_until_stalled`.
+        let mut seen = std::collections::HashSet::new();        for (process_id, task_id) in wakeups {
             if !seen.insert((process_id, task_id)) {
                 continue;
             }
             self.cancel_waits_for_task(process_id, task_id);
             self.wake_process_task(process_id, task_id);
-        }
-    }
-
-    /// Enqueues a mailbox wake for a task WITHOUT executing its reactor.
-    ///
-    /// This is the CROSS-THREAD wake path (kernel poller callbacks): guest
-    /// reactor state is thread-local, so WASM must never be executed on the
-    /// waking thread. The marked process's reactor runs when the owning
-    /// thread next calls [`Self::drain_pending_exec`] — automatically at
-    /// every hostcall create/poll boundary, or explicitly from embedder/test
-    /// code that owns the guest.
-    #[expect(dead_code, reason = "spike: bypassed by direct wake_process_task")]
-    pub(crate) fn enqueue_wake_deferred(&self, process_id: ProcessId, task_id: TaskId) {
-        self.pending_exec.lock().insert(process_id);
-        if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned()
-            && let Err(error) = mailbox.enqueue(task_id)
-        {
-            debug!(
-                process_id,
-                task_id,
-                error = %error,
-                "failed to enqueue guest task wake"
-            );
-        }
-    }
-
-    /// Executes deferred reactor polls for all processes marked by
-    /// cross-thread wakes (mailbox wakes enqueued by kernel poller threads).
-    ///
-    /// MUST be called from the thread that owns the target guests'
-    /// reactors — the hostcall boundary hooks do this automatically;
-    /// embedders and tests driving guests manually should call it after
-    /// operations that may have triggered cross-thread wakes.
-    pub fn drain_pending_exec(&self) {
-        let mut guard = self.pending_exec.lock();
-        let pending: Vec<ProcessId> = { guard.drain().collect() };
-        drop(guard);
-        for process_id in pending {
-            self.poll_guest_until_stalled(process_id);
         }
     }
 
@@ -613,31 +571,44 @@ impl Runtime {
 
     /// Executes the guest reactor until it stalls.
     ///
-    /// Only one thread may execute a given guest's WASM store at a time.
-    /// Callers that lose the race (e.g. a mailbox wake delivered from the
-    /// network poller thread while the hostcall thread is already polling)
-    /// return immediately: the executing thread re-checks for pending
-    /// mailbox wakes *after* releasing the execution guard, so any wake
-    /// that raced with its pass either gets seen here or is picked up by
-    /// the waking thread itself. No wake is lost.
+    /// # Memory-model contract (single-entry invariant)
+    ///
+    /// Guest reactor state (task lists, waker queues, generation-wait map)
+    /// lives in the guest instance's linear memory and is accessed without
+    /// synchronisation. Correctness therefore requires that **at most one
+    /// thread executes a given guest's WASM at a time**; that invariant is
+    /// provided by [`Self::try_begin_guest_exec`] / `end_guest_exec` around
+    /// every poll, plus exclusive removal of the [`LoadedGuest`] from its
+    /// registry for the duration of each poll.
+    ///
+    /// Any thread may deliver a wake ([`Self::wake_process_task`]) from any
+    /// thread: the mailbox is shared linear memory with a flag handshake.
+    /// Callers that lose the execution-guard race return immediately; the
+    /// guard holder re-checks pending mailbox state *after* releasing the
+    /// guard, so a wake racing an in-flight poll is delivered by one of the
+    /// two threads. No wake is lost.
     pub(crate) fn poll_guest_until_stalled(&self, process_id: ProcessId) {
         loop {
             if !self.try_begin_guest_exec(process_id) {
                 return;
             }
-            self.poll_guest_once(process_id);
+            let polled = self.poll_guest_once(process_id);
             self.end_guest_exec(process_id);
             // Check outside the guard: if a wake lands after this point,
             // the waking thread acquires the free guard and polls itself.
-            if !self.has_pending_wake(process_id) {
+            if !polled || !self.has_pending_wake(process_id) {
                 return;
             }
         }
     }
 
-    fn poll_guest_once(&self, process_id: ProcessId) {
+    /// Runs one reactor pass. Returns false when no progress is possible —
+    /// the guest is not loaded, or `__selium_guest_poll` trapped — so the
+    /// caller must not keep looping on pending mailbox state (the guest
+    /// cannot clear it).
+    fn poll_guest_once(&self, process_id: ProcessId) -> bool {
         let Some(mut loaded_guest) = self.loaded_guests.lock().remove(&process_id) else {
-            return;
+            return false;
         };
         let result =
             loaded_guest
@@ -647,12 +618,16 @@ impl Runtime {
         // Kick outbound network proxies on reactor stall — the guest may
         // have written outbound frames before parking.
         self.kick_network_waiters();
-        if let Err(error) = result {
-            debug!(
-                process_id,
-                error = %error,
-                "guest poll after mailbox wake failed"
-            );
+        match result {
+            Ok(_) => true,
+            Err(error) => {
+                debug!(
+                    process_id,
+                    error = %error,
+                    "guest poll after mailbox wake failed"
+                );
+                false
+            }
         }
     }
 
@@ -688,7 +663,7 @@ impl Runtime {
         };
         if targets.is_empty() {
             // No tracked per-task waiter: poll the queue's owning process
-            // directly (SPIKE: inline, no deferral).
+            // directly.
             let process_id = self.queue_waiters.lock().get(&queue_local_id).copied();
             if let Some(process_id) = process_id {
                 self.poll_guest_until_stalled(process_id);
@@ -696,7 +671,6 @@ impl Runtime {
             return;
         }
         for (process_id, task_id) in targets {
-            // SPIKE: direct cross-thread wake (mailbox + inline poll).
             self.wake_process_task(process_id, task_id);
         }
     }
@@ -732,6 +706,118 @@ mod tests {
     use super::*;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
     use selium_abi::{LocalityScope, MeteringObservation, ResourceSelector};
+    use std::sync::Arc;
+    use crate::mailbox::GuestMailbox;
+    use wasmtiny::runtime::{Limits, Memory as WasmMemory, MemoryType};
+
+    /// Registers a mailbox for `process_id` backed by scratch linear memory
+    /// so wake-delivery mechanics can be exercised without a real guest.
+    fn install_scratch_mailbox(runtime: &Runtime, process_id: ProcessId) -> Arc<GuestMailbox> {
+        let mem_type = MemoryType {
+            limits: Limits::Min(1),
+            shared: false,
+        };
+        let memory = Arc::new(std::sync::Mutex::new(
+            WasmMemory::new(mem_type).expect("scratch memory"),
+        ));
+        let mailbox = Arc::new(crate::mailbox::GuestMailbox::new(memory.clone(), 0));
+        runtime.register_mailbox(process_id, mailbox.clone());
+        mailbox
+    }
+
+    /// Task 2.3: a wake delivered from another thread while the execution
+    /// guard is held must not be lost — the mailbox flag stays set and the
+    /// post-release re-check observes it.
+    #[test]
+    fn wake_while_guard_held_is_not_lost() {
+        let runtime = Arc::new(Runtime::default());
+        let pid: ProcessId = 7;
+        let mailbox = install_scratch_mailbox(&runtime, pid);
+
+        // Hold the execution guard, simulating an in-flight reactor poll.
+        assert!(
+            runtime.try_begin_guest_exec(pid),
+            "guard must be initially free"
+        );
+
+        // Deliver a wake from another thread while the guard is held.
+        let rt = runtime.clone();
+        let handle = std::thread::spawn(move || {
+            rt.wake_process_task(pid, 1);
+        });
+        handle.join().expect("waker thread");
+
+        // The waking thread must not have blocked on the guard, and the
+        // wake must be pending in the mailbox (flag set by enqueue).
+        assert!(
+            !runtime.try_begin_guest_exec(pid),
+            "our guard must still be held"
+        );
+        assert!(
+            runtime.has_pending_wake(pid),
+            "wake enqueued under contention must remain pending"
+        );
+
+        // Release the guard; the pending-wake re-check path must observe
+        // the flag. Clear it manually (no real reactor to consume it) and
+        // confirm the poll terminates cleanly instead of looping forever.
+        runtime.end_guest_exec(pid);
+        assert!(runtime.has_pending_wake(pid));
+        {
+            let mailboxes = runtime.mailboxes.lock();
+            let mb = mailboxes.get(&pid).expect("mailbox registered");
+            mb.memory
+                .lock()
+                .expect("memory lock")
+                .write_u32(selium_abi::mailbox::FLAG_OFFSET as u32, 0)
+                .expect("clear flag");
+        }
+        runtime.poll_guest_until_stalled(pid);
+    }
+
+    /// Task 4.2: many threads deliver wakes to one guest concurrently.
+    /// Every wake must be enqueued exactly once (tail counts monotonically)
+    /// and the runtime must stay consistent — no lost or corrupted wakes.
+    #[test]
+    fn concurrent_wake_delivery_never_loses_wakes() {
+        let runtime = Arc::new(Runtime::default());
+        let pid: ProcessId = 9;
+        install_scratch_mailbox(&runtime, pid);
+
+        const THREADS: usize = 8;
+        const WAKES_PER_THREAD: usize = 50;
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let rt = runtime.clone();
+            handles.push(std::thread::spawn(move || {
+                for task in 0..WAKES_PER_THREAD {
+                    rt.wake_process_task(pid, task as u32);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("waker thread");
+        }
+
+        // Total delivered wakes == THREADS * WAKES_PER_THREAD, observable
+        // as the mailbox tail counter.
+        let mailboxes = runtime.mailboxes.lock();
+        let mb = mailboxes.get(&pid).expect("mailbox registered");
+        let tail = mb
+            .memory
+            .lock()
+            .expect("memory lock")
+            .read_u32(
+                0 + selium_abi::mailbox::TAIL_OFFSET as u32,
+            )
+            .expect("read tail");
+        assert_eq!(
+            tail as usize,
+            THREADS * WAKES_PER_THREAD,
+            "every concurrent wake must be enqueued exactly once"
+        );
+    }
 
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (export \"{entrypoint}\") {body}))"))
