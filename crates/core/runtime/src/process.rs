@@ -560,7 +560,8 @@ impl Runtime {
         }
         // Cross-thread wakes (kernel poller threads) are safe here: see the
         // memory-model contract on `poll_guest_until_stalled`.
-        let mut seen = std::collections::HashSet::new();        for (process_id, task_id) in wakeups {
+        let mut seen = std::collections::HashSet::new();
+        for (process_id, task_id) in wakeups {
             if !seen.insert((process_id, task_id)) {
                 continue;
             }
@@ -712,10 +713,10 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mailbox::GuestMailbox;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
     use selium_abi::{LocalityScope, MeteringObservation, ResourceSelector};
     use std::sync::Arc;
-    use crate::mailbox::GuestMailbox;
     use wasmtiny::runtime::{Limits, Memory as WasmMemory, MemoryType};
 
     /// Registers a mailbox for `process_id` backed by scratch linear memory
@@ -816,9 +817,7 @@ mod tests {
             .memory
             .lock()
             .expect("memory lock")
-            .read_u32(
-                0 + selium_abi::mailbox::TAIL_OFFSET as u32,
-            )
+            .read_u32(0 + selium_abi::mailbox::TAIL_OFFSET as u32)
             .expect("read tail");
         assert_eq!(
             tail as usize,

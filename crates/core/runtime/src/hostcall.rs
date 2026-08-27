@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -911,6 +912,30 @@ impl Runtime {
                     descriptor,
                 )))
             }
+            HostcallRequest::RandomBytes { len } => {
+                const MAX_RANDOM_BYTES: u32 = 4096;
+                if len > MAX_RANDOM_BYTES {
+                    return Err(AbiError::new(
+                        AbiErrorCode::MalformedPayload,
+                        format!("RandomBytes length {len} exceeds maximum {MAX_RANDOM_BYTES}"),
+                    ));
+                }
+                let len = len as usize;
+                let mut buf = vec![0u8; len];
+                let mut file = std::fs::File::open("/dev/urandom").map_err(|error| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("failed to open /dev/urandom: {error}"),
+                    )
+                })?;
+                file.read_exact(&mut buf).map_err(|error| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("failed to read /dev/urandom: {error}"),
+                    )
+                })?;
+                Ok(HostOperationState::Ready(HostcallOutput::RandomBytes(buf)))
+            }
             HostcallRequest::RecordResolvedQueueFor {
                 client_process_id,
                 shared_id,
@@ -1140,6 +1165,16 @@ impl Runtime {
                     if let Ok(Some((client_process_id, value))) =
                         self.kernel.queues().try_host_queue_recv(local_id)
                     {
+                        // Queue handoff: mirror the ownership sharing performed
+                        // by the `poll_hostcall` completion path. Without this,
+                        // a receiver woken via `HostQueueSend` gets the value
+                        // but no authorisation basis to attach the handed-off
+                        // region (documented rendezvous pattern).
+                        self.share_region_ownership_on_recv(
+                            operation.process_id,
+                            client_process_id,
+                            value,
+                        );
                         operation.state =
                             HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                                 client_process_id,

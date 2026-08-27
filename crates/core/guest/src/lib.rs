@@ -9,13 +9,13 @@ pub use crate::{
     },
     context::Context,
     error::{GuestError, Result},
+    hostcall::{random_bytes, record_resolved_queue_for},
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::{mark_ready, process_id},
     process::{ActivityLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     storage::{BlobStore, DurableLog},
     time::{Instant, Timer, now},
-    hostcall::record_resolved_queue_for,
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,

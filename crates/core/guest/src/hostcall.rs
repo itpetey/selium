@@ -182,6 +182,20 @@ pub(crate) fn poll_operation(operation_id: OperationId) -> Result<Option<Hostcal
     }
 }
 
+/// Fills a buffer with cryptographically secure random bytes from the host.
+///
+/// Used by TLS-terminating guests on wasm32 where no OS entropy source is
+/// available. The host enforces a maximum length (currently 4096 bytes);
+/// legitimate TLS operations request well under that limit.
+pub fn random_bytes(len: u32) -> Result<Vec<u8>> {
+    match hostcall_ready(HostcallRequest::RandomBytes { len })? {
+        HostcallOutput::RandomBytes(bytes) => Ok(bytes),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for RandomBytes: {other:?}"
+        ))),
+    }
+}
+
 /// Records, on behalf of the discovery service, that a discovery resolve
 /// performed by `client_process_id` returned `shared_id`. The runtime
 /// accepts this hostcall only from the discovery system guest; the recorded

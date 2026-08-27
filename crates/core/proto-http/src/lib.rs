@@ -88,11 +88,7 @@ pub struct HttpResponse {
 impl HttpResponse {
     /// Convenience constructor that accepts `impl Into<String>` for header
     /// fields.
-    pub fn from_str(
-        status: u16,
-        headers: Vec<HttpHeader>,
-        body: Vec<u8>,
-    ) -> Self {
+    pub fn from_str(status: u16, headers: Vec<HttpHeader>, body: Vec<u8>) -> Self {
         Self {
             status,
             headers,
@@ -123,6 +119,87 @@ pub struct HttpBodyChunk {
 pub struct HttpTrailer {
     pub name: String,
     pub value: String,
+}
+
+/// One item of a streamed HTTP response carried over server-streaming RPC.
+///
+/// A streamed response is a sequence of items: exactly one head (status and
+/// headers, empty body) first, then zero or more body chunks, then zero or
+/// more trailers. End-of-stream is signalled by the stream lifecycle
+/// (see `streaming-rpc-patterns`), not by an item.
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpStreamItem",
+    binding = "selium_proto_http::fbs::selium::http::HttpStreamItem"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpStreamItem {
+    pub kind: u8,
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub data: Vec<u8>,
+    pub name: String,
+    pub value: String,
+}
+
+impl HttpStreamItem {
+    /// Item kind marker for the response head (status + headers).
+    pub const KIND_HEAD: u8 = 1;
+    /// Item kind marker for a body chunk.
+    pub const KIND_CHUNK: u8 = 2;
+    /// Item kind marker for a trailer header.
+    pub const KIND_TRAILER: u8 = 3;
+
+    /// Builds a stream head item carrying status and headers.
+    pub fn head(status: u16, headers: Vec<HttpHeader>) -> Self {
+        Self {
+            kind: Self::KIND_HEAD,
+            status,
+            headers,
+            data: Vec::new(),
+            name: String::new(),
+            value: String::new(),
+        }
+    }
+
+    /// Builds a body chunk item.
+    pub fn chunk(data: Vec<u8>) -> Self {
+        Self {
+            kind: Self::KIND_CHUNK,
+            status: 0,
+            headers: Vec::new(),
+            data,
+            name: String::new(),
+            value: String::new(),
+        }
+    }
+
+    /// Builds a trailer header item.
+    pub fn trailer(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            kind: Self::KIND_TRAILER,
+            status: 0,
+            headers: Vec::new(),
+            data: Vec::new(),
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Returns true if this item is a stream head.
+    pub fn is_head(&self) -> bool {
+        self.kind == Self::KIND_HEAD
+    }
+
+    /// Returns true if this item is a body chunk.
+    pub fn is_chunk(&self) -> bool {
+        self.kind == Self::KIND_CHUNK
+    }
+
+    /// Returns true if this item is a trailer header.
+    pub fn is_trailer(&self) -> bool {
+        self.kind == Self::KIND_TRAILER
+    }
 }
 
 impl HttpTrailer {
@@ -269,10 +346,10 @@ mod tests {
     #[test]
     fn chunked_body_sequence_binary() {
         // Binary chunks with varied sizes
-        let chunks: Vec<HttpBodyChunk> = (0..5)
+        let chunks: Vec<HttpBodyChunk> = (0u8..5)
             .map(|i| {
-                let size = 1 << (i + 4); // 16, 32, 64, 128, 256 bytes
-                HttpBodyChunk::new(vec![i as u8; size])
+                let size = 1usize << (i + 4); // 16, 32, 64, 128, 256 bytes
+                HttpBodyChunk::new(vec![i; size])
             })
             .collect();
         for chunk in &chunks {
@@ -307,6 +384,56 @@ mod tests {
     }
 
     #[test]
+    fn http_stream_item_head_round_trip() {
+        let head = HttpStreamItem::head(
+            200,
+            vec![
+                HttpHeader::from_str("content-type", "text/event-stream"),
+                HttpHeader::from_str("cache-control", "no-cache"),
+            ],
+        );
+        assert!(head.is_head());
+        assert!(!head.is_chunk());
+        assert!(!head.is_trailer());
+        round_trip(&head);
+    }
+
+    #[test]
+    fn http_stream_item_chunk_round_trip() {
+        let chunk = HttpStreamItem::chunk(b"data: {\"tick\":1}\n\n".to_vec());
+        assert!(chunk.is_chunk());
+        round_trip(&chunk);
+    }
+
+    #[test]
+    fn http_stream_item_trailer_round_trip() {
+        let trailer = HttpStreamItem::trailer("x-checksum", "abc123");
+        assert!(trailer.is_trailer());
+        round_trip(&trailer);
+    }
+
+    #[test]
+    fn http_stream_item_sequence_round_trip() {
+        // A full streamed response: head, chunks, trailer.
+        let items = vec![
+            HttpStreamItem::head(
+                200,
+                vec![HttpHeader::from_str("content-type", "text/plain")],
+            ),
+            HttpStreamItem::chunk(b"hello ".to_vec()),
+            HttpStreamItem::chunk(b"world".to_vec()),
+            HttpStreamItem::trailer("x-items", "2"),
+        ];
+        for item in &items {
+            round_trip(item);
+        }
+        assert!(items[0].is_head());
+        assert!(items[1].is_chunk());
+        assert!(items[2].is_chunk());
+        assert!(items[3].is_trailer());
+    }
+
+    #[test]
     fn has_schema_verification() {
         use selium_encoding::HasSchema;
         // Every schema type should report its FQ name
@@ -315,6 +442,7 @@ mod tests {
         assert_eq!(HttpBodyChunk::SCHEMA.fqname, "selium.http.HttpBodyChunk");
         assert_eq!(HttpHeader::SCHEMA.fqname, "selium.http.HttpHeader");
         assert_eq!(HttpTrailer::SCHEMA.fqname, "selium.http.HttpTrailer");
+        assert_eq!(HttpStreamItem::SCHEMA.fqname, "selium.http.HttpStreamItem");
 
         // SCHEMA hash should be non-zero
         assert_ne!(HttpRequest::SCHEMA.hash, [0u8; 16]);

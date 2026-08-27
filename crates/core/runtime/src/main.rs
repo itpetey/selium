@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::{PathBuf},
-    time::Duration,
-};
+use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;

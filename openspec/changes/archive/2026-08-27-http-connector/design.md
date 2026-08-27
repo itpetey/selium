@@ -68,9 +68,14 @@ The app-guest surface is `RpcConnection<HttpRequest, HttpResponse, M>`
 
 ### Backpressure honesty
 
-Ring full → the connector stops reading from the socket (TCP flow
-control propagates through the edge). Streaming bodies use
-server-streaming RPC so the edge never buffers a whole body.
+Each connection runs a windowed pipeline: parsed requests are forwarded
+concurrently up to a bounded in-flight window; when the window is full
+the connector stops reading from the client socket until a forward
+completes (TCP flow control propagates through the edge). Replies are
+reordered into request order by a correlation buffer whose queues are
+all bounded, so no path buffers without bound. Streaming bodies use
+server-streaming RPC so the edge never buffers a whole body; slow
+consumers park ring writers at the transport layer (Park semantics).
 
 ## Risks / Trade-offs
 

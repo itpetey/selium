@@ -287,8 +287,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -604,6 +606,7 @@ version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
+ "web-time",
  "zeroize",
 ]
 
@@ -642,8 +645,12 @@ dependencies = [
 name = "selium-connector-http"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "futures",
+ "getrandom",
+ "ring",
  "rustls",
  "rustls-pemfile",
+ "rustls-pki-types",
  "selium-abi",
  "selium-encoding",
  "selium-guest",
@@ -653,6 +660,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -1295,6 +1303,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dda82c82e1486c7eed42a0465e544d80fff37abc3b39482e0d34dbaabe2fe5b1"
 dependencies = [
  "wast",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+dependencies = [
+ "rustversion",
+ "wasm-bindgen",
 ]
 
 [[package]]

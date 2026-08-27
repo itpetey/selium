@@ -63,4 +63,5 @@ behaviour without changing their requirements.)
 - Golden path: `curl` → connector → typed channel → app guest →
   response + log line, in CI (invariant 6).
 - Follow-ons (not in this change): DNS/WebSocket/IMAP/SMTP connectors;
-  HTTP/2+H3 after the QUIC path is reinstated.
+  HTTP/2+H3 after the QUIC path is reinstated; the external `curl`-in-CI
+  golden path once a live wasm guest deployment is available.

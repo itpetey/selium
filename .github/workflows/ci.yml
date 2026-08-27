@@ -95,7 +95,7 @@ jobs:
       # Every system guest must compile to wasm32; regressions here are
       # invisible to the native test suite.
       - name: build guests for wasm32
-        run: cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery -p selium-discovery-probe -p selium-guest
+        run: cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery -p selium-discovery-probe -p selium-guest -p selium-connector-http -p selium-connector-http
         working-directory: proto/arch3
 
       - name: golden-path spine test

@@ -156,10 +156,8 @@ fn resolve_basis_allows_foreign_queue_attach() {
         .expect("spawn intruder");
 
     // Step 1: Process A creates a host queue.
-    let (status, op_id) = runtime.begin_hostcall(
-        proc_a.process_id,
-        HostcallRequest::HostQueueCreate,
-    );
+    let (status, op_id) =
+        runtime.begin_hostcall(proc_a.process_id, HostcallRequest::HostQueueCreate);
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_descriptor)) =
         runtime.poll_hostcall(proc_a.process_id, op_id)
@@ -377,10 +375,7 @@ fn zero_grant_guest_round_trip_via_host_queue() {
     );
 
     // Step 1: Server creates a listener queue.
-    let (_, op_id) = runtime.begin_hostcall(
-        server,
-        HostcallRequest::HostQueueCreate,
-    );
+    let (_, op_id) = runtime.begin_hostcall(server, HostcallRequest::HostQueueCreate);
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(server, op_id)
     else {
@@ -440,18 +435,14 @@ fn zero_grant_guest_round_trip_via_host_queue() {
     // If data was already enqueued, recv returns READY immediately.
     // Otherwise it returns PENDING; poll_hostcall will wake it.
     let received_region_id = match recv_status {
-        selium_abi::HOSTCALL_STATUS_READY => {
-            match runtime.poll_hostcall(server, server_recv_op) {
-                CompletionState::Ready(HostcallOutput::ConnectionInfo { value, .. }) => value,
-                other => panic!("expected ConnectionInfo on ready recv, got {other:?}"),
-            }
-        }
-        _ => {
-            match runtime.poll_hostcall(server, server_recv_op) {
-                CompletionState::Ready(HostcallOutput::ConnectionInfo { value, .. }) => value,
-                other => panic!("expected ConnectionInfo on poll after pending recv, got {other:?}"),
-            }
-        }
+        selium_abi::HOSTCALL_STATUS_READY => match runtime.poll_hostcall(server, server_recv_op) {
+            CompletionState::Ready(HostcallOutput::ConnectionInfo { value, .. }) => value,
+            other => panic!("expected ConnectionInfo on ready recv, got {other:?}"),
+        },
+        _ => match runtime.poll_hostcall(server, server_recv_op) {
+            CompletionState::Ready(HostcallOutput::ConnectionInfo { value, .. }) => value,
+            other => panic!("expected ConnectionInfo on poll after pending recv, got {other:?}"),
+        },
     };
     assert_eq!(received_region_id, alloc.region_id);
 
@@ -626,9 +617,8 @@ fn concurrent_connections_use_distinct_regions() {
             local_id: listener.local_id,
         },
     );
-    let CompletionState::Ready(HostcallOutput::ConnectionInfo {
-        value: recv_a, ..
-    }) = runtime.poll_hostcall(server, server_recv_a)
+    let CompletionState::Ready(HostcallOutput::ConnectionInfo { value: recv_a, .. }) =
+        runtime.poll_hostcall(server, server_recv_a)
     else {
         panic!("server should receive region A");
     };
@@ -640,9 +630,8 @@ fn concurrent_connections_use_distinct_regions() {
             local_id: listener.local_id,
         },
     );
-    let CompletionState::Ready(HostcallOutput::ConnectionInfo {
-        value: recv_b, ..
-    }) = runtime.poll_hostcall(server, server_recv_b)
+    let CompletionState::Ready(HostcallOutput::ConnectionInfo { value: recv_b, .. }) =
+        runtime.poll_hostcall(server, server_recv_b)
     else {
         panic!("server should receive region B");
     };
@@ -703,11 +692,7 @@ fn spawn_guest(
 /// discovery service does after a successful Resolve. The runtime accepts
 /// `RecordResolvedQueueFor` only from the process booted under the
 /// "discovery" name.
-fn discovery_records_resolve(
-    runtime: &Runtime,
-    client: selium_abi::ProcessId,
-    shared_id: u64,
-) {
+fn discovery_records_resolve(runtime: &Runtime, client: selium_abi::ProcessId, shared_id: u64) {
     let discovery = spawn_guest(runtime, "discovery", Vec::new());
     let (status, _op) = runtime.begin_hostcall(
         discovery,
@@ -753,8 +738,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         )],
     );
 
-    let (_, op_id) =
-        runtime.begin_hostcall(server_a, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server_a, HostcallRequest::HostQueueCreate);
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_a)) =
         runtime.poll_hostcall(server_a, op_id)
     else {
@@ -793,9 +777,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
 
     // --- Phase 2: Revocation (server stops) ---
 
-    runtime
-        .stop_process(server_a)
-        .expect("stop server-a");
+    runtime.stop_process(server_a).expect("stop server-a");
 
     // Connector's cached route is stale. Attaching to the old queue id
     // should fail — the queue is gone, and the resolved basis still
@@ -842,8 +824,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         )],
     );
 
-    let (_, op_id) =
-        runtime.begin_hostcall(server_b, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server_b, HostcallRequest::HostQueueCreate);
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_b)) =
         runtime.poll_hostcall(server_b, op_id)
     else {

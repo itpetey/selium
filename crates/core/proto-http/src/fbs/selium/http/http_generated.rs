@@ -609,6 +609,187 @@ impl ::core::fmt::Debug for HttpTrailer<'_> {
       ds.finish()
   }
 }
+pub enum HttpStreamItemOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct HttpStreamItem<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for HttpStreamItem<'a> {
+  type Inner = HttpStreamItem<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> HttpStreamItem<'a> {
+  pub const VT_KIND: ::flatbuffers::VOffsetT = 4;
+  pub const VT_STATUS: ::flatbuffers::VOffsetT = 6;
+  pub const VT_HEADERS: ::flatbuffers::VOffsetT = 8;
+  pub const VT_DATA: ::flatbuffers::VOffsetT = 10;
+  pub const VT_NAME: ::flatbuffers::VOffsetT = 12;
+  pub const VT_VALUE: ::flatbuffers::VOffsetT = 14;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    HttpStreamItem { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args HttpStreamItemArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<HttpStreamItem<'bldr>> {
+    let mut builder = HttpStreamItemBuilder::new(_fbb);
+    if let Some(x) = args.value { builder.add_value(x); }
+    if let Some(x) = args.name { builder.add_name(x); }
+    if let Some(x) = args.data { builder.add_data(x); }
+    if let Some(x) = args.headers { builder.add_headers(x); }
+    builder.add_status(args.status);
+    builder.add_kind(args.kind);
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn kind(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(HttpStreamItem::VT_KIND, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn status(&self) -> u16 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u16>(HttpStreamItem::VT_STATUS, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn headers(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<HttpHeader<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<HttpHeader>>>>(HttpStreamItem::VT_HEADERS, None)}
+  }
+  #[inline]
+  pub fn data(&self) -> Option<::flatbuffers::Vector<'a, u8>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(HttpStreamItem::VT_DATA, None)}
+  }
+  #[inline]
+  pub fn name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(HttpStreamItem::VT_NAME, None)}
+  }
+  #[inline]
+  pub fn value(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(HttpStreamItem::VT_VALUE, None)}
+  }
+}
+
+impl ::flatbuffers::Verifiable for HttpStreamItem<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<u8>("kind", Self::VT_KIND, false)?
+     .visit_field::<u16>("status", Self::VT_STATUS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<HttpHeader>>>>("headers", Self::VT_HEADERS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("data", Self::VT_DATA, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("value", Self::VT_VALUE, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct HttpStreamItemArgs<'a> {
+    pub kind: u8,
+    pub status: u16,
+    pub headers: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<HttpHeader<'a>>>>>,
+    pub data: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub value: Option<::flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for HttpStreamItemArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    HttpStreamItemArgs {
+      kind: 0,
+      status: 0,
+      headers: None,
+      data: None,
+      name: None,
+      value: None,
+    }
+  }
+}
+
+pub struct HttpStreamItemBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> HttpStreamItemBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_kind(&mut self, kind: u8) {
+    self.fbb_.push_slot::<u8>(HttpStreamItem::VT_KIND, kind, 0);
+  }
+  #[inline]
+  pub fn add_status(&mut self, status: u16) {
+    self.fbb_.push_slot::<u16>(HttpStreamItem::VT_STATUS, status, 0);
+  }
+  #[inline]
+  pub fn add_headers(&mut self, headers: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<HttpHeader<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(HttpStreamItem::VT_HEADERS, headers);
+  }
+  #[inline]
+  pub fn add_data(&mut self, data: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , u8>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(HttpStreamItem::VT_DATA, data);
+  }
+  #[inline]
+  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(HttpStreamItem::VT_NAME, name);
+  }
+  #[inline]
+  pub fn add_value(&mut self, value: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(HttpStreamItem::VT_VALUE, value);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> HttpStreamItemBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    HttpStreamItemBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<HttpStreamItem<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for HttpStreamItem<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("HttpStreamItem");
+      ds.field("kind", &self.kind());
+      ds.field("status", &self.status());
+      ds.field("headers", &self.headers());
+      ds.field("data", &self.data());
+      ds.field("name", &self.name());
+      ds.field("value", &self.value());
+      ds.finish()
+  }
+}
 #[inline]
 /// Verifies that a buffer of bytes contains a `HttpRequest`
 /// and returns it.

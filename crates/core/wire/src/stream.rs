@@ -1236,6 +1236,12 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
 
 /// Registers a generation wait on the reader's region for cooperative
 /// scheduling, falling back to a waker wake if no callback is installed.
+///
+/// Regions without an id (e.g. RPC session sub-channels carved from a
+/// parent region) cannot name a generation-wait registration, so the task
+/// self-wakes to keep polling — the same fallback `generation_wait` applies.
+/// Without this, a stream reader parked before its peer's first frame would
+/// never be re-polled.
 fn register_gen_wait<M: MessageTransport>(reader: &mut FramedRead<M>, cx: &mut Context<'_>) {
     let region_id = reader.inner().region_id();
     if region_id != 0 {
@@ -1243,6 +1249,8 @@ fn register_gen_wait<M: MessageTransport>(reader: &mut FramedRead<M>, cx: &mut C
         if !selium_memory::register_generation_wait(region_id, cur_gen, cx.waker()) {
             cx.waker().wake_by_ref();
         }
+    } else {
+        cx.waker().wake_by_ref();
     }
 }
 

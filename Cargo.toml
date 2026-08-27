@@ -43,33 +43,37 @@ bytes = { version = "1.12", default-features = false }
 clap = { version = "4.6", default-features = false }
 flatbuffers = { version = "25.12", default-features = false }
 futures = { version = "0.3", default-features = false }
+getrandom = { version = "0.2", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
 quote = { version = "1.0", default-features = false }
+ring = { version = "0.17", default-features = false }
 rkyv = { version = "0.8", default-features = false }
+rustls = { version = "0.23", default-features = false }
+rustls-pemfile = { version = "2", default-features = false }
+rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/core/abi", default-features = false }
 selium-connector-http = { path = "crates/guests/connector-http", default-features = false }
 selium-encoding = { path = "crates/core/encoding", default-features = false }
-selium-proto-http = { path = "crates/core/proto-http", default-features = false }
 selium-guest = { path = "crates/core/guest", default-features = false }
-selium-guest-macros = {
-  path = "crates/core/guest/macros",
-  default-features = false
-}
+selium-guest-macros = { path = "crates/core/guest/macros", default-features = false }
 selium-kernel = { path = "crates/core/kernel", default-features = false }
 selium-memory = { path = "crates/core/memory", default-features = false }
+selium-proto-http = { path = "crates/core/proto-http", default-features = false }
 selium-shm = { path = "crates/core/shm", default-features = false }
 selium-wire = { path = "crates/core/wire", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "3.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.53", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", default-features = false }
 wasmtiny = { version = "0.1", default-features = false }
 wat = { version = "1.255", default-features = false }
+web-time = "1.1"
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
@@ -112,3 +116,4 @@ unwrap_used = "warn"
 
 [patch.crates-io]
 wasmtiny = { path = "../../wasmtiny" }
+web-time = { path = "../../web-time" }

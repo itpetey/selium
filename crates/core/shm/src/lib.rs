@@ -34,7 +34,11 @@ pub use channels::{Channel, ChannelBackpressure};
 pub use layout::{RingReader, RingWriter, round_capacity as layout_round_capacity};
 pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
 pub use ring_buf::{RingBuf, round_capacity};
-pub use rpc::{OwnedRpcClient, RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
+pub use rpc::{
+    OwnedRpcClient, OwnedServerStreamClient, RpcClient, RpcConnection, RpcError, RpcRequest,
+    ServerStreamClient, ServerStreamConnection, ServerStreamRequest, accept, accept_server_stream,
+    connect, connect_server_stream,
+};
 pub use transport::{ShmRendezvous, ShmTransport};
 
 pub mod channels;

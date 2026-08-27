@@ -80,6 +80,27 @@ NOT buffer unboundedly.
 - **THEN** the connector SHALL pause socket reads and resume on
   generation advance, with no request bytes lost
 
+### Requirement: Streaming Bodies via Server-Streaming RPC
+Streamed HTTP response bodies SHALL be mapped to server-streaming RPC
+(`streaming-rpc-patterns`): routes registered with the streaming
+interface deliver a typed head followed by body chunks and optional
+trailers, which the connector SHALL write to the wire incrementally with
+chunked transfer encoding. The connector SHALL NOT buffer an entire
+streamed body at the edge. Requests with chunked bodies SHALL be decoded
+at the edge into the typed request's inline body.
+
+#### Scenario: Chunked response streamed to the wire
+- **WHEN** a serving guest produces a streamed response (head, chunks,
+  trailers) over a server-streaming session
+- **THEN** the connector SHALL write chunked transfer encoding
+  incrementally, with chunks and trailers in produced order and the
+  stream terminated by the zero-length chunk
+
+#### Scenario: Oversized request rejected at the edge
+- **WHEN** a request exceeds the edge's inline size limit
+- **THEN** the connector SHALL respond with a typed 413-equivalent error
+  and SHALL NOT forward the request
+
 ### Requirement: Raw-Path Coexistence
 The connector SHALL be one framing of the shared substrate, not the only
 one: guests using raw `TcpStream`/`TcpListener` directly (BYO framework)
