@@ -5,10 +5,15 @@
 //! lookups per connection-worker and evicts on attach failure, so a stale
 //! entry costs one failed request and forces a fresh lookup.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use selium_guest::Context;
+
+/// Test support: re-exports helpers for integration tests in `tests/`.
+/// Test utilities — not for production use.
+pub mod test_support {
+    pub use super::RouteResolver;
+}
 
 /// Shared handle to the route resolver, cloned into each connection task.
 ///
@@ -17,16 +22,16 @@ use selium_guest::Context;
 /// round-trips entirely.
 pub type ResolverHandle = Arc<tokio::sync::Mutex<RouteResolver>>;
 
-#[derive(Clone)]
-struct CachedRoute {
-    target: selium_abi::ResourceTarget,
-    _created_at_ms: u64,
-}
-
 /// Resolves Host + path to a serving channel via discovery lookups.
 pub struct RouteResolver {
     ctx: Option<Context>,
     cache: HashMap<String, CachedRoute>,
+}
+
+#[derive(Clone)]
+struct CachedRoute {
+    target: selium_abi::ResourceTarget,
+    _created_at_ms: u64,
 }
 
 /// Route resolution failures.
@@ -62,11 +67,7 @@ impl RouteResolver {
     /// Creates a RouteResolver with a pre-populated cache entry.
     /// Test utility — bypasses discovery lookup so tests can exercise cache
     /// semantics without a running discovery service.
-    pub fn with_cached_route(
-        host: &str,
-        path: &str,
-        target: selium_abi::ResourceTarget,
-    ) -> Self {
+    pub fn with_cached_route(host: &str, path: &str, target: selium_abi::ResourceTarget) -> Self {
         let mut cache = HashMap::new();
         let cache_key = format!("{}:{}", host, path);
         cache.insert(
@@ -92,10 +93,7 @@ impl RouteResolver {
     /// Creates a resolver with several pre-populated cache entries,
     /// keyed by path for one host. Test utility.
     #[allow(dead_code)]
-    pub fn with_routes(
-        host: &str,
-        routes: HashMap<String, selium_abi::ResourceTarget>,
-    ) -> Self {
+    pub fn with_routes(host: &str, routes: HashMap<String, selium_abi::ResourceTarget>) -> Self {
         let mut cache = HashMap::new();
         for (path, target) in routes {
             let cache_key = format!("{}:{}", host, path);
@@ -215,12 +213,6 @@ impl RouteResolver {
             _ => Err(ResolveError::NotFound),
         }
     }
-}
-
-/// Test support: re-exports helpers for integration tests in `tests/`.
-/// Test utilities — not for production use.
-pub mod test_support {
-    pub use super::RouteResolver;
 }
 
 #[cfg(test)]

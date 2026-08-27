@@ -124,6 +124,45 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "net-demo".to_string(),
+        module_id: "net-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "net_demo".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
+            ),
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            // Receiving from the bind-created host queue needs HostQueue.
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+    }
+}
+
+/// Path to the compiled net-demo WASM module.
+fn net_demo_wasm_path() -> PathBuf {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
+}
+
 fn parse_app(raw: &str) -> Result<AppDef, String> {
     // Stateful split: a comma-separated segment that contains '=' starts
     // a new key; segments without '=' are appended to the previous key's
@@ -200,45 +239,6 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
         tenant,
         readiness,
     })
-}
-
-/// Path to the compiled net-demo WASM module.
-fn net_demo_wasm_path() -> PathBuf {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
-    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
-}
-
-fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "net-demo".to_string(),
-        module_id: "net-demo-module".to_string(),
-        module_bytes,
-        entrypoint: "net_demo".to_string(),
-        arguments: Vec::new(),
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::TcpListener)],
-            ),
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            // Receiving from the bind-created host queue needs HostQueue.
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-    }
 }
 
 /// Event-driven network wake demo (task 4.3): bootstraps the net-demo

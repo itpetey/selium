@@ -13,12 +13,6 @@
 //! written back to the wire. Connections are served concurrently; routes
 //! are resolved through a shared, cached discovery resolver.
 
-pub mod codec;
-pub mod pipeline;
-pub mod resolve;
-pub mod serve;
-pub mod wire_out;
-
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -34,29 +28,135 @@ pub use pipeline::{
 };
 pub use resolve::{ResolveError, ResolverHandle, RouteResolver};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+pub mod codec;
+pub mod pipeline;
+pub mod resolve;
+pub mod serve;
+pub mod wire_out;
 
-/// Storage blob store name for TLS material.
-const TLS_STORE_NAME: &str = "tls-certs";
 /// Manifest name for the certificate chain PEM.
 const TLS_CERT_MANIFEST: &str = "cert-pem";
 /// Manifest name for the private key PEM.
 const TLS_KEY_MANIFEST: &str = "key-pem";
+/// Storage blob store name for TLS material.
+const TLS_STORE_NAME: &str = "tls-certs";
 
-// ---------------------------------------------------------------------------
-// TLS termination
-// ---------------------------------------------------------------------------
+#[derive(Debug)]
+enum TlsError {
+    StorageUnavailable,
+    MissingCertificate,
+    MissingKey,
+    InvalidCertificate,
+    InvalidKey,
+    ConfigError,
+}
 
-/// Custom `getrandom` backend for wasm32: fills `buf` by calling the
-/// `RandomBytes` hostcall, then copies into the provided slice.
-#[cfg(target_arch = "wasm32")]
-fn wasm_fill_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
-    use selium_guest::random_bytes;
-    let bytes = random_bytes(buf.len() as u32).map_err(|_| getrandom::Error::UNEXPECTED)?;
-    buf.copy_from_slice(&bytes);
-    Ok(())
+impl std::fmt::Display for TlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsError::StorageUnavailable => write!(f, "TLS storage unavailable"),
+            TlsError::MissingCertificate => write!(f, "TLS certificate not found"),
+            TlsError::MissingKey => write!(f, "TLS private key not found"),
+            TlsError::InvalidCertificate => write!(f, "invalid TLS certificate"),
+            TlsError::InvalidKey => write!(f, "invalid TLS private key"),
+            TlsError::ConfigError => write!(f, "TLS configuration error"),
+        }
+    }
+}
+
+/// Entrypoint for the HTTP connector system guest.
+///
+/// Receives a discovery `Context` handle for route resolution. The runtime
+/// wires this at bootstrap via the entrypoint args mechanism.
+///
+/// TLS certificates are loaded from blob storage at startup. The connector
+/// fails loudly if certificate material is missing or invalid, and never
+/// serves plaintext HTTP on the TLS listener.
+/// Each accepted connection is handled by its own task: TLS handshake, then
+/// the windowed forwarding pipeline. Connections are served concurrently;
+/// one slow (or parked-on-backpressure) connection never blocks the others.
+#[entrypoint]
+async fn connector_http(ctx: Context) {
+    // On wasm32 the host provides randomness and time through hostcalls;
+    // register both backends before any TLS operation touches `ring`/
+    // `getrandom` or `rustls-pki-types`/`web-time`.
+    #[cfg(target_arch = "wasm32")]
+    {
+        getrandom::register_custom_getrandom!(wasm_fill_random);
+        web_time::set_custom_time_source(web_time::TimeSource {
+            monotonic_ns: || {
+                selium_guest::time::Instant::now()
+                    .expect("TimeMonotonic hostcall")
+                    .as_nanos()
+            },
+            wall_clock_ns: || selium_guest::time::now().expect("TimeNow hostcall"),
+        });
+    }
+
+    drop(selium_guest::log::init());
+    info!("http-connector started");
+
+    // Load TLS configuration. This fails loudly on missing/invalid material
+    // per spec: "loud failure on missing/invalid cert material".
+    let tls_config = match load_tls_config() {
+        Ok(cfg) => {
+            info!("http-connector: TLS configured");
+            cfg
+        }
+        Err(e) => {
+            error!("http-connector: TLS setup failed: {e}");
+            error!("http-connector: refusing to serve plaintext on TLS listener");
+            return;
+        }
+    };
+
+    let listener = match TcpListener::bind("0.0.0.0:443") {
+        Ok(l) => {
+            info!("http-connector: bound to 0.0.0.0:443");
+            l
+        }
+        Err(e) => {
+            error!("http-connector: bind failed: {e}");
+            return;
+        }
+    };
+
+    mark_ready();
+
+    let acceptor = TlsAcceptor::from(tls_config);
+    let resolver: ResolverHandle = Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx)));
+    let config = ConnectionConfig::default();
+
+    loop {
+        let stream: TcpStream = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("http-connector: accept failed: {e}");
+                continue;
+            }
+        };
+
+        info!("http-connector: accepted connection");
+
+        // Per-connection task: handshake, then the forwarding pipeline.
+        // Spawning keeps connections independent — a slow or
+        // backpressure-parked connection never blocks the accept loop or
+        // any other connection.
+        let acceptor = acceptor.clone();
+        let resolver = resolver.clone();
+        let factory = ShmSessionFactory;
+        spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("http-connector: TLS handshake failed: {e}");
+                    return;
+                }
+            };
+            debug!("http-connector: TLS handshake complete");
+            handle_connection(tls_stream, resolver, factory, config).await;
+        });
+    }
 }
 
 /// Load TLS certificate and key material from storage via the connector's
@@ -157,124 +257,12 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
     Ok(Arc::new(config))
 }
 
-#[derive(Debug)]
-enum TlsError {
-    StorageUnavailable,
-    MissingCertificate,
-    MissingKey,
-    InvalidCertificate,
-    InvalidKey,
-    ConfigError,
-}
-
-impl std::fmt::Display for TlsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TlsError::StorageUnavailable => write!(f, "TLS storage unavailable"),
-            TlsError::MissingCertificate => write!(f, "TLS certificate not found"),
-            TlsError::MissingKey => write!(f, "TLS private key not found"),
-            TlsError::InvalidCertificate => write!(f, "invalid TLS certificate"),
-            TlsError::InvalidKey => write!(f, "invalid TLS private key"),
-            TlsError::ConfigError => write!(f, "TLS configuration error"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Entrypoint
-// ---------------------------------------------------------------------------
-
-/// Entrypoint for the HTTP connector system guest.
-///
-/// Receives a discovery `Context` handle for route resolution. The runtime
-/// wires this at bootstrap via the entrypoint args mechanism.
-///
-/// TLS certificates are loaded from blob storage at startup. The connector
-/// fails loudly if certificate material is missing or invalid, and never
-/// serves plaintext HTTP on the TLS listener.
-/// Each accepted connection is handled by its own task: TLS handshake, then
-/// the windowed forwarding pipeline. Connections are served concurrently;
-/// one slow (or parked-on-backpressure) connection never blocks the others.
-#[entrypoint]
-async fn connector_http(ctx: Context) {
-    // On wasm32 the host provides randomness and time through hostcalls;
-    // register both backends before any TLS operation touches `ring`/
-    // `getrandom` or `rustls-pki-types`/`web-time`.
-    #[cfg(target_arch = "wasm32")]
-    {
-        getrandom::register_custom_getrandom!(wasm_fill_random);
-        web_time::set_custom_time_source(web_time::TimeSource {
-            monotonic_ns: || {
-                selium_guest::time::Instant::now()
-                    .expect("TimeMonotonic hostcall")
-                    .as_nanos()
-            },
-            wall_clock_ns: || selium_guest::time::now().expect("TimeNow hostcall"),
-        });
-    }
-
-    drop(selium_guest::log::init());
-    info!("http-connector started");
-
-    // Load TLS configuration. This fails loudly on missing/invalid material
-    // per spec: "loud failure on missing/invalid cert material".
-    let tls_config = match load_tls_config() {
-        Ok(cfg) => {
-            info!("http-connector: TLS configured");
-            cfg
-        }
-        Err(e) => {
-            error!("http-connector: TLS setup failed: {e}");
-            error!("http-connector: refusing to serve plaintext on TLS listener");
-            return;
-        }
-    };
-
-    let listener = match TcpListener::bind("0.0.0.0:443") {
-        Ok(l) => {
-            info!("http-connector: bound to 0.0.0.0:443");
-            l
-        }
-        Err(e) => {
-            error!("http-connector: bind failed: {e}");
-            return;
-        }
-    };
-
-    mark_ready();
-
-    let acceptor = TlsAcceptor::from(tls_config);
-    let resolver: ResolverHandle = Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx)));
-    let config = ConnectionConfig::default();
-
-    loop {
-        let stream: TcpStream = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("http-connector: accept failed: {e}");
-                continue;
-            }
-        };
-
-        info!("http-connector: accepted connection");
-
-        // Per-connection task: handshake, then the forwarding pipeline.
-        // Spawning keeps connections independent — a slow or
-        // backpressure-parked connection never blocks the accept loop or
-        // any other connection.
-        let acceptor = acceptor.clone();
-        let resolver = resolver.clone();
-        let factory = ShmSessionFactory;
-        spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("http-connector: TLS handshake failed: {e}");
-                    return;
-                }
-            };
-            debug!("http-connector: TLS handshake complete");
-            handle_connection(tls_stream, resolver, factory, config).await;
-        });
-    }
+/// Custom `getrandom` backend for wasm32: fills `buf` by calling the
+/// `RandomBytes` hostcall, then copies into the provided slice.
+#[cfg(target_arch = "wasm32")]
+fn wasm_fill_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    use selium_guest::random_bytes;
+    let bytes = random_bytes(buf.len() as u32).map_err(|_| getrandom::Error::UNEXPECTED)?;
+    buf.copy_from_slice(&bytes);
+    Ok(())
 }

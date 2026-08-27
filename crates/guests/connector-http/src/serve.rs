@@ -59,6 +59,86 @@ pub struct HttpServe {
     uri: String,
 }
 
+/// A single typed HTTP connection from the connector.
+///
+/// Wraps `RpcConnection<HttpRequest, HttpResponse>` for per-connection
+/// channel hygiene. Each connection carries one request at a time with
+/// tag-based correlation preserved end-to-end.
+pub struct HttpConnection {
+    conn: RpcConnection<HttpRequest, HttpResponse>,
+}
+
+/// A received HTTP request with the ability to reply.
+pub struct HttpRequestHandle<'a> {
+    req: selium_shm::rpc::RpcRequest<'a, HttpRequest, HttpResponse>,
+}
+
+/// Errors that can occur during typed HTTP serving.
+#[derive(Debug)]
+pub enum HttpServeError {
+    /// Failed to accept an incoming connection.
+    Accept(String),
+    /// The remote connection was closed.
+    ConnectionClosed,
+    /// An RPC-level error occurred.
+    Rpc(RpcError),
+}
+
+/// A typed HTTP serve handle for **streamed** responses.
+///
+/// Like [`HttpServe`], but registers [`HTTP_STREAM_INTERFACE`] with
+/// discovery so the connector establishes server-streaming sessions. The
+/// app guest produces a response head, then body chunks (and optional
+/// trailers), which the connector writes to the wire incrementally with
+/// chunked transfer encoding — the edge never buffers the whole body.
+///
+/// Same capability model as [`HttpServe`]: zero `Network` grants required.
+///
+/// ## Example
+///
+/// ```ignore
+/// use selium_connector_http::serve::HttpServeStream;
+/// use selium_guest::entrypoint;
+///
+/// #[entrypoint]
+/// async fn my_app(mut ctx: Context) {
+///     let mut serve = HttpServeStream::bind(&mut ctx, "sel://example.com/events")
+///         .await
+///         .expect("bind failed");
+///
+///     while let Ok(mut conn) = serve.accept().await {
+///         while let Ok(mut req) = conn.recv().await {
+///             let _request = req.payload().unwrap();
+///             req.send_head(200, vec![]).await.unwrap();
+///             req.send_chunk(b"data: tick\n\n".to_vec()).await.unwrap();
+///             req.finish().await.unwrap();
+///         }
+///     }
+/// }
+/// ```
+pub struct HttpServeStream {
+    listener: ResourceListener,
+    uri: String,
+}
+
+/// A single streamed HTTP connection from the connector.
+pub struct HttpStreamConnection {
+    conn: rpc::ServerStreamConnection<HttpRequest, HttpStreamItem>,
+}
+
+/// A received HTTP request whose response is produced as a stream.
+///
+/// Response protocol: exactly one [`send_head`](Self::send_head) first,
+/// then zero or more [`send_chunk`](Self::send_chunk) /
+/// [`send_trailer`](Self::send_trailer) calls, then
+/// [`finish`](Self::finish). The connector writes the head immediately
+/// (chunked transfer encoding) and relays chunks to the wire as they are
+/// produced — ring backpressure parks `send_chunk` when the client is
+/// slow, so a slow consumer throttles the producer, not the edge buffer.
+pub struct HttpStreamRequestHandle<'a> {
+    req: rpc::ServerStreamRequest<'a, HttpRequest, HttpStreamItem>,
+}
+
 impl HttpServe {
     /// Bind to a URI subtree and register it with discovery.
     ///
@@ -114,15 +194,6 @@ impl HttpServe {
     }
 }
 
-/// A single typed HTTP connection from the connector.
-///
-/// Wraps `RpcConnection<HttpRequest, HttpResponse>` for per-connection
-/// channel hygiene. Each connection carries one request at a time with
-/// tag-based correlation preserved end-to-end.
-pub struct HttpConnection {
-    conn: RpcConnection<HttpRequest, HttpResponse>,
-}
-
 impl HttpConnection {
     /// Receive the next HTTP request on this connection.
     ///
@@ -145,11 +216,6 @@ impl HttpConnection {
     pub fn client_process_id(&self) -> u64 {
         self.conn.client_process_id()
     }
-}
-
-/// A received HTTP request with the ability to reply.
-pub struct HttpRequestHandle<'a> {
-    req: selium_shm::rpc::RpcRequest<'a, HttpRequest, HttpResponse>,
 }
 
 impl HttpRequestHandle<'_> {
@@ -177,17 +243,6 @@ impl HttpRequestHandle<'_> {
     }
 }
 
-/// Errors that can occur during typed HTTP serving.
-#[derive(Debug)]
-pub enum HttpServeError {
-    /// Failed to accept an incoming connection.
-    Accept(String),
-    /// The remote connection was closed.
-    ConnectionClosed,
-    /// An RPC-level error occurred.
-    Rpc(RpcError),
-}
-
 impl std::fmt::Display for HttpServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -199,47 +254,6 @@ impl std::fmt::Display for HttpServeError {
 }
 
 impl std::error::Error for HttpServeError {}
-
-// ---------------------------------------------------------------------------
-// Streaming serve API (server-streaming RPC; chunked/SSE response bodies)
-// ---------------------------------------------------------------------------
-
-/// A typed HTTP serve handle for **streamed** responses.
-///
-/// Like [`HttpServe`], but registers [`HTTP_STREAM_INTERFACE`] with
-/// discovery so the connector establishes server-streaming sessions. The
-/// app guest produces a response head, then body chunks (and optional
-/// trailers), which the connector writes to the wire incrementally with
-/// chunked transfer encoding — the edge never buffers the whole body.
-///
-/// Same capability model as [`HttpServe`]: zero `Network` grants required.
-///
-/// ## Example
-///
-/// ```ignore
-/// use selium_connector_http::serve::HttpServeStream;
-/// use selium_guest::entrypoint;
-///
-/// #[entrypoint]
-/// async fn my_app(mut ctx: Context) {
-///     let mut serve = HttpServeStream::bind(&mut ctx, "sel://example.com/events")
-///         .await
-///         .expect("bind failed");
-///
-///     while let Ok(mut conn) = serve.accept().await {
-///         while let Ok(mut req) = conn.recv().await {
-///             let _request = req.payload().unwrap();
-///             req.send_head(200, vec![]).await.unwrap();
-///             req.send_chunk(b"data: tick\n\n".to_vec()).await.unwrap();
-///             req.finish().await.unwrap();
-///         }
-///     }
-/// }
-/// ```
-pub struct HttpServeStream {
-    listener: ResourceListener,
-    uri: String,
-}
 
 impl HttpServeStream {
     /// Bind to a URI subtree and register it with discovery as a streamed
@@ -289,11 +303,6 @@ impl HttpServeStream {
     }
 }
 
-/// A single streamed HTTP connection from the connector.
-pub struct HttpStreamConnection {
-    conn: rpc::ServerStreamConnection<HttpRequest, HttpStreamItem>,
-}
-
 impl HttpStreamConnection {
     /// Receive the next HTTP request on this connection.
     pub async fn recv(&mut self) -> Result<HttpStreamRequestHandle<'_>, HttpServeError> {
@@ -311,19 +320,6 @@ impl HttpStreamConnection {
     pub fn client_process_id(&self) -> u64 {
         self.conn.client_process_id()
     }
-}
-
-/// A received HTTP request whose response is produced as a stream.
-///
-/// Response protocol: exactly one [`send_head`](Self::send_head) first,
-/// then zero or more [`send_chunk`](Self::send_chunk) /
-/// [`send_trailer`](Self::send_trailer) calls, then
-/// [`finish`](Self::finish). The connector writes the head immediately
-/// (chunked transfer encoding) and relays chunks to the wire as they are
-/// produced — ring backpressure parks `send_chunk` when the client is
-/// slow, so a slow consumer throttles the producer, not the edge buffer.
-pub struct HttpStreamRequestHandle<'a> {
-    req: rpc::ServerStreamRequest<'a, HttpRequest, HttpStreamItem>,
 }
 
 impl HttpStreamRequestHandle<'_> {

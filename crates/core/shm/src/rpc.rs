@@ -8,8 +8,10 @@
 //! server via a [`Rendezvous`]; the server attaches to the same region and
 //! parses the header to discover the rings.
 
-use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
+use std::{
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+};
 
 use selium_abi::{RegionProt, ResourceKind};
 use selium_encoding::FlatMsg;
@@ -38,6 +40,22 @@ pub use selium_wire::rpc::RpcError;
 
 /// Client-side handle for typed RPC requests over shared memory.
 pub type RpcClient<Req, Rep> = WireRpcClient<Req, Rep, ShmTransport>;
+/// Server-side handle for an established shared-memory RPC session.
+pub type RpcConnection<Req, Rep> = WireRpcConnection<Req, Rep, ShmTransport>;
+/// A single request received by the server, with the ability to reply.
+pub type RpcRequest<'a, Req, Rep> = WireRpcRequest<'a, Req, Rep, ShmTransport>;
+/// Client-side handle for a server-streaming RPC session over shared memory.
+pub type ServerStreamClient<Req, Item> = WireServerStreamClient<Req, Item, ShmTransport>;
+/// Server-side handle for an established server-streaming RPC session.
+pub type ServerStreamConnection<Req, Item> = WireServerStreamConnection<Req, Item, ShmTransport>;
+/// A server-streaming request received from a client, with the ability to
+/// send stream items.
+pub type ServerStreamRequest<'a, Req, Item> = WireServerStreamRequest<'a, Req, Item, ShmTransport>;
+
+/// Default reply ring capacity in bytes.
+const DEFAULT_REP_CAPACITY: u64 = 4096;
+/// Default request ring capacity in bytes.
+const DEFAULT_REQ_CAPACITY: u64 = 4096;
 
 /// An [`RpcClient`] that owns its session region.
 ///
@@ -50,6 +68,18 @@ pub type RpcClient<Req, Rep> = WireRpcClient<Req, Rep, ShmTransport>;
 /// teardown never touches unmapped memory.
 pub struct OwnedRpcClient<Req, Rep> {
     inner: ManuallyDrop<RpcClient<Req, Rep>>,
+    shared_id: u64,
+}
+
+/// Yields once and re-checks, used by [`wait_for_server_accept`].
+struct YieldOnce(bool);
+
+/// A [`ServerStreamClient`] that owns its session region.
+///
+/// Mirrors [`OwnedRpcClient`] for server-streaming sessions: the session
+/// region pair is freed via the global region provider when dropped.
+pub struct OwnedServerStreamClient<Req, Item> {
+    inner: ManuallyDrop<ServerStreamClient<Req, Item>>,
     shared_id: u64,
 }
 
@@ -86,15 +116,57 @@ impl<Req, Rep> Drop for OwnedRpcClient<Req, Rep> {
         }
     }
 }
-/// Server-side handle for an established shared-memory RPC session.
-pub type RpcConnection<Req, Rep> = WireRpcConnection<Req, Rep, ShmTransport>;
-/// A single request received by the server, with the ability to reply.
-pub type RpcRequest<'a, Req, Rep> = WireRpcRequest<'a, Req, Rep, ShmTransport>;
 
-/// Default reply ring capacity in bytes.
-const DEFAULT_REP_CAPACITY: u64 = 4096;
-/// Default request ring capacity in bytes.
-const DEFAULT_REQ_CAPACITY: u64 = 4096;
+impl std::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            std::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl<Req, Item> OwnedServerStreamClient<Req, Item> {
+    /// Returns the parent shared id of the owned session region.
+    pub fn shared_id(&self) -> u64 {
+        self.shared_id
+    }
+}
+
+impl<Req, Item> Deref for OwnedServerStreamClient<Req, Item> {
+    type Target = ServerStreamClient<Req, Item>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<Req, Item> DerefMut for OwnedServerStreamClient<Req, Item> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
+    fn drop(&mut self) {
+        // SAFETY: `inner` is not used again after this point; dropping it
+        // first ensures all channel state is torn down while the mapping
+        // is still valid.
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
+        if crate::free_region(self.shared_id).is_err() {
+            // Already reclaimed (e.g. peer freed it first, or process
+            // teardown raced); nothing further to do during drop.
+        }
+    }
+}
 
 /// Accepts an incoming shared-memory RPC session.
 ///
@@ -116,6 +188,32 @@ where
         ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
 
     Ok(RpcConnection::new(
+        FramedRead::new(request_transport),
+        FramedWrite::new(reply_transport),
+        connection.client_process_id,
+    ))
+}
+
+/// Accepts an incoming shared-memory server-streaming RPC session.
+///
+/// Attaches to the multi-memory region identified by `connection.shared_id`,
+/// parses the request/reply ring layout, and returns a typed
+/// [`ServerStreamConnection`] for the server side.
+pub fn accept_server_stream<Req, Item>(
+    connection: IncomingConnection,
+) -> std::result::Result<ServerStreamConnection<Req, Item>, RpcError>
+where
+    Req: FlatMsg,
+    Item: FlatMsg,
+{
+    let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
+
+    let request_transport =
+        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+
+    Ok(ServerStreamConnection::new(
         FramedRead::new(request_transport),
         FramedWrite::new(reply_transport),
         connection.client_process_id,
@@ -193,135 +291,6 @@ where
     })
 }
 
-/// Yields once and re-checks, used by [`wait_for_server_accept`].
-struct YieldOnce(bool);
-
-impl std::future::Future for YieldOnce {
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        if self.0 {
-            std::task::Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    }
-}
-
-/// Waits until the serving side has accepted the session.
-///
-/// A blocking reader starts at the ring tail *at registration time*, so any
-/// frame written before the server registers its reader is invisible to the
-/// server forever. Waiting here makes first-frame ordering deterministic:
-/// the client cannot write its first request before the serving side has a
-/// reader positioned at the (empty) ring start.
-///
-/// The accept signal is the writer count on the request channel. The client
-/// contributes exactly one writer (its request transport's write half); the
-/// server contributes a second when it builds its request transport during
-/// accept. Because a transport registers its eager reader before its writer,
-/// observing the second writer guarantees the server's reader is already in
-/// place. If the server never accepts, the caller parks here — the honest
-/// backpressure outcome for a route nobody serves.
-async fn wait_for_server_accept(channel: &Channel) -> Result<()> {
-    while channel.ring().region().load_writer_count()? < 2 {
-        YieldOnce(false).await;
-    }
-    Ok(())
-}
-
-/// Aligns a value up to the given alignment.
-fn align_up(value: u64, alignment: u64) -> u64 {
-    let rem = value % alignment;
-    if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
-    }
-}
-
-/// Client-side handle for a server-streaming RPC session over shared memory.
-pub type ServerStreamClient<Req, Item> = WireServerStreamClient<Req, Item, ShmTransport>;
-/// Server-side handle for an established server-streaming RPC session.
-pub type ServerStreamConnection<Req, Item> = WireServerStreamConnection<Req, Item, ShmTransport>;
-/// A server-streaming request received from a client, with the ability to
-/// send stream items.
-pub type ServerStreamRequest<'a, Req, Item> = WireServerStreamRequest<'a, Req, Item, ShmTransport>;
-
-/// A [`ServerStreamClient`] that owns its session region.
-///
-/// Mirrors [`OwnedRpcClient`] for server-streaming sessions: the session
-/// region pair is freed via the global region provider when dropped.
-pub struct OwnedServerStreamClient<Req, Item> {
-    inner: ManuallyDrop<ServerStreamClient<Req, Item>>,
-    shared_id: u64,
-}
-
-impl<Req, Item> OwnedServerStreamClient<Req, Item> {
-    /// Returns the parent shared id of the owned session region.
-    pub fn shared_id(&self) -> u64 {
-        self.shared_id
-    }
-}
-
-impl<Req, Item> Deref for OwnedServerStreamClient<Req, Item> {
-    type Target = ServerStreamClient<Req, Item>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<Req, Item> DerefMut for OwnedServerStreamClient<Req, Item> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
-    fn drop(&mut self) {
-        // SAFETY: `inner` is not used again after this point; dropping it
-        // first ensures all channel state is torn down while the mapping
-        // is still valid.
-        unsafe { ManuallyDrop::drop(&mut self.inner) };
-        if crate::free_region(self.shared_id).is_err() {
-            // Already reclaimed (e.g. peer freed it first, or process
-            // teardown raced); nothing further to do during drop.
-        }
-    }
-}
-
-/// Accepts an incoming shared-memory server-streaming RPC session.
-///
-/// Attaches to the multi-memory region identified by `connection.shared_id`,
-/// parses the request/reply ring layout, and returns a typed
-/// [`ServerStreamConnection`] for the server side.
-pub fn accept_server_stream<Req, Item>(
-    connection: IncomingConnection,
-) -> std::result::Result<ServerStreamConnection<Req, Item>, RpcError>
-where
-    Req: FlatMsg,
-    Item: FlatMsg,
-{
-    let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
-
-    let request_transport =
-        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-    let reply_transport =
-        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
-
-    Ok(ServerStreamConnection::new(
-        FramedRead::new(request_transport),
-        FramedWrite::new(reply_transport),
-        connection.client_process_id,
-    ))
-}
-
 /// Creates a new shared-memory server-streaming RPC client.
 ///
 /// Allocates a multi-memory region with a request ring and a reply ring,
@@ -391,6 +360,16 @@ where
         inner: ManuallyDrop::new(client),
         shared_id,
     })
+}
+
+/// Aligns a value up to the given alignment.
+fn align_up(value: u64, alignment: u64) -> u64 {
+    let rem = value % alignment;
+    if rem == 0 {
+        value
+    } else {
+        value + alignment - rem
+    }
 }
 
 /// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
@@ -531,6 +510,28 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
 /// Computes the number of WASM pages needed to hold `bytes`.
 fn pages_for_bytes(bytes: u64) -> u32 {
     bytes.div_ceil(WASM_PAGE_SIZE) as u32
+}
+
+/// Waits until the serving side has accepted the session.
+///
+/// A blocking reader starts at the ring tail *at registration time*, so any
+/// frame written before the server registers its reader is invisible to the
+/// server forever. Waiting here makes first-frame ordering deterministic:
+/// the client cannot write its first request before the serving side has a
+/// reader positioned at the (empty) ring start.
+///
+/// The accept signal is the writer count on the request channel. The client
+/// contributes exactly one writer (its request transport's write half); the
+/// server contributes a second when it builds its request transport during
+/// accept. Because a transport registers its eager reader before its writer,
+/// observing the second writer guarantees the server's reader is already in
+/// place. If the server never accepts, the caller parks here — the honest
+/// backpressure outcome for a route nobody serves.
+async fn wait_for_server_accept(channel: &Channel) -> Result<()> {
+    while channel.ring().region().load_writer_count()? < 2 {
+        YieldOnce(false).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

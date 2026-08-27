@@ -48,6 +48,17 @@ pub mod ring_buf;
 pub mod rpc;
 pub mod transport;
 
+/// Frees a shared memory region via the global provider.
+///
+/// In guest mode this issues a `FreeRegion` hostcall, which is
+/// ownership-checked by the runtime; in native test mode it removes the
+/// region from the heap registry.
+pub fn free_region(region_id: u64) -> Result<(), Error> {
+    selium_memory::region_provider()?
+        .free(region_id)
+        .map_err(Error::from)
+}
+
 /// Allocates a shared memory region via the global provider.
 pub(crate) fn allocate_region(
     pages: u32,
@@ -76,17 +87,6 @@ pub(crate) fn ensure_heap_provider() {
     if selium_memory::region_provider().is_err() {
         install_heap_provider();
     }
-}
-
-/// Frees a shared memory region via the global provider.
-///
-/// In guest mode this issues a `FreeRegion` hostcall, which is
-/// ownership-checked by the runtime; in native test mode it removes the
-/// region from the heap registry.
-pub fn free_region(region_id: u64) -> Result<(), Error> {
-    selium_memory::region_provider()?
-        .free(region_id)
-        .map_err(Error::from)
 }
 
 /// Convenience helper to install the heap provider for tests.

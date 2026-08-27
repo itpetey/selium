@@ -8,6 +8,91 @@
 use selium_proto_http::{HttpHeader, HttpResponse, HttpTrailer};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+/// Typed 502 response for session/forwarding failures.
+pub fn bad_gateway_response() -> HttpResponse {
+    HttpResponse::new(
+        502,
+        vec![HttpHeader::new(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        b"Bad Gateway".to_vec(),
+    )
+}
+
+/// Typed 500 response for transport-level failures.
+pub fn internal_error_response() -> HttpResponse {
+    HttpResponse::new(
+        500,
+        vec![HttpHeader::new(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        b"Internal Server Error".to_vec(),
+    )
+}
+
+/// Typed 404-equivalent response for unmatched routes.
+pub fn not_found_response() -> HttpResponse {
+    HttpResponse::new(
+        404,
+        vec![HttpHeader::new(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        b"Not Found".to_vec(),
+    )
+}
+
+/// Typed 413 response for requests exceeding the edge size limit.
+pub fn payload_too_large_response() -> HttpResponse {
+    HttpResponse::new(
+        413,
+        vec![HttpHeader::new(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        b"Payload Too Large".to_vec(),
+    )
+}
+
+pub fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        414 => "URI Too Long",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
+/// Writes one chunk of a chunked response body.
+pub async fn write_chunk<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let size_line = format!("{:x}\r\n", data.len());
+    stream.write_all(size_line.as_bytes()).await?;
+    stream.write_all(data).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Writes a complete (unary) HTTP/1.1 response.
 pub async fn write_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
@@ -37,6 +122,22 @@ pub async fn write_response<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Terminates a chunked response: the zero chunk, any trailers, and the
+/// final blank line.
+pub async fn write_stream_end<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    trailers: &[HttpTrailer],
+) -> std::io::Result<()> {
+    stream.write_all(b"0\r\n").await?;
+    for trailer in trailers {
+        let line = format!("{}: {}\r\n", trailer.name, trailer.value);
+        stream.write_all(line.as_bytes()).await?;
+    }
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Writes the head of a streamed response: status line and headers, with
 /// `Transfer-Encoding: chunked` replacing any body-length framing.
 pub async fn write_stream_head<S: AsyncWrite + Unpin>(
@@ -61,107 +162,6 @@ pub async fn write_stream_head<S: AsyncWrite + Unpin>(
     stream.write_all(b"\r\n").await?;
     stream.flush().await?;
     Ok(())
-}
-
-/// Writes one chunk of a chunked response body.
-pub async fn write_chunk<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    data: &[u8],
-) -> std::io::Result<()> {
-    let size_line = format!("{:x}\r\n", data.len());
-    stream.write_all(size_line.as_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.write_all(b"\r\n").await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Terminates a chunked response: the zero chunk, any trailers, and the
-/// final blank line.
-pub async fn write_stream_end<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    trailers: &[HttpTrailer],
-) -> std::io::Result<()> {
-    stream.write_all(b"0\r\n").await?;
-    for trailer in trailers {
-        let line = format!("{}: {}\r\n", trailer.name, trailer.value);
-        stream.write_all(line.as_bytes()).await?;
-    }
-    stream.write_all(b"\r\n").await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Typed 404-equivalent response for unmatched routes.
-pub fn not_found_response() -> HttpResponse {
-    HttpResponse::new(
-        404,
-        vec![HttpHeader::new(
-            "content-type".to_string(),
-            "text/plain".to_string(),
-        )],
-        b"Not Found".to_vec(),
-    )
-}
-
-/// Typed 502 response for session/forwarding failures.
-pub fn bad_gateway_response() -> HttpResponse {
-    HttpResponse::new(
-        502,
-        vec![HttpHeader::new(
-            "content-type".to_string(),
-            "text/plain".to_string(),
-        )],
-        b"Bad Gateway".to_vec(),
-    )
-}
-
-/// Typed 413 response for requests exceeding the edge size limit.
-pub fn payload_too_large_response() -> HttpResponse {
-    HttpResponse::new(
-        413,
-        vec![HttpHeader::new(
-            "content-type".to_string(),
-            "text/plain".to_string(),
-        )],
-        b"Payload Too Large".to_vec(),
-    )
-}
-
-/// Typed 500 response for transport-level failures.
-pub fn internal_error_response() -> HttpResponse {
-    HttpResponse::new(
-        500,
-        vec![HttpHeader::new(
-            "content-type".to_string(),
-            "text/plain".to_string(),
-        )],
-        b"Internal Server Error".to_vec(),
-    )
-}
-
-pub fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Payload Too Large",
-        414 => "URI Too Long",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Unknown",
-    }
 }
 
 #[cfg(test)]

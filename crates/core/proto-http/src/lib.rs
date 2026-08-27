@@ -4,8 +4,6 @@
 //! and trailers. Used by the HTTP connector for typed forwarding over
 //! shared-memory channels.
 
-extern crate self as selium_proto_http;
-
 use selium_guest_macros::schema;
 
 pub mod fbs;
@@ -14,10 +12,90 @@ pub mod fbs;
 #[schema(
     path = "schemas/http.fbs",
     ty = "selium.http.HttpHeader",
-    binding = "selium_proto_http::fbs::selium::http::HttpHeader"
+    binding = "fbs::selium::http::HttpHeader"
 )]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// A typed HTTP request forwarded by the connector.
+///
+/// The `body` field carries inline bytes for requests with `Content-Length`
+/// below a connector-configured threshold. For streaming (chunked) bodies,
+/// `body` is empty and chunks are delivered via server-streaming RPC.
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpRequest",
+    binding = "fbs::selium::http::HttpRequest"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub uri: String,
+    pub headers: Vec<HttpHeader>,
+    pub body: Vec<u8>,
+}
+
+/// A typed HTTP response sent back through the connector.
+///
+/// The `body` field carries inline bytes for responses. For streaming
+/// (chunked) responses, `body` is empty and chunks are delivered via
+/// server-streaming RPC.
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpResponse",
+    binding = "fbs::selium::http::HttpResponse"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub body: Vec<u8>,
+}
+
+/// A chunk of streaming body data.
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpBodyChunk",
+    binding = "fbs::selium::http::HttpBodyChunk"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpBodyChunk {
+    pub data: Vec<u8>,
+}
+
+/// A single HTTP trailer header (sent after the body in chunked transfer
+/// encoding).
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpTrailer",
+    binding = "fbs::selium::http::HttpTrailer"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpTrailer {
+    pub name: String,
+    pub value: String,
+}
+
+/// One item of a streamed HTTP response carried over server-streaming RPC.
+///
+/// A streamed response is a sequence of items: exactly one head (status and
+/// headers, empty body) first, then zero or more body chunks, then zero or
+/// more trailers. End-of-stream is signalled by the stream lifecycle
+/// (see `streaming-rpc-patterns`), not by an item.
+#[schema(
+    path = "schemas/http.fbs",
+    ty = "selium.http.HttpStreamItem",
+    binding = "fbs::selium::http::HttpStreamItem"
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpStreamItem {
+    pub kind: u8,
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub data: Vec<u8>,
     pub name: String,
     pub value: String,
 }
@@ -30,24 +108,6 @@ impl HttpHeader {
             value: value.into(),
         }
     }
-}
-
-/// A typed HTTP request forwarded by the connector.
-///
-/// The `body` field carries inline bytes for requests with `Content-Length`
-/// below a connector-configured threshold. For streaming (chunked) bodies,
-/// `body` is empty and chunks are delivered via server-streaming RPC.
-#[schema(
-    path = "schemas/http.fbs",
-    ty = "selium.http.HttpRequest",
-    binding = "selium_proto_http::fbs::selium::http::HttpRequest"
-)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpRequest {
-    pub method: String,
-    pub uri: String,
-    pub headers: Vec<HttpHeader>,
-    pub body: Vec<u8>,
 }
 
 impl HttpRequest {
@@ -68,23 +128,6 @@ impl HttpRequest {
     }
 }
 
-/// A typed HTTP response sent back through the connector.
-///
-/// The `body` field carries inline bytes for responses. For streaming
-/// (chunked) responses, `body` is empty and chunks are delivered via
-/// server-streaming RPC.
-#[schema(
-    path = "schemas/http.fbs",
-    ty = "selium.http.HttpResponse",
-    binding = "selium_proto_http::fbs::selium::http::HttpResponse"
-)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: Vec<HttpHeader>,
-    pub body: Vec<u8>,
-}
-
 impl HttpResponse {
     /// Convenience constructor that accepts `impl Into<String>` for header
     /// fields.
@@ -97,49 +140,14 @@ impl HttpResponse {
     }
 }
 
-/// A chunk of streaming body data.
-#[schema(
-    path = "schemas/http.fbs",
-    ty = "selium.http.HttpBodyChunk",
-    binding = "selium_proto_http::fbs::selium::http::HttpBodyChunk"
-)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpBodyChunk {
-    pub data: Vec<u8>,
-}
-
-/// A single HTTP trailer header (sent after the body in chunked transfer
-/// encoding).
-#[schema(
-    path = "schemas/http.fbs",
-    ty = "selium.http.HttpTrailer",
-    binding = "selium_proto_http::fbs::selium::http::HttpTrailer"
-)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpTrailer {
-    pub name: String,
-    pub value: String,
-}
-
-/// One item of a streamed HTTP response carried over server-streaming RPC.
-///
-/// A streamed response is a sequence of items: exactly one head (status and
-/// headers, empty body) first, then zero or more body chunks, then zero or
-/// more trailers. End-of-stream is signalled by the stream lifecycle
-/// (see `streaming-rpc-patterns`), not by an item.
-#[schema(
-    path = "schemas/http.fbs",
-    ty = "selium.http.HttpStreamItem",
-    binding = "selium_proto_http::fbs::selium::http::HttpStreamItem"
-)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpStreamItem {
-    pub kind: u8,
-    pub status: u16,
-    pub headers: Vec<HttpHeader>,
-    pub data: Vec<u8>,
-    pub name: String,
-    pub value: String,
+impl HttpTrailer {
+    /// Convenience constructor that accepts `impl Into<String>`.
+    pub fn from_str(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
 }
 
 impl HttpStreamItem {
@@ -199,16 +207,6 @@ impl HttpStreamItem {
     /// Returns true if this item is a trailer header.
     pub fn is_trailer(&self) -> bool {
         self.kind == Self::KIND_TRAILER
-    }
-}
-
-impl HttpTrailer {
-    /// Convenience constructor that accepts `impl Into<String>`.
-    pub fn from_str(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
-        }
     }
 }
 

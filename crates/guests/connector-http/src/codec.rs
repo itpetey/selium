@@ -16,14 +16,16 @@
 use selium_proto_http::{HttpHeader, HttpRequest};
 use tokio::io::AsyncRead;
 
-/// Read buffer size for one connection; also the maximum inline request
-/// size (headers + body) the edge accepts.
-pub const READ_BUF_SIZE: usize = 16384;
+/// Parsed request head: (method, uri, headers as lowercase name/value pairs).
+pub type ParsedHead = (String, String, Vec<(String, String)>);
 
 pub const MAX_HEADERS: usize = 128;
 pub const MAX_HEADER_NAME_LEN: usize = 256;
 pub const MAX_HEADER_VALUE_LEN: usize = 8192;
 pub const MAX_URI_LEN: usize = 8192;
+/// Read buffer size for one connection; also the maximum inline request
+/// size (headers + body) the edge accepts.
+pub const READ_BUF_SIZE: usize = 16384;
 
 /// Outcome of a codec read.
 #[derive(Debug)]
@@ -45,16 +47,6 @@ pub enum CodecError {
     PartialClosed,
 }
 
-impl std::fmt::Display for CodecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CodecError::Io(error) => write!(f, "read: {error}"),
-            CodecError::RequestTooLarge => write!(f, "request too large"),
-            CodecError::PartialClosed => write!(f, "connection closed with partial request"),
-        }
-    }
-}
-
 /// Incremental HTTP/1.1 request parser over a buffered byte stream.
 ///
 /// Cancel-safe: bytes already read are retained in the internal buffer, so
@@ -65,9 +57,13 @@ pub struct HttpCodec {
     pos: usize,
 }
 
-impl Default for HttpCodec {
-    fn default() -> Self {
-        Self::new()
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodecError::Io(error) => write!(f, "read: {error}"),
+            CodecError::RequestTooLarge => write!(f, "request too large"),
+            CodecError::PartialClosed => write!(f, "connection closed with partial request"),
+        }
     }
 }
 
@@ -171,39 +167,9 @@ impl HttpCodec {
     }
 }
 
-/// Decodes a chunked transfer-encoded body.
-///
-/// Returns the decoded body and the number of consumed bytes (through the
-/// terminating zero chunk and its trailing CRLF — any trailers are
-/// consumed but not forwarded; request trailers are rare and carry no
-/// semantics the typed surface needs). Returns `None` while the buffer
-/// holds an incomplete chunk sequence.
-fn decode_chunked_body(data: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let mut body = Vec::new();
-    let mut offset = 0usize;
-
-    loop {
-        let line_end = offset + find_subsequence(&data[offset..], b"\r\n")?;
-        let size_line = std::str::from_utf8(&data[offset..line_end]).ok()?;
-        // Chunk extensions (`;name=value`) are permitted and ignored.
-        let size_token = size_line.split(';').next()?.trim();
-        let size = usize::from_str_radix(size_token, 16).ok()?;
-        offset = line_end + 2;
-
-        if size == 0 {
-            // Terminal chunk: consume trailers up to the blank line.
-            let trailer_end = offset + find_subsequence(&data[offset..], b"\r\n")?;
-            return Some((body, trailer_end + 2));
-        }
-
-        if offset + size + 2 > data.len() {
-            return None;
-        }
-        if &data[offset + size..offset + size + 2] != b"\r\n" {
-            return None;
-        }
-        body.extend_from_slice(&data[offset..offset + size]);
-        offset += size + 2;
+impl Default for HttpCodec {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -213,8 +179,21 @@ pub(crate) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
         .position(|window| window == needle)
 }
 
-/// Parsed request head: (method, uri, headers as lowercase name/value pairs).
-pub type ParsedHead = (String, String, Vec<(String, String)>);
+pub(crate) fn get_header_str<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let name_lower = name.to_lowercase();
+    headers
+        .iter()
+        .find(|(n, _)| *n == name_lower)
+        .map(|(_, v)| v.as_str())
+}
+
+pub(crate) fn get_typed_header<'a>(headers: &'a [HttpHeader], name: &str) -> Option<&'a str> {
+    let name_lower = name.to_lowercase();
+    headers
+        .iter()
+        .find(|h| h.name.to_lowercase() == name_lower)
+        .map(|h| h.value.as_str())
+}
 
 pub(crate) fn parse_request_head(data: &[u8]) -> Result<ParsedHead, &'static str> {
     let text = match std::str::from_utf8(data) {
@@ -258,20 +237,40 @@ pub(crate) fn parse_request_head(data: &[u8]) -> Result<ParsedHead, &'static str
     Ok((method, uri, headers))
 }
 
-pub(crate) fn get_header_str<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    let name_lower = name.to_lowercase();
-    headers
-        .iter()
-        .find(|(n, _)| *n == name_lower)
-        .map(|(_, v)| v.as_str())
-}
+/// Decodes a chunked transfer-encoded body.
+///
+/// Returns the decoded body and the number of consumed bytes (through the
+/// terminating zero chunk and its trailing CRLF — any trailers are
+/// consumed but not forwarded; request trailers are rare and carry no
+/// semantics the typed surface needs). Returns `None` while the buffer
+/// holds an incomplete chunk sequence.
+fn decode_chunked_body(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut body = Vec::new();
+    let mut offset = 0usize;
 
-pub(crate) fn get_typed_header<'a>(headers: &'a [HttpHeader], name: &str) -> Option<&'a str> {
-    let name_lower = name.to_lowercase();
-    headers
-        .iter()
-        .find(|h| h.name.to_lowercase() == name_lower)
-        .map(|h| h.value.as_str())
+    loop {
+        let line_end = offset + find_subsequence(&data[offset..], b"\r\n")?;
+        let size_line = std::str::from_utf8(&data[offset..line_end]).ok()?;
+        // Chunk extensions (`;name=value`) are permitted and ignored.
+        let size_token = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_token, 16).ok()?;
+        offset = line_end + 2;
+
+        if size == 0 {
+            // Terminal chunk: consume trailers up to the blank line.
+            let trailer_end = offset + find_subsequence(&data[offset..], b"\r\n")?;
+            return Some((body, trailer_end + 2));
+        }
+
+        if offset + size + 2 > data.len() {
+            return None;
+        }
+        if &data[offset + size..offset + size + 2] != b"\r\n" {
+            return None;
+        }
+        body.extend_from_slice(&data[offset..offset + size]);
+        offset += size + 2;
+    }
 }
 
 #[cfg(test)]

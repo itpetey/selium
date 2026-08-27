@@ -23,12 +23,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use futures::{StreamExt, stream::FuturesUnordered};
 use selium_abi::ResourceTarget;
 use selium_proto_http::{HttpRequest, HttpResponse, HttpStreamItem, HttpTrailer};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc,
+};
 use tracing::warn;
 
 use crate::{
@@ -40,17 +41,48 @@ use crate::{
     },
 };
 
+/// Default pipeline window: maximum concurrently in-flight forwarded
+/// requests per connection.
+pub const DEFAULT_MAX_PIPELINE: usize = 8;
+/// Default capacity of the bounded reply-event channel.
+pub const DEFAULT_REPLY_CAPACITY: usize = 16;
 /// Interface name registered by app guests that serve streamed responses.
 ///
 /// Routes whose discovery registration carries this interface are forwarded
 /// over server-streaming RPC; all other routes use unary RPC.
 pub const HTTP_STREAM_INTERFACE: &str = "selium.http/stream";
 
-/// Default pipeline window: maximum concurrently in-flight forwarded
-/// requests per connection.
-pub const DEFAULT_MAX_PIPELINE: usize = 8;
-/// Default capacity of the bounded reply-event channel.
-pub const DEFAULT_REPLY_CAPACITY: usize = 16;
+/// A typed session with a serving guest, able to forward one request.
+pub trait ForwardSession {
+    /// Forwards one typed request, emitting reply events on `out`.
+    ///
+    /// Implementations SHOULD emit exactly one terminal event; the
+    /// pipeline guarantees termination regardless (see `pump`).
+    ///
+    /// `tag` is the connection-level correlation tag assigned to this
+    /// request; every typed request on a connection carries a distinct one.
+    async fn forward<S: ReplySink>(
+        self,
+        tag: u64,
+        request: HttpRequest,
+        out: &mut S,
+    ) -> Result<(), ForwardError>;
+}
+
+/// Sink for typed reply events produced while forwarding one request.
+pub trait ReplySink {
+    /// Emits one reply event for the request being forwarded.
+    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError>;
+}
+
+/// Establishes typed sessions to resolved routes.
+pub trait SessionFactory {
+    /// The session type this factory produces.
+    type Session: ForwardSession;
+
+    /// Establishes a session with the serving guest for `target`.
+    async fn connect(&self, target: &ResourceTarget) -> Result<Self::Session, ForwardError>;
+}
 
 /// Tunables for the per-connection pipeline.
 #[derive(Debug, Clone, Copy)]
@@ -61,15 +93,6 @@ pub struct ConnectionConfig {
     /// Capacity of the bounded reply-event channel between the dispatch
     /// and egress loops.
     pub reply_capacity: usize,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            max_pipeline: DEFAULT_MAX_PIPELINE,
-            reply_capacity: DEFAULT_REPLY_CAPACITY,
-        }
-    }
 }
 
 /// A typed reply event produced while forwarding one request.
@@ -96,16 +119,6 @@ pub enum ReplyEvent {
     Fail,
 }
 
-impl ReplyEvent {
-    /// Returns true if this event terminates its request's reply sequence.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            ReplyEvent::Complete(_) | ReplyEvent::End | ReplyEvent::Fail
-        )
-    }
-}
-
 /// Errors surfaced by session establishment and forwarding.
 #[derive(Debug)]
 pub enum ForwardError {
@@ -115,6 +128,66 @@ pub enum ForwardError {
     Connect(String),
     /// Sending the request or relaying reply events failed.
     Send(String),
+}
+
+/// Correlation buffer that reorders reply events into request order.
+///
+/// Maps connection-level correlation tags (protocol-native request
+/// ordering) to reply events: events for a later request are held back
+/// until every earlier request has emitted its terminal event.
+pub(crate) struct CorrelationMap {
+    pending: BTreeMap<u64, VecDeque<ReplyEvent>>,
+    next_to_send: u64,
+}
+
+/// Wraps a sink and records whether a terminal event (and whether a stream
+/// head) has been emitted.
+struct TerminalTracker<S> {
+    inner: S,
+    saw_terminal: bool,
+    saw_head: bool,
+}
+
+/// Sink adapter that sends tagged events to the egress channel.
+struct MpscSink {
+    tag: u64,
+    out: mpsc::Sender<(u64, ReplyEvent)>,
+}
+
+/// Production session factory: attaches the resolved route's host queue and
+/// establishes a shared-memory typed RPC session.
+///
+/// Routes registered with [`HTTP_STREAM_INTERFACE`] get server-streaming
+/// sessions (streamed bodies); all other routes get unary sessions.
+#[derive(Clone, Copy, Default)]
+pub struct ShmSessionFactory;
+
+/// A production typed session with a serving guest.
+pub enum ShmSession {
+    /// Unary RPC: one `HttpRequest` in, one `HttpResponse` out.
+    Unary(selium_shm::rpc::OwnedRpcClient<HttpRequest, HttpResponse>),
+    /// Server-streaming RPC: one `HttpRequest` in, a stream of
+    /// [`HttpStreamItem`]s out (head, chunks, trailers).
+    Stream(selium_shm::rpc::OwnedServerStreamClient<HttpRequest, HttpStreamItem>),
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            max_pipeline: DEFAULT_MAX_PIPELINE,
+            reply_capacity: DEFAULT_REPLY_CAPACITY,
+        }
+    }
+}
+
+impl ReplyEvent {
+    /// Returns true if this event terminates its request's reply sequence.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ReplyEvent::Complete(_) | ReplyEvent::End | ReplyEvent::Fail
+        )
+    }
 }
 
 impl std::fmt::Display for ForwardError {
@@ -128,48 +201,6 @@ impl std::fmt::Display for ForwardError {
 }
 
 impl std::error::Error for ForwardError {}
-
-/// Sink for typed reply events produced while forwarding one request.
-pub trait ReplySink {
-    /// Emits one reply event for the request being forwarded.
-    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError>;
-}
-
-/// A typed session with a serving guest, able to forward one request.
-pub trait ForwardSession {
-    /// Forwards one typed request, emitting reply events on `out`.
-    ///
-    /// Implementations SHOULD emit exactly one terminal event; the
-    /// pipeline guarantees termination regardless (see `pump`).
-    ///
-    /// `tag` is the connection-level correlation tag assigned to this
-    /// request; every typed request on a connection carries a distinct one.
-    async fn forward<S: ReplySink>(
-        self,
-        tag: u64,
-        request: HttpRequest,
-        out: &mut S,
-    ) -> Result<(), ForwardError>;
-}
-
-/// Establishes typed sessions to resolved routes.
-pub trait SessionFactory {
-    /// The session type this factory produces.
-    type Session: ForwardSession;
-
-    /// Establishes a session with the serving guest for `target`.
-    async fn connect(&self, target: &ResourceTarget) -> Result<Self::Session, ForwardError>;
-}
-
-/// Correlation buffer that reorders reply events into request order.
-///
-/// Maps connection-level correlation tags (protocol-native request
-/// ordering) to reply events: events for a later request are held back
-/// until every earlier request has emitted its terminal event.
-pub(crate) struct CorrelationMap {
-    pending: BTreeMap<u64, VecDeque<ReplyEvent>>,
-    next_to_send: u64,
-}
 
 impl CorrelationMap {
     fn new() -> Self {
@@ -201,6 +232,86 @@ impl CorrelationMap {
             }
         }
         ready
+    }
+}
+
+impl<S: ReplySink> ReplySink for TerminalTracker<S> {
+    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError> {
+        match &event {
+            ReplyEvent::Complete(_) | ReplyEvent::End | ReplyEvent::Fail => {
+                self.saw_terminal = true;
+            }
+            ReplyEvent::Head(_) => self.saw_head = true,
+            ReplyEvent::Chunk(_) | ReplyEvent::Trailer(_) => {}
+        }
+        self.inner.emit(event).await
+    }
+}
+
+impl ReplySink for MpscSink {
+    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError> {
+        match self.out.send((self.tag, event)).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(ForwardError::Send("egress loop closed".to_string())),
+        }
+    }
+}
+
+impl SessionFactory for ShmSessionFactory {
+    type Session = ShmSession;
+
+    async fn connect(&self, target: &ResourceTarget) -> Result<ShmSession, ForwardError> {
+        let sender = selium_guest::ResourceSender::attach(target.resource_id)
+            .map_err(|error| ForwardError::Attach(error.to_string()))?;
+
+        let streamed = target
+            .interface
+            .as_ref()
+            .is_some_and(|interface| interface.name == HTTP_STREAM_INTERFACE);
+
+        if streamed {
+            let client = selium_shm::rpc::connect_server_stream::<HttpRequest, HttpStreamItem, _>(
+                sender, 0, 0,
+            )
+            .await
+            .map_err(|error| ForwardError::Connect(error.to_string()))?;
+            Ok(ShmSession::Stream(client))
+        } else {
+            let client = selium_shm::rpc::connect(sender, 0, 0)
+                .await
+                .map_err(|error| ForwardError::Connect(error.to_string()))?;
+            Ok(ShmSession::Unary(client))
+        }
+    }
+}
+
+impl ForwardSession for ShmSession {
+    async fn forward<S: ReplySink>(
+        self,
+        _tag: u64,
+        request: HttpRequest,
+        out: &mut S,
+    ) -> Result<(), ForwardError> {
+        match self {
+            ShmSession::Unary(mut client) => {
+                let response = client
+                    .request(request)
+                    .await
+                    .map_err(|error| ForwardError::Send(error.to_string()))?;
+                out.emit(ReplyEvent::Complete(response)).await
+            }
+            ShmSession::Stream(mut client) => {
+                let mut stream = client
+                    .call(request)
+                    .await
+                    .map_err(|error| ForwardError::Send(error.to_string()))?;
+                while let Some(item) = stream.next().await {
+                    let item = item.map_err(|error| ForwardError::Send(error.to_string()))?;
+                    out.emit(stream_item_event(item)).await?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -347,71 +458,6 @@ async fn dispatch_loop<R, F>(
     let _ = inflight;
 }
 
-/// Forwards one request through its session, relaying reply events with
-/// the connection-level tag and guaranteeing exactly one terminal event.
-async fn pump<F: ForwardSession>(
-    session: F,
-    tag: u64,
-    request: HttpRequest,
-    out: mpsc::Sender<(u64, ReplyEvent)>,
-) {
-    let mut sink = TerminalTracker {
-        inner: MpscSink { tag, out },
-        saw_terminal: false,
-        saw_head: false,
-    };
-    let result = session.forward(tag, request, &mut sink).await;
-    if result.is_err() {
-        warn!("http-connector: forward failed for tag {tag}");
-    }
-    // Guarantee termination even for misbehaving or interrupted sessions:
-    // an open stream is ended, an unanswered request fails to 502.
-    if !sink.saw_terminal {
-        let event = if sink.saw_head {
-            ReplyEvent::End
-        } else {
-            ReplyEvent::Fail
-        };
-        drop(sink.inner.emit(event).await);
-    }
-}
-
-/// Wraps a sink and records whether a terminal event (and whether a stream
-/// head) has been emitted.
-struct TerminalTracker<S> {
-    inner: S,
-    saw_terminal: bool,
-    saw_head: bool,
-}
-
-impl<S: ReplySink> ReplySink for TerminalTracker<S> {
-    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError> {
-        match &event {
-            ReplyEvent::Complete(_) | ReplyEvent::End | ReplyEvent::Fail => {
-                self.saw_terminal = true;
-            }
-            ReplyEvent::Head(_) => self.saw_head = true,
-            ReplyEvent::Chunk(_) | ReplyEvent::Trailer(_) => {}
-        }
-        self.inner.emit(event).await
-    }
-}
-
-/// Sink adapter that sends tagged events to the egress channel.
-struct MpscSink {
-    tag: u64,
-    out: mpsc::Sender<(u64, ReplyEvent)>,
-}
-
-impl ReplySink for MpscSink {
-    async fn emit(&mut self, event: ReplyEvent) -> Result<(), ForwardError> {
-        match self.out.send((self.tag, event)).await {
-            Ok(()) => Ok(()),
-            Err(_) => Err(ForwardError::Send("egress loop closed".to_string())),
-        }
-    }
-}
-
 /// Receives reply events and writes them to the wire in request order.
 async fn egress_loop<W>(mut writer: W, mut reply_rx: mpsc::Receiver<(u64, ReplyEvent)>)
 where
@@ -470,82 +516,32 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Production session factory: shared-memory typed RPC
-// ---------------------------------------------------------------------------
-
-/// Production session factory: attaches the resolved route's host queue and
-/// establishes a shared-memory typed RPC session.
-///
-/// Routes registered with [`HTTP_STREAM_INTERFACE`] get server-streaming
-/// sessions (streamed bodies); all other routes get unary sessions.
-#[derive(Clone, Copy, Default)]
-pub struct ShmSessionFactory;
-
-impl SessionFactory for ShmSessionFactory {
-    type Session = ShmSession;
-
-    async fn connect(&self, target: &ResourceTarget) -> Result<ShmSession, ForwardError> {
-        let sender = selium_guest::ResourceSender::attach(target.resource_id)
-            .map_err(|error| ForwardError::Attach(error.to_string()))?;
-
-        let streamed = target
-            .interface
-            .as_ref()
-            .is_some_and(|interface| interface.name == HTTP_STREAM_INTERFACE);
-
-        if streamed {
-            let client = selium_shm::rpc::connect_server_stream::<HttpRequest, HttpStreamItem, _>(
-                sender, 0, 0,
-            )
-            .await
-            .map_err(|error| ForwardError::Connect(error.to_string()))?;
-            Ok(ShmSession::Stream(client))
-        } else {
-            let client = selium_shm::rpc::connect(sender, 0, 0)
-                .await
-                .map_err(|error| ForwardError::Connect(error.to_string()))?;
-            Ok(ShmSession::Unary(client))
-        }
+/// Forwards one request through its session, relaying reply events with
+/// the connection-level tag and guaranteeing exactly one terminal event.
+async fn pump<F: ForwardSession>(
+    session: F,
+    tag: u64,
+    request: HttpRequest,
+    out: mpsc::Sender<(u64, ReplyEvent)>,
+) {
+    let mut sink = TerminalTracker {
+        inner: MpscSink { tag, out },
+        saw_terminal: false,
+        saw_head: false,
+    };
+    let result = session.forward(tag, request, &mut sink).await;
+    if result.is_err() {
+        warn!("http-connector: forward failed for tag {tag}");
     }
-}
-
-/// A production typed session with a serving guest.
-pub enum ShmSession {
-    /// Unary RPC: one `HttpRequest` in, one `HttpResponse` out.
-    Unary(selium_shm::rpc::OwnedRpcClient<HttpRequest, HttpResponse>),
-    /// Server-streaming RPC: one `HttpRequest` in, a stream of
-    /// [`HttpStreamItem`]s out (head, chunks, trailers).
-    Stream(selium_shm::rpc::OwnedServerStreamClient<HttpRequest, HttpStreamItem>),
-}
-
-impl ForwardSession for ShmSession {
-    async fn forward<S: ReplySink>(
-        self,
-        _tag: u64,
-        request: HttpRequest,
-        out: &mut S,
-    ) -> Result<(), ForwardError> {
-        match self {
-            ShmSession::Unary(mut client) => {
-                let response = client
-                    .request(request)
-                    .await
-                    .map_err(|error| ForwardError::Send(error.to_string()))?;
-                out.emit(ReplyEvent::Complete(response)).await
-            }
-            ShmSession::Stream(mut client) => {
-                let mut stream = client
-                    .call(request)
-                    .await
-                    .map_err(|error| ForwardError::Send(error.to_string()))?;
-                while let Some(item) = stream.next().await {
-                    let item = item.map_err(|error| ForwardError::Send(error.to_string()))?;
-                    out.emit(stream_item_event(item)).await?;
-                }
-                Ok(())
-            }
-        }
+    // Guarantee termination even for misbehaving or interrupted sessions:
+    // an open stream is ended, an unanswered request fails to 502.
+    if !sink.saw_terminal {
+        let event = if sink.saw_head {
+            ReplyEvent::End
+        } else {
+            ReplyEvent::Fail
+        };
+        drop(sink.inner.emit(event).await);
     }
 }
 
