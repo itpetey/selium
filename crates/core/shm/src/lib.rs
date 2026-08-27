@@ -34,7 +34,7 @@ pub use channels::{Channel, ChannelBackpressure};
 pub use layout::{RingReader, RingWriter, round_capacity as layout_round_capacity};
 pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
 pub use ring_buf::{RingBuf, round_capacity};
-pub use rpc::{RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
+pub use rpc::{OwnedRpcClient, RpcClient, RpcConnection, RpcError, RpcRequest, accept, connect};
 pub use transport::{ShmRendezvous, ShmTransport};
 
 pub mod channels;
@@ -75,8 +75,11 @@ pub(crate) fn ensure_heap_provider() {
 }
 
 /// Frees a shared memory region via the global provider.
-#[cfg(test)]
-pub(crate) fn free_region(region_id: u64) -> Result<(), Error> {
+///
+/// In guest mode this issues a `FreeRegion` hostcall, which is
+/// ownership-checked by the runtime; in native test mode it removes the
+/// region from the heap registry.
+pub fn free_region(region_id: u64) -> Result<(), Error> {
     selium_memory::region_provider()?
         .free(region_id)
         .map_err(Error::from)

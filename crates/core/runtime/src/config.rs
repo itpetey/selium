@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
 use wasmtiny::WasmValue;
 
@@ -71,6 +73,10 @@ pub struct ProcessAuthority {
     /// Parent process id, if spawned by another process. `None` for
     /// bootstrapped system guests. Used by the `Children` selector.
     pub parent: Option<ProcessId>,
+    /// Queue ids returned to this process by successful discovery Resolve
+    /// calls. Provides an authorisation basis for cross-process
+    /// `HostQueueAttach` without requiring an `ExplicitResource` grant.
+    pub resolved_queue_ids: HashSet<u64>,
 }
 
 impl SystemGuestDescriptor {

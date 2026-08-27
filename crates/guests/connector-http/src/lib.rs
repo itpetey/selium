@@ -12,7 +12,7 @@ use selium_guest::{
     debug, entrypoint, error, info, warn,
     mark_ready,
     net::tcp::{TcpListener, TcpStream},
-    BlobStore, Context,
+    BlobStore, Context, ResourceSender,
 };
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse};
 use std::collections::{BTreeMap, HashMap};
@@ -415,16 +415,51 @@ struct CachedRoute {
 }
 
 struct RouteResolver {
-    ctx: Context,
+    ctx: Option<Context>,
     cache: HashMap<String, CachedRoute>,
 }
 
 impl RouteResolver {
     fn new(ctx: Context) -> Self {
         Self {
-            ctx,
+            ctx: Some(ctx),
             cache: HashMap::new(),
         }
+    }
+
+    /// Evicts a cached route entry, forcing re-resolution on the next
+    /// request for the same host+path. Called on queue-attach failure.
+    fn evict(&mut self, host: &str, path: &str) {
+        let cache_key = format!("{}:{}", host, path);
+        self.cache.remove(&cache_key);
+    }
+
+    /// Returns whether a route is cached for the given host+path.
+    #[cfg(test)]
+    fn is_cached(&self, host: &str, path: &str) -> bool {
+        let cache_key = format!("{}:{}", host, path);
+        self.cache.contains_key(&cache_key)
+    }
+
+    /// Creates a RouteResolver with a pre-populated cache entry.
+    /// Test-only: bypasses discovery lookup so tests can exercise cache
+    /// semantics without a running discovery service.
+    #[cfg(test)]
+    fn with_cached_route(
+        host: &str,
+        path: &str,
+        target: selium_abi::ResourceTarget,
+    ) -> Self {
+        let mut cache = HashMap::new();
+        let cache_key = format!("{}:{}", host, path);
+        cache.insert(
+            cache_key,
+            CachedRoute {
+                target,
+                _created_at_ms: 0,
+            },
+        );
+        Self { ctx: None, cache }
     }
 
     async fn resolve(
@@ -437,6 +472,10 @@ impl RouteResolver {
             return Ok(route.target.clone());
         }
 
+        let Some(ref mut ctx) = self.ctx else {
+            return Err(ResolveError::NotFound);
+        };
+
         let clean_path = path.trim_start_matches('/').trim_end_matches('/');
         let discovery_uri = if clean_path.is_empty() {
             format!("sel://{}", host)
@@ -444,7 +483,7 @@ impl RouteResolver {
             format!("sel://{}/{}", host, clean_path)
         };
 
-        match self.ctx.lookup(&discovery_uri).await {
+        match ctx.lookup(&discovery_uri).await {
             Ok(Some(target)) => {
                 self.cache.insert(
                     cache_key,
@@ -468,6 +507,10 @@ impl RouteResolver {
         host: &str,
         path: &str,
     ) -> Result<selium_abi::ResourceTarget, ResolveError> {
+        let Some(ref mut ctx) = self.ctx else {
+            return Err(ResolveError::NotFound);
+        };
+
         let segments: Vec<&str> = path
             .trim_matches('/')
             .split('/')
@@ -478,7 +521,7 @@ impl RouteResolver {
             let prefix = segments[..=i].join("/");
             let uri = format!("sel://{}/{}", host, prefix);
 
-            match self.ctx.lookup(&uri).await {
+            match ctx.lookup(&uri).await {
                 Ok(Some(target)) => {
                     let orig_key = format!("{}:{}", host, path);
                     self.cache.insert(
@@ -499,7 +542,7 @@ impl RouteResolver {
         }
 
         let root_uri = format!("sel://{}", host);
-        match self.ctx.lookup(&root_uri).await {
+        match ctx.lookup(&root_uri).await {
             Ok(Some(target)) => {
                 let orig_key = format!("{}:{}", host, path);
                 self.cache.insert(
@@ -598,7 +641,7 @@ async fn handle_tls_connection(
             .unwrap_or("localhost")
             .to_string();
 
-        let _target = match resolver.resolve(&host, &request.uri).await {
+        let target = match resolver.resolve(&host, &request.uri).await {
             Ok(target) => target,
             Err(_) => {
                 let _ = write_404(&mut writer).await;
@@ -606,22 +649,79 @@ async fn handle_tls_connection(
             }
         };
 
-        let seq = correlation.next_tag();
+        // Establish typed RPC session with the serving guest.
+        let sender = match ResourceSender::attach(target.resource_id) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("queue attach failed for {}: {e}", target.uri);
+                resolver.evict(&host, &request.uri);
+                let _ = write_response(
+                    &mut writer,
+                    &HttpResponse::new(
+                        502,
+                        vec![HttpHeader::new(
+                            "content-type".to_string(),
+                            "text/plain".to_string(),
+                        )],
+                        b"Bad Gateway".to_vec(),
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
 
-        let response = HttpResponse::new(
-            200,
-            vec![HttpHeader::new(
-                "content-type".to_string(),
-                "text/plain".to_string(),
-            )],
-            b"Hello from HTTP connector".to_vec(),
-        );
+        let mut rpc_client: selium_shm::rpc::OwnedRpcClient<HttpRequest, HttpResponse> =
+            match selium_shm::rpc::connect(sender, 0, 0).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("rpc connect failed for {}: {e}", target.uri);
+                    let _ = write_response(
+                        &mut writer,
+                        &HttpResponse::new(
+                            502,
+                            vec![HttpHeader::new(
+                                "content-type".to_string(),
+                                "text/plain".to_string(),
+                            )],
+                            b"Bad Gateway".to_vec(),
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+            };
 
-        let ready = correlation.insert_and_flush(seq, response);
-        for resp in ready {
-            if let Err(e) = write_response(&mut writer, &resp).await {
-                warn!("write error: {e}");
-                return;
+        // Forward the pre-parsed typed HttpRequest to the serving guest.
+        match rpc_client.request(request).await {
+            Ok(response) => {
+                let seq = correlation.next_tag();
+                let ready = correlation.insert_and_flush(seq, response);
+                for resp in ready {
+                    if let Err(e) = write_response(&mut writer, &resp).await {
+                        warn!("write error: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("rpc request failed for {}: {e}", target.uri);
+                let seq = correlation.next_tag();
+                let response = HttpResponse::new(
+                    502,
+                    vec![HttpHeader::new(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )],
+                    b"Bad Gateway".to_vec(),
+                );
+                let ready = correlation.insert_and_flush(seq, response);
+                for resp in ready {
+                    if let Err(e) = write_response(&mut writer, &resp).await {
+                        warn!("write error: {e}");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -982,6 +1082,96 @@ mod tests {
     #[test]
     fn status_reason_unknown() {
         assert_eq!(status_reason(999), "Unknown");
+    }
+
+    // --- RouteResolver cache tests (tasks 3.2, 3.3) ---
+
+    fn make_target(id: u64) -> selium_abi::ResourceTarget {
+        selium_abi::ResourceTarget {
+            uri: format!("sel://example.com/test"),
+            host_id: String::new(),
+            resource_id: id,
+            interface: None,
+            tenant: None,
+        }
+    }
+
+    #[test]
+    fn route_resolver_evict_removes_cached_entry() {
+        let target = make_target(42);
+        let mut resolver = RouteResolver::with_cached_route("example.com", "/test", target.clone());
+
+        assert!(resolver.is_cached("example.com", "/test"));
+        resolver.evict("example.com", "/test");
+        assert!(!resolver.is_cached("example.com", "/test"));
+    }
+
+    #[test]
+    fn route_resolver_evict_of_nonexistent_entry_is_noop() {
+        let target = make_target(42);
+        let mut resolver = RouteResolver::with_cached_route("example.com", "/api", target);
+
+        assert!(resolver.is_cached("example.com", "/api"));
+        assert!(!resolver.is_cached("example.com", "/other"));
+
+        // Evict unrelated entry — cached entry should remain.
+        resolver.evict("example.com", "/other");
+        assert!(resolver.is_cached("example.com", "/api"));
+
+        // Evict the actual entry.
+        resolver.evict("example.com", "/api");
+        assert!(!resolver.is_cached("example.com", "/api"));
+    }
+
+    #[test]
+    fn route_resolver_cache_hit_returns_cached_target() {
+        // Task 3.3: Verify cache hit returns correct target without lookup.
+        let target = make_target(42);
+        let mut resolver = RouteResolver::with_cached_route("example.com", "/test", target.clone());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let result = rt.block_on(resolver.resolve("example.com", "/test"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().resource_id, 42);
+    }
+
+    #[test]
+    fn route_resolver_cache_miss_without_context_returns_not_found() {
+        // Task 3.3: A resolver without a Context (test-only) returns NotFound
+        // on cache miss. In production, the Context would perform discovery.
+        let mut resolver = RouteResolver::with_cached_route(
+            "example.com",
+            "/cached-only",
+            make_target(7),
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let result = rt.block_on(resolver.resolve("example.com", "/not-cached"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn route_resolver_stale_entry_not_reused_after_eviction() {
+        // Task 3.3: After evicting a cached entry, the resolver must not
+        // return the stale entry on the next request.
+        let target = make_target(42);
+        let mut resolver = RouteResolver::with_cached_route("example.com", "/test", target);
+
+        // Evict the entry.
+        resolver.evict("example.com", "/test");
+        assert!(!resolver.is_cached("example.com", "/test"));
+
+        // Resolution without Context returns NotFound — the stale entry
+        // is not reused. In production, this forces a fresh discovery lookup.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let result = rt.block_on(resolver.resolve("example.com", "/test"));
+        assert!(result.is_err());
     }
 }
 

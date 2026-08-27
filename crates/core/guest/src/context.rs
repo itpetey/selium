@@ -1,5 +1,5 @@
 use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
-use selium_shm::rpc::{self, RpcClient};
+use selium_shm::rpc::{self, OwnedRpcClient};
 
 use crate::{GuestError, resource::ResourceSender};
 
@@ -13,7 +13,7 @@ const RPC_REQ_CAPACITY: u64 = 4096;
 /// Provides a pre-connected discovery client for URI resolution via RPC
 /// over shared-memory ring buffers.
 pub struct Context {
-    client: RpcClient<DiscoveryRequest, DiscoveryResponse>,
+    client: OwnedRpcClient<DiscoveryRequest, DiscoveryResponse>,
 }
 
 impl Context {
@@ -21,7 +21,7 @@ impl Context {
     ///
     /// Use this to send custom discovery requests beyond the convenience
     /// `lookup()` method.
-    pub fn discovery(&mut self) -> &mut RpcClient<DiscoveryRequest, DiscoveryResponse> {
+    pub fn discovery(&mut self) -> &mut OwnedRpcClient<DiscoveryRequest, DiscoveryResponse> {
         &mut self.client
     }
 
@@ -44,6 +44,9 @@ impl Context {
     /// Resolves a URI to a resource via the discovery service.
     ///
     /// Convenience method that delegates to `self.discovery().request()`.
+    /// A successful resolve also gives the caller an authorisation basis for
+    /// `HostQueueAttach` on the returned queue: the discovery service records
+    /// the resolved id with the runtime on the caller's behalf.
     pub async fn lookup(&mut self, uri: &str) -> Result<Option<ResourceTarget>, GuestError> {
         let request = DiscoveryRequest::Resolve(uri.to_string());
 

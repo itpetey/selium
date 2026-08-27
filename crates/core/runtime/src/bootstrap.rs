@@ -242,6 +242,12 @@ impl Runtime {
             "bootstrapped system guest"
         );
 
+        // Record the discovery service's process identity so the runtime can
+        // restrict `RecordResolvedQueueFor` to the trusted discovery guest.
+        if descriptor.name == "discovery" {
+            *self.discovery_process.lock() = Some(process.local_id);
+        }
+
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,

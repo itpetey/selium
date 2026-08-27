@@ -280,10 +280,23 @@ async fn handler(
                         Ok(DiscoveryRequest::Resolve(uri)) => {
                             // TODO: Pass caller's tenant from RPC connection metadata
                             // when tenant tracking is added to the runtime.
-                            if let Some(target) = store.resolve_exact_scoped(&uri, None) {
-                                DiscoveryResponse::Found(target)
-                            } else {
-                                DiscoveryResponse::NotFound
+                            match store.resolve_exact_scoped(&uri, None) {
+                                Some(target) => {
+                                    // Record the resolved queue id with the runtime so
+                                    // the resolving client gains an authorisation basis
+                                    // for cross-process `HostQueueAttach`. The runtime
+                                    // accepts this only from the discovery guest.
+                                    if let Err(error) = selium_guest::record_resolved_queue_for(
+                                        client_process_id,
+                                        target.resource_id,
+                                    ) {
+                                        selium_guest::warn!(
+                                            "resolve authorisation record failed: {error}"
+                                        );
+                                    }
+                                    DiscoveryResponse::Found(target)
+                                }
+                                None => DiscoveryResponse::NotFound,
                             }
                         }
                         Ok(DiscoveryRequest::Register { uri: _, target }) => {

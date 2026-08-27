@@ -181,3 +181,19 @@ pub(crate) fn poll_operation(operation_id: OperationId) -> Result<Option<Hostcal
         };
     }
 }
+
+/// Records, on behalf of the discovery service, that a discovery resolve
+/// performed by `client_process_id` returned `shared_id`. The runtime
+/// accepts this hostcall only from the discovery system guest; the recorded
+/// id gives the resolving client an authorisation basis for cross-process
+/// `HostQueueAttach`.
+pub fn record_resolved_queue_for(
+    client_process_id: selium_abi::ProcessId,
+    shared_id: selium_abi::SharedResourceId,
+) -> Result<()> {
+    hostcall_ready(HostcallRequest::RecordResolvedQueueFor {
+        client_process_id,
+        shared_id,
+    })
+    .map(|_| ())
+}

@@ -865,12 +865,42 @@ impl Runtime {
                 )))
             }
             HostcallRequest::HostQueueAttach { shared_id } => {
-                self.require(
-                    process_id,
-                    Capability::HostQueue,
-                    ResourceClass::HostQueue,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
+                // Check: owner? → allow; has ExplicitResource grant? → allow;
+                // resolved via discovery? → allow; else deny.
+                let is_owner = self
+                    .shared_resource_owners
+                    .lock()
+                    .get(&(ResourceClass::HostQueue, shared_id))
+                    .is_some_and(|owners| owners.contains(&process_id));
+                let has_explicit_grant = self
+                    .process_authorities
+                    .lock()
+                    .get(&process_id)
+                    .is_some_and(|auth| {
+                        auth.grants.iter().any(|grant| {
+                            grant.capability == Capability::HostQueue
+                                && grant.selectors.iter().any(|sel| {
+                                    sel == &ResourceSelector::ExplicitResource(
+                                        ResourceIdentity::Shared(shared_id),
+                                    )
+                                })
+                        })
+                    });
+                let is_resolved = self
+                    .process_authorities
+                    .lock()
+                    .get(&process_id)
+                    .is_some_and(|auth| auth.resolved_queue_ids.contains(&shared_id));
+
+                if !is_owner && !has_explicit_grant && !is_resolved {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "HostQueueAttach denied for shared_id {shared_id}: process {process_id} is not owner, lacks ExplicitResource grant, and did not resolve via discovery",
+                        ),
+                    ));
+                }
+
                 let descriptor = self
                     .kernel
                     .queues()
@@ -880,6 +910,28 @@ impl Runtime {
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
+            }
+            HostcallRequest::RecordResolvedQueueFor {
+                client_process_id,
+                shared_id,
+            } => {
+                // Only the discovery system guest may report resolve results.
+                // A guest reporting its own resolves would be able to
+                // self-authorize cross-process queue attach.
+                let discovery = *self.discovery_process.lock();
+                if discovery != Some(process_id) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "RecordResolvedQueueFor denied for process {process_id}: only the discovery service may record resolved queues",
+                        ),
+                    ));
+                }
+                let mut authorities = self.process_authorities.lock();
+                if let Some(auth) = authorities.get_mut(&client_process_id) {
+                    auth.resolved_queue_ids.insert(shared_id);
+                }
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
             HostcallRequest::HostQueueSend { local_id, value } => {
                 self.ensure_local_handle_owner(

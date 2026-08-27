@@ -15,6 +15,7 @@ pub use crate::{
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
     storage::{BlobStore, DurableLog},
     time::{Instant, Timer, now},
+    hostcall::record_resolved_queue_for,
 };
 pub use selium_abi::{
     Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,

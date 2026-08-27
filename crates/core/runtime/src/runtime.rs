@@ -50,6 +50,9 @@ pub struct Runtime {
     pub(crate) discovery_publisher: Arc<Mutex<Option<DiscoveryPublisher>>>,
     /// Shared id of the discovery RPC listener, when discovery is enabled.
     pub(crate) discovery_listener_shared_id: Arc<Mutex<Option<u64>>>,
+    /// Process id of the booted discovery system guest, if any. Only this
+    /// process may call `RecordResolvedQueueFor` on behalf of resolvers.
+    pub(crate) discovery_process: Arc<Mutex<Option<ProcessId>>>,
     /// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
     pub(crate) region_purposes: Arc<Mutex<RegionPurposes>>,
     /// Wait registry: guest tasks parked on host-writable rings.
@@ -95,6 +98,7 @@ impl Runtime {
             mailboxes,
             discovery_publisher: Arc::new(Mutex::new(None)),
             discovery_listener_shared_id: Arc::new(Mutex::new(None)),
+            discovery_process: Arc::new(Mutex::new(None)),
             region_purposes: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),

@@ -711,6 +711,17 @@ pub enum HostcallRequest {
         /// Generation value that the task is waiting to see advanced.
         generation: u64,
     },
+    /// Record that a discovery resolve performed by `client_process_id`
+    /// returned `shared_id`. Callable only by the discovery system guest;
+    /// the runtime rejects the hostcall from any other process. This gives
+    /// the resolved client an authorisation basis for cross-process
+    /// `HostQueueAttach` without requiring an `ExplicitResource` grant.
+    RecordResolvedQueueFor {
+        /// Process that performed the discovery resolve.
+        client_process_id: ProcessId,
+        /// Queue id returned to that process by the resolve.
+        shared_id: SharedResourceId,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.

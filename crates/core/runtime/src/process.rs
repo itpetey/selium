@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use selium_abi::{
     ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, LocalityScope, ProcessId,
     ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, TaskId, encode_rkyv,
@@ -29,6 +31,11 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
+        // If the discovery service stopped, drop its recorded identity so
+        // `RecordResolvedQueueFor` is no longer accepted from any caller.
+        if *self.discovery_process.lock() == Some(process_id) {
+            *self.discovery_process.lock() = None;
+        }
         self.kernel.processes().reap_process(process_id)?;
         Ok(())
     }
@@ -161,6 +168,7 @@ impl Runtime {
                 grants,
                 tenant,
                 parent,
+                resolved_queue_ids: HashSet::new(),
             },
         );
     }

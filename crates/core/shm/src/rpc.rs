@@ -8,6 +8,9 @@
 //! server via a [`Rendezvous`]; the server attaches to the same region and
 //! parses the header to discover the rings.
 
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
+
 use selium_abi::{RegionProt, ResourceKind};
 use selium_encoding::FlatMsg;
 use selium_memory::{
@@ -30,6 +33,54 @@ pub use selium_wire::rpc::RpcError;
 
 /// Client-side handle for typed RPC requests over shared memory.
 pub type RpcClient<Req, Rep> = WireRpcClient<Req, Rep, ShmTransport>;
+
+/// An [`RpcClient`] that owns its session region.
+///
+/// [`connect`] allocates the request/reply region pair client-side; this
+/// wrapper frees the parent region via the global region provider when
+/// dropped, reclaiming the session's shared memory. The free is
+/// ownership-checked by the runtime in guest mode (the allocator is the
+/// owner), so dropping a non-owning handle cannot destroy a foreign
+/// region. Dropping the inner client before freeing guarantees ring
+/// teardown never touches unmapped memory.
+pub struct OwnedRpcClient<Req, Rep> {
+    inner: ManuallyDrop<RpcClient<Req, Rep>>,
+    shared_id: u64,
+}
+
+impl<Req, Rep> OwnedRpcClient<Req, Rep> {
+    /// Returns the parent shared id of the owned session region.
+    pub fn shared_id(&self) -> u64 {
+        self.shared_id
+    }
+}
+
+impl<Req, Rep> Deref for OwnedRpcClient<Req, Rep> {
+    type Target = RpcClient<Req, Rep>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<Req, Rep> DerefMut for OwnedRpcClient<Req, Rep> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<Req, Rep> Drop for OwnedRpcClient<Req, Rep> {
+    fn drop(&mut self) {
+        // SAFETY: `inner` is not used again after this point; dropping it
+        // first ensures all channel state is torn down while the mapping
+        // is still valid.
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
+        if crate::free_region(self.shared_id).is_err() {
+            // Already reclaimed (e.g. peer freed it first, or process
+            // teardown raced); nothing further to do during drop.
+        }
+    }
+}
 /// Server-side handle for an established shared-memory RPC session.
 pub type RpcConnection<Req, Rep> = WireRpcConnection<Req, Rep, ShmTransport>;
 /// A single request received by the server, with the ability to reply.
@@ -70,12 +121,13 @@ where
 ///
 /// Allocates a multi-memory region with a request ring and a reply ring,
 /// sends the parent `shared_id` to the server through `rendezvous`, and
-/// returns a typed [`RpcClient`] ready for requests.
+/// returns an [`OwnedRpcClient`] ready for requests. Dropping the client
+/// frees the session region pair.
 pub async fn connect<Req, Rep, R>(
     rendezvous: R,
     request_capacity: u64,
     reply_capacity: u64,
-) -> std::result::Result<RpcClient<Req, Rep>, RpcError>
+) -> std::result::Result<OwnedRpcClient<Req, Rep>, RpcError>
 where
     Req: FlatMsg,
     Rep: FlatMsg,
@@ -94,20 +146,44 @@ where
 
     let (request_channel, reply_channel, shared_id) = create_rpc_region(req_cap, rep_cap)?;
 
-    rendezvous
-        .send(shared_id)
-        .await
-        .map_err(|error| RpcError::Serialization(format!("rendezvous send failed: {error}")))?;
+    let build_client = || -> std::result::Result<RpcClient<Req, Rep>, RpcError> {
+        let request_transport =
+            ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
+        let reply_transport =
+            ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+        Ok(WireRpcClient::new(
+            FramedWrite::new(request_transport),
+            FramedRead::new(reply_transport),
+        ))
+    };
 
-    let request_transport =
-        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-    let reply_transport =
-        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+    match rendezvous.send(shared_id).await {
+        Ok(()) => {}
+        Err(error) => {
+            // Rendezvous failed: reclaim the region pair before returning.
+            if crate::free_region(shared_id).is_err() {
+                // Best-effort reclaim; surface the rendezvous error instead.
+            }
+            return Err(RpcError::Serialization(format!(
+                "rendezvous send failed: {error}"
+            )));
+        }
+    }
 
-    Ok(RpcClient::new(
-        FramedWrite::new(request_transport),
-        FramedRead::new(reply_transport),
-    ))
+    let client = match build_client() {
+        Ok(client) => client,
+        Err(error) => {
+            if crate::free_region(shared_id).is_err() {
+                // Best-effort reclaim; surface the transport error instead.
+            }
+            return Err(error);
+        }
+    };
+
+    Ok(OwnedRpcClient {
+        inner: ManuallyDrop::new(client),
+        shared_id,
+    })
 }
 
 /// Aligns a value up to the given alignment.
@@ -258,4 +334,36 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
 /// Computes the number of WASM pages needed to hold `bytes`.
 fn pages_for_bytes(bytes: u64) -> u32 {
     bytes.div_ceil(WASM_PAGE_SIZE) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() {
+        crate::install_heap_provider();
+    }
+
+    #[test]
+    fn create_and_attach_rpc_region_round_trip() {
+        // Task 2.1: Verify that create_rpc_region produces a multi-memory
+        // region that attach_rpc_region can attach to. The connector calls
+        // rpc::connect (create_rpc_region + rendezvous) and the app guest
+        // calls rpc::accept (attach_rpc_region).
+        setup();
+
+        let (req_ch, rep_ch, shared_id) =
+            create_rpc_region(4096, 4096).expect("create_rpc_region");
+
+        // Parent shared_id must be valid (non-zero).
+        assert!(shared_id > 0, "parent shared_id must be non-zero");
+
+        // Attach to the same region (simulates rpc::accept server side).
+        let (attached_req, attached_rep) =
+            attach_rpc_region(shared_id).expect("attach_rpc_region");
+
+        // Both created and attached channels should use the same capacity.
+        assert_eq!(attached_req.ring().capacity(), req_ch.ring().capacity());
+        assert_eq!(attached_rep.ring().capacity(), rep_ch.ring().capacity());
+    }
 }
