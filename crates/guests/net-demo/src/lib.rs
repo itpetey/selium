@@ -54,11 +54,18 @@ async fn net_demo() {
         }
         Ok(n) => {
             info!("net-demo: read done ({n} bytes)");
-            if let Err(e) = stream.write_all(&buf[..n]).await {
+            let chunk = match buf.get(..n) {
+                Some(chunk) => chunk,
+                None => {
+                    error!("net-demo: read returned out-of-bounds length {n}");
+                    return;
+                }
+            };
+            if let Err(e) = stream.write_all(chunk).await {
                 error!("net-demo: echo write failed: {e}");
                 return;
             }
-            let _ = stream.flush().await;
+            drop(stream.flush().await);
         }
         Err(e) => {
             error!("net-demo: read failed: {e}");

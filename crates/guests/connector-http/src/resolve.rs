@@ -82,7 +82,6 @@ impl RouteResolver {
 
     /// Creates an empty resolver with no context and no routes.
     /// Test utility.
-    #[allow(dead_code)]
     pub fn empty() -> Self {
         Self {
             ctx: None,
@@ -92,7 +91,6 @@ impl RouteResolver {
 
     /// Creates a resolver with several pre-populated cache entries,
     /// keyed by path for one host. Test utility.
-    #[allow(dead_code)]
     pub fn with_routes(host: &str, routes: HashMap<String, selium_abi::ResourceTarget>) -> Self {
         let mut cache = HashMap::new();
         for (path, target) in routes {

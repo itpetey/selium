@@ -320,13 +320,13 @@ fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
     if let Some(task_id) = current_task_id() {
         // Best-effort: if the hostcall fails, the gen-wait map still holds
         // the waker, and the backstop wake path may still fire.
-        let _ = hostcall_ready_with_task(
+        drop(hostcall_ready_with_task(
             HostcallRequest::WaitRegister {
                 region_id,
                 generation: observed_generation,
             },
             task_id,
-        );
+        ));
     }
 }
 

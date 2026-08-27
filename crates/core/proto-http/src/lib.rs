@@ -6,6 +6,8 @@
 
 use selium_guest_macros::schema;
 
+#[allow(warnings)]
+#[rustfmt::skip]
 pub mod fbs;
 
 /// A single HTTP header name-value pair.

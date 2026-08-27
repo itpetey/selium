@@ -250,13 +250,13 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
 /// of this loop except the log printing and the guest still progresses.
 async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
     let path = net_demo_wasm_path();
-    let module_bytes = fs::read(&path).unwrap_or_else(|error| {
-        panic!(
+    let module_bytes = fs::read(&path).map_err(|error| {
+        anyhow::anyhow!(
             "net demo guest not found at {} ({error}).\nBuild it first:\n  \
              cargo build --target wasm32-unknown-unknown -p selium-net-demo",
             path.display()
         )
-    });
+    })?;
 
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {

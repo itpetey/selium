@@ -369,7 +369,7 @@ fn non_discovery_process_cannot_self_authorize_attach() {
         CompletionState::Failed(_)
     ));
 
-    let (status, op_id) = runtime.begin_hostcall(
+    let (status, _op_id) = runtime.begin_hostcall(
         attacker,
         HostcallRequest::HostQueueAttach {
             shared_id: queue.shared_id,

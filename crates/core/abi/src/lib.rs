@@ -985,9 +985,7 @@ impl NetworkEndpoint {
             return None;
         }
         // Port is after the last colon.
-        let port_colon = rest.rfind(':')?;
-        let host_part = &rest[..port_colon];
-        let port = &rest[port_colon + 1..];
+        let (host_part, port) = rest.rsplit_once(':')?;
 
         // Validate port: empty rejected; comma-separated digits accepted; bare * accepted.
         if port.is_empty() {
@@ -1042,7 +1040,7 @@ impl NetworkEndpoint {
             if context_host.ends_with(suffix) && context_host.len() > suffix.len() {
                 // Ensure the character before the suffix is a dot (label boundary).
                 let dot_pos = context_host.len() - suffix.len() - 1;
-                return context_host.as_bytes()[dot_pos] == b'.';
+                return context_host.as_bytes().get(dot_pos) == Some(&b'.');
             }
         }
         false

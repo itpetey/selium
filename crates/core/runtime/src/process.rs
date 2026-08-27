@@ -741,7 +741,7 @@ mod tests {
     fn wake_while_guard_held_is_not_lost() {
         let runtime = Arc::new(Runtime::default());
         let pid: ProcessId = 7;
-        let mailbox = install_scratch_mailbox(&runtime, pid);
+        let _mailbox = install_scratch_mailbox(&runtime, pid);
 
         // Hold the execution guard, simulating an in-flight reactor poll.
         assert!(
