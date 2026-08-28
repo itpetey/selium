@@ -16,12 +16,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 parking_lot.workspace = true
-selium-abi.workspace = true
 selium-guest.workspace = true
 selium-proto-dns.workspace = true
 selium-shm.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
-tracing.workspace = true
 
 [lints]
 workspace = true

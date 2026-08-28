@@ -21,15 +21,12 @@ futures = { workspace = true, features = ["std"] }
 # The `wasm_js`/`wasm32_unknown_unknown_js` browser backends are deliberately
 # not used: the guest runtime has no DOM/wasm-bindgen environment.
 getrandom = { workspace = true }
-ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
 rustls = { workspace = true, default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, default-features = false, features = ["std"] }
 selium-abi.workspace = true
-selium-encoding.workspace = true
 selium-guest.workspace = true
 selium-proto-http.workspace = true
 selium-shm.workspace = true
-selium-wire.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tokio-rustls = { workspace = true, default-features = false }
 tracing.workspace = true
@@ -37,9 +34,6 @@ web-time.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-rustls-pki-types = { workspace = true, features = ["web"] }
 
 [lints]
 workspace = true

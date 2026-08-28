@@ -50,16 +50,11 @@ getrandom = { version = "0.4", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
 quote = { version = "1.0", default-features = false }
-ring = { version = "0.17", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2", default-features = false }
-rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/core/abi", default-features = false }
-selium-connector-dns = { path = "crates/guests/connector-dns", default-features = false }
-selium-connector-http = { path = "crates/guests/connector-http", default-features = false }
 selium-encoding = { path = "crates/core/encoding", default-features = false }
-selium-dns-demo = { path = "crates/guests/dns-demo", default-features = false }
 selium-guest = { path = "crates/core/guest", default-features = false }
 selium-guest-macros = { path = "crates/core/guest/macros", default-features = false }
 selium-kernel = { path = "crates/core/kernel", default-features = false }

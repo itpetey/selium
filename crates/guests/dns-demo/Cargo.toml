@@ -18,7 +18,6 @@ crate-type = ["cdylib", "rlib"]
 selium-guest.workspace = true
 selium-proto-dns.workspace = true
 selium-shm.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true
