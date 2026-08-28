@@ -8,8 +8,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use selium_abi::uri;
-use selium_guest::Context;
-use selium_guest::net::http::HTTP_SCHEME;
+use selium_guest::{Context, net::http::HTTP_SCHEME};
 
 /// Test support: re-exports helpers for integration tests in `tests/`.
 /// Test utilities — not for production use.

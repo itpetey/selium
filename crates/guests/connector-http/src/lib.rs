@@ -63,6 +63,43 @@ impl std::fmt::Display for TlsError {
     }
 }
 
+/// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
+/// when built with the `custom` backend (`getrandom_backend = "custom"`).
+///
+/// Fills the caller's (possibly uninitialized) buffer by calling the host
+/// `RandomBytes` hostcall, then copies the bytes into the destination.
+///
+/// # Safety
+/// The contract is defined by `getrandom`: `dest` must be valid for writes of
+/// `len` bytes, and on success the entire buffer must be initialized.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    use selium_guest::random_bytes;
+
+    // `getrandom` may request a zero-length buffer; the hostcall expects a
+    // real length, so short-circuit before touching the host.
+    if len == 0 {
+        return Ok(());
+    }
+
+    let bytes = match random_bytes(len as u32) {
+        Ok(bytes) => bytes,
+        // The hostcall error carries no meaning for `getrandom` consumers, so
+        // collapse it into a generic unexpected-error.
+        Err(_) => return Err(getrandom::Error::UNEXPECTED),
+    };
+
+    // Safety: `getrandom` guarantees `dest` is valid for `len` bytes of writes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+    }
+    Ok(())
+}
+
 /// Entrypoint for the HTTP connector system guest.
 ///
 /// Receives a discovery `Context` handle for route resolution. The runtime
@@ -257,41 +294,4 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
 
     info!("http-connector: TLS configured successfully");
     Ok(Arc::new(config))
-}
-
-/// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
-/// when built with the `custom` backend (`getrandom_backend = "custom"`).
-///
-/// Fills the caller's (possibly uninitialized) buffer by calling the host
-/// `RandomBytes` hostcall, then copies the bytes into the destination.
-///
-/// # Safety
-/// The contract is defined by `getrandom`: `dest` must be valid for writes of
-/// `len` bytes, and on success the entire buffer must be initialized.
-#[cfg(target_arch = "wasm32")]
-#[unsafe(no_mangle)]
-unsafe extern "Rust" fn __getrandom_v03_custom(
-    dest: *mut u8,
-    len: usize,
-) -> Result<(), getrandom::Error> {
-    use selium_guest::random_bytes;
-
-    // `getrandom` may request a zero-length buffer; the hostcall expects a
-    // real length, so short-circuit before touching the host.
-    if len == 0 {
-        return Ok(());
-    }
-
-    let bytes = match random_bytes(len as u32) {
-        Ok(bytes) => bytes,
-        // The hostcall error carries no meaning for `getrandom` consumers, so
-        // collapse it into a generic unexpected-error.
-        Err(_) => return Err(getrandom::Error::UNEXPECTED),
-    };
-
-    // Safety: `getrandom` guarantees `dest` is valid for `len` bytes of writes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
-    }
-    Ok(())
 }

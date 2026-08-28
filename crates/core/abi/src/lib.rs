@@ -33,8 +33,6 @@ use rkyv::{
 };
 use thiserror::Error;
 
-pub mod uri;
-
 /// Layout constants for the guest wake mailbox shared with the host.
 pub mod mailbox {
     /// Byte offset of the ring head word.
@@ -54,6 +52,7 @@ pub mod mailbox {
     /// Total mailbox byte length.
     pub const BYTE_LEN: usize = RING_OFFSET + CAPACITY * SLOT_SIZE;
 }
+pub mod uri;
 
 /// Identifier for a resource handle that is local to one process or host context.
 pub type LocalResourceId = u64;

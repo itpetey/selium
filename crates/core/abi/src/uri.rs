@@ -13,39 +13,12 @@
 //! runtime (URI generation), the discovery guest (validation), and the
 //! connectors (route construction and prefix matching).
 
-/// Resolved/tier-1 namespace prefix. Anything under it is runtime-owned.
-pub const RESERVED_URI_PREFIX: &str = "sel://_sys/";
-/// Process-scoped tier-1 prefix: `sel://_sys/proc/<process-id>/...`.
-pub const PROC_URI_PREFIX: &str = "sel://_sys/proc/";
 /// Prefix under which protocol handlers register: `sel://_sys/handlers/<scheme>`.
 pub const HANDLER_URI_PREFIX: &str = "sel://_sys/handlers/";
-
-/// Returns the scheme portion of `uri` (`sel`, `sel-http`, …), if well-formed.
-pub fn scheme_of(uri: &str) -> Option<&str> {
-    let scheme = uri.split_once("://")?.0;
-    (!scheme.is_empty()
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-'))
-    .then_some(scheme)
-}
-
-/// Returns whether the URI falls inside the reserved tier-1 namespace.
-pub fn is_reserved(uri: &str) -> bool {
-    uri.starts_with(RESERVED_URI_PREFIX)
-}
-
-/// Returns whether `scheme` is a protocol-aware fanric scheme (`sel-<proto>`).
-pub fn is_protocol_scheme(scheme: &str) -> bool {
-    scheme.starts_with("sel-")
-}
-
-/// Returns the protocol scheme of a protocol-aware URI (`sel-http` for
-/// `sel-http://…`), or `None` for generic `sel://` URIs.
-pub fn protocol_scheme(uri: &str) -> Option<&str> {
-    let scheme = scheme_of(uri)?;
-    is_protocol_scheme(scheme).then_some(scheme)
-}
+/// Process-scoped tier-1 prefix: `sel://_sys/proc/<process-id>/...`.
+pub const PROC_URI_PREFIX: &str = "sel://_sys/proc/";
+/// Resolved/tier-1 namespace prefix. Anything under it is runtime-owned.
+pub const RESERVED_URI_PREFIX: &str = "sel://_sys/";
 
 /// Extracts the process id from a `sel://_sys/proc/<id>/...` URI, if present.
 pub fn extract_process_id(uri: &str) -> Option<u64> {
@@ -59,10 +32,14 @@ pub fn handler_uri(scheme: &str) -> String {
     format!("{HANDLER_URI_PREFIX}{scheme}")
 }
 
-/// Builds a protocol-aware URI from its parts, e.g.
-/// `protocol_uri("sel-http", "example.com", "/api")` → `sel-http://example.com/api`.
-pub fn protocol_uri(scheme: &str, authority: &str, path: &str) -> String {
-    format!("{scheme}://{authority}{path}")
+/// Returns whether `scheme` is a protocol-aware fanric scheme (`sel-<proto>`).
+pub fn is_protocol_scheme(scheme: &str) -> bool {
+    scheme.starts_with("sel-")
+}
+
+/// Returns whether the URI falls inside the reserved tier-1 namespace.
+pub fn is_reserved(uri: &str) -> bool {
+    uri.starts_with(RESERVED_URI_PREFIX)
 }
 
 /// Normalises a `Host` header value: lowercased, trailing dot stripped, and
@@ -106,6 +83,29 @@ pub fn prefix_matches(prefix: &str, uri: &str) -> bool {
     } else {
         segment_prefix(prefix_rest, uri_rest)
     }
+}
+
+/// Returns the protocol scheme of a protocol-aware URI (`sel-http` for
+/// `sel-http://…`), or `None` for generic `sel://` URIs.
+pub fn protocol_scheme(uri: &str) -> Option<&str> {
+    let scheme = scheme_of(uri)?;
+    is_protocol_scheme(scheme).then_some(scheme)
+}
+
+/// Builds a protocol-aware URI from its parts, e.g.
+/// `protocol_uri("sel-http", "example.com", "/api")` → `sel-http://example.com/api`.
+pub fn protocol_uri(scheme: &str, authority: &str, path: &str) -> String {
+    format!("{scheme}://{authority}{path}")
+}
+
+/// Returns the scheme portion of `uri` (`sel`, `sel-http`, …), if well-formed.
+pub fn scheme_of(uri: &str) -> Option<&str> {
+    let scheme = uri.split_once("://")?.0;
+    (!scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    .then_some(scheme)
 }
 
 /// Returns whether `prefix_host` matches `host` (exact or a `*.` wildcard at a

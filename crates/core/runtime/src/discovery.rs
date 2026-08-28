@@ -4,8 +4,20 @@
 //! runtime→discovery pub/sub feed. This module provides the URI generation
 //! logic; durable registration state lives in the discovery guest, not here.
 
-use selium_abi::uri::PROC_URI_PREFIX;
-use selium_abi::{ProcessId, ResourceKind, uri};
+use selium_abi::{ProcessId, ResourceKind, uri, uri::PROC_URI_PREFIX};
+
+/// Returns the protocol handler registration URI for a scheme.
+pub fn handler_registration_uri(scheme: &str) -> String {
+    uri::handler_uri(scheme)
+}
+
+/// Generates the tier-1 registration URI for a host connection queue created
+/// by `HostQueueCreate`. Queues are first-class resources so guests can
+/// register routes (e.g. HTTP routes) whose target is a listener queue and
+/// still pass discovery's ownership validation.
+pub fn queue_registration_uri(process_id: ProcessId, queue_id: u64) -> String {
+    format!("{PROC_URI_PREFIX}{process_id}/queues/{queue_id}")
+}
 
 /// Generates the URIs to register for a given allocation.
 ///
@@ -21,19 +33,6 @@ pub fn registration_uris(
         format!("{PROC_URI_PREFIX}{process_id}/regions/{region_id}"),
         format!("{PROC_URI_PREFIX}{process_id}/{}", purpose_alias(purpose)),
     ]
-}
-
-/// Generates the tier-1 registration URI for a host connection queue created
-/// by `HostQueueCreate`. Queues are first-class resources so guests can
-/// register routes (e.g. HTTP routes) whose target is a listener queue and
-/// still pass discovery's ownership validation.
-pub fn queue_registration_uri(process_id: ProcessId, queue_id: u64) -> String {
-    format!("{PROC_URI_PREFIX}{process_id}/queues/{queue_id}")
-}
-
-/// Returns the protocol handler registration URI for a scheme.
-pub fn handler_registration_uri(scheme: &str) -> String {
-    uri::handler_uri(scheme)
 }
 
 /// Returns the purpose-specific URI alias suffix for a `ResourceKind`, if any.

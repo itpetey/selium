@@ -45,7 +45,6 @@ use crate::{Context, GuestError, ResourceListener};
 
 /// Protocol scheme for HTTP routes (`sel-http://…`.
 pub const HTTP_SCHEME: &str = "sel-http";
-
 /// Interface marker for streamed HTTP serving.
 ///
 /// [`HttpServeStream::bind`] registers this interface with discovery; the
@@ -140,30 +139,6 @@ pub struct HttpStreamConnection {
 /// slow, so a slow consumer throttles the producer, not the edge buffer.
 pub struct HttpStreamRequestHandle<'a> {
     req: rpc::ServerStreamRequest<'a, HttpRequest, HttpStreamItem>,
-}
-
-fn http_target(
-    listener: &ResourceListener,
-    uri: &str,
-    interface: Option<InterfaceMetadata>,
-) -> ResourceTarget {
-    ResourceTarget {
-        uri: uri.to_string(),
-        host_id: String::new(),
-        resource_id: listener.descriptor().shared_id,
-        interface,
-        tenant: None,
-    }
-}
-
-fn require_http_scheme(uri: &str) -> Result<(), GuestError> {
-    if uri::scheme_of(uri) == Some(HTTP_SCHEME) {
-        Ok(())
-    } else {
-        Err(GuestError::Host(format!(
-            "HTTP serve requires a `{HTTP_SCHEME}://` URI, got: {uri}"
-        )))
-    }
 }
 
 impl HttpServe {
@@ -410,5 +385,29 @@ impl HttpStreamRequestHandle<'_> {
     /// Check whether the client cancelled the stream (call between chunks).
     pub fn check_cancel(&mut self) -> bool {
         self.req.check_cancel()
+    }
+}
+
+fn http_target(
+    listener: &ResourceListener,
+    uri: &str,
+    interface: Option<InterfaceMetadata>,
+) -> ResourceTarget {
+    ResourceTarget {
+        uri: uri.to_string(),
+        host_id: String::new(),
+        resource_id: listener.descriptor().shared_id,
+        interface,
+        tenant: None,
+    }
+}
+
+fn require_http_scheme(uri: &str) -> Result<(), GuestError> {
+    if uri::scheme_of(uri) == Some(HTTP_SCHEME) {
+        Ok(())
+    } else {
+        Err(GuestError::Host(format!(
+            "HTTP serve requires a `{HTTP_SCHEME}://` URI, got: {uri}"
+        )))
     }
 }
