@@ -16,7 +16,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 futures = { workspace = true, features = ["std"] }
-getrandom = { workspace = true, features = ["custom"] }
+# getrandom uses the `custom` backend on wasm32 (see `.cargo/config.toml`),
+# which forwards to the host `RandomBytes` hostcall via `__getrandom_v03_custom`.
+# The `wasm_js`/`wasm32_unknown_unknown_js` browser backends are deliberately
+# not used: the guest runtime has no DOM/wasm-bindgen environment.
+getrandom = { workspace = true }
 ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
 rustls = { workspace = true, default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true, default-features = false, features = ["std"] }

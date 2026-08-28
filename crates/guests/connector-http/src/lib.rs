@@ -82,7 +82,10 @@ async fn connector_http(ctx: Context) {
     // `getrandom` or `rustls-pki-types`/`web-time`.
     #[cfg(target_arch = "wasm32")]
     {
-        getrandom::register_custom_getrandom!(wasm_fill_random);
+        // The custom getrandom backend (`__getrandom_v03_custom`) is declared
+        // at the bottom of this file; it forwards to the host `RandomBytes`
+        // hostcall. Register the time backend before any TLS operation touches
+        // `rustls-pki-types`/`web-time`.
         web_time::set_custom_time_source(web_time::TimeSource {
             monotonic_ns: || {
                 selium_guest::time::Instant::now()
@@ -257,12 +260,39 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
     Ok(Arc::new(config))
 }
 
-/// Custom `getrandom` backend for wasm32: fills `buf` by calling the
-/// `RandomBytes` hostcall, then copies into the provided slice.
+/// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
+/// when built with the `custom` backend (`getrandom_backend = "custom"`).
+///
+/// Fills the caller's (possibly uninitialized) buffer by calling the host
+/// `RandomBytes` hostcall, then copies the bytes into the destination.
+///
+/// # Safety
+/// The contract is defined by `getrandom`: `dest` must be valid for writes of
+/// `len` bytes, and on success the entire buffer must be initialized.
 #[cfg(target_arch = "wasm32")]
-fn wasm_fill_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
     use selium_guest::random_bytes;
-    let bytes = random_bytes(buf.len() as u32).map_err(|_| getrandom::Error::UNEXPECTED)?;
-    buf.copy_from_slice(&bytes);
+
+    // `getrandom` may request a zero-length buffer; the hostcall expects a
+    // real length, so short-circuit before touching the host.
+    if len == 0 {
+        return Ok(());
+    }
+
+    let bytes = match random_bytes(len as u32) {
+        Ok(bytes) => bytes,
+        // The hostcall error carries no meaning for `getrandom` consumers, so
+        // collapse it into a generic unexpected-error.
+        Err(_) => return Err(getrandom::Error::UNEXPECTED),
+    };
+
+    // Safety: `getrandom` guarantees `dest` is valid for `len` bytes of writes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+    }
     Ok(())
 }
