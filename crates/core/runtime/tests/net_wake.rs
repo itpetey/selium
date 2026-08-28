@@ -169,6 +169,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         // The test polls the guest log channel itself for phase markers.
         readiness: ReadinessCondition::Immediate,
         tenant: None,
+        well_known_uri: None,
     }
 }
 

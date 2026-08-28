@@ -33,6 +33,7 @@ pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
 pub use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
 pub use tracing::{debug, error, info, trace, warn};
 
+pub mod args;
 mod async_runtime;
 mod context;
 mod error;

@@ -65,6 +65,10 @@ pub struct Runtime {
     /// so kernel-side sends (e.g. an accepted connection enqueued by the
     /// network poller) can wake the parked receiving guest.
     pub(crate) queue_waiters: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Well-known discovery URIs provisioned at spawn time, keyed by the
+    /// serving process: `(uri, listener shared id)`. Revoked (and the entry
+    /// removed) when the process terminates.
+    pub(crate) well_known_uris: Arc<Mutex<HashMap<ProcessId, (String, u64)>>>,
     /// Process ids whose guest reactor is currently being executed by a
     /// host thread. Guarantees at most one thread enters a guest's WASM
     /// store; losers of the race return and rely on the winner's
@@ -103,6 +107,7 @@ impl Runtime {
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
+            well_known_uris: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
         };
 
@@ -136,6 +141,12 @@ impl Runtime {
     /// Returns the shared id of the discovery RPC listener, if discovery was started.
     pub fn discovery_listener_shared_id(&self) -> Option<u64> {
         *self.discovery_listener_shared_id.lock()
+    }
+
+    /// Returns the well-known discovery URI provisioned for `process_id`, if
+    /// any, together with its host listener queue shared id.
+    pub fn well_known_uri(&self, process_id: ProcessId) -> Option<(String, u64)> {
+        self.well_known_uris.lock().get(&process_id).cloned()
     }
 
     /// Publishes a raw rkyv-encoded discovery operation to the discovery feed.

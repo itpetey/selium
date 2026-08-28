@@ -95,8 +95,8 @@ impl UdpSocket {
             .length
             .saturating_sub(selium_shm::layout::DATA_OFFSET);
 
-        let recv_region = ChannelRegion::from_mapping(recv_mapping, ring_cap);
-        let send_region = ChannelRegion::from_mapping(send_mapping, ring_cap);
+        let recv_region = ChannelRegion::from_mapping_with_id(recv_mapping, ring_cap, shared_id);
+        let send_region = ChannelRegion::from_mapping_with_id(send_mapping, ring_cap, shared_id);
 
         let recv_ring = RingBuf::wrap_region(recv_region)
             .map_err(|e| GuestError::Host(format!("wrap recv ring failed: {e}")))?;

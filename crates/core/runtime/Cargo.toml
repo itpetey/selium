@@ -30,6 +30,7 @@ wasmtiny.workspace = true
 
 [dev-dependencies]
 selium-encoding.workspace = true
+selium-proto-dns.workspace = true
 wat.workspace = true
 
 [lints]

@@ -348,6 +348,22 @@ fn wake_gen_waiters(region_id: u64, new_generation: u64) {
             }
         }
     });
+
+    // Notify the host of the advance so cross-guest waiters that registered
+    // via `WaitRegister` are woken through the mailbox. Local waiters are
+    // handled above; the host call is advisory and decided `cfg` for wasm
+    // only (native test fallbacks have no cross-guest peers).
+    #[cfg(target_arch = "wasm32")]
+    {
+        if crate::hostcall::hostcall_ready(HostcallRequest::GenerationAdvance {
+            region_id,
+            generation: new_generation,
+        })
+        .is_err()
+        {
+            // Best-effort: waiters re-check and re-park on their next poll.
+        }
+    }
 }
 
 #[cfg(test)]

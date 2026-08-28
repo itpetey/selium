@@ -26,6 +26,7 @@ use selium_abi::{
     decode_rkyv,
 };
 use selium_encoding::FlatMsg;
+use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
@@ -74,7 +75,7 @@ fn discovery_bootstrap_slice_end_to_end() {
         })
         .expect("bootstrap system guests");
 
-    // Both guests should be in the report.
+    // All guests should be in the report.
     assert_eq!(report.guests.len(), 2);
     let discovery_guest = report
         .guests
@@ -142,6 +143,27 @@ fn discovery_bootstrap_slice_end_to_end() {
         "expected Tier-1 register URI {expected_uri}, got: {registered:?}"
     );
 
+    // --- Well-known connector channel provisioning ---
+    // Spawn a stub guest standing in for the DNS connector after attaching
+    // the subscriber, so its provision-time Register is observable on the
+    // feed. The runtime provisions the channel (host listener queue +
+    // leading entrypoint argument) and publishes the well-known URI.
+    let stub = runtime
+        .spawn_system_guest(well_known_stub_descriptor())
+        .expect("spawn well-known stub");
+    let stub_listener = stub
+        .well_known_listener
+        .expect("runtime provisions the well-known listener");
+    assert_eq!(
+        runtime.well_known_uri(stub.process_id),
+        Some((RESOLVE_URI.to_string(), stub_listener))
+    );
+    let registered = drain_register_uris(&mut subscriber);
+    assert!(
+        registered.contains(RESOLVE_URI),
+        "expected well-known register URI {RESOLVE_URI}, got: {registered:?}"
+    );
+
     // --- 2.4: Assert revocation ---
     // Stop the probe process — the runtime must publish Revoke events.
     runtime
@@ -153,6 +175,17 @@ fn discovery_bootstrap_slice_end_to_end() {
         revoked.contains(&expected_uri),
         "expected revoke for {expected_uri}, got: {revoked:?}"
     );
+
+    // Stopping the well-known stub revokes its well-known URI too.
+    runtime
+        .stop_process(stub.process_id)
+        .expect("stop well-known stub");
+    let revoked = drain_revoke_uris(&mut subscriber);
+    assert!(
+        revoked.contains(RESOLVE_URI),
+        "expected revoke for {RESOLVE_URI}, got: {revoked:?}"
+    );
+    assert!(runtime.well_known_uri(stub.process_id).is_none());
 
     // Verify the probe process is fully gone.
     assert_eq!(runtime.loaded_guest_count(), 1); // only discovery remains
@@ -184,6 +217,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
+        well_known_uri: None,
     }
 }
 
@@ -207,6 +241,27 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
+        well_known_uri: None,
+    }
+}
+
+/// A minimal guest serving the DNS connector's well-known URI: its
+/// entrypoint takes the runtime-injected listener id (one `i64` param).
+fn well_known_stub_descriptor() -> SystemGuestDescriptor {
+    let module_bytes = wat::parse_str(r#"(module (func (export "boot") (param i64)))"#)
+        .expect("compile well-known stub wat");
+
+    SystemGuestDescriptor {
+        name: "dns-stub".to_string(),
+        module_id: "dns-stub-module".to_string(),
+        module_bytes,
+        entrypoint: "boot".to_string(),
+        arguments: Vec::new(), // populated by provisioning via the well-known listener
+        grants: Vec::new(),    // provisioning adds the listener HostQueue grant
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: Some(RESOLVE_URI.to_string()),
     }
 }
 

@@ -718,6 +718,16 @@ pub enum HostcallRequest {
         /// Generation value that the task is waiting to see advanced.
         generation: u64,
     },
+    /// Notify the runtime that the calling guest advanced a shared-memory
+    /// ring's generation. The runtime wakes any cross-guest waiters that
+    /// registered interest via [`HostcallRequest::WaitRegister`]. Spurious
+    /// or redundant notifications are benign: waiters re-check and re-park.
+    GenerationAdvance {
+        /// Shared region id of the ring that advanced.
+        region_id: SharedResourceId,
+        /// The new generation value written by the guest.
+        generation: u64,
+    },
     /// Record that a discovery resolve performed by `client_process_id`
     /// returned `shared_id`. Callable only by the discovery system guest;
     /// the runtime rejects the hostcall from any other process. This gives

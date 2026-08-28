@@ -255,6 +255,16 @@ impl Runtime {
             }
         }
 
+        // Revoke any well-known URI provisioned for this process, so a
+        // terminated connector's channel stops resolving. Best-effort, like
+        // the rest of this teardown path.
+        if let Some((uri, _listener_shared_id)) = self.well_known_uris.lock().remove(&process_id) {
+            let request = DiscoveryRequest::Revoke { uri };
+            if let Ok(bytes) = encode_rkyv(&request) {
+                drop(self.publish_discovery_event(bytes));
+            }
+        }
+
         let owned_handles = self
             .local_handle_owners
             .lock()
@@ -848,6 +858,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn guest");
         runtime.project_metering(
@@ -895,6 +906,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn owner-a");
 
@@ -912,6 +924,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn owner-b");
 

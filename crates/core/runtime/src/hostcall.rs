@@ -490,6 +490,13 @@ impl Runtime {
                     ResourceClass::TcpStream,
                     descriptor.shared_id,
                 );
+                // The guest attaches the stream's ring region via AttachRegion,
+                // whose authorisation is keyed on SharedRegion ownership.
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::SharedRegion,
+                    descriptor.shared_id,
+                );
                 Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
                     descriptor,
                 )))
@@ -515,6 +522,13 @@ impl Runtime {
                 self.claim_shared_resource(
                     process_id,
                     ResourceClass::UdpSocket,
+                    descriptor.shared_id,
+                );
+                // The guest attaches the socket's ring region via AttachRegion,
+                // whose authorisation is keyed on SharedRegion ownership.
+                self.claim_shared_resource(
+                    process_id,
+                    ResourceClass::SharedRegion,
                     descriptor.shared_id,
                 );
                 Ok(HostOperationState::Ready(HostcallOutput::SharedRegion(
@@ -747,11 +761,14 @@ impl Runtime {
                     module_id: module_id.clone(),
                     module_bytes,
                     entrypoint,
-                    arguments,
+                    arguments: crate::wasm::decode_integer_arguments(&arguments).map_err(
+                        |error| AbiError::new(AbiErrorCode::MalformedPayload, error.to_string()),
+                    )?,
                     grants,
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant,
+                    well_known_uri: None,
                 };
                 let child = self
                     .spawn_system_guest(descriptor)
@@ -1142,6 +1159,29 @@ impl Runtime {
                 // Ready immediately — the wake comes later via mailbox.
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
+            HostcallRequest::GenerationAdvance {
+                region_id,
+                generation,
+            } => {
+                // Mirrors WaitRegister authorisation: only a process that
+                // attached the region may advance (and thereby wake) it.
+                let owns = self
+                    .shared_resource_owners
+                    .lock()
+                    .get(&(ResourceClass::SharedRegion, region_id))
+                    .is_some_and(|owners| owners.contains(&process_id));
+                if !owns {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "GenerationAdvance denied: process {process_id} has not attached region {region_id}"
+                        ),
+                    ));
+                }
+
+                self.note_generation_advance(region_id, generation);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
         }
     }
 
@@ -1459,6 +1499,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn hostcall test guest")
     }
@@ -1491,6 +1532,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn rollover guest");
         *runtime.next_operation_id.lock() = OperationId::MAX;
@@ -1879,6 +1921,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
+                well_known_uri: None,
             })
             .expect("spawn tenant-a guest");
 
@@ -1900,6 +1943,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("beta".to_string()),
+                well_known_uri: None,
             })
             .expect("spawn tenant-b guest");
 
@@ -1960,6 +2004,7 @@ mod tests {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
+            well_known_uri: None,
         });
 
         let error = result.expect_err("should reject UriPrefix grant at spawn");
@@ -2034,6 +2079,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("empty selector grant should be accepted");
 
@@ -2076,6 +2122,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn guesser");
 
@@ -2162,6 +2209,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn explicit-b");
 
@@ -2348,6 +2396,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
+                well_known_uri: None,
             })
             .expect("spawn contain-parent");
 

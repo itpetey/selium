@@ -4,7 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::{ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, ResourceSelector};
+use selium_abi::{
+    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, ResourceIdentity,
+    ResourceSelector, ResourceTarget, encode_rkyv,
+};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
@@ -13,12 +16,11 @@ use wasmtiny::{WasmApplication, WasmValue};
 use crate::{
     Error, Result,
     config::{
-        BootstrapReport, BootstrappedGuest, ReadinessCondition, RuntimeConfig,
+        BootstrapReport, BootstrappedGuest, ReadinessCondition, RuntimeConfig, SystemGuestArg,
         SystemGuestDescriptor,
     },
     error::map_wasm_error,
     runtime::{DiscoveryPublisher, Runtime},
-    wasm::decode_wasm_arguments,
 };
 
 const DEFAULT_READINESS_POLL_MS: u64 = 10;
@@ -60,7 +62,10 @@ impl Runtime {
                             ResourceIdentity::Shared(listener_shared_id),
                         )],
                     ));
-                } else if descriptor.arguments.is_empty() {
+                } else if descriptor.arguments.is_empty() && descriptor.well_known_uri.is_none() {
+                    // Other guests also need the discovery handle. Guests with
+                    // a well-known channel receive their provisioned listener
+                    // as the leading argument instead (injected at spawn).
                     descriptor.set_discovery_handle(listener_shared_id);
                     // Other guests also need explicit grant for the discovery listener.
                     descriptor.grants.push(CapabilityGrant::new(
@@ -173,9 +178,33 @@ impl Runtime {
     /// Starts and records a single system guest.
     pub fn spawn_system_guest(
         &self,
-        descriptor: SystemGuestDescriptor,
+        mut descriptor: SystemGuestDescriptor,
     ) -> Result<BootstrappedGuest> {
         self.validate_grants(&descriptor.grants)?;
+
+        // Provision the well-known channel, if the descriptor declares one:
+        // create the host listener queue, inject its shared id as the leading
+        // entrypoint argument, and grant the guest attach rights for it.
+        // Registration with discovery happens below, once the guest is up.
+        let well_known = match &descriptor.well_known_uri {
+            Some(uri) => {
+                let queues = self.kernel.queues();
+                let memory = self.kernel.memory();
+                let listener = queues.create_host_queue(&memory);
+                descriptor
+                    .arguments
+                    .insert(0, SystemGuestArg::Integer(listener.shared_id));
+                descriptor.grants.push(CapabilityGrant::new(
+                    Capability::HostQueue,
+                    vec![ResourceSelector::ExplicitResource(
+                        ResourceIdentity::Shared(listener.shared_id),
+                    )],
+                ));
+                Some((uri.clone(), listener.shared_id))
+            }
+            None => None,
+        };
+
         let process = self.kernel.processes().start_process(
             descriptor.module_id.clone(),
             descriptor.entrypoint.clone(),
@@ -248,10 +277,56 @@ impl Runtime {
             *self.discovery_process.lock() = Some(process.local_id);
         }
 
+        // Register the well-known URI with discovery now that the guest is up.
+        // Publishing is a no-op when discovery is not enabled (the queue and
+        // argument injection above still apply).
+        if let Some((uri, listener_shared_id)) = well_known.clone()
+            && let Err(error) =
+                self.register_well_known_uri(process.local_id, uri, listener_shared_id)
+        {
+            self.cleanup_failed_process(process.local_id)?;
+            return Err(error);
+        }
+
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,
+            well_known_listener: well_known.map(|(_, listener)| listener),
         })
+    }
+
+    /// Records and publishes the well-known registration for a spawned system
+    /// guest: the URI maps to the provisioned listener queue so guests can
+    /// resolve it and attach with a channel grant.
+    fn register_well_known_uri(
+        &self,
+        process_id: selium_abi::ProcessId,
+        uri: String,
+        listener_shared_id: u64,
+    ) -> Result<()> {
+        let target = ResourceTarget {
+            uri: uri.clone(),
+            host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
+            resource_id: listener_shared_id,
+            interface: None,
+            tenant: self.process_tenant(process_id),
+        };
+        let request = DiscoveryRequest::Register {
+            uri: uri.clone(),
+            target,
+        };
+        let bytes = encode_rkyv(&request)
+            .map_err(|error| Error::Host(format!("discovery encode failed: {error}")))?;
+        self.publish_discovery_event(bytes)?;
+        self.well_known_uris
+            .lock()
+            .insert(process_id, (uri.clone(), listener_shared_id));
+        self.kernel.processes().record_activity(ActivityEvent {
+            kind: selium_abi::ActivityKind::GuestBootstrapped,
+            process_id: Some(process_id),
+            message: format!("well-known uri={uri} listener={listener_shared_id}"),
+        });
+        Ok(())
     }
 
     pub(crate) fn load_guest_module(
@@ -279,7 +354,11 @@ impl Runtime {
         mut loaded_guest: LoadedGuest,
         descriptor: &SystemGuestDescriptor,
     ) -> Result<LoadedGuest> {
-        let arguments = decode_wasm_arguments(&descriptor.arguments)?;
+        let arguments = crate::wasm::resolve_entrypoint_arguments(
+            &mut loaded_guest.app,
+            loaded_guest.module_index,
+            &descriptor.arguments,
+        )?;
         let results = loaded_guest
             .app
             .call_function(
@@ -371,6 +450,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             }],
         };
 
@@ -404,6 +484,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
                 tenant: None,
+                well_known_uri: None,
             })
             .expect("spawn bridged guest");
 
@@ -434,6 +515,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             }],
         };
 
@@ -467,6 +549,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
             }],
         };
 
@@ -476,6 +559,61 @@ mod tests {
         assert!(
             matches!(err, Error::EntrypointFailed(ref name) if name == "fail-guest"),
             "expected EntrypointFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn well_known_channel_is_provisioned_injected_and_revoked() {
+        // The entrypoint echoes its first argument, proving the runtime
+        // injected the provisioned listener id as the leading argument.
+        let runtime = Runtime::default();
+        let config = RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![SystemGuestDescriptor {
+                name: "well-known".to_string(),
+                module_id: "well-known-module".to_string(),
+                module_bytes: module_with_entrypoint(
+                    "boot",
+                    "(param i64) (result i64) local.get 0",
+                ),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                well_known_uri: Some("sel://sys/dns/resolve".to_string()),
+            }],
+        };
+
+        let report = runtime
+            .bootstrap_system_guests(config)
+            .expect("bootstrap guest");
+        let guest = &report.guests[0];
+        let listener = guest
+            .well_known_listener
+            .expect("runtime provisions the well-known listener");
+
+        // The listener id was injected as the leading entrypoint argument.
+        assert_eq!(
+            runtime
+                .entrypoint_results(guest.process_id)
+                .expect("entrypoint results"),
+            vec![WasmValue::I64(listener as i64)]
+        );
+
+        // The registration is recorded (and revoked on teardown).
+        assert_eq!(
+            runtime.well_known_uri(guest.process_id),
+            Some(("sel://sys/dns/resolve".to_string(), listener))
+        );
+        runtime.stop_process(guest.process_id).expect("stop guest");
+        assert!(
+            runtime.well_known_uri(guest.process_id).is_none(),
+            "well-known registration must be revoked at teardown"
         );
     }
 }

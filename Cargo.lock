@@ -642,6 +642,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-connector-dns"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "parking_lot",
+ "selium-abi",
+ "selium-guest",
+ "selium-proto-dns",
+ "selium-shm",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "selium-connector-http"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -683,6 +696,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-dns-demo"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-guest",
+ "selium-proto-dns",
+ "selium-shm",
+ "tracing",
+]
+
+[[package]]
 name = "selium-encoding"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -702,6 +725,7 @@ dependencies = [
  "selium-encoding",
  "selium-guest-macros",
  "selium-memory",
+ "selium-proto-dns",
  "selium-shm",
  "selium-wire",
  "thiserror",
@@ -757,6 +781,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-proto-dns"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "flatbuffers",
+ "selium-encoding",
+ "selium-guest-macros",
+]
+
+[[package]]
 name = "selium-proto-http"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -776,6 +809,7 @@ dependencies = [
  "selium-encoding",
  "selium-kernel",
  "selium-memory",
+ "selium-proto-dns",
  "selium-shm",
  "selium-wire",
  "thiserror",

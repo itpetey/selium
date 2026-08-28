@@ -7,13 +7,16 @@ members = [
   "crates/core/guest/macros",
   "crates/core/kernel",
   "crates/core/memory",
+  "crates/core/proto-dns",
   "crates/core/proto-http",
   "crates/core/runtime",
   "crates/core/shm",
   "crates/core/wire",
+  "crates/guests/connector-dns",
   "crates/guests/connector-http",
   "crates/guests/discovery",
   "crates/guests/discovery-probe",
+  "crates/guests/dns-demo",
   "crates/guests/net-demo",
   "crates/guests/spine-demo",
 ]
@@ -53,12 +56,15 @@ rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2", default-features = false }
 rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/core/abi", default-features = false }
+selium-connector-dns = { path = "crates/guests/connector-dns", default-features = false }
 selium-connector-http = { path = "crates/guests/connector-http", default-features = false }
 selium-encoding = { path = "crates/core/encoding", default-features = false }
+selium-dns-demo = { path = "crates/guests/dns-demo", default-features = false }
 selium-guest = { path = "crates/core/guest", default-features = false }
 selium-guest-macros = { path = "crates/core/guest/macros", default-features = false }
 selium-kernel = { path = "crates/core/kernel", default-features = false }
 selium-memory = { path = "crates/core/memory", default-features = false }
+selium-proto-dns = { path = "crates/core/proto-dns", default-features = false }
 selium-proto-http = { path = "crates/core/proto-http", default-features = false }
 selium-shm = { path = "crates/core/shm", default-features = false }
 selium-wire = { path = "crates/core/wire", default-features = false }

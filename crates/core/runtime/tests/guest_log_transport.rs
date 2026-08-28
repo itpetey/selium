@@ -305,6 +305,7 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
+            well_known_uri: None,
         })
         .expect("spawn guest")
         .process_id

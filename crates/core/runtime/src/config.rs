@@ -1,7 +1,19 @@
 use std::collections::HashSet;
 
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
-use wasmtiny::WasmValue;
+
+/// A single entrypoint argument, in declaration order.
+///
+/// Integer arguments are carried by value; pointer arguments carry a byte
+/// payload that the runtime copies into the guest's linear memory before
+/// invoking the entrypoint, passing the `(address, length)` pair instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemGuestArg {
+    /// A u64-valued argument passed through as a single `i64` slot.
+    Integer(u64),
+    /// A pointer argument passed as two `i64` slots: `(address, length)`.
+    Pointer(Vec<u8>),
+}
 
 /// Condition used to decide when a bootstrapped system guest is ready.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +35,8 @@ pub struct SystemGuestDescriptor {
     pub module_bytes: Vec<u8>,
     /// Entrypoint export to invoke.
     pub entrypoint: String,
-    /// Encoded entrypoint arguments.
-    pub arguments: Vec<Vec<u8>>,
+    /// Entrypoint arguments, in declaration order.
+    pub arguments: Vec<SystemGuestArg>,
     /// Capability grants assigned to the guest process.
     pub grants: Vec<CapabilityGrant>,
     /// Names of system guests that must become ready first.
@@ -34,6 +46,14 @@ pub struct SystemGuestDescriptor {
     /// Tenant identity for this guest. `None` means "platform tenant".
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
+    /// Well-known discovery URI this guest serves (e.g. the DNS connector's
+    /// `sel://sys/dns/resolve`). When set, the runtime provisions the
+    /// guest's channel at spawn time — exactly like the discovery listener —
+    /// by creating the host listener queue, injecting its shared id as the
+    /// leading entrypoint argument, granting attach rights for it, and
+    /// registering the URI with discovery. The registration is revoked when
+    /// the guest terminates.
+    pub well_known_uri: Option<String>,
 }
 
 /// Runtime bootstrap configuration.
@@ -53,6 +73,10 @@ pub struct BootstrappedGuest {
     pub name: String,
     /// Process id assigned to the guest.
     pub process_id: ProcessId,
+    /// Shared id of the host listener queue provisioned for a guest with a
+    /// [`SystemGuestDescriptor::well_known_uri`], if any. Deployers use this
+    /// to grant other guests attach rights for the well-known channel.
+    pub well_known_listener: Option<u64>,
 }
 
 /// Report returned after bootstrapping system guests.
@@ -98,6 +122,7 @@ impl SystemGuestDescriptor {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
+            well_known_uri: None,
         }
     }
 
@@ -128,7 +153,7 @@ impl SystemGuestDescriptor {
     /// app_guest.dependencies.push("discovery".to_string());
     /// ```
     pub fn set_discovery_handle(&mut self, shared_id: u64) {
-        self.arguments = vec![encode_u64_argument(shared_id)];
+        self.arguments = vec![SystemGuestArg::Integer(shared_id)];
     }
 
     /// Sets both the discovery feed ring region id and the discovery RPC
@@ -138,18 +163,10 @@ impl SystemGuestDescriptor {
     /// listener shared id as the second.
     pub fn set_discovery_feed_and_handle(&mut self, feed_region_id: u64, listener_shared_id: u64) {
         self.arguments = vec![
-            encode_u64_argument(feed_region_id),
-            encode_u64_argument(listener_shared_id),
+            SystemGuestArg::Integer(feed_region_id),
+            SystemGuestArg::Integer(listener_shared_id),
         ];
     }
-}
-
-/// Encodes a `u64` as a WASM `i64` entrypoint argument, using the runtime's
-/// tagged `WasmValue` serialisation expected by `decode_wasm_arguments`.
-fn encode_u64_argument(value: u64) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    WasmValue::I64(value as i64).to_bytes(&mut bytes);
-    bytes
 }
 
 #[cfg(test)]
@@ -157,14 +174,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoded_arguments_round_trip_through_wasm_value_codecs() {
-        for value in [0_u64, 1, 7, u32::MAX as u64, u64::MAX] {
-            let bytes = encode_u64_argument(value);
-            let Some((decoded, used)) = WasmValue::from_bytes(&bytes) else {
-                panic!("failed to decode argument {value}");
-            };
-            assert_eq!(used, bytes.len(), "trailing bytes for {value}");
-            assert_eq!(decoded, WasmValue::I64(value as i64));
+    fn integer_argument_carries_u64_values() {
+        assert_eq!(SystemGuestArg::Integer(7), SystemGuestArg::Integer(7));
+        assert_ne!(SystemGuestArg::Integer(7), SystemGuestArg::Integer(8));
+        assert_ne!(SystemGuestArg::Integer(7), SystemGuestArg::Pointer(vec![]));
+    }
+
+    #[test]
+    fn pointer_argument_carries_payload() {
+        let arg = SystemGuestArg::Pointer(b"udp://127.0.0.1:53".to_vec());
+        match arg {
+            SystemGuestArg::Pointer(bytes) => assert_eq!(bytes, b"udp://127.0.0.1:53"),
+            other => panic!("expected pointer argument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_arguments_is_default() {
+        let descriptor = SystemGuestDescriptor {
+            name: "guest".to_string(),
+            module_id: "m".to_string(),
+            module_bytes: vec![0, 97, 115, 109],
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: Vec::new(),
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            well_known_uri: None,
+        };
+        assert!(descriptor.arguments.is_empty());
     }
 }

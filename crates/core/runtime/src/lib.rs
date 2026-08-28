@@ -2,7 +2,7 @@
 
 pub use config::{
     BootstrapReport, BootstrappedGuest, ProcessAuthority, ReadinessCondition, RuntimeConfig,
-    SystemGuestDescriptor,
+    SystemGuestArg, SystemGuestDescriptor,
 };
 pub use error::{Error, Result};
 pub use runtime::Runtime;

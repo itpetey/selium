@@ -2,6 +2,7 @@
 
 #![allow(
     clippy::collapsible_if,
+    clippy::indexing_slicing,
     clippy::map_err_ignore,
     clippy::panic,
     clippy::type_complexity,
@@ -13,7 +14,9 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{GenericArgument, ItemFn, ItemTrait, PathArguments, ReturnType, Type, parse_macro_input};
+use syn::{
+    FnArg, GenericArgument, ItemFn, ItemTrait, PathArguments, ReturnType, Type, parse_macro_input,
+};
 
 mod schema;
 
@@ -24,21 +27,35 @@ enum EntrypointReturn {
     ResultUnit,
 }
 
+/// A classified entrypoint parameter.
+#[derive(Clone)]
+enum EntrypointParam {
+    /// The leading discovery `Context` (consumes the discovery-handle slot).
+    Context,
+    /// An integer parameter narrowed from a single `i64` slot.
+    Integer(Box<Type>),
+    /// A `(u64, u64)` pointer parameter (consumes two `i64` slots).
+    Pointer,
+}
+
+impl EntrypointParam {
+    fn slots(&self) -> usize {
+        match self {
+            EntrypointParam::Context | EntrypointParam::Integer(_) => 1,
+            EntrypointParam::Pointer => 2,
+        }
+    }
+}
+
 /// Marks a function as an exported Selium guest entrypoint.
 ///
-/// Accepts entrypoints returning `()` or `Result<()>` with 0–2 `u64` parameters
-/// or a single `Context` parameter, in both sync and async variants.
+/// Accepts entrypoints returning `()` or `Result<()>` whose parameters are an
+/// optional leading `Context`, followed by integer parameters
+/// (`u8`/`u16`/`u32`/`u64`/`usize` and signed equivalents) and `(u64, u64)`
+/// pointer parameters, in sync and async variants.
 #[proc_macro_attribute]
 pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
-    if function.sig.inputs.len() > 2 {
-        return syn::Error::new_spanned(
-            &function.sig.inputs,
-            "#[entrypoint] supports at most two arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
     if !function.sig.generics.params.is_empty() {
         return syn::Error::new_spanned(
             &function.sig.generics,
@@ -48,16 +65,13 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    let return_kind = match inspect_return_type(&function.sig.output) {
-        Some(kind) => kind,
-        None => {
-            return syn::Error::new_spanned(
-                &function.sig.output,
-                "#[entrypoint] return type must be `()` or `Result<()>`",
-            )
-            .to_compile_error()
-            .into();
-        }
+    let Some(return_kind) = inspect_return_type(&function.sig.output) else {
+        return syn::Error::new_spanned(
+            &function.sig.output,
+            "#[entrypoint] return type must be `()` or `Result<()>`",
+        )
+        .to_compile_error()
+        .into();
     };
 
     let ident = function.sig.ident.clone();
@@ -66,72 +80,24 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let export_name = ident.to_string();
     let is_async = function.sig.asyncness.is_some();
 
-    let param_kind = function.sig.inputs.iter().next().and_then(|arg| {
-        if let syn::FnArg::Typed(pat_type) = arg {
-            if let syn::Type::Path(type_path) = &*pat_type.ty {
-                type_path
-                    .path
-                    .segments
-                    .last()
-                    .map(|seg| seg.ident.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
+    // Classify every parameter, rejecting unsupported types up front.
+    let mut params = Vec::with_capacity(function.sig.inputs.len());
+    for (index, arg) in function.sig.inputs.iter().enumerate() {
+        match classify_param(arg, index) {
+            Ok(kind) => params.push(kind),
+            Err(error) => return error.to_compile_error().into(),
         }
-    });
+    }
 
-    let init_call = quote! {
-        ::selium_guest::init().expect("failed to install Selium guest runtime");
-    };
-
-    let generated = match (function.sig.inputs.len(), param_kind.as_deref()) {
-        (0, _) => generate_zero_param(
-            &function,
-            return_kind,
-            is_async,
-            &ident,
-            &export_name,
-            &export_ident,
-            &init_call,
-        ),
-        (1, Some("Context")) => generate_context_param(
-            &function,
-            return_kind,
-            is_async,
-            &ident,
-            &export_name,
-            &export_ident,
-            &init_call,
-        ),
-        (1, _) => generate_one_param(
-            &function,
-            return_kind,
-            is_async,
-            &ident,
-            &export_name,
-            &export_ident,
-            &init_call,
-        ),
-        (2, _) => generate_two_params(
-            &function,
-            return_kind,
-            is_async,
-            &ident,
-            &export_name,
-            &export_ident,
-            &init_call,
-        ),
-        _ => {
-            return syn::Error::new_spanned(
-                &function.sig.inputs,
-                "#[entrypoint] supports at most two arguments",
-            )
-            .to_compile_error()
-            .into();
-        }
-    };
+    let generated = generate_entrypoint(
+        &function,
+        return_kind,
+        is_async,
+        &ident,
+        &export_name,
+        &export_ident,
+        &params,
+    );
 
     quote! {
         #generated
@@ -182,36 +148,134 @@ pub fn schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     schema::expand(attr, item)
 }
 
-/// Returns the return type suffix for the extern "C" signature: nothing for
-/// `()`, `-> i32` for `Result<()>`.
-fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
-    match return_kind {
-        EntrypointReturn::Unit => quote!(),
-        EntrypointReturn::ResultUnit => quote!(-> i32),
+/// Classifies one entrypoint parameter by its syntactic shape.
+fn classify_param(arg: &FnArg, index: usize) -> syn::Result<EntrypointParam> {
+    let FnArg::Typed(pat_type) = arg else {
+        return Err(syn::Error::new_spanned(
+            arg,
+            "#[entrypoint] parameters must be typed",
+        ));
+    };
+    let ty = &*pat_type.ty;
+
+    if is_u64_pair(ty) {
+        return Ok(EntrypointParam::Pointer);
+    }
+
+    let Type::Path(type_path) = ty else {
+        return Err(unsupported_param_error(ty));
+    };
+
+    let name = type_path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .unwrap_or_default();
+
+    match name.as_str() {
+        "Context" => {
+            if index != 0 {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "`Context` must be the first entrypoint parameter",
+                ));
+            }
+            Ok(EntrypointParam::Context)
+        }
+        name if is_integer_type_name(name) => Ok(EntrypointParam::Integer(Box::new(ty.clone()))),
+        _ => Err(unsupported_param_error(ty)),
     }
 }
 
-fn generate_context_param(
+fn is_integer_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize"
+    )
+}
+
+fn is_u64_pair(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Tuple(tuple)
+            if tuple.elems.len() == 2
+                && tuple.elems.iter().all(|element| matches!(
+                    element,
+                    Type::Path(path) if path.path.is_ident("u64")
+                ))
+    )
+}
+
+fn unsupported_param_error(ty: &Type) -> syn::Error {
+    syn::Error::new_spanned(
+        ty,
+        "unsupported entrypoint parameter; expected `Context` (leading), an integer \
+         (u8/u16/u32/u64/usize/i8/i16/i32/i64/isize), or a `(u64, u64)` pointer argument",
+    )
+}
+
+/// Generates the ABI wrapper for a classified parameter list.
+///
+/// The export takes exactly the total slot count of `i64` parameters and
+/// re-binds them into the user function call (constructing `Context`,
+/// narrowing integers, and pairing pointer slots) in declaration order.
+fn generate_entrypoint(
     function: &ItemFn,
     return_kind: EntrypointReturn,
     is_async: bool,
     ident: &syn::Ident,
     export_name: &str,
     export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
+    params: &[EntrypointParam],
 ) -> proc_macro2::TokenStream {
+    let init_call =
+        quote! { ::selium_guest::init().expect("failed to install Selium guest runtime"); };
+
+    let total_slots: usize = params.iter().map(EntrypointParam::slots).sum();
+    let arg_idents: Vec<syn::Ident> = (0..total_slots)
+        .map(|index| format_ident!("arg{index}"))
+        .collect();
+
+    let mut prelude = Vec::new();
+    let mut call_args = Vec::new();
+    let mut slot = 0usize;
+    for param in params {
+        match param {
+            EntrypointParam::Context => {
+                let arg = &arg_idents[slot];
+                slot += 1;
+                prelude.push(quote! {
+                    let ctx = ::selium_guest::Context::from_raw(#arg as u64)
+                        .await
+                        .expect("failed to construct bootstrap context");
+                });
+                call_args.push(quote! { ctx });
+            }
+            EntrypointParam::Integer(ty) => {
+                let arg = &arg_idents[slot];
+                slot += 1;
+                call_args.push(quote! { (#arg as #ty) });
+            }
+            EntrypointParam::Pointer => {
+                let address = &arg_idents[slot];
+                let length = &arg_idents[slot + 1];
+                slot += 2;
+                call_args.push(quote! { (#address as u64, #length as u64) });
+            }
+        }
+    }
+
     let call_tokens = if is_async {
-        quote!(#ident(ctx).await)
+        quote! { #ident(#(#call_args),*).await }
     } else {
-        quote!(#ident(ctx))
+        quote! { #ident(#(#call_args),*) }
     };
     let call = make_call(is_async, return_kind, call_tokens);
     let body = make_wrapper_body(
         return_kind,
         quote! {
-            let ctx = ::selium_guest::Context::from_raw(discovery_handle as u64)
-                .await
-                .expect("failed to construct bootstrap context");
+            #(#prelude)*
             #call
         },
     );
@@ -221,97 +285,19 @@ fn generate_context_param(
         #function
 
         #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(discovery_handle: i64) #ret {
+        pub extern "C" fn #export_ident(#(#arg_idents: i64),*) #ret {
             #init_call
             #body
         }
     }
 }
 
-fn generate_one_param(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident(handle as u64).await)
-    } else {
-        quote!(#ident(handle as u64))
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(handle: i64) #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-fn generate_two_params(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident(arg0 as u64, arg1 as u64).await)
-    } else {
-        quote!(#ident(arg0 as u64, arg1 as u64))
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident(arg0: i64, arg1: i64) #ret {
-            #init_call
-            #body
-        }
-    }
-}
-
-fn generate_zero_param(
-    function: &ItemFn,
-    return_kind: EntrypointReturn,
-    is_async: bool,
-    ident: &syn::Ident,
-    export_name: &str,
-    export_ident: &syn::Ident,
-    init_call: &proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let call_tokens = if is_async {
-        quote!(#ident().await)
-    } else {
-        quote!(#ident())
-    };
-    let call = make_call(is_async, return_kind, call_tokens);
-    let body = make_wrapper_body(return_kind, call);
-    let ret = extern_return_type(return_kind);
-
-    quote! {
-        #function
-
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #export_ident() #ret {
-            #init_call
-            #body
-        }
+/// Returns the return type suffix for the extern "C" signature: nothing for
+/// `()`, `-> i32` for `Result<()>`.
+fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
+    match return_kind {
+        EntrypointReturn::Unit => quote!(),
+        EntrypointReturn::ResultUnit => quote!(-> i32),
     }
 }
 

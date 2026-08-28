@@ -1,11 +1,5 @@
 use selium_guest::{Capability, CapabilityGrant, LocalityScope, ResourceSelector, entrypoint};
-use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
-
-fn encode_u64_argument(value: u64) -> Vec<u8> {
-    let mut bytes = vec![1u8]; // WasmValue::I64 tag
-    bytes.extend_from_slice(&value.to_le_bytes());
-    bytes
-}
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor};
 
 #[test]
 fn entrypoint_with_u64_param_receives_argument() {
@@ -20,7 +14,7 @@ fn entrypoint_with_u64_param_receives_argument() {
             vec![ResourceSelector::Locality(LocalityScope::Cluster)],
         )],
     );
-    descriptor.arguments = vec![encode_u64_argument(42)];
+    descriptor.arguments = vec![SystemGuestArg::Integer(42)];
 
     let config = RuntimeConfig {
         start_discovery: false,

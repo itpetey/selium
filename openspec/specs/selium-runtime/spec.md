@@ -200,3 +200,54 @@ SHALL mean "unrestricted within the capability" and be documented as such.
 #### Scenario: Void entrypoint (no return value) proceeds normally
 - **WHEN** `execute_entrypoint` returns an empty `Vec<WasmValue>` (existing `()`-returning entrypoints)
 - **THEN** the runtime SHALL proceed to the readiness check as normal
+
+### Requirement: Entrypoint Argument Injection
+
+`selium-runtime` SHALL inject entrypoint arguments by decoding each
+`SystemGuestDescriptor` argument into tagged `WasmValue`s. Integer
+arguments SHALL be encoded as `WasmValue::I64`. Pointer arguments SHALL
+carry a byte payload that the runtime copies into the guest's linear
+memory before invoking the entrypoint; the pair `(address, length)` SHALL
+then be encoded as two consecutive `WasmValue::I64` slots (address first,
+then length).
+
+#### Scenario: Integer argument encoded as i64
+
+- **WHEN** a descriptor declares an integer argument
+- **THEN** `decode_wasm_arguments` decodes it without error for all possible u64 values
+
+#### Scenario: Pointer argument bytes injected into guest memory
+
+- **WHEN** a descriptor declares a pointer argument with payload bytes
+- **THEN** the runtime copies the payload into the guest's linear memory before invoking the entrypoint
+- **AND** the entrypoint receives two `i64` arguments: the address the bytes were written at, and the byte length
+
+#### Scenario: Pointer argument layout is declaration-ordered
+
+- **WHEN** a descriptor declares an integer argument followed by a pointer argument
+- **THEN** the entrypoint receives the integer in the first slot and the pointer pair in the following two slots
+
+#### Scenario: Oversized pointer payload rejected
+
+- **WHEN** a pointer-argument payload cannot be written into the guest's linear memory
+- **THEN** the runtime SHALL fail the bootstrap with a descriptive error rather than truncating or silently dropping the payload
+
+### Requirement: Well-Known Connector Channel Provisioning
+
+`selium-runtime` SHALL provision the well-known channel of a system guest
+whose descriptor declares a well-known URI (e.g. the DNS connector's
+`sel://sys/dns/resolve`): it SHALL create the host listener queue, inject
+the queue's shared id as the leading entrypoint argument, grant the guest
+attach rights for it, register the URI with discovery at provision time,
+and publish a revocation for the URI when the guest terminates. A
+well-known guest SHALL NOT also receive the discovery handle argument.
+
+#### Scenario: Well-known channel provisioned at spawn time
+
+- **WHEN** a system guest descriptor declares a well-known URI
+- **THEN** the runtime SHALL create a host listener queue, pass its shared id as the first entrypoint argument, grant the guest attach rights for it, and publish a discovery `Register` for the URI targeting that queue
+
+#### Scenario: Well-known URI revoked at teardown
+
+- **WHEN** the guest serving a well-known URI terminates
+- **THEN** the runtime SHALL publish a discovery `Revoke` for that URI before reclaiming the process's resources

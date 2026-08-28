@@ -11,6 +11,10 @@ pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
 /// Prefix for process-scoped URIs registered by the runtime (Tier 1).
 const PROCESS_URI_PREFIX: &str = "sel://process/";
+/// Prefix for well-known system URIs (e.g. `sel://sys/dns/resolve`) whose
+/// channels the runtime provisions at spawn time and registers on the
+/// serving guest's behalf.
+const SYS_URI_PREFIX: &str = "sel://sys/";
 pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
@@ -146,6 +150,13 @@ impl DiscoveryStore {
             DiscoveryRequest::Register { uri: _, target } => {
                 if let Some(process_id) = extract_process_id_from_uri(&target.uri) {
                     self.register_tier1(process_id, target);
+                } else if target.uri.starts_with(SYS_URI_PREFIX) {
+                    // Well-known system URIs (e.g. the DNS connector's
+                    // `sel://sys/dns/resolve`) are runtime-authoritative:
+                    // provisioned at spawn time, revoked at teardown. No
+                    // ownership entry — guests cannot re-register or take
+                    // over a system URI via Tier-2.
+                    self.register(target);
                 } else {
                     // Runtime should only publish process-scoped Tier-1 registrations.
                     selium_guest::warn!(
@@ -554,5 +565,37 @@ mod tests {
 
         assert!(store.resolve_exact("sel://process/42/regions/7").is_none());
         assert!(!store.owns_resource(42, 7));
+    }
+
+    #[test]
+    fn well_known_sys_uri_registers_and_resolves() {
+        // The DNS connector's well-known channel is runtime-authoritative:
+        // a Tier-1 Register must store it so guests can resolve it.
+        let mut store = DiscoveryStore::default();
+        store.apply_tier1_event(DiscoveryRequest::Register {
+            uri: "sel://sys/dns/resolve".to_string(),
+            target: target("sel://sys/dns/resolve", 12),
+        });
+
+        let resolved = store.resolve_exact("sel://sys/dns/resolve");
+        assert_eq!(resolved.expect("sys uri resolves").resource_id, 12);
+
+        // No ownership entry: a guest cannot take over a system URI via
+        // Tier-2, and teardown revokes by URI.
+        assert!(!store.owns_resource(0, 12));
+        store.apply_tier1_event(DiscoveryRequest::Revoke {
+            uri: "sel://sys/dns/resolve".to_string(),
+        });
+        assert!(store.resolve_exact("sel://sys/dns/resolve").is_none());
+    }
+
+    #[test]
+    fn non_system_non_process_tier1_registration_is_ignored() {
+        let mut store = DiscoveryStore::default();
+        store.apply_tier1_event(DiscoveryRequest::Register {
+            uri: "sel://my-app/logs".to_string(),
+            target: target("sel://my-app/logs", 7),
+        });
+        assert!(store.resolve_exact("sel://my-app/logs").is_none());
     }
 }

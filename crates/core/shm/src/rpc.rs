@@ -402,26 +402,32 @@ fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
         req_entry.offset,
         req_entry.length,
         req_capacity,
+        shared_id,
     )?;
     let reply_channel = channel_from_sub_mapping(
         &parent_mapping,
         rep_entry.offset,
         rep_entry.length,
         rep_capacity,
+        shared_id,
     )?;
 
     Ok((request_channel, reply_channel))
 }
 
 /// Wraps an existing sub-mapping as a channel without initialising it.
+///
+/// The parent `shared_id` is recorded on the region so generation waits and
+/// bumps name the correct shared region for cross-guest wakeups.
 fn channel_from_sub_mapping(
     parent_mapping: &RegionMapping,
     offset: u64,
     len: u64,
     capacity: u64,
+    shared_id: u64,
 ) -> Result<Channel> {
     let mapping = parent_mapping.sub_region(offset, len)?;
-    let region = ChannelRegion::from_mapping(mapping, capacity);
+    let region = ChannelRegion::from_mapping_with_id(mapping, capacity, shared_id);
     let ring = RingBuf::wrap_region(region)?;
     Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
 }
@@ -464,26 +470,32 @@ fn create_rpc_region(req_capacity: u64, rep_capacity: u64) -> Result<(Channel, C
         sub_memory_0_offset,
         req_region_len,
         req_capacity,
+        shared_id,
     )?;
     let reply_channel = initialise_sub_channel(
         &parent_mapping,
         sub_memory_1_offset,
         rep_region_len,
         rep_capacity,
+        shared_id,
     )?;
 
     Ok((request_channel, reply_channel, shared_id))
 }
 
 /// Initialises a sub-region for a freshly-allocated RPC channel.
+///
+/// The parent `shared_id` is recorded on the region so generation waits and
+/// bumps name the correct shared region for cross-guest wakeups.
 fn initialise_sub_channel(
     parent_mapping: &RegionMapping,
     offset: u64,
     len: u64,
     capacity: u64,
+    shared_id: u64,
 ) -> Result<Channel> {
     let mapping = parent_mapping.sub_region(offset, len)?;
-    let region = ChannelRegion::from_mapping(mapping, capacity);
+    let region = ChannelRegion::from_mapping_with_id(mapping, capacity, shared_id);
     region.initialise()?;
     region.store_backpressure(ChannelBackpressure::Park.to_u8())?;
     region.store_shared_capacity(capacity)?;

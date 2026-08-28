@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
                 dependencies: app.dependencies.clone(),
                 readiness,
                 tenant: app.tenant.clone(),
+                well_known_uri: None,
             })
         })
         .collect::<Result<_>>()?;
@@ -153,6 +154,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::Immediate,
         tenant: None,
+        well_known_uri: None,
     }
 }
 
