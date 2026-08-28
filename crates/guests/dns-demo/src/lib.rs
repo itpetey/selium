@@ -15,6 +15,14 @@ use selium_shm::rpc;
 /// The name the demo resolves.
 const DEMO_NAME: &str = "example.test";
 
+/// Reads the target `ip:port` from a pointer argument.
+fn read_connect_addr(connect: (u64, u64)) -> Option<SocketAddr> {
+    // SAFETY: the `(address, length)` pair was written into this guest's
+    // linear memory by the runtime for this entrypoint invocation.
+    let text = unsafe { selium_guest::args::str(connect.0, connect.1) }?;
+    text.trim().parse().ok()
+}
+
 #[entrypoint]
 async fn resolve_demo(connector: u64, connect: (u64, u64)) {
     drop(selium_guest::log::init());
@@ -73,12 +81,4 @@ async fn resolve_demo(connector: u64, connect: (u64, u64)) {
     }
 
     mark_ready();
-}
-
-/// Reads the target `ip:port` from a pointer argument.
-fn read_connect_addr(connect: (u64, u64)) -> Option<SocketAddr> {
-    // SAFETY: the `(address, length)` pair was written into this guest's
-    // linear memory by the runtime for this entrypoint invocation.
-    let text = unsafe { selium_guest::args::str(connect.0, connect.1) }?;
-    text.trim().parse().ok()
 }

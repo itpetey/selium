@@ -18,26 +18,22 @@ use std::{fmt, net::Ipv4Addr, net::Ipv6Addr};
 
 use crate::{DnsOutcome, DnsQuery, DnsRecordType};
 
-/// Byte length of the fixed DNS message header.
-const HEADER_LEN: usize = 12;
-
-/// DNS resource record type codes (IANA).
-const TYPE_A: u16 = 1;
-const TYPE_CNAME: u16 = 5;
-const TYPE_AAAA: u16 = 28;
-
 /// DNS class code for the Internet class.
 const CLASS_IN: u16 = 1;
-
+const FLAG_RD: u16 = 0x0100;
 /// DNS flags bit fields.
 const FLAG_TC: u16 = 0x0200;
-const FLAG_RD: u16 = 0x0100;
-
+/// Byte length of the fixed DNS message header.
+const HEADER_LEN: usize = 12;
 /// DNS response codes (IANA).
 const RCODE_NOERROR: u8 = 0;
-const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_REFUSED: u8 = 5;
+const RCODE_SERVFAIL: u8 = 2;
+/// DNS resource record type codes (IANA).
+const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
+const TYPE_CNAME: u16 = 5;
 
 /// Errors produced by the wire codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +48,17 @@ pub enum WireError {
     CompressionLoop,
 }
 
+/// A parsed upstream DNS response, ready to be mapped to a [`crate::DnsResponse`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedResponse {
+    /// The transaction id echoed by the resolver (used for correlation).
+    pub txid: u16,
+    /// The typed outcome derived from the header.
+    pub outcome: DnsOutcome,
+    /// A/AAAA addresses carried by the answer section.
+    pub addresses: Vec<String>,
+}
+
 impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -64,17 +71,6 @@ impl fmt::Display for WireError {
 }
 
 impl std::error::Error for WireError {}
-
-/// A parsed upstream DNS response, ready to be mapped to a [`crate::DnsResponse`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParsedResponse {
-    /// The transaction id echoed by the resolver (used for correlation).
-    pub txid: u16,
-    /// The typed outcome derived from the header.
-    pub outcome: DnsOutcome,
-    /// A/AAAA addresses carried by the answer section.
-    pub addresses: Vec<String>,
-}
 
 impl DnsRecordType {
     /// Maps a record type to its IANA RR TYPE code.
@@ -185,21 +181,6 @@ pub fn parse_response(bytes: &[u8]) -> Result<ParsedResponse, WireError> {
     })
 }
 
-/// Extracts the 4-bit response code from the flags field.
-fn rcode(flags: u16) -> u8 {
-    (flags & 0x000F) as u8
-}
-
-/// Ensures `len` more bytes are available at `pos`, returning the advanced
-/// position.
-fn require(bytes: &[u8], pos: usize, len: usize) -> Result<usize, WireError> {
-    let end = pos.checked_add(len).ok_or(WireError::Short)?;
-    if end > bytes.len() {
-        return Err(WireError::Short);
-    }
-    Ok(end)
-}
-
 /// Encodes a domain name as a sequence of length-prefixed labels followed
 /// by a zero terminator.
 fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), WireError> {
@@ -282,6 +263,21 @@ fn parse_name(bytes: &[u8], start: usize) -> Result<(String, usize), WireError> 
     }
 
     Ok((labels.join("."), end))
+}
+
+/// Extracts the 4-bit response code from the flags field.
+fn rcode(flags: u16) -> u8 {
+    (flags & 0x000F) as u8
+}
+
+/// Ensures `len` more bytes are available at `pos`, returning the advanced
+/// position.
+fn require(bytes: &[u8], pos: usize, len: usize) -> Result<usize, WireError> {
+    let end = pos.checked_add(len).ok_or(WireError::Short)?;
+    if end > bytes.len() {
+        return Err(WireError::Short);
+    }
+    Ok(end)
 }
 
 #[cfg(test)]

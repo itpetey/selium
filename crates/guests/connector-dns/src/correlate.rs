@@ -6,8 +6,7 @@
 //! delivered to exactly the requester that issued them. Unknown transaction
 //! ids are dropped: a reply nobody asked for is cross-talk, not an answer.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use selium_proto_dns::{DnsOutcome, DnsResponse, wire::ParsedResponse};

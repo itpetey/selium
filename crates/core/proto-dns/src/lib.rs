@@ -11,7 +11,6 @@ use selium_guest_macros::schema;
 #[allow(warnings)]
 #[rustfmt::skip]
 pub mod fbs;
-
 pub mod wire;
 
 /// Well-known discovery URI registered by the DNS connector at boot.

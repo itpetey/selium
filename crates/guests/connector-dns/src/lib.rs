@@ -19,6 +19,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use correlate::{InFlight, response_from_parsed};
 use parking_lot::Mutex;
 use selium_guest::{
     Datagram, Instant, ResourceListener, Timer, UdpSocket, debug, entrypoint, error, info,
@@ -30,11 +31,42 @@ use tokio::sync::mpsc;
 
 pub mod correlate;
 
-use correlate::{InFlight, response_from_parsed};
-
 /// How long the connector waits for an upstream reply before surfacing a
 /// typed [`DnsOutcome::Timeout`].
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Accepts typed RPC connections and serves one handler per connection.
+async fn accept_loop(
+    listener: ResourceListener,
+    inflight: Arc<InFlight>,
+    socket: Arc<Mutex<UdpSocket>>,
+    resolver: SocketAddr,
+) {
+    loop {
+        let incoming = match listener.recv().await {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                warn!("dns-connector: accept failed: {e}");
+                continue;
+            }
+        };
+
+        let connection = match rpc::accept::<DnsQuery, DnsResponse>(incoming.into()) {
+            Ok(connection) => connection,
+            Err(e) => {
+                warn!("dns-connector: rpc accept failed: {e}");
+                continue;
+            }
+        };
+
+        spawn(handler(
+            connection,
+            inflight.clone(),
+            socket.clone(),
+            resolver,
+        ));
+    }
+}
 
 /// Entrypoint for the DNS connector system guest.
 ///
@@ -86,48 +118,6 @@ async fn dns_connector(listener: u64, resolver: (u64, u64)) {
         socket,
         resolver_addr,
     ));
-}
-
-/// Reads and parses the resolver argument into a socket address.
-fn read_resolver(resolver: (u64, u64)) -> Option<SocketAddr> {
-    // SAFETY: the `(address, length)` pair was written into this guest's
-    // linear memory by the runtime for this entrypoint invocation.
-    let text = unsafe { selium_guest::args::str(resolver.0, resolver.1) }?;
-    let text = text.trim().strip_prefix("udp://").unwrap_or(text);
-    text.parse().ok()
-}
-
-/// Accepts typed RPC connections and serves one handler per connection.
-async fn accept_loop(
-    listener: ResourceListener,
-    inflight: Arc<InFlight>,
-    socket: Arc<Mutex<UdpSocket>>,
-    resolver: SocketAddr,
-) {
-    loop {
-        let incoming = match listener.recv().await {
-            Ok(incoming) => incoming,
-            Err(e) => {
-                warn!("dns-connector: accept failed: {e}");
-                continue;
-            }
-        };
-
-        let connection = match rpc::accept::<DnsQuery, DnsResponse>(incoming.into()) {
-            Ok(connection) => connection,
-            Err(e) => {
-                warn!("dns-connector: rpc accept failed: {e}");
-                continue;
-            }
-        };
-
-        spawn(handler(
-            connection,
-            inflight.clone(),
-            socket.clone(),
-            resolver,
-        ));
-    }
 }
 
 /// Serves queries on one connection: forwards to the upstream resolver and
@@ -205,6 +195,15 @@ async fn handler(
     }
 }
 
+/// Reads and parses the resolver argument into a socket address.
+fn read_resolver(resolver: (u64, u64)) -> Option<SocketAddr> {
+    // SAFETY: the `(address, length)` pair was written into this guest's
+    // linear memory by the runtime for this entrypoint invocation.
+    let text = unsafe { selium_guest::args::str(resolver.0, resolver.1) }?;
+    let text = text.trim().strip_prefix("udp://").unwrap_or(text);
+    text.parse().ok()
+}
+
 /// Receives upstream datagrams and demuxes them by transaction id.
 async fn recv_loop(socket: Arc<Mutex<UdpSocket>>, inflight: Arc<InFlight>, resolver: SocketAddr) {
     loop {
@@ -244,6 +243,16 @@ async fn recv_loop(socket: Arc<Mutex<UdpSocket>>, inflight: Arc<InFlight>, resol
     }
 }
 
+/// Receives one datagram through the shared socket.
+async fn udp_recv(socket: Arc<Mutex<UdpSocket>>) -> selium_guest::Result<Datagram> {
+    std::future::poll_fn(move |cx| {
+        let mut guard = socket.lock();
+        let socket = std::pin::Pin::new(&mut *guard);
+        socket.poll_recv(cx)
+    })
+    .await
+}
+
 /// Sends one datagram through the shared socket.
 async fn udp_send(
     socket: Arc<Mutex<UdpSocket>>,
@@ -260,16 +269,6 @@ async fn udp_send(
                 payload: payload.clone(),
             },
         )
-    })
-    .await
-}
-
-/// Receives one datagram through the shared socket.
-async fn udp_recv(socket: Arc<Mutex<UdpSocket>>) -> selium_guest::Result<Datagram> {
-    std::future::poll_fn(move |cx| {
-        let mut guard = socket.lock();
-        let socket = std::pin::Pin::new(&mut *guard);
-        socket.poll_recv(cx)
     })
     .await
 }

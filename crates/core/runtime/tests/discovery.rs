@@ -245,26 +245,6 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
-/// A minimal guest serving the DNS connector's well-known URI: its
-/// entrypoint takes the runtime-injected listener id (one `i64` param).
-fn well_known_stub_descriptor() -> SystemGuestDescriptor {
-    let module_bytes = wat::parse_str(r#"(module (func (export "boot") (param i64)))"#)
-        .expect("compile well-known stub wat");
-
-    SystemGuestDescriptor {
-        name: "dns-stub".to_string(),
-        module_id: "dns-stub-module".to_string(),
-        module_bytes,
-        entrypoint: "boot".to_string(),
-        arguments: Vec::new(), // populated by provisioning via the well-known listener
-        grants: Vec::new(),    // provisioning adds the listener HostQueue grant
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: Some(RESOLVE_URI.to_string()),
-    }
-}
-
 fn discovery_probe_wasm_path() -> PathBuf {
     target_dir().join("wasm32-unknown-unknown/debug/selium_discovery_probe.wasm")
 }
@@ -351,4 +331,24 @@ fn target_dir() -> PathBuf {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
     });
     PathBuf::from(target_dir)
+}
+
+/// A minimal guest serving the DNS connector's well-known URI: its
+/// entrypoint takes the runtime-injected listener id (one `i64` param).
+fn well_known_stub_descriptor() -> SystemGuestDescriptor {
+    let module_bytes = wat::parse_str(r#"(module (func (export "boot") (param i64)))"#)
+        .expect("compile well-known stub wat");
+
+    SystemGuestDescriptor {
+        name: "dns-stub".to_string(),
+        module_id: "dns-stub-module".to_string(),
+        module_bytes,
+        entrypoint: "boot".to_string(),
+        arguments: Vec::new(), // populated by provisioning via the well-known listener
+        grants: Vec::new(),    // provisioning adds the listener HostQueue grant
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: Some(RESOLVE_URI.to_string()),
+    }
 }

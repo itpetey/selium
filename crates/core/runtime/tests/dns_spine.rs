@@ -24,6 +24,83 @@ use selium_encoding::FlatMsg;
 use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
 
+fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "dns-connector".to_string(),
+        module_id: "dns-connector-module".to_string(),
+        module_bytes,
+        entrypoint: "dns_connector".to_string(),
+        // Only the resolver pointer argument: the runtime injects the
+        // well-known listener as the leading integer argument.
+        arguments: vec![SystemGuestArg::Pointer(resolver.into_bytes())],
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: Some(RESOLVE_URI.to_string()),
+    }
+}
+
+fn connector_wasm() -> Vec<u8> {
+    read_wasm(
+        "selium-connector-dns",
+        "wasm32-unknown-unknown/debug/selium_connector_dns.wasm",
+    )
+}
+
+fn demo_descriptor(
+    module_bytes: Vec<u8>,
+    connector: u64,
+    connect: String,
+) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "dns-demo".to_string(),
+        module_id: "dns-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "resolve_demo".to_string(),
+        arguments: vec![
+            SystemGuestArg::Integer(connector),
+            SystemGuestArg::Pointer(connect.into_bytes()),
+        ],
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ExplicitResource(
+                    ResourceIdentity::Shared(connector),
+                )],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: None,
+    }
+}
+
+fn demo_wasm() -> Vec<u8> {
+    read_wasm(
+        "selium-dns-demo",
+        "wasm32-unknown-unknown/debug/selium_dns_demo.wasm",
+    )
+}
+
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
     runtime
         .kernel()
@@ -96,6 +173,24 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
         .expect("stop connector");
 }
 
+#[expect(
+    clippy::panic,
+    reason = "missing build artifact is a hard test failure"
+)]
+fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+    let path = PathBuf::from(target_dir).join(file_name);
+    std::fs::read(&path).unwrap_or_else(|_error| {
+        panic!(
+            "{crate_name} guest not found at {}.\n\
+             Build it first:\n  \
+             cargo build --target wasm32-unknown-unknown -p {crate_name}",
+            path.display()
+        )
+    })
+}
+
 /// A loopback UDP server that answers every A query for `example.test` with
 /// `127.0.0.1`, echoing the client's transaction id.
 fn spawn_fake_dns_resolver() -> std::net::SocketAddr {
@@ -156,101 +251,6 @@ fn spawn_fake_tcp_server() -> std::net::SocketAddr {
     });
 
     addr
-}
-
-fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "dns-connector".to_string(),
-        module_id: "dns-connector-module".to_string(),
-        module_bytes,
-        entrypoint: "dns_connector".to_string(),
-        // Only the resolver pointer argument: the runtime injects the
-        // well-known listener as the leading integer argument.
-        arguments: vec![SystemGuestArg::Pointer(resolver.into_bytes())],
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: Some(RESOLVE_URI.to_string()),
-    }
-}
-
-fn demo_descriptor(
-    module_bytes: Vec<u8>,
-    connector: u64,
-    connect: String,
-) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "dns-demo".to_string(),
-        module_id: "dns-demo-module".to_string(),
-        module_bytes,
-        entrypoint: "resolve_demo".to_string(),
-        arguments: vec![
-            SystemGuestArg::Integer(connector),
-            SystemGuestArg::Pointer(connect.into_bytes()),
-        ],
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::TcpStream)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ExplicitResource(
-                    ResourceIdentity::Shared(connector),
-                )],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: None,
-    }
-}
-
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
-fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
-    let path = PathBuf::from(target_dir).join(file_name);
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "{crate_name} guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p {crate_name}",
-            path.display()
-        )
-    })
-}
-
-fn connector_wasm() -> Vec<u8> {
-    read_wasm(
-        "selium-connector-dns",
-        "wasm32-unknown-unknown/debug/selium_connector_dns.wasm",
-    )
-}
-
-fn demo_wasm() -> Vec<u8> {
-    read_wasm(
-        "selium-dns-demo",
-        "wasm32-unknown-unknown/debug/selium_dns_demo.wasm",
-    )
 }
 
 /// Polls the guest log channel until every needle appears in the drained

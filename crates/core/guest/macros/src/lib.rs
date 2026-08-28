@@ -188,31 +188,13 @@ fn classify_param(arg: &FnArg, index: usize) -> syn::Result<EntrypointParam> {
     }
 }
 
-fn is_integer_type_name(name: &str) -> bool {
-    matches!(
-        name,
-        "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize"
-    )
-}
-
-fn is_u64_pair(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Tuple(tuple)
-            if tuple.elems.len() == 2
-                && tuple.elems.iter().all(|element| matches!(
-                    element,
-                    Type::Path(path) if path.path.is_ident("u64")
-                ))
-    )
-}
-
-fn unsupported_param_error(ty: &Type) -> syn::Error {
-    syn::Error::new_spanned(
-        ty,
-        "unsupported entrypoint parameter; expected `Context` (leading), an integer \
-         (u8/u16/u32/u64/usize/i8/i16/i32/i64/isize), or a `(u64, u64)` pointer argument",
-    )
+/// Returns the return type suffix for the extern "C" signature: nothing for
+/// `()`, `-> i32` for `Result<()>`.
+fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
+    match return_kind {
+        EntrypointReturn::Unit => quote!(),
+        EntrypointReturn::ResultUnit => quote!(-> i32),
+    }
 }
 
 /// Generates the ABI wrapper for a classified parameter list.
@@ -292,15 +274,6 @@ fn generate_entrypoint(
     }
 }
 
-/// Returns the return type suffix for the extern "C" signature: nothing for
-/// `()`, `-> i32` for `Result<()>`.
-fn extern_return_type(return_kind: EntrypointReturn) -> proc_macro2::TokenStream {
-    match return_kind {
-        EntrypointReturn::Unit => quote!(),
-        EntrypointReturn::ResultUnit => quote!(-> i32),
-    }
-}
-
 /// Inspects the return type to determine whether it is `()`, `Result<()>`, or
 /// unsupported. Returns `None` for unsupported types.
 fn inspect_return_type(output: &ReturnType) -> Option<EntrypointReturn> {
@@ -314,6 +287,13 @@ fn inspect_return_type(output: &ReturnType) -> Option<EntrypointReturn> {
             }
         }
     }
+}
+
+fn is_integer_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize"
+    )
 }
 
 /// Returns true if `ty` is `Result<()>` or `Result<(), E>` (accepts both the
@@ -337,6 +317,18 @@ fn is_result_of_unit(ty: &Type) -> bool {
         }
     }
     false
+}
+
+fn is_u64_pair(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Tuple(tuple)
+            if tuple.elems.len() == 2
+                && tuple.elems.iter().all(|element| matches!(
+                    element,
+                    Type::Path(path) if path.path.is_ident("u64")
+                ))
+    )
 }
 
 /// Returns true if `ty` is the unit type `()`.
@@ -388,4 +380,12 @@ fn make_wrapper_body(
             }
         }
     }
+}
+
+fn unsupported_param_error(ty: &Type) -> syn::Error {
+    syn::Error::new_spanned(
+        ty,
+        "unsupported entrypoint parameter; expected `Context` (leading), an integer \
+         (u8/u16/u32/u64/usize/i8/i16/i32/i64/isize), or a `(u64, u64)` pointer argument",
+    )
 }

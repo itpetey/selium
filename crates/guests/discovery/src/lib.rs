@@ -11,11 +11,11 @@ pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
 /// Prefix for process-scoped URIs registered by the runtime (Tier 1).
 const PROCESS_URI_PREFIX: &str = "sel://process/";
+pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 /// Prefix for well-known system URIs (e.g. `sel://sys/dns/resolve`) whose
 /// channels the runtime provisions at spawn time and registers on the
 /// serving guest's behalf.
 const SYS_URI_PREFIX: &str = "sel://sys/";
-pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
 #[pattern_interface]

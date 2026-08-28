@@ -1,11 +1,36 @@
+use selium_memory::WASM_PAGE_SIZE;
 use wasmtiny::{
     FunctionType, WasmApplication, WasmError, WasmValue,
     runtime::{HostCaller, HostFunc, SharedMemory},
 };
 
-use selium_memory::WASM_PAGE_SIZE;
-
 use crate::{Error, Result, config::SystemGuestArg, error::map_wasm_error};
+
+/// Decodes raw `WasmValue` argument bytes (the existing child-spawn ABI
+/// form) into integer [`SystemGuestArg`]s.
+///
+/// The signed-to-unsigned casts are bit-preserving: the encode side stores
+/// `u64` values into the `I64`/`I32` slots and the decode side restores the
+/// original bits.
+#[expect(clippy::cast_sign_loss, reason = "bit-preserving ABI round-trip")]
+pub(crate) fn decode_integer_arguments(arguments: &[Vec<u8>]) -> Result<Vec<SystemGuestArg>> {
+    arguments
+        .iter()
+        .map(|raw| {
+            let Some((value, used)) = WasmValue::from_bytes(raw) else {
+                return Err(Error::InvalidEntrypointArgument);
+            };
+            if used != raw.len() {
+                return Err(Error::InvalidEntrypointArgument);
+            }
+            match value {
+                WasmValue::I64(value) => Ok(SystemGuestArg::Integer(value as u64)),
+                WasmValue::I32(value) => Ok(SystemGuestArg::Integer(value as u64)),
+                _ => Err(Error::InvalidEntrypointArgument),
+            }
+        })
+        .collect()
+}
 
 pub(crate) fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmValue>> {
     arguments
@@ -20,6 +45,45 @@ pub(crate) fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmVal
             Ok(value)
         })
         .collect()
+}
+
+pub(crate) fn guest_memory(caller: &HostCaller<'_>) -> wasmtiny::runtime::Result<SharedMemory> {
+    caller
+        .memory(0)
+        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))
+}
+
+pub(crate) fn read_guest_memory(
+    caller: &HostCaller<'_>,
+    ptr: u32,
+    len: usize,
+) -> wasmtiny::runtime::Result<Vec<u8>> {
+    let memory = guest_memory(caller)?;
+    let mut bytes = vec![0; len];
+    memory
+        .lock()
+        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .read(ptr, &mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn register_optional_host_function(
+    app: &mut WasmApplication,
+    module_index: u32,
+    import_module: &str,
+    name: &str,
+    func: Box<dyn HostFunc>,
+    func_type: FunctionType,
+) -> Result<()> {
+    match app.register_host_function(module_index, import_module, name, func, func_type) {
+        Ok(()) => Ok(()),
+        Err(WasmError::Instantiate(message))
+            if message == format!("import {import_module}.{name} not found") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(map_wasm_error(error)),
+    }
 }
 
 /// Resolves structured [`SystemGuestArg`]s into the flattened `WasmValue`
@@ -47,6 +111,30 @@ pub(crate) fn resolve_entrypoint_arguments(
         }
     }
     decode_wasm_arguments(&encoded)
+}
+
+pub(crate) fn wasm_i32_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i32> {
+    args.get(index)
+        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
+        .i32()
+}
+
+pub(crate) fn wasm_i64_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i64> {
+    args.get(index)
+        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
+        .i64()
+}
+
+pub(crate) fn write_guest_memory(
+    caller: &HostCaller<'_>,
+    ptr: u32,
+    bytes: &[u8],
+) -> wasmtiny::runtime::Result<()> {
+    let memory = guest_memory(caller)?;
+    memory
+        .lock()
+        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
+        .write(ptr, bytes)
 }
 
 /// Encodes a single `WasmValue` into the tagged byte form expected by
@@ -92,95 +180,6 @@ fn write_entrypoint_bytes(
     }
 
     Ok(base as u64)
-}
-
-/// Decodes raw `WasmValue` argument bytes (the existing child-spawn ABI
-/// form) into integer [`SystemGuestArg`]s.
-///
-/// The signed-to-unsigned casts are bit-preserving: the encode side stores
-/// `u64` values into the `I64`/`I32` slots and the decode side restores the
-/// original bits.
-#[expect(clippy::cast_sign_loss, reason = "bit-preserving ABI round-trip")]
-pub(crate) fn decode_integer_arguments(arguments: &[Vec<u8>]) -> Result<Vec<SystemGuestArg>> {
-    arguments
-        .iter()
-        .map(|raw| {
-            let Some((value, used)) = WasmValue::from_bytes(raw) else {
-                return Err(Error::InvalidEntrypointArgument);
-            };
-            if used != raw.len() {
-                return Err(Error::InvalidEntrypointArgument);
-            }
-            match value {
-                WasmValue::I64(value) => Ok(SystemGuestArg::Integer(value as u64)),
-                WasmValue::I32(value) => Ok(SystemGuestArg::Integer(value as u64)),
-                _ => Err(Error::InvalidEntrypointArgument),
-            }
-        })
-        .collect()
-}
-
-pub(crate) fn guest_memory(caller: &HostCaller<'_>) -> wasmtiny::runtime::Result<SharedMemory> {
-    caller
-        .memory(0)
-        .ok_or_else(|| WasmError::Runtime("guest module does not expose memory".to_string()))
-}
-
-pub(crate) fn read_guest_memory(
-    caller: &HostCaller<'_>,
-    ptr: u32,
-    len: usize,
-) -> wasmtiny::runtime::Result<Vec<u8>> {
-    let memory = guest_memory(caller)?;
-    let mut bytes = vec![0; len];
-    memory
-        .lock()
-        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
-        .read(ptr, &mut bytes)?;
-    Ok(bytes)
-}
-
-pub(crate) fn register_optional_host_function(
-    app: &mut WasmApplication,
-    module_index: u32,
-    import_module: &str,
-    name: &str,
-    func: Box<dyn HostFunc>,
-    func_type: FunctionType,
-) -> Result<()> {
-    match app.register_host_function(module_index, import_module, name, func, func_type) {
-        Ok(()) => Ok(()),
-        Err(WasmError::Instantiate(message))
-            if message == format!("import {import_module}.{name} not found") =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(map_wasm_error(error)),
-    }
-}
-
-pub(crate) fn wasm_i32_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i32> {
-    args.get(index)
-        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
-        .i32()
-}
-
-pub(crate) fn wasm_i64_arg(args: &[WasmValue], index: usize) -> wasmtiny::runtime::Result<i64> {
-    args.get(index)
-        .ok_or_else(|| WasmError::Runtime(format!("missing argument {index}")))?
-        .i64()
-}
-
-pub(crate) fn write_guest_memory(
-    caller: &HostCaller<'_>,
-    ptr: u32,
-    bytes: &[u8],
-) -> wasmtiny::runtime::Result<()> {
-    let memory = guest_memory(caller)?;
-    memory
-        .lock()
-        .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
-        .write(ptr, bytes)
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
-use selium_guest::{Context, entrypoint};
+use selium_guest::{
+    Context,
+    entrypoint,
+};
 
 #[entrypoint]
 async fn context_mixed_entrypoint(ctx: Context, _app_id: u32, _generation: u64) {

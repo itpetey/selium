@@ -17,57 +17,6 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-/// Task 4.3: a guest without a grant for the connector's channel cannot
-/// attach to it (and therefore cannot resolve).
-#[test]
-fn ungranted_guest_cannot_attach_connector_channel() {
-    let runtime = Runtime::default();
-
-    // The connector owns a host queue for the well-known resolve channel.
-    let connector = spawn_guest(
-        &runtime,
-        "dns-connector",
-        vec![
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-        ],
-    );
-
-    let intruder = spawn_guest(&runtime, "resolver-without-grant", Vec::new());
-
-    // The connector creates its listener queue.
-    let (_, op_id) = runtime.begin_hostcall(connector, HostcallRequest::HostQueueCreate);
-    let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
-        runtime.poll_hostcall(connector, op_id)
-    else {
-        panic!("connector should create a host queue");
-    };
-
-    // The intruder has no resolve basis and no grant: attach is denied, so
-    // no DNS traffic can ever leave the host on its behalf.
-    let (status, deny_op) = runtime.begin_hostcall(
-        intruder,
-        HostcallRequest::HostQueueAttach {
-            shared_id: listener.shared_id,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_FAILED,
-        "guest without a grant for the connector channel must be denied attach"
-    );
-    assert!(matches!(
-        runtime.poll_hostcall(intruder, deny_op),
-        CompletionState::Failed(_)
-    ));
-}
-
 /// Task 4.1 substrate: the connector's raw UDP socket is capability-gated by
 /// `Network + UdpSocket`; a guest without that grant cannot bind one.
 #[test]
@@ -114,6 +63,13 @@ fn connector_udp_socket_requires_network_grant() {
         runtime.poll_hostcall(ungranted, deny_op),
         CompletionState::Failed(_)
     ));
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!(
+        "(module (memory 1) (func (export \"{entrypoint}\")))"
+    ))
+    .expect("compile wat")
 }
 
 /// A guest must be able to attach the ring region of a socket it opened:
@@ -170,13 +126,6 @@ fn network_socket_regions_are_attachable_by_owner() {
     ));
 }
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!(
-        "(module (memory 1) (func (export \"{entrypoint}\")))"
-    ))
-    .expect("compile wat")
-}
-
 fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
@@ -200,4 +149,55 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
         .first()
         .expect("bootstrap report contains the requested guest")
         .process_id
+}
+
+/// Task 4.3: a guest without a grant for the connector's channel cannot
+/// attach to it (and therefore cannot resolve).
+#[test]
+fn ungranted_guest_cannot_attach_connector_channel() {
+    let runtime = Runtime::default();
+
+    // The connector owns a host queue for the well-known resolve channel.
+    let connector = spawn_guest(
+        &runtime,
+        "dns-connector",
+        vec![
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+        ],
+    );
+
+    let intruder = spawn_guest(&runtime, "resolver-without-grant", Vec::new());
+
+    // The connector creates its listener queue.
+    let (_, op_id) = runtime.begin_hostcall(connector, HostcallRequest::HostQueueCreate);
+    let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
+        runtime.poll_hostcall(connector, op_id)
+    else {
+        panic!("connector should create a host queue");
+    };
+
+    // The intruder has no resolve basis and no grant: attach is denied, so
+    // no DNS traffic can ever leave the host on its behalf.
+    let (status, deny_op) = runtime.begin_hostcall(
+        intruder,
+        HostcallRequest::HostQueueAttach {
+            shared_id: listener.shared_id,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "guest without a grant for the connector channel must be denied attach"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(intruder, deny_op),
+        CompletionState::Failed(_)
+    ));
 }
