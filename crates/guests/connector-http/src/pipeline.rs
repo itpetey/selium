@@ -49,8 +49,9 @@ pub const DEFAULT_REPLY_CAPACITY: usize = 16;
 /// Interface name registered by app guests that serve streamed responses.
 ///
 /// Routes whose discovery registration carries this interface are forwarded
-/// over server-streaming RPC; all other routes use unary RPC.
-pub const HTTP_STREAM_INTERFACE: &str = "selium.http/stream";
+/// over server-streaming RPC; all other routes use unary RPC. Defined once
+/// in the guest SDK (`selium_guest::net::http`) and shared with app guests.
+pub use selium_guest::net::http::HTTP_STREAM_INTERFACE;
 
 /// A typed session with a serving guest, able to forward one request.
 pub trait ForwardSession {
@@ -406,9 +407,9 @@ async fn dispatch_loop<R, F>(
                 let tag = next_seq;
                 next_seq += 1;
 
-                let host = get_typed_header(&request.headers, "host")
-                    .unwrap_or("localhost")
-                    .to_string();
+                let host = selium_abi::uri::normalize_host(
+                    get_typed_header(&request.headers, "host").unwrap_or("localhost"),
+                );
 
                 let target = {
                     let mut resolver = resolver.lock().await;

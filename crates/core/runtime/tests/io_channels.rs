@@ -238,6 +238,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap");

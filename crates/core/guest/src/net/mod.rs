@@ -9,6 +9,7 @@ pub use resolve::resolve;
 pub use tcp::{TcpListener, TcpStream};
 pub use udp::{Datagram, UdpSocket};
 
+pub mod http;
 pub mod resolve;
 pub mod tcp;
 pub mod udp;

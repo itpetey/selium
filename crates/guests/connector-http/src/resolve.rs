@@ -7,7 +7,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use selium_abi::uri;
 use selium_guest::Context;
+use selium_guest::net::http::HTTP_SCHEME;
 
 /// Test support: re-exports helpers for integration tests in `tests/`.
 /// Test utilities — not for production use.
@@ -110,12 +112,14 @@ impl RouteResolver {
     ///
     /// Tries the exact discovery URI first, then each parent subtree
     /// (longest prefix first), then the host root — matching app guests'
-    /// registered URI subtrees.
+    /// registered URI subtrees. Routes are protocol-aware (`sel-http://…`),
+    /// so the Host header maps mechanically onto the discovery URI.
     pub async fn resolve(
         &mut self,
         host: &str,
         path: &str,
     ) -> Result<selium_abi::ResourceTarget, ResolveError> {
+        let host = uri::normalize_host(host);
         let cache_key = format!("{}:{}", host, path);
         if let Some(route) = self.cache.get(&cache_key) {
             return Ok(route.target.clone());
@@ -126,11 +130,7 @@ impl RouteResolver {
         };
 
         let clean_path = path.trim_start_matches('/').trim_end_matches('/');
-        let discovery_uri = if clean_path.is_empty() {
-            format!("sel://{}", host)
-        } else {
-            format!("sel://{}/{}", host, clean_path)
-        };
+        let discovery_uri = route_uri(&host, clean_path);
 
         match ctx.lookup(&discovery_uri).await {
             Ok(Some(target)) => {
@@ -143,7 +143,7 @@ impl RouteResolver {
                 );
                 Ok(target)
             }
-            Ok(None) => self.resolve_parent(host, path).await,
+            Ok(None) => self.resolve_parent(&host, path).await,
             Err(e) => {
                 tracing::warn!("discovery lookup failed for {discovery_uri}: {e}");
                 Err(ResolveError::NotFound)
@@ -173,7 +173,7 @@ impl RouteResolver {
                 .copied()
                 .collect::<Vec<_>>()
                 .join("/");
-            let uri = format!("sel://{}/{}", host, prefix);
+            let uri = route_uri(host, &prefix);
 
             match ctx.lookup(&uri).await {
                 Ok(Some(target)) => {
@@ -195,7 +195,7 @@ impl RouteResolver {
             }
         }
 
-        let root_uri = format!("sel://{}", host);
+        let root_uri = route_uri(host, "");
         match ctx.lookup(&root_uri).await {
             Ok(Some(target)) => {
                 let orig_key = format!("{}:{}", host, path);
@@ -213,9 +213,28 @@ impl RouteResolver {
     }
 }
 
+/// Builds the `sel-http://` discovery URI for a normalised host and a
+/// trimmed path (`""` or no leading/trailing slash).
+fn route_uri(host: &str, path: &str) -> String {
+    if path.is_empty() {
+        uri::protocol_uri(HTTP_SCHEME, host, "")
+    } else {
+        uri::protocol_uri(HTTP_SCHEME, host, &format!("/{path}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_uri_builds_protocol_aware_uris() {
+        assert_eq!(
+            route_uri("example.com", "api"),
+            "sel-http://example.com/api"
+        );
+        assert_eq!(route_uri("example.com", ""), "sel-http://example.com");
+    }
 
     fn make_target(id: u64) -> selium_abi::ResourceTarget {
         selium_abi::ResourceTarget {

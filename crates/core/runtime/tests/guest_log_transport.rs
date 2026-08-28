@@ -44,11 +44,11 @@ fn alloc_region_with_log_channel_publishes_discovery_register_events() {
     let uris = drain_register_uris(&mut subscriber);
 
     assert!(
-        uris.contains(&format!("sel://process/{process_id}/regions/{region_id}")),
+        uris.contains(&format!("sel://_sys/proc/{process_id}/regions/{region_id}")),
         "expected region URI to be published"
     );
     assert!(
-        uris.contains(&format!("sel://process/{process_id}/logs")),
+        uris.contains(&format!("sel://_sys/proc/{process_id}/logs")),
         "expected log alias URI to be published"
     );
 }
@@ -306,6 +306,7 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         })
         .expect("spawn guest")
         .process_id

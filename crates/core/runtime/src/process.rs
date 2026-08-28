@@ -265,6 +265,39 @@ impl Runtime {
             }
         }
 
+        // Revoke tier-1 registrations for host queues created by this process.
+        let owned_queues = self
+            .shared_resource_owners
+            .lock()
+            .iter()
+            .filter_map(|((resource_class, shared_id), owners)| {
+                if resource_class == &ResourceClass::HostQueue && owners.contains(&process_id) {
+                    Some(*shared_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for shared_id in owned_queues {
+            let request = DiscoveryRequest::Revoke {
+                uri: crate::discovery::queue_registration_uri(process_id, shared_id),
+            };
+            if let Ok(bytes) = encode_rkyv(&request) {
+                drop(self.publish_discovery_event(bytes));
+            }
+        }
+
+        // Revoke protocol handler registrations for this process.
+        let handler_schemes = self.handler_schemes.lock().remove(&process_id);
+        if let Some(schemes) = handler_schemes {
+            for scheme in schemes {
+                let request = DiscoveryRequest::RevokeHandler { protocol: scheme };
+                if let Ok(bytes) = encode_rkyv(&request) {
+                    drop(self.publish_discovery_event(bytes));
+                }
+            }
+        }
+
         let owned_handles = self
             .local_handle_owners
             .lock()
@@ -859,6 +892,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn guest");
         runtime.project_metering(
@@ -907,6 +941,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn owner-a");
 
@@ -925,6 +960,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn owner-b");
 

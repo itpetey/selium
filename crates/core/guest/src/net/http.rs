@@ -1,7 +1,7 @@
 //! Typed HTTP serve API for application guests.
 //!
-//! This module provides the app-guest side of the HTTP connector:
-//! register a URI subtree with discovery, accept typed RPC connections,
+//! This module is the app-guest side of the HTTP connector: register a
+//! protocol-aware URI subtree with discovery, accept typed RPC connections,
 //! and handle `HttpRequest` → `HttpResponse` in a loop.
 //!
 //! ## Capability Model
@@ -18,12 +18,12 @@
 //! ## Example
 //!
 //! ```ignore
-//! use selium_connector_http::serve::HttpServe;
-//! use selium_guest::{entrypoint, Context};
+//! use selium_guest::{net::http::HttpServe, entrypoint, Context};
+//! use selium_proto_http::HttpResponse;
 //!
 //! #[entrypoint]
 //! async fn my_app(mut ctx: Context) {
-//!     let mut serve = HttpServe::bind(&mut ctx, "sel://example.com/api")
+//!     let mut serve = HttpServe::bind(&mut ctx, "sel-http://example.com/api")
 //!         .await
 //!         .expect("bind failed");
 //!
@@ -37,17 +37,21 @@
 //! }
 //! ```
 
-use selium_abi::{InterfaceMetadata, ResourceTarget};
-use selium_guest::{Context, GuestError, ResourceListener};
+use selium_abi::{InterfaceMetadata, ResourceTarget, uri};
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
+
+use crate::{Context, GuestError, ResourceListener};
+
+/// Protocol scheme for HTTP routes (`sel-http://…`.
+pub const HTTP_SCHEME: &str = "sel-http";
 
 /// Interface marker for streamed HTTP serving.
 ///
 /// [`HttpServeStream::bind`] registers this interface with discovery; the
 /// connector routes matching requests through server-streaming RPC so
 /// response bodies stream to the wire as chunked transfer encoding.
-pub const HTTP_STREAM_INTERFACE: &str = crate::HTTP_STREAM_INTERFACE;
+pub const HTTP_STREAM_INTERFACE: &str = "selium.http/stream";
 
 /// A typed HTTP serve handle.
 ///
@@ -97,12 +101,11 @@ pub enum HttpServeError {
 /// ## Example
 ///
 /// ```ignore
-/// use selium_connector_http::serve::HttpServeStream;
-/// use selium_guest::entrypoint;
+/// use selium_guest::{net::http::HttpServeStream, entrypoint};
 ///
 /// #[entrypoint]
 /// async fn my_app(mut ctx: Context) {
-///     let mut serve = HttpServeStream::bind(&mut ctx, "sel://example.com/events")
+///     let mut serve = HttpServeStream::bind(&mut ctx, "sel-http://example.com/events")
 ///         .await
 ///         .expect("bind failed");
 ///
@@ -139,29 +142,49 @@ pub struct HttpStreamRequestHandle<'a> {
     req: rpc::ServerStreamRequest<'a, HttpRequest, HttpStreamItem>,
 }
 
+fn http_target(
+    listener: &ResourceListener,
+    uri: &str,
+    interface: Option<InterfaceMetadata>,
+) -> ResourceTarget {
+    ResourceTarget {
+        uri: uri.to_string(),
+        host_id: String::new(),
+        resource_id: listener.descriptor().shared_id,
+        interface,
+        tenant: None,
+    }
+}
+
+fn require_http_scheme(uri: &str) -> Result<(), GuestError> {
+    if uri::scheme_of(uri) == Some(HTTP_SCHEME) {
+        Ok(())
+    } else {
+        Err(GuestError::Host(format!(
+            "HTTP serve requires a `{HTTP_SCHEME}://` URI, got: {uri}"
+        )))
+    }
+}
+
 impl HttpServe {
     /// Bind to a URI subtree and register it with discovery.
     ///
-    /// The `uri` should be in the form `sel://<host>/<prefix>` (e.g.
-    /// `sel://my-app/api`). The runtime allocates a host queue for the
+    /// The `uri` must be protocol-aware: `sel-http://<host>/<prefix>` (e.g.
+    /// `sel-http://my-app/api`). The runtime allocates a host queue for the
     /// listener and registers the URI→queue mapping with the discovery
-    /// service.
+    /// service, which rejects it unless an HTTP handler (the connector) is
+    /// present.
     ///
     /// The guest requires a channel attach grant but **no `Network` grant**
     /// — networking is handled by the connector.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
+        require_http_scheme(uri)?;
+
         // Allocate a host queue for incoming connections (synchronous).
         let listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
 
-        // Register the URI subtree with discovery.
-        let target = ResourceTarget {
-            uri: uri.to_string(),
-            host_id: String::new(),
-            resource_id: listener.descriptor().shared_id,
-            interface: None,
-            tenant: None,
-        };
+        let target = http_target(&listener, uri, None);
         ctx.register(uri, target).await?;
 
         Ok(Self {
@@ -262,19 +285,19 @@ impl HttpServeStream {
     /// The guest requires a channel attach grant but **no `Network`
     /// grant** — networking is handled by the connector.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
+        require_http_scheme(uri)?;
+
         let listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
 
-        let target = ResourceTarget {
-            uri: uri.to_string(),
-            host_id: String::new(),
-            resource_id: listener.descriptor().shared_id,
-            interface: Some(InterfaceMetadata {
+        let target = http_target(
+            &listener,
+            uri,
+            Some(InterfaceMetadata {
                 name: HTTP_STREAM_INTERFACE.to_string(),
                 methods: Vec::new(),
             }),
-            tenant: None,
-        };
+        );
         ctx.register(uri, target).await?;
 
         Ok(Self {

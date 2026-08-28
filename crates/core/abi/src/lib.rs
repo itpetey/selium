@@ -33,6 +33,8 @@ use rkyv::{
 };
 use thiserror::Error;
 
+pub mod uri;
+
 /// Layout constants for the guest wake mailbox shared with the host.
 pub mod mailbox {
     /// Byte offset of the ring head word.
@@ -485,6 +487,20 @@ pub enum DiscoveryRequest {
         /// URI to revoke.
         uri: String,
     },
+    /// Tier-1: register a protocol handler for `protocol` scheme (e.g.
+    /// `sel-http`). Published by the runtime over the discovery feed; never
+    /// accepted over the guest RPC path.
+    RegisterHandler {
+        /// Protocol scheme the handler serves (`sel-http`, `sel-dns`, …).
+        protocol: String,
+        /// System service serving the scheme.
+        target: ResourceTarget,
+    },
+    /// Tier-1: revoke a protocol handler registration.
+    RevokeHandler {
+        /// Protocol scheme whose handler is being removed.
+        protocol: String,
+    },
 }
 
 /// Response from the discovery service.
@@ -501,6 +517,10 @@ pub enum DiscoveryResponse {
     Revoked,
     /// The caller is not authorised to register the given target.
     Forbidden,
+    /// No protocol handler is registered for the URI's scheme: registering a
+    /// `sel-http://…` route before the HTTP connector is present is rejected
+    /// loudly rather than accepted and silently unroutable.
+    NoHandler,
 }
 
 /// Host operation requested by a guest.
@@ -1339,9 +1359,9 @@ mod tests {
     #[test]
     fn discovery_request_register_round_trip() {
         let request = DiscoveryRequest::Register {
-            uri: "sel://process/42/logs".to_string(),
+            uri: "sel://_sys/proc/42/logs".to_string(),
             target: ResourceTarget {
-                uri: "sel://process/42/logs".to_string(),
+                uri: "sel://_sys/proc/42/logs".to_string(),
                 host_id: "host-a".to_string(),
                 resource_id: 7,
                 interface: None,
@@ -1356,7 +1376,7 @@ mod tests {
     #[test]
     fn discovery_request_revoke_round_trip() {
         let request = DiscoveryRequest::Revoke {
-            uri: "sel://process/42/logs".to_string(),
+            uri: "sel://_sys/proc/42/logs".to_string(),
         };
         let encoded = encode_rkyv(&request).expect("encode");
         let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");

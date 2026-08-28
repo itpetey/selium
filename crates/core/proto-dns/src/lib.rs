@@ -17,7 +17,7 @@ pub mod wire;
 ///
 /// Resolving guests attach by looking this URI up through discovery; a
 /// channel grant on this URI is the capability that expresses "may resolve".
-pub const RESOLVE_URI: &str = "sel://sys/dns/resolve";
+pub const RESOLVE_URI: &str = "sel://_sys/dns/resolve";
 
 /// DNS resource record types carried by typed queries and responses.
 ///

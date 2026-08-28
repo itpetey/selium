@@ -769,6 +769,7 @@ impl Runtime {
                     readiness: ReadinessCondition::Immediate,
                     tenant,
                     well_known_uri: None,
+                    handlers: Vec::new(),
                 };
                 let child = self
                     .spawn_system_guest(descriptor)
@@ -878,6 +879,33 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     descriptor.shared_id,
                 );
+                // Tier-1 registration: queues are first-class resources so a
+                // guest can register a route (e.g. `sel-http://…`) whose target
+                // is its listener queue and still pass discovery's ownership
+                // validation. Revoked on process teardown.
+                let target = ResourceTarget {
+                    uri: crate::discovery::queue_registration_uri(process_id, descriptor.shared_id),
+                    host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
+                    resource_id: descriptor.shared_id,
+                    interface: None,
+                    tenant: self.process_tenant(process_id),
+                };
+                let request = DiscoveryRequest::Register {
+                    uri: target.uri.clone(),
+                    target,
+                };
+                let bytes = encode_rkyv(&request).map_err(|error| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("discovery encode failed: {error}"),
+                    )
+                })?;
+                if let Err(error) = self.publish_discovery_event(bytes) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("discovery publish failed: {error}"),
+                    ));
+                }
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
@@ -1500,6 +1528,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn hostcall test guest")
     }
@@ -1533,6 +1562,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn rollover guest");
         *runtime.next_operation_id.lock() = OperationId::MAX;
@@ -1922,6 +1952,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn tenant-a guest");
 
@@ -1944,6 +1975,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("beta".to_string()),
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn tenant-b guest");
 
@@ -2005,6 +2037,7 @@ mod tests {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         });
 
         let error = result.expect_err("should reject UriPrefix grant at spawn");
@@ -2080,6 +2113,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("empty selector grant should be accepted");
 
@@ -2123,6 +2157,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn guesser");
 
@@ -2210,6 +2245,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn explicit-b");
 
@@ -2397,6 +2433,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn contain-parent");
 

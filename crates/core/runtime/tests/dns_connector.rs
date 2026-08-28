@@ -141,6 +141,7 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap guest");

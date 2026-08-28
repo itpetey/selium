@@ -69,6 +69,9 @@ pub struct Runtime {
     /// serving process: `(uri, listener shared id)`. Revoked (and the entry
     /// removed) when the process terminates.
     pub(crate) well_known_uris: Arc<Mutex<HashMap<ProcessId, (String, u64)>>>,
+    /// Protocol schemes a booted system guest handles (e.g. `sel-http`),
+    /// keyed by process id. Revoked when the process terminates.
+    pub(crate) handler_schemes: Arc<Mutex<HashMap<ProcessId, Vec<String>>>>,
     /// Process ids whose guest reactor is currently being executed by a
     /// host thread. Guarantees at most one thread enters a guest's WASM
     /// store; losers of the race return and rely on the winner's
@@ -108,6 +111,7 @@ impl Runtime {
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
             well_known_uris: Arc::new(Mutex::new(HashMap::new())),
+            handler_schemes: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
         };
 

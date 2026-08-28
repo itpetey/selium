@@ -20,6 +20,7 @@ selium-encoding.workspace = true
 selium-guest-macros = { path = "macros" }
 selium-memory.workspace = true
 selium-proto-dns.workspace = true
+selium-proto-http.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
 thiserror.workspace = true

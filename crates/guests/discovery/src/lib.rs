@@ -2,20 +2,14 @@
 
 use std::{cell::RefCell, collections::BTreeMap, collections::HashMap, rc::Rc};
 
-use selium_abi::{DiscoveryRequest, DiscoveryResponse, decode_rkyv};
-use selium_guest::{InterfaceMetadata, ResourceTarget, entrypoint, pattern_interface};
+use selium_abi::{DiscoveryRequest, DiscoveryResponse, ResourceTarget, decode_rkyv, uri};
+use selium_guest::{InterfaceMetadata, entrypoint, pattern_interface};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
-/// Prefix for process-scoped URIs registered by the runtime (Tier 1).
-const PROCESS_URI_PREFIX: &str = "sel://process/";
 pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
-/// Prefix for well-known system URIs (e.g. `sel://sys/dns/resolve`) whose
-/// channels the runtime provisions at spawn time and registers on the
-/// serving guest's behalf.
-const SYS_URI_PREFIX: &str = "sel://sys/";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
 #[pattern_interface]
@@ -33,6 +27,10 @@ pub struct DiscoveryStore {
     /// Tier-1 (runtime) registrations. Used to validate Tier-2 (guest) custom
     /// URI registrations.
     ownership: HashMap<(u64, u64), ()>,
+    /// Protocol handlers by scheme (`sel-http`, `sel-dns`, …), populated by
+    /// Tier-1 `RegisterHandler` events. A protocol-aware route registration
+    /// is rejected when its scheme has no live handler.
+    handlers: HashMap<String, ResourceTarget>,
 }
 
 impl DiscoveryStore {
@@ -41,7 +39,7 @@ impl DiscoveryStore {
     }
 
     /// Tier-1 registration: store the mapping AND populate the ownership table.
-    /// Called when the URI starts with `sel://process/<id>/`.
+    /// Called for runtime-published `sel://_sys/proc/<id>/` URIs.
     pub fn register_tier1(
         &mut self,
         process_id: u64,
@@ -71,6 +69,42 @@ impl DiscoveryStore {
         Ok(self.registrations.insert(target.uri.clone(), target))
     }
 
+    /// Registers a protocol handler for `protocol` scheme. Tier-1 only.
+    pub fn register_handler(
+        &mut self,
+        protocol: String,
+        target: ResourceTarget,
+    ) -> Option<ResourceTarget> {
+        self.handlers.insert(protocol, target)
+    }
+
+    /// Removes a protocol handler registration. Tier-1 only.
+    pub fn revoke_handler(&mut self, protocol: &str) -> Option<ResourceTarget> {
+        self.handlers.remove(protocol)
+    }
+
+    /// Returns whether a handler is registered for `scheme`.
+    pub fn has_handler(&self, scheme: &str) -> bool {
+        self.handlers.contains_key(scheme)
+    }
+
+    /// Applies a guest (Tier-2) registration with the full validation chain:
+    /// reserved namespace, protocol handler presence, then ownership.
+    pub fn apply_register(&mut self, caller: u64, target: ResourceTarget) -> DiscoveryResponse {
+        if uri::is_reserved(&target.uri) {
+            return DiscoveryResponse::Forbidden;
+        }
+        if let Some(scheme) = uri::protocol_scheme(&target.uri)
+            && !self.handlers.contains_key(scheme)
+        {
+            return DiscoveryResponse::NoHandler;
+        }
+        match self.register_tier2(caller, target) {
+            Ok(_) => DiscoveryResponse::Registered,
+            Err(()) => DiscoveryResponse::Forbidden,
+        }
+    }
+
     pub fn remove(&mut self, uri: &str) -> Option<ResourceTarget> {
         let removed = self.registrations.remove(uri);
         // Clean up ownership entries for resources no longer referenced by any URI.
@@ -89,7 +123,7 @@ impl DiscoveryStore {
 
     /// Removes all registrations and ownership entries for a process.
     pub fn revoke_process(&mut self, process_id: u64) {
-        let prefix = format!("sel://process/{process_id}/");
+        let prefix = format!("{}{process_id}/", uri::PROC_URI_PREFIX);
         self.registrations
             .retain(|uri, _| !uri.starts_with(&prefix));
         self.ownership.retain(|(pid, _), _| *pid != process_id);
@@ -100,7 +134,7 @@ impl DiscoveryStore {
     }
 
     /// Resolves a URI with optional tenant scoping. For process-scoped URIs
-    /// (`sel://process/<id>/...`), only returns `Found` if the caller's tenant
+    /// (`sel://_sys/proc/<id>/...`), only returns `Found` if the caller's tenant
     /// matches the target's tenant. If either tenant is None, the check is skipped
     /// (backward compatible with non-tenant-aware registrations).
     pub fn resolve_exact_scoped(
@@ -111,7 +145,7 @@ impl DiscoveryStore {
         let target = self.resolve_exact(uri)?;
 
         // Only enforce tenant scoping for process-scoped URIs
-        if uri.starts_with(PROCESS_URI_PREFIX) {
+        if uri.starts_with(uri::PROC_URI_PREFIX) {
             // If caller provides a tenant and target has a tenant, they must match
             if let (Some(caller), Some(target_tenant)) = (caller_tenant, &target.tenant)
                 && caller != target_tenant
@@ -130,8 +164,8 @@ impl DiscoveryStore {
 
     pub fn resolve_prefix(&self, prefix: &str) -> Vec<ResourceTarget> {
         self.registrations
-            .range(prefix.to_string()..)
-            .take_while(|(uri, _target)| uri.starts_with(prefix))
+            .iter()
+            .filter(|(uri, _target)| uri::prefix_matches(prefix, uri))
             .map(|(_uri, target)| target.clone())
             .collect()
     }
@@ -145,28 +179,39 @@ impl DiscoveryStore {
     }
 
     /// Applies a volatile Tier-1 event from the runtime feed.
+    ///
+    /// Tier-1 authority comes from the *transport* (the runtime feed), never
+    /// from the URI string: everything arriving here is treated as
+    /// runtime-authoritative — process registrations populate the ownership
+    /// table, reserved `_sys` URIs are stored without an ownership entry, and
+    /// protocol handlers are recorded for scheme validation.
     fn apply_tier1_event(&mut self, request: DiscoveryRequest) {
         match request {
             DiscoveryRequest::Register { uri: _, target } => {
-                if let Some(process_id) = extract_process_id_from_uri(&target.uri) {
+                if let Some(process_id) = uri::extract_process_id(&target.uri) {
                     self.register_tier1(process_id, target);
-                } else if target.uri.starts_with(SYS_URI_PREFIX) {
-                    // Well-known system URIs (e.g. the DNS connector's
-                    // `sel://sys/dns/resolve`) are runtime-authoritative:
-                    // provisioned at spawn time, revoked at teardown. No
-                    // ownership entry — guests cannot re-register or take
-                    // over a system URI via Tier-2.
+                } else if uri::is_reserved(&target.uri) {
+                    // Reserved system URIs (e.g. the DNS connector's channel)
+                    // are runtime-authoritative: provisioned at spawn time,
+                    // revoked at teardown. No ownership entry — guests cannot
+                    // re-register or take over a system URI via Tier-2.
                     self.register(target);
                 } else {
-                    // Runtime should only publish process-scoped Tier-1 registrations.
+                    // Runtime should only publish reserved Tier-1 registrations.
                     selium_guest::warn!(
                         uri = target.uri,
-                        "ignoring non-process-scoped Tier-1 registration"
+                        "ignoring non-reserved Tier-1 registration"
                     );
                 }
             }
             DiscoveryRequest::Revoke { uri } => {
                 self.remove(&uri);
+            }
+            DiscoveryRequest::RegisterHandler { protocol, target } => {
+                self.register_handler(protocol, target);
+            }
+            DiscoveryRequest::RevokeHandler { protocol } => {
+                self.revoke_handler(&protocol);
             }
             _ => {}
         }
@@ -247,13 +292,6 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
     }
 }
 
-/// Extracts the process id from a `sel://process/<id>/...` URI, if present.
-fn extract_process_id_from_uri(uri: &str) -> Option<u64> {
-    let rest = uri.strip_prefix(PROCESS_URI_PREFIX)?;
-    let id_str = rest.split('/').next()?;
-    id_str.parse().ok()
-}
-
 async fn feed_loop(
     store: Rc<RefCell<DiscoveryStore>>,
     mut subscriber: Subscriber<Vec<u8>, ShmTransport>,
@@ -311,24 +349,26 @@ async fn handler(
                             }
                         }
                         Ok(DiscoveryRequest::Register { uri: _, target }) => {
-                            // Tier-1: URI starts with sel://process/<id>/ — authoritative
-                            // registration from the runtime. Populate ownership table.
-                            // Tier-2: custom URI from a guest — validate ownership.
-                            if let Some(process_id) = extract_process_id_from_uri(&target.uri) {
-                                // Tier-1: runtime-authoritative
-                                store.register_tier1(process_id, target.clone());
-                                DiscoveryResponse::Registered
-                            } else {
-                                // Tier-2: guest-requested, validated
-                                match store.register_tier2(client_process_id, target.clone()) {
-                                    Ok(_) => DiscoveryResponse::Registered,
-                                    Err(()) => DiscoveryResponse::Forbidden,
-                                }
-                            }
+                            // Guest registrations are always Tier-2: reserved
+                            // namespace, handler presence, then ownership are
+                            // validated before the mapping is stored. Tier-1
+                            // registrations arrive only over the runtime feed.
+                            store.apply_register(client_process_id, target)
                         }
                         Ok(DiscoveryRequest::Revoke { uri }) => {
-                            store.remove(&uri);
-                            DiscoveryResponse::Revoked
+                            // Guests may not revoke reserved system URIs.
+                            if uri::is_reserved(&uri) {
+                                DiscoveryResponse::Forbidden
+                            } else {
+                                store.remove(&uri);
+                                DiscoveryResponse::Revoked
+                            }
+                        }
+                        // Handler lifecycle is runtime-authoritative (Tier-1):
+                        // guests cannot register themselves as protocol handlers.
+                        Ok(DiscoveryRequest::RegisterHandler { .. })
+                        | Ok(DiscoveryRequest::RevokeHandler { .. }) => {
+                            DiscoveryResponse::Forbidden
                         }
                         Err(error) => {
                             selium_guest::warn!("discovery payload decode failed: {error}");
@@ -425,6 +465,8 @@ mod tests {
                 }
             }
             DiscoveryRequest::Register { .. } => DiscoveryResponse::Registered,
+            DiscoveryRequest::RegisterHandler { .. } => DiscoveryResponse::Forbidden,
+            DiscoveryRequest::RevokeHandler { .. } => DiscoveryResponse::Forbidden,
             DiscoveryRequest::Revoke { .. } => DiscoveryResponse::Revoked,
         };
 
@@ -445,6 +487,8 @@ mod tests {
                 }
             }
             DiscoveryRequest::Register { .. } => DiscoveryResponse::Registered,
+            DiscoveryRequest::RegisterHandler { .. } => DiscoveryResponse::Forbidden,
+            DiscoveryRequest::RevokeHandler { .. } => DiscoveryResponse::Forbidden,
             DiscoveryRequest::Revoke { .. } => DiscoveryResponse::Revoked,
         };
 
@@ -466,18 +510,22 @@ mod tests {
     #[test]
     fn tier1_register_populates_ownership() {
         let mut store = DiscoveryStore::default();
-        let t = target("sel://process/42/regions/7", 7);
+        let t = target("sel://_sys/proc/42/regions/7", 7);
         store.register_tier1(42, t);
 
         assert!(store.owns_resource(42, 7));
         assert!(!store.owns_resource(99, 7));
-        assert!(store.resolve_exact("sel://process/42/regions/7").is_some());
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/42/regions/7")
+                .is_some()
+        );
     }
 
     #[test]
     fn tier2_register_succeeds_for_owned_resource() {
         let mut store = DiscoveryStore::default();
-        store.register_tier1(42, target("sel://process/42/regions/7", 7));
+        store.register_tier1(42, target("sel://_sys/proc/42/regions/7", 7));
 
         let custom = target("sel://my-app/logs", 7);
         let result = store.register_tier2(42, custom);
@@ -488,7 +536,7 @@ mod tests {
     #[test]
     fn tier2_register_rejected_for_unowned_resource() {
         let mut store = DiscoveryStore::default();
-        store.register_tier1(42, target("sel://process/42/regions/7", 7));
+        store.register_tier1(42, target("sel://_sys/proc/42/regions/7", 7));
 
         // Process 99 does not own resource 7
         let custom = target("sel://evil/logs", 7);
@@ -500,70 +548,87 @@ mod tests {
     #[test]
     fn revoke_removes_registration_and_ownership() {
         let mut store = DiscoveryStore::default();
-        store.register_tier1(42, target("sel://process/42/regions/7", 7));
+        store.register_tier1(42, target("sel://_sys/proc/42/regions/7", 7));
         assert!(store.owns_resource(42, 7));
 
-        store.remove("sel://process/42/regions/7");
-        assert!(store.resolve_exact("sel://process/42/regions/7").is_none());
+        store.remove("sel://_sys/proc/42/regions/7");
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/42/regions/7")
+                .is_none()
+        );
         assert!(!store.owns_resource(42, 7));
     }
 
     #[test]
     fn revoke_process_removes_all_process_entries() {
         let mut store = DiscoveryStore::default();
-        store.register_tier1(42, target("sel://process/42/regions/7", 7));
-        store.register_tier1(42, target("sel://process/42/logs", 8));
-        store.register_tier1(99, target("sel://process/99/regions/1", 1));
+        store.register_tier1(42, target("sel://_sys/proc/42/regions/7", 7));
+        store.register_tier1(42, target("sel://_sys/proc/42/logs", 8));
+        store.register_tier1(99, target("sel://_sys/proc/99/regions/1", 1));
 
         store.revoke_process(42);
 
-        assert!(store.resolve_exact("sel://process/42/regions/7").is_none());
-        assert!(store.resolve_exact("sel://process/42/logs").is_none());
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/42/regions/7")
+                .is_none()
+        );
+        assert!(store.resolve_exact("sel://_sys/proc/42/logs").is_none());
         assert!(!store.owns_resource(42, 7));
         assert!(!store.owns_resource(42, 8));
         // Process 99 unaffected.
-        assert!(store.resolve_exact("sel://process/99/regions/1").is_some());
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/99/regions/1")
+                .is_some()
+        );
         assert!(store.owns_resource(99, 1));
     }
 
     #[test]
     fn extract_process_id_from_uri_works() {
         assert_eq!(
-            extract_process_id_from_uri("sel://process/42/regions/7"),
+            uri::extract_process_id("sel://_sys/proc/42/regions/7"),
             Some(42)
         );
-        assert_eq!(
-            extract_process_id_from_uri("sel://process/99/logs"),
-            Some(99)
-        );
-        assert_eq!(extract_process_id_from_uri("sel://my-app/logs"), None);
-        assert_eq!(extract_process_id_from_uri("not-a-uri"), None);
+        assert_eq!(uri::extract_process_id("sel://_sys/proc/99/logs"), Some(99));
+        assert_eq!(uri::extract_process_id("sel://my-app/logs"), None);
+        assert_eq!(uri::extract_process_id("not-a-uri"), None);
     }
 
     #[test]
     fn apply_tier1_register_event() {
         let mut store = DiscoveryStore::default();
-        let t = target("sel://process/42/regions/7", 7);
+        let t = target("sel://_sys/proc/42/regions/7", 7);
         store.apply_tier1_event(DiscoveryRequest::Register {
             uri: t.uri.clone(),
             target: t,
         });
 
         assert!(store.owns_resource(42, 7));
-        assert!(store.resolve_exact("sel://process/42/regions/7").is_some());
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/42/regions/7")
+                .is_some()
+        );
     }
 
     #[test]
     fn apply_tier1_revoke_event() {
         let mut store = DiscoveryStore::default();
-        store.register_tier1(42, target("sel://process/42/regions/7", 7));
+        store.register_tier1(42, target("sel://_sys/proc/42/regions/7", 7));
         assert!(store.owns_resource(42, 7));
 
         store.apply_tier1_event(DiscoveryRequest::Revoke {
-            uri: "sel://process/42/regions/7".to_string(),
+            uri: "sel://_sys/proc/42/regions/7".to_string(),
         });
 
-        assert!(store.resolve_exact("sel://process/42/regions/7").is_none());
+        assert!(
+            store
+                .resolve_exact("sel://_sys/proc/42/regions/7")
+                .is_none()
+        );
         assert!(!store.owns_resource(42, 7));
     }
 
@@ -573,20 +638,20 @@ mod tests {
         // a Tier-1 Register must store it so guests can resolve it.
         let mut store = DiscoveryStore::default();
         store.apply_tier1_event(DiscoveryRequest::Register {
-            uri: "sel://sys/dns/resolve".to_string(),
-            target: target("sel://sys/dns/resolve", 12),
+            uri: "sel://_sys/dns/resolve".to_string(),
+            target: target("sel://_sys/dns/resolve", 12),
         });
 
-        let resolved = store.resolve_exact("sel://sys/dns/resolve");
+        let resolved = store.resolve_exact("sel://_sys/dns/resolve");
         assert_eq!(resolved.expect("sys uri resolves").resource_id, 12);
 
         // No ownership entry: a guest cannot take over a system URI via
         // Tier-2, and teardown revokes by URI.
         assert!(!store.owns_resource(0, 12));
         store.apply_tier1_event(DiscoveryRequest::Revoke {
-            uri: "sel://sys/dns/resolve".to_string(),
+            uri: "sel://_sys/dns/resolve".to_string(),
         });
-        assert!(store.resolve_exact("sel://sys/dns/resolve").is_none());
+        assert!(store.resolve_exact("sel://_sys/dns/resolve").is_none());
     }
 
     #[test]
@@ -597,5 +662,77 @@ mod tests {
             target: target("sel://my-app/logs", 7),
         });
         assert!(store.resolve_exact("sel://my-app/logs").is_none());
+    }
+
+    #[test]
+    fn tier2_register_rejected_for_reserved_namespace() {
+        let mut store = DiscoveryStore::default();
+        store.register_tier1(42, target("sel://_sys/proc/42/queues/7", 7));
+
+        let response = store.apply_register(42, target("sel://_sys/handlers/sel-http", 7));
+        assert!(matches!(response, DiscoveryResponse::Forbidden));
+        assert!(
+            store
+                .resolve_exact("sel://_sys/handlers/sel-http")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_route_requires_registered_handler() {
+        let mut store = DiscoveryStore::default();
+        store.register_tier1(42, target("sel://_sys/proc/42/queues/7", 7));
+
+        let response = store.apply_register(42, target("sel-http://example.com/api", 7));
+        assert!(matches!(response, DiscoveryResponse::NoHandler));
+        assert!(store.resolve_exact("sel-http://example.com/api").is_none());
+
+        store.apply_tier1_event(DiscoveryRequest::RegisterHandler {
+            protocol: "sel-http".to_string(),
+            target: target("sel://_sys/handlers/sel-http", 100),
+        });
+        assert!(store.has_handler("sel-http"));
+
+        let response = store.apply_register(42, target("sel-http://example.com/api", 7));
+        assert!(matches!(response, DiscoveryResponse::Registered));
+        assert!(store.resolve_exact("sel-http://example.com/api").is_some());
+    }
+
+    #[test]
+    fn generic_route_does_not_require_a_handler() {
+        let mut store = DiscoveryStore::default();
+        store.register_tier1(42, target("sel://_sys/proc/42/queues/7", 7));
+
+        let response = store.apply_register(42, target("sel://my-app/logs", 7));
+        assert!(matches!(response, DiscoveryResponse::Registered));
+    }
+
+    #[test]
+    fn handler_lifecycle_over_tier1_feed() {
+        let mut store = DiscoveryStore::default();
+        store.apply_tier1_event(DiscoveryRequest::RegisterHandler {
+            protocol: "sel-http".to_string(),
+            target: target("sel://_sys/handlers/sel-http", 100),
+        });
+        assert!(store.has_handler("sel-http"));
+
+        store.apply_tier1_event(DiscoveryRequest::RevokeHandler {
+            protocol: "sel-http".to_string(),
+        });
+        assert!(!store.has_handler("sel-http"));
+    }
+
+    #[test]
+    fn protocol_prefix_resolution_is_component_aware() {
+        let mut store = DiscoveryStore::default();
+        store.register(target("sel-http://example.com/foo", 7));
+        store.register(target("sel-http://example.com/foobar", 8));
+
+        let results = store.resolve_prefix("sel-http://example.com/foo");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].resource_id, 7);
+
+        let results = store.resolve_prefix("sel-http://example.com/foo/");
+        assert_eq!(results.len(), 1);
     }
 }

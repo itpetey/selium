@@ -726,6 +726,7 @@ dependencies = [
  "selium-guest-macros",
  "selium-memory",
  "selium-proto-dns",
+ "selium-proto-http",
  "selium-shm",
  "selium-wire",
  "thiserror",

@@ -209,6 +209,7 @@ fn foundation_crates_work_together_through_hostcalls() {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap runtime");
@@ -252,6 +253,7 @@ fn hostcalls_enforce_session_grants() {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap runtime");
@@ -408,6 +410,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         })
         .expect("spawn owner");
 
@@ -427,6 +430,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         })
         .expect("spawn resolver");
 
@@ -446,6 +450,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         })
         .expect("spawn intruder");
 
@@ -682,6 +687,7 @@ fn spawn_guest(
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap guest");

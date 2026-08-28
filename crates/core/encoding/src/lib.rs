@@ -170,6 +170,12 @@ impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
                 Self::new(1, uri.clone(), Some(ResourceTargetWire::from(target)))
             }
             selium_abi::DiscoveryRequest::Revoke { uri } => Self::new(2, uri.clone(), None),
+            selium_abi::DiscoveryRequest::RegisterHandler { protocol, target } => {
+                Self::new(3, protocol.clone(), Some(ResourceTargetWire::from(target)))
+            }
+            selium_abi::DiscoveryRequest::RevokeHandler { protocol } => {
+                Self::new(4, protocol.clone(), None)
+            }
         }
     }
 }
@@ -184,6 +190,7 @@ impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
             selium_abi::DiscoveryResponse::Registered => Self::new(2, None),
             selium_abi::DiscoveryResponse::Revoked => Self::new(3, None),
             selium_abi::DiscoveryResponse::Forbidden => Self::new(4, None),
+            selium_abi::DiscoveryResponse::NoHandler => Self::new(5, None),
         }
     }
 }
@@ -393,6 +400,22 @@ impl From<DiscoveryRequestWire> for selium_abi::DiscoveryRequest {
                 }
             }
             2 => selium_abi::DiscoveryRequest::Revoke { uri: wire.uri },
+            3 => {
+                let target = wire.target.map(selium_abi::ResourceTarget::from).unwrap_or(
+                    selium_abi::ResourceTarget {
+                        uri: String::new(),
+                        host_id: String::new(),
+                        resource_id: 0,
+                        interface: None,
+                        tenant: None,
+                    },
+                );
+                selium_abi::DiscoveryRequest::RegisterHandler {
+                    protocol: wire.uri,
+                    target,
+                }
+            }
+            4 => selium_abi::DiscoveryRequest::RevokeHandler { protocol: wire.uri },
             _ => selium_abi::DiscoveryRequest::Resolve(String::new()),
         }
     }
@@ -428,6 +451,7 @@ impl From<DiscoveryResponseWire> for selium_abi::DiscoveryResponse {
             2 => selium_abi::DiscoveryResponse::Registered,
             3 => selium_abi::DiscoveryResponse::Revoked,
             4 => selium_abi::DiscoveryResponse::Forbidden,
+            5 => selium_abi::DiscoveryResponse::NoHandler,
             _ => selium_abi::DiscoveryResponse::NotFound,
         }
     }

@@ -170,6 +170,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         well_known_uri: None,
+        handlers: Vec::new(),
     }
 }
 

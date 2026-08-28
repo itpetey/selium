@@ -31,7 +31,6 @@ pub use resolve::{ResolveError, ResolverHandle, RouteResolver};
 pub mod codec;
 pub mod pipeline;
 pub mod resolve;
-pub mod serve;
 pub mod wire_out;
 
 /// Manifest name for the certificate chain PEM.

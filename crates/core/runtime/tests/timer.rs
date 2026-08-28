@@ -178,6 +178,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         })
         .expect("bootstrap");

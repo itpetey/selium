@@ -47,6 +47,7 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         well_known_uri: Some(RESOLVE_URI.to_string()),
+        handlers: Vec::new(),
     }
 }
 
@@ -91,6 +92,7 @@ fn demo_descriptor(
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         well_known_uri: None,
+        handlers: Vec::new(),
     }
 }
 

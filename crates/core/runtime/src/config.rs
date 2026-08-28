@@ -47,13 +47,19 @@ pub struct SystemGuestDescriptor {
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
     /// Well-known discovery URI this guest serves (e.g. the DNS connector's
-    /// `sel://sys/dns/resolve`). When set, the runtime provisions the
+    /// `sel://_sys/dns/resolve`). When set, the runtime provisions the
     /// guest's channel at spawn time — exactly like the discovery listener —
     /// by creating the host listener queue, injecting its shared id as the
     /// leading entrypoint argument, granting attach rights for it, and
     /// registering the URI with discovery. The registration is revoked when
     /// the guest terminates.
     pub well_known_uri: Option<String>,
+    /// Protocol schemes this guest handles (e.g. `sel-http` for
+    /// `selium-connector-http`). The runtime publishes a Tier-1 handler
+    /// registration under `sel://_sys/handlers/<scheme>` once the guest is
+    /// up, and revokes it on teardown. Discovery uses this to reject route
+    /// registrations whose scheme has no live handler.
+    pub handlers: Vec<String>,
 }
 
 /// Runtime bootstrap configuration.
@@ -123,6 +129,7 @@ impl SystemGuestDescriptor {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         }
     }
 
@@ -202,6 +209,7 @@ mod tests {
             readiness: ReadinessCondition::Immediate,
             tenant: None,
             well_known_uri: None,
+            handlers: Vec::new(),
         };
         assert!(descriptor.arguments.is_empty());
     }

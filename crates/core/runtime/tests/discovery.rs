@@ -133,7 +133,7 @@ fn discovery_bootstrap_slice_end_to_end() {
     let mut subscriber = attach_feed_subscriber(&runtime);
     let host_region_id = alloc_region(&runtime, probe_guest.process_id, ResourceKind::SharedMemory);
     let expected_uri = format!(
-        "sel://process/{}/regions/{host_region_id}",
+        "sel://_sys/proc/{}/regions/{host_region_id}",
         probe_guest.process_id
     );
 
@@ -218,6 +218,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
         well_known_uri: None,
+        handlers: Vec::new(),
     }
 }
 
@@ -242,6 +243,7 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
         well_known_uri: None,
+        handlers: Vec::new(),
     }
 }
 
@@ -350,5 +352,6 @@ fn well_known_stub_descriptor() -> SystemGuestDescriptor {
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         well_known_uri: Some(RESOLVE_URI.to_string()),
+        handlers: Vec::new(),
     }
 }

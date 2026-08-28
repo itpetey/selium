@@ -288,6 +288,32 @@ impl Runtime {
             return Err(error);
         }
 
+        // Publish Tier-1 protocol handler registrations for any schemes this
+        // guest handles, so discovery can validate route registrations.
+        for scheme in &descriptor.handlers {
+            let uri = crate::discovery::handler_registration_uri(scheme);
+            let target = ResourceTarget {
+                uri,
+                host_id: String::new(),
+                resource_id: process.local_id,
+                interface: None,
+                tenant: descriptor.tenant.clone(),
+            };
+            let request = DiscoveryRequest::RegisterHandler {
+                protocol: scheme.clone(),
+                target,
+            };
+            let bytes = encode_rkyv(&request).map_err(|error| {
+                Error::Host(format!("handler discovery encode failed: {error}"))
+            })?;
+            self.publish_discovery_event(bytes)?;
+        }
+        if !descriptor.handlers.is_empty() {
+            self.handler_schemes
+                .lock()
+                .insert(process.local_id, descriptor.handlers.clone());
+        }
+
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,
@@ -451,6 +477,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         };
 
@@ -485,6 +512,7 @@ mod tests {
                 readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             })
             .expect("spawn bridged guest");
 
@@ -516,6 +544,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         };
 
@@ -550,6 +579,7 @@ mod tests {
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
                 well_known_uri: None,
+                handlers: Vec::new(),
             }],
         };
 
@@ -585,7 +615,8 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: Some("sel://sys/dns/resolve".to_string()),
+                well_known_uri: Some("sel://_sys/dns/resolve".to_string()),
+                handlers: Vec::new(),
             }],
         };
 
@@ -608,7 +639,7 @@ mod tests {
         // The registration is recorded (and revoked on teardown).
         assert_eq!(
             runtime.well_known_uri(guest.process_id),
-            Some(("sel://sys/dns/resolve".to_string(), listener))
+            Some(("sel://_sys/dns/resolve".to_string(), listener))
         );
         runtime.stop_process(guest.process_id).expect("stop guest");
         assert!(

@@ -4,22 +4,36 @@
 //! runtime→discovery pub/sub feed. This module provides the URI generation
 //! logic; durable registration state lives in the discovery guest, not here.
 
-use selium_abi::{ProcessId, ResourceKind};
+use selium_abi::uri::PROC_URI_PREFIX;
+use selium_abi::{ProcessId, ResourceKind, uri};
 
 /// Generates the URIs to register for a given allocation.
 ///
-/// Always returns `sel://process/<process_id>/regions/<region_id>`.
+/// Always returns `sel://_sys/proc/<process_id>/regions/<region_id>`.
 /// If the purpose maps to a known alias, also returns
-/// `sel://process/<process_id>/<alias>`.
+/// `sel://_sys/proc/<process_id>/<alias>`.
 pub fn registration_uris(
     process_id: ProcessId,
     region_id: u64,
     purpose: ResourceKind,
 ) -> Vec<String> {
     vec![
-        format!("sel://process/{process_id}/regions/{region_id}"),
-        format!("sel://process/{process_id}/{}", purpose_alias(purpose)),
+        format!("{PROC_URI_PREFIX}{process_id}/regions/{region_id}"),
+        format!("{PROC_URI_PREFIX}{process_id}/{}", purpose_alias(purpose)),
     ]
+}
+
+/// Generates the tier-1 registration URI for a host connection queue created
+/// by `HostQueueCreate`. Queues are first-class resources so guests can
+/// register routes (e.g. HTTP routes) whose target is a listener queue and
+/// still pass discovery's ownership validation.
+pub fn queue_registration_uri(process_id: ProcessId, queue_id: u64) -> String {
+    format!("{PROC_URI_PREFIX}{process_id}/queues/{queue_id}")
+}
+
+/// Returns the protocol handler registration URI for a scheme.
+pub fn handler_registration_uri(scheme: &str) -> String {
+    uri::handler_uri(scheme)
 }
 
 /// Returns the purpose-specific URI alias suffix for a `ResourceKind`, if any.
@@ -52,7 +66,7 @@ mod tests {
         let uris = registration_uris(42, 7, ResourceKind::SharedMemory);
         assert_eq!(
             uris,
-            vec!["sel://process/42/regions/7", "sel://process/42/shm"]
+            vec!["sel://_sys/proc/42/regions/7", "sel://_sys/proc/42/shm"]
         );
     }
 
@@ -61,7 +75,7 @@ mod tests {
         let uris = registration_uris(42, 7, ResourceKind::LogChannel);
         assert_eq!(
             uris,
-            vec!["sel://process/42/regions/7", "sel://process/42/logs",]
+            vec!["sel://_sys/proc/42/regions/7", "sel://_sys/proc/42/logs"]
         );
     }
 
@@ -70,7 +84,20 @@ mod tests {
         let uris = registration_uris(99, 3, ResourceKind::LiveTable);
         assert_eq!(
             uris,
-            vec!["sel://process/99/regions/3", "sel://process/99/tables",]
+            vec!["sel://_sys/proc/99/regions/3", "sel://_sys/proc/99/tables"]
+        );
+    }
+
+    #[test]
+    fn queue_registration_uri_is_under_proc_namespace() {
+        assert_eq!(queue_registration_uri(42, 7), "sel://_sys/proc/42/queues/7");
+    }
+
+    #[test]
+    fn handler_registration_uri_is_under_reserved_namespace() {
+        assert_eq!(
+            handler_registration_uri("sel-http"),
+            "sel://_sys/handlers/sel-http"
         );
     }
 }
