@@ -1,7 +1,6 @@
 //! Selium kernel primitives.
 
 pub use backend::KernelBackend;
-pub use backend::shared_offset_key;
 pub use error::{Error, Result};
 pub use host_queue::HostQueueRegistry;
 pub use kernel::Kernel;
@@ -21,6 +20,7 @@ mod kernel;
 mod memory;
 mod network;
 mod network_runtime;
+mod os_wait_word;
 mod poller;
 mod process;
 mod storage;

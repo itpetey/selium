@@ -231,6 +231,8 @@ impl Runtime {
     }
 
     pub(crate) fn cleanup_process_resources(&self, process_id: ProcessId) -> Result<()> {
+        // The process's fast-path capability vote is moot once it is gone.
+        self.process_fastpath.lock().remove(&process_id);
         // Revoke all discovery URIs registered for this process by publishing
         // Revoke operations to the discovery feed.
         let region_purposes: Vec<(u64, selium_abi::ResourceKind)> = {
@@ -418,6 +420,18 @@ impl Runtime {
         resource_class: &ResourceClass,
         shared_id: u64,
     ) -> bool {
+        // Fast-path eligibility is per-attachment: the departing process
+        // no longer votes. Remaining all-capable attachers keep the fast
+        // path; an empty voter set drops the region entry entirely.
+        if resource_class == &ResourceClass::SharedRegion {
+            let mut attachments = self.fast_path_attachments.lock();
+            if let Some(voters) = attachments.get_mut(&shared_id) {
+                voters.remove(&process_id);
+                if voters.is_empty() {
+                    attachments.remove(&shared_id);
+                }
+            }
+        }
         let mut shared_resource_owners = self.shared_resource_owners.lock();
         let Some(owners) = shared_resource_owners.get_mut(&(resource_class.clone(), shared_id))
         else {
@@ -569,17 +583,62 @@ impl Runtime {
         });
     }
 
-    /// Kicks all active network outbound proxy threads by notifying their
-    /// condvar wait keys. Called on guest→host transitions to ensure the
-    /// outbound drain runs promptly after a guest write.
+    /// Kicks active network outbound proxy threads by notifying the unified
+    /// region waiter registry on each ring's generation word. Called on
+    /// guest→host transitions to ensure the outbound drain runs promptly after
+    /// a guest write.
     ///
-    /// Notified under the lock (no snapshot clone on this hot path): waiters
-    /// never take `network_wait_keys` when waking, so holding it across
-    /// `host_notify` cannot deadlock.
+    /// Regions with the shared-page fast path active are skipped: the writer
+    /// guest's `memory.atomic.notify` already wakes the drainer directly, so a
+    /// transition kick would be redundant. A missed kick can never stall a
+    /// proxy — the bounded-timeout backstop in the drain loop re-checks.
     pub fn kick_network_waiters(&self) {
-        for (_shared_id, key) in self.network_wait_keys.lock().iter() {
-            selium_memory::host_notify(*key, 1);
+        let memory = self.kernel.memory();
+        let fast_path = self.fast_path_attachments.lock().clone();
+        for (shared_id, generation_offset) in self.network_wait_keys.lock().iter() {
+            if region_fast_path_active(&fast_path, *shared_id) {
+                continue;
+            }
+            drop(memory.notify_region(*shared_id, *generation_offset, 1));
+            *self.kick_counts.lock().entry(*shared_id).or_insert(0) += 1;
         }
+    }
+
+    /// True when the shared-page fast path is active for `shared_id`: every
+    /// attaching process's guest module is fast-path capable (shared memory
+    /// declaration + atomic notify opcodes; see `module_probe`) and the
+    /// engine advertises its per-region wait registry. Detection, not
+    /// configuration — see the `shared-page-fastpath` capability spec.
+    pub fn fast_path_region_active(&self, shared_id: u64) -> bool {
+        let attachments = self.fast_path_attachments.lock().clone();
+        region_fast_path_active(&attachments, shared_id)
+    }
+
+    /// Shared ids of the regions with active network outbound proxies (the
+    /// kick targets), for observability and tests.
+    pub fn network_wait_regions(&self) -> Vec<u64> {
+        self.network_wait_keys
+            .lock()
+            .iter()
+            .map(|(shared_id, _)| *shared_id)
+            .collect()
+    }
+
+    /// Total guest→host transition kicks **delivered** since runtime
+    /// creation (suppressed regions are not counted).
+    pub fn kick_count(&self) -> u64 {
+        self.kick_counts.lock().values().sum()
+    }
+
+    /// Guest→host transition kicks delivered to `shared_id`. Zero for a
+    /// fast-path region means every wake was carried by the guest's atomic
+    /// notify — the end-to-end fast-path assertion.
+    pub fn region_kick_count(&self, shared_id: u64) -> u64 {
+        self.kick_counts
+            .lock()
+            .get(&shared_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Called when the host advances a region's generation. Checks the wait
@@ -751,6 +810,60 @@ impl Runtime {
             .read_u32(mailbox.base + selium_abi::mailbox::FLAG_OFFSET as u32)
             .is_ok_and(|flag| flag != 0)
     }
+
+    /// Records a guest module's fast-path capability, probed from its module
+    /// bytes at spawn (see `module_probe`). Consumed at region attach.
+    pub(crate) fn record_process_fastpath(&self, process_id: ProcessId, capable: bool) {
+        self.process_fastpath.lock().insert(process_id, capable);
+    }
+
+    /// True when the process's guest module is fast-path capable. Unknown
+    /// processes (never spawned, or already cleaned up) are not — the
+    /// portable kick path is the safe default.
+    pub(crate) fn process_fastpath_capable(&self, process_id: ProcessId) -> bool {
+        self.process_fastpath
+            .lock()
+            .get(&process_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Records the per-attachment fast-path eligibility vote for
+    /// `(region_id, process_id)` at attach time. `capable` combines the
+    /// engine's registry support with the attaching process's module probe;
+    /// an incapable attacher votes `false` so the region's fast path stays
+    /// off until every attacher is capable.
+    pub(crate) fn record_fast_path_attachment(
+        &self,
+        region_id: u64,
+        process_id: ProcessId,
+        capable: bool,
+    ) {
+        self.fast_path_attachments
+            .lock()
+            .entry(region_id)
+            .or_default()
+            .insert(process_id, capable);
+    }
+
+    /// Drops all fast-path eligibility for a destroyed region. Called when
+    /// the region is freed: every attachment is force-detached, so every
+    /// vote is stale.
+    pub(crate) fn clear_fast_path_attachments(&self, region_id: u64) {
+        self.fast_path_attachments.lock().remove(&region_id);
+    }
+}
+
+/// True when the per-attachment eligibility map marks every attacher of
+/// `shared_id` as fast-path capable (and at least one attacher exists). See
+/// [`Runtime::fast_path_region_active`].
+fn region_fast_path_active(
+    attachments: &std::collections::HashMap<u64, std::collections::HashMap<ProcessId, bool>>,
+    shared_id: u64,
+) -> bool {
+    attachments
+        .get(&shared_id)
+        .is_some_and(|voters| !voters.is_empty() && voters.values().all(|capable| *capable))
 }
 
 #[cfg(test)]

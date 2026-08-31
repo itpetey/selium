@@ -13,6 +13,16 @@
 //! - Global provider installation so that higher-level crates can allocate
 //!   regions without threading a provider through every type.
 
+// The `nightly-wasm-atomics` feature enables the genuine
+// `memory.atomic.wait32` / `memory.atomic.notify` WASM intrinsics in
+// `PointerBackend`. Those intrinsics live behind the
+// `stdarch_wasm_atomic_wait` feature gate on nightly; gate the attribute so
+// stable builds (without the cargo feature) stay on the stable compiler.
+#![cfg_attr(
+    all(target_arch = "wasm32", feature = "nightly-wasm-atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 use std::{
     any::Any,
     collections::HashMap,

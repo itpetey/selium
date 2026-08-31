@@ -32,5 +32,16 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 selium-memory.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
+[features]
+# Guest-side fast-path opt-in: forwards to `selium-memory` (and
+# `selium-shm`) so the ring write path emits a genuine
+# `memory.atomic.notify` on the generation word instead of the honest no-op.
+# Requires a nightly toolchain with `stdarch_wasm_atomic_wait` and a
+# `+atomics`/shared-memory target.
+nightly-wasm-atomics = [
+    "selium-memory/nightly-wasm-atomics",
+    "selium-shm/nightly-wasm-atomics",
+]
+
 [lints]
 workspace = true

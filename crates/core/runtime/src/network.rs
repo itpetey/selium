@@ -128,9 +128,10 @@ pub fn tcp_bind(
                         return;
                     }
 
-                    // Register the wait key for runtime kicks.
-                    let wait_key = generation_wait_key(shared_id, ring_offset);
-                    rt.network_wait_keys.lock().push((shared_id, wait_key));
+                    // Register the wait target for runtime kicks: the
+                    // generation-word offset within the shared region.
+                    let gen_offset = ring_offset + GENERATION_COUNTER_OFFSET;
+                    rt.network_wait_keys.lock().push((shared_id, gen_offset));
 
                     // Spawn outbound drain on a dedicated thread.
                     let memory = k.memory();
@@ -195,9 +196,12 @@ pub fn tcp_connect(runtime: &Runtime, address: String) -> Result<SharedRegionDes
             .map_err(|e| crate::Error::Host(format!("poller register stream: {e}")))?;
     }
 
-    // Register the wait key for runtime kicks.
-    let wait_key = generation_wait_key(shared_id, ring_offset);
-    runtime.network_wait_keys.lock().push((shared_id, wait_key));
+    // Register the wait target for runtime kicks.
+    let gen_offset = ring_offset + GENERATION_COUNTER_OFFSET;
+    runtime
+        .network_wait_keys
+        .lock()
+        .push((shared_id, gen_offset));
 
     // Spawn the outbound drain on a dedicated thread.
     let memory = kernel.memory();
@@ -247,9 +251,12 @@ pub fn udp_bind(runtime: &Runtime, address: String) -> Result<SharedRegionDescri
             .map_err(|e| crate::Error::Host(format!("poller register udp: {e}")))?;
     }
 
-    // Register the wait key for runtime kicks.
-    let wait_key = generation_wait_key(shared_id, ring_offset);
-    runtime.network_wait_keys.lock().push((shared_id, wait_key));
+    // Register the wait target for runtime kicks.
+    let gen_offset = ring_offset + GENERATION_COUNTER_OFFSET;
+    runtime
+        .network_wait_keys
+        .lock()
+        .push((shared_id, gen_offset));
 
     // Spawn the outbound send drain on a dedicated thread.
     let memory = kernel.memory();
@@ -346,15 +353,6 @@ fn create_stream_region(
         sub_memory_1_offset,
         parent_local_id,
     ))
-}
-
-/// Compute the waiters key for a ring's generation word, given the parent
-/// shared region id and the sub-memory offset of the ring.
-///
-/// Delegates to the kernel's canonical derivation so runtime kicks are
-/// guaranteed to match the keys `atomic_wait32` parks on.
-fn generation_wait_key(shared_id: u64, ring_offset: u64) -> usize {
-    selium_kernel::shared_offset_key(shared_id, ring_offset + GENERATION_COUNTER_OFFSET)
 }
 
 /// Outbound drain for TCP: reads frames from the ring, writes to the socket.
@@ -586,16 +584,6 @@ mod tests {
         );
     }
 
-    /// Verify the wait key computation is deterministic and stable.
-    #[test]
-    fn generation_wait_key_is_deterministic() {
-        let key1 = generation_wait_key(42, 4096);
-        let key2 = generation_wait_key(42, 4096);
-        assert_eq!(key1, key2);
-        // Different offsets produce different keys.
-        assert_ne!(key1, generation_wait_key(42, 8192));
-    }
-
     /// End-to-end TCP echo test using the event-driven proxy infrastructure.
     #[tokio::test]
     async fn tcp_echo_via_event_driven_proxy() {
@@ -679,6 +667,85 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(1),
             "wake latency should be under 1 second, was {:?}",
             start.elapsed()
+        );
+
+        drop(outbound_writer);
+        server_handle.join().expect("server thread");
+        runtime.kernel.close_tcp_stream(shared_id).unwrap();
+    }
+
+    /// Stage 1 scenario: a guest write wakes the outbound drainer through the
+    /// unified region waiter registry with **no runtime kick**. The
+    /// `notify_region` call here stands in for a fast-path guest's
+    /// `memory.atomic.notify` landing on the same registry the drainer parks
+    /// in, with `kick_network_waiters` never invoked.
+    #[tokio::test]
+    async fn tcp_echo_via_unified_registry_no_kick() {
+        use std::io::{Read, Write};
+
+        let kernel = Kernel::default();
+        let _ = kernel.init_poller().expect("init poller");
+        let runtime = Runtime::new(kernel.clone());
+
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = server.local_addr().expect("addr");
+        let server_handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = server.accept() {
+                let mut buf = [0u8; 256];
+                if let Ok(n) = stream.read(&mut buf) {
+                    drop(stream.write_all(&buf[..n]));
+                    drop(stream.flush());
+                }
+            }
+        });
+
+        let descriptor = tcp_connect(&runtime, server_addr.to_string()).expect("tcp connect");
+        let shared_id = descriptor.shared_id;
+
+        let memory = runtime.kernel.memory();
+        let parent_backend = memory.attach_backend(shared_id).expect("attach");
+        let header = MultiMemoryHeader::parse(&parent_backend, 0).expect("parse");
+        let outbound_entry = header.entry(1).expect("outbound entry");
+
+        let outbound_backend = parent_backend
+            .sub_region(outbound_entry.offset, outbound_entry.length)
+            .expect("outbound sub");
+        let outbound_writer =
+            RingWriter::open(outbound_backend, DEFAULT_RING_CAPACITY).expect("open writer");
+        outbound_writer.increment_writer_count().expect("inc wc");
+        outbound_writer
+            .write_frame(b"registry wake", 0, 0)
+            .expect("write frame");
+
+        // Notably absent: `kick_network_waiters()`. The fast-path guest's
+        // generation-word notify reaches the drainer directly through the
+        // unified registry, exactly like a `memory.atomic.notify` would.
+        memory
+            .notify_region(shared_id, outbound_entry.offset, 1)
+            .expect("notify region");
+
+        let inbound_entry = header.entry(0).expect("inbound entry");
+        let inbound_backend = parent_backend
+            .sub_region(inbound_entry.offset, inbound_entry.length)
+            .expect("inbound sub");
+        let mut inbound_reader =
+            RingReader::open(inbound_backend, DEFAULT_RING_CAPACITY, false).expect("open reader");
+
+        let start = std::time::Instant::now();
+        let mut found = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            if let Ok(Some((_h, payload))) = inbound_reader.read_frame()
+                && payload == b"registry wake"
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            found,
+            "expected echo via the unified registry with no runtime kick"
         );
 
         drop(outbound_writer);

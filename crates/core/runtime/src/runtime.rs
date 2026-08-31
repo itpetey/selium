@@ -57,10 +57,32 @@ pub struct Runtime {
     pub(crate) region_purposes: Arc<Mutex<RegionPurposes>>,
     /// Wait registry: guest tasks parked on host-writable rings.
     pub(crate) wait_registry: Arc<Mutex<WaitRegistry>>,
-    /// Wait keys for active network outbound proxy threads.
-    /// Each entry is `(shared_id, wait_key)` used to kick the proxy
-    /// on guest→host transitions.
-    pub(crate) network_wait_keys: Arc<Mutex<Vec<(u64, usize)>>>,
+    /// Wait targets for active network outbound proxy threads.
+    /// Each entry is `(shared_id, generation_offset)` — the absolute byte
+    /// offset of the ring's generation word within the shared region — used
+    /// to kick the proxy on guest→host transitions for regions without the
+    /// fast path.
+    pub(crate) network_wait_keys: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Per-attachment shared-page fast-path eligibility: region id →
+    /// attaching process id → whether that process's guest module is
+    /// fast-path capable (engine registry support + module declares shared
+    /// memory and contains atomic notify opcodes; see `module_probe`).
+    ///
+    /// A region's fast path is active only when **every** attacher is
+    /// capable, so a stable-built guest sharing a region with an atomics
+    /// guest keeps its transition kicks. Entries are recorded at attach and
+    /// removed when the attacher releases the region or the region is
+    /// destroyed.
+    pub(crate) fast_path_attachments: Arc<Mutex<HashMap<u64, HashMap<ProcessId, bool>>>>,
+    /// Per-process fast-path capability, probed from the guest's module
+    /// bytes at spawn (see `module_probe`). Removed at process cleanup.
+    pub(crate) process_fastpath: Arc<Mutex<HashMap<ProcessId, bool>>>,
+    /// Guest→host transition kicks **delivered** per network region id.
+    /// Suppressed regions (fast path active) are not counted. Observability
+    /// for embedders and the fast-path end-to-end test, which asserts a
+    /// fast-path region's count stays at zero while the guest's atomic
+    /// notify carries its wakes.
+    pub(crate) kick_counts: Arc<Mutex<HashMap<u64, u64>>>,
     /// Maps a host queue's local id to the process that owns its receiver,
     /// so kernel-side sends (e.g. an accepted connection enqueued by the
     /// network poller) can wake the parked receiving guest.
@@ -109,6 +131,9 @@ impl Runtime {
             region_purposes: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
+            fast_path_attachments: Arc::new(Mutex::new(HashMap::new())),
+            process_fastpath: Arc::new(Mutex::new(HashMap::new())),
+            kick_counts: Arc::new(Mutex::new(HashMap::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
             well_known_uris: Arc::new(Mutex::new(HashMap::new())),
             handler_schemes: Arc::new(Mutex::new(HashMap::new())),

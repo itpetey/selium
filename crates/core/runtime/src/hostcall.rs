@@ -319,6 +319,9 @@ impl Runtime {
                     .memory()
                     .destroy_shared_region(region_id)
                     .map_err(kernel_error)?;
+                // Every attachment was force-detached above, so every
+                // fast-path eligibility vote for this region is stale.
+                self.clear_fast_path_attachments(region_id);
                 self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
 
                 // Tier-1 discovery revocation: publish Revoke operations for each URI.
@@ -415,6 +418,36 @@ impl Runtime {
                     drop(guests);
                     page_offset
                 };
+
+                // Shared-page fast-path detection, not configuration. The
+                // outbound drain for this region blocks on the engine's
+                // unified waiter registry, so a transition kick is only
+                // redundant when two things hold:
+                //   - the engine advertises its per-region wait registry
+                //     (`HostWaitSupport`); and
+                //   - the attaching guest's module is fast-path capable — it
+                //     declares shared memory AND contains atomic notify
+                //     opcodes (probed from the module bytes at spawn; see
+                //     `module_probe`), i.e. it was built with the atomics
+                //     feature and emits generation-word notifies on its
+                //     write path.
+                // The pinned wasmtiny always advertises at least
+                // `RegistryOnly`, so the guest module probe is the operative
+                // signal; the flag keeps the detection honest if an
+                // unsupported variant is ever added.
+                let engine_supports_registry = {
+                    use wasmtiny::runtime::HostWaitSupport;
+                    matches!(
+                        self.kernel.memory().host_wait_support(),
+                        HostWaitSupport::RegistryOnly | HostWaitSupport::RegistryAndOsWake
+                    )
+                };
+                let guest_fastpath_capable =
+                    engine_supports_registry && self.process_fastpath_capable(process_id);
+                // Every attacher votes; the region's fast path is active
+                // only when all of them are capable, so a stable-built guest
+                // sharing a region with an atomics guest keeps its kicks.
+                self.record_fast_path_attachment(region_id, process_id, guest_fastpath_capable);
 
                 let local_id = self
                     .kernel

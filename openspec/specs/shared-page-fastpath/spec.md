@@ -46,30 +46,52 @@ active and SHALL keep kicking for all others.
   region
 
 ### Requirement: Optional Per-OS Wait-Word Primitives (Stage 2)
-Where a platform wait-word primitive is wired and its conformance test
-has passed (Linux futex, macOS `__ulock_*`, Windows
-`WaitOnAddress`/`WakeByAddress`, FreeBSD `_umtx_op`), host waits SHALL
-use that primitive and the engine's notify SHALL emit the matching
-platform wake. Platforms without it SHALL use Stage 1 with identical
-semantics.
+Where a platform wait-word primitive is wired, its notify/wait race
+conformance test has passed, and the build enables the engine's platform
+wake emission (a build-time opt-in detected via the engine's support
+flag), host waits SHALL use that primitive and the engine's notify SHALL
+emit the matching platform wake. Platforms without all three SHALL use
+Stage 1 with identical semantics. macOS SHALL permanently use Stage 1:
+Darwin rejects the wait-word syscalls (`__ulock_wait`,
+`os_sync_wait_on_address`, the restricted futex) for ordinary binaries,
+so the host can never park on the word the engine would wake; its
+`__ulock_*` backend is retained only for the day that changes.
 
 #### Scenario: Platform without Stage 2
-- **WHEN** the host platform has no wired wait-word primitive or its
-  conformance test has not passed
+- **WHEN** the host platform has no wired wait-word primitive, its
+  conformance test has not passed, or the build did not enable the
+  engine's platform wake emission
 - **THEN** waits SHALL use Stage 1 (or the portable path) with no
   behavioural difference beyond latency
 
+#### Scenario: Conformance-gated enablement
+- **WHEN** the Stage 2 notify/wait race conformance test fails on a
+  platform
+- **THEN** Stage 2 SHALL remain disabled there and Stage 1 SHALL carry
+  every wait with identical semantics
+
 ### Requirement: Detection, Not Configuration
-Fast-path availability SHALL be detected per region at attach time
-(engine support flag, guest build feature, platform primitive for
-Stage 2). There SHALL be no user-facing configuration for this
-behaviour, and fallback SHALL be automatic.
+Fast-path availability SHALL be detected per region at attach time from
+the engine support flag and the attaching guest's own module bytes
+(shared-memory declaration plus atomic-notify opcodes — the ground truth
+the engine's validator uses). There SHALL be no user-facing
+configuration for this behaviour, and fallback SHALL be automatic. A
+region's fast path SHALL be active only when every attaching process's
+guest is capable, so a stable-built guest sharing a region with an
+atomics guest retains its transition kicks.
 
 #### Scenario: Attach detects capability
 - **WHEN** a region is attached and the engine reports no fast-path
-  support
+  support, or the attaching guest's module declares no shared memory or
+  contains no atomic notify opcodes
 - **THEN** the runtime SHALL record the region as portable-path and
   SHALL NOT attempt kick suppression for it
+
+#### Scenario: Mixed attachers
+- **WHEN** a region is attached by both a fast-path-capable guest and a
+  guest whose module is not capable
+- **THEN** the runtime SHALL keep transition kicks for that region until
+  the incapable attacher detaches
 
 ### Requirement: No Spin Regression
 Neither stage SHALL introduce sleep-based polling anywhere; platforms

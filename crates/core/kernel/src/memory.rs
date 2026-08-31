@@ -9,7 +9,7 @@ use selium_abi::SharedResourceId;
 use wasmtiny::{
     RegionProt,
     memory::Memory,
-    runtime::{SharedRegionId, Store},
+    runtime::{HostWaitSupport, RegionWaiter, SharedRegionId, Store},
 };
 
 use crate::{Error, Result, error::map_wasm_error, kernel::hashed_id};
@@ -261,6 +261,123 @@ impl MemoryRegistry {
             .get(&shared_id)
             .map(|record| record.region_id)
             .ok_or_else(|| Error::NotFound(format!("shared region {shared_id}")))
+    }
+
+    /// Registers a host waiter on `(shared_id, offset)` in the engine's
+    /// per-region waiter registry.
+    ///
+    /// This is the same registry guest `memory.atomic.wait32`/`notify` use on
+    /// shared ranges, so a guest notify on the address mapping `offset` wakes
+    /// the returned waiter directly — no runtime transition kick involved.
+    /// The caller owns the returned handle; dropping it deregisters the entry.
+    pub fn register_region_waiter(
+        &self,
+        shared_id: SharedResourceId,
+        offset: u64,
+    ) -> Result<Arc<RegionWaiter>> {
+        let region_id = self.wasmtiny_region_id(shared_id)?;
+        let registry = self.inner.store.lock().shared_memory_registry();
+        registry
+            .lock()
+            .register_region_waiter(region_id, offset as usize)
+            .map_err(map_wasm_error)
+    }
+
+    /// Notifies up to `count` waiters registered on `(shared_id, offset)` in
+    /// the engine's per-region waiter registry, and — when Stage 2 is active
+    /// — additionally emits the platform wake on the region's host mapping
+    /// address so OS-wait-word parkers wake too.
+    ///
+    /// Wakes both host waiters created via [`Self::register_region_waiter`]
+    /// and guest threads parked in `memory.atomic.wait32` on the address
+    /// mapping `offset`. This is the unified wait registry: guest notifies
+    /// and host kicks both flow through it for engine-backed regions, and the
+    /// stage-2 side effect keeps the platform primitive consistent with the
+    /// registry.
+    pub fn notify_region(
+        &self,
+        shared_id: SharedResourceId,
+        offset: u64,
+        count: u32,
+    ) -> Result<u32> {
+        let region_id = self.wasmtiny_region_id(shared_id)?;
+        let registry = self.inner.store.lock().shared_memory_registry();
+        let guard = registry.lock();
+        let notified = guard
+            .notify_region(region_id, offset as usize, count)
+            .map_err(map_wasm_error)?;
+
+        // Stage 2 side effect: parkers sleeping in the OS wait-word primitive
+        // (fast-path proxies) are not reachable through the registry, so wake
+        // them on the region's host mapping address. Emitted only when the
+        // engine's platform-wake support is compiled in and this host has a
+        // wired wait-word; otherwise a no-op.
+        if crate::os_wait_word::available()
+            && guard.host_wait_support() == HostWaitSupport::RegistryAndOsWake
+        {
+            let region = guard.get_region(region_id).map_err(map_wasm_error)?;
+            // The engine's `notify_region` above checks only `offset < len`;
+            // the wait-word primitive touches the full 4-byte word, so check
+            // `offset + 4 <= len` here before forming the pointer.
+            if offset.checked_add(4).map(|end| end as usize) > Some(region.len()) {
+                return Err(Error::NotFound(format!(
+                    "shared region {shared_id} wait-word offset {offset} out of bounds"
+                )));
+            }
+            // SAFETY: `offset + 4 <= len` was just verified, and `region` is
+            // the engine's live host mapping of that length, so
+            // `region.ptr() + offset` is a valid 4-byte slot for the duration
+            // of the wake call. 4-byte alignment holds because wait-word
+            // offsets are always 4-aligned (ring generation words).
+            let word = unsafe { region.ptr().add(offset as usize) };
+            // SAFETY: as above; `word` is a valid, aligned 4-byte slot in
+            // live shared memory for the duration of the call.
+            unsafe {
+                crate::os_wait_word::wake(word, count);
+            }
+        }
+        drop(guard);
+        Ok(notified)
+    }
+
+    /// Reports the engine's host-wait support level for shared regions.
+    ///
+    /// [`HostWaitSupport::RegistryOnly`] means Stage 1 (unified registry) is
+    /// available; [`HostWaitSupport::RegistryAndOsWake`] additionally means
+    /// the engine emits the platform wake primitive on guest notifies
+    /// (Stage 2). This is a process-wide build-time capability — there is no
+    /// runtime toggle — so it is detected rather than configured.
+    pub fn host_wait_support(&self) -> HostWaitSupport {
+        self.inner
+            .store
+            .lock()
+            .shared_memory_registry()
+            .lock()
+            .host_wait_support()
+    }
+
+    /// True when Stage 2 wait-words are active for this kernel: the engine
+    /// reports [`HostWaitSupport::RegistryAndOsWake`] (its platform wake
+    /// emission is compiled in — the conformance-gated per-platform opt-in)
+    /// AND this host has a wired wait-word primitive. Otherwise Stage 1 is
+    /// used with identical semantics.
+    pub fn stage2_active(&self) -> bool {
+        crate::os_wait_word::available()
+            && self.host_wait_support() == HostWaitSupport::RegistryAndOsWake
+    }
+
+    /// Returns the host mapping address of a shared region (Stage 2 wait-word
+    /// target). The returned pointer is the engine's own mapping of the
+    /// region; a byte at `ptr + offset` is the same physical word a guest
+    /// notify's platform wake targets.
+    pub fn region_host_ptr(&self, shared_id: SharedResourceId) -> Result<*mut u8> {
+        let region_id = self.wasmtiny_region_id(shared_id)?;
+        let registry = self.inner.store.lock().shared_memory_registry();
+        let region = registry
+            .lock()
+            .get_region(region_id)
+            .map_err(map_wasm_error)?;
+        Ok(region.ptr())
     }
 
     pub(crate) fn shared_mapping(&self, local_id: u64) -> Result<SharedMappingState> {

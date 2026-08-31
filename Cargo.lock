@@ -755,6 +755,7 @@ dependencies = [
 name = "selium-kernel"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "libc",
  "mio",
  "parking_lot",
  "selium-abi",

@@ -162,10 +162,14 @@ impl ChannelRegion {
     /// Increments the generation counter in shared memory and notifies waiters.
     pub fn bump_generation(&self) -> Result<u64> {
         let new_gen = layout::bump_generation(self.backend())?;
-        drop(
-            self.mapping
-                .atomic_notify(GENERATION_COUNTER_OFFSET, u32::MAX),
-        );
+        // Wake count is 1: exactly one host drainer parks on the ring's
+        // generation word (guest tasks park via `register_generation_wait`
+        // below, which never uses `memory.atomic.wait`). The count was
+        // u32::MAX when the notify was a stable no-op; a genuine
+        // `memory.atomic.notify` would make the engine iterate the count
+        // under the waiter registry's read lock, so keep it minimal and
+        // exact.
+        drop(self.mapping.atomic_notify(GENERATION_COUNTER_OFFSET, 1));
         selium_memory::wake_generation_waiters(self.region_id, new_gen);
         Ok(new_gen)
     }

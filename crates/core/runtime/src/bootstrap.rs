@@ -225,6 +225,12 @@ impl Runtime {
                 return Err(error);
             }
         };
+        // Shared-page fast-path detection: probe the guest's module bytes
+        // once at spawn (shared memory declaration + atomic notify
+        // opcodes). Region attach consumes the result; no user-facing
+        // configuration exists (see the shared-page-fastpath spec).
+        let fastpath = crate::module_probe::probe(&descriptor.module_bytes);
+        self.record_process_fastpath(process.local_id, fastpath.fast_path_capable());
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
             Ok(loaded_guest) => {
                 if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {

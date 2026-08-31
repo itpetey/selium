@@ -14,6 +14,7 @@ mod error;
 mod host_functions;
 mod hostcall;
 mod mailbox;
+mod module_probe;
 mod network;
 mod process;
 mod region_provider;

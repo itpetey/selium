@@ -28,6 +28,14 @@ tokio = {
 tracing.workspace = true
 wasmtiny.workspace = true
 
+[features]
+# Forwards the Stage 2 (per-OS wait-words) opt-in to the kernel, which in
+# turn enables the engine's platform wake emission. Embedders building the
+# full runtime stack enable it here. Off by default; see
+# `selium-kernel`'s feature docs and the shared-page-fastpath spec for the
+# detection/fallback rules.
+stage2-wait-words = ["selium-kernel/stage2-wait-words"]
+
 [dev-dependencies]
 selium-encoding.workspace = true
 selium-proto-dns.workspace = true
