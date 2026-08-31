@@ -1,24 +1,24 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/core/abi",
-  "crates/core/encoding",
-  "crates/core/guest",
-  "crates/core/guest/macros",
-  "crates/core/kernel",
-  "crates/core/memory",
-  "crates/core/proto-dns",
-  "crates/core/proto-http",
-  "crates/core/runtime",
-  "crates/core/shm",
-  "crates/core/wire",
-  "crates/guests/connector-dns",
-  "crates/guests/connector-http",
-  "crates/guests/discovery",
-  "crates/guests/discovery-probe",
-  "crates/guests/dns-demo",
-  "crates/guests/net-demo",
-  "crates/guests/spine-demo",
+  "crates/abi",
+  "crates/encoding",
+  "crates/guest",
+  "crates/guest/macros",
+  "crates/kernel",
+  "crates/memory",
+  "crates/proto-dns",
+  "crates/proto-http",
+  "crates/runtime",
+  "crates/shm",
+  "crates/wire",
+  "guests/connector-dns",
+  "guests/connector-http",
+  "guests/discovery",
+  "guests/discovery-probe",
+  "guests/dns-demo",
+  "guests/net-demo",
+  "guests/spine-demo",
 ]
 # Frozen during the spine rebuild (kept in-tree for later increments):
 #   "crates/core/quic"
@@ -53,16 +53,16 @@ quote = { version = "1.0", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2", default-features = false }
-selium-abi = { path = "crates/core/abi", default-features = false }
-selium-encoding = { path = "crates/core/encoding", default-features = false }
-selium-guest = { path = "crates/core/guest", default-features = false }
-selium-guest-macros = { path = "crates/core/guest/macros", default-features = false }
-selium-kernel = { path = "crates/core/kernel", default-features = false }
-selium-memory = { path = "crates/core/memory", default-features = false }
-selium-proto-dns = { path = "crates/core/proto-dns", default-features = false }
-selium-proto-http = { path = "crates/core/proto-http", default-features = false }
-selium-shm = { path = "crates/core/shm", default-features = false }
-selium-wire = { path = "crates/core/wire", default-features = false }
+selium-abi = { path = "crates/abi", default-features = false }
+selium-encoding = { path = "crates/encoding", default-features = false }
+selium-guest = { path = "crates/guest", default-features = false }
+selium-guest-macros = { path = "crates/guest/macros", default-features = false }
+selium-kernel = { path = "crates/kernel", default-features = false }
+selium-memory = { path = "crates/memory", default-features = false }
+selium-proto-dns = { path = "crates/proto-dns", default-features = false }
+selium-proto-http = { path = "crates/proto-http", default-features = false }
+selium-shm = { path = "crates/shm", default-features = false }
+selium-wire = { path = "crates/wire", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "3.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
