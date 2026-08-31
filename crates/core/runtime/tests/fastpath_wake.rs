@@ -60,22 +60,6 @@ fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
         .collect()
 }
 
-/// Polls the guest log channel until a message containing `needle` appears.
-#[expect(clippy::panic, reason = "test helper")]
-fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Duration) {
-    let mut seen: Vec<String> = Vec::new();
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        let fresh = drain_logs(runtime, process_id);
-        seen.extend(fresh);
-        if seen.iter().any(|message| message.contains(needle)) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
-}
-
 /// Task 5.1: a fast-path guest's atomic notify wakes the host drainer with
 /// **no runtime kick** for the entire connection lifecycle.
 #[test]
@@ -255,13 +239,6 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
-/// Returns the path to the compiled atomics net-demo WASM module.
-fn net_demo_wasm_path() -> PathBuf {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
-    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
-}
-
 /// Loads the atomics net-demo WASM module and verifies it was built with the
 /// `nightly-wasm-atomics` feature (shared memory declaration + atomic notify
 /// opcodes). A stale or stable-built artifact produces a precise, actionable
@@ -273,19 +250,18 @@ fn net_demo_wasm_path() -> PathBuf {
 )]
 fn net_demo_wasm() -> Vec<u8> {
     let path = net_demo_wasm_path();
-    let bytes =
-        std::fs::read(&path).unwrap_or_else(|_error| {
-            panic!(
-                "atomics net demo guest not found at {}.\n\
+    let bytes = std::fs::read(&path).unwrap_or_else(|_error| {
+        panic!(
+            "atomics net demo guest not found at {}.\n\
                  Build it first (see this test's module docs):\n  \
                  RUSTFLAGS=\"-C target-feature=+atomics,+bulk-memory,+mutable-globals \
                  -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824\" \\\n  \
                  cargo +nightly build -Zbuild-std=std,panic_abort \
                  --target wasm32-unknown-unknown -p selium-net-demo \
                  --features selium-guest/nightly-wasm-atomics",
-                path.display()
-            )
-        });
+            path.display()
+        )
+    });
 
     let (shared_memory, atomic_notify) = probe_atomics(&bytes);
     assert!(
@@ -304,6 +280,13 @@ fn net_demo_wasm() -> Vec<u8> {
         path.display()
     );
     bytes
+}
+
+/// Returns the path to the compiled atomics net-demo WASM module.
+fn net_demo_wasm_path() -> PathBuf {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
 }
 
 /// Minimal WASM scan for the fast-path signals: any memory entry declaring a
@@ -333,15 +316,6 @@ fn probe_atomics(module: &[u8]) -> (bool, bool) {
     (shared_memory, atomic_notify)
 }
 
-fn read_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
-    let id = *bytes.get(*pos)?;
-    *pos += 1;
-    let (size, next) = read_leb_u32(bytes, *pos)?;
-    let payload = bytes.get(next..next + size as usize)?;
-    *pos = next + size as usize;
-    Some((id, payload))
-}
-
 fn read_leb_u32(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
     let mut result: u32 = 0;
     let mut shift = 0;
@@ -357,6 +331,15 @@ fn read_leb_u32(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
             return None;
         }
     }
+}
+
+fn read_section<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
+    let id = *bytes.get(*pos)?;
+    *pos += 1;
+    let (size, next) = read_leb_u32(bytes, *pos)?;
+    let payload = bytes.get(next..next + size as usize)?;
+    *pos = next + size as usize;
+    Some((id, payload))
 }
 
 fn scan_shared_memory(payload: &[u8]) -> bool {
@@ -385,4 +368,20 @@ fn scan_shared_memory(payload: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Polls the guest log channel until a message containing `needle` appears.
+#[expect(clippy::panic, reason = "test helper")]
+fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Duration) {
+    let mut seen: Vec<String> = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let fresh = drain_logs(runtime, process_id);
+        seen.extend(fresh);
+        if seen.iter().any(|message| message.contains(needle)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
 }

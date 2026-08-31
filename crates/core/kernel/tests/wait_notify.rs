@@ -10,115 +10,9 @@ use std::time::Duration;
 
 use selium_kernel::Kernel;
 use wasmtiny::runtime::{HostWaitSupport, WakeOutcome};
-
 // The Stage 2 conformance test uses the backend wait/notify path.
 #[cfg(feature = "stage2-wait-words")]
 use selium_memory::MappingBackend;
-
-const ITERATIONS: usize = 5_000;
-
-/// Stage 1 conformance: a host waiter registered on a shared region offset is
-/// woken by a notify on that offset, reliably and across many iterations. The
-/// register → notify → wait ordering is controlled so no wake can be lost;
-/// a lost wake would surface as a `TimedOut` and fail the test.
-#[test]
-fn notify_wake_registry_conformance() {
-    let kernel = Kernel::default();
-    let memory = kernel.memory();
-    let (shared_id, _len) = memory.allocate_shared_region(64).expect("allocate region");
-
-    for _ in 0..ITERATIONS {
-        // Register the waiter first; the notify below is strictly ordered
-        // after registration, so the waiter must observe it.
-        let waiter = memory
-            .register_region_waiter(shared_id, 0)
-            .expect("register waiter");
-
-        let notify_memory = memory.clone();
-        let notifier = std::thread::spawn(move || {
-            notify_memory
-                .notify_region(shared_id, 0, 1)
-                .expect("notify region");
-        });
-        notifier.join().expect("notify thread");
-
-        match waiter
-            .wait(Duration::from_millis(100))
-            .expect("waiter wait")
-        {
-            WakeOutcome::Woken => {}
-            WakeOutcome::TimedOut => panic!("waiter not woken by notify"),
-        }
-    }
-}
-
-/// Stage 2 opt-in gate: the host may wait on OS wait-words only when the
-/// engine reports `RegistryAndOsWake` (its platform wake emission is compiled
-/// in — the conformance-gated opt-in). Everywhere else — including platforms
-/// that permanently fall back, like macOS — Stage 1 is used with identical
-/// semantics.
-#[test]
-fn stage2_requires_engine_os_wake_support() {
-    let kernel = Kernel::default();
-    let memory = kernel.memory();
-
-    if memory.host_wait_support() != HostWaitSupport::RegistryAndOsWake {
-        assert!(
-            !memory.stage2_active(),
-            "Stage 2 must be inactive when the engine does not emit platform wakes"
-        );
-    }
-}
-
-/// Stage 2 conformance: the notify/wait race on a real shared region, many
-/// iterations, with jittered park/notify interleavings. The waiter parks in
-/// the OS wait-word primitive (`atomic_wait32` with Stage 2 active) and the
-/// waker bumps the word then notifies — exactly the guest-write pattern. A
-/// lost wake surfaces as a `wait32 timed out` error and fails the test.
-///
-/// This is the gate for enabling `stage2-wait-words` on a platform (task
-/// 4.2/4.3 of the shared-page-fastpath change): it is compiled only when the
-/// feature is on, and skips (with a message) where Stage 2 is inactive, so
-/// CI runs it as real evidence on Linux. Any failure means the platform
-/// must stay on Stage 1 permanently.
-#[test]
-#[cfg(feature = "stage2-wait-words")]
-fn stage2_notify_wait_race_conformance() {
-    let kernel = Kernel::default();
-    let memory = kernel.memory();
-    if !memory.stage2_active() {
-        eprintln!("stage2: OS wait-words not enabled on this platform; skipping");
-        return;
-    }
-
-    let (shared_id, _len) = memory.allocate_shared_region(64).expect("allocate region");
-    let backend = memory.attach_backend(shared_id).expect("attach backend");
-
-    for i in 0..ITERATIONS {
-        // The waiter parks on the *current* generation value; the waker
-        // bumps it to i + 1 and notifies. Jitter the waker's start so the
-        // notify sometimes lands before the park (value-race path) and
-        // sometimes after (wake path) — both must resolve as a wake.
-        let expected = 0_u32;
-        let new_value = (i as u32 % 100) + 1;
-        let park_delay_us = (i % 64) as u64 * 3;
-
-        let waiter_backend = backend.clone();
-        let waiter = std::thread::spawn(move || {
-            waiter_backend
-                .atomic_wait32(0, expected, 1_000)
-                .expect("stage2 wait must not time out (lost wake?)")
-        });
-
-        std::thread::sleep(Duration::from_micros(park_delay_us));
-        backend
-            .write(0, &new_value.to_le_bytes())
-            .expect("write word");
-        backend.atomic_notify(0, 1).expect("notify");
-
-        waiter.join().expect("waiter thread");
-    }
-}
 
 /// Non-gating latency reports (task 5.4): the three-way comparison of
 /// wake latencies — kick path (portable baseline), Stage 1 (unified
@@ -328,5 +222,110 @@ mod latency_reports {
             );
         }
         report("stage2 OS-wait-word wake", total);
+    }
+}
+
+const ITERATIONS: usize = 5_000;
+
+/// Stage 1 conformance: a host waiter registered on a shared region offset is
+/// woken by a notify on that offset, reliably and across many iterations. The
+/// register → notify → wait ordering is controlled so no wake can be lost;
+/// a lost wake would surface as a `TimedOut` and fail the test.
+#[test]
+fn notify_wake_registry_conformance() {
+    let kernel = Kernel::default();
+    let memory = kernel.memory();
+    let (shared_id, _len) = memory.allocate_shared_region(64).expect("allocate region");
+
+    for _ in 0..ITERATIONS {
+        // Register the waiter first; the notify below is strictly ordered
+        // after registration, so the waiter must observe it.
+        let waiter = memory
+            .register_region_waiter(shared_id, 0)
+            .expect("register waiter");
+
+        let notify_memory = memory.clone();
+        let notifier = std::thread::spawn(move || {
+            notify_memory
+                .notify_region(shared_id, 0, 1)
+                .expect("notify region");
+        });
+        notifier.join().expect("notify thread");
+
+        match waiter
+            .wait(Duration::from_millis(100))
+            .expect("waiter wait")
+        {
+            WakeOutcome::Woken => {}
+            WakeOutcome::TimedOut => panic!("waiter not woken by notify"),
+        }
+    }
+}
+
+/// Stage 2 conformance: the notify/wait race on a real shared region, many
+/// iterations, with jittered park/notify interleavings. The waiter parks in
+/// the OS wait-word primitive (`atomic_wait32` with Stage 2 active) and the
+/// waker bumps the word then notifies — exactly the guest-write pattern. A
+/// lost wake surfaces as a `wait32 timed out` error and fails the test.
+///
+/// This is the gate for enabling `stage2-wait-words` on a platform (task
+/// 4.2/4.3 of the shared-page-fastpath change): it is compiled only when the
+/// feature is on, and skips (with a message) where Stage 2 is inactive, so
+/// CI runs it as real evidence on Linux. Any failure means the platform
+/// must stay on Stage 1 permanently.
+#[test]
+#[cfg(feature = "stage2-wait-words")]
+fn stage2_notify_wait_race_conformance() {
+    let kernel = Kernel::default();
+    let memory = kernel.memory();
+    if !memory.stage2_active() {
+        eprintln!("stage2: OS wait-words not enabled on this platform; skipping");
+        return;
+    }
+
+    let (shared_id, _len) = memory.allocate_shared_region(64).expect("allocate region");
+    let backend = memory.attach_backend(shared_id).expect("attach backend");
+
+    for i in 0..ITERATIONS {
+        // The waiter parks on the *current* generation value; the waker
+        // bumps it to i + 1 and notifies. Jitter the waker's start so the
+        // notify sometimes lands before the park (value-race path) and
+        // sometimes after (wake path) — both must resolve as a wake.
+        let expected = 0_u32;
+        let new_value = (i as u32 % 100) + 1;
+        let park_delay_us = (i % 64) as u64 * 3;
+
+        let waiter_backend = backend.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_backend
+                .atomic_wait32(0, expected, 1_000)
+                .expect("stage2 wait must not time out (lost wake?)")
+        });
+
+        std::thread::sleep(Duration::from_micros(park_delay_us));
+        backend
+            .write(0, &new_value.to_le_bytes())
+            .expect("write word");
+        backend.atomic_notify(0, 1).expect("notify");
+
+        waiter.join().expect("waiter thread");
+    }
+}
+
+/// Stage 2 opt-in gate: the host may wait on OS wait-words only when the
+/// engine reports `RegistryAndOsWake` (its platform wake emission is compiled
+/// in — the conformance-gated opt-in). Everywhere else — including platforms
+/// that permanently fall back, like macOS — Stage 1 is used with identical
+/// semantics.
+#[test]
+fn stage2_requires_engine_os_wake_support() {
+    let kernel = Kernel::default();
+    let memory = kernel.memory();
+
+    if memory.host_wait_support() != HostWaitSupport::RegistryAndOsWake {
+        assert!(
+            !memory.stage2_active(),
+            "Stage 2 must be inactive when the engine does not emit platform wakes"
+        );
     }
 }

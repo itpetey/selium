@@ -113,25 +113,6 @@ unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
-unsafe fn wake_impl(ptr: *mut u8, count: u32) -> u32 {
-    // SAFETY: contract of [`wake`]. Keyed by inode+offset for shared
-    // mappings, so it reaches waiters on other mappings of the same shm pages
-    // (matching the engine's emission).
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            ptr.cast::<libc::c_void>(),
-            libc::FUTEX_WAKE,
-            count as libc::c_int,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<libc::c_void>(),
-            0,
-        )
-    };
-    u32::try_from(r).unwrap_or(0)
-}
-
 #[cfg(target_os = "windows")]
 unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     unsafe extern "system" {
@@ -167,20 +148,6 @@ unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     // TRUE: woken by WakeByAddress*. FALSE with ERROR_TIMEOUT: timed out.
     // FALSE with any other error: spurious — re-check the word.
     ok != 0 || std::io::Error::last_os_error().raw_os_error() != Some(ERROR_TIMEOUT)
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn wake_impl(ptr: *mut u8, _count: u32) -> u32 {
-    unsafe extern "system" {
-        #[link_name = "WakeByAddressAll"]
-        fn wake_by_address_all_(address: *mut libc::c_void);
-    }
-    // SAFETY: contract of [`wake`].
-    unsafe {
-        wake_by_address_all_(ptr.cast::<libc::c_void>());
-    }
-    // `WakeByAddressAll` returns nothing; report one wake attempt delivered.
-    1
 }
 
 #[cfg(target_os = "freebsd")]
@@ -245,34 +212,6 @@ unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     }
 }
 
-#[cfg(target_os = "freebsd")]
-unsafe fn wake_impl(ptr: *mut u8, count: u32) -> u32 {
-    unsafe extern "C" {
-        fn _umtx_op(
-            obj: *mut libc::c_void,
-            op: libc::c_int,
-            val: libc::c_ulong,
-            uaddr: *mut libc::c_void,
-            uaddr2: *mut libc::c_void,
-        ) -> libc::c_int;
-    }
-
-    // UMTX_OP_WAKE_PRIVATE wakes private-address waiters.
-    const UMTX_OP_WAKE_PRIVATE: libc::c_int = 16;
-
-    // SAFETY: contract of [`wake`].
-    let r = unsafe {
-        _umtx_op(
-            ptr.cast::<libc::c_void>(),
-            UMTX_OP_WAKE_PRIVATE,
-            count as libc::c_ulong,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    u32::try_from(r).unwrap_or(0)
-}
-
 #[cfg(target_os = "macos")]
 unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     // Retained against the day Darwin allows wait-word primitives.
@@ -315,6 +254,80 @@ unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
     }
 }
 
+// Platforms with no wired primitive: `available()` is never true there, so
+// these bodies are unreachable by construction (retained for completeness so
+// the crate still type-checks on exotic targets).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "freebsd",
+    target_os = "macos"
+)))]
+unsafe fn wait_impl(_ptr: *mut u8, _expected: u32, _timeout_ms: u64) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn wake_impl(ptr: *mut u8, count: u32) -> u32 {
+    // SAFETY: contract of [`wake`]. Keyed by inode+offset for shared
+    // mappings, so it reaches waiters on other mappings of the same shm pages
+    // (matching the engine's emission).
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            ptr.cast::<libc::c_void>(),
+            libc::FUTEX_WAKE,
+            count as libc::c_int,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<libc::c_void>(),
+            0,
+        )
+    };
+    u32::try_from(r).unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn wake_impl(ptr: *mut u8, _count: u32) -> u32 {
+    unsafe extern "system" {
+        #[link_name = "WakeByAddressAll"]
+        fn wake_by_address_all_(address: *mut libc::c_void);
+    }
+    // SAFETY: contract of [`wake`].
+    unsafe {
+        wake_by_address_all_(ptr.cast::<libc::c_void>());
+    }
+    // `WakeByAddressAll` returns nothing; report one wake attempt delivered.
+    1
+}
+
+#[cfg(target_os = "freebsd")]
+unsafe fn wake_impl(ptr: *mut u8, count: u32) -> u32 {
+    unsafe extern "C" {
+        fn _umtx_op(
+            obj: *mut libc::c_void,
+            op: libc::c_int,
+            val: libc::c_ulong,
+            uaddr: *mut libc::c_void,
+            uaddr2: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+
+    // UMTX_OP_WAKE_PRIVATE wakes private-address waiters.
+    const UMTX_OP_WAKE_PRIVATE: libc::c_int = 16;
+
+    // SAFETY: contract of [`wake`].
+    let r = unsafe {
+        _umtx_op(
+            ptr.cast::<libc::c_void>(),
+            UMTX_OP_WAKE_PRIVATE,
+            count as libc::c_ulong,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    u32::try_from(r).unwrap_or(0)
+}
+
 #[cfg(target_os = "macos")]
 unsafe fn wake_impl(ptr: *mut u8, _count: u32) -> u32 {
     // Retained for the day Darwin allows wait-words on shared memory;
@@ -337,19 +350,6 @@ unsafe fn wake_impl(ptr: *mut u8, _count: u32) -> u32 {
         );
     }
     1
-}
-
-// Platforms with no wired primitive: `available()` is never true there, so
-// these bodies are unreachable by construction (retained for completeness so
-// the crate still type-checks on exotic targets).
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "windows",
-    target_os = "freebsd",
-    target_os = "macos"
-)))]
-unsafe fn wait_impl(_ptr: *mut u8, _expected: u32, _timeout_ms: u64) -> bool {
-    false
 }
 
 #[cfg(not(any(

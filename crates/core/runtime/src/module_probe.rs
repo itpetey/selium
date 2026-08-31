@@ -28,6 +28,9 @@
 //! Detection, not configuration: there is no user-facing knob; see the
 //! `shared-page-fastpath` capability spec.
 
+const CODE_SECTION: u8 = 10;
+const MEMORY_SECTION: u8 = 5;
+
 /// Probe result: does this module participate in the shared-page fast path?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleProbe {
@@ -38,6 +41,13 @@ pub struct ModuleProbe {
     pub atomic_notify: bool,
 }
 
+/// Iterates the sections of a wasm module. Returns `None` when the magic
+/// header or version is missing.
+struct SectionCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
 impl ModuleProbe {
     /// True when a guest built from this module is fast-path capable: it
     /// declares shared memory (validator requirement for atomics) and its
@@ -45,40 +55,6 @@ impl ModuleProbe {
     pub fn fast_path_capable(&self) -> bool {
         self.shared_memory && self.atomic_notify
     }
-}
-
-/// Probes a wasm module's memory section and code section for the fast-path
-/// signals. Malformed input yields an all-false result — the safe fallback
-/// (portable kick path) — rather than an error: a module that cannot be
-/// parsed here would not have loaded far enough to attach a region anyway.
-pub fn probe(module: &[u8]) -> ModuleProbe {
-    let mut probe = ModuleProbe {
-        shared_memory: false,
-        atomic_notify: false,
-    };
-
-    let Some(mut cursor) = SectionCursor::new(module) else {
-        return probe;
-    };
-
-    while let Some((id, payload)) = cursor.next_section() {
-        match id {
-            MEMORY_SECTION => probe.shared_memory |= scan_memory_section(payload),
-            CODE_SECTION => probe.atomic_notify |= scan_code_section(payload),
-            _ => {}
-        }
-    }
-    probe
-}
-
-const MEMORY_SECTION: u8 = 5;
-const CODE_SECTION: u8 = 10;
-
-/// Iterates the sections of a wasm module. Returns `None` when the magic
-/// header or version is missing.
-struct SectionCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
 }
 
 impl<'a> SectionCursor<'a> {
@@ -124,6 +100,37 @@ impl<'a> SectionCursor<'a> {
     }
 }
 
+/// Probes a wasm module's memory section and code section for the fast-path
+/// signals. Malformed input yields an all-false result — the safe fallback
+/// (portable kick path) — rather than an error: a module that cannot be
+/// parsed here would not have loaded far enough to attach a region anyway.
+pub fn probe(module: &[u8]) -> ModuleProbe {
+    let mut probe = ModuleProbe {
+        shared_memory: false,
+        atomic_notify: false,
+    };
+
+    let Some(mut cursor) = SectionCursor::new(module) else {
+        return probe;
+    };
+
+    while let Some((id, payload)) = cursor.next_section() {
+        match id {
+            MEMORY_SECTION => probe.shared_memory |= scan_memory_section(payload),
+            CODE_SECTION => probe.atomic_notify |= scan_code_section(payload),
+            _ => {}
+        }
+    }
+    probe
+}
+
+/// True when the code section payload contains the `memory.atomic.notify`
+/// opcode sequence (`0xFE 0x00`). See the module docs for the false-positive
+/// analysis; there are no false negatives.
+fn scan_code_section(payload: &[u8]) -> bool {
+    payload.windows(2).any(|pair| pair == [0xFE, 0x00])
+}
+
 /// True when any memory entry in a memory section payload sets the shared
 /// flag (bit 1 of the limits flags byte). Stops at the first shared entry;
 /// returns false on malformed input.
@@ -153,13 +160,6 @@ fn scan_memory_section(payload: &[u8]) -> bool {
         }
     }
     false
-}
-
-/// True when the code section payload contains the `memory.atomic.notify`
-/// opcode sequence (`0xFE 0x00`). See the module docs for the false-positive
-/// analysis; there are no false negatives.
-fn scan_code_section(payload: &[u8]) -> bool {
-    payload.windows(2).any(|pair| pair == [0xFE, 0x00])
 }
 
 #[cfg(test)]
