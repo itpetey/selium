@@ -22,6 +22,7 @@ members = [
   "guests/quic-demo",
   "guests/spine-demo",
 ]
+exclude = ["vendor"]
 # Frozen during the spine rebuild (kept in-tree for later increments):
 #   "crates/guests/bridge"
 #   "crates/guests/cluster"
@@ -120,26 +121,8 @@ unwrap_in_result = "warn"
 unwrap_used = "warn"
 
 [patch.crates-io]
-# - `getrandom` (modified fork, upstreamable fix): quinn-proto and ring's
-#   `wasm32_unknown_unknown_js` feature enable getrandom's `wasm_js` feature on
-#   wasm32-unknown-unknown, and 0.4.3's `error.rs` references
-#   `Error::WEB_CRYPTO` — defined only in the `wasm_js` backend — whenever that
-#   feature is on, even when the `custom` backend cfg is selected (see
-#   `.cargo/config.toml`). The fork moves the const into `error.rs`. Drop this
-#   entry once getrandom > 0.4.3 ships the fix.
-# - `ring` (pristine upstream master, zero local changes): LOAD-BEARING. With
-#   this entry missing, builds still succeed but resolve registry ring
-#   0.17.14, whose getrandom 0.2 dependency compiles the JS-backed RNG
-#   (browser/Node detection, `__wbindgen_placeholder__` imports) into the
-#   wasm guests — unloadable in wasmtiny. `scripts/check-wasm-patches.sh`
-#   guards against this. Drop this entry once ring releases a 0.17.x built on
-#   getrandom 0.4.
-# - `web-time` (modified fork): gates the JS `Date`/`Performance` bindings
-#   behind a non-default `js` feature (with `wasm-bindgen` optional), so wasm
-#   guests compile zero `__wbindgen` imports; they register the host time
-#   hostcalls via `web_time::set_custom_time_source` instead (see
-#   `.cargo/config.toml`). Upstreamable.
-getrandom = { path = "../../getrandom" }
-ring = { path = "../../ring" }
+getrandom = { git = "https://github.com/seliumlabs/getrandom", rev = "1cd6d1f288be4a8dfe2f72aac02add4b8c3e0ac5" }
+# Drop this entry once ring releases a 0.17.x built on getrandom 0.4.
+ring = { git = "https://github.com/briansmith/ring", rev = "840167e18e4fa837eb48de46500454a616a15a6e" }
 wasmtiny = { path = "../../wasmtiny" }
-web-time = { path = "../../web-time" }
+web-time = { path = "vendor/web-time" }

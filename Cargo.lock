@@ -293,6 +293,7 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.4.3"
+source = "git+https://github.com/seliumlabs/getrandom?rev=1cd6d1f288be4a8dfe2f72aac02add4b8c3e0ac5#1cd6d1f288be4a8dfe2f72aac02add4b8c3e0ac5"
 dependencies = [
  "cfg-if",
  "js-sys",
@@ -630,6 +631,7 @@ dependencies = [
 [[package]]
 name = "ring"
 version = "0.17.16000"
+source = "git+https://github.com/briansmith/ring?rev=840167e18e4fa837eb48de46500454a616a15a6e#840167e18e4fa837eb48de46500454a616a15a6e"
 dependencies = [
  "cc",
  "cfg-if",

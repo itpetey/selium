@@ -59,6 +59,7 @@ cargo test -p selium-guest
   3. `cargo test --workspace --all-targets`
   4. `cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery`
   5. `cargo test -p selium-runtime --test spine -- --ignored`
+  6. `scripts/check-wasm-patches.sh` (guards the ring/getrandom wasm patches against silent fallback to the JS-backed RNG; see `[patch.crates-io]` in `Cargo.toml`)
 - **Workspace dependencies** - Use `[workspace.dependencies]` in root `Cargo.toml`. Do not pin different versions.
 - **wasmtiny sibling checkout** - The workspace patches `wasmtiny` from `../../wasmtiny`. Keep the two repos side-by-side, and keep changes to the engine minimal and spec-driven.
 - **International English only** - Do not use American English anywhere in the project unless required for calling third party APIs.
