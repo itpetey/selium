@@ -181,7 +181,7 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
 )]
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
     let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
     let path = PathBuf::from(target_dir).join(file_name);
     std::fs::read(&path).unwrap_or_else(|_error| {
         panic!(

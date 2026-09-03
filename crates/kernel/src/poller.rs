@@ -212,6 +212,18 @@ impl Poller {
         self.inner.running.store(false, Ordering::Relaxed);
     }
 
+    /// Services one readiness event.
+    ///
+    /// mio readiness is edge-triggered (kqueue `EV_CLEAR` / epoll `EPOLLET`):
+    /// a single event stands for *everything* queued on the socket at the
+    /// time it is retrieved, and no further event is generated for those
+    /// bytes or datagrams. Every branch below therefore drains its socket
+    /// until `WouldBlock`. Reading once per event strands whatever else was
+    /// queued — typically several datagrams that arrived while the guest was
+    /// being executed inline on this thread — until the *next* arrival,
+    /// leaving the guest permanently one or more packets behind its peer (a
+    /// QUIC peer then waits forever for a reply to a packet the poller has
+    /// but never delivers).
     fn handle_readable(&self, token: Token) {
         let advance = self.inner.generation_advance.lock().clone();
 
@@ -236,44 +248,51 @@ impl Poller {
                 }
                 let mut buf = vec![0u8; 8192];
                 let mut finished = false;
-                match stream.read(&mut buf) {
-                    Ok(0) => {
-                        drop(inbound_writer.decrement_writer_count());
-                        // Bump the generation so readers parked on this ring
-                        // (via WaitRegister) are woken and observe EOF;
-                        // writer-count changes alone do not wake anyone.
-                        let new_gen = inbound_writer
-                            .backend()
-                            .fetch_add_u64(
-                                selium_shm::layout::GENERATION_COUNTER_OFFSET,
-                                1,
-                                Ordering::Release,
-                            )
-                            .map(|g| g.wrapping_add(1))
-                            .ok();
-                        running.store(false, Ordering::Relaxed);
-                        finished = true;
-                        if let (Some(new_gen), Some(cb)) = (new_gen, advance.as_ref()) {
-                            cb(region_id, new_gen);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => {
+                            drop(inbound_writer.decrement_writer_count());
+                            // Bump the generation so readers parked on this ring
+                            // (via WaitRegister) are woken and observe EOF;
+                            // writer-count changes alone do not wake anyone.
+                            let new_gen = inbound_writer
+                                .backend()
+                                .fetch_add_u64(
+                                    selium_shm::layout::GENERATION_COUNTER_OFFSET,
+                                    1,
+                                    Ordering::Release,
+                                )
+                                .map(|g| g.wrapping_add(1))
+                                .ok();
+                            running.store(false, Ordering::Relaxed);
+                            finished = true;
+                            if let (Some(new_gen), Some(cb)) = (new_gen, advance.as_ref()) {
+                                cb(region_id, new_gen);
+                            }
+                            break;
                         }
-                    }
-                    Ok(n) => {
-                        let payload = buf.get(..n).unwrap_or(&[]);
-                        if inbound_writer.write_frame(payload, 0, 0).is_err() {
-                            eprintln!(
-                                "inbound ring full for region {region_id}; dropped {n} bytes"
-                            );
-                        } else if let Some(cb) = advance.as_ref()
-                            && let Ok(new_gen) = inbound_writer.generation()
-                        {
-                            cb(region_id, new_gen);
+                        Ok(n) => {
+                            let payload = buf.get(..n).unwrap_or(&[]);
+                            if inbound_writer.write_frame(payload, 0, 0).is_err() {
+                                eprintln!(
+                                    "inbound ring full for region {region_id}; dropped {n} bytes"
+                                );
+                            } else if let Some(cb) = advance.as_ref()
+                                && let Ok(new_gen) = inbound_writer.generation()
+                            {
+                                // Wake (and inline-execute) the guest per chunk so
+                                // it consumes the ring before the next write.
+                                cb(region_id, new_gen);
+                            }
                         }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        eprintln!("inbound TCP read error: {e}");
-                        running.store(false, Ordering::Relaxed);
-                        finished = true;
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            eprintln!("inbound TCP read error: {e}");
+                            running.store(false, Ordering::Relaxed);
+                            finished = true;
+                            break;
+                        }
                     }
                 }
                 if finished {
@@ -311,14 +330,18 @@ impl Poller {
                     return;
                 }
                 // Accept via the std listener, not mio — we get a std
-                // TcpStream that the callback can use directly.
-                match listener.accept() {
-                    Ok((stream, _addr)) => accept_fn(stream),
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        eprintln!("accept error: {e}");
-                        running.store(false, Ordering::Relaxed);
-                        return;
+                // TcpStream that the callback can use directly. Drain the
+                // accept queue: one edge may cover several pending connections.
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => accept_fn(stream),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            eprintln!("accept error: {e}");
+                            running.store(false, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
                 self.reinsert(token, entry);
@@ -337,23 +360,31 @@ impl Poller {
                 }
                 let mut buf = vec![0u8; 65536];
                 let mut finished = false;
-                match socket.recv_from(&mut buf) {
-                    Ok((n, addr)) => {
-                        let payload = buf.get(..n).unwrap_or(&[]);
-                        let frame = crate::network::encode_udp_frame(addr, payload);
-                        if recv_writer.write_frame(&frame, 0, 0).is_err() {
-                            eprintln!("inbound ring full for region {region_id}; dropped datagram");
-                        } else if let Some(cb) = advance.as_ref()
-                            && let Ok(new_gen) = recv_writer.generation()
-                        {
-                            cb(region_id, new_gen);
+                loop {
+                    match socket.recv_from(&mut buf) {
+                        Ok((n, addr)) => {
+                            let payload = buf.get(..n).unwrap_or(&[]);
+                            let frame = crate::network::encode_udp_frame(addr, payload);
+                            if recv_writer.write_frame(&frame, 0, 0).is_err() {
+                                eprintln!(
+                                    "inbound ring full for region {region_id}; dropped datagram"
+                                );
+                            } else if let Some(cb) = advance.as_ref()
+                                && let Ok(new_gen) = recv_writer.generation()
+                            {
+                                // Wake (and inline-execute) the guest per datagram
+                                // so it consumes the ring before the next write.
+                                cb(region_id, new_gen);
+                            }
                         }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        eprintln!("UDP recv error: {e}");
-                        running.store(false, Ordering::Relaxed);
-                        finished = true;
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            eprintln!("UDP recv error: {e}");
+                            running.store(false, Ordering::Relaxed);
+                            finished = true;
+                            break;
+                        }
                     }
                 }
                 if finished {

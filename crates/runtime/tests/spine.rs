@@ -75,9 +75,8 @@ fn spine_demo_wasm() -> Vec<u8> {
 
 /// Returns the path to the compiled spine-demo WASM module.
 fn spine_demo_wasm_path() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
-    });
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .unwrap_or_else(|_error| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target").to_string());
     PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_spine_demo.wasm")
 }
 

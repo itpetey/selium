@@ -186,11 +186,13 @@ impl AsyncRead for BlockingReader {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
-                    // Check-after-register: a writer may have committed
-                    // between our empty check and the registration. Re-arm
-                    // so we are re-polled and observe the data.
+                    // Check-after-register: a writer may have committed —
+                    // or the last writer closed — between our empty/EOF
+                    // check and the registration. Re-arm so we are re-polled
+                    // and observe the data or the EOF.
                     if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
                         || self.region.load_generation().ok() != Some(cur_gen)
+                        || self.region.load_writer_count().ok() == Some(0)
                     {
                         cx.waker().wake_by_ref();
                     }
@@ -368,12 +370,14 @@ impl AsyncRead for Reader {
                         cur_gen,
                         cx.waker(),
                     );
-                    // Check-after-register: a writer may have committed
-                    // between our empty check and the registration, leaving
-                    // this registration permanently stale. Re-arm so we are
-                    // re-polled and observe the data.
+                    // Check-after-register: a writer may have committed — or
+                    // the last writer closed — between our empty/EOF check
+                    // and the registration, leaving this registration
+                    // permanently stale. Re-arm so we are re-polled and
+                    // observe the data or the EOF.
                     if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
                         || self.region.load_generation().ok() != Some(cur_gen)
+                        || self.region.load_writer_count().ok() == Some(0)
                     {
                         cx.waker().wake_by_ref();
                     }

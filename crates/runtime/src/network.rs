@@ -450,9 +450,35 @@ fn proxy_outbound_udp(
                         Some(d) => (d.0, d.1),
                         None => continue,
                     };
-                    if let Err(_e) = socket.send_to(payload, addr) {
-                        running.store(false, Ordering::Relaxed);
-                        return Ok(());
+                    // The proxy socket is non-blocking, so `send_to` can fail
+                    // transiently. Treating every error as fatal (and exiting
+                    // silently) strands every later datagram — a single
+                    // transient `WouldBlock` would take down the whole relay.
+                    // Drop that one datagram instead: for QUIC, loss recovery
+                    // resends it.
+                    match socket.send_to(payload, addr) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            eprintln!(
+                                "outbound UDP send blocked; dropping {}B bound for {addr}",
+                                payload.len()
+                            );
+                        }
+                        // EINTR is spurious on UDP; retry the same datagram.
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            if let Err(e) = socket.send_to(payload, addr) {
+                                eprintln!(
+                                    "outbound UDP send to {addr} failed: {e}; stopping relay"
+                                );
+                                running.store(false, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("outbound UDP send to {addr} failed: {e}; stopping relay");
+                            running.store(false, Ordering::Relaxed);
+                            return Ok(());
+                        }
                     }
                     saw_frame = true;
                 }

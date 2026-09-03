@@ -88,23 +88,45 @@ impl Runtime {
             },
         );
 
-        // Register SleepWait timer via tokio::spawn so the guest is
-        // woken via mailbox when the deadline arrives.
+        // Register SleepWait timer so the guest is woken via mailbox when
+        // the deadline arrives. The wake is spawned context-free: a guest
+        // executed inline on a non-Tokio thread (e.g. the kernel poller's
+        // datagram-wake path) has no ambient reactor, so reuse a handle
+        // captured from the first Tokio-threaded hostcall — falling back to
+        // a minimal dedicated runtime when no Tokio context was ever seen.
         if let HostOperationState::SleepWait { deadline } = state
             && let Some(tid) = task_id
         {
             let duration = deadline.saturating_duration_since(Instant::now());
             let operations = Arc::clone(&self.operations);
-            let mailboxes = Arc::clone(&self.mailboxes);
-            tokio::spawn(async move {
+            let runtime = self.clone();
+            let timer = async move {
                 tokio::time::sleep(duration).await;
                 if let Some(op) = operations.lock().get_mut(&operation_id) {
                     op.state = HostOperationState::Ready(HostcallOutput::Empty);
                 }
-                if let Some(mailbox) = mailboxes.lock().get(&process_id) {
-                    drop(mailbox.enqueue(tid));
-                }
-            });
+                // Deliver through the standard wake path (mailbox enqueue +
+                // inline guest poll). A bare enqueue is a lost wake when the
+                // guest reactor is stalled with only this timer outstanding:
+                // nothing else would ever poll it, deadlocking timer-driven
+                // progress (e.g. quinn loss detection, pacing, delayed ACKs).
+                runtime.wake_process_task(process_id, tid);
+            };
+            let ambient = tokio::runtime::Handle::try_current().ok();
+            if let Some(handle) = ambient.as_ref() {
+                let _ = self.timer_handle.set(handle.clone());
+            }
+            match ambient.or_else(|| self.timer_handle.get().cloned()) {
+                Some(handle) => drop(handle.spawn(timer)),
+                None => drop(std::thread::spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                    {
+                        runtime.block_on(timer);
+                    }
+                })),
+            }
         }
 
         (status, operation_id)

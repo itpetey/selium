@@ -13,11 +13,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use selium_abi::{RegionProt, ResourceKind};
 use selium_encoding::FlatMsg;
-use selium_memory::{
-    HEADER_SIZE_TWO_ENTRIES, MultiMemoryHeader, RING_HEADER_SIZE, RegionMapping, WASM_PAGE_SIZE,
-};
 use selium_wire::{
     error::{Error, Result},
     framed::{FramedRead, FramedWrite},
@@ -32,9 +28,7 @@ use selium_wire::{
     },
 };
 
-use crate::{
-    Channel, ChannelBackpressure, ChannelRegion, ring_buf::RingBuf, transport::ShmTransport,
-};
+use crate::{Channel, transport::ShmTransport};
 
 pub use selium_wire::rpc::RpcError;
 
@@ -362,145 +356,21 @@ where
     })
 }
 
-/// Aligns a value up to the given alignment.
-fn align_up(value: u64, alignment: u64) -> u64 {
-    let rem = value % alignment;
-    if rem == 0 {
-        value
-    } else {
-        value + alignment - rem
-    }
-}
-
 /// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
 fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
-    let region = selium_memory::region_provider()?
-        .attach(shared_id, None, RegionProt::ReadWrite)
-        .map_err(Error::from)?;
-    let parent_mapping = region.mapping();
-
-    // Parse the multi-memory header using the shared definition.
-    let header = MultiMemoryHeader::parse(parent_mapping.backend(), 0).map_err(Error::from)?;
-    if header.count < 2 {
-        return Err(Error::InvalidLayout);
-    }
-
-    let req_entry = header.entry(0)?;
-    let rep_entry = header.entry(1)?;
-
-    let req_capacity = req_entry
-        .length
-        .checked_sub(RING_HEADER_SIZE)
-        .ok_or(Error::InvalidLayout)?;
-    let rep_capacity = rep_entry
-        .length
-        .checked_sub(RING_HEADER_SIZE)
-        .ok_or(Error::InvalidLayout)?;
-
-    let request_channel = channel_from_sub_mapping(
-        &parent_mapping,
-        req_entry.offset,
-        req_entry.length,
-        req_capacity,
-        shared_id,
-    )?;
-    let reply_channel = channel_from_sub_mapping(
-        &parent_mapping,
-        rep_entry.offset,
-        rep_entry.length,
-        rep_capacity,
-        shared_id,
-    )?;
-
-    Ok((request_channel, reply_channel))
-}
-
-/// Wraps an existing sub-mapping as a channel without initialising it.
-///
-/// The parent `shared_id` is recorded on the region so generation waits and
-/// bumps name the correct shared region for cross-guest wakeups.
-fn channel_from_sub_mapping(
-    parent_mapping: &RegionMapping,
-    offset: u64,
-    len: u64,
-    capacity: u64,
-    shared_id: u64,
-) -> Result<Channel> {
-    let mapping = parent_mapping.sub_region(offset, len)?;
-    let region = ChannelRegion::from_mapping_with_id(mapping, capacity, shared_id);
-    let ring = RingBuf::wrap_region(region)?;
-    Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
+    crate::byte_channel::attach(shared_id)
 }
 
 /// Creates a multi-memory region with two ring buffers for RPC.
 ///
-/// Returns the request channel, reply channel, and parent `shared_id`.
+/// Returns the request channel, reply channel, and parent `shared_id`. The
+/// parent region handle is dropped: the channels hold their own mappings,
+/// so the allocation's attachment outlives it (see
+/// [`byte_channel::create`], which documents the no-second-attach rule).
 fn create_rpc_region(req_capacity: u64, rep_capacity: u64) -> Result<(Channel, Channel, u64)> {
-    // Each sub-memory: coordination header + data area.
-    let req_region_len = RING_HEADER_SIZE + req_capacity;
-    let rep_region_len = RING_HEADER_SIZE + rep_capacity;
-
-    // Calculate offsets.
-    let sub_memory_0_offset = align_up(HEADER_SIZE_TWO_ENTRIES, 8);
-    let sub_memory_1_offset = align_up(sub_memory_0_offset + req_region_len, 8);
-    let total_capacity = align_up(sub_memory_1_offset + rep_region_len, WASM_PAGE_SIZE);
-
-    // Allocate the parent region via the global provider.
-    let pages = pages_for_bytes(total_capacity);
-    let region = selium_memory::region_provider()?
-        .allocate(pages, RegionProt::ReadWrite, ResourceKind::SharedMemory)
-        .map_err(Error::from)?;
-    let shared_id = region.region_id();
-    let parent_mapping = region.mapping();
-
-    // Write the multi-memory header using the shared definition.
-    MultiMemoryHeader::write_two_entries(
-        parent_mapping.backend(),
-        0,
-        total_capacity,
-        [
-            (sub_memory_0_offset, req_region_len),
-            (sub_memory_1_offset, rep_region_len),
-        ],
-    )
-    .map_err(Error::from)?;
-
-    let request_channel = initialise_sub_channel(
-        &parent_mapping,
-        sub_memory_0_offset,
-        req_region_len,
-        req_capacity,
-        shared_id,
-    )?;
-    let reply_channel = initialise_sub_channel(
-        &parent_mapping,
-        sub_memory_1_offset,
-        rep_region_len,
-        rep_capacity,
-        shared_id,
-    )?;
-
+    let (request_channel, reply_channel, shared_id, _region) =
+        crate::byte_channel::create(req_capacity, rep_capacity)?;
     Ok((request_channel, reply_channel, shared_id))
-}
-
-/// Initialises a sub-region for a freshly-allocated RPC channel.
-///
-/// The parent `shared_id` is recorded on the region so generation waits and
-/// bumps name the correct shared region for cross-guest wakeups.
-fn initialise_sub_channel(
-    parent_mapping: &RegionMapping,
-    offset: u64,
-    len: u64,
-    capacity: u64,
-    shared_id: u64,
-) -> Result<Channel> {
-    let mapping = parent_mapping.sub_region(offset, len)?;
-    let region = ChannelRegion::from_mapping_with_id(mapping, capacity, shared_id);
-    region.initialise()?;
-    region.store_backpressure(ChannelBackpressure::Park.to_u8())?;
-    region.store_shared_capacity(capacity)?;
-    let ring = RingBuf::wrap_region(region)?;
-    Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
 }
 
 /// Maps a transport error to an [`RpcError`].
@@ -517,11 +387,6 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
         }
         other => RpcError::Serialization(other.to_string()),
     }
-}
-
-/// Computes the number of WASM pages needed to hold `bytes`.
-fn pages_for_bytes(bytes: u64) -> u32 {
-    bytes.div_ceil(WASM_PAGE_SIZE) as u32
 }
 
 /// Waits until the serving side has accepted the session.

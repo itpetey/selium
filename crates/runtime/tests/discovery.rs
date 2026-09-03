@@ -329,9 +329,8 @@ fn read_wasm(path: &std::path::Path) -> Vec<u8> {
 }
 
 fn target_dir() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_error| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../target").to_string()
-    });
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .unwrap_or_else(|_error| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target").to_string());
     PathBuf::from(target_dir)
 }
 

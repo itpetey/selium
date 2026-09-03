@@ -1,18 +1,21 @@
 [package]
-name = "selium-quic"
+name = "selium-quic-demo"
 version.workspace = true
 edition.workspace = true
-description = "Selium QUIC stream transport implementing MessageTransport"
+description = "QUIC echo demo guest (serves sel-quic streams relayed by the QUIC connector)"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-quinn.workspace = true
-selium-wire.workspace = true
+selium-guest.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [lints]

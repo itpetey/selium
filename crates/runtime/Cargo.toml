@@ -37,6 +37,12 @@ wasmtiny.workspace = true
 stage2-wait-words = ["selium-kernel/stage2-wait-words"]
 
 [dev-dependencies]
+# Native quinn client for the `quic_spine` wasm32 integration test: the
+# external side of the QUIC connector relay. `runtime-tokio` drives the
+# client endpoint inside the test's tokio runtime; `rustls-ring` is the TLS
+# provider. Test-only: quinn never enters the runtime itself.
+quinn = { workspace = true, features = ["rustls-ring", "runtime-tokio"] }
+rustls-pemfile = { workspace = true, features = ["std"] }
 selium-encoding.workspace = true
 selium-proto-dns.workspace = true
 wat.workspace = true

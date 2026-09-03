@@ -204,14 +204,31 @@ impl BlockingWriter {
     /// Decrements writer_count and releases the writer slot to compensate
     /// for the lost Drop decrement.
     pub fn downgrade(mut self) -> Writer {
-        drop(self.region.decrement_writer_count());
-        drop(self.region.release_writer_slot(self.writer_slot));
         self.closed = true;
+        self.release_writer_registration();
         Writer {
             region: self.region.clone(),
             writer_id: self.writer_id,
             backpressure: self.backpressure,
         }
+    }
+
+    /// Withdraws this writer from the ring's writer count and slot table,
+    /// then bumps the generation so every reader parked on the ring is
+    /// woken to observe the new writer count.
+    ///
+    /// The bump is what makes close observable: a reader that found the
+    /// ring empty parks with a generation wait, and a bare writer-count
+    /// decrement advances nothing and wakes nobody — the reader would sleep
+    /// forever with `writer_count == 0` (EOF) sitting unread in shared
+    /// memory. Treating close as an EOF generation bump mirrors the host
+    /// poller's socket-EOF path and reaches every waiter kind: same-guest
+    /// wakers, cross-guest `WaitRegister` tasks (via the `GenerationAdvance`
+    /// hostcall), and host drainers parked on the generation word.
+    fn release_writer_registration(&self) {
+        drop(self.region.decrement_writer_count());
+        drop(self.region.release_writer_slot(self.writer_slot));
+        drop(self.region.bump_generation());
     }
 }
 
@@ -279,8 +296,8 @@ impl Drop for BlockingWriter {
         if self.closed {
             return;
         }
-        drop(self.region.decrement_writer_count());
-        drop(self.region.release_writer_slot(self.writer_slot));
+        self.closed = true;
+        self.release_writer_registration();
     }
 }
 

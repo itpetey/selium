@@ -18,7 +18,7 @@ use crate::{
 /// A measurement of the monotonic clock, backed by the Selium host.
 ///
 /// `Instant` mirrors the [`std::time::Instant`] API but uses the hostcall-based
-/// [`time_monotonic`] clock as its source, making it reliable on `wasm32`
+/// `time_monotonic` clock as its source, making it reliable on `wasm32`
 /// targets where [`std::time::Instant::now`] is unavailable or unreliable
 /// depending on the WASM runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

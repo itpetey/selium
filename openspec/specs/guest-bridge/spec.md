@@ -40,7 +40,7 @@ A bridge crash or supervisor kill SHALL only affect that user's sessions. Inner 
 - **AND** no other bridge or guest SHALL be affected
 
 ### Requirement: Bridge Is Deployable Guest Code
-The bridge SHALL be implemented as a standard WASM guest using `selium-guest` and `selium-quic`. It SHALL NOT require special runtime modifications beyond the existing UDP datagram hostcall.
+The bridge SHALL be implemented as a standard WASM guest using `selium-guest`. It SHALL NOT depend on the deleted `selium-quic` crate; QUIC termination SHALL instead be provided by the QUIC connector (`quic-connector`), which the frozen bridge reuses or replaces if it is re-activated. The bridge SHALL NOT require special runtime modifications beyond the existing UDP datagram hostcall.
 
 #### Scenario: Bridge deployed via normal guest lifecycle
 - **WHEN** the platform starts a bridge guest via `Process::start` with appropriate capability grants

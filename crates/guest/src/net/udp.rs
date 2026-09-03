@@ -154,6 +154,40 @@ impl UdpSocket {
         }
     }
 
+    /// Polls whether the send ring has room for another datagram, without
+    /// writing to it.
+    ///
+    /// This is a non-mutating readiness probe used by the quinn `UdpPoller`
+    /// adapter: it checks the shared send ring's free space and, when the ring
+    /// is pinned full by a slow reader or writer, parks on the same
+    /// generation-wait the [`Writer`] uses under `Park` backpressure, so a
+    /// draining peer wakes the probe.
+    pub fn poll_send_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // SAFETY: we project only to the send_writer's region; caller upholds
+        // pin invariants.
+        let this = unsafe { self.get_unchecked_mut() };
+        let region = this.send_writer.region();
+
+        // Minimum writable payload: one 12-byte frame header. If at least that
+        // much space is free, a datagram write can proceed.
+        let needed = selium_memory::FrameHeader::ENCODED_SIZE as u64;
+        match send_ring_writable(region, needed) {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => {
+                let generation = region.load_generation().unwrap_or(0);
+                if !selium_memory::register_generation_wait(
+                    region.region_id(),
+                    generation,
+                    cx.waker(),
+                ) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
     /// Attempts to receive a datagram. Returns `Poll::Pending` if the recv ring is
     /// empty but writers are still connected (after registering a generation wait).
     /// Returns an error if the channel is closed (`writer_count == 0`).
@@ -194,6 +228,30 @@ impl UdpSocket {
 
 // SAFETY: Reader and Writer are backed by process-level shared memory mappings.
 unsafe impl Send for UdpSocket {}
+
+/// Returns whether `needed` bytes can be written to the send ring without
+/// overwriting the slowest blocking reader or writer.
+fn send_ring_writable(region: &selium_shm::ChannelRegion, needed: u64) -> Result<bool> {
+    let tail = region
+        .read_next_tail()
+        .map_err(|e| GuestError::Host(e.to_string()))?;
+    let reader = region
+        .minimum_reader_position()
+        .map_err(|e| GuestError::Host(e.to_string()))?
+        .unwrap_or(tail);
+    let writer = region
+        .minimum_writer_position()
+        .map_err(|e| GuestError::Host(e.to_string()))?
+        .unwrap_or(tail);
+    let pinned = reader.min(writer);
+
+    // Available space = capacity - (tail - pinned). A nil pin (no blocking
+    // reader/writer registered) leaves the full capacity available.
+    let available = pinned
+        .saturating_sub(tail)
+        .saturating_add(region.capacity());
+    Ok(available >= needed)
+}
 
 /// Decode a binary frame into a `Datagram`, returning `None` if malformed.
 pub fn decode_datagram(frame: &[u8]) -> Option<Datagram> {

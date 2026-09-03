@@ -182,7 +182,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 )]
 fn net_demo_wasm() -> Vec<u8> {
     let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
     let path = PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm");
     std::fs::read(&path).unwrap_or_else(|_error| {
         panic!(

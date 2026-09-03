@@ -163,7 +163,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 /// Path to the compiled net-demo WASM module.
 fn net_demo_wasm_path() -> PathBuf {
     let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../../target".to_string());
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
     PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
 }
 

@@ -99,6 +99,12 @@ pub struct Runtime {
     /// store; losers of the race return and rely on the winner's
     /// pending-wake re-check (see `poll_guest_until_stalled`).
     pub(crate) executing_guests: Arc<Mutex<HashSet<ProcessId>>>,
+    /// Captured ambient Tokio runtime handle, used to spawn `Sleep`
+    /// hostcall timer wakes. Guests can be executed inline on non-Tokio
+    /// threads (e.g. the kernel poller's datagram-wake path), where
+    /// `tokio::spawn` would panic for lack of a thread-local reactor; the
+    /// first handle observed on a Tokio thread is reused for those.
+    pub(crate) timer_handle: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
 }
 
 impl Runtime {
@@ -138,6 +144,7 @@ impl Runtime {
             well_known_uris: Arc::new(Mutex::new(HashMap::new())),
             handler_schemes: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
+            timer_handle: Arc::new(std::sync::OnceLock::new()),
         };
 
         // Initialise the mio network poller if possible (best-effort).

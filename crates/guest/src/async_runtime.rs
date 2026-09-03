@@ -85,7 +85,17 @@ impl Future for YieldNow {
             Poll::Ready(())
         } else {
             self.yielded = true;
-            cx.waker().wake_by_ref();
+            match current_task_id() {
+                // Inside a reactor task: queue a yield wake. Yields are
+                // applied WITHOUT counting as reactor progress (see
+                // `apply_yield_queue`), so a spinning `yield_now` loop
+                // cannot keep the reactor alive and peg the host thread;
+                // the yielding task is polled on the next reactor entry.
+                Some(task_id) => yield_task(task_id),
+                // Outside a reactor task there is no queue to park on:
+                // fall back to self-waking through the caller's waker.
+                None => cx.waker().wake_by_ref(),
+            }
             Poll::Pending
         }
     }
@@ -101,6 +111,7 @@ thread_local! {
     static BACKGROUND: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static SPAWN_QUEUE: RefCell<Vec<BackgroundTask>> = const { RefCell::new(Vec::new()) };
     static WAKE_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
+    static YIELD_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
     static CURRENT_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
     static NEXT_TASK_ID: RefCell<TaskId> = const { RefCell::new(1) };
     /// (region_id, observed_generation) → list of wakers for tasks waiting
@@ -211,6 +222,13 @@ pub(crate) fn wake_task(task_id: TaskId) {
     }
 }
 
+/// Queues a cooperative yield for `task_id` (see [`YieldNow`]).
+pub(crate) fn yield_task(task_id: TaskId) {
+    if task_id != 0 {
+        YIELD_QUEUE.with(|queue| queue.borrow_mut().push(task_id));
+    }
+}
+
 fn apply_wake_queue() -> bool {
     let wakeups = WAKE_QUEUE.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
     if wakeups.is_empty() {
@@ -237,6 +255,33 @@ fn apply_wake_queue() -> bool {
     true
 }
 
+/// Applies queued cooperative yields: marks the yielding tasks runnable for
+/// the next reactor pass without counting as forward progress (see
+/// [`YieldNow`]).
+fn apply_yield_queue() {
+    let yields = YIELD_QUEUE.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
+    if yields.is_empty() {
+        return;
+    }
+    BACKGROUND.with(|tasks| {
+        if let Ok(mut tasks) = tasks.try_borrow_mut() {
+            for task_id in &yields {
+                if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
+                    task.runnable = true;
+                }
+            }
+        }
+    });
+    SPAWN_QUEUE.with(|tasks| {
+        let mut tasks = tasks.borrow_mut();
+        for task_id in &yields {
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
+                task.runnable = true;
+            }
+        }
+    });
+}
+
 fn merge_spawn_queue() -> bool {
     SPAWN_QUEUE.with(|queue| {
         let mut queue = queue.borrow_mut();
@@ -260,6 +305,9 @@ fn next_task_id() -> TaskId {
 fn poll_backgrounds() -> bool {
     let mut progressed = merge_spawn_queue();
     progressed |= apply_wake_queue();
+    // Leftover yields from a previous reactor entry: run those tasks in
+    // this pass (they are already runnable), without counting as progress.
+    apply_yield_queue();
     BACKGROUND.with(|tasks| {
         if let Ok(mut tasks) = tasks.try_borrow_mut() {
             let mut index = 0;
@@ -294,12 +342,24 @@ fn poll_backgrounds() -> bool {
             }
         }
     });
-    // Drain wakes/spawns that tasks generated while being polled.
-    // These are applied for the next iteration but do not by themselves
-    // keep the reactor alive — only task completions and new spawns
-    // constitute forward progress.
-    apply_wake_queue();
-    merge_spawn_queue();
+    // Drain wakes/yields/spawns that tasks generated while being polled.
+    //
+    // Wakes and spawns count as forward progress: without that, the
+    // reactor stalls before the woken/spawned task is ever polled. A task
+    // woken by another task's poll (an in-guest producer→consumer handoff,
+    // e.g. quinn's endpoint driver handing stream data to a relay pump)
+    // would then never run unless an external wake happened to arrive —
+    // deadlocking the handoff whenever both peers end up parked on purely
+    // external waits. Similarly, a task spawned while another was being
+    // polled (e.g. a runtime adapter spawning its driver during the
+    // entrypoint's poll) must be polled before the reactor stalls, or it
+    // never registers the waits the host would need to wake the guest.
+    //
+    // Yields do NOT count (see `YieldNow`): a spinning `yield_now` loop
+    // must not keep the reactor alive.
+    apply_yield_queue();
+    progressed |= apply_wake_queue();
+    progressed |= merge_spawn_queue();
     progressed
 }
 

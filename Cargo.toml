@@ -14,14 +14,15 @@ members = [
   "crates/wire",
   "guests/connector-dns",
   "guests/connector-http",
+  "guests/connector-quic",
   "guests/discovery",
   "guests/discovery-probe",
   "guests/dns-demo",
   "guests/net-demo",
+  "guests/quic-demo",
   "guests/spine-demo",
 ]
 # Frozen during the spine rebuild (kept in-tree for later increments):
-#   "crates/core/quic"
 #   "crates/guests/bridge"
 #   "crates/guests/cluster"
 #   "crates/guests/external-api"
@@ -49,10 +50,13 @@ futures = { version = "0.3", default-features = false }
 getrandom = { version = "0.4", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
+quinn = { version = "0.11", default-features = false }
 quote = { version = "1.0", default-features = false }
+ring = { version = "0.17", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2", default-features = false }
+rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/abi", default-features = false }
 selium-encoding = { path = "crates/encoding", default-features = false }
 selium-guest = { path = "crates/guest", default-features = false }
@@ -116,5 +120,26 @@ unwrap_in_result = "warn"
 unwrap_used = "warn"
 
 [patch.crates-io]
+# - `getrandom` (modified fork, upstreamable fix): quinn-proto and ring's
+#   `wasm32_unknown_unknown_js` feature enable getrandom's `wasm_js` feature on
+#   wasm32-unknown-unknown, and 0.4.3's `error.rs` references
+#   `Error::WEB_CRYPTO` — defined only in the `wasm_js` backend — whenever that
+#   feature is on, even when the `custom` backend cfg is selected (see
+#   `.cargo/config.toml`). The fork moves the const into `error.rs`. Drop this
+#   entry once getrandom > 0.4.3 ships the fix.
+# - `ring` (pristine upstream master, zero local changes): LOAD-BEARING. With
+#   this entry missing, builds still succeed but resolve registry ring
+#   0.17.14, whose getrandom 0.2 dependency compiles the JS-backed RNG
+#   (browser/Node detection, `__wbindgen_placeholder__` imports) into the
+#   wasm guests — unloadable in wasmtiny. `scripts/check-wasm-patches.sh`
+#   guards against this. Drop this entry once ring releases a 0.17.x built on
+#   getrandom 0.4.
+# - `web-time` (modified fork): gates the JS `Date`/`Performance` bindings
+#   behind a non-default `js` feature (with `wasm-bindgen` optional), so wasm
+#   guests compile zero `__wbindgen` imports; they register the host time
+#   hostcalls via `web_time::set_custom_time_source` instead (see
+#   `.cargo/config.toml`). Upstreamable.
+getrandom = { path = "../../getrandom" }
+ring = { path = "../../ring" }
 wasmtiny = { path = "../../wasmtiny" }
 web-time = { path = "../../web-time" }

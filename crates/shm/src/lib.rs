@@ -41,6 +41,7 @@ pub use rpc::{
 };
 pub use transport::{ShmRendezvous, ShmTransport};
 
+pub mod byte_channel;
 pub mod channels;
 pub mod layout;
 pub mod region;

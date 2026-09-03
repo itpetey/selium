@@ -149,6 +149,22 @@ impl Channel {
         ))
     }
 
+    /// Returns a blocking reader starting at `start_pos`.
+    ///
+    /// Unlike [`blocking_reader`](Self::blocking_reader), which starts at
+    /// the live tail (skipping frames written before the call), a reader
+    /// from position `0` consumes everything in the ring — required for
+    /// peer-to-peer byte channels, where the writing peer may have relayed
+    /// frames before this peer attached.
+    pub fn blocking_reader_from(&self, start_pos: u64) -> Result<BlockingReader> {
+        let reader_id = self.ring.region().allocate_reader_slot(start_pos)?;
+        Ok(BlockingReader::new(
+            self.ring.region().clone(),
+            start_pos,
+            reader_id,
+        ))
+    }
+
     /// Returns the backpressure strategy for this channel.
     pub fn backpressure(&self) -> ChannelBackpressure {
         self.backpressure

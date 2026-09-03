@@ -15,12 +15,19 @@
 
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile as pemfile;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use selium_guest::{
     Context, TcpListener, TcpStream, debug, entrypoint, error, info, mark_ready, spawn, warn,
 };
 use tokio_rustls::TlsAcceptor;
+
+// Feature-unification anchor, not a code dependency: pulls in `ring` (with its
+// `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
+// wasm32-unknown-unknown — the backend actually used is getrandom's `custom`
+// (see `.cargo/config.toml`). Guards against cargo-shear removing the dep.
+#[cfg(target_arch = "wasm32")]
+use ring as _;
 
 pub use pipeline::{
     ConnectionConfig, ForwardError, ForwardSession, HTTP_STREAM_INTERFACE, ReplyEvent, ReplySink,
