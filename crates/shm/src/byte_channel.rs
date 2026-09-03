@@ -15,11 +15,54 @@
 
 use selium_abi::{RegionProt, ResourceKind};
 use selium_memory::{
-    HEADER_SIZE_TWO_ENTRIES, MultiMemoryHeader, Region, RING_HEADER_SIZE, WASM_PAGE_SIZE,
+    HEADER_SIZE_TWO_ENTRIES, MultiMemoryHeader, RING_HEADER_SIZE, Region, WASM_PAGE_SIZE,
 };
 use selium_wire::error::Result;
 
 use crate::{Channel, ChannelBackpressure, ChannelRegion, ring_buf::RingBuf};
+
+/// Attaches to an existing two-ring region pair by parent `shared_id`.
+pub fn attach(shared_id: u64) -> Result<(Channel, Channel)> {
+    let region = selium_memory::region_provider()?
+        .attach(shared_id, None, RegionProt::ReadWrite)
+        .map_err(selium_wire::error::Error::from)?;
+    let parent_mapping = region.mapping();
+
+    let header = MultiMemoryHeader::parse(parent_mapping.backend(), 0)
+        .map_err(selium_wire::error::Error::from)?;
+    if header.count < 2 {
+        return Err(selium_wire::error::Error::InvalidLayout);
+    }
+
+    let entry_0 = header.entry(0)?;
+    let entry_1 = header.entry(1)?;
+
+    let capacity_0 = entry_0
+        .length
+        .checked_sub(RING_HEADER_SIZE)
+        .ok_or(selium_wire::error::Error::InvalidLayout)?;
+    let capacity_1 = entry_1
+        .length
+        .checked_sub(RING_HEADER_SIZE)
+        .ok_or(selium_wire::error::Error::InvalidLayout)?;
+
+    let channel_0 = channel_from_sub_mapping(
+        &parent_mapping,
+        entry_0.offset,
+        entry_0.length,
+        capacity_0,
+        shared_id,
+    )?;
+    let channel_1 = channel_from_sub_mapping(
+        &parent_mapping,
+        entry_1.offset,
+        entry_1.length,
+        capacity_1,
+        shared_id,
+    )?;
+
+    Ok((channel_0, channel_1))
+}
 
 /// Creates a fresh two-ring region pair.
 ///
@@ -71,49 +114,6 @@ pub fn create(capacity_0: u64, capacity_1: u64) -> Result<(Channel, Channel, u64
     Ok((channel_0, channel_1, shared_id, region))
 }
 
-/// Attaches to an existing two-ring region pair by parent `shared_id`.
-pub fn attach(shared_id: u64) -> Result<(Channel, Channel)> {
-    let region = selium_memory::region_provider()?
-        .attach(shared_id, None, RegionProt::ReadWrite)
-        .map_err(selium_wire::error::Error::from)?;
-    let parent_mapping = region.mapping();
-
-    let header = MultiMemoryHeader::parse(parent_mapping.backend(), 0)
-        .map_err(selium_wire::error::Error::from)?;
-    if header.count < 2 {
-        return Err(selium_wire::error::Error::InvalidLayout);
-    }
-
-    let entry_0 = header.entry(0)?;
-    let entry_1 = header.entry(1)?;
-
-    let capacity_0 = entry_0
-        .length
-        .checked_sub(RING_HEADER_SIZE)
-        .ok_or(selium_wire::error::Error::InvalidLayout)?;
-    let capacity_1 = entry_1
-        .length
-        .checked_sub(RING_HEADER_SIZE)
-        .ok_or(selium_wire::error::Error::InvalidLayout)?;
-
-    let channel_0 = channel_from_sub_mapping(
-        &parent_mapping,
-        entry_0.offset,
-        entry_0.length,
-        capacity_0,
-        shared_id,
-    )?;
-    let channel_1 = channel_from_sub_mapping(
-        &parent_mapping,
-        entry_1.offset,
-        entry_1.length,
-        capacity_1,
-        shared_id,
-    )?;
-
-    Ok((channel_0, channel_1))
-}
-
 /// Aligns a value up to the given alignment.
 fn align_up(value: u64, alignment: u64) -> u64 {
     let rem = value % alignment;
@@ -122,11 +122,6 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     } else {
         value + alignment - rem
     }
-}
-
-/// Computes the number of WASM pages needed to hold `bytes`.
-fn pages_for_bytes(bytes: u64) -> u32 {
-    bytes.div_ceil(WASM_PAGE_SIZE) as u32
 }
 
 /// Wraps an existing sub-mapping as a channel without initialising it.
@@ -158,6 +153,11 @@ fn initialise_sub_channel(
     region.store_shared_capacity(capacity)?;
     let ring = RingBuf::wrap_region(region)?;
     Ok(Channel::from_ring(ring, ChannelBackpressure::Park))
+}
+
+/// Computes the number of WASM pages needed to hold `bytes`.
+fn pages_for_bytes(bytes: u64) -> u32 {
+    bytes.div_ceil(WASM_PAGE_SIZE) as u32
 }
 
 #[cfg(test)]

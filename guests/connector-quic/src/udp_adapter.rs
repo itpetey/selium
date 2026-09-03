@@ -53,20 +53,6 @@ impl QuicUdpSocket {
     }
 }
 
-impl fmt::Debug for QuicUdpSocket {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QuicUdpSocket")
-            .field("local_addr", &self.local_addr)
-            .finish_non_exhaustive()
-    }
-}
-
-impl fmt::Debug for QuicUdpPoller {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QuicUdpPoller").finish_non_exhaustive()
-    }
-}
-
 impl AsyncUdpSocket for QuicUdpSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(QuicUdpPoller { socket: self })
@@ -139,6 +125,14 @@ impl AsyncUdpSocket for QuicUdpSocket {
     }
 }
 
+impl fmt::Debug for QuicUdpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicUdpSocket")
+            .field("local_addr", &self.local_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UdpPoller for QuicUdpPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut guard = self.socket.inner.lock();
@@ -148,5 +142,11 @@ impl UdpPoller for QuicUdpPoller {
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl fmt::Debug for QuicUdpPoller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicUdpPoller").finish_non_exhaustive()
     }
 }

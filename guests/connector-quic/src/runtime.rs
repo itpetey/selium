@@ -20,17 +20,16 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-
 // Only used by `wrap_udp_socket`, which quinn's trait defines on non-wasm
 // targets only.
 #[cfg(not(target_arch = "wasm32"))]
 use std::{io, sync::Arc};
 
+use quinn::{AsyncTimer, Runtime};
 // Only used by `wrap_udp_socket`, which quinn's trait defines on non-wasm
 // targets only.
 #[cfg(not(target_arch = "wasm32"))]
 use quinn::AsyncUdpSocket;
-use quinn::{AsyncTimer, Runtime};
 
 /// quinn `Runtime` implementation for the connector guest.
 #[derive(Debug, Default)]
@@ -40,24 +39,6 @@ pub struct ConnectorRuntime;
 pub struct ConnectorTimer {
     deadline: web_time::Instant,
     sleep: Option<selium_guest::Timer>,
-}
-
-impl ConnectorTimer {
-    /// Creates a timer that expires at `deadline`.
-    pub fn new(deadline: web_time::Instant) -> Self {
-        Self {
-            deadline,
-            sleep: None,
-        }
-    }
-}
-
-impl std::fmt::Debug for ConnectorTimer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectorTimer")
-            .field("deadline", &self.deadline)
-            .finish()
-    }
 }
 
 impl Runtime for ConnectorRuntime {
@@ -94,6 +75,16 @@ impl Runtime for ConnectorRuntime {
 
     fn now(&self) -> web_time::Instant {
         web_time::Instant::now()
+    }
+}
+
+impl ConnectorTimer {
+    /// Creates a timer that expires at `deadline`.
+    pub fn new(deadline: web_time::Instant) -> Self {
+        Self {
+            deadline,
+            sleep: None,
+        }
     }
 }
 
@@ -136,5 +127,13 @@ impl AsyncTimer for ConnectorTimer {
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl std::fmt::Debug for ConnectorTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorTimer")
+            .field("deadline", &self.deadline)
+            .finish()
     }
 }

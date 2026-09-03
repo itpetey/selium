@@ -45,33 +45,6 @@ pub enum StreamWriter {
     Blocking(BlockingWriter),
 }
 
-impl AsyncWrite for StreamWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            StreamWriter::Plain(writer) => Pin::new(writer).poll_write(cx, buf),
-            StreamWriter::Blocking(writer) => Pin::new(writer).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            StreamWriter::Plain(writer) => Pin::new(writer).poll_flush(cx),
-            StreamWriter::Blocking(writer) => Pin::new(writer).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            StreamWriter::Plain(writer) => Pin::new(writer).poll_shutdown(cx),
-            StreamWriter::Blocking(writer) => Pin::new(writer).poll_shutdown(cx),
-        }
-    }
-}
-
 /// The read half of a byte stream: decodes frames from the inbound ring and
 /// strips headers, presenting a continuous byte stream.
 ///
@@ -101,19 +74,6 @@ enum StreamReader {
     Blocking(BlockingReader),
 }
 
-impl StreamReader {
-    fn poll_read_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            StreamReader::Plain(reader) => Pin::new(reader).poll_read(cx, buf),
-            StreamReader::Blocking(reader) => Pin::new(reader).poll_read(cx, buf),
-        }
-    }
-}
-
 /// The write half of a byte stream: encodes each write as one frame
 /// (header + payload) on the outbound ring.
 pub struct ByteStreamWriter {
@@ -130,6 +90,33 @@ pub struct ByteStreamWriter {
 pub struct ByteStream {
     reader: ByteStreamReader,
     writer: ByteStreamWriter,
+}
+
+impl AsyncWrite for StreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            StreamWriter::Plain(writer) => Pin::new(writer).poll_write(cx, buf),
+            StreamWriter::Blocking(writer) => Pin::new(writer).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamWriter::Plain(writer) => Pin::new(writer).poll_flush(cx),
+            StreamWriter::Blocking(writer) => Pin::new(writer).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamWriter::Plain(writer) => Pin::new(writer).poll_shutdown(cx),
+            StreamWriter::Blocking(writer) => Pin::new(writer).poll_shutdown(cx),
+        }
+    }
 }
 
 impl ByteStreamReader {
@@ -155,6 +142,78 @@ impl ByteStreamReader {
     }
 }
 
+impl AsyncRead for ByteStreamReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // Drain any previously buffered payload bytes (header already stripped).
+        if this.read_offset < this.read_buf.len() {
+            let remaining = this.read_buf.get(this.read_offset..).unwrap_or(&[]);
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(remaining.get(..to_copy).unwrap_or(remaining));
+            this.read_offset += to_copy;
+            if this.read_offset >= this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_offset = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Read a full frame into a temporary buffer, then strip the header.
+        let mut frame_buf = vec![0u8; 65536];
+        let mut inner_buf = ReadBuf::new(&mut frame_buf);
+
+        match Pin::new(&mut this.reader).poll_read_frame(cx, &mut inner_buf) {
+            Poll::Ready(Ok(())) => {
+                let filled = inner_buf.filled().len();
+                if filled == 0 {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+                let header_size = FrameHeader::ENCODED_SIZE;
+                if filled <= header_size {
+                    return Poll::Ready(Ok(()));
+                }
+                let payload = frame_buf.get(header_size..filled).unwrap_or(&[]).to_vec();
+
+                // Store stripped payload in read_buf for potential partial copy.
+                this.read_buf = payload;
+                this.read_offset = 0;
+
+                let to_copy = this.read_buf.len().min(buf.remaining());
+                buf.put_slice(this.read_buf.get(..to_copy).unwrap_or(&[]));
+                this.read_offset = to_copy;
+                if this.read_offset >= this.read_buf.len() {
+                    this.read_buf.clear();
+                    this.read_offset = 0;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// SAFETY: see the `Send` impl on `ByteStream`.
+unsafe impl Send for ByteStreamReader {}
+
+impl StreamReader {
+    fn poll_read_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            StreamReader::Plain(reader) => Pin::new(reader).poll_read(cx, buf),
+            StreamReader::Blocking(reader) => Pin::new(reader).poll_read(cx, buf),
+        }
+    }
+}
+
 impl ByteStreamWriter {
     /// Wraps a non-blocking ring writer as the write half of a byte stream.
     pub fn plain(writer: Writer, region: Region) -> Self {
@@ -172,6 +231,50 @@ impl ByteStreamWriter {
         }
     }
 }
+
+impl AsyncWrite for ByteStreamWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let payload_len = buf.len() as u32;
+        let header = FrameHeader {
+            len: payload_len,
+            tag: 0,
+            flags: 0,
+            _reserved: [0; 3],
+        };
+        let header_bytes = header.encode();
+
+        // Build the framed buffer: [FrameHeader 12 bytes][user payload].
+        let mut write_buf = Vec::with_capacity(header_bytes.len() + buf.len());
+        write_buf.extend_from_slice(&header_bytes);
+        write_buf.extend_from_slice(buf);
+
+        match Pin::new(&mut this.writer).poll_write(cx, &write_buf) {
+            Poll::Ready(Ok(n)) => {
+                // Report payload bytes written (not header+payload).
+                let payload_written = n.saturating_sub(header_bytes.len());
+                Poll::Ready(Ok(payload_written))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
+}
+
+// SAFETY: see the `Send` impl on `ByteStream`.
+unsafe impl Send for ByteStreamWriter {}
 
 impl ByteStream {
     /// Attaches to a two-ring stream region by `shared_id` as the "primary"
@@ -207,12 +310,8 @@ impl ByteStream {
         region: Region,
         blocking: bool,
     ) -> Result<Self> {
-        let (reader, writer) = Self::halves_from_channels(
-            reader_channel,
-            writer_channel,
-            region.clone(),
-            blocking,
-        )?;
+        let (reader, writer) =
+            Self::halves_from_channels(reader_channel, writer_channel, region.clone(), blocking)?;
         Ok(Self { reader, writer })
     }
 
@@ -320,15 +419,6 @@ impl ByteStream {
     }
 }
 
-// SAFETY: Reader, Writer, BlockingReader, and BlockingWriter are safe to
-// send across threads (they encapsulate shared memory regions backed by
-// process-level mappings).
-unsafe impl Send for ByteStream {}
-// SAFETY: see the `Send` impl on `ByteStream`.
-unsafe impl Send for ByteStreamReader {}
-// SAFETY: see the `Send` impl on `ByteStream`.
-unsafe impl Send for ByteStreamWriter {}
-
 impl AsyncRead for ByteStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -357,99 +447,7 @@ impl AsyncWrite for ByteStream {
     }
 }
 
-impl AsyncRead for ByteStreamReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-
-        // Drain any previously buffered payload bytes (header already stripped).
-        if this.read_offset < this.read_buf.len() {
-            let remaining = this.read_buf.get(this.read_offset..).unwrap_or(&[]);
-            let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(remaining.get(..to_copy).unwrap_or(remaining));
-            this.read_offset += to_copy;
-            if this.read_offset >= this.read_buf.len() {
-                this.read_buf.clear();
-                this.read_offset = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-
-        // Read a full frame into a temporary buffer, then strip the header.
-        let mut frame_buf = vec![0u8; 65536];
-        let mut inner_buf = ReadBuf::new(&mut frame_buf);
-
-        match Pin::new(&mut this.reader).poll_read_frame(cx, &mut inner_buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = inner_buf.filled().len();
-                if filled == 0 {
-                    return Poll::Ready(Ok(())); // EOF
-                }
-                let header_size = FrameHeader::ENCODED_SIZE;
-                if filled <= header_size {
-                    return Poll::Ready(Ok(()));
-                }
-                let payload = frame_buf.get(header_size..filled).unwrap_or(&[]).to_vec();
-
-                // Store stripped payload in read_buf for potential partial copy.
-                this.read_buf = payload;
-                this.read_offset = 0;
-
-                let to_copy = this.read_buf.len().min(buf.remaining());
-                buf.put_slice(this.read_buf.get(..to_copy).unwrap_or(&[]));
-                this.read_offset = to_copy;
-                if this.read_offset >= this.read_buf.len() {
-                    this.read_buf.clear();
-                    this.read_offset = 0;
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for ByteStreamWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let payload_len = buf.len() as u32;
-        let header = FrameHeader {
-            len: payload_len,
-            tag: 0,
-            flags: 0,
-            _reserved: [0; 3],
-        };
-        let header_bytes = header.encode();
-
-        // Build the framed buffer: [FrameHeader 12 bytes][user payload].
-        let mut write_buf = Vec::with_capacity(header_bytes.len() + buf.len());
-        write_buf.extend_from_slice(&header_bytes);
-        write_buf.extend_from_slice(buf);
-
-        match Pin::new(&mut this.writer).poll_write(cx, &write_buf) {
-            Poll::Ready(Ok(n)) => {
-                // Report payload bytes written (not header+payload).
-                let payload_written = n.saturating_sub(header_bytes.len());
-                Poll::Ready(Ok(payload_written))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
-    }
-}
+// SAFETY: Reader, Writer, BlockingReader, and BlockingWriter are safe to
+// send across threads (they encapsulate shared memory regions backed by
+// process-level mappings).
+unsafe impl Send for ByteStream {}

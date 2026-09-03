@@ -21,7 +21,6 @@ use selium_guest::{
     Context, TcpListener, TcpStream, debug, entrypoint, error, info, mark_ready, spawn, warn,
 };
 use tokio_rustls::TlsAcceptor;
-
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
 // wasm32-unknown-unknown — the backend actually used is getrandom's `custom`

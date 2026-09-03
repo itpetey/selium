@@ -18,9 +18,8 @@
 
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
 use selium_guest::net::bytes::{ByteStreamReader, ByteStreamWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Relay copy buffer size.
 pub const RELAY_BUFFER_SIZE: usize = 16 * 1024;

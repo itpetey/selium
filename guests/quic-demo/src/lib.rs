@@ -21,16 +21,53 @@ use selium_guest::{
     warn,
 };
 
-/// The `sel-quic://` name this demo serves. Must match the test client's SNI
-/// and the test certificate's SAN (`localhost`).
-const SERVE_NAME: &str = "sel-quic://localhost";
-
 /// Bind attempts before giving up. The connector's Tier-1 `sel-quic` handler
 /// registration is published to the discovery feed before this guest boots,
 /// but the discovery guest consumes feed events on its own reactor turns, so
 /// a registration racing ahead of that consumption is answered `NoHandler` —
 /// retry briefly instead of failing the deployment.
 const BIND_ATTEMPTS: u8 = 10;
+/// The `sel-quic://` name this demo serves. Must match the test client's SNI
+/// and the test certificate's SAN (`localhost`).
+const SERVE_NAME: &str = "sel-quic://localhost";
+
+/// Attempts to bind the route, retrying briefly on failure.
+async fn bind_with_retry(ctx: &mut Context, uri: &str) -> Result<QuicServe, GuestError> {
+    for attempt in 1..BIND_ATTEMPTS {
+        match QuicServe::bind(ctx, uri).await {
+            Ok(serve) => return Ok(serve),
+            Err(e) => {
+                warn!("quic-demo: bind attempt {attempt}/{BIND_ATTEMPTS} failed: {e}; retrying");
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    QuicServe::bind(ctx, uri).await
+}
+
+/// Echoes one relayed stream.
+///
+/// Reads until the client's FIN surfaces as EOF on the stream's channel,
+/// writes the payload back, then drops the stream: the blocking writer's drop
+/// decrements the ring's writer count, so the connector observes ring EOF and
+/// finishes the QUIC stream on the wire (the client sees its FIN).
+async fn echo_stream(stream: QuicStream) {
+    let mut stream = stream;
+    let mut payload = Vec::new();
+    if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut payload).await {
+        error!("quic-demo: stream read failed: {e}");
+        return;
+    }
+    let len = payload.len();
+    info!("quic-demo: eof after {len} bytes, echoing");
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, &payload).await {
+        error!("quic-demo: stream write failed: {e}");
+        return;
+    }
+    info!("quic-demo: echo written, closing");
+    drop(stream);
+    info!("quic-demo: echoed {len} bytes");
+}
 
 /// Serves QUIC byte streams relayed by the connector: register the route with
 /// discovery, then echo each accepted stream.
@@ -64,20 +101,6 @@ async fn quic_demo(ctx: Context) {
     }
 }
 
-/// Attempts to bind the route, retrying briefly on failure.
-async fn bind_with_retry(ctx: &mut Context, uri: &str) -> Result<QuicServe, GuestError> {
-    for attempt in 1..BIND_ATTEMPTS {
-        match QuicServe::bind(ctx, uri).await {
-            Ok(serve) => return Ok(serve),
-            Err(e) => {
-                warn!("quic-demo: bind attempt {attempt}/{BIND_ATTEMPTS} failed: {e}; retrying");
-                sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-    QuicServe::bind(ctx, uri).await
-}
-
 /// Sleeps for `duration` via the guest `Sleep` hostcall.
 async fn sleep(duration: Duration) {
     let deadline = match Instant::now() {
@@ -85,28 +108,4 @@ async fn sleep(duration: Duration) {
         Err(_) => Instant::MAX,
     };
     Timer::new(deadline).await;
-}
-
-/// Echoes one relayed stream.
-///
-/// Reads until the client's FIN surfaces as EOF on the stream's channel,
-/// writes the payload back, then drops the stream: the blocking writer's drop
-/// decrements the ring's writer count, so the connector observes ring EOF and
-/// finishes the QUIC stream on the wire (the client sees its FIN).
-async fn echo_stream(stream: QuicStream) {
-    let mut stream = stream;
-    let mut payload = Vec::new();
-    if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut payload).await {
-        error!("quic-demo: stream read failed: {e}");
-        return;
-    }
-    let len = payload.len();
-    info!("quic-demo: eof after {len} bytes, echoing");
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, &payload).await {
-        error!("quic-demo: stream write failed: {e}");
-        return;
-    }
-    info!("quic-demo: echo written, closing");
-    drop(stream);
-    info!("quic-demo: echoed {len} bytes");
 }

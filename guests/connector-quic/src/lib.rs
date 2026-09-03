@@ -26,7 +26,6 @@ use rustls_pemfile as pemfile;
 use selium_guest::{
     Context, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
 };
-
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
 // wasm32-unknown-unknown — the backend actually used is getrandom's `custom`
@@ -47,6 +46,13 @@ pub mod runtime;
 pub mod stream;
 pub mod udp_adapter;
 
+/// Default listener address for the QUIC connector.
+///
+/// Deferred policy: recorded in the connector's config, not spec behaviour
+/// (see design open questions).
+const QUIC_LISTEN_ADDR: &str = "0.0.0.0:4433";
+/// QUIC close code used for handshake refusal (crypto error, unspecified).
+const REFUSE_ERROR_CODE: u32 = 0x100;
 /// Manifest name for the certificate chain PEM.
 const TLS_CERT_MANIFEST: &str = "cert-pem";
 /// Manifest name for the private key PEM.
@@ -77,6 +83,111 @@ impl std::fmt::Display for TlsError {
     }
 }
 
+/// Builds a quinn server endpoint from an abstract UDP socket and runtime.
+///
+/// This is the quinn-on-wasm32 seam: every endpoint in this crate is built via
+/// [`quinn::Endpoint::new_with_abstract_socket`], with the connector supplying
+/// both halves quinn needs (the shm datagram adapter and the guest runtime).
+pub fn build_endpoint(
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    runtime: Arc<dyn quinn::Runtime>,
+    server_config: Option<ServerConfig>,
+) -> std::io::Result<quinn::Endpoint> {
+    quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        server_config,
+        socket,
+        runtime,
+    )
+}
+
+/// Serves one QUIC connection: resolve its serving guest once from SNI, then
+/// relay every accepted bidirectional stream to that guest over a per-stream
+/// byte channel.
+///
+/// Exposed for the connector's integration tests: the refusal path (unknown
+/// or absent SNI) closes the connection before any guest contact.
+pub async fn handle_connection(connection: quinn::Connection, resolver: ResolverHandle) {
+    // Route from the handshake SNI. Unknown/absent SNI refuses the connection
+    // without ever contacting an app guest.
+    let Some(server_name) = sni_of(&connection) else {
+        warn!("quic-connector: refusing connection with no SNI");
+        connection.close(REFUSE_ERROR_CODE.into(), b"no server name");
+        return;
+    };
+
+    let target = match resolver.lock().await.resolve(&server_name).await {
+        Ok(target) => target,
+        Err(ResolveError::NotFound) => {
+            warn!("quic-connector: refusing connection: no route for {server_name}");
+            connection.close(REFUSE_ERROR_CODE.into(), b"unknown server name");
+            return;
+        }
+    };
+
+    // Deliver every accepted stream over its own byte channel.
+    let sender = match ResourceSender::attach(target.resource_id) {
+        Ok(sender) => sender,
+        Err(e) => {
+            warn!("quic-connector: attach to guest queue failed: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                warn!("quic-connector: accept_bi failed: {e}");
+                break;
+            }
+        };
+
+        let channel = match crate::stream::QuicChannel::allocate() {
+            Ok(channel) => channel,
+            Err(e) => {
+                warn!("quic-connector: stream channel allocation failed: {e}");
+                continue;
+            }
+        };
+
+        if let Err(e) = sender.send(channel.shared_id()).await {
+            // Stale route: evict so the next connection re-resolves.
+            warn!("quic-connector: stream delivery failed: {e}");
+            resolver.lock().await.evict(&server_name);
+            continue;
+        }
+
+        let (guest_reader, guest_writer) = channel.into_halves();
+        spawn(relay_stream(recv, send, guest_reader, guest_writer));
+    }
+}
+
+/// Registers the wasm32 time source backing `web_time::Instant`, forwarding to
+/// the hostcall monotonic and wall clocks.
+///
+/// Must run before any TLS/quinn operation on wasm32.
+#[cfg(target_arch = "wasm32")]
+pub fn register_wasm_time_source() {
+    web_time::set_custom_time_source(web_time::TimeSource {
+        monotonic_ns: || {
+            selium_guest::time::Instant::now()
+                .expect("TimeMonotonic hostcall")
+                .as_nanos()
+        },
+        wall_clock_ns: || selium_guest::time::now().expect("TimeNow hostcall"),
+    });
+}
+
+/// Extracts the rustls server name (SNI) from an established connection.
+pub fn sni_of(connection: &quinn::Connection) -> Option<String> {
+    let data = connection.handshake_data()?;
+    let handshake = data
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?;
+    handshake.server_name
+}
+
 /// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
 /// when built with the `custom` backend (`getrandom_backend = "custom"`).
 ///
@@ -105,40 +216,6 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
     }
     Ok(())
-}
-
-/// Registers the wasm32 time source backing `web_time::Instant`, forwarding to
-/// the hostcall monotonic and wall clocks.
-///
-/// Must run before any TLS/quinn operation on wasm32.
-#[cfg(target_arch = "wasm32")]
-pub fn register_wasm_time_source() {
-    web_time::set_custom_time_source(web_time::TimeSource {
-        monotonic_ns: || {
-            selium_guest::time::Instant::now()
-                .expect("TimeMonotonic hostcall")
-                .as_nanos()
-        },
-        wall_clock_ns: || selium_guest::time::now().expect("TimeNow hostcall"),
-    });
-}
-
-/// Builds a quinn server endpoint from an abstract UDP socket and runtime.
-///
-/// This is the quinn-on-wasm32 seam: every endpoint in this crate is built via
-/// [`quinn::Endpoint::new_with_abstract_socket`], with the connector supplying
-/// both halves quinn needs (the shm datagram adapter and the guest runtime).
-pub fn build_endpoint(
-    socket: Arc<dyn quinn::AsyncUdpSocket>,
-    runtime: Arc<dyn quinn::Runtime>,
-    server_config: Option<ServerConfig>,
-) -> std::io::Result<quinn::Endpoint> {
-    quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        server_config,
-        socket,
-        runtime,
-    )
 }
 
 /// Entrypoint for the QUIC connector system guest.
@@ -224,86 +301,6 @@ async fn connector_quic(ctx: Context) {
         });
     }
 }
-
-/// Serves one QUIC connection: resolve its serving guest once from SNI, then
-/// relay every accepted bidirectional stream to that guest over a per-stream
-/// byte channel.
-///
-/// Exposed for the connector's integration tests: the refusal path (unknown
-/// or absent SNI) closes the connection before any guest contact.
-pub async fn handle_connection(connection: quinn::Connection, resolver: ResolverHandle) {
-    // Route from the handshake SNI. Unknown/absent SNI refuses the connection
-    // without ever contacting an app guest.
-    let Some(server_name) = sni_of(&connection) else {
-        warn!("quic-connector: refusing connection with no SNI");
-        connection.close(REFUSE_ERROR_CODE.into(), b"no server name");
-        return;
-    };
-
-    let target = match resolver.lock().await.resolve(&server_name).await {
-        Ok(target) => target,
-        Err(ResolveError::NotFound) => {
-            warn!("quic-connector: refusing connection: no route for {server_name}");
-            connection.close(REFUSE_ERROR_CODE.into(), b"unknown server name");
-            return;
-        }
-    };
-
-    // Deliver every accepted stream over its own byte channel.
-    let sender = match ResourceSender::attach(target.resource_id) {
-        Ok(sender) => sender,
-        Err(e) => {
-            warn!("quic-connector: attach to guest queue failed: {e}");
-            return;
-        }
-    };
-
-    loop {
-        let (send, recv) = match connection.accept_bi().await {
-            Ok(streams) => streams,
-            Err(e) => {
-                warn!("quic-connector: accept_bi failed: {e}");
-                break;
-            }
-        };
-
-        let channel = match crate::stream::QuicChannel::allocate() {
-            Ok(channel) => channel,
-            Err(e) => {
-                warn!("quic-connector: stream channel allocation failed: {e}");
-                continue;
-            }
-        };
-
-        if let Err(e) = sender.send(channel.shared_id()).await {
-            // Stale route: evict so the next connection re-resolves.
-            warn!("quic-connector: stream delivery failed: {e}");
-            resolver.lock().await.evict(&server_name);
-            continue;
-        }
-
-        let (guest_reader, guest_writer) = channel.into_halves();
-        spawn(relay_stream(recv, send, guest_reader, guest_writer));
-    }
-}
-
-/// Extracts the rustls server name (SNI) from an established connection.
-pub fn sni_of(connection: &quinn::Connection) -> Option<String> {
-    let data = connection.handshake_data()?;
-    let handshake = data
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
-        .ok()?;
-    handshake.server_name
-}
-
-/// QUIC close code used for handshake refusal (crypto error, unspecified).
-const REFUSE_ERROR_CODE: u32 = 0x100;
-
-/// Default listener address for the QUIC connector.
-///
-/// Deferred policy: recorded in the connector's config, not spec behaviour
-/// (see design open questions).
-const QUIC_LISTEN_ADDR: &str = "0.0.0.0:4433";
 
 /// Loads the QUIC server TLS config from storage via the connector's
 /// `Storage` grant. Fails loudly on missing or invalid material.

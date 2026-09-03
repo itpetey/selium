@@ -35,22 +35,9 @@ use selium_connector_quic::{
     sni_of,
     udp_adapter::QuicUdpSocket,
 };
+
 const CERT_DER: &[u8] = include_bytes!("fixtures/cert.der");
 const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
-
-/// Builds the server config from the embedded self-signed test certificate,
-/// returning the certificate so the client can trust it.
-fn server_config() -> (
-    ServerConfig,
-    quinn::rustls::pki_types::CertificateDer<'static>,
-) {
-    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-
-    let cert = CertificateDer::from(CERT_DER.to_vec());
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER.to_vec()));
-    let config = ServerConfig::with_single_cert(vec![cert.clone()], key).expect("server config");
-    (config, cert)
-}
 
 /// A native test-only `quinn::AsyncUdpSocket` over `tokio::net::UdpSocket`.
 struct TokioUdpSocket {
@@ -63,16 +50,13 @@ struct TokioUdpPoller {
     writable: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>>,
 }
 
-impl std::fmt::Debug for TokioUdpSocket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokioUdpSocket").finish_non_exhaustive()
-    }
-}
+/// A native test-only `quinn::Runtime` over the tokio executor.
+#[derive(Debug, Default)]
+struct TokioRuntime;
 
-impl std::fmt::Debug for TokioUdpPoller {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokioUdpPoller").finish_non_exhaustive()
-    }
+struct TokioTimer {
+    deadline: std::time::Instant,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl quinn::AsyncUdpSocket for TokioUdpSocket {
@@ -138,6 +122,12 @@ impl quinn::AsyncUdpSocket for TokioUdpSocket {
     }
 }
 
+impl std::fmt::Debug for TokioUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokioUdpSocket").finish_non_exhaustive()
+    }
+}
+
 impl quinn::UdpPoller for TokioUdpPoller {
     fn poll_writable(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.writable.is_none() {
@@ -155,20 +145,9 @@ impl quinn::UdpPoller for TokioUdpPoller {
     }
 }
 
-/// A native test-only `quinn::Runtime` over the tokio executor.
-#[derive(Debug, Default)]
-struct TokioRuntime;
-
-struct TokioTimer {
-    deadline: std::time::Instant,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl std::fmt::Debug for TokioTimer {
+impl std::fmt::Debug for TokioUdpPoller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TokioTimer")
-            .field("deadline", &self.deadline)
-            .finish()
+        f.debug_struct("TokioUdpPoller").finish_non_exhaustive()
     }
 }
 
@@ -231,92 +210,12 @@ impl quinn::AsyncTimer for TokioTimer {
     }
 }
 
-/// The production shm adapter + guest runtime satisfy quinn's trait bounds.
-///
-/// This is the compile-level verification for the wasm-only types (they cannot
-/// drive a real handshake natively); the wire behaviour is exercised by the
-/// runtime substrate tests once the guest is built for wasm32.
-#[test]
-fn production_adapter_types_satisfy_quinn_trait_bounds() {
-    fn assert_udp<T: quinn::AsyncUdpSocket>() {}
-    fn assert_runtime<T: quinn::Runtime>() {}
-    fn assert_timer<T: quinn::AsyncTimer>() {}
-    assert_udp::<QuicUdpSocket>();
-    assert_runtime::<ConnectorRuntime>();
-    assert_timer::<ConnectorTimer>();
-}
-
-/// Unknown SNI is refused: the connector closes the connection before ever
-/// contacting an app guest (no discovery context = nothing to contact).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_sni_is_refused_without_guest_contact() {
-    let (server_config, cert) = server_config();
-
-    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind server socket");
-    let server_addr = server_socket.local_addr().expect("server addr");
-    let server_socket = TokioUdpSocket {
-        inner: Arc::new(server_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let endpoint = build_endpoint(
-        Arc::new(server_socket),
-        Arc::new(TokioRuntime),
-        Some(server_config),
-    )
-    .expect("build server endpoint");
-
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind client socket");
-    let client_socket = TokioUdpSocket {
-        inner: Arc::new(client_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
-        .expect("build client endpoint");
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert).expect("add root cert");
-    client_endpoint.set_default_client_config(
-        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
-    );
-
-    // Connect with a valid server name (so TLS succeeds) and drive both sides.
-    let client_task = {
-        let ep = client_endpoint.clone();
-        tokio::spawn(async move {
-            ep.connect(server_addr, "localhost")
-                .expect("connect")
-                .await
-                .expect("client connection")
-        })
-    };
-    let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let incoming = endpoint.accept().await.expect("server incoming");
-        incoming.await.expect("server handshake")
-    })
-    .await
-    .expect("handshake completes");
-    let client_conn = client_task.await.expect("client task");
-
-    // The presented SNI is recovered from the handshake.
-    assert_eq!(sni_of(&server_conn).as_deref(), Some("localhost"));
-
-    // An empty resolver = no registered route: the connector must refuse and
-    // close the connection without contacting any app guest.
-    let resolver: selium_connector_quic::resolve::ResolverHandle =
-        Arc::new(tokio::sync::Mutex::new(RouteResolver::empty()));
-    handle_connection(server_conn.clone(), resolver).await;
-
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), server_conn.closed())
-        .await
-        .is_ok();
-    assert!(closed, "unknown SNI must be refused and closed");
-
-    drop(client_conn);
-    drop(endpoint);
-    drop(client_endpoint);
+impl std::fmt::Debug for TokioTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokioTimer")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -406,6 +305,108 @@ async fn handshake_completes_and_relays_a_stream() {
     send.finish().expect("server finish");
 
     client_stream_task.await.expect("client stream task");
+
+    drop(client_conn);
+    drop(endpoint);
+    drop(client_endpoint);
+}
+
+/// The production shm adapter + guest runtime satisfy quinn's trait bounds.
+///
+/// This is the compile-level verification for the wasm-only types (they cannot
+/// drive a real handshake natively); the wire behaviour is exercised by the
+/// runtime substrate tests once the guest is built for wasm32.
+#[test]
+fn production_adapter_types_satisfy_quinn_trait_bounds() {
+    fn assert_udp<T: quinn::AsyncUdpSocket>() {}
+    fn assert_runtime<T: quinn::Runtime>() {}
+    fn assert_timer<T: quinn::AsyncTimer>() {}
+    assert_udp::<QuicUdpSocket>();
+    assert_runtime::<ConnectorRuntime>();
+    assert_timer::<ConnectorTimer>();
+}
+
+/// Builds the server config from the embedded self-signed test certificate,
+/// returning the certificate so the client can trust it.
+fn server_config() -> (
+    ServerConfig,
+    quinn::rustls::pki_types::CertificateDer<'static>,
+) {
+    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let cert = CertificateDer::from(CERT_DER.to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER.to_vec()));
+    let config = ServerConfig::with_single_cert(vec![cert.clone()], key).expect("server config");
+    (config, cert)
+}
+
+/// Unknown SNI is refused: the connector closes the connection before ever
+/// contacting an app guest (no discovery context = nothing to contact).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_sni_is_refused_without_guest_contact() {
+    let (server_config, cert) = server_config();
+
+    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind server socket");
+    let server_addr = server_socket.local_addr().expect("server addr");
+    let server_socket = TokioUdpSocket {
+        inner: Arc::new(server_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let endpoint = build_endpoint(
+        Arc::new(server_socket),
+        Arc::new(TokioRuntime),
+        Some(server_config),
+    )
+    .expect("build server endpoint");
+
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let client_socket = TokioUdpSocket {
+        inner: Arc::new(client_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
+        .expect("build client endpoint");
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert).expect("add root cert");
+    client_endpoint.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
+    );
+
+    // Connect with a valid server name (so TLS succeeds) and drive both sides.
+    let client_task = {
+        let ep = client_endpoint.clone();
+        tokio::spawn(async move {
+            ep.connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("client connection")
+        })
+    };
+    let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let incoming = endpoint.accept().await.expect("server incoming");
+        incoming.await.expect("server handshake")
+    })
+    .await
+    .expect("handshake completes");
+    let client_conn = client_task.await.expect("client task");
+
+    // The presented SNI is recovered from the handshake.
+    assert_eq!(sni_of(&server_conn).as_deref(), Some("localhost"));
+
+    // An empty resolver = no registered route: the connector must refuse and
+    // close the connection without contacting any app guest.
+    let resolver: selium_connector_quic::resolve::ResolverHandle =
+        Arc::new(tokio::sync::Mutex::new(RouteResolver::empty()));
+    handle_connection(server_conn.clone(), resolver).await;
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), server_conn.closed())
+        .await
+        .is_ok();
+    assert!(closed, "unknown SNI must be refused and closed");
 
     drop(client_conn);
     drop(endpoint);

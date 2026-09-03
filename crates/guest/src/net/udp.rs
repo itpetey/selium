@@ -229,30 +229,6 @@ impl UdpSocket {
 // SAFETY: Reader and Writer are backed by process-level shared memory mappings.
 unsafe impl Send for UdpSocket {}
 
-/// Returns whether `needed` bytes can be written to the send ring without
-/// overwriting the slowest blocking reader or writer.
-fn send_ring_writable(region: &selium_shm::ChannelRegion, needed: u64) -> Result<bool> {
-    let tail = region
-        .read_next_tail()
-        .map_err(|e| GuestError::Host(e.to_string()))?;
-    let reader = region
-        .minimum_reader_position()
-        .map_err(|e| GuestError::Host(e.to_string()))?
-        .unwrap_or(tail);
-    let writer = region
-        .minimum_writer_position()
-        .map_err(|e| GuestError::Host(e.to_string()))?
-        .unwrap_or(tail);
-    let pinned = reader.min(writer);
-
-    // Available space = capacity - (tail - pinned). A nil pin (no blocking
-    // reader/writer registered) leaves the full capacity available.
-    let available = pinned
-        .saturating_sub(tail)
-        .saturating_add(region.capacity());
-    Ok(available >= needed)
-}
-
 /// Decode a binary frame into a `Datagram`, returning `None` if malformed.
 pub fn decode_datagram(frame: &[u8]) -> Option<Datagram> {
     decode_udp_frame(frame)
@@ -333,6 +309,30 @@ fn encode_udp_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
     }
     frame.extend_from_slice(payload);
     frame
+}
+
+/// Returns whether `needed` bytes can be written to the send ring without
+/// overwriting the slowest blocking reader or writer.
+fn send_ring_writable(region: &selium_shm::ChannelRegion, needed: u64) -> Result<bool> {
+    let tail = region
+        .read_next_tail()
+        .map_err(|e| GuestError::Host(e.to_string()))?;
+    let reader = region
+        .minimum_reader_position()
+        .map_err(|e| GuestError::Host(e.to_string()))?
+        .unwrap_or(tail);
+    let writer = region
+        .minimum_writer_position()
+        .map_err(|e| GuestError::Host(e.to_string()))?
+        .unwrap_or(tail);
+    let pinned = reader.min(writer);
+
+    // Available space = capacity - (tail - pinned). A nil pin (no blocking
+    // reader/writer registered) leaves the full capacity available.
+    let available = pinned
+        .saturating_sub(tail)
+        .saturating_add(region.capacity());
+    Ok(available >= needed)
 }
 
 #[cfg(test)]

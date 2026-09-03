@@ -17,6 +17,116 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
+fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u64) {
+    let discovery = spawn_guest(runtime, "discovery", Vec::new());
+    let (status, _) = runtime.begin_hostcall(
+        discovery,
+        HostcallRequest::RecordResolvedQueueFor {
+            client_process_id: client,
+            shared_id,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "discovery service must record resolve results"
+    );
+}
+
+/// Task 6.2 substrate layer: a full Park ring parks writers (no loss), the
+/// channel mechanism the connector's backpressure honesty is built on.
+#[tokio::test]
+async fn full_ring_parks_writes_until_consumed() {
+    drop(selium_memory::set_region_provider(Box::new(
+        selium_memory::HeapRegionProvider::new(),
+    )));
+
+    let capacity: u64 = 128;
+    let channel = selium_shm::Channel::create_with_backpressure(
+        capacity,
+        selium_shm::ChannelBackpressure::Park,
+        selium_abi::ResourceKind::SharedMemory,
+    )
+    .expect("create park channel");
+    let dummy = selium_shm::Channel::create_with_backpressure(
+        64,
+        selium_shm::ChannelBackpressure::Park,
+        selium_abi::ResourceKind::SharedMemory,
+    )
+    .expect("create dummy channel");
+
+    let writer_transport =
+        selium_shm::ShmTransport::new(&dummy, &channel).expect("writer transport");
+    let reader_transport =
+        selium_shm::ShmTransport::new(&channel, &dummy).expect("reader transport");
+
+    let mut writer = selium_wire::FramedWrite::new(writer_transport);
+    let mut reader = selium_wire::FramedRead::new(reader_transport);
+
+    let payload = [0xABu8; 16];
+    let frame_size = selium_memory::FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
+    let max_frames = (capacity / frame_size) as u32;
+
+    for tag in 0..max_frames {
+        writer
+            .write_frame_with_flags_async(&payload, tag, selium_memory::FrameHeader::FLAG_READY)
+            .await
+            .expect("write within capacity");
+    }
+
+    // A write past capacity must park, not overflow.
+    let mut write_handle = tokio::spawn(async move {
+        writer
+            .write_frame_with_flags_async(
+                &payload,
+                max_frames,
+                selium_memory::FrameHeader::FLAG_READY,
+            )
+            .await
+    });
+    let parked = tokio::time::timeout(std::time::Duration::from_millis(100), &mut write_handle)
+        .await
+        .is_err();
+    assert!(parked, "a write past ring capacity must park, not overflow");
+
+    let (frame, tag, flags) = reader.read_frame().expect("read first frame");
+    assert_eq!(frame, payload);
+    assert_eq!(tag, 0);
+    assert_ne!(flags & selium_memory::FrameHeader::FLAG_READY, 0);
+
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut write_handle)
+        .await
+        .expect("parked write must resume once capacity frees");
+    assert!(resumed.is_ok(), "resumed write must succeed");
+
+    // Drain everything: no bytes lost to backpressure.
+    let mut tags = vec![0u32];
+    for expected in 1..=max_frames {
+        loop {
+            match reader.read_frame() {
+                Ok((frame, tag, _)) => {
+                    assert_eq!(frame, payload);
+                    assert_eq!(tag, expected);
+                    tags.push(tag);
+                    break;
+                }
+                Err(selium_wire::Error::BufferEmpty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+    }
+    assert_eq!(tags, (0..=max_frames).collect::<Vec<u32>>());
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!(
+        "(module (memory 1) (func (export \"{entrypoint}\")))"
+    ))
+    .expect("compile wat")
+}
+
 /// Task 6.1 substrate layer: the connector ↔ app-guest channel handoff.
 ///
 /// Mirrors the HTTP connector golden path: the app guest creates a listener
@@ -279,116 +389,6 @@ fn quic_stream_isolation_and_ungranted_attach_denied() {
     }
 
     let _ = app;
-}
-
-/// Task 6.2 substrate layer: a full Park ring parks writers (no loss), the
-/// channel mechanism the connector's backpressure honesty is built on.
-#[tokio::test]
-async fn full_ring_parks_writes_until_consumed() {
-    drop(selium_memory::set_region_provider(Box::new(
-        selium_memory::HeapRegionProvider::new(),
-    )));
-
-    let capacity: u64 = 128;
-    let channel = selium_shm::Channel::create_with_backpressure(
-        capacity,
-        selium_shm::ChannelBackpressure::Park,
-        selium_abi::ResourceKind::SharedMemory,
-    )
-    .expect("create park channel");
-    let dummy = selium_shm::Channel::create_with_backpressure(
-        64,
-        selium_shm::ChannelBackpressure::Park,
-        selium_abi::ResourceKind::SharedMemory,
-    )
-    .expect("create dummy channel");
-
-    let writer_transport =
-        selium_shm::ShmTransport::new(&dummy, &channel).expect("writer transport");
-    let reader_transport =
-        selium_shm::ShmTransport::new(&channel, &dummy).expect("reader transport");
-
-    let mut writer = selium_wire::FramedWrite::new(writer_transport);
-    let mut reader = selium_wire::FramedRead::new(reader_transport);
-
-    let payload = [0xABu8; 16];
-    let frame_size = selium_memory::FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
-    let max_frames = (capacity / frame_size) as u32;
-
-    for tag in 0..max_frames {
-        writer
-            .write_frame_with_flags_async(&payload, tag, selium_memory::FrameHeader::FLAG_READY)
-            .await
-            .expect("write within capacity");
-    }
-
-    // A write past capacity must park, not overflow.
-    let mut write_handle = tokio::spawn(async move {
-        writer
-            .write_frame_with_flags_async(
-                &payload,
-                max_frames,
-                selium_memory::FrameHeader::FLAG_READY,
-            )
-            .await
-    });
-    let parked = tokio::time::timeout(std::time::Duration::from_millis(100), &mut write_handle)
-        .await
-        .is_err();
-    assert!(parked, "a write past ring capacity must park, not overflow");
-
-    let (frame, tag, flags) = reader.read_frame().expect("read first frame");
-    assert_eq!(frame, payload);
-    assert_eq!(tag, 0);
-    assert_ne!(flags & selium_memory::FrameHeader::FLAG_READY, 0);
-
-    let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut write_handle)
-        .await
-        .expect("parked write must resume once capacity frees");
-    assert!(resumed.is_ok(), "resumed write must succeed");
-
-    // Drain everything: no bytes lost to backpressure.
-    let mut tags = vec![0u32];
-    for expected in 1..=max_frames {
-        loop {
-            match reader.read_frame() {
-                Ok((frame, tag, _)) => {
-                    assert_eq!(frame, payload);
-                    assert_eq!(tag, expected);
-                    tags.push(tag);
-                    break;
-                }
-                Err(selium_wire::Error::BufferEmpty) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => panic!("unexpected read error: {e}"),
-            }
-        }
-    }
-    assert_eq!(tags, (0..=max_frames).collect::<Vec<u32>>());
-}
-
-fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new());
-    let (status, _) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "discovery service must record resolve results"
-    );
-}
-
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!(
-        "(module (memory 1) (func (export \"{entrypoint}\")))"
-    ))
-    .expect("compile wat")
 }
 
 fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {

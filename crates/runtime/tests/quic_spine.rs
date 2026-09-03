@@ -57,12 +57,9 @@ use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDesc
 /// before the connector guest boots (the same PEM fixtures the
 /// `selium-connector-quic` native handshake tests derive their DER from).
 const CERT_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixtures/cert.pem");
-const KEY_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixtures/key.pem");
-
 /// The connector's fixed listener (its `QUIC_LISTEN_ADDR` const).
 const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
-/// SNI / `sel-quic://` route name; must match the certificate's SAN.
-const SERVER_NAME: &str = "localhost";
+const KEY_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixtures/key.pem");
 /// Per-stream payload. Sized for the wasm interpreter's current QUIC
 /// throughput: each wire packet costs tens of milliseconds of interpreted
 /// crypto, so bulk transfers crawl (and the connector's default 30 s idle
@@ -71,11 +68,162 @@ const SERVER_NAME: &str = "localhost";
 /// connector's 64 KiB per-direction ring capacity — so each direction is
 /// forced through at least one park/resume cycle by payload size alone.
 const PAYLOAD_LEN: usize = 16 * 1024;
-
+/// SNI / `sel-quic://` route name; must match the certificate's SAN.
+const SERVER_NAME: &str = "localhost";
 /// Warm-up round trips driven before the timed payload streams (see the
 /// handshake comment). Each opens a stream, so the guest-side "one accept
 /// per stream" assertion counts these too; keep the two in sync.
 const WARMUP_ROUNDS: usize = 12;
+
+/// The QUIC connector system guest. Empty arguments + no well-known URI mean
+/// bootstrap injects the discovery handle as the leading entrypoint argument
+/// (consumed by the `Context` parameter) and grants attach rights for the
+/// discovery listener. `handlers: ["sel-quic"]` publishes the Tier-1
+/// protocol-handler registration discovery requires before accepting the
+/// demo's Tier-2 `sel-quic://localhost` route.
+fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "quic-connector".to_string(),
+        module_id: "quic-connector-module".to_string(),
+        module_bytes,
+        entrypoint: "connector_quic".to_string(),
+        arguments: Vec::new(), // discovery handle injected by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+            ),
+        ],
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: None,
+        handlers: vec!["sel-quic".to_string()],
+    }
+}
+
+fn connector_wasm() -> Vec<u8> {
+    read_wasm("selium-connector-quic", "selium_connector_quic.wasm")
+}
+
+/// The echo demo app guest. Note the grants: HostQueue (create its listener,
+/// attach the discovery listener) + SharedMemory (attach delivered stream
+/// regions) — **no `Network` grant**: QUIC is terminated by the connector.
+fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "quic-demo".to_string(),
+        module_id: "quic-demo-module".to_string(),
+        module_bytes,
+        entrypoint: "quic_demo".to_string(),
+        arguments: Vec::new(), // discovery handle injected by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+        ],
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        well_known_uri: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn demo_wasm() -> Vec<u8> {
+    read_wasm("selium-quic-demo", "selium_quic_demo.wasm")
+}
+
+/// The discovery system guest, exactly as the `discovery` integration test
+/// deploys it: the guest is named `"discovery"` so bootstrap wires the feed
+/// region and listener handle into its arguments and grants.
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        well_known_uri: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn discovery_wasm() -> Vec<u8> {
+    read_wasm("selium-discovery", "selium_discovery.wasm")
+}
+
+/// Drains a guest's log channel and decodes each frame as a `LogRecord`.
+fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .kernel()
+        .processes()
+        .drain_log_channel(process_id)
+        .expect("drain log channel")
+        .iter()
+        .map(|frame| {
+            selium_encoding::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
+
+/// Opens one bidirectional stream, writes `payload`, finishes (client FIN),
+/// then reads the echo to end-of-stream (the guest's close surfaces as the
+/// wire FIN via the connector) and returns it. The caller asserts on the
+/// content so failure output can include guest-side logs.
+async fn echo_round_trip(connection: &quinn::Connection, payload: Vec<u8>) -> Vec<u8> {
+    let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
+
+    send.write_all(&payload).await.expect("client write");
+    send.finish().expect("client finish");
+
+    let mut echo = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        // `None` from quinn's read is end-of-stream.
+        let n = recv
+            .read(&mut chunk)
+            .await
+            .expect("client echo read")
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        echo.extend_from_slice(&chunk[..n]);
+    }
+    echo
+}
 
 /// Golden path: external quinn client → connector handshake + streams →
 /// per-stream channels → demo guest echo → bytes returned, byte-identical,
@@ -281,99 +429,53 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     drop(client);
 }
 
-/// The discovery system guest, exactly as the `discovery` integration test
-/// deploys it: the guest is named `"discovery"` so bootstrap wires the feed
-/// region and listener handle into its arguments and grants.
-fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
-        well_known_uri: None,
-        handlers: Vec::new(),
-    }
+/// A deterministic payload of `size` bytes parameterised by `seed`, so a
+/// cross-stream leak between the two concurrent streams corrupts an
+/// assertion instead of passing silently.
+fn payload(size: usize, seed: u8) -> Vec<u8> {
+    (0..size)
+        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
-/// The QUIC connector system guest. Empty arguments + no well-known URI mean
-/// bootstrap injects the discovery handle as the leading entrypoint argument
-/// (consumed by the `Context` parameter) and grants attach rights for the
-/// discovery listener. `handlers: ["sel-quic"]` publishes the Tier-1
-/// protocol-handler registration discovery requires before accepting the
-/// demo's Tier-2 `sel-quic://localhost` route.
-fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "quic-connector".to_string(),
-        module_id: "quic-connector-module".to_string(),
-        module_bytes,
-        entrypoint: "connector_quic".to_string(),
-        arguments: Vec::new(), // discovery handle injected by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
-            ),
-        ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: None,
-        handlers: vec!["sel-quic".to_string()],
+/// Reads a guest WASM module, with an actionable error if it is missing.
+///
+/// Prefers a release-profile artifact: this test drives a TLS 1.3 handshake
+/// and bulk stream relay through the wasm interpreter, which is too slow at
+/// debug optimization for the quinn defaults (and the test timeout) to
+/// tolerate.
+#[expect(
+    clippy::panic,
+    reason = "missing build artifact is a hard test failure"
+)]
+fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
+    // Resolve the workspace target dir from this crate's manifest dir: cargo
+    // runs test binaries with the package root as working directory, so a
+    // bare relative default would resolve outside the workspace.
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let release = PathBuf::from(&target_dir)
+        .join("wasm32-unknown-unknown/release")
+        .join(file_name);
+    if let Ok(bytes) = std::fs::read(&release) {
+        return bytes;
     }
-}
-
-/// The echo demo app guest. Note the grants: HostQueue (create its listener,
-/// attach the discovery listener) + SharedMemory (attach delivered stream
-/// regions) — **no `Network` grant**: QUIC is terminated by the connector.
-fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "quic-demo".to_string(),
-        module_id: "quic-demo-module".to_string(),
-        module_bytes,
-        entrypoint: "quic_demo".to_string(),
-        arguments: Vec::new(), // discovery handle injected by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-        ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: None,
-        handlers: Vec::new(),
-    }
+    let debug = PathBuf::from(&target_dir)
+        .join("wasm32-unknown-unknown/debug")
+        .join(file_name);
+    std::fs::read(&debug).unwrap_or_else(|_error| {
+        panic!(
+            "{crate_name} guest not found at {} (or {}).\n\
+             Build it first (release preferred — see this test's docs):\n  \
+             cargo build --release --target wasm32-unknown-unknown -p {crate_name}",
+            release.display(),
+            debug.display()
+        )
+    })
 }
 
 /// Provisions the connector's TLS material into the `tls-certs` blob store
@@ -427,110 +529,6 @@ fn trusting_client_config() -> quinn::ClientConfig {
     transport.initial_rtt(Duration::from_millis(250));
     config.transport_config(Arc::new(transport));
     config
-}
-
-/// Opens one bidirectional stream, writes `payload`, finishes (client FIN),
-/// then reads the echo to end-of-stream (the guest's close surfaces as the
-/// wire FIN via the connector) and returns it. The caller asserts on the
-/// content so failure output can include guest-side logs.
-async fn echo_round_trip(connection: &quinn::Connection, payload: Vec<u8>) -> Vec<u8> {
-    let (mut send, mut recv) = connection.open_bi().await.expect("open stream");
-
-    send.write_all(&payload).await.expect("client write");
-    send.finish().expect("client finish");
-
-    let mut echo = Vec::new();
-    let mut chunk = [0u8; 65536];
-    loop {
-        // `None` from quinn's read is end-of-stream.
-        let n = recv
-            .read(&mut chunk)
-            .await
-            .expect("client echo read")
-            .unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        echo.extend_from_slice(&chunk[..n]);
-    }
-    echo
-}
-
-/// A deterministic payload of `size` bytes parameterised by `seed`, so a
-/// cross-stream leak between the two concurrent streams corrupts an
-/// assertion instead of passing silently.
-fn payload(size: usize, seed: u8) -> Vec<u8> {
-    (0..size)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
-        .collect()
-}
-
-fn discovery_wasm() -> Vec<u8> {
-    read_wasm("selium-discovery", "selium_discovery.wasm")
-}
-
-fn connector_wasm() -> Vec<u8> {
-    read_wasm("selium-connector-quic", "selium_connector_quic.wasm")
-}
-
-fn demo_wasm() -> Vec<u8> {
-    read_wasm("selium-quic-demo", "selium_quic_demo.wasm")
-}
-
-/// Reads a guest WASM module, with an actionable error if it is missing.
-///
-/// Prefers a release-profile artifact: this test drives a TLS 1.3 handshake
-/// and bulk stream relay through the wasm interpreter, which is too slow at
-/// debug optimization for the quinn defaults (and the test timeout) to
-/// tolerate.
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
-fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    // Resolve the workspace target dir from this crate's manifest dir: cargo
-    // runs test binaries with the package root as working directory, so a
-    // bare relative default would resolve outside the workspace.
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .to_string_lossy()
-            .into_owned()
-    });
-    let release = PathBuf::from(&target_dir)
-        .join("wasm32-unknown-unknown/release")
-        .join(file_name);
-    if let Ok(bytes) = std::fs::read(&release) {
-        return bytes;
-    }
-    let debug = PathBuf::from(&target_dir)
-        .join("wasm32-unknown-unknown/debug")
-        .join(file_name);
-    std::fs::read(&debug).unwrap_or_else(|_error| {
-        panic!(
-            "{crate_name} guest not found at {} (or {}).\n\
-             Build it first (release preferred — see this test's docs):\n  \
-             cargo build --release --target wasm32-unknown-unknown -p {crate_name}",
-            release.display(),
-            debug.display()
-        )
-    })
-}
-
-/// Drains a guest's log channel and decodes each frame as a `LogRecord`.
-fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
-        .iter()
-        .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
 }
 
 /// Polls a guest's log channel until every `(needle, count)` pair is

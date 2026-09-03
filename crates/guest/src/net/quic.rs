@@ -47,11 +47,11 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
+use super::bytes::ByteStream;
 use selium_abi::{InterfaceMetadata, ResourceTarget, uri};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::bytes::ByteStream;
 use crate::{Context, GuestError, ResourceListener};
 
 /// Protocol scheme for QUIC routes (`sel-quic://…`).
