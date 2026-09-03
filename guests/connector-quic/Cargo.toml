@@ -15,7 +15,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-futures = { workspace = true, features = ["std"] }
 getrandom.workspace = true
 parking_lot.workspace = true
 quinn = { workspace = true, features = ["rustls-ring"] }
@@ -29,6 +28,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tracing.workspace = true
 web-time.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
 # ring gates `SystemRandom`'s `SecureRandom` impl on wasm32-unknown-unknown
 # behind its `wasm32_unknown_unknown_js` feature. The feature exists only to
 # satisfy ring's cfg: the getrandom backend actually used is `custom` (see
@@ -37,12 +39,6 @@ web-time.workspace = true
 # dependencies) is never enabled for native builds.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
-
-[dev-dependencies]
-futures = { workspace = true, features = ["std"] }
-rustls = { workspace = true, features = ["ring", "std"] }
-selium-encoding.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true
