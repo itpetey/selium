@@ -114,7 +114,7 @@ impl Runtime {
             };
             let ambient = tokio::runtime::Handle::try_current().ok();
             if let Some(handle) = ambient.as_ref() {
-                let _ = self.timer_handle.set(handle.clone());
+                drop(self.timer_handle.set(handle.clone()));
             }
             match ambient.or_else(|| self.timer_handle.get().cloned()) {
                 Some(handle) => drop(handle.spawn(timer)),

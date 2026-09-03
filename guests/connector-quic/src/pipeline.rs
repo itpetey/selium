@@ -36,11 +36,11 @@ pub trait FinishSink: AsyncWrite + Unpin {
 
 impl FinishSink for quinn::SendStream {
     fn finish(&mut self) {
-        let _ = quinn::SendStream::finish(self);
+        drop(quinn::SendStream::finish(self));
     }
 
     fn reset(&mut self, code: quinn::VarInt) {
-        let _ = quinn::SendStream::reset(self, code);
+        drop(quinn::SendStream::reset(self, code));
     }
 }
 
@@ -63,6 +63,7 @@ where
                 return Ok(total);
             }
             Ok(n) => {
+                #[expect(clippy::indexing_slicing, reason = "n is bounded by read() return value")]
                 guest_writer.write_all(&buf[..n]).await?;
                 total += n as u64;
             }
@@ -89,6 +90,7 @@ where
                 return Ok(());
             }
             Ok(n) => {
+                #[expect(clippy::indexing_slicing, reason = "n is bounded by read() return value")]
                 if let Err(e) = wire_send.write_all(&buf[..n]).await {
                     wire_send.reset(0u32.into());
                     return Err(e);
@@ -118,7 +120,7 @@ pub async fn relay_stream<R, W>(
 {
     let to_guest = pump_client_to_guest(wire_recv, guest_writer);
     let to_client = pump_guest_to_client(guest_reader, wire_send);
-    let _ = tokio::join!(to_guest, to_client);
+    drop(tokio::join!(to_guest, to_client));
 }
 
 #[cfg(test)]

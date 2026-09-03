@@ -93,6 +93,7 @@ impl AsyncUdpSocket for QuicUdpSocket {
                     return Poll::Ready(Ok(0));
                 };
                 let n = datagram.payload.len().min(buf.len());
+                #[expect(clippy::indexing_slicing, reason = "n is bounded by min(buf.len(), payload.len())")]
                 buf[..n].copy_from_slice(&datagram.payload[..n]);
                 *meta_slot = RecvMeta {
                     addr: datagram.addr,
