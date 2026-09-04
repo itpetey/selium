@@ -126,6 +126,7 @@ fn app_guest_without_network_grants() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: alloc.region_id,
+            metadata: Vec::new(),
         },
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
@@ -412,6 +413,7 @@ fn http_connector_golden_path() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: alloc.region_id,
+            metadata: Vec::new(),
         },
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
@@ -543,6 +545,7 @@ fn keep_alive_ordering_preserved() {
             HostcallRequest::HostQueueSend {
                 local_id: queue.local_id,
                 value,
+                metadata: Vec::new(),
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -702,6 +705,7 @@ fn ungranted_region_attach_denied() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: alloc.region_id,
+            metadata: Vec::new(),
         },
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);

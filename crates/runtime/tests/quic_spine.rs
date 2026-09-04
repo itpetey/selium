@@ -44,7 +44,6 @@
 //! time.
 
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -52,6 +51,8 @@ use std::{
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+
+mod common;
 
 /// Connector TLS material, provisioned into the `tls-certs` blob store
 /// before the connector guest boots (the same PEM fixtures the
@@ -220,7 +221,7 @@ async fn echo_round_trip(connection: &quinn::Connection, payload: Vec<u8>) -> Ve
         if n == 0 {
             break;
         }
-        echo.extend_from_slice(&chunk[..n]);
+        echo.extend_from_slice(chunk.get(..n).unwrap_or_default());
     }
     echo
 }
@@ -233,6 +234,10 @@ async fn echo_round_trip(connection: &quinn::Connection, payload: Vec<u8>) -> Ve
 // test provides a Tokio runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the discovery, connector and demo guests built for wasm32-unknown-unknown"]
+#[expect(
+    clippy::large_futures,
+    reason = "the warm-up and payload round-trips intentionally run inline for deterministic join semantics"
+)]
 async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     let runtime = Runtime::default();
     seed_tls_blob_store(&runtime);
@@ -444,38 +449,11 @@ fn payload(size: usize, seed: u8) -> Vec<u8> {
 /// and bulk stream relay through the wasm interpreter, which is too slow at
 /// debug optimization for the quinn defaults (and the test timeout) to
 /// tolerate.
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    // Resolve the workspace target dir from this crate's manifest dir: cargo
-    // runs test binaries with the package root as working directory, so a
-    // bare relative default would resolve outside the workspace.
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .to_string_lossy()
-            .into_owned()
-    });
-    let release = PathBuf::from(&target_dir)
-        .join("wasm32-unknown-unknown/release")
-        .join(file_name);
-    if let Ok(bytes) = std::fs::read(&release) {
-        return bytes;
-    }
-    let debug = PathBuf::from(&target_dir)
-        .join("wasm32-unknown-unknown/debug")
-        .join(file_name);
-    std::fs::read(&debug).unwrap_or_else(|_error| {
-        panic!(
-            "{crate_name} guest not found at {} (or {}).\n\
-             Build it first (release preferred — see this test's docs):\n  \
-             cargo build --release --target wasm32-unknown-unknown -p {crate_name}",
-            release.display(),
-            debug.display()
-        )
-    })
+    // The shared reader prefers the release profile and fails loudly when
+    // the artifact is older than the guest's sources (stale guest wasm is
+    // not ABI-safe against the runtime and fails incomprehensibly).
+    common::read_guest_wasm(crate_name, file_name)
 }
 
 /// Provisions the connector's TLS material into the `tls-certs` blob store

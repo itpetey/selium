@@ -147,7 +147,10 @@ pub fn tcp_bind(
                         drop(memory.detach_shared_region(parent_local_id));
                     });
 
-                    if let Err(e) = k.queues().host_queue_send(queue_local_id, 0, shared_id) {
+                    if let Err(e) =
+                        k.queues()
+                            .host_queue_send(queue_local_id, 0, shared_id, Vec::new())
+                    {
                         eprintln!("failed to enqueue connection: {e}");
                     } else {
                         // The connection is queued: wake the guest parked on
@@ -628,8 +631,8 @@ mod tests {
             if let Ok((mut stream, _)) = server.accept() {
                 let mut buf = [0u8; 256];
                 if let Ok(n) = stream.read(&mut buf) {
-                    let _ = stream.write_all(&buf[..n]);
-                    let _ = stream.flush();
+                    drop(stream.write_all(&buf[..n]));
+                    drop(stream.flush());
                 }
             }
         });

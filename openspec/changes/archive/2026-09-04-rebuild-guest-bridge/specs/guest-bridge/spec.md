@@ -1,8 +1,14 @@
-## Purpose
+## REMOVED Requirements
 
-Define the reference bridge guest that terminates external QUIC connections and transparently proxies `selium-wire` frames into shared-memory rings, enabling external clients to communicate with inner guests through the Selium fabric.
+### Requirement: Bridge Guest Per External User
+**Reason**: The bridge is rebuilt around per-stream `bridge-channel` processes rather than a single process per external user. One process per user assumes one QUIC connection per user and pushes channel multiplexing into the bridge.
+**Migration**: Use the per-stream `bridge-channel` model added below; an external client opens one QUIC stream per fabric channel it joins.
 
-## Requirements
+### Requirement: Acceptor Guest Demux
+**Reason**: The acceptor role is replaced by the per-tenant `bridge-server`, which terminates nothing itself and is served by the existing `quic-connector` rather than owning a public UDP endpoint.
+**Migration**: Deploy a `bridge-server` per tenant registered at `sel-quic://<tenant>/bridge`; the connector delivers authenticated streams to it.
+
+## MODIFIED Requirements
 
 ### Requirement: Transparent Frame Proxy
 A bridge-channel SHALL be a transparent relay: `selium-wire` frames SHALL pass through unchanged between the relayed QUIC stream and the fabric channel. Correlation IDs (frame tags), payload bytes, and frame flags SHALL be preserved end-to-end. The bridge-channel SHALL NOT decode or re-encode payload contents.
@@ -34,6 +40,8 @@ The bridge-server and bridge-channel SHALL be implemented as standard WASM guest
 #### Scenario: Bridge deployed via normal guest lifecycle
 - **WHEN** the platform starts a bridge-server and it spawns bridge-channel guests via `Process::start` holding the client's grants
 - **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initializes a pipe and relays frames to/from channels within its grants
+
+## ADDED Requirements
 
 ### Requirement: Per-Tenant Bridge Server
 The system SHALL support a `bridge-server` system guest deployed one per tenant. The bridge-server SHALL register a `sel-quic://<tenant>/bridge` serving route so the QUIC connector delivers bridge-bound connections to it as per-stream handoffs. The bridge-server SHALL NOT terminate QUIC itself and SHALL NOT relay stream bytes.

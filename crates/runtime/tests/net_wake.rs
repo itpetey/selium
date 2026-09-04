@@ -19,11 +19,12 @@
 
 use std::{
     io::{Read, Write},
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
+
+mod common;
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
@@ -176,22 +177,11 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 
 /// Returns the path to the compiled net-demo WASM module, with an
 /// actionable error if it is missing.
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
+/// Reads the net-demo WASM module, failing loudly when it is missing or
+/// older than its sources (stale guest wasm is not ABI-safe against the
+/// runtime and fails incomprehensibly).
 fn net_demo_wasm() -> Vec<u8> {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
-    let path = PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm");
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "net demo guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p selium-net-demo",
-            path.display()
-        )
-    })
+    common::read_guest_wasm_debug("selium-net-demo", "selium_net_demo.wasm")
 }
 
 /// Polls the guest log channel until a message containing `needle` appears.

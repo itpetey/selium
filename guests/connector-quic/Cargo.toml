@@ -24,6 +24,7 @@ selium-abi.workspace = true
 selium-guest.workspace = true
 selium-memory.workspace = true
 selium-shm.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tracing.workspace = true
 web-time.workspace = true

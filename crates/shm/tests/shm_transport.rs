@@ -71,15 +71,10 @@ async fn bidi_stream_backpressure_no_spin_no_loss() {
 
         // Receive all items from client.
         let mut items = Vec::new();
-        loop {
-            match request_stream.recv().await.expect("recv") {
-                Some(item) => {
-                    items.push(item);
-                    if items.len() == 8 {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(item) = request_stream.recv().await.expect("recv") {
+            items.push(item);
+            if items.len() == 8 {
+                break;
             }
         }
         assert_eq!(items.len(), 8);
@@ -400,7 +395,7 @@ async fn server_drop_sends_cancel_to_client() {
     let server_handle = tokio::spawn(async move {
         let req = server.recv().await.expect("recv request");
         drop(req); // abandon without finish/send_error
-        let _ = dropped_tx.send(());
+        dropped_tx.send(()).unwrap_or_default();
         // Hold the connection (and writers) open.
         for _ in 0..2000 {
             tokio::task::yield_now().await;
@@ -420,6 +415,10 @@ async fn server_drop_sends_cancel_to_client() {
         // a hang waiting for peer close. Bounded by yield count so a
         // regression fails the assertion instead of hanging forever.
         let mut got_none = false;
+        #[expect(
+            clippy::never_loop,
+            reason = "`poll_fn(...).await` parks until the stream resolves; the counter only bounds the wait as written"
+        )]
         for _ in 0..100_000 {
             // Yield between polls so the server task gets scheduled; keeps
             // this from being a tight spin while still bounding the wait.
@@ -439,7 +438,7 @@ async fn server_drop_sends_cancel_to_client() {
         );
     }
 
-    dropped_rx.try_recv().ok();
+    dropped_rx.try_recv().unwrap_or_default();
     server_handle.await.expect("server task");
 }
 
@@ -597,7 +596,7 @@ async fn server_stream_drop_cancels() {
         // Wait for cancel via the check.
         for _ in 0..200 {
             if req.check_cancel() {
-                let _ = cancel_tx.send(());
+                cancel_tx.send(()).unwrap_or_default();
                 return;
             }
             tokio::task::yield_now().await;

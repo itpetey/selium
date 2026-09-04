@@ -63,7 +63,10 @@ where
                 return Ok(total);
             }
             Ok(n) => {
-                #[expect(clippy::indexing_slicing, reason = "n is bounded by read() return value")]
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "n is bounded by read() return value"
+                )]
                 guest_writer.write_all(&buf[..n]).await?;
                 total += n as u64;
             }
@@ -89,8 +92,12 @@ where
                 wire_send.finish();
                 return Ok(());
             }
-            Ok(n) => {
-                #[expect(clippy::indexing_slicing, reason = "n is bounded by read() return value")]
+            Ok(n) =>
+            {
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "n is bounded by read() return value"
+                )]
                 if let Err(e) = wire_send.write_all(&buf[..n]).await {
                     wire_send.reset(0u32.into());
                     return Err(e);

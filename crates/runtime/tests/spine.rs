@@ -14,7 +14,7 @@
 //! cargo test -p selium-runtime --test spine -- --ignored
 //! ```
 
-use std::path::PathBuf;
+mod common;
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
@@ -56,28 +56,11 @@ fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
-/// Reads the spine-demo WASM module, with an actionable error if it is missing.
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
+/// Reads the spine-demo WASM module, failing loudly when it is missing or
+/// older than its sources (stale guest wasm is not ABI-safe against the
+/// runtime and fails incomprehensibly).
 fn spine_demo_wasm() -> Vec<u8> {
-    let path = spine_demo_wasm_path();
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "spine demo guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p selium-spine-demo",
-            path.display()
-        )
-    })
-}
-
-/// Returns the path to the compiled spine-demo WASM module.
-fn spine_demo_wasm_path() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_error| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target").to_string());
-    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_spine_demo.wasm")
+    common::read_guest_wasm_debug("selium-spine-demo", "selium_spine_demo.wasm")
 }
 
 #[test]

@@ -106,6 +106,7 @@ fn concurrent_connections_use_distinct_regions() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: region_a.region_id,
+            metadata: Vec::new(),
         },
     );
     let _ = runtime.begin_hostcall(
@@ -113,6 +114,7 @@ fn concurrent_connections_use_distinct_regions() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: region_b.region_id,
+            metadata: Vec::new(),
         },
     );
 
@@ -796,6 +798,7 @@ fn zero_grant_guest_round_trip_via_host_queue() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: alloc.region_id,
+            metadata: Vec::new(),
         },
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);

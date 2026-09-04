@@ -18,7 +18,7 @@
 //! cargo test -p selium-runtime --test discovery -- --ignored
 //! ```
 
-use std::path::PathBuf;
+mod common;
 
 use selium_abi::{
     Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
@@ -61,8 +61,8 @@ fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<Vec<u8>, ShmTransport
 #[test]
 #[ignore = "requires both discovery and discovery-probe guests built for wasm32-unknown-unknown"]
 fn discovery_bootstrap_slice_end_to_end() {
-    let discovery_wasm = read_wasm(&discovery_wasm_path());
-    let probe_wasm = read_wasm(&discovery_probe_wasm_path());
+    let discovery_wasm = discovery_wasm();
+    let probe_wasm = discovery_probe_wasm();
 
     let runtime = Runtime::default();
     let report = runtime
@@ -247,14 +247,6 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
-fn discovery_probe_wasm_path() -> PathBuf {
-    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery_probe.wasm")
-}
-
-fn discovery_wasm_path() -> PathBuf {
-    target_dir().join("wasm32-unknown-unknown/debug/selium_discovery.wasm")
-}
-
 fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
     let frames = runtime
         .kernel()
@@ -313,25 +305,15 @@ fn drain_revoke_uris(
     uris
 }
 
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
-fn read_wasm(path: &std::path::Path) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_else(|_error| {
-        panic!(
-            "guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-discovery-probe",
-            path.display()
-        )
-    })
+fn discovery_wasm() -> Vec<u8> {
+    // The shared reader fails loudly when the artifact is missing or older
+    // than the guest's sources (stale guest wasm is not ABI-safe against the
+    // runtime and fails incomprehensibly).
+    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
 }
 
-fn target_dir() -> PathBuf {
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_error| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target").to_string());
-    PathBuf::from(target_dir)
+fn discovery_probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-discovery-probe", "selium_discovery_probe.wasm")
 }
 
 /// A minimal guest serving the DNS connector's well-known URI: its

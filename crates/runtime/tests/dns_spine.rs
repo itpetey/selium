@@ -14,12 +14,11 @@
 //! cargo test -p selium-runtime --test dns_spine -- --ignored
 //! ```
 
-use std::{
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector};
+
+mod common;
 use selium_encoding::FlatMsg;
 use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
@@ -52,10 +51,7 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
 }
 
 fn connector_wasm() -> Vec<u8> {
-    read_wasm(
-        "selium-connector-dns",
-        "wasm32-unknown-unknown/debug/selium_connector_dns.wasm",
-    )
+    read_wasm("selium-connector-dns", "selium_connector_dns.wasm")
 }
 
 fn demo_descriptor(
@@ -97,10 +93,7 @@ fn demo_descriptor(
 }
 
 fn demo_wasm() -> Vec<u8> {
-    read_wasm(
-        "selium-dns-demo",
-        "wasm32-unknown-unknown/debug/selium_dns_demo.wasm",
-    )
+    read_wasm("selium-dns-demo", "selium_dns_demo.wasm")
 }
 
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
@@ -175,22 +168,11 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
         .expect("stop connector");
 }
 
-#[expect(
-    clippy::panic,
-    reason = "missing build artifact is a hard test failure"
-)]
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
-    let path = PathBuf::from(target_dir).join(file_name);
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "{crate_name} guest not found at {}.\n\
-             Build it first:\n  \
-             cargo build --target wasm32-unknown-unknown -p {crate_name}",
-            path.display()
-        )
-    })
+    // The shared reader fails loudly when the artifact is missing or older
+    // than the guest's sources (stale guest wasm is not ABI-safe against
+    // the runtime and fails incomprehensibly).
+    common::read_guest_wasm_debug(crate_name, file_name)
 }
 
 /// A loopback UDP server that answers every A query for `example.test` with

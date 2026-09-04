@@ -12,6 +12,8 @@ members = [
   "crates/runtime",
   "crates/shm",
   "crates/wire",
+  "guests/bridge",
+  "guests/bridge-channel",
   "guests/connector-dns",
   "guests/connector-http",
   "guests/connector-quic",
@@ -24,7 +26,6 @@ members = [
 ]
 exclude = ["vendor"]
 # Frozen during the spine rebuild (kept in-tree for later increments):
-#   "crates/guests/bridge"
 #   "crates/guests/cluster"
 #   "crates/guests/external-api"
 #   "crates/guests/scheduler"

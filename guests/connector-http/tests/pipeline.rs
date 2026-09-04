@@ -647,6 +647,7 @@ async fn pipelined_requests_get_distinct_tags_and_ordered_responses() {
 }
 
 /// Reads from `client` until the buffer contains `marker` (or EOF).
+#[expect(clippy::panic, reason = "test helper")]
 async fn read_until(client: &mut tokio::io::DuplexStream, marker: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -660,7 +661,7 @@ async fn read_until(client: &mut tokio::io::DuplexStream, marker: &str) -> Vec<u
         match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk)).await
         {
             Ok(Ok(0)) => return buf,
-            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Ok(n)) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
             Ok(Err(e)) => panic!("client read error: {e}"),
             Err(_) => panic!(
                 "timed out waiting for marker {marker:?}; got so far: {:?}",

@@ -106,6 +106,39 @@ pub fn record_resolved_queue_for(
     .map(|_| ())
 }
 
+/// The calling process's own identity: process id and tenant scope.
+///
+/// System guests use this to verify handoff identities against their own
+/// tenant (e.g. the bridge-server refuses clients whose authenticated
+/// tenant scope differs from its own).
+pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
+    match hostcall_ready(HostcallRequest::SelfInfo)? {
+        HostcallOutput::SelfInfo { process_id, tenant } => Ok((process_id, tenant)),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for SelfInfo: {other:?}"
+        ))),
+    }
+}
+
+/// Resolves the bootstrap-registered protocol handler for `scheme`
+/// (e.g. `sel-quic`) to its process id.
+///
+/// Handler registrations are Tier-1 (runtime-published at bootstrap), so the
+/// result cannot be forged by guests. Serve-side guests use it to pin the
+/// process legitimately allowed to deliver handoffs (see
+/// [`ResourceListener::expect_sender`](crate::ResourceListener::expect_sender)).
+pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::ProcessId>> {
+    match hostcall_ready(HostcallRequest::ResolveProtocolHandler {
+        scheme: scheme.to_string(),
+    })? {
+        HostcallOutput::U64(process_id) => Ok(Some(process_id)),
+        HostcallOutput::Empty => Ok(None),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ResolveProtocolHandler: {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn hostcall_async(request: HostcallRequest) -> HostcallFuture {
     HostcallFuture {
         request: Some(request),

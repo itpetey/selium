@@ -9,6 +9,7 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
 
+#[expect(clippy::panic, reason = "test helper")]
 fn assert_failed_with_code(
     runtime: &Runtime,
     process_id: u64,

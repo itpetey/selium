@@ -213,6 +213,7 @@ fn quic_channel_handoff_golden_path() {
         HostcallRequest::HostQueueSend {
             local_id: connector_queue.local_id,
             value: alloc.region_id,
+            metadata: Vec::new(),
         },
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);

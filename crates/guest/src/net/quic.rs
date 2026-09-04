@@ -97,13 +97,21 @@ impl QuicServe {
     /// `sel-quic://my-app`). The runtime allocates a host queue for the
     /// listener and registers the URI→queue mapping with discovery.
     ///
+    /// The listener is **pinned to the registered `sel-quic` protocol
+    /// handler** (the QUIC connector): handoffs from any other process are
+    /// refused. Handoff metadata is sender-controlled, so without the pin
+    /// any guest able to attach the queue could forge handoffs. Binding
+    /// fails when no connector is registered — serving unpinned handoffs
+    /// would reintroduce that vector.
+    ///
     /// The guest requires a channel attach grant but **no `Network` grant** —
     /// QUIC is terminated and relayed by the connector.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
         require_quic_scheme(uri)?;
 
-        let listener = ResourceListener::create()
+        let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
+        super::pin_to_scheme_handler(&mut listener, QUIC_SCHEME)?;
 
         let target = quic_target(&listener, uri);
         ctx.register(uri, target).await?;
@@ -216,7 +224,7 @@ mod tests {
 
     #[test]
     fn bind_requires_quic_scheme() {
-        assert!(require_quic_scheme("sel-quic://my-app").is_ok());
+        require_quic_scheme("sel-quic://my-app").expect("`sel-quic://` scheme is accepted");
         assert!(require_quic_scheme("sel-http://my-app").is_err());
         assert!(require_quic_scheme("my-app").is_err());
     }

@@ -152,12 +152,18 @@ impl HttpServe {
     ///
     /// The guest requires a channel attach grant but **no `Network` grant**
     /// — networking is handled by the connector.
+    ///
+    /// The listener is **pinned to the registered `sel-http` protocol
+    /// handler** (the HTTP connector): handoffs from any other process are
+    /// refused, since handoff metadata is sender-controlled. Binding fails
+    /// when no connector is registered.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
         require_http_scheme(uri)?;
 
         // Allocate a host queue for incoming connections (synchronous).
-        let listener = ResourceListener::create()
+        let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
+        super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
 
         let target = http_target(&listener, uri, None);
         ctx.register(uri, target).await?;
@@ -259,11 +265,16 @@ impl HttpServeStream {
     ///
     /// The guest requires a channel attach grant but **no `Network`
     /// grant** — networking is handled by the connector.
+    ///
+    /// The listener is **pinned to the registered `sel-http` protocol
+    /// handler** (the HTTP connector): handoffs from any other process are
+    /// refused. Binding fails when no connector is registered.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
         require_http_scheme(uri)?;
 
-        let listener = ResourceListener::create()
+        let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
+        super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
 
         let target = http_target(
             &listener,

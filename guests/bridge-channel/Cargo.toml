@@ -1,8 +1,8 @@
 [package]
-name = "selium-bridge-server"
+name = "selium-bridge-channel"
 version.workspace = true
 edition.workspace = true
-description = "Per-tenant bridge server system guest (authenticates clients, spawns bridge-channels)"
+description = "Per-stream bridge channel system guest (attaches a relayed region and splices frames)"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -15,12 +15,15 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+rkyv = { workspace = true, features = ["bytecheck", "std"] }
 selium-abi.workspace = true
 selium-guest.workspace = true
+selium-shm.workspace = true
+selium-wire.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
 
 [dev-dependencies]
 selium-memory.workspace = true
-selium-shm.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "time"] }
 
 [lints]

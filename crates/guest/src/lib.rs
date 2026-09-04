@@ -9,7 +9,7 @@ pub use crate::{
     },
     context::Context,
     error::{GuestError, Result},
-    hostcall::{random_bytes, record_resolved_queue_for},
+    hostcall::{random_bytes, record_resolved_queue_for, resolve_protocol_handler, self_info},
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::{mark_ready, process_id},
     process::{ActivityLog, Metering, Process},

@@ -14,10 +14,22 @@
 //!   and timers.
 //! - TLS server material (certificate + key) is loaded from blob storage via
 //!   the connector's `Storage` grant, failing loudly when missing or invalid.
+//! - **Client authentication (mTLS) is opt-in and endpoint-global.** With no
+//!   per-tenant trust anchors configured in the TLS blob store, the connector
+//!   serves without client authentication. When anchors are configured, a
+//!   client certificate verifying against the union of all anchors is required
+//!   for *every* route it serves (there is no per-route or per-SNI client-auth
+//!   policy today; introducing one is deployment nuance tracked as an open
+//!   question, not current spec behaviour). Bridge routes must only be
+//!   deployed on connectors with anchors configured: the bridge-server
+//!   attributes authority from the identity the connector attaches to each
+//!   handoff, so an mTLS-disabled connector must not serve bridge traffic.
 //! - One quinn server endpoint accepts connections; the serving guest for each
 //!   connection is resolved from the handshake SNI (`sel-quic://<name>`), and
 //!   each accepted bidirectional stream is relayed over its own two-ring
-//!   shared-memory channel (see [`pipeline`]).
+//!   shared-memory channel (see [`pipeline`]). Under mTLS, each stream handoff
+//!   carries the authenticated client [`identity`] as metadata; without mTLS,
+//!   handoffs carry empty metadata.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -34,12 +46,14 @@ use selium_guest::{
 use ring as _;
 
 use crate::{
+    identity::{ClientAnchorSet, build_server_config},
     pipeline::relay_stream,
     resolve::{ResolveError, ResolverHandle, RouteResolver},
     runtime::ConnectorRuntime,
     udp_adapter::QuicUdpSocket,
 };
 
+pub mod identity;
 pub mod pipeline;
 pub mod resolve;
 pub mod runtime;
@@ -57,16 +71,22 @@ const REFUSE_ERROR_CODE: u32 = 0x100;
 const TLS_CERT_MANIFEST: &str = "cert-pem";
 /// Manifest name for the private key PEM.
 const TLS_KEY_MANIFEST: &str = "key-pem";
+/// Manifest name for the newline-separated client trust-anchor tenant list.
+const TLS_CLIENT_CA_TENANTS_MANIFEST: &str = "client-ca-tenants";
+/// Manifest prefix for a tenant's client CA anchor PEM (`client-ca-<tenant>`).
+const TLS_CLIENT_CA_MANIFEST_PREFIX: &str = "client-ca-";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
 #[derive(Debug)]
-enum TlsError {
+pub enum TlsError {
     StorageUnavailable,
     MissingCertificate,
     MissingKey,
     InvalidCertificate,
     InvalidKey,
+    MissingClientAnchors,
+    InvalidClientAnchor,
     ConfigError,
 }
 
@@ -78,6 +98,8 @@ impl std::fmt::Display for TlsError {
             TlsError::MissingKey => write!(f, "TLS private key not found"),
             TlsError::InvalidCertificate => write!(f, "invalid TLS certificate"),
             TlsError::InvalidKey => write!(f, "invalid TLS private key"),
+            TlsError::MissingClientAnchors => write!(f, "no client trust anchors configured"),
+            TlsError::InvalidClientAnchor => write!(f, "invalid client trust anchor"),
             TlsError::ConfigError => write!(f, "TLS configuration error"),
         }
     }
@@ -101,13 +123,24 @@ pub fn build_endpoint(
     )
 }
 
-/// Serves one QUIC connection: resolve its serving guest once from SNI, then
-/// relay every accepted bidirectional stream to that guest over a per-stream
-/// byte channel.
+/// Serves one QUIC connection: derive its authenticated client identity, resolve
+/// its serving guest once from SNI, then relay every accepted bidirectional
+/// stream to that guest over a per-stream byte channel, attaching the identity
+/// as handoff metadata.
+///
+/// `anchors` is the **opt-in** mTLS policy: `Some(anchors)` requires every
+/// client to present a certificate verifying against the configured trust
+/// anchors and attaches the derived identity to each handoff; `None` serves
+/// without client authentication and attaches empty metadata.
 ///
 /// Exposed for the connector's integration tests: the refusal path (unknown
-/// or absent SNI) closes the connection before any guest contact.
-pub async fn handle_connection(connection: quinn::Connection, resolver: ResolverHandle) {
+/// or absent SNI, or missing/unverifiable client identity under mTLS)
+/// closes the connection before any guest contact.
+pub async fn handle_connection(
+    connection: quinn::Connection,
+    resolver: ResolverHandle,
+    anchors: Option<ClientAnchorSet>,
+) {
     // Route from the handshake SNI. Unknown/absent SNI refuses the connection
     // without ever contacting an app guest.
     let Some(server_name) = sni_of(&connection) else {
@@ -123,6 +156,22 @@ pub async fn handle_connection(connection: quinn::Connection, resolver: Resolver
             connection.close(REFUSE_ERROR_CODE.into(), b"unknown server name");
             return;
         }
+    };
+
+    // Authenticated identity, attached to each stream handoff so the serving
+    // guest can attribute authority (the bridge-server maps it to grants).
+    // Without configured anchors, mTLS is off and handoffs carry empty
+    // metadata.
+    let identity_metadata = match &anchors {
+        Some(anchors) => match anchors.identity_for(&connection) {
+            Some(identity) => identity.encode(),
+            None => {
+                warn!("quic-connector: refusing connection: unverifiable client identity");
+                connection.close(REFUSE_ERROR_CODE.into(), b"untrusted client certificate");
+                return;
+            }
+        },
+        None => Vec::new(),
     };
 
     // Deliver every accepted stream over its own byte channel.
@@ -151,7 +200,10 @@ pub async fn handle_connection(connection: quinn::Connection, resolver: Resolver
             }
         };
 
-        if let Err(e) = sender.send(channel.shared_id()).await {
+        if let Err(e) = sender
+            .send_with_metadata(channel.shared_id(), identity_metadata.clone())
+            .await
+        {
             // Stale route: evict so the next connection re-resolves.
             warn!("quic-connector: stream delivery failed: {e}");
             resolver.lock().await.evict(&server_name);
@@ -234,10 +286,14 @@ async fn connector_quic(ctx: Context) {
     drop(selium_guest::log::init());
     info!("quic-connector: started");
 
-    let server_config = match load_server_config() {
-        Ok(config) => {
-            info!("quic-connector: TLS configured");
-            config
+    let (server_config, anchors) = match load_server_config() {
+        Ok((config, anchors)) => {
+            if anchors.is_some() {
+                info!("quic-connector: TLS configured (mTLS client authentication)");
+            } else {
+                info!("quic-connector: TLS configured (client authentication disabled)");
+            }
+            (config, anchors)
         }
         Err(e) => {
             error!("quic-connector: TLS setup failed: {e}");
@@ -296,15 +352,17 @@ async fn connector_quic(ctx: Context) {
 
         info!("quic-connector: QUIC handshake complete");
         let resolver = resolver.clone();
+        let anchors = anchors.clone();
         spawn(async move {
-            handle_connection(connection, resolver).await;
+            handle_connection(connection, resolver, anchors).await;
         });
     }
 }
 
-/// Loads the QUIC server TLS config from storage via the connector's
-/// `Storage` grant. Fails loudly on missing or invalid material.
-fn load_server_config() -> Result<ServerConfig, TlsError> {
+/// Loads the QUIC server TLS config and client trust anchors from storage via
+/// the connector's `Storage` grant. Fails loudly on missing or invalid
+/// material. Returns `None` anchors when mTLS is not configured (opt-in).
+fn load_server_config() -> Result<(ServerConfig, Option<ClientAnchorSet>), TlsError> {
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use selium_guest::BlobStore;
 
@@ -385,8 +443,96 @@ fn load_server_config() -> Result<ServerConfig, TlsError> {
         }
     };
 
-    ServerConfig::with_single_cert(certs, key).map_err(|e| {
-        error!("quic-connector: failed to build TLS config: {e}");
-        TlsError::ConfigError
-    })
+    let anchors = load_client_anchors(&store)?;
+    if anchors.is_some() {
+        info!("quic-connector: loaded client trust anchors (mTLS enabled)");
+    }
+    let config = build_server_config(certs, key, anchors.as_ref())?;
+    Ok((config, anchors))
+}
+
+/// Loads per-tenant client trust anchors from the TLS blob store.
+///
+/// **mTLS is opt-in**: an absent `client-ca-tenants` manifest disables client
+/// authentication (`Ok(None)`). When the manifest is present, every listed
+/// tenant's CA anchor must be loadable and valid — a configured but broken
+/// anchor set fails loudly rather than silently downgrading to no client auth.
+fn load_client_anchors(
+    store: &selium_guest::BlobStore,
+) -> Result<Option<ClientAnchorSet>, TlsError> {
+    use rustls_pki_types::CertificateDer;
+
+    let Some(tenants_blob_id) = store
+        .manifest(TLS_CLIENT_CA_TENANTS_MANIFEST)
+        .map_err(|e| {
+            error!("quic-connector: client anchor tenant list manifest failed: {e}");
+            TlsError::MissingClientAnchors
+        })?
+    else {
+        warn!("quic-connector: no client trust anchors configured; mTLS disabled");
+        return Ok(None);
+    };
+    let tenants_blob = store
+        .get(&tenants_blob_id)
+        .map_err(|e| {
+            error!("quic-connector: failed to read client anchor tenant list: {e}");
+            TlsError::MissingClientAnchors
+        })?
+        .ok_or_else(|| {
+            error!("quic-connector: client anchor tenant list is empty");
+            TlsError::MissingClientAnchors
+        })?;
+    let tenants_text = String::from_utf8(tenants_blob).map_err(|e| {
+        error!("quic-connector: client anchor tenant list is not UTF-8: {e}");
+        TlsError::InvalidClientAnchor
+    })?;
+
+    let mut anchors = Vec::new();
+    for tenant in tenants_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let manifest = format!("{TLS_CLIENT_CA_MANIFEST_PREFIX}{tenant}");
+        let blob_id = store
+            .manifest(&manifest)
+            .map_err(|e| {
+                error!("quic-connector: client anchor manifest '{manifest}' failed: {e}");
+                TlsError::MissingClientAnchors
+            })?
+            .ok_or_else(|| {
+                error!("quic-connector: missing client anchor for tenant {tenant}");
+                TlsError::MissingClientAnchors
+            })?;
+        let pem = store
+            .get(&blob_id)
+            .map_err(|e| {
+                error!("quic-connector: failed to read client anchor for {tenant}: {e}");
+                TlsError::MissingClientAnchors
+            })?
+            .ok_or_else(|| {
+                error!("quic-connector: client anchor blob for {tenant} is empty");
+                TlsError::MissingClientAnchors
+            })?;
+
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs: Vec<CertificateDer<'static>> = pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                error!("quic-connector: invalid client anchor PEM for {tenant}: {e}");
+                TlsError::InvalidClientAnchor
+            })?;
+        let ca = certs.into_iter().next().ok_or_else(|| {
+            error!("quic-connector: empty client anchor PEM for {tenant}");
+            TlsError::InvalidClientAnchor
+        })?;
+        anchors.push((tenant.to_string(), ca));
+    }
+
+    if anchors.is_empty() {
+        error!("quic-connector: client anchor tenant list has no tenants");
+        return Err(TlsError::MissingClientAnchors);
+    }
+
+    Ok(Some(ClientAnchorSet::new(anchors)?))
 }

@@ -973,7 +973,7 @@ mod tests {
             .memory
             .lock()
             .expect("memory lock")
-            .read_u32(0 + selium_abi::mailbox::TAIL_OFFSET as u32)
+            .read_u32(selium_abi::mailbox::TAIL_OFFSET as u32)
             .expect("read tail");
         assert_eq!(
             tail as usize,

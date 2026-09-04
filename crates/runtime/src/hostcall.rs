@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Read,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -157,7 +157,7 @@ impl Runtime {
             HostOperationState::Failed(error) => CompletionState::Failed(error.clone()),
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
                 match self.kernel.queues().try_host_queue_recv(local_id) {
-                    Ok(Some((client_process_id, value))) => {
+                    Ok(Some((client_process_id, value, metadata))) => {
                         // Queue handoff: share region ownership on recv.
                         self.share_region_ownership_on_recv(
                             operation.process_id,
@@ -179,6 +179,7 @@ impl Runtime {
                         let output = HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
+                            metadata,
                         };
                         operation.state = HostOperationState::Ready(output.clone());
                         CompletionState::Ready(output)
@@ -1058,13 +1059,46 @@ impl Runtime {
                 }
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
-            HostcallRequest::HostQueueSend { local_id, value } => {
+            HostcallRequest::SelfInfo => Ok(HostOperationState::Ready(HostcallOutput::SelfInfo {
+                process_id,
+                tenant: self.process_tenant(process_id),
+            })),
+            HostcallRequest::ResolveProtocolHandler { scheme } => {
+                // Handler registrations are Tier-1 (bootstrap-published), so
+                // this lookup cannot be forged by guests. Serve-side guests
+                // use it to pin the process legitimately delivering handoffs.
+                let handler = self
+                    .handler_schemes
+                    .lock()
+                    .iter()
+                    .find(|(_, schemes)| schemes.contains(&scheme))
+                    .map(|(pid, _)| *pid);
+                match handler {
+                    Some(pid) => Ok(HostOperationState::Ready(HostcallOutput::U64(pid))),
+                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
+                }
+            }
+            HostcallRequest::HostQueueSend {
+                local_id,
+                value,
+                metadata,
+            } => {
                 self.ensure_local_handle_owner(
                     process_id,
                     Capability::HostQueue,
                     ResourceClass::HostQueue,
                     local_id,
                 )?;
+                if metadata.len() > selium_abi::METADATA_MAX_BYTES {
+                    return Err(AbiError::new(
+                        AbiErrorCode::MalformedPayload,
+                        format!(
+                            "handoff metadata length {} exceeds maximum {}",
+                            metadata.len(),
+                            selium_abi::METADATA_MAX_BYTES
+                        ),
+                    ));
+                }
                 let shared_id = self
                     .kernel
                     .queues()
@@ -1078,7 +1112,7 @@ impl Runtime {
                 )?;
                 self.kernel
                     .queues()
-                    .host_queue_send(local_id, process_id, value)
+                    .host_queue_send(local_id, process_id, value, metadata)
                     .map_err(kernel_error)?;
                 self.wake_host_queue_waiters(shared_id);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
@@ -1107,7 +1141,7 @@ impl Runtime {
                     .try_host_queue_recv(local_id)
                     .map_err(kernel_error)?
                 {
-                    Some((client_process_id, value)) => {
+                    Some((client_process_id, value, metadata)) => {
                         // Queue handoff: if the value matches a shared region
                         // owned by the sender, share ownership with the receiver
                         // (documented rendezvous pattern — the only place
@@ -1116,6 +1150,7 @@ impl Runtime {
                         Ok(HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
+                            metadata,
                         }))
                     }
                     None => Ok(HostOperationState::HostQueueRecvWait {
@@ -1285,7 +1320,7 @@ impl Runtime {
                         HostOperationState::HostQueueRecvWait { local_id, .. } => *local_id,
                         _ => continue,
                     };
-                    if let Ok(Some((client_process_id, value))) =
+                    if let Ok(Some((client_process_id, value, metadata))) =
                         self.kernel.queues().try_host_queue_recv(local_id)
                     {
                         // Queue handoff: mirror the ownership sharing performed
@@ -1302,6 +1337,7 @@ impl Runtime {
                             HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                                 client_process_id,
                                 value,
+                                metadata,
                             });
                         if let Some(task_id) = operation.task_id {
                             wakeups.push((operation.process_id, task_id));
@@ -1465,17 +1501,63 @@ impl Runtime {
         process_id: ProcessId,
         grants: &[CapabilityGrant],
     ) -> std::result::Result<(), AbiError> {
+        // Well-formedness admission always runs, even under delegation.
         self.validate_grants(grants)
             .map_err(|error| AbiError::new(AbiErrorCode::MalformedPayload, error.to_string()))?;
-        let parent_grants = self
-            .restore_process_authority(process_id)
-            .map(|authority| authority.grants)
-            .ok_or_else(|| {
-                AbiError::new(
-                    AbiErrorCode::InvalidHandle,
-                    format!("unknown process authority {process_id}"),
-                )
-            })?;
+        let authority = self.restore_process_authority(process_id).ok_or_else(|| {
+            AbiError::new(
+                AbiErrorCode::InvalidHandle,
+                format!("unknown process authority {process_id}"),
+            )
+        })?;
+
+        // `DelegateGrants` is bootstrap-provisioned only: it can never be
+        // conferred on a child process, not even by a parent that holds it.
+        // Without this, a delegator could spawn further delegators and chain
+        // the exception to authority monotonicity arbitrarily.
+        if grants
+            .iter()
+            .any(|grant| grant.capability == Capability::DelegateGrants)
+        {
+            return Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                "DelegateGrants cannot be delegated to child processes",
+            ));
+        }
+
+        // Tenant-scoped grant delegation: a parent holding a
+        // `DelegateGrants` grant with a tenant selector may confer child
+        // grants it does not itself hold, provided **every** child grant is
+        // itself tenant-scoped within the parent's delegation scope. A
+        // grant without an in-scope `Tenant` selector is unrestricted within
+        // its capability and must therefore fall through to the subset
+        // check: admitting it under delegation would escape the tenant
+        // fence. This is the deliberate, tenant-fenced exception to
+        // authority monotonicity (see the `rebuild-guest-bridge` design, D7).
+        let delegate_scopes: HashSet<&str> = authority
+            .grants
+            .iter()
+            .filter(|grant| grant.capability == Capability::DelegateGrants)
+            .filter_map(|grant| {
+                grant.selectors.iter().find_map(|selector| match selector {
+                    ResourceSelector::Tenant(tenant) => Some(tenant.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+        let delegating = !delegate_scopes.is_empty()
+            && grants.iter().all(|grant| {
+                grant.selectors.iter().any(|selector| match selector {
+                    ResourceSelector::Tenant(tenant) => delegate_scopes.contains(tenant.as_str()),
+                    _ => false,
+                })
+            });
+
+        if delegating {
+            return Ok(());
+        }
+
+        let parent_grants = authority.grants;
         for grant in grants {
             if !parent_grants
                 .iter()
@@ -1559,7 +1641,7 @@ fn to_wasm_prot(prot: selium_abi::RegionProt) -> WasmProt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+    use crate::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
     use selium_abi::{GuestLogEntry, MeteringObservation, ResourceSelector};
 
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
@@ -1582,6 +1664,29 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
+                well_known_uri: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn hostcall test guest")
+    }
+
+    fn spawn_with_grants_and_tenant(
+        runtime: &Runtime,
+        name: &str,
+        grants: Vec<CapabilityGrant>,
+        tenant: Option<&str>,
+    ) -> crate::BootstrappedGuest {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants,
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: tenant.map(str::to_string),
                 well_known_uri: None,
                 handlers: Vec::new(),
             })
@@ -2151,6 +2256,457 @@ mod tests {
             }
             other => panic!("expected failed hostcall for accept-then-deny trap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn delegator_within_tenant_spawns_child_with_extra_grants() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        // A per-tenant bridge-server holding DelegateGrants(Tenant "acme")
+        // but no Network grant of its own can still confer a tenant-scoped
+        // Network grant on a child within the same tenant.
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "delegating-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Network,
+                    vec![
+                        ResourceSelector::Tenant("acme".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                    ],
+                )],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_READY,
+            "delegation within the tenant must succeed"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Ready(HostcallOutput::Process(_))
+        ));
+    }
+
+    #[test]
+    fn non_delegator_out_of_scope_child_denied() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "plain-parent",
+            vec![CapabilityGrant::new(
+                Capability::ProcessLifecycle,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+            )],
+            Some("acme"),
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Network,
+                    vec![
+                        ResourceSelector::Tenant("acme".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                    ],
+                )],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "a non-delegator child grant exceeding its own must be denied"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn delegation_outside_tenant_denied() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Network,
+                    vec![
+                        ResourceSelector::Tenant("beta".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                    ],
+                )],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "delegation outside the tenant must be denied"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn delegation_denies_unscoped_child_grant() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        // The mixed set contains one tenant-scoped grant and one
+        // unrestricted (empty-selector) grant. The unrestricted grant must
+        // not be conferable under delegation: it escapes the tenant fence,
+        // so the spawn falls through to the subset check and is denied.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![
+                    CapabilityGrant::new(
+                        Capability::Network,
+                        vec![
+                            ResourceSelector::Tenant("acme".to_string()),
+                            ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                        ],
+                    ),
+                    CapabilityGrant::new(Capability::Storage, Vec::new()),
+                ],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "an unscoped child grant must not ride the delegation path"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn delegate_grants_cannot_be_conferred_on_children() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        // Attempt to re-delegate `DelegateGrants` itself (tenant-scoped, so
+        // the tenant fence alone would admit it): conferment must be denied
+        // outright.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                )],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "DelegateGrants must never be conferred on a child process"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn self_info_returns_process_id_and_tenant() {
+        let runtime = Runtime::default();
+        let guest =
+            spawn_with_grants_and_tenant(&runtime, "tenant-guest", vec![], Some("acme")).process_id;
+
+        let (status, op) = runtime.begin_hostcall(guest, HostcallRequest::SelfInfo);
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        match runtime.poll_hostcall(guest, op) {
+            CompletionState::Ready(HostcallOutput::SelfInfo { process_id, tenant }) => {
+                assert_eq!(process_id, guest);
+                assert_eq!(tenant.as_deref(), Some("acme"));
+            }
+            other => panic!("expected SelfInfo output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_protocol_handler_returns_registered_handler_pid() {
+        let runtime = Runtime::default();
+        let report = runtime
+            .bootstrap_system_guests(RuntimeConfig {
+                start_discovery: false,
+                system_guests: vec![SystemGuestDescriptor {
+                    name: "quic-connector".to_string(),
+                    module_id: "quic-connector-module".to_string(),
+                    module_bytes: module_with_entrypoint("boot", ""),
+                    entrypoint: "boot".to_string(),
+                    arguments: Vec::new(),
+                    grants: Vec::new(),
+                    dependencies: Vec::new(),
+                    readiness: ReadinessCondition::Immediate,
+                    tenant: None,
+                    well_known_uri: None,
+                    handlers: vec!["sel-quic".to_string()],
+                }],
+            })
+            .expect("bootstrap connector");
+        let connector = report.guests.first().expect("connector").process_id;
+        let bystander =
+            spawn_with_grants_and_tenant(&runtime, "bystander", vec![], None).process_id;
+
+        // A guest can resolve the bootstrap-registered handler for a scheme.
+        let (status, op) = runtime.begin_hostcall(
+            bystander,
+            HostcallRequest::ResolveProtocolHandler {
+                scheme: "sel-quic".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        match runtime.poll_hostcall(bystander, op) {
+            CompletionState::Ready(HostcallOutput::U64(pid)) => assert_eq!(pid, connector),
+            other => panic!("expected handler pid, got {other:?}"),
+        }
+
+        // An unregistered scheme yields Empty, not a forged or stale pid.
+        let (status, op) = runtime.begin_hostcall(
+            bystander,
+            HostcallRequest::ResolveProtocolHandler {
+                scheme: "sel-http".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(bystander, op),
+            CompletionState::Ready(HostcallOutput::Empty)
+        ));
+    }
+
+    #[test]
+    fn host_queue_send_rejects_oversized_metadata() {
+        let runtime = Runtime::default();
+        let sender = spawn_with_grants_and_tenant(
+            &runtime,
+            "meta-sender",
+            vec![CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            )],
+            None,
+        )
+        .process_id;
+
+        let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate);
+        let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
+            runtime.poll_hostcall(sender, op_id)
+        else {
+            panic!("sender should create its listener queue");
+        };
+
+        let oversized = vec![0u8; selium_abi::METADATA_MAX_BYTES + 1];
+        let (status, op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueSend {
+                local_id: queue.local_id,
+                value: 1,
+                metadata: oversized,
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "oversized handoff metadata must be rejected"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(sender, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::MalformedPayload
+        ));
+
+        // The bound itself is admitted.
+        let (status, op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueSend {
+                local_id: queue.local_id,
+                value: 2,
+                metadata: vec![0u8; selium_abi::METADATA_MAX_BYTES],
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        drop(runtime.poll_hostcall(sender, op));
+    }
+
+    #[test]
+    fn spawned_child_inherits_parent_tenant() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "bridge-channel-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "bridge-server-tenant",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        let child_grants = vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                ],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                ],
+            ),
+        ];
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "bridge-channel-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: child_grants,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let child_pid = match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Ready(HostcallOutput::Process(process)) => process.local_id,
+            other => panic!("expected child process descriptor, got {other:?}"),
+        };
+
+        assert_eq!(
+            runtime.process_tenant(child_pid).as_deref(),
+            Some("acme"),
+            "a spawned bridge-channel must inherit the bridge-server's tenant"
+        );
     }
 
     #[test]

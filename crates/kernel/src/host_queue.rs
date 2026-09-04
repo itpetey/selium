@@ -14,7 +14,7 @@ pub struct HostQueueRegistry {
 }
 
 pub(crate) struct HostQueueState {
-    pub(crate) entries: Mutex<VecDeque<(u64, u64)>>,
+    pub(crate) entries: Mutex<VecDeque<(u64, u64, Vec<u8>)>>,
     pub(crate) notify: Condvar,
 }
 
@@ -79,8 +79,14 @@ impl HostQueueRegistry {
         })
     }
 
-    /// Enqueues a value into a host queue.
-    pub fn host_queue_send(&self, local_id: u64, client_process_id: u64, value: u64) -> Result<()> {
+    /// Enqueues a value into a host queue, with optional opaque metadata.
+    pub fn host_queue_send(
+        &self,
+        local_id: u64,
+        client_process_id: u64,
+        value: u64,
+        metadata: Vec<u8>,
+    ) -> Result<()> {
         let shared_id = self
             .inner
             .local_queues
@@ -92,13 +98,16 @@ impl HostQueueRegistry {
         let queue = queues
             .get(&shared_id)
             .ok_or(Error::NotFound(format!("host queue {shared_id}")))?;
-        queue.entries.lock().push_back((client_process_id, value));
+        queue
+            .entries
+            .lock()
+            .push_back((client_process_id, value, metadata));
         queue.notify.notify_all();
         Ok(())
     }
 
     /// Tries to dequeue the next value from a host queue without waiting.
-    pub fn try_host_queue_recv(&self, local_id: u64) -> Result<Option<(u64, u64)>> {
+    pub fn try_host_queue_recv(&self, local_id: u64) -> Result<Option<(u64, u64, Vec<u8>)>> {
         let shared_id = self
             .inner
             .local_queues
