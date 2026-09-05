@@ -5,7 +5,7 @@
 //! metadata carries the authenticated client identity (`tenant` +
 //! fingerprint). The bridge server:
 //!
-//! - binds its serving route (`sel-quic://<tenant>/bridge`) — provisioned by
+//! - binds its serving route (`sel://<tenant>/bridge`) — provisioned by
 //!   the runtime via the `well_known_uri` descriptor field, which injects the
 //!   listener queue's shared id as the leading entrypoint argument and
 //!   registers the URI with discovery;
@@ -148,7 +148,7 @@ const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 /// for this guest's `well_known_uri` route) and the discovery handle (set in
 /// the descriptor's `arguments` so the server can hand it to spawned
 /// bridge-channels). Deployers wire the descriptor as:
-/// `well_known_uri = "sel-quic://<tenant>/bridge"` plus
+/// `well_known_uri = "sel://<tenant>/bridge"` plus
 /// `arguments = [Integer(discovery_handle)]`.
 #[entrypoint]
 async fn bridge_server(listener: u64, discovery: u64) {

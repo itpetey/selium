@@ -25,7 +25,7 @@ While discovery is running, the runtime SHALL publish register/revoke events for
 #### Scenario: Region allocation becomes resolvable
 
 - **WHEN** a process allocates a shared region while discovery is running
-- **THEN** a `sel://process/<pid>/regions/<id>` registration is published on the feed and becomes resolvable through discovery lookup
+- **THEN** a `sel://<tenant>/region/<id>` registration is published on the feed and becomes resolvable through discovery lookup
 
 #### Scenario: Process exit revokes registrations
 

@@ -25,7 +25,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
 
     // Bootstrap the connector (registered Tier-1 handler for `sel-quic`) and
     // the bridge-server (provisioned with its well-known route,
-    // `sel-quic://acme/bridge`) together: the runtime provisions the
+    // `sel://acme/bridge`) together: the runtime provisions the
     // bridge-server's listener host queue, injects its shared id as the
     // leading entrypoint argument, and registers the URI with discovery
     // (4.2: bind registers with discovery).
@@ -78,7 +78,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant: Some("acme".to_string()),
-                    well_known_uri: Some("sel-quic://acme/bridge".to_string()),
+                    well_known_uri: Some("sel://acme/bridge".to_string()),
                     handlers: Vec::new(),
                 },
             ],
@@ -100,7 +100,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
     let (route_uri, route_shared_id) = runtime
         .well_known_uri(bridge_server)
         .expect("route registered with the runtime");
-    assert_eq!(route_uri, "sel-quic://acme/bridge");
+    assert_eq!(route_uri, "sel://acme/bridge");
     assert_eq!(route_shared_id, listener_shared_id);
 
     // The bridge-server pins its listener to the registered `sel-quic`
@@ -161,6 +161,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(stream_region)) =

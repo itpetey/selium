@@ -38,7 +38,7 @@ fn handoff_metadata_delivered() {
     let sender = spawn_guest(&runtime, "meta-sender", backpressure_queue_grants());
     let receiver = spawn_guest(&runtime, "meta-receiver", backpressure_queue_grants());
 
-    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(sender, op_id)
     else {
@@ -99,7 +99,7 @@ fn handoff_no_metadata_yields_empty() {
     let sender = spawn_guest(&runtime, "meta-sender-empty", backpressure_queue_grants());
     let receiver = spawn_guest(&runtime, "meta-receiver-empty", backpressure_queue_grants());
 
-    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(sender, op_id)
     else {

@@ -1,30 +1,10 @@
-## Purpose
+## REMOVED Requirements
 
-Discovery registration enables Selium guests and the runtime to register, revoke, and resolve URI-to-resource mappings through the discovery service, using a single deterministic tenant-scoped URI schema (`sel://<tenant>/<type>/<id>`), tenant-scoped validation of guest custom registrations, and tenant-scoped resolution that fails closed.
+### Requirement: Runtime-authoritative ownership registration
+**Reason**: The `sel://process/<id>/` prefix and the `(process_id, resource_id)` ownership table it populated are replaced by tenant-scoped registration under principal provenance — resources are minted under a serving tenant, not keyed by the allocating process's id in the URI. There is no process prefix left to extract an owner from.
+**Migration**: Register resources as `sel://<tenant>/<type>/<id>`; Tier-2 validation gates on the registering process's own tenant and on ownership of the target resource, which the runtime records separately from the URI.
 
-## Requirements
-
-### Requirement: Discovery URI registration
-The discovery service SHALL accept `DiscoveryRequest::Register { uri, target }` and store the mapping in its registry. It SHALL accept `DiscoveryRequest::Revoke { uri }` and remove the mapping. Both SHALL respond with a confirmation: `DiscoveryResponse::Registered` or `DiscoveryResponse::Revoked`.
-
-#### Scenario: Caller registers a URI
-- **WHEN** a caller sends `DiscoveryRequest::Register { uri: "sel://tenant/logs/app", target }` to the discovery service
-- **THEN** the discovery service SHALL store the mapping and respond with `DiscoveryResponse::Registered`
-- **AND** subsequent `DiscoveryRequest::Resolve("sel://tenant/logs/app")` SHALL return `DiscoveryResponse::Found(target)`
-
-#### Scenario: Caller revokes a URI
-- **WHEN** a caller sends `DiscoveryRequest::Revoke { uri: "sel://tenant/logs/app" }` to the discovery service
-- **THEN** the discovery service SHALL remove the mapping and respond with `DiscoveryResponse::Revoked`
-- **AND** subsequent `DiscoveryRequest::Resolve("sel://tenant/logs/app")` SHALL return `DiscoveryResponse::NotFound`
-
-#### Scenario: Register overwrites existing URI
-- **WHEN** a caller registers a URI that is already mapped
-- **THEN** the new target SHALL replace the existing mapping
-- **AND** the response SHALL be `DiscoveryResponse::Registered`
-
-#### Scenario: Revoke on unknown URI
-- **WHEN** a caller revokes a URI that is not registered
-- **THEN** the discovery service SHALL respond with `DiscoveryResponse::Revoked` (idempotent)
+## MODIFIED Requirements
 
 ### Requirement: Guest custom URI validation
 A guest (Tier-2) SHALL be permitted to register a URI only within the guest's own tenant (a non-root tenant) and only for a target resource the guest owns. Registration into the root tenant (empty tenant) SHALL be rejected. A guest MAY register leaf aliases for a target it owns, under its own tenant. A leaf alias SHALL be accepted only when the claimed target's typed registration currently exists and the claimed class matches the class of the resource the caller owns; external names SHALL meet the same class-match requirement.
@@ -66,20 +46,7 @@ Resolving a typed URI (`sel://<tenant>/proc/<id>`, `sel://<tenant>/region/<id>`,
 - **WHEN** the discovery service cannot resolve the calling process's tenant from the runtime
 - **THEN** the service SHALL deny the request (`Forbidden` for Register/Revoke, `NotFound` or an empty set for queries) rather than treating the caller as unscoped
 
-### Requirement: Context convenience methods for registration
-`Context` SHALL provide `register(&mut self, uri: &str, target: ResourceTarget) -> Result<(), GuestError>` and `revoke(&mut self, uri: &str) -> Result<(), GuestError>` convenience methods that delegate to the discovery RPC client.
-
-#### Scenario: Context::register sends Register request
-- **WHEN** a guest calls `ctx.register("sel://tenant/logs/app", target).await`
-- **THEN** the method SHALL send `DiscoveryRequest::Register { uri: "sel://tenant/logs/app", target }` via the RPC client and return `Ok(())` on `DiscoveryResponse::Registered`
-
-#### Scenario: Context::register returns error on Forbidden
-- **WHEN** a guest calls `ctx.register(uri, target).await` and the discovery service responds with `DiscoveryResponse::Forbidden`
-- **THEN** the method SHALL return `Err(GuestError::Host("registration forbidden: process does not own resource"))`
-
-#### Scenario: Context::revoke sends Revoke request
-- **WHEN** a guest calls `ctx.revoke("sel://tenant/logs/app").await`
-- **THEN** the method SHALL send `DiscoveryRequest::Revoke { uri: "sel://tenant/logs/app" }` via the RPC client and return `Ok(())` on `DiscoveryResponse::Revoked`
+## ADDED Requirements
 
 ### Requirement: Deterministic Tenant-Scoped URI Schema
 Internal addressing SHALL use a single deterministic URI schema: `sel://<tenant>/<type>/<id>`, where `<tenant>` is the URI authority (empty for the root/system tenant), `<type>` names a resource class from the closed set, and `<id>` is the resource's numeric identity. Arbitrary user-defined path hierarchy SHALL NOT be used.

@@ -11,6 +11,8 @@ pub enum DiscoveryRequestOffset {}
 ///   0 = Resolve(uri)
 ///   1 = Register { uri, target }
 ///   2 = Revoke { uri }
+///   3 = ResolvePrefix(uri)
+///   4 = ResolveLabels { key, value }
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -26,7 +28,9 @@ impl<'a> ::flatbuffers::Follow<'a> for DiscoveryRequest<'a> {
 impl<'a> DiscoveryRequest<'a> {
   pub const VT_VARIANT: ::flatbuffers::VOffsetT = 4;
   pub const VT_URI: ::flatbuffers::VOffsetT = 6;
-  pub const VT_TARGET: ::flatbuffers::VOffsetT = 8;
+  pub const VT_KEY: ::flatbuffers::VOffsetT = 8;
+  pub const VT_VALUE: ::flatbuffers::VOffsetT = 10;
+  pub const VT_TARGET: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -39,6 +43,8 @@ impl<'a> DiscoveryRequest<'a> {
   ) -> ::flatbuffers::WIPOffset<DiscoveryRequest<'bldr>> {
     let mut builder = DiscoveryRequestBuilder::new(_fbb);
     if let Some(x) = args.target { builder.add_target(x); }
+    if let Some(x) = args.value { builder.add_value(x); }
+    if let Some(x) = args.key { builder.add_key(x); }
     if let Some(x) = args.uri { builder.add_uri(x); }
     builder.add_variant(args.variant);
     builder.finish()
@@ -53,13 +59,29 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u8>(DiscoveryRequest::VT_VARIANT, Some(0)).unwrap()}
   }
-  /// URI to resolve or register (used by Resolve, Register, Revoke variants).
+  /// URI to resolve or register (used by Resolve, ResolvePrefix, Register, Revoke variants).
   #[inline]
   pub fn uri(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_URI, None)}
+  }
+  /// Label key (used by the ResolveLabels variant).
+  #[inline]
+  pub fn key(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_KEY, None)}
+  }
+  /// Label value (used by the ResolveLabels variant).
+  #[inline]
+  pub fn value(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_VALUE, None)}
   }
   /// Target resource for registration (used by Register variant).
   #[inline]
@@ -79,6 +101,8 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
     v.visit_table(pos)?
      .visit_field::<u8>("variant", Self::VT_VARIANT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("uri", Self::VT_URI, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("value", Self::VT_VALUE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResourceTarget>>("target", Self::VT_TARGET, false)?
      .finish();
     Ok(())
@@ -87,6 +111,8 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
 pub struct DiscoveryRequestArgs<'a> {
     pub variant: u8,
     pub uri: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub key: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub value: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub target: Option<::flatbuffers::WIPOffset<ResourceTarget<'a>>>,
 }
 impl<'a> Default for DiscoveryRequestArgs<'a> {
@@ -95,6 +121,8 @@ impl<'a> Default for DiscoveryRequestArgs<'a> {
     DiscoveryRequestArgs {
       variant: 0,
       uri: None,
+      key: None,
+      value: None,
       target: None,
     }
   }
@@ -112,6 +140,14 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryRequestBuilder<'a, '
   #[inline]
   pub fn add_uri(&mut self, uri: ::flatbuffers::WIPOffset<&'b  str>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_URI, uri);
+  }
+  #[inline]
+  pub fn add_key(&mut self, key: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_KEY, key);
+  }
+  #[inline]
+  pub fn add_value(&mut self, value: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_VALUE, value);
   }
   #[inline]
   pub fn add_target(&mut self, target: ::flatbuffers::WIPOffset<ResourceTarget<'b >>) {
@@ -137,6 +173,8 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
     let mut ds = f.debug_struct("DiscoveryRequest");
       ds.field("variant", &self.variant());
       ds.field("uri", &self.uri());
+      ds.field("key", &self.key());
+      ds.field("value", &self.value());
       ds.field("target", &self.target());
       ds.finish()
   }

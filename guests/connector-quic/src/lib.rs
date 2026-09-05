@@ -25,7 +25,7 @@
 //!   attributes authority from the identity the connector attaches to each
 //!   handoff, so an mTLS-disabled connector must not serve bridge traffic.
 //! - One quinn server endpoint accepts connections; the serving guest for each
-//!   connection is resolved from the handshake SNI (`sel-quic://<name>`), and
+//!   connection is resolved from the handshake SNI (a bare server name), and
 //!   each accepted bidirectional stream is relayed over its own two-ring
 //!   shared-memory channel (see [`pipeline`]). Under mTLS, each stream handoff
 //!   carries the authenticated client [`identity`] as metadata; without mTLS,
@@ -162,16 +162,16 @@ pub async fn handle_connection(
     // guest can attribute authority (the bridge-server maps it to grants).
     // Without configured anchors, mTLS is off and handoffs carry empty
     // metadata.
-    let identity_metadata = match &anchors {
+    let (identity_metadata, serving_tenant) = match &anchors {
         Some(anchors) => match anchors.identity_for(&connection) {
-            Some(identity) => identity.encode(),
+            Some(identity) => (identity.encode(), Some(identity.tenant)),
             None => {
                 warn!("quic-connector: refusing connection: unverifiable client identity");
                 connection.close(REFUSE_ERROR_CODE.into(), b"untrusted client certificate");
                 return;
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), None),
     };
 
     // Deliver every accepted stream over its own byte channel.
@@ -192,13 +192,14 @@ pub async fn handle_connection(
             }
         };
 
-        let channel = match crate::stream::QuicChannel::allocate() {
-            Ok(channel) => channel,
-            Err(e) => {
-                warn!("quic-connector: stream channel allocation failed: {e}");
-                continue;
-            }
-        };
+        let channel =
+            match crate::stream::QuicChannel::allocate_for_tenant(serving_tenant.as_deref()) {
+                Ok(channel) => channel,
+                Err(e) => {
+                    warn!("quic-connector: stream channel allocation failed: {e}");
+                    continue;
+                }
+            };
 
         if let Err(e) = sender
             .send_with_metadata(channel.shared_id(), identity_metadata.clone())

@@ -169,7 +169,7 @@ fn quic_channel_handoff_golden_path() {
     );
 
     // 1. App creates its listener queue.
-    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(app, op_id)
     else {
@@ -199,6 +199,7 @@ fn quic_channel_handoff_golden_path() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) =
@@ -332,6 +333,7 @@ fn quic_stream_isolation_and_ungranted_attach_denied() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(region_a)) =
@@ -346,6 +348,7 @@ fn quic_stream_isolation_and_ungranted_attach_denied() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(region_b)) =

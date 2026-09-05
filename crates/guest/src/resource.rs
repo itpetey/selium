@@ -98,9 +98,22 @@ impl selium_wire::Rendezvous for ResourceSender {
 }
 
 impl ResourceListener {
-    /// Creates a new host-mediated connection queue.
+    /// Creates a new host-mediated connection queue, minted under the
+    /// calling process's own tenant.
     pub fn create() -> Result<Self> {
-        match hostcall_ready(HostcallRequest::HostQueueCreate)? {
+        Self::create_for_tenant(None)
+    }
+
+    /// Creates a new host-mediated connection queue minted under the
+    /// supplied serving tenant, mirroring region allocation's principal
+    /// provenance. `None` mints under the caller's own tenant; a tenant
+    /// differing from the caller's own requires cross-tenant allocation
+    /// authority (root principal or tenant-scoped delegation).
+    pub fn create_for_tenant(serving_tenant: Option<&str>) -> Result<Self> {
+        let request = HostcallRequest::HostQueueCreate {
+            serving_tenant: serving_tenant.map(str::to_string),
+        };
+        match hostcall_ready(request)? {
             HostcallOutput::HostQueue(descriptor) => Ok(Self {
                 descriptor,
                 expected_sender: None,

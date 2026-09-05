@@ -197,6 +197,52 @@ pub enum ResourceClass {
     HostQueue,
 }
 
+impl ResourceClass {
+    /// Returns the lowercased typed URI segment for this class, drawn from the
+    /// closed segment vocabulary (`proc`, `region`, `queue`, …). This is the
+    /// single mapping between a resource class and the `<type>` segment of a
+    /// `sel://<tenant>/<type>/<id>` URI.
+    pub fn uri_segment(&self) -> &'static str {
+        match self {
+            Self::SharedRegion => "region",
+            Self::SharedMapping => "mapping",
+            Self::Signal => "signal",
+            Self::TcpListener => "listener",
+            Self::TcpStream => "stream",
+            Self::UdpSocket => "socket",
+            Self::DurableLog => "log",
+            Self::BlobStore => "blob",
+            Self::Process => "proc",
+            Self::ActivityLog => "activity",
+            Self::MeteringStream => "metering",
+            Self::GuestLog => "guest-log",
+            Self::HostQueue => "queue",
+        }
+    }
+
+    /// Returns the class named by a typed URI segment, if the segment is part
+    /// of the closed vocabulary. Inverse of [`Self::uri_segment`], used to
+    /// reserve class nouns so a leaf alias cannot shadow a type segment.
+    pub fn from_uri_segment(segment: &str) -> Option<Self> {
+        match segment {
+            "region" => Some(Self::SharedRegion),
+            "mapping" => Some(Self::SharedMapping),
+            "signal" => Some(Self::Signal),
+            "listener" => Some(Self::TcpListener),
+            "stream" => Some(Self::TcpStream),
+            "socket" => Some(Self::UdpSocket),
+            "log" => Some(Self::DurableLog),
+            "blob" => Some(Self::BlobStore),
+            "proc" => Some(Self::Process),
+            "activity" => Some(Self::ActivityLog),
+            "metering" => Some(Self::MeteringStream),
+            "guest-log" => Some(Self::GuestLog),
+            "queue" => Some(Self::HostQueue),
+            _ => None,
+        }
+    }
+}
+
 /// Context used to evaluate a capability grant.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -479,39 +525,41 @@ pub struct ResourceTarget {
     pub interface: Option<InterfaceMetadata>,
     /// Optional tenant identifier for multi-tenant isolation.
     pub tenant: Option<String>,
+    /// Resource class identifying the typed segment of the target's URI.
+    pub class: ResourceClass,
+    /// Classification key/value label pairs.
+    pub labels: Vec<(String, String)>,
 }
 
 /// Request sent to the discovery service.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum DiscoveryRequest {
-    /// Resolve a URI to a resource target.
+    /// Resolve a URI (typed, alias, root, or external name) to a resource target.
     Resolve(String),
+    /// List the targets matching a prefix/wildcard query (`sel://<tenant>/<type>/*`).
+    ResolvePrefix(String),
+    /// Return every target in the caller's tenant matching a label pair.
+    ResolveLabels {
+        /// Label key to match.
+        key: String,
+        /// Label value to match.
+        value: String,
+    },
     /// Register a URI→target mapping.
     Register {
         /// URI to register.
         uri: String,
         /// Target resource to map the URI to.
         target: ResourceTarget,
+        /// Owning process, populated by Tier-1 runtime registrations so the
+        /// store can validate Tier-2 ownership without parsing the URI.
+        owner: Option<ProcessId>,
     },
     /// Remove a URI→target mapping.
     Revoke {
         /// URI to revoke.
         uri: String,
-    },
-    /// Tier-1: register a protocol handler for `protocol` scheme (e.g.
-    /// `sel-http`). Published by the runtime over the discovery feed; never
-    /// accepted over the guest RPC path.
-    RegisterHandler {
-        /// Protocol scheme the handler serves (`sel-http`, `sel-dns`, …).
-        protocol: String,
-        /// System service serving the scheme.
-        target: ResourceTarget,
-    },
-    /// Tier-1: revoke a protocol handler registration.
-    RevokeHandler {
-        /// Protocol scheme whose handler is being removed.
-        protocol: String,
     },
 }
 
@@ -521,6 +569,9 @@ pub enum DiscoveryRequest {
 pub enum DiscoveryResponse {
     /// The requested URI was found.
     Found(ResourceTarget),
+    /// A query returned multiple matching targets (prefix enumeration,
+    /// label queries). Preserves order.
+    Resolved(Vec<ResourceTarget>),
     /// The requested URI was not found.
     NotFound,
     /// The URI was successfully registered.
@@ -529,10 +580,6 @@ pub enum DiscoveryResponse {
     Revoked,
     /// The caller is not authorised to register the given target.
     Forbidden,
-    /// No protocol handler is registered for the URI's scheme: registering a
-    /// `sel-http://…` route before the HTTP connector is present is rejected
-    /// loudly rather than accepted and silently unroutable.
-    NoHandler,
 }
 
 /// Host operation requested by a guest.
@@ -678,8 +725,15 @@ pub enum HostcallRequest {
         /// Optional process id filter.
         process_id: Option<ProcessId>,
     },
-    /// Create a host-mediated connection queue.
-    HostQueueCreate,
+    /// Create a host-mediated connection queue, registered with discovery
+    /// under the principal (serving) tenant. `None` mints the queue under
+    /// the allocating process's own tenant; a tenant differing from the
+    /// allocating process's own requires cross-tenant allocation authority
+    /// (root principal or tenant-scoped delegation).
+    HostQueueCreate {
+        /// Tenant on whose behalf the queue is minted.
+        serving_tenant: Option<String>,
+    },
     /// Attach to an existing host-mediated connection queue.
     HostQueueAttach {
         /// Shared queue id to attach to.
@@ -722,6 +776,18 @@ pub enum HostcallRequest {
         prot: RegionProt,
         /// Informational purpose tag for the allocated region.
         purpose: ResourceKind,
+        /// Serving tenant the region is minted under. `None` (or a value
+        /// equal to the allocating process's own tenant) mints under the
+        /// process's own tenant; a different tenant requires tenant-scoped
+        /// delegation and is denied without it.
+        serving_tenant: Option<String>,
+    },
+    /// Returns the tenant identity assigned to another process, if any.
+    /// Used by the discovery service to scope resolution to the caller's
+    /// tenant.
+    ProcessTenant {
+        /// Process whose tenant to look up.
+        process_id: ProcessId,
     },
     /// Free a previously allocated shared memory region.
     FreeRegion {
@@ -873,6 +939,8 @@ pub enum HostcallOutput {
         /// Tenant scope of the caller, if provisioned.
         tenant: Option<String>,
     },
+    /// A tenant identity for [`HostcallRequest::ProcessTenant`].
+    Tenant(Option<String>),
 }
 
 /// Current completion state of a hostcall operation.
@@ -1236,6 +1304,7 @@ mod tests {
                 pages: 16,
                 prot: RegionProt::ReadWrite,
                 purpose: ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
             task_id: Some(42),
         };
@@ -1265,7 +1334,9 @@ mod tests {
     #[test]
     fn host_queue_create_round_trip() {
         let envelope = HostcallEnvelope {
-            request: HostcallRequest::HostQueueCreate,
+            request: HostcallRequest::HostQueueCreate {
+                serving_tenant: Some("acme".to_string()),
+            },
             task_id: Some(1),
         };
         let encoded = encode_rkyv(&envelope).expect("encode");
@@ -1419,15 +1490,36 @@ mod tests {
     #[test]
     fn discovery_response_found_round_trip() {
         let response = DiscoveryResponse::Found(ResourceTarget {
-            uri: "sel://tenant/app/api".to_string(),
+            uri: "sel://tenant/region/7".to_string(),
             host_id: "host-a".to_string(),
             resource_id: 7,
             interface: None,
             tenant: None,
+            class: ResourceClass::SharedRegion,
+            labels: Vec::new(),
         });
         let encoded = encode_rkyv(&response).expect("encode");
         let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn resource_target_class_and_labels_round_trip() {
+        // Task 1.1: class and labels survive the rkyv codec unchanged.
+        let target = ResourceTarget {
+            uri: "sel://acme/proc/123".to_string(),
+            host_id: "host-a".to_string(),
+            resource_id: 123,
+            interface: None,
+            tenant: Some("acme".to_string()),
+            class: ResourceClass::Process,
+            labels: vec![("app".to_string(), "web".to_string())],
+        };
+        let encoded = encode_rkyv(&target).expect("encode");
+        let decoded: ResourceTarget = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, target);
+        assert_eq!(decoded.class, ResourceClass::Process);
+        assert_eq!(decoded.labels, vec![("app".to_string(), "web".to_string())]);
     }
 
     #[test]
@@ -1465,6 +1557,54 @@ mod tests {
     }
 
     #[test]
+    fn resource_class_uri_segments_cover_every_variant() {
+        // Task 1.3: the segment vocabulary covers the entire closed set, and
+        // the mapping round-trips. Documented names are asserted exactly.
+        let every = [
+            (ResourceClass::SharedRegion, "region"),
+            (ResourceClass::SharedMapping, "mapping"),
+            (ResourceClass::Signal, "signal"),
+            (ResourceClass::TcpListener, "listener"),
+            (ResourceClass::TcpStream, "stream"),
+            (ResourceClass::UdpSocket, "socket"),
+            (ResourceClass::DurableLog, "log"),
+            (ResourceClass::BlobStore, "blob"),
+            (ResourceClass::Process, "proc"),
+            (ResourceClass::ActivityLog, "activity"),
+            (ResourceClass::MeteringStream, "metering"),
+            (ResourceClass::GuestLog, "guest-log"),
+            (ResourceClass::HostQueue, "queue"),
+        ];
+        for (class, expected) in every {
+            assert_eq!(class.uri_segment(), expected, "segment for {class:?}");
+            assert_eq!(
+                ResourceClass::from_uri_segment(expected),
+                Some(class),
+                "inverse for {expected}"
+            );
+            assert!(expected.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+            let _ = class;
+        }
+        assert_eq!(ResourceClass::from_uri_segment("unknown"), None);
+    }
+
+    #[test]
+    fn process_tenant_hostcall_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::ProcessTenant { process_id: 42 },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+
+        let output = HostcallOutput::Tenant(Some("acme".to_string()));
+        let encoded = encode_rkyv(&output).expect("encode");
+        let decoded: HostcallOutput = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, output);
+    }
+
+    #[test]
     fn resource_kind_round_trip() {
         for kind in [
             ResourceKind::LogChannel,
@@ -1485,14 +1625,17 @@ mod tests {
     #[test]
     fn discovery_request_register_round_trip() {
         let request = DiscoveryRequest::Register {
-            uri: "sel://_sys/proc/42/logs".to_string(),
+            uri: "sel://acme/region/7".to_string(),
             target: ResourceTarget {
-                uri: "sel://_sys/proc/42/logs".to_string(),
+                uri: "sel://acme/region/7".to_string(),
                 host_id: "host-a".to_string(),
                 resource_id: 7,
                 interface: None,
-                tenant: None,
+                tenant: Some("acme".to_string()),
+                class: ResourceClass::SharedRegion,
+                labels: Vec::new(),
             },
+            owner: Some(42),
         };
         let encoded = encode_rkyv(&request).expect("encode");
         let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
@@ -1502,11 +1645,58 @@ mod tests {
     #[test]
     fn discovery_request_revoke_round_trip() {
         let request = DiscoveryRequest::Revoke {
-            uri: "sel://_sys/proc/42/logs".to_string(),
+            uri: "sel://acme/region/7".to_string(),
         };
         let encoded = encode_rkyv(&request).expect("encode");
         let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_request_prefix_query_round_trip() {
+        let request = DiscoveryRequest::ResolvePrefix("sel://acme/region/*".to_string());
+        let encoded = encode_rkyv(&request).expect("encode");
+        let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_request_label_query_round_trip() {
+        let request = DiscoveryRequest::ResolveLabels {
+            key: "app".to_string(),
+            value: "web".to_string(),
+        };
+        let encoded = encode_rkyv(&request).expect("encode");
+        let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_response_multi_target_round_trip() {
+        let targets = vec![
+            ResourceTarget {
+                uri: "sel://acme/proc/1".to_string(),
+                host_id: String::new(),
+                resource_id: 1,
+                interface: None,
+                tenant: Some("acme".to_string()),
+                class: ResourceClass::Process,
+                labels: vec![("app".to_string(), "web".to_string())],
+            },
+            ResourceTarget {
+                uri: "sel://acme/proc/2".to_string(),
+                host_id: String::new(),
+                resource_id: 2,
+                interface: None,
+                tenant: Some("acme".to_string()),
+                class: ResourceClass::Process,
+                labels: vec![("app".to_string(), "web".to_string())],
+            },
+        ];
+        let response = DiscoveryResponse::Resolved(targets);
+        let encoded = encode_rkyv(&response).expect("encode");
+        let decoded: DiscoveryResponse = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, response);
     }
 
     #[test]
@@ -1540,6 +1730,7 @@ mod tests {
                 pages: 8,
                 prot: RegionProt::ReadWrite,
                 purpose: ResourceKind::LogChannel,
+                serving_tenant: Some("acme".to_string()),
             },
             task_id: Some(5),
         };

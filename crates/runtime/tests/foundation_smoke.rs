@@ -41,7 +41,7 @@ fn concurrent_connections_use_distinct_regions() {
     );
 
     // Server creates a listener queue.
-    let (_, op_id) = runtime.begin_hostcall(server, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(server, op_id)
     else {
@@ -72,6 +72,7 @@ fn concurrent_connections_use_distinct_regions() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(region_a)) =
@@ -86,6 +87,7 @@ fn concurrent_connections_use_distinct_regions() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(region_b)) =
@@ -224,6 +226,7 @@ fn foundation_crates_work_together_through_hostcalls() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -267,6 +270,7 @@ fn hostcalls_enforce_session_grants() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::SharedMemory,
+            serving_tenant: None,
         },
     );
 
@@ -300,7 +304,7 @@ fn non_discovery_process_cannot_self_authorize_attach() {
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
         )],
     );
-    let (_, op_id) = runtime.begin_hostcall(owner, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(owner, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(owner, op_id)
     else {
@@ -458,7 +462,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
 
     // Step 1: Process A creates a host queue.
     let (status, op_id) =
-        runtime.begin_hostcall(proc_a.process_id, HostcallRequest::HostQueueCreate);
+        runtime.begin_hostcall(proc_a.process_id, HostcallRequest::HostQueueCreate { serving_tenant: None });
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_descriptor)) =
         runtime.poll_hostcall(proc_a.process_id, op_id)
@@ -544,7 +548,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         )],
     );
 
-    let (_, op_id) = runtime.begin_hostcall(server_a, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server_a, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_a)) =
         runtime.poll_hostcall(server_a, op_id)
     else {
@@ -630,7 +634,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         )],
     );
 
-    let (_, op_id) = runtime.begin_hostcall(server_b, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server_b, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue_b)) =
         runtime.poll_hostcall(server_b, op_id)
     else {
@@ -754,7 +758,7 @@ fn zero_grant_guest_round_trip_via_host_queue() {
     );
 
     // Step 1: Server creates a listener queue.
-    let (_, op_id) = runtime.begin_hostcall(server, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(server, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(server, op_id)
     else {
@@ -785,6 +789,7 @@ fn zero_grant_guest_round_trip_via_host_queue() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: selium_abi::ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) =

@@ -74,6 +74,16 @@ pub fn attach(shared_id: u64) -> Result<(Channel, Channel)> {
 /// responsible for delivering `shared_id` to its peer (and eventually
 /// freeing the region).
 pub fn create(capacity_0: u64, capacity_1: u64) -> Result<(Channel, Channel, u64, Region)> {
+    create_for_tenant(capacity_0, capacity_1, None)
+}
+
+/// Creates a fresh two-ring region pair minted under `serving_tenant` (see
+/// [`RegionProvider::allocate_for_tenant`](selium_memory::RegionProvider)).
+pub fn create_for_tenant(
+    capacity_0: u64,
+    capacity_1: u64,
+    serving_tenant: Option<&str>,
+) -> Result<(Channel, Channel, u64, Region)> {
     let len_0 = RING_HEADER_SIZE + capacity_0;
     let len_1 = RING_HEADER_SIZE + capacity_1;
 
@@ -83,7 +93,12 @@ pub fn create(capacity_0: u64, capacity_1: u64) -> Result<(Channel, Channel, u64
 
     let pages = pages_for_bytes(total_capacity);
     let region = selium_memory::region_provider()?
-        .allocate(pages, RegionProt::ReadWrite, ResourceKind::SharedMemory)
+        .allocate_for_tenant(
+            pages,
+            RegionProt::ReadWrite,
+            ResourceKind::SharedMemory,
+            serving_tenant,
+        )
         .map_err(selium_wire::error::Error::from)?;
     let shared_id = region.region_id();
     let parent_mapping = region.mapping();

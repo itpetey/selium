@@ -5,7 +5,7 @@ use std::{
 };
 
 use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, ResourceIdentity,
+    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, ResourceClass, ResourceIdentity,
     ResourceSelector, ResourceTarget, encode_rkyv,
 };
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
@@ -283,6 +283,16 @@ impl Runtime {
             *self.discovery_process.lock() = Some(process.local_id);
         }
 
+        // Register the process node (`sel://<tenant>/proc/<id>`) so every
+        // process is discoverable from spawn. Publishing is a no-op when
+        // discovery is not enabled.
+        if let Err(error) =
+            self.register_process_node(process.local_id, descriptor.tenant.as_deref())
+        {
+            self.cleanup_failed_process(process.local_id)?;
+            return Err(error);
+        }
+
         // Register the well-known URI with discovery now that the guest is up.
         // Publishing is a no-op when discovery is not enabled (the queue and
         // argument injection above still apply).
@@ -294,26 +304,8 @@ impl Runtime {
             return Err(error);
         }
 
-        // Publish Tier-1 protocol handler registrations for any schemes this
-        // guest handles, so discovery can validate route registrations.
-        for scheme in &descriptor.handlers {
-            let uri = crate::discovery::handler_registration_uri(scheme);
-            let target = ResourceTarget {
-                uri,
-                host_id: String::new(),
-                resource_id: process.local_id,
-                interface: None,
-                tenant: descriptor.tenant.clone(),
-            };
-            let request = DiscoveryRequest::RegisterHandler {
-                protocol: scheme.clone(),
-                target,
-            };
-            let bytes = encode_rkyv(&request).map_err(|error| {
-                Error::Host(format!("handler discovery encode failed: {error}"))
-            })?;
-            self.publish_discovery_event(bytes)?;
-        }
+        // Remember the protocol schemes this guest handles so serve-side
+        // guests can pin it via `ResolveProtocolHandler`.
         if !descriptor.handlers.is_empty() {
             self.handler_schemes
                 .lock()
@@ -342,10 +334,13 @@ impl Runtime {
             resource_id: listener_shared_id,
             interface: None,
             tenant: self.process_tenant(process_id),
+            class: ResourceClass::HostQueue,
+            labels: Vec::new(),
         };
         let request = DiscoveryRequest::Register {
             uri: uri.clone(),
             target,
+            owner: None,
         };
         let bytes = encode_rkyv(&request)
             .map_err(|error| Error::Host(format!("discovery encode failed: {error}")))?;
@@ -358,6 +353,36 @@ impl Runtime {
             process_id: Some(process_id),
             message: format!("well-known uri={uri} listener={listener_shared_id}"),
         });
+        Ok(())
+    }
+
+    /// Records and publishes the process-node registration for a spawned
+    /// process so it is addressable as `sel://<tenant>/proc/<id>` from spawn
+    /// until teardown.
+    fn register_process_node(
+        &self,
+        process_id: selium_abi::ProcessId,
+        tenant: Option<&str>,
+    ) -> Result<()> {
+        let uri =
+            crate::discovery::process_registration_uri(tenant.unwrap_or_default(), process_id);
+        let target = ResourceTarget {
+            uri: uri.clone(),
+            host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
+            resource_id: process_id,
+            interface: None,
+            tenant: tenant.map(str::to_string),
+            class: ResourceClass::Process,
+            labels: Vec::new(),
+        };
+        let request = DiscoveryRequest::Register {
+            uri,
+            target,
+            owner: Some(process_id),
+        };
+        let bytes = encode_rkyv(&request)
+            .map_err(|error| Error::Host(format!("process discovery encode failed: {error}")))?;
+        self.publish_discovery_event(bytes)?;
         Ok(())
     }
 
@@ -621,7 +646,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: Some("sel://_sys/dns/resolve".to_string()),
+                well_known_uri: Some("sel:///dns/resolve".to_string()),
                 handlers: Vec::new(),
             }],
         };
@@ -645,7 +670,7 @@ mod tests {
         // The registration is recorded (and revoked on teardown).
         assert_eq!(
             runtime.well_known_uri(guest.process_id),
-            Some(("sel://_sys/dns/resolve".to_string(), listener))
+            Some(("sel:///dns/resolve".to_string(), listener))
         );
         runtime.stop_process(guest.process_id).expect("stop guest");
         assert!(

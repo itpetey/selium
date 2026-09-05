@@ -62,7 +62,7 @@ impl Context {
             DiscoveryResponse::Registered
             | DiscoveryResponse::Revoked
             | DiscoveryResponse::Forbidden
-            | DiscoveryResponse::NoHandler => Err(GuestError::Host(
+            | DiscoveryResponse::Resolved(_) => Err(GuestError::Host(
                 "unexpected discovery response variant".to_string(),
             )),
         }
@@ -77,6 +77,9 @@ impl Context {
         let request = DiscoveryRequest::Register {
             uri: uri.to_string(),
             target,
+            // Guests register on their own behalf; the runtime supplies the
+            // Tier-1 owner over the discovery feed.
+            owner: None,
         };
 
         let response = self
@@ -90,10 +93,6 @@ impl Context {
             DiscoveryResponse::Forbidden => Err(GuestError::Host(
                 "registration forbidden: process does not own resource".to_string(),
             )),
-            DiscoveryResponse::NoHandler => Err(GuestError::Host(format!(
-                "registration rejected: no protocol handler registered for {}",
-                uri
-            ))),
             other => Err(GuestError::Host(format!(
                 "unexpected discovery response: {other:?}"
             ))),

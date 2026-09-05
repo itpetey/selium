@@ -30,19 +30,41 @@ pub struct QuicChannel {
 impl QuicChannel {
     /// Allocates a fresh two-ring region and attaches this (connector) peer.
     pub fn allocate() -> Result<Self> {
-        Self::with_capacity(DEFAULT_STREAM_RING_CAPACITY, DEFAULT_STREAM_RING_CAPACITY)
+        Self::allocate_for_tenant(None)
+    }
+
+    /// Allocates a fresh two-ring region minted under `serving_tenant` (the
+    /// authenticated client's tenant): principal provenance so bridged stream
+    /// regions land under the tenant they serve rather than the root
+    /// connector's namespace.
+    pub fn allocate_for_tenant(serving_tenant: Option<&str>) -> Result<Self> {
+        Self::with_capacity_for_tenant(
+            DEFAULT_STREAM_RING_CAPACITY,
+            DEFAULT_STREAM_RING_CAPACITY,
+            serving_tenant,
+        )
     }
 
     /// Like [`allocate`](Self::allocate), with explicit per-direction ring
     /// capacities (client → guest, guest → client).
     pub fn with_capacity(client_to_guest: u64, guest_to_client: u64) -> Result<Self> {
+        Self::with_capacity_for_tenant(client_to_guest, guest_to_client, None)
+    }
+
+    /// Like [`with_capacity`](Self::with_capacity), minting the region under
+    /// `serving_tenant`.
+    pub fn with_capacity_for_tenant(
+        client_to_guest: u64,
+        guest_to_client: u64,
+        serving_tenant: Option<&str>,
+    ) -> Result<Self> {
         // `create` allocates the region pair with this side already
         // attached (the allocation maps it), so build the halves from its
         // channels and region handle directly. A second `attach` on the
         // same region would be rejected by the runtime's region provider
         // ("already attached"); the mirror peer attaches via `shared_id`.
         let (ring_to_guest, ring_from_guest, shared_id, region) =
-            byte_channel::create(client_to_guest, guest_to_client)
+            byte_channel::create_for_tenant(client_to_guest, guest_to_client, serving_tenant)
                 .map_err(|e| GuestError::Host(format!("allocate stream region: {e}")))?;
 
         // Connector mirrors the guest: read the guest's outbound ring and

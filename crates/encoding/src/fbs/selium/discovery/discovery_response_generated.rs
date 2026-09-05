@@ -13,6 +13,7 @@ pub enum DiscoveryResponseOffset {}
 ///   2 = Registered
 ///   3 = Revoked
 ///   4 = Forbidden
+///   5 = Resolved(targets)
 pub struct DiscoveryResponse<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -28,6 +29,7 @@ impl<'a> ::flatbuffers::Follow<'a> for DiscoveryResponse<'a> {
 impl<'a> DiscoveryResponse<'a> {
   pub const VT_VARIANT: ::flatbuffers::VOffsetT = 4;
   pub const VT_TARGET: ::flatbuffers::VOffsetT = 6;
+  pub const VT_TARGETS: ::flatbuffers::VOffsetT = 8;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -39,6 +41,7 @@ impl<'a> DiscoveryResponse<'a> {
     args: &'args DiscoveryResponseArgs<'args>
   ) -> ::flatbuffers::WIPOffset<DiscoveryResponse<'bldr>> {
     let mut builder = DiscoveryResponseBuilder::new(_fbb);
+    if let Some(x) = args.targets { builder.add_targets(x); }
     if let Some(x) = args.target { builder.add_target(x); }
     builder.add_variant(args.variant);
     builder.finish()
@@ -61,6 +64,14 @@ impl<'a> DiscoveryResponse<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<ResourceTarget>>(DiscoveryResponse::VT_TARGET, None)}
   }
+  /// The matched resources (used by Resolved variant).
+  #[inline]
+  pub fn targets(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ResourceTarget<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ResourceTarget>>>>(DiscoveryResponse::VT_TARGETS, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryResponse<'_> {
@@ -71,6 +82,7 @@ impl ::flatbuffers::Verifiable for DiscoveryResponse<'_> {
     v.visit_table(pos)?
      .visit_field::<u8>("variant", Self::VT_VARIANT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResourceTarget>>("target", Self::VT_TARGET, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ResourceTarget>>>>("targets", Self::VT_TARGETS, false)?
      .finish();
     Ok(())
   }
@@ -78,6 +90,7 @@ impl ::flatbuffers::Verifiable for DiscoveryResponse<'_> {
 pub struct DiscoveryResponseArgs<'a> {
     pub variant: u8,
     pub target: Option<::flatbuffers::WIPOffset<ResourceTarget<'a>>>,
+    pub targets: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ResourceTarget<'a>>>>>,
 }
 impl<'a> Default for DiscoveryResponseArgs<'a> {
   #[inline]
@@ -85,6 +98,7 @@ impl<'a> Default for DiscoveryResponseArgs<'a> {
     DiscoveryResponseArgs {
       variant: 0,
       target: None,
+      targets: None,
     }
   }
 }
@@ -101,6 +115,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryResponseBuilder<'a, 
   #[inline]
   pub fn add_target(&mut self, target: ::flatbuffers::WIPOffset<ResourceTarget<'b >>) {
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<ResourceTarget>>(DiscoveryResponse::VT_TARGET, target);
+  }
+  #[inline]
+  pub fn add_targets(&mut self, targets: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<ResourceTarget<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryResponse::VT_TARGETS, targets);
   }
   #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryResponseBuilder<'a, 'b, A> {
@@ -122,6 +140,7 @@ impl ::core::fmt::Debug for DiscoveryResponse<'_> {
     let mut ds = f.debug_struct("DiscoveryResponse");
       ds.field("variant", &self.variant());
       ds.field("target", &self.target());
+      ds.field("targets", &self.targets());
       ds.finish()
   }
 }

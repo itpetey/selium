@@ -1,7 +1,7 @@
 //! SNI-based discovery route resolution with caching.
 //!
 //! The connector holds no routing table: routes live in discovery as
-//! `sel-quic://<name>` entries registered by app guests via
+//! bare server names registered by app guests via
 //! [`QuicServe::bind`](selium_guest::net::quic::QuicServe::bind). A connection
 //! is routed once, from the QUIC handshake's server name (SNI); every stream
 //! on the connection then goes to that resolved guest. The resolver caches the
@@ -11,7 +11,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use selium_abi::uri;
-use selium_guest::{Context, net::quic::QUIC_SCHEME};
+use selium_guest::Context;
 
 /// Shared handle to the SNI route resolver, cloned into each connection task.
 pub type ResolverHandle = Arc<tokio::sync::Mutex<RouteResolver>>;
@@ -46,8 +46,12 @@ impl RouteResolver {
 
     /// Evicts a cached route entry, forcing re-resolution on the next
     /// connection for the same name. Called on channel-attach failure.
+    ///
+    /// The supplied name is normalised first: routes are cached under the
+    /// canonical (lowercased, trailing-dot-stripped) name, so a raw SNI
+    /// must be normalised to hit the cache entry.
     pub fn evict(&mut self, name: &str) {
-        self.cache.remove(name);
+        self.cache.remove(&normalize_sni(name));
     }
 
     /// Returns whether a route is cached for the given name.
@@ -83,8 +87,8 @@ impl RouteResolver {
     /// Resolves the serving guest for a server name.
     ///
     /// The name is normalised (lowercased, trailing dot stripped) and matched
-    /// against the registered `sel-quic://<name>` discovery URI. Resolution
-    /// happens once per connection; the connector caches the result.
+    /// against the registered bare external name. Resolution happens once per
+    /// connection; the connector caches the result.
     pub async fn resolve(
         &mut self,
         server_name: &str,
@@ -124,9 +128,9 @@ fn normalize_sni(server_name: &str) -> String {
     uri::normalize_host(server_name)
 }
 
-/// Builds the `sel-quic://` discovery URI for a normalised server name.
+/// Builds the canonical bare external name for a normalised server name.
 fn route_uri(name: &str) -> String {
-    uri::protocol_uri(QUIC_SCHEME, name, "")
+    uri::bare_external_name(name)
 }
 
 #[cfg(test)]
@@ -134,8 +138,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_uri_builds_protocol_aware_uris() {
-        assert_eq!(route_uri("example.com"), "sel-quic://example.com");
+    fn route_uri_builds_bare_external_names() {
+        assert_eq!(route_uri("example.com"), "example.com");
     }
 
     #[test]
@@ -146,11 +150,13 @@ mod tests {
 
     fn make_target(id: u64) -> selium_abi::ResourceTarget {
         selium_abi::ResourceTarget {
-            uri: "sel-quic://example.com".to_string(),
+            uri: "example.com".to_string(),
             host_id: String::new(),
             resource_id: id,
             interface: None,
             tenant: None,
+            class: selium_abi::ResourceClass::HostQueue,
+            labels: Vec::new(),
         }
     }
 
@@ -159,6 +165,17 @@ mod tests {
         let mut resolver = RouteResolver::with_cached_route("example.com", make_target(42));
         assert!(resolver.is_cached("example.com"));
         resolver.evict("example.com");
+        assert!(!resolver.is_cached("example.com"));
+    }
+
+    #[test]
+    fn resolver_evict_normalises_the_raw_sni() {
+        // A route looked up under the raw SNI `Example.COM.` is cached under
+        // the normalised name (resolve normalises before caching); eviction
+        // must normalise the same way or the stale route would survive.
+        let mut resolver = RouteResolver::with_cached_route("example.com", make_target(42));
+        assert!(resolver.is_cached("example.com"));
+        resolver.evict("Example.COM.");
         assert!(!resolver.is_cached("example.com"));
     }
 

@@ -1,6 +1,6 @@
 //! QUIC echo demo guest.
 //!
-//! The app-guest side of the QUIC connector: binds a `sel-quic://` name with
+//! The app-guest side of the QUIC connector: binds a bare server name with
 //! discovery and echoes every accepted stream's bytes back to the client.
 //! The `selium-runtime` `quic_spine` integration test deploys this guest
 //! alongside the real QUIC connector guest and an external native quinn
@@ -27,9 +27,9 @@ use selium_guest::{
 /// a registration racing ahead of that consumption is answered `NoHandler` —
 /// retry briefly instead of failing the deployment.
 const BIND_ATTEMPTS: u8 = 10;
-/// The `sel-quic://` name this demo serves. Must match the test client's SNI
+/// The bare server name this demo serves. Must match the test client's SNI
 /// and the test certificate's SAN (`localhost`).
-const SERVE_NAME: &str = "sel-quic://localhost";
+const SERVE_NAME: &str = "localhost";
 
 /// Attempts to bind the route, retrying briefly on failure.
 async fn bind_with_retry(ctx: &mut Context, uri: &str) -> Result<QuicServe, GuestError> {

@@ -8,7 +8,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use selium_abi::uri;
-use selium_guest::{Context, net::http::HTTP_SCHEME};
+use selium_guest::Context;
 
 /// Test support: re-exports helpers for integration tests in `tests/`.
 /// Test utilities — not for production use.
@@ -109,10 +109,10 @@ impl RouteResolver {
 
     /// Resolves the serving target for a Host + path pair.
     ///
-    /// Tries the exact discovery URI first, then each parent subtree
+    /// Tries the exact external-name key first, then each parent subtree
     /// (longest prefix first), then the host root — matching app guests'
-    /// registered URI subtrees. Routes are protocol-aware (`sel-http://…`),
-    /// so the Host header maps mechanically onto the discovery URI.
+    /// registered external names. The Host header is normalised to the
+    /// canonical `https://<host>/<path>` key.
     pub async fn resolve(
         &mut self,
         host: &str,
@@ -212,14 +212,10 @@ impl RouteResolver {
     }
 }
 
-/// Builds the `sel-http://` discovery URI for a normalised host and a
-/// trimmed path (`""` or no leading/trailing slash).
+/// Builds the canonical `https://` external-name key for a normalised host
+/// and a trimmed path (`""` or no leading/trailing slash).
 fn route_uri(host: &str, path: &str) -> String {
-    if path.is_empty() {
-        uri::protocol_uri(HTTP_SCHEME, host, "")
-    } else {
-        uri::protocol_uri(HTTP_SCHEME, host, &format!("/{path}"))
-    }
+    uri::https_external_name(host, path)
 }
 
 #[cfg(test)]
@@ -227,21 +223,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_uri_builds_protocol_aware_uris() {
-        assert_eq!(
-            route_uri("example.com", "api"),
-            "sel-http://example.com/api"
-        );
-        assert_eq!(route_uri("example.com", ""), "sel-http://example.com");
+    fn route_uri_builds_canonical_external_names() {
+        assert_eq!(route_uri("example.com", "api"), "https://example.com/api");
+        assert_eq!(route_uri("example.com", ""), "https://example.com");
     }
 
     fn make_target(id: u64) -> selium_abi::ResourceTarget {
         selium_abi::ResourceTarget {
-            uri: "sel://example.com/test".to_string(),
+            uri: "https://example.com/test".to_string(),
             host_id: String::new(),
             resource_id: id,
             interface: None,
             tenant: None,
+            class: selium_abi::ResourceClass::HostQueue,
+            labels: Vec::new(),
         }
     }
 

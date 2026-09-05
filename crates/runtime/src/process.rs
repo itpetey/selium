@@ -13,20 +13,38 @@ use crate::{
 
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
+    ///
+    /// Idempotent for teardown retries: if a previous stop failed part-way
+    /// (e.g. a discovery publish error), the process authority is retained
+    /// and the stop can be retried to complete the remaining revocations.
     pub fn stop_process(&self, process_id: selium_abi::ProcessId) -> Result<()> {
-        self.kernel.processes().stop_process(process_id)?;
+        // A retry of a partially torn-down process finds the kernel process
+        // already stopped (or already reaped, when the failure path was
+        // `cleanup_failed_process`); both are expected, not errors.
+        if let Err(error) = self.kernel.processes().stop_process(process_id) {
+            let resuming_teardown =
+                matches!(error, selium_kernel::Error::ProcessStopped(_))
+                    || (matches!(error, selium_kernel::Error::NotFound(_))
+                        && self.process_authorities.lock().contains_key(&process_id));
+            if !resuming_teardown {
+                return Err(error.into());
+            }
+        }
         self.loaded_guests.lock().remove(&process_id);
-        if self
-            .process_authorities
-            .lock()
-            .remove(&process_id)
-            .is_some()
-        {
+        // Capture the authority before it is dropped so cleanup can revoke
+        // the process's typed URIs, and re-insert it if teardown fails so a
+        // retry re-enters the cleanup path.
+        let authority = self.process_authorities.lock().remove(&process_id);
+        if let Some(authority) = authority {
             self.operations
                 .lock()
                 .retain(|_, operation| operation.process_id != process_id);
             self.mailboxes.lock().remove(&process_id);
-            self.cleanup_process_resources(process_id)?;
+            if let Err(error) = self.cleanup_process_resources(process_id, authority.tenant.clone())
+            {
+                self.process_authorities.lock().insert(process_id, authority);
+                return Err(error);
+            }
         }
         self.local_handle_owners
             .lock()
@@ -36,7 +54,13 @@ impl Runtime {
         if *self.discovery_process.lock() == Some(process_id) {
             *self.discovery_process.lock() = None;
         }
-        self.kernel.processes().reap_process(process_id)?;
+        // An already-reaped process (retry after `cleanup_failed_process`)
+        // reports NotFound; the kernel state is already reclaimed.
+        if let Err(error) = self.kernel.processes().reap_process(process_id)
+            && !matches!(error, selium_kernel::Error::NotFound(_))
+        {
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -187,9 +211,21 @@ impl Runtime {
     /// `Tenant`, `Children`.
     /// Admitted with constraints: `UriPrefix` (requires a network
     /// `ResourceClass` selector in the same grant).
-    /// Empty selector list = unrestricted within the capability.
+    /// Empty selector list = unrestricted within the capability — except
+    /// `DelegateGrants`: an empty selector list would vacuously match every
+    /// tenant (including root) and grant global cross-tenant delegation
+    /// authority, so a `DelegateGrants` grant MUST carry at least one
+    /// `Tenant` selector.
     pub(crate) fn validate_grants(&self, grants: &[CapabilityGrant]) -> Result<()> {
         for grant in grants {
+            if grant.capability == Capability::DelegateGrants
+                && !grant
+                    .selectors
+                    .iter()
+                    .any(|selector| matches!(selector, ResourceSelector::Tenant(_)))
+            {
+                return Err(Error::InvalidGrant(grant.capability.clone()));
+            }
             for selector in &grant.selectors {
                 if !selector.is_evaluatable(&grant.selectors) {
                     return Err(Error::UnevaluatableSelector(
@@ -210,9 +246,17 @@ impl Runtime {
         self.operations
             .lock()
             .retain(|_, operation| operation.process_id != process_id);
-        drop(self.cleanup_process_resources(process_id));
+        let process_tenant = self.process_tenant(process_id);
+        // Discovery revocations stage their bookkeeping: a failed publish
+        // leaves the pending entries intact. If teardown failed, retain the
+        // process authority so a later `stop_process` retry can complete the
+        // remaining revocations (its kernel record is already reaped below,
+        // which `stop_process` tolerates for retained authorities).
+        let cleanup_failed = self.cleanup_process_resources(process_id, process_tenant).is_err();
         drop(self.kernel.processes().reap_process(process_id));
-        self.process_authorities.lock().remove(&process_id);
+        if !cleanup_failed {
+            self.process_authorities.lock().remove(&process_id);
+        }
         self.mailboxes.lock().remove(&process_id);
         self.local_handle_owners
             .lock()
@@ -230,75 +274,86 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn cleanup_process_resources(&self, process_id: ProcessId) -> Result<()> {
+    pub(crate) fn cleanup_process_resources(
+        &self,
+        process_id: ProcessId,
+        process_tenant: Option<String>,
+    ) -> Result<()> {
         // The process's fast-path capability vote is moot once it is gone.
         self.process_fastpath.lock().remove(&process_id);
-        // Revoke all discovery URIs registered for this process by publishing
-        // Revoke operations to the discovery feed.
-        let region_purposes: Vec<(u64, selium_abi::ResourceKind)> = {
-            let mut map = self.region_purposes.lock();
-            let keys: Vec<(ProcessId, u64)> = map
-                .keys()
-                .filter(|(pid, _)| *pid == process_id)
-                .copied()
-                .collect();
-            keys.into_iter()
-                .filter_map(|key| map.remove(&key).map(|purpose| (key.1, purpose)))
-                .collect()
-        };
-        for (shared_id, purpose) in region_purposes {
-            let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
-            for uri in uris {
+
+        // Revoke the process node first, so the process becomes unresolvable
+        // before its resources are reclaimed.
+        let tenant = process_tenant.as_deref().unwrap_or_default();
+        let node_uri = crate::discovery::process_registration_uri(tenant, process_id);
+        let request = DiscoveryRequest::Revoke { uri: node_uri };
+        let bytes = encode_rkyv(&request)
+            .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
+        self.publish_discovery_event(bytes)?;
+
+        // Revoke all region registrations minted for this process, publishing
+        // Revoke operations to the discovery feed under the serving tenant.
+        // Staged: each `region_tenants` entry is removed only after its
+        // revocation publishes successfully, so a failed teardown can be
+        // retried without losing bookkeeping.
+        let region_keys: Vec<(ProcessId, u64)> = self
+            .region_tenants
+            .lock()
+            .keys()
+            .filter(|(pid, _)| *pid == process_id)
+            .copied()
+            .collect();
+        for key in region_keys {
+            let serving_tenant = self.region_tenants.lock().get(&key).cloned();
+            if let Some(serving_tenant) = serving_tenant {
+                let uri = crate::discovery::region_registration_uri(&serving_tenant, key.1);
                 let request = DiscoveryRequest::Revoke { uri };
                 let bytes = encode_rkyv(&request).map_err(|error| {
                     crate::Error::Host(format!("discovery encode failed: {error}"))
                 })?;
                 self.publish_discovery_event(bytes)?;
+                self.region_tenants.lock().remove(&key);
             }
         }
 
         // Revoke any well-known URI provisioned for this process, so a
-        // terminated connector's channel stops resolving. Best-effort, like
-        // the rest of this teardown path.
-        if let Some((uri, _listener_shared_id)) = self.well_known_uris.lock().remove(&process_id) {
+        // terminated connector's channel stops resolving. Staged like the
+        // region revocations above.
+        let well_known = self.well_known_uris.lock().get(&process_id).cloned();
+        if let Some((uri, _listener_shared_id)) = well_known {
             let request = DiscoveryRequest::Revoke { uri };
-            if let Ok(bytes) = encode_rkyv(&request) {
-                drop(self.publish_discovery_event(bytes));
-            }
+            let bytes = encode_rkyv(&request)
+                .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
+            self.publish_discovery_event(bytes)?;
+            self.well_known_uris.lock().remove(&process_id);
         }
 
-        // Revoke tier-1 registrations for host queues created by this process.
-        let owned_queues = self
-            .shared_resource_owners
+        // Revoke tier-1 registrations for host queues created by this
+        // process, under the principal tenant each queue was minted for.
+        // Staged like the region revocations above.
+        let queue_keys: Vec<(ProcessId, u64)> = self
+            .queue_tenants
             .lock()
-            .iter()
-            .filter_map(|((resource_class, shared_id), owners)| {
-                if resource_class == &ResourceClass::HostQueue && owners.contains(&process_id) {
-                    Some(*shared_id)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for shared_id in owned_queues {
-            let request = DiscoveryRequest::Revoke {
-                uri: crate::discovery::queue_registration_uri(process_id, shared_id),
-            };
-            if let Ok(bytes) = encode_rkyv(&request) {
-                drop(self.publish_discovery_event(bytes));
+            .keys()
+            .filter(|(pid, _)| *pid == process_id)
+            .copied()
+            .collect();
+        for key in queue_keys {
+            let principal = self.queue_tenants.lock().get(&key).cloned();
+            if let Some(principal) = principal {
+                let request = DiscoveryRequest::Revoke {
+                    uri: crate::discovery::queue_registration_uri(&principal, key.1),
+                };
+                let bytes = encode_rkyv(&request).map_err(|error| {
+                    crate::Error::Host(format!("discovery encode failed: {error}"))
+                })?;
+                self.publish_discovery_event(bytes)?;
+                self.queue_tenants.lock().remove(&key);
             }
         }
 
-        // Revoke protocol handler registrations for this process.
-        let handler_schemes = self.handler_schemes.lock().remove(&process_id);
-        if let Some(schemes) = handler_schemes {
-            for scheme in schemes {
-                let request = DiscoveryRequest::RevokeHandler { protocol: scheme };
-                if let Ok(bytes) = encode_rkyv(&request) {
-                    drop(self.publish_discovery_event(bytes));
-                }
-            }
-        }
+        // Drop the protocol-handler pinning registry for this process.
+        self.handler_schemes.lock().remove(&process_id);
 
         let owned_handles = self
             .local_handle_owners
@@ -1102,5 +1157,232 @@ mod tests {
             still_owns,
             "co-owner b should retain ownership after a fails"
         );
+    }
+
+    /// Teardown support: replaces the runtime's discovery publisher with one
+    /// over a full Park channel, so every synchronous publish surfaces
+    /// `BufferFull` instead of silently succeeding (the real feed is a Drop
+    /// channel, which never fails). Returns the original publisher.
+    fn swap_in_failing_publisher(
+        runtime: &Runtime,
+    ) -> Option<crate::runtime::DiscoveryPublisher> {
+        let full_channel = selium_shm::Channel::create_with_backpressure(
+            64,
+            selium_shm::ChannelBackpressure::Park,
+            selium_abi::ResourceKind::PubSubTopic,
+        )
+        .expect("park channel");
+        let transport = selium_shm::transport::ShmTransport::new(&full_channel, &full_channel)
+            .expect("transport");
+        // Fill the ring so any further write parks (surfaced as BufferFull
+        // by the synchronous write path).
+        let mut filler = selium_wire::framed::FramedWrite::new(transport);
+        while filler.write_frame(b"x", 0).is_ok() {}
+        let publisher = selium_wire::pubsub::Publisher::new(filler);
+        (*runtime.discovery_publisher.lock()).replace(publisher)
+    }
+
+    /// Spawns a tenant-scoped guest so teardown has a registered process
+    /// node to revoke.
+    fn spawn_tenant_guest(runtime: &Runtime, name: &str, tenant: &str) -> selium_abi::ProcessId {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: wat::parse_str("(module (func (export \"boot\")))").expect("wat"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some(tenant.to_string()),
+                well_known_uri: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest")
+            .process_id
+    }
+
+    /// Installs a fresh working publisher and returns a subscriber attached
+    /// to its channel, so a retried teardown's revocations are observable.
+    fn swap_in_working_publisher(
+        runtime: &Runtime,
+    ) -> selium_wire::pubsub::Subscriber<Vec<u8>, selium_shm::transport::ShmTransport> {
+        let channel = selium_shm::Channel::create_with_backpressure(
+            64 * 1024,
+            selium_shm::ChannelBackpressure::Drop,
+            selium_abi::ResourceKind::PubSubTopic,
+        )
+        .expect("channel");
+        let writer = selium_shm::transport::ShmTransport::new(&channel, &channel)
+            .expect("writer transport");
+        let reader = selium_shm::transport::ShmTransport::new(&channel, &channel)
+            .expect("reader transport");
+        let publisher =
+            selium_wire::pubsub::Publisher::new(selium_wire::framed::FramedWrite::new(writer));
+        *runtime.discovery_publisher.lock() = Some(publisher);
+        selium_wire::pubsub::Subscriber::new(
+            selium_wire::framed::FramedRead::new(reader),
+            Some(channel.ring().capacity()),
+        )
+    }
+
+    /// Drains every discovery event currently readable from the subscriber.
+    fn drain_feed(
+        subscriber: &mut selium_wire::pubsub::Subscriber<
+            Vec<u8>,
+            selium_shm::transport::ShmTransport,
+        >,
+    ) -> Vec<DiscoveryRequest> {
+        let mut events = Vec::new();
+        loop {
+            match subscriber.read_with_tag() {
+                Ok((bytes, _tag)) => {
+                    events.push(selium_abi::decode_rkyv(&bytes).expect("decode event"));
+                }
+                Err(selium_wire::error::Error::BufferEmpty) => break,
+                Err(error) => panic!("feed read failed: {error}"),
+            }
+        }
+        events
+    }
+
+    /// A discovery publish failure during `stop_process` must fail the stop
+    /// (rather than silently skipping revocations), keep the process
+    /// authority so the stop can be retried, and leave the pending
+    /// revocations staged so the retry publishes them.
+    #[test]
+    fn stop_process_teardown_is_retryable_after_publish_failure() {
+        let runtime = Runtime::default();
+        runtime
+            .bootstrap_system_guests(crate::RuntimeConfig {
+                start_discovery: true,
+                system_guests: Vec::new(),
+            })
+            .expect("bootstrap discovery");
+        let pid = spawn_tenant_guest(&runtime, "retry-guest", "acme");
+
+        // Every publish now fails: teardown cannot revoke the process node.
+        swap_in_failing_publisher(&runtime);
+        let stopped = runtime.stop_process(pid);
+        assert!(stopped.is_err(), "teardown must fail while publishes fail");
+        // The authority is retained so the stop is retryable, not lost.
+        assert_eq!(
+            runtime.process_tenant(pid).as_deref(),
+            Some("acme"),
+            "authority must be retained for a teardown retry"
+        );
+
+        // Install a working publisher and retry: the stop completes and the
+        // process-node revocation is published.
+        let mut subscriber = swap_in_working_publisher(&runtime);
+        runtime.stop_process(pid).expect("retry stop");
+        let events = drain_feed(&mut subscriber);
+        let revoked = events
+            .iter()
+            .filter_map(|event| match event {
+                DiscoveryRequest::Revoke { uri } => Some(uri.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            revoked.contains(&crate::discovery::process_registration_uri("acme", pid)),
+            "expected the process-node revocation after retry, got: {revoked:?}"
+        );
+        assert!(
+            runtime.process_tenant(pid).is_none(),
+            "authority must be dropped after a successful teardown"
+        );
+    }
+
+    /// A publish failure during `cleanup_failed_process` retains the process
+    /// authority (best-effort teardown still reclaims what it can), and a
+    /// later `stop_process` retry completes the pending revocations even
+    /// though the kernel record is already reaped.
+    #[test]
+    fn cleanup_failed_process_retains_authority_for_teardown_retry() {
+        let runtime = Runtime::default();
+        runtime
+            .bootstrap_system_guests(crate::RuntimeConfig {
+                start_discovery: true,
+                system_guests: Vec::new(),
+            })
+            .expect("bootstrap discovery");
+        let pid = spawn_tenant_guest(&runtime, "failed-guest", "acme");
+
+        // Every publish now fails: the failed-process teardown cannot revoke
+        // the process node, but stays best-effort.
+        swap_in_failing_publisher(&runtime);
+        runtime.cleanup_failed_process(pid).expect("best-effort cleanup");
+        assert_eq!(
+            runtime.process_tenant(pid).as_deref(),
+            Some("acme"),
+            "authority must be retained for a teardown retry"
+        );
+
+        // A later stop completes the pending revocation, tolerating the
+        // already-reaped kernel record.
+        let mut subscriber = swap_in_working_publisher(&runtime);
+        runtime.stop_process(pid).expect("retry stop");
+        let events = drain_feed(&mut subscriber);
+        let revoked = events
+            .iter()
+            .filter_map(|event| match event {
+                DiscoveryRequest::Revoke { uri } => Some(uri.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            revoked.contains(&crate::discovery::process_registration_uri("acme", pid)),
+            "expected the process-node revocation after retry, got: {revoked:?}"
+        );
+    }
+
+    /// A `DelegateGrants` grant with no `Tenant` selector would vacuously
+    /// match every scope context (including root), granting global
+    /// cross-tenant delegation authority; validation rejects it.
+    #[test]
+    fn delegate_grants_requires_a_tenant_selector() {
+        let runtime = Runtime::default();
+
+        let rejected = runtime.spawn_system_guest(SystemGuestDescriptor {
+            name: "bad-delegator".to_string(),
+            module_id: "bad-delegator-module".to_string(),
+            module_bytes: wat::parse_str("(module (func (export \"boot\")))").expect("wat"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(Capability::DelegateGrants, Vec::new())],
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            well_known_uri: None,
+            handlers: Vec::new(),
+        });
+        assert!(
+            matches!(
+                rejected,
+                Err(crate::Error::InvalidGrant(grant)) if grant == Capability::DelegateGrants
+            ),
+            "selector-less DelegateGrants must be rejected"
+        );
+
+        // A tenant-scoped delegation grant is admitted.
+        let admitted = runtime.spawn_system_guest(SystemGuestDescriptor {
+            name: "scoped-delegator".to_string(),
+            module_id: "scoped-delegator-module".to_string(),
+            module_bytes: wat::parse_str("(module (func (export \"boot\")))").expect("wat"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::DelegateGrants,
+                vec![ResourceSelector::Tenant("acme".to_string())],
+            )],
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            well_known_uri: None,
+            handlers: Vec::new(),
+        });
+        assert!(admitted.is_ok(), "tenant-scoped DelegateGrants is admitted");
     }
 }

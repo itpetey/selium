@@ -4,14 +4,16 @@ pub mod selium {
   use super::*;
   pub mod discovery {
     use super::*;
+    mod interface_metadata_generated;
+    pub use self::interface_metadata_generated::*;
+    mod label_generated;
+    pub use self::label_generated::*;
+    mod resource_target_generated;
+    pub use self::resource_target_generated::*;
     mod discovery_request_generated;
     pub use self::discovery_request_generated::*;
     mod discovery_response_generated;
     pub use self::discovery_response_generated::*;
-    mod interface_metadata_generated;
-    pub use self::interface_metadata_generated::*;
-    mod resource_target_generated;
-    pub use self::resource_target_generated::*;
   }
   pub mod live_table {
     use super::*;

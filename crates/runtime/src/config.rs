@@ -46,19 +46,18 @@ pub struct SystemGuestDescriptor {
     /// Tenant identity for this guest. `None` means "platform tenant".
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
-    /// Well-known discovery URI this guest serves (e.g. the DNS connector's
-    /// `sel://_sys/dns/resolve`). When set, the runtime provisions the
-    /// guest's channel at spawn time — exactly like the discovery listener —
-    /// by creating the host listener queue, injecting its shared id as the
-    /// leading entrypoint argument, granting attach rights for it, and
-    /// registering the URI with discovery. The registration is revoked when
-    /// the guest terminates.
+    /// Well-known discovery URI this guest serves under the root tenant
+    /// (e.g. the DNS connector's `sel:///dns/resolve`). When set, the runtime
+    /// provisions the guest's channel at spawn time — exactly like the
+    /// discovery listener — by creating the host listener queue, injecting
+    /// its shared id as the leading entrypoint argument, granting attach
+    /// rights for it, and registering the URI with discovery. The
+    /// registration is revoked when the guest terminates.
     pub well_known_uri: Option<String>,
-    /// Protocol schemes this guest handles (e.g. `sel-http` for
-    /// `selium-connector-http`). The runtime publishes a Tier-1 handler
-    /// registration under `sel://_sys/handlers/<scheme>` once the guest is
-    /// up, and revokes it on teardown. Discovery uses this to reject route
-    /// registrations whose scheme has no live handler.
+    /// Protocol handler names this guest serves (e.g. `sel-http` for
+    /// `selium-connector-http`). The runtime records these so serve-side
+    /// guests can pin their listeners to the handler process via
+    /// `ResolveProtocolHandler`; the registry is revoked on teardown.
     pub handlers: Vec<String>,
 }
 

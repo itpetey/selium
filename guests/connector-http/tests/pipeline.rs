@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use selium_abi::ResourceTarget;
+use selium_abi::{ResourceClass, ResourceTarget};
 use selium_connector_http::{
     pipeline::{
         ConnectionConfig, ForwardError, ForwardSession, ReplyEvent, ReplySink, SessionFactory,
@@ -752,6 +752,8 @@ fn target_for(uri: &str, id: u64) -> ResourceTarget {
         resource_id: id,
         interface: None,
         tenant: None,
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
     }
 }
 

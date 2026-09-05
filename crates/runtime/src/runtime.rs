@@ -4,7 +4,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use selium_abi::{OperationId, ProcessId, ResourceClass, ResourceKind, TaskId};
+use selium_abi::{OperationId, ProcessId, ResourceClass, TaskId};
 use selium_kernel::Kernel;
 use selium_shm::transport::ShmTransport;
 use selium_wire::pubsub::Publisher;
@@ -17,8 +17,11 @@ use crate::{
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-/// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
-pub(crate) type RegionPurposes = HashMap<(ProcessId, u64), ResourceKind>;
+/// Serving tenant tracked per (process_id, region_id) so FreeRegion can revoke
+/// the region's URI (minted under principal provenance).
+pub(crate) type RegionTenants = HashMap<(ProcessId, u64), String>;
+/// Principal tenant per `(process_id, queue shared id)` for host queues.
+pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Wait registry keyed by (process_id, region_id).
 pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
@@ -53,8 +56,13 @@ pub struct Runtime {
     /// Process id of the booted discovery system guest, if any. Only this
     /// process may call `RecordResolvedQueueFor` on behalf of resolvers.
     pub(crate) discovery_process: Arc<Mutex<Option<ProcessId>>>,
-    /// Region purpose tracked per (process_id, region_id) so FreeRegion can revoke aliases.
-    pub(crate) region_purposes: Arc<Mutex<RegionPurposes>>,
+    /// Serving tenant tracked per (process_id, region_id) so FreeRegion can
+    /// revoke the region's URI.
+    pub(crate) region_tenants: Arc<Mutex<RegionTenants>>,
+    /// Principal tenant tracked per (process_id, queue_id) so process
+    /// teardown can revoke the queue's URI under the tenant it was minted
+    /// for (which may differ from the creating process's own tenant).
+    pub(crate) queue_tenants: Arc<Mutex<QueueTenants>>,
     /// Wait registry: guest tasks parked on host-writable rings.
     pub(crate) wait_registry: Arc<Mutex<WaitRegistry>>,
     /// Wait targets for active network outbound proxy threads.
@@ -134,7 +142,8 @@ impl Runtime {
             discovery_publisher: Arc::new(Mutex::new(None)),
             discovery_listener_shared_id: Arc::new(Mutex::new(None)),
             discovery_process: Arc::new(Mutex::new(None)),
-            region_purposes: Arc::new(Mutex::new(HashMap::new())),
+            region_tenants: Arc::new(Mutex::new(HashMap::new())),
+            queue_tenants: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
             fast_path_attachments: Arc::new(Mutex::new(HashMap::new())),

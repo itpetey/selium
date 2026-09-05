@@ -39,6 +39,7 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose,
+            serving_tenant: None,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -132,10 +133,9 @@ fn discovery_bootstrap_slice_end_to_end() {
     // the probe process to observe Tier-1 register events.
     let mut subscriber = attach_feed_subscriber(&runtime);
     let host_region_id = alloc_region(&runtime, probe_guest.process_id, ResourceKind::SharedMemory);
-    let expected_uri = format!(
-        "sel://_sys/proc/{}/regions/{host_region_id}",
-        probe_guest.process_id
-    );
+    // The probe runs with no tenant (platform), so its region mints under the
+    // root tenant as a typed `sel:///region/<id>` URI.
+    let expected_uri = format!("sel:///region/{host_region_id}");
 
     let registered = drain_register_uris(&mut subscriber);
     assert!(

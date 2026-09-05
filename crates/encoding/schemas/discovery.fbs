@@ -9,6 +9,14 @@ table InterfaceMetadata {
     methods: [string];
 }
 
+/// A classification key/value label pair.
+table Label {
+    /// Label key.
+    key: string;
+    /// Label value.
+    value: string;
+}
+
 /// Target resource returned by discovery resolution.
 table ResourceTarget {
     /// URI of the resource.
@@ -21,6 +29,10 @@ table ResourceTarget {
     interface: InterfaceMetadata;
     /// Optional tenant identifier for multi-tenant isolation.
     tenant: string;
+    /// Resource class segment (`proc`, `region`, `queue`, …).
+    class: string;
+    /// Classification label pairs.
+    labels: [Label];
 }
 
 /// Discovery request message.
@@ -29,11 +41,17 @@ table ResourceTarget {
 ///   0 = Resolve(uri)
 ///   1 = Register { uri, target }
 ///   2 = Revoke { uri }
+///   3 = ResolvePrefix(uri)
+///   4 = ResolveLabels { key, value }
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
-    /// URI to resolve or register (used by Resolve, Register, Revoke variants).
+    /// URI to resolve or register (used by Resolve, ResolvePrefix, Register, Revoke variants).
     uri: string;
+    /// Label key (used by the ResolveLabels variant).
+    key: string;
+    /// Label value (used by the ResolveLabels variant).
+    value: string;
     /// Target resource for registration (used by Register variant).
     target: ResourceTarget;
 }
@@ -46,11 +64,14 @@ table DiscoveryRequest {
 ///   2 = Registered
 ///   3 = Revoked
 ///   4 = Forbidden
+///   5 = Resolved(targets)
 table DiscoveryResponse {
     /// Variant discriminator.
     variant: ubyte;
     /// The discovered resource (used by Found variant).
     target: ResourceTarget;
+    /// The matched resources (used by Resolved variant).
+    targets: [ResourceTarget];
 }
 
 root_type DiscoveryResponse;

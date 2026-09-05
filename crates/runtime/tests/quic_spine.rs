@@ -14,7 +14,7 @@
 //! the native `selium-connector-quic` tests substitute tokio UDP/runtime
 //! doubles (the shm adapters need the guest hostcalls), so only this test
 //! exercises the production adapter pair against a real handshake, plus the
-//! discovery wiring (`sel-quic://` registration, SNI resolve, queue attach)
+//! discovery wiring (external-name registration, SNI resolve, queue attach)
 //! that SNI routing depends on.
 //!
 //! Covers:
@@ -69,7 +69,7 @@ const KEY_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixt
 /// connector's 64 KiB per-direction ring capacity — so each direction is
 /// forced through at least one park/resume cycle by payload size alone.
 const PAYLOAD_LEN: usize = 16 * 1024;
-/// SNI / `sel-quic://` route name; must match the certificate's SAN.
+/// SNI / bare route name; must match the certificate's SAN.
 const SERVER_NAME: &str = "localhost";
 /// Warm-up round trips driven before the timed payload streams (see the
 /// handshake comment). Each opens a stream, so the guest-side "one accept
@@ -81,7 +81,7 @@ const WARMUP_ROUNDS: usize = 12;
 /// (consumed by the `Context` parameter) and grants attach rights for the
 /// discovery listener. `handlers: ["sel-quic"]` publishes the Tier-1
 /// protocol-handler registration discovery requires before accepting the
-/// demo's Tier-2 `sel-quic://localhost` route.
+/// demo's Tier-2 external `localhost` route.
 fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "quic-connector".to_string(),
@@ -273,7 +273,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
         &[("quic-connector: listening on", 1)],
         Duration::from_secs(30),
     );
-    let bound = format!("quic-demo: bound sel-quic://{SERVER_NAME}");
+    let bound = format!("quic-demo: bound {SERVER_NAME}");
     let _ = wait_for_logs(&runtime, demo, &[(&bound, 1)], Duration::from_secs(30));
 
     // External native quinn client — no Selium software anywhere on this

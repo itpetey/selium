@@ -1,7 +1,7 @@
 //! Byte-transport QUIC serve API for application guests.
 //!
 //! This module is the app-guest side of the QUIC connector: register a
-//! `sel-quic://<name>` URI subtree with discovery and accept per-stream byte
+//! a bare server name with discovery and accept per-stream byte
 //! channels from the connector, then frame the bytes with any user schema.
 //!
 //! ## Capability model
@@ -29,7 +29,7 @@
 //!
 //! #[entrypoint]
 //! async fn my_app(mut ctx: Context) {
-//!     let mut serve = QuicServe::bind(&mut ctx, "sel-quic://my-app")
+//!     let mut serve = QuicServe::bind(&mut ctx, "my-app")
 //!         .await
 //!         .expect("bind failed");
 //!
@@ -48,13 +48,14 @@ use std::{
 };
 
 use super::bytes::ByteStream;
-use selium_abi::{InterfaceMetadata, ResourceTarget, uri};
+use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{Context, GuestError, ResourceListener};
 
-/// Protocol scheme for QUIC routes (`sel-quic://…`).
+/// Protocol handler name for QUIC routes. Used to pin serve listeners to the
+/// QUIC connector's handoffs; not a URI scheme.
 pub const QUIC_SCHEME: &str = "sel-quic";
 /// Interface marker registered by app guests that serve QUIC byte channels.
 pub const QUIC_STREAM_INTERFACE: &str = "selium.quic/stream";
@@ -62,7 +63,7 @@ pub const QUIC_STREAM_INTERFACE: &str = "selium.quic/stream";
 /// A byte-transport QUIC serve handle.
 ///
 /// Wraps a [`ResourceListener`] and a discovery registration for a
-/// `sel-quic://<name>` URI. Each accepted stream is a [`QuicStream`] byte
+/// a bare server name (`my-app`). Each accepted stream is a [`QuicStream`] byte
 /// channel from the connector.
 pub struct QuicServe {
     listener: ResourceListener,
@@ -91,11 +92,12 @@ pub enum QuicServeError {
 }
 
 impl QuicServe {
-    /// Binds to a `sel-quic://<name>` URI and registers it with discovery.
+    /// Binds to a bare server name and registers it with discovery.
     ///
-    /// The `uri` must be protocol-aware: `sel-quic://<name>` (e.g.
-    /// `sel-quic://my-app`). The runtime allocates a host queue for the
-    /// listener and registers the URI→queue mapping with discovery.
+    /// The `name` is an opaque external name (a normalised hostname, e.g.
+    /// `my-app`); discovery stores and matches it exactly. The runtime
+    /// allocates a host queue for the listener and registers the name→queue
+    /// mapping with discovery.
     ///
     /// The listener is **pinned to the registered `sel-quic` protocol
     /// handler** (the QUIC connector): handoffs from any other process are
@@ -106,19 +108,19 @@ impl QuicServe {
     ///
     /// The guest requires a channel attach grant but **no `Network` grant** —
     /// QUIC is terminated and relayed by the connector.
-    pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
-        require_quic_scheme(uri)?;
+    pub async fn bind(ctx: &mut Context, name: &str) -> Result<Self, GuestError> {
+        let name = selium_abi::uri::normalize_external_name(name);
 
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
         super::pin_to_scheme_handler(&mut listener, QUIC_SCHEME)?;
 
-        let target = quic_target(&listener, uri);
-        ctx.register(uri, target).await?;
+        let target = quic_target(&listener, &name);
+        ctx.register(&name, target).await?;
 
         Ok(Self {
             listener,
-            uri: uri.to_string(),
+            uri: name.to_string(),
         })
     }
 
@@ -187,9 +189,9 @@ impl AsyncWrite for QuicStream {
     }
 }
 
-fn quic_target(listener: &ResourceListener, uri: &str) -> ResourceTarget {
+fn quic_target(listener: &ResourceListener, name: &str) -> ResourceTarget {
     ResourceTarget {
-        uri: uri.to_string(),
+        uri: name.to_string(),
         host_id: String::new(),
         resource_id: listener.descriptor().shared_id,
         interface: Some(InterfaceMetadata {
@@ -197,16 +199,8 @@ fn quic_target(listener: &ResourceListener, uri: &str) -> ResourceTarget {
             methods: Vec::new(),
         }),
         tenant: None,
-    }
-}
-
-fn require_quic_scheme(uri: &str) -> Result<(), GuestError> {
-    if uri::scheme_of(uri) == Some(QUIC_SCHEME) {
-        Ok(())
-    } else {
-        Err(GuestError::Host(format!(
-            "QUIC serve requires a `{QUIC_SCHEME}://` URI, got: {uri}"
-        )))
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
     }
 }
 
@@ -223,10 +217,12 @@ mod tests {
     }
 
     #[test]
-    fn bind_requires_quic_scheme() {
-        require_quic_scheme("sel-quic://my-app").expect("`sel-quic://` scheme is accepted");
-        assert!(require_quic_scheme("sel-http://my-app").is_err());
-        assert!(require_quic_scheme("my-app").is_err());
+    fn bind_normalises_server_names() {
+        assert_eq!(
+            selium_abi::uri::normalize_external_name("Example.COM."),
+            "example.com"
+        );
+        assert_eq!(selium_abi::uri::normalize_external_name("my-app"), "my-app");
     }
 
     #[tokio::test]

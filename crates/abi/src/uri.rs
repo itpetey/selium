@@ -1,48 +1,94 @@
-//! Fabric URI classification and matching.
+//! Selium URI grammar and matching.
 //!
-//! Selium uses a single `sel` URI family with two shapes:
+//! Selium uses two addressing surfaces:
 //!
-//! - `sel://<path>` — a generic namespace (plain name registration).
-//! - `sel-<protocol>://<authority>/<path>` — a protocol-aware route whose
-//!   scheme declares the handler that serves it (e.g. `sel-http://`).
+//! - `sel://<tenant>/<type>/<id>` — the internal typed schema. `<tenant>` is
+//!   the URI authority (empty for the root/system tenant), `<type>` is a
+//!   lowercased [`ResourceClass`] segment (`proc`, `region`, `queue`, …), and
+//!   `<id>` is the resource's numeric identity. A single non-class segment
+//!   (`sel://<tenant>/<name>`) names a leaf alias.
+//! - External names — always a distinct, opaque key such as
+//!   `https://acme.com/path/` or a bare hostname for server-name-only
+//!   transport. Discovery stores and matches these exactly without
+//!   interpreting their scheme or path.
 //!
-//! The `sel://_sys/` subtree is **reserved**: only the runtime may register
-//! inside it (Tier 1). Guests registering over RPC (Tier 2) are rejected.
+//! The root tenant (`sel:///…`) is **reserved**: only the runtime and system
+//! guests (Tier-1) may register inside it. Guests registering over RPC
+//! (Tier-2) are rejected.
 //!
 //! This module is the single source of truth for these rules, shared by the
 //! runtime (URI generation), the discovery guest (validation), and the
-//! connectors (route construction and prefix matching).
+//! connectors (external-name normalisation).
 
-/// Prefix under which protocol handlers register: `sel://_sys/handlers/<scheme>`.
-pub const HANDLER_URI_PREFIX: &str = "sel://_sys/handlers/";
-/// Process-scoped tier-1 prefix: `sel://_sys/proc/<process-id>/...`.
-pub const PROC_URI_PREFIX: &str = "sel://_sys/proc/";
-/// Resolved/tier-1 namespace prefix. Anything under it is runtime-owned.
-pub const RESERVED_URI_PREFIX: &str = "sel://_sys/";
+use super::ResourceClass;
 
-/// Extracts the process id from a `sel://_sys/proc/<id>/...` URI, if present.
-pub fn extract_process_id(uri: &str) -> Option<u64> {
-    let rest = uri.strip_prefix(PROC_URI_PREFIX)?;
-    let id_str = rest.split('/').next()?;
-    id_str.parse().ok()
+/// The scheme of internal `sel` URIs.
+pub const SEL_PREFIX: &str = "sel://";
+
+/// Parses a `sel://` URI into its `(tenant, path)` components.
+///
+/// `tenant` is the authority (empty for the root/system tenant); `path` is
+/// the remainder with leading and trailing `/` stripped (it may be empty or
+/// contain `/`-separated segments). Returns `None` for external names and
+/// other non-`sel` URIs.
+pub fn parse_sel(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix(SEL_PREFIX)?;
+    let (tenant, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((tenant, path.trim_matches('/')))
 }
 
-/// Returns the tier-1 registration URI for a protocol handler.
-pub fn handler_uri(scheme: &str) -> String {
-    format!("{HANDLER_URI_PREFIX}{scheme}")
+/// Returns whether `uri` addresses the root/system tenant (`sel:///…`).
+pub fn is_root_uri(uri: &str) -> bool {
+    matches!(parse_sel(uri), Some((tenant, _)) if tenant.is_empty())
 }
 
-/// Returns whether `scheme` is a protocol-aware fanric scheme (`sel-<proto>`).
-pub fn is_protocol_scheme(scheme: &str) -> bool {
-    scheme.starts_with("sel-")
+/// Builds a typed resource URI: `sel://<tenant>/<type>/<id>`.
+pub fn resource_uri(tenant: &str, class: ResourceClass, id: u64) -> String {
+    format!("{SEL_PREFIX}{tenant}/{}/{id}", class.uri_segment())
 }
 
-/// Returns whether the URI falls inside the reserved tier-1 namespace.
-pub fn is_reserved(uri: &str) -> bool {
-    uri.starts_with(RESERVED_URI_PREFIX)
+/// Returns whether `segment` names a resource class (a reserved type segment).
+pub fn is_class_segment(segment: &str) -> bool {
+    ResourceClass::from_uri_segment(segment).is_some()
 }
 
-/// Normalises a `Host` header value: lowercased, trailing dot stripped, and
+/// Parses a typed internal URI `sel://<tenant>/<type>/<id>` into
+/// `(tenant, class, id)`. Returns `None` for aliases, root well-known paths,
+/// and external names.
+pub fn parse_typed(uri: &str) -> Option<(&str, ResourceClass, u64)> {
+    let (tenant, path) = parse_sel(uri)?;
+    let (class_seg, id_seg) = path.split_once('/')?;
+    if id_seg.is_empty() || id_seg.contains('/') {
+        return None;
+    }
+    let class = ResourceClass::from_uri_segment(class_seg)?;
+    let id = id_seg.parse::<u64>().ok()?;
+    Some((tenant, class, id))
+}
+
+/// Parses a leaf alias `sel://<tenant>/<name>` into `(tenant, name)`.
+/// A class noun is reserved, so a name shadowing a type segment is rejected.
+pub fn parse_alias(uri: &str) -> Option<(&str, &str)> {
+    let (tenant, path) = parse_sel(uri)?;
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    if is_class_segment(path) {
+        return None;
+    }
+    Some((tenant, path))
+}
+
+/// Returns whether a `sel` path is a wildcard enumeration (`…/*`), and the
+/// non-wildcard prefix of the path (everything before the `/*`).
+pub fn wildcard_prefix(path: &str) -> Option<&str> {
+    let stripped = path.trim_end_matches('/');
+    let prefix = stripped.strip_suffix("*")?;
+    let prefix = prefix.trim_end_matches('/');
+    Some(prefix)
+}
+
+/// Normalises a host/authority value: lowercased, trailing dot stripped, and
 /// a numeric `:port` suffix removed.
 pub fn normalize_host(host: &str) -> String {
     let host = host.trim().to_ascii_lowercase();
@@ -56,89 +102,40 @@ pub fn normalize_host(host: &str) -> String {
     host.to_string()
 }
 
-/// Returns whether `prefix` is a component-aware prefix of `uri`.
+/// Normalises an external address to its canonical opaque key.
 ///
-/// Component boundaries are honoured so that `sel-http://example.com/foo`
-/// never matches `sel-http://example.com/foobar` (path segments) or
-/// `sel-http://example.com` never matches `sel-http://example.com.evil`
-/// (host label boundaries).
-pub fn prefix_matches(prefix: &str, uri: &str) -> bool {
-    if prefix == uri {
-        return true;
-    }
-    let Some((prefix_scheme, prefix_rest)) = prefix.split_once("://") else {
-        return false;
+/// Scheme and authority are lowercased, the authority's trailing dot and
+/// numeric port are stripped, and trailing path slashes are removed. A value
+/// without a `://` is treated as a bare hostname (server-name-only transport)
+/// and host-normalised.
+pub fn normalize_external_name(name: &str) -> String {
+    let trimmed = name.trim_end_matches('/');
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return normalize_host(trimmed);
     };
-    let Some((uri_scheme, uri_rest)) = uri.split_once("://") else {
-        return false;
-    };
-    if prefix_scheme != uri_scheme {
-        return false;
-    }
-
-    if is_protocol_scheme(prefix_scheme) {
-        let (prefix_host, prefix_path) = split_host_path(prefix_rest);
-        let (uri_host, uri_path) = split_host_path(uri_rest);
-        host_matches(prefix_host, uri_host) && segment_prefix(prefix_path, uri_path)
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = normalize_host(authority);
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        format!("{scheme}://{authority}")
     } else {
-        segment_prefix(prefix_rest, uri_rest)
+        format!("{scheme}://{authority}/{path}")
     }
 }
 
-/// Returns the protocol scheme of a protocol-aware URI (`sel-http` for
-/// `sel-http://…`), or `None` for generic `sel://` URIs.
-pub fn protocol_scheme(uri: &str) -> Option<&str> {
-    let scheme = scheme_of(uri)?;
-    is_protocol_scheme(scheme).then_some(scheme)
+/// Builds the canonical external key for an HTTP route: `https://<host>/<path>`.
+///
+/// `host` and `path` are normalised so the connector's lookup and the app
+/// guest's registration agree on one key.
+pub fn https_external_name(host: &str, path: &str) -> String {
+    normalize_external_name(&format!("https://{host}/{path}"))
 }
 
-/// Builds a protocol-aware URI from its parts, e.g.
-/// `protocol_uri("sel-http", "example.com", "/api")` → `sel-http://example.com/api`.
-pub fn protocol_uri(scheme: &str, authority: &str, path: &str) -> String {
-    format!("{scheme}://{authority}{path}")
-}
-
-/// Returns the scheme portion of `uri` (`sel`, `sel-http`, …), if well-formed.
-pub fn scheme_of(uri: &str) -> Option<&str> {
-    let scheme = uri.split_once("://")?.0;
-    (!scheme.is_empty()
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-'))
-    .then_some(scheme)
-}
-
-/// Returns whether `prefix_host` matches `host` (exact or a `*.` wildcard at a
-/// label boundary).
-fn host_matches(prefix_host: &str, host: &str) -> bool {
-    if prefix_host == host {
-        return true;
-    }
-    let Some(suffix) = prefix_host.strip_prefix("*.") else {
-        return false;
-    };
-    host.len() > suffix.len()
-        && host.ends_with(suffix)
-        && host.as_bytes().get(host.len() - suffix.len() - 1) == Some(&b'.')
-}
-
-/// Returns whether `prefix_path` is a prefix of `path` at a segment boundary.
-/// Trailing slashes on the prefix are ignored so `/foo/` matches `/foo/bar`.
-fn segment_prefix(prefix_path: &str, path: &str) -> bool {
-    let prefix = prefix_path.trim_end_matches('/');
-    if prefix.is_empty() {
-        return true;
-    }
-    if prefix == path.trim_end_matches('/') {
-        return true;
-    }
-    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
-}
-
-/// Splits the authority+path portion of a URI into `(host, path)` where `path`
-/// retains its leading `/` (or is empty when absent).
-fn split_host_path(rest: &str) -> (&str, &str) {
-    rest.split_once('/').unwrap_or((rest, ""))
+/// Builds the canonical external key for a server-name-only protocol (a bare
+/// normalised hostname).
+pub fn bare_external_name(name: &str) -> String {
+    normalize_host(name)
 }
 
 #[cfg(test)]
@@ -146,95 +143,121 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scheme_of_parses_known_forms() {
-        assert_eq!(scheme_of("sel://tenant/app"), Some("sel"));
-        assert_eq!(scheme_of("sel-http://example.com/api"), Some("sel-http"));
-        assert_eq!(scheme_of("not-a-uri"), None);
-        assert_eq!(scheme_of("sel://"), Some("sel"));
+    fn parse_sel_extracts_tenant_and_path() {
+        assert_eq!(parse_sel("sel://tenant/app"), Some(("tenant", "app")));
+        assert_eq!(parse_sel("sel://acme/region/7"), Some(("acme", "region/7")));
+        assert_eq!(parse_sel("sel:///dns/resolve"), Some(("", "dns/resolve")));
+        assert_eq!(parse_sel("sel:///proc/1"), Some(("", "proc/1")));
+        assert_eq!(parse_sel("https://example.com/"), None);
+        assert_eq!(parse_sel("example.com"), None);
     }
 
     #[test]
-    fn reserved_namespace_detection() {
-        assert!(is_reserved("sel://_sys/proc/42/regions/7"));
-        assert!(is_reserved("sel://_sys/handlers/sel-http"));
-        assert!(!is_reserved("sel://tenant/app"));
-        assert!(!is_reserved("sel-http://example.com/"));
+    fn root_uri_detection() {
+        assert!(is_root_uri("sel:///dns/resolve"));
+        assert!(is_root_uri("sel:///proc/1"));
+        assert!(!is_root_uri("sel://acme/proc/1"));
+        assert!(!is_root_uri("https://example.com/"));
     }
 
     #[test]
-    fn protocol_scheme_detection() {
+    fn resource_uri_uses_typed_segment() {
         assert_eq!(
-            protocol_scheme("sel-http://example.com/api"),
-            Some("sel-http")
+            resource_uri("acme", ResourceClass::SharedRegion, 7),
+            "sel://acme/region/7"
         );
-        assert_eq!(protocol_scheme("sel://tenant/app"), None);
-        assert_eq!(protocol_scheme("not-a-uri"), None);
+        assert_eq!(
+            resource_uri("acme", ResourceClass::Process, 42),
+            "sel://acme/proc/42"
+        );
+        assert_eq!(
+            resource_uri("acme", ResourceClass::HostQueue, 9),
+            "sel://acme/queue/9"
+        );
+        assert_eq!(
+            resource_uri("", ResourceClass::HostQueue, 9),
+            "sel:///queue/9"
+        );
     }
 
     #[test]
-    fn extract_process_id_from_proc_uris() {
-        assert_eq!(extract_process_id("sel://_sys/proc/42/regions/7"), Some(42));
-        assert_eq!(extract_process_id("sel://_sys/proc/99/queues/3"), Some(99));
-        assert_eq!(extract_process_id("sel://my-app/logs"), None);
-        assert_eq!(extract_process_id("sel://_sys/handlers/sel-http"), None);
+    fn parse_typed_recognises_typed_uris() {
+        assert_eq!(
+            parse_typed("sel://acme/region/7"),
+            Some(("acme", ResourceClass::SharedRegion, 7))
+        );
+        assert_eq!(
+            parse_typed("sel://acme/proc/42"),
+            Some(("acme", ResourceClass::Process, 42))
+        );
+        assert_eq!(
+            parse_typed("sel:///queue/9"),
+            Some(("", ResourceClass::HostQueue, 9))
+        );
+        assert_eq!(parse_typed("sel://acme/proxy"), None);
+        assert_eq!(parse_typed("sel:///dns/resolve"), None);
+        assert_eq!(parse_typed("https://example.com/"), None);
     }
 
     #[test]
-    fn handler_uri_places_scheme_under_reserved_prefix() {
-        assert_eq!(handler_uri("sel-http"), "sel://_sys/handlers/sel-http");
-        assert!(is_reserved(&handler_uri("sel-http")));
+    fn parse_alias_recognises_leaf_names() {
+        assert_eq!(parse_alias("sel://acme/proxy"), Some(("acme", "proxy")));
+        assert_eq!(parse_alias("sel:///discovery"), Some(("", "discovery")));
+        // Class nouns are reserved: an alias cannot shadow a type segment.
+        assert_eq!(parse_alias("sel://acme/region"), None);
+        assert_eq!(parse_alias("sel://acme/proc"), None);
+        assert_eq!(parse_alias("sel://acme/region/7"), None);
+        assert_eq!(parse_alias("https://example.com/"), None);
     }
 
     #[test]
-    fn normalize_host_lowercases_and_strips_port() {
-        assert_eq!(normalize_host("Example.COM:443"), "example.com");
-        assert_eq!(normalize_host("example.com"), "example.com");
-        assert_eq!(normalize_host("example.com."), "example.com");
-        // Non-numeric suffixes are kept (e.g. an odd header value).
-        assert_eq!(normalize_host("example.com:https"), "example.com:https");
+    fn class_segment_detection() {
+        assert!(is_class_segment("proc"));
+        assert!(is_class_segment("region"));
+        assert!(is_class_segment("queue"));
+        assert!(!is_class_segment("proxy"));
+        assert!(!is_class_segment(""));
     }
 
     #[test]
-    fn protocol_prefix_matching_honours_segment_boundaries() {
-        assert!(prefix_matches(
-            "sel-http://example.com/foo",
-            "sel-http://example.com/foo/bar"
-        ));
-        assert!(!prefix_matches(
-            "sel-http://example.com/foo",
-            "sel-http://example.com/foobar"
-        ));
-        // Trailing slash on the prefix is equivalent.
-        assert!(prefix_matches(
-            "sel-http://example.com/foo/",
-            "sel-http://example.com/foo/bar"
-        ));
-        // Scheme must match.
-        assert!(!prefix_matches(
-            "sel-http://example.com/",
-            "sel-dns://example.com/"
-        ));
+    fn wildcard_prefix_strips_star() {
+        assert_eq!(wildcard_prefix("region/*"), Some("region"));
+        assert_eq!(wildcard_prefix("region/*/"), Some("region"));
+        assert_eq!(wildcard_prefix("*"), Some(""));
+        assert_eq!(wildcard_prefix("region/7"), None);
     }
 
     #[test]
-    fn protocol_prefix_matching_honours_host_label_boundaries() {
-        assert!(prefix_matches(
-            "sel-http://example.com",
-            "sel-http://example.com/api"
-        ));
-        assert!(!prefix_matches(
-            "sel-http://example.com",
-            "sel-http://example.com.evil/api"
-        ));
+    fn normalize_external_name_is_canonical() {
+        assert_eq!(
+            normalize_external_name("https://Acme.com/path/"),
+            "https://acme.com/path"
+        );
+        assert_eq!(
+            normalize_external_name("https://acme.com"),
+            "https://acme.com"
+        );
+        assert_eq!(
+            normalize_external_name("https://acme.com:443/"),
+            "https://acme.com"
+        );
+        assert_eq!(normalize_external_name("Example.COM."), "example.com");
+        assert_eq!(
+            normalize_external_name("QUIC://Example.com/"),
+            "quic://example.com"
+        );
     }
 
     #[test]
-    fn generic_prefix_matching_honours_segment_boundaries() {
-        assert!(prefix_matches("sel://tenant/app/", "sel://tenant/app/api"));
-        assert!(!prefix_matches("sel://tenant/app/", "sel://tenant/apple"));
-        assert!(prefix_matches(
-            "sel://tenant/app/",
-            "sel://tenant/app/worker"
-        ));
+    fn external_name_builders_match_normalization() {
+        assert_eq!(
+            https_external_name("example.com", "api"),
+            "https://example.com/api"
+        );
+        assert_eq!(
+            https_external_name("example.com", ""),
+            "https://example.com"
+        );
+        assert_eq!(bare_external_name("Example.COM."), "example.com");
     }
 }

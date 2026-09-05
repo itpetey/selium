@@ -24,6 +24,8 @@ impl<'a> ResourceTarget<'a> {
   pub const VT_RESOURCE_ID: ::flatbuffers::VOffsetT = 8;
   pub const VT_INTERFACE: ::flatbuffers::VOffsetT = 10;
   pub const VT_TENANT: ::flatbuffers::VOffsetT = 12;
+  pub const VT_CLASS: ::flatbuffers::VOffsetT = 14;
+  pub const VT_LABELS: ::flatbuffers::VOffsetT = 16;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -36,6 +38,8 @@ impl<'a> ResourceTarget<'a> {
   ) -> ::flatbuffers::WIPOffset<ResourceTarget<'bldr>> {
     let mut builder = ResourceTargetBuilder::new(_fbb);
     builder.add_resource_id(args.resource_id);
+    if let Some(x) = args.labels { builder.add_labels(x); }
+    if let Some(x) = args.class { builder.add_class(x); }
     if let Some(x) = args.tenant { builder.add_tenant(x); }
     if let Some(x) = args.interface { builder.add_interface(x); }
     if let Some(x) = args.host_id { builder.add_host_id(x); }
@@ -84,6 +88,22 @@ impl<'a> ResourceTarget<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(ResourceTarget::VT_TENANT, None)}
   }
+  /// Resource class segment (`proc`, `region`, `queue`, …).
+  #[inline]
+  pub fn class(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(ResourceTarget::VT_CLASS, None)}
+  }
+  /// Classification label pairs.
+  #[inline]
+  pub fn labels(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Label<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Label>>>>(ResourceTarget::VT_LABELS, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for ResourceTarget<'_> {
@@ -97,6 +117,8 @@ impl ::flatbuffers::Verifiable for ResourceTarget<'_> {
      .visit_field::<u64>("resource_id", Self::VT_RESOURCE_ID, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<InterfaceMetadata>>("interface", Self::VT_INTERFACE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("class", Self::VT_CLASS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<Label>>>>("labels", Self::VT_LABELS, false)?
      .finish();
     Ok(())
   }
@@ -107,6 +129,8 @@ pub struct ResourceTargetArgs<'a> {
     pub resource_id: u64,
     pub interface: Option<::flatbuffers::WIPOffset<InterfaceMetadata<'a>>>,
     pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub class: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub labels: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<Label<'a>>>>>,
 }
 impl<'a> Default for ResourceTargetArgs<'a> {
   #[inline]
@@ -117,6 +141,8 @@ impl<'a> Default for ResourceTargetArgs<'a> {
       resource_id: 0,
       interface: None,
       tenant: None,
+      class: None,
+      labels: None,
     }
   }
 }
@@ -147,6 +173,14 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ResourceTargetBuilder<'a, 'b,
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ResourceTarget::VT_TENANT, tenant);
   }
   #[inline]
+  pub fn add_class(&mut self, class: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ResourceTarget::VT_CLASS, class);
+  }
+  #[inline]
+  pub fn add_labels(&mut self, labels: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<Label<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ResourceTarget::VT_LABELS, labels);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ResourceTargetBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     ResourceTargetBuilder {
@@ -169,6 +203,8 @@ impl ::core::fmt::Debug for ResourceTarget<'_> {
       ds.field("resource_id", &self.resource_id());
       ds.field("interface", &self.interface());
       ds.field("tenant", &self.tenant());
+      ds.field("class", &self.class());
+      ds.field("labels", &self.labels());
       ds.finish()
   }
 }

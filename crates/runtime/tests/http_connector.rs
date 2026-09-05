@@ -77,7 +77,7 @@ fn app_guest_without_network_grants() {
     );
 
     // Step 1: App creates a listener queue — succeeds with zero Network grants.
-    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(app, op_id)
     else {
@@ -112,6 +112,7 @@ fn app_guest_without_network_grants() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) =
@@ -364,7 +365,7 @@ fn http_connector_golden_path() {
     );
 
     // Step 1: App creates a listener host queue.
-    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(app, op_id)
     else {
@@ -399,6 +400,7 @@ fn http_connector_golden_path() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) =
@@ -516,7 +518,7 @@ fn keep_alive_ordering_preserved() {
     );
 
     // Owner creates a queue.
-    let (_, op_id) = runtime.begin_hostcall(owner, HostcallRequest::HostQueueCreate);
+    let (_, op_id) = runtime.begin_hostcall(owner, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(owner, op_id)
     else {
@@ -672,6 +674,7 @@ fn ungranted_region_attach_denied() {
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose: ResourceKind::RpcRing,
+            serving_tenant: None,
         },
     );
     let CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) =
@@ -682,7 +685,7 @@ fn ungranted_region_attach_denied() {
 
     // Handoff: the region id is delivered to the app through the queue,
     // which shares ownership with the receiver (and only the receiver).
-    let (_, queue_op) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate);
+    let (_, queue_op) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate { serving_tenant: None });
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(app, queue_op)
     else {

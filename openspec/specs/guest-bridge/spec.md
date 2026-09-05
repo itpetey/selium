@@ -36,7 +36,7 @@ The bridge-server and bridge-channel SHALL be implemented as standard WASM guest
 - **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initializes a pipe and relays frames to/from channels within its grants
 
 ### Requirement: Per-Tenant Bridge Server
-The system SHALL support a `bridge-server` system guest deployed one per tenant. The bridge-server SHALL register a `sel-quic://<tenant>/bridge` serving route so the QUIC connector delivers bridge-bound connections to it as per-stream handoffs. The bridge-server SHALL NOT terminate QUIC itself and SHALL NOT relay stream bytes.
+The system SHALL support a `bridge-server` system guest deployed one per tenant. The bridge-server SHALL register a `sel://<tenant>/bridge` serving route (a leaf alias under its own tenant) so the QUIC connector delivers bridge-bound connections to it as per-stream handoffs. The bridge-server SHALL NOT terminate QUIC itself and SHALL NOT relay stream bytes.
 
 #### Scenario: Bridge traffic routed to the tenant's bridge-server
 - **WHEN** an external client presents an SNI matching a tenant's registered bridge route

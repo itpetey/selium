@@ -120,6 +120,19 @@ pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
     }
 }
 
+/// The tenant identity assigned to another process, if any.
+///
+/// The discovery service uses this to scope resolution to the calling
+/// process's own tenant.
+pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String>> {
+    match hostcall_ready(HostcallRequest::ProcessTenant { process_id })? {
+        HostcallOutput::Tenant(tenant) => Ok(tenant),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessTenant: {other:?}"
+        ))),
+    }
+}
+
 /// Resolves the bootstrap-registered protocol handler for `scheme`
 /// (e.g. `sel-quic`) to its process id.
 ///

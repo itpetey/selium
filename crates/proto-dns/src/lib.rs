@@ -13,11 +13,12 @@ use selium_guest_macros::schema;
 pub mod fbs;
 pub mod wire;
 
-/// Well-known discovery URI registered by the DNS connector at boot.
+/// Well-known discovery URI registered by the DNS connector at boot, under
+/// the root (empty) tenant.
 ///
 /// Resolving guests attach by looking this URI up through discovery; a
 /// channel grant on this URI is the capability that expresses "may resolve".
-pub const RESOLVE_URI: &str = "sel://_sys/dns/resolve";
+pub const RESOLVE_URI: &str = "sel:///dns/resolve";
 
 /// DNS resource record types carried by typed queries and responses.
 ///

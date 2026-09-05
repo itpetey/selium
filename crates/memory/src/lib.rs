@@ -206,8 +206,25 @@ pub trait MappingBackend: Send + Sync + Any {
 /// Implementations may be backed by host hostcalls (WASM guests), a runtime
 /// region table (native runtime), or a heap allocation map (native tests).
 pub trait RegionProvider: Send + Sync {
-    /// Allocates a shared memory region.
-    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region>;
+    /// Allocates a shared memory region under the allocating process's own
+    /// tenant.
+    fn allocate(&self, pages: u32, prot: RegionProt, purpose: ResourceKind) -> Result<Region> {
+        self.allocate_for_tenant(pages, prot, purpose, None)
+    }
+
+    /// Allocates a shared memory region minted under `serving_tenant`
+    /// (`None` = the allocating process's own tenant). Providers that cannot
+    /// distinguish a serving tenant (heap/runtime tables) delegate to
+    /// [`allocate`](Self::allocate).
+    fn allocate_for_tenant(
+        &self,
+        pages: u32,
+        prot: RegionProt,
+        purpose: ResourceKind,
+        _serving_tenant: Option<&str>,
+    ) -> Result<Region> {
+        self.allocate(pages, prot, purpose)
+    }
 
     /// Attaches an existing shared region.
     fn attach(&self, region_id: u64, reader_slot: Option<u32>, prot: RegionProt) -> Result<Region>;

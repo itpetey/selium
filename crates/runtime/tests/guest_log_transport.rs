@@ -25,6 +25,7 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
             pages: 1,
             prot: RegionProt::ReadWrite,
             purpose,
+            serving_tenant: None,
         },
     );
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -43,13 +44,16 @@ fn alloc_region_with_log_channel_publishes_discovery_register_events() {
 
     let uris = drain_register_uris(&mut subscriber);
 
+    // Region registrations are typed and tenant-scoped: the guest runs with
+    // no tenant (platform), so its region mint under the root tenant.
     assert!(
-        uris.contains(&format!("sel://_sys/proc/{process_id}/regions/{region_id}")),
-        "expected region URI to be published"
+        uris.contains(&format!("sel:///region/{region_id}")),
+        "expected region URI to be published, got: {uris:?}"
     );
+    // The runtime SHALL NOT auto-register purpose aliases.
     assert!(
-        uris.contains(&format!("sel://_sys/proc/{process_id}/logs")),
-        "expected log alias URI to be published"
+        !uris.iter().any(|uri| uri == "sel:///logs"),
+        "no purpose alias shall be published"
     );
 }
 

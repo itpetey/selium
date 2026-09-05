@@ -23,7 +23,7 @@
 //!
 //! #[entrypoint]
 //! async fn my_app(mut ctx: Context) {
-//!     let mut serve = HttpServe::bind(&mut ctx, "sel-http://example.com/api")
+//!     let mut serve = HttpServe::bind(&mut ctx, "https://example.com/api")
 //!         .await
 //!         .expect("bind failed");
 //!
@@ -37,13 +37,14 @@
 //! }
 //! ```
 
-use selium_abi::{InterfaceMetadata, ResourceTarget, uri};
+use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
 
 use crate::{Context, GuestError, ResourceListener};
 
-/// Protocol scheme for HTTP routes (`sel-http://…`.
+/// Protocol handler name for HTTP routes. Used to pin serve listeners to the
+/// HTTP connector's handoffs; not a URI scheme.
 pub const HTTP_SCHEME: &str = "sel-http";
 /// Interface marker for streamed HTTP serving.
 ///
@@ -104,7 +105,7 @@ pub enum HttpServeError {
 ///
 /// #[entrypoint]
 /// async fn my_app(mut ctx: Context) {
-///     let mut serve = HttpServeStream::bind(&mut ctx, "sel-http://example.com/events")
+///     let mut serve = HttpServeStream::bind(&mut ctx, "https://example.com/events")
 ///         .await
 ///         .expect("bind failed");
 ///
@@ -142,13 +143,12 @@ pub struct HttpStreamRequestHandle<'a> {
 }
 
 impl HttpServe {
-    /// Bind to a URI subtree and register it with discovery.
+    /// Bind to an external address and register it with discovery.
     ///
-    /// The `uri` must be protocol-aware: `sel-http://<host>/<prefix>` (e.g.
-    /// `sel-http://my-app/api`). The runtime allocates a host queue for the
-    /// listener and registers the URI→queue mapping with the discovery
-    /// service, which rejects it unless an HTTP handler (the connector) is
-    /// present.
+    /// The `uri` is an opaque external name such as `https://my-app/api`;
+    /// discovery stores and matches it exactly. The runtime allocates a host
+    /// queue for the listener and registers the name→queue mapping with the
+    /// discovery service.
     ///
     /// The guest requires a channel attach grant but **no `Network` grant**
     /// — networking is handled by the connector.
@@ -158,15 +158,15 @@ impl HttpServe {
     /// refused, since handoff metadata is sender-controlled. Binding fails
     /// when no connector is registered.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
-        require_http_scheme(uri)?;
+        let uri = selium_abi::uri::normalize_external_name(uri);
 
         // Allocate a host queue for incoming connections (synchronous).
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
         super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
 
-        let target = http_target(&listener, uri, None);
-        ctx.register(uri, target).await?;
+        let target = http_target(&listener, &uri, None);
+        ctx.register(&uri, target).await?;
 
         Ok(Self {
             listener,
@@ -260,8 +260,8 @@ impl std::fmt::Display for HttpServeError {
 impl std::error::Error for HttpServeError {}
 
 impl HttpServeStream {
-    /// Bind to a URI subtree and register it with discovery as a streamed
-    /// HTTP route.
+    /// Bind to an external address and register it with discovery as a
+    /// streamed HTTP route.
     ///
     /// The guest requires a channel attach grant but **no `Network`
     /// grant** — networking is handled by the connector.
@@ -270,7 +270,7 @@ impl HttpServeStream {
     /// handler** (the HTTP connector): handoffs from any other process are
     /// refused. Binding fails when no connector is registered.
     pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
-        require_http_scheme(uri)?;
+        let uri = selium_abi::uri::normalize_external_name(uri);
 
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
@@ -278,13 +278,13 @@ impl HttpServeStream {
 
         let target = http_target(
             &listener,
-            uri,
+            &uri,
             Some(InterfaceMetadata {
                 name: HTTP_STREAM_INTERFACE.to_string(),
                 methods: Vec::new(),
             }),
         );
-        ctx.register(uri, target).await?;
+        ctx.register(&uri, target).await?;
 
         Ok(Self {
             listener,
@@ -410,15 +410,7 @@ fn http_target(
         resource_id: listener.descriptor().shared_id,
         interface,
         tenant: None,
-    }
-}
-
-fn require_http_scheme(uri: &str) -> Result<(), GuestError> {
-    if uri::scheme_of(uri) == Some(HTTP_SCHEME) {
-        Ok(())
-    } else {
-        Err(GuestError::Host(format!(
-            "HTTP serve requires a `{HTTP_SCHEME}://` URI, got: {uri}"
-        )))
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
     }
 }

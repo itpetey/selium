@@ -17,11 +17,12 @@ impl HostcallRegionProvider {
 }
 
 impl RegionProvider for HostcallRegionProvider {
-    fn allocate(
+    fn allocate_for_tenant(
         &self,
         pages: u32,
         prot: RegionProt,
         purpose: ResourceKind,
+        serving_tenant: Option<&str>,
     ) -> Result<Region, MemoryError> {
         // AllocRegion only reserves the region in the host; it does not map it
         // into this guest's linear memory. Attach immediately so the returned
@@ -30,6 +31,7 @@ impl RegionProvider for HostcallRegionProvider {
             pages,
             prot,
             purpose,
+            serving_tenant: serving_tenant.map(str::to_string),
         })
         .map_err(|error| MemoryError::Other(error.to_string()))?
         {

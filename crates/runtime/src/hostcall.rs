@@ -8,7 +8,7 @@ use std::{
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
     GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ResourceTarget, TaskId, encode_rkyv,
+    ResourceIdentity, ResourceSelector, ResourceTarget, ScopeContext, TaskId, encode_rkyv,
 };
 use selium_encoding::{FlatMsg, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
@@ -219,6 +219,46 @@ impl Runtime {
         }
     }
 
+    /// Authorizes a principal-provenance allocation for the supplied
+    /// serving tenant and returns the principal tenant the resource is
+    /// minted under.
+    ///
+    /// A serving tenant equal to the allocating process's own tenant (or
+    /// absent) needs no extra authority. A root principal (no tenant) may
+    /// mint for any tenant — connectors and other trusted edge
+    /// infrastructure run as root. A tenant-scoped process may mint for
+    /// another tenant only with a `DelegateGrants` grant scoped to that
+    /// tenant.
+    fn authorize_serving_tenant(
+        &self,
+        process_id: ProcessId,
+        serving_tenant: Option<&str>,
+    ) -> std::result::Result<String, AbiError> {
+        let own_tenant = self.process_tenant(process_id);
+        let Some(requested) = serving_tenant else {
+            return Ok(own_tenant.unwrap_or_default());
+        };
+        if own_tenant.as_deref() == Some(requested) || own_tenant.is_none() {
+            return Ok(requested.to_string());
+        }
+        if self.authorises(
+            process_id,
+            Capability::DelegateGrants,
+            &ScopeContext {
+                tenant: Some(requested.to_string()),
+                ..ScopeContext::default()
+            },
+        ) {
+            return Ok(requested.to_string());
+        }
+        Err(AbiError::new(
+            AbiErrorCode::PermissionDenied,
+            format!(
+                "cross-tenant allocation for tenant {requested:?} requires a root principal or tenant-scoped delegation"
+            ),
+        ))
+    }
+
     fn dispatch_hostcall(
         &self,
         process_id: ProcessId,
@@ -237,10 +277,11 @@ impl Runtime {
                 pages,
                 prot,
                 purpose,
+                serving_tenant,
             } => {
-                // Ignore unused `prot` field; `purpose` is informational and used
-                // for Tier-1 discovery registration.
+                // Ignore unused `prot` field; `purpose` is informational.
                 let _prot = prot;
+                let _purpose = purpose;
 
                 self.require(
                     process_id,
@@ -248,6 +289,14 @@ impl Runtime {
                     ResourceClass::SharedRegion,
                     None,
                 )?;
+
+                // Principal provenance: the region is minted under the serving
+                // tenant, which may differ from the allocating process's own
+                // tenant only for a root principal or with tenant-scoped
+                // delegation.
+                let principal =
+                    self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
+
                 let size_bytes = (pages as u64) * 65536; // WASM page size
                 let size_u32 = u32::try_from(size_bytes).map_err(|_error| {
                     AbiError::new(AbiErrorCode::MalformedPayload, "region size exceeds u32")
@@ -268,38 +317,39 @@ impl Runtime {
 
                 self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
 
-                // Tier-1 discovery registration: publish Register operations for each URI.
-                let uris = crate::discovery::registration_uris(process_id, shared_id, purpose);
-                for uri in &uris {
-                    let target = ResourceTarget {
-                        uri: uri.clone(),
-                        host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
-                        resource_id: shared_id,
-                        interface: None,
-                        tenant: self.process_tenant(process_id),
-                    };
-                    let request = DiscoveryRequest::Register {
-                        uri: uri.clone(),
-                        target,
-                    };
-                    let bytes = encode_rkyv(&request).map_err(|error| {
-                        AbiError::new(
-                            AbiErrorCode::Internal,
-                            format!("discovery encode failed: {error}"),
-                        )
-                    })?;
-                    if let Err(error) = self.publish_discovery_event(bytes) {
-                        return Err(AbiError::new(
-                            AbiErrorCode::Internal,
-                            format!("discovery publish failed: {error}"),
-                        ));
-                    }
+                // Tier-1 discovery registration: one canonical typed URI.
+                let uri = crate::discovery::region_registration_uri(&principal, shared_id);
+                let target = ResourceTarget {
+                    uri: uri.clone(),
+                    host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
+                    resource_id: shared_id,
+                    interface: None,
+                    tenant: (!principal.is_empty()).then_some(principal.clone()),
+                    class: ResourceClass::SharedRegion,
+                    labels: Vec::new(),
+                };
+                let request = DiscoveryRequest::Register {
+                    uri,
+                    target,
+                    owner: Some(process_id),
+                };
+                let bytes = encode_rkyv(&request).map_err(|error| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("discovery encode failed: {error}"),
+                    )
+                })?;
+                if let Err(error) = self.publish_discovery_event(bytes) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::Internal,
+                        format!("discovery publish failed: {error}"),
+                    ));
                 }
 
-                // Remember the purpose so FreeRegion can revoke aliases without caching all URIs.
-                self.region_purposes
+                // Remember the serving tenant so FreeRegion can revoke the URI.
+                self.region_tenants
                     .lock()
-                    .insert((process_id, shared_id), purpose);
+                    .insert((process_id, shared_id), principal);
 
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAlloc(
                     selium_abi::RegionAllocation {
@@ -347,24 +397,21 @@ impl Runtime {
                 self.clear_fast_path_attachments(region_id);
                 self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
 
-                // Tier-1 discovery revocation: publish Revoke operations for each URI.
-                if let Some(purpose) = self.region_purposes.lock().remove(&(process_id, region_id))
-                {
-                    let uris = crate::discovery::registration_uris(process_id, region_id, purpose);
-                    for uri in uris {
-                        let request = DiscoveryRequest::Revoke { uri };
-                        let bytes = encode_rkyv(&request).map_err(|error| {
-                            AbiError::new(
-                                AbiErrorCode::Internal,
-                                format!("discovery encode failed: {error}"),
-                            )
-                        })?;
-                        if let Err(error) = self.publish_discovery_event(bytes) {
-                            return Err(AbiError::new(
-                                AbiErrorCode::Internal,
-                                format!("discovery publish failed: {error}"),
-                            ));
-                        }
+                // Tier-1 discovery revocation: publish a Revoke for the region URI.
+                if let Some(tenant) = self.region_tenants.lock().remove(&(process_id, region_id)) {
+                    let uri = crate::discovery::region_registration_uri(&tenant, region_id);
+                    let request = DiscoveryRequest::Revoke { uri };
+                    let bytes = encode_rkyv(&request).map_err(|error| {
+                        AbiError::new(
+                            AbiErrorCode::Internal,
+                            format!("discovery encode failed: {error}"),
+                        )
+                    })?;
+                    if let Err(error) = self.publish_discovery_event(bytes) {
+                        return Err(AbiError::new(
+                            AbiErrorCode::Internal,
+                            format!("discovery publish failed: {error}"),
+                        ));
                     }
                 }
 
@@ -919,13 +966,19 @@ impl Runtime {
                 self.kernel.processes().write_guest_log(entry);
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
-            HostcallRequest::HostQueueCreate => {
+            HostcallRequest::HostQueueCreate { serving_tenant } => {
                 self.require(
                     process_id,
                     Capability::HostQueue,
                     ResourceClass::HostQueue,
                     None,
                 )?;
+                // Principal provenance, mirroring AllocRegion: the queue is
+                // minted under the serving tenant, which may differ from the
+                // allocating process's own tenant only for a root principal or
+                // with tenant-scoped delegation.
+                let principal =
+                    self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
                 let queues = self.kernel.queues();
                 let memory = self.kernel.memory();
                 let descriptor = queues.create_host_queue(&memory);
@@ -936,19 +989,24 @@ impl Runtime {
                     descriptor.shared_id,
                 );
                 // Tier-1 registration: queues are first-class resources so a
-                // guest can register a route (e.g. `sel-http://…`) whose target
-                // is its listener queue and still pass discovery's ownership
-                // validation. Revoked on process teardown.
+                // guest can register an external route whose target is its
+                // listener queue and still pass discovery's ownership
+                // validation. Registered under the principal tenant and
+                // revoked on process teardown.
+                let uri = crate::discovery::queue_registration_uri(&principal, descriptor.shared_id);
                 let target = ResourceTarget {
-                    uri: crate::discovery::queue_registration_uri(process_id, descriptor.shared_id),
+                    uri: uri.clone(),
                     host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
                     resource_id: descriptor.shared_id,
                     interface: None,
-                    tenant: self.process_tenant(process_id),
+                    tenant: (!principal.is_empty()).then_some(principal.clone()),
+                    class: ResourceClass::HostQueue,
+                    labels: Vec::new(),
                 };
                 let request = DiscoveryRequest::Register {
-                    uri: target.uri.clone(),
+                    uri,
                     target,
+                    owner: Some(process_id),
                 };
                 let bytes = encode_rkyv(&request).map_err(|error| {
                     AbiError::new(
@@ -962,6 +1020,10 @@ impl Runtime {
                         format!("discovery publish failed: {error}"),
                     ));
                 }
+                // Remember the principal tenant so teardown revokes the same URI.
+                self.queue_tenants
+                    .lock()
+                    .insert((process_id, descriptor.shared_id), principal);
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
@@ -1063,6 +1125,9 @@ impl Runtime {
                 process_id,
                 tenant: self.process_tenant(process_id),
             })),
+            HostcallRequest::ProcessTenant { process_id } => Ok(HostOperationState::Ready(
+                HostcallOutput::Tenant(self.process_tenant(process_id)),
+            )),
             HostcallRequest::ResolveProtocolHandler { scheme } => {
                 // Handler registrations are Tier-1 (bootstrap-published), so
                 // this lookup cannot be forged by guests. Serve-side guests
@@ -1733,6 +1798,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         let (second_status, second_id) = runtime.begin_hostcall(
@@ -1741,6 +1807,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
 
@@ -2049,6 +2116,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::LogChannel,
+                serving_tenant: None,
             },
         );
         let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, bootstrapped.process_id, alloc_op)
@@ -2146,6 +2214,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         assert_eq!(status_a, selium_abi::HOSTCALL_STATUS_READY);
@@ -2157,6 +2226,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         assert_eq!(status_b, selium_abi::HOSTCALL_STATUS_FAILED);
@@ -2605,7 +2675,12 @@ mod tests {
         )
         .process_id;
 
-        let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate);
+        let (_, op_id) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueCreate {
+                serving_tenant: None,
+            },
+        );
         let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
             runtime.poll_hostcall(sender, op_id)
         else {
@@ -2734,6 +2809,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -2779,6 +2855,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, guest_a.process_id, alloc_op)
@@ -2829,6 +2906,7 @@ mod tests {
                 pages: 1,
                 prot: selium_abi::RegionProt::ReadWrite,
                 purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
             },
         );
         let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, guest_a.process_id, alloc_op)
