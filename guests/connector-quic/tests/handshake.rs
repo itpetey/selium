@@ -38,9 +38,9 @@ use selium_connector_quic::{
 };
 
 const CERT_DER: &[u8] = include_bytes!("fixtures/cert.der");
-const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
 const CLIENT_CERT_DER: &[u8] = include_bytes!("fixtures/client_cert.der");
 const CLIENT_KEY_DER: &[u8] = include_bytes!("fixtures/client_key.der");
+const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
 
 /// A native test-only `quinn::AsyncUdpSocket` over `tokio::net::UdpSocket`.
 struct TokioUdpSocket {
@@ -225,6 +225,118 @@ impl std::fmt::Debug for TokioTimer {
     }
 }
 
+/// A client presenting no certificate (or one outside the anchors) fails the
+/// handshake before any guest is contacted: `incoming.await` errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn certless_client_handshake_is_refused() {
+    let (server_config, _anchors) = mtls_server_config();
+    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
+
+    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind server socket");
+    let server_addr = server_socket.local_addr().expect("server addr");
+    let server_socket = TokioUdpSocket {
+        inner: Arc::new(server_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let endpoint = build_endpoint(
+        Arc::new(server_socket),
+        Arc::new(TokioRuntime),
+        Some(server_config),
+    )
+    .expect("build server endpoint");
+
+    // A client trusting the server but presenting NO client certificate.
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let client_socket = TokioUdpSocket {
+        inner: Arc::new(client_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
+        .expect("build client endpoint");
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert).expect("trust server cert");
+    client_endpoint.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
+    );
+
+    let client_task = {
+        let ep = client_endpoint.clone();
+        tokio::spawn(async move {
+            ep.connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("client connection (fails)")
+        })
+    };
+
+    // The server-side handshake must not complete for a certless client.
+    let mut refused = false;
+    if let Some(incoming) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.accept())
+            .await
+            .expect("accept within timeout")
+    {
+        refused = incoming.await.is_err();
+    }
+
+    assert!(
+        refused,
+        "certless client must be refused before any guest contact"
+    );
+
+    // The client task must observe the connection failure (the endpoint drop
+    // below unblocks it either way).
+    drop(tokio::time::timeout(std::time::Duration::from_secs(5), client_task).await);
+
+    drop(endpoint);
+    drop(client_endpoint);
+}
+
+/// Builds a client config that trusts the server's certificate and presents
+/// the embedded client certificate for client authentication.
+fn client_config_with_certificate(
+    server_cert: quinn::rustls::pki_types::CertificateDer<'static>,
+) -> ClientConfig {
+    use quinn::crypto::rustls::QuicClientConfig;
+    use quinn::rustls::{
+        RootCertStore,
+        client::WebPkiServerVerifier,
+        crypto::ring::default_provider,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        version::TLS13,
+    };
+
+    let mut roots = RootCertStore::empty();
+    roots.add(server_cert).expect("trust server cert");
+
+    let client_cert = CertificateDer::from(CLIENT_CERT_DER.to_vec());
+    let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(CLIENT_KEY_DER.to_vec()));
+
+    let rustls_client =
+        quinn::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&TLS13])
+            .expect("ring provider supports TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(
+                WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    Arc::new(default_provider()),
+                )
+                .build()
+                .expect("server verifier"),
+            )
+            .with_client_auth_cert(vec![client_cert], client_key)
+            .expect("client auth cert");
+
+    ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(rustls_client).expect("quic client"),
+    ))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handshake_completes_and_relays_a_stream() {
     let (server_config, cert) = server_config();
@@ -318,6 +430,88 @@ async fn handshake_completes_and_relays_a_stream() {
     drop(client_endpoint);
 }
 
+/// mTLS is opt-in: with no trust anchors configured, the connector serves
+/// without client authentication, so a certless client completes the
+/// handshake (restoring pre-mTLS behaviour for non-bridge deployments).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mtls_off_accepts_certless_client() {
+    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
+    let key = quinn::rustls::pki_types::PrivateKeyDer::Pkcs8(
+        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(KEY_DER.to_vec()),
+    );
+    let server_config = build_server_config(vec![cert], key, None).expect("no-mtls server config");
+
+    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind server socket");
+    let server_addr = server_socket.local_addr().expect("server addr");
+    let server_socket = TokioUdpSocket {
+        inner: Arc::new(server_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let endpoint = build_endpoint(
+        Arc::new(server_socket),
+        Arc::new(TokioRuntime),
+        Some(server_config),
+    )
+    .expect("build server endpoint");
+
+    // A client trusting the server but presenting NO client certificate.
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let client_socket = TokioUdpSocket {
+        inner: Arc::new(client_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
+        .expect("build client endpoint");
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots
+        .add(quinn::rustls::pki_types::CertificateDer::from(
+            CERT_DER.to_vec(),
+        ))
+        .expect("trust server cert");
+    client_endpoint.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
+    );
+
+    let client_task = {
+        let ep = client_endpoint.clone();
+        tokio::spawn(async move {
+            ep.connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("certless client completes handshake with mTLS off")
+        })
+    };
+
+    let _server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let incoming = endpoint.accept().await.expect("server incoming");
+        incoming
+            .await
+            .expect("server handshake completes with mTLS off")
+    })
+    .await
+    .expect("handshake completed within timeout");
+    drop(client_task.await.expect("client task"));
+
+    drop(endpoint);
+    drop(client_endpoint);
+}
+
+/// Builds an mTLS server config (mandatory client auth against the test
+/// anchor) plus the tenant anchor set it was built from.
+fn mtls_server_config() -> (ServerConfig, ClientAnchorSet) {
+    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
+    let key = quinn::rustls::pki_types::PrivateKeyDer::Pkcs8(
+        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(KEY_DER.to_vec()),
+    );
+    let anchors = test_anchor_set();
+    let config = build_server_config(vec![cert], key, Some(&anchors)).expect("mtls server config");
+    (config, anchors)
+}
+
 /// The production shm adapter + guest runtime satisfy quinn's trait bounds.
 ///
 /// This is the compile-level verification for the wasm-only types (they cannot
@@ -347,80 +541,6 @@ fn server_config() -> (
     (config, cert)
 }
 
-/// Unknown SNI is refused: the connector closes the connection before ever
-/// contacting an app guest (no discovery context = nothing to contact).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_sni_is_refused_without_guest_contact() {
-    let (server_config, cert) = server_config();
-
-    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind server socket");
-    let server_addr = server_socket.local_addr().expect("server addr");
-    let server_socket = TokioUdpSocket {
-        inner: Arc::new(server_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let endpoint = build_endpoint(
-        Arc::new(server_socket),
-        Arc::new(TokioRuntime),
-        Some(server_config),
-    )
-    .expect("build server endpoint");
-
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind client socket");
-    let client_socket = TokioUdpSocket {
-        inner: Arc::new(client_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
-        .expect("build client endpoint");
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert).expect("add root cert");
-    client_endpoint.set_default_client_config(
-        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
-    );
-
-    // Connect with a valid server name (so TLS succeeds) and drive both sides.
-    let client_task = {
-        let ep = client_endpoint.clone();
-        tokio::spawn(async move {
-            ep.connect(server_addr, "localhost")
-                .expect("connect")
-                .await
-                .expect("client connection")
-        })
-    };
-    let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let incoming = endpoint.accept().await.expect("server incoming");
-        incoming.await.expect("server handshake")
-    })
-    .await
-    .expect("handshake completes");
-    let client_conn = client_task.await.expect("client task");
-
-    // The presented SNI is recovered from the handshake.
-    assert_eq!(sni_of(&server_conn).as_deref(), Some("localhost"));
-
-    // An empty resolver = no registered route: the connector must refuse and
-    // close the connection without contacting any app guest.
-    let resolver: selium_connector_quic::resolve::ResolverHandle =
-        Arc::new(tokio::sync::Mutex::new(RouteResolver::empty()));
-    let anchors = test_anchor_set();
-    handle_connection(server_conn.clone(), resolver, Some(anchors)).await;
-
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), server_conn.closed())
-        .await
-        .is_ok();
-    assert!(closed, "unknown SNI must be refused and closed");
-
-    drop(client_conn);
-    drop(endpoint);
-    drop(client_endpoint);
-}
-
 /// A test anchor set trusting the embedded client certificate as tenant
 /// "acme"'s trust anchor (self-signed: the anchor *is* the client cert).
 fn test_anchor_set() -> ClientAnchorSet {
@@ -428,59 +548,6 @@ fn test_anchor_set() -> ClientAnchorSet {
 
     let cert = CertificateDer::from(CLIENT_CERT_DER.to_vec());
     ClientAnchorSet::new(vec![("acme".to_string(), cert)]).expect("build test anchor set")
-}
-
-/// Builds an mTLS server config (mandatory client auth against the test
-/// anchor) plus the tenant anchor set it was built from.
-fn mtls_server_config() -> (ServerConfig, ClientAnchorSet) {
-    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
-    let key = quinn::rustls::pki_types::PrivateKeyDer::Pkcs8(
-        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(KEY_DER.to_vec()),
-    );
-    let anchors = test_anchor_set();
-    let config = build_server_config(vec![cert], key, Some(&anchors)).expect("mtls server config");
-    (config, anchors)
-}
-
-/// Builds a client config that trusts the server's certificate and presents
-/// the embedded client certificate for client authentication.
-fn client_config_with_certificate(
-    server_cert: quinn::rustls::pki_types::CertificateDer<'static>,
-) -> ClientConfig {
-    use quinn::crypto::rustls::QuicClientConfig;
-    use quinn::rustls::{
-        RootCertStore,
-        client::WebPkiServerVerifier,
-        crypto::ring::default_provider,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-        version::TLS13,
-    };
-
-    let mut roots = RootCertStore::empty();
-    roots.add(server_cert).expect("trust server cert");
-
-    let client_cert = CertificateDer::from(CLIENT_CERT_DER.to_vec());
-    let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(CLIENT_KEY_DER.to_vec()));
-
-    let rustls_client =
-        quinn::rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
-            .with_protocol_versions(&[&TLS13])
-            .expect("ring provider supports TLS 1.3")
-            .dangerous()
-            .with_custom_certificate_verifier(
-                WebPkiServerVerifier::builder_with_provider(
-                    Arc::new(roots),
-                    Arc::new(default_provider()),
-                )
-                .build()
-                .expect("server verifier"),
-            )
-            .with_client_auth_cert(vec![client_cert], client_key)
-            .expect("client auth cert");
-
-    ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(rustls_client).expect("quic client"),
-    ))
 }
 
 /// A trusted client presenting the configured certificate completes the
@@ -553,12 +620,11 @@ async fn trusted_client_handshake_derives_identity() {
     drop(client_endpoint);
 }
 
-/// A client presenting no certificate (or one outside the anchors) fails the
-/// handshake before any guest is contacted: `incoming.await` errors.
+/// Unknown SNI is refused: the connector closes the connection before ever
+/// contacting an app guest (no discovery context = nothing to contact).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn certless_client_handshake_is_refused() {
-    let (server_config, _anchors) = mtls_server_config();
-    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
+async fn unknown_sni_is_refused_without_guest_contact() {
+    let (server_config, cert) = server_config();
 
     let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -575,7 +641,6 @@ async fn certless_client_handshake_is_refused() {
     )
     .expect("build server endpoint");
 
-    // A client trusting the server but presenting NO client certificate.
     let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind client socket");
@@ -586,110 +651,45 @@ async fn certless_client_handshake_is_refused() {
     let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
         .expect("build client endpoint");
     let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert).expect("trust server cert");
+    roots.add(cert).expect("add root cert");
     client_endpoint.set_default_client_config(
         ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
     );
 
+    // Connect with a valid server name (so TLS succeeds) and drive both sides.
     let client_task = {
         let ep = client_endpoint.clone();
         tokio::spawn(async move {
             ep.connect(server_addr, "localhost")
                 .expect("connect")
                 .await
-                .expect("client connection (fails)")
+                .expect("client connection")
         })
     };
-
-    // The server-side handshake must not complete for a certless client.
-    let mut refused = false;
-    if let Some(incoming) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.accept())
-            .await
-            .expect("accept within timeout")
-    {
-        refused = incoming.await.is_err();
-    }
-
-    assert!(
-        refused,
-        "certless client must be refused before any guest contact"
-    );
-
-    // The client task must observe the connection failure (the endpoint drop
-    // below unblocks it either way).
-    drop(tokio::time::timeout(std::time::Duration::from_secs(5), client_task).await);
-
-    drop(endpoint);
-    drop(client_endpoint);
-}
-
-/// mTLS is opt-in: with no trust anchors configured, the connector serves
-/// without client authentication, so a certless client completes the
-/// handshake (restoring pre-mTLS behaviour for non-bridge deployments).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mtls_off_accepts_certless_client() {
-    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
-    let key = quinn::rustls::pki_types::PrivateKeyDer::Pkcs8(
-        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(KEY_DER.to_vec()),
-    );
-    let server_config = build_server_config(vec![cert], key, None).expect("no-mtls server config");
-
-    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind server socket");
-    let server_addr = server_socket.local_addr().expect("server addr");
-    let server_socket = TokioUdpSocket {
-        inner: Arc::new(server_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let endpoint = build_endpoint(
-        Arc::new(server_socket),
-        Arc::new(TokioRuntime),
-        Some(server_config),
-    )
-    .expect("build server endpoint");
-
-    // A client trusting the server but presenting NO client certificate.
-    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind client socket");
-    let client_socket = TokioUdpSocket {
-        inner: Arc::new(client_socket),
-        buf: Mutex::new(vec![0u8; 65536]),
-    };
-    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
-        .expect("build client endpoint");
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots
-        .add(quinn::rustls::pki_types::CertificateDer::from(
-            CERT_DER.to_vec(),
-        ))
-        .expect("trust server cert");
-    client_endpoint.set_default_client_config(
-        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
-    );
-
-    let client_task = {
-        let ep = client_endpoint.clone();
-        tokio::spawn(async move {
-            ep.connect(server_addr, "localhost")
-                .expect("connect")
-                .await
-                .expect("certless client completes handshake with mTLS off")
-        })
-    };
-
-    let _server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let incoming = endpoint.accept().await.expect("server incoming");
-        incoming
-            .await
-            .expect("server handshake completes with mTLS off")
+        incoming.await.expect("server handshake")
     })
     .await
-    .expect("handshake completed within timeout");
-    drop(client_task.await.expect("client task"));
+    .expect("handshake completes");
+    let client_conn = client_task.await.expect("client task");
 
+    // The presented SNI is recovered from the handshake.
+    assert_eq!(sni_of(&server_conn).as_deref(), Some("localhost"));
+
+    // An empty resolver = no registered route: the connector must refuse and
+    // close the connection without contacting any app guest.
+    let resolver: selium_connector_quic::resolve::ResolverHandle =
+        Arc::new(tokio::sync::Mutex::new(RouteResolver::empty()));
+    let anchors = test_anchor_set();
+    handle_connection(server_conn.clone(), resolver, Some(anchors)).await;
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), server_conn.closed())
+        .await
+        .is_ok();
+    assert!(closed, "unknown SNI must be refused and closed");
+
+    drop(client_conn);
     drop(endpoint);
     drop(client_endpoint);
 }

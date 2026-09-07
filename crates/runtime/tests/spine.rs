@@ -14,11 +14,11 @@
 //! cargo test -p selium-runtime --test spine -- --ignored
 //! ```
 
-mod common;
-
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+
+mod common;
 
 /// Drains the guest's log channel and decodes each frame as a `LogRecord`.
 fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {

@@ -177,7 +177,12 @@ fn ungranted_guest_cannot_attach_connector_channel() {
     let intruder = spawn_guest(&runtime, "resolver-without-grant", Vec::new());
 
     // The connector creates its listener queue.
-    let (_, op_id) = runtime.begin_hostcall(connector, HostcallRequest::HostQueueCreate { serving_tenant: None });
+    let (_, op_id) = runtime.begin_hostcall(
+        connector,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(connector, op_id)
     else {

@@ -76,6 +76,19 @@ impl Drop for HostcallFuture {
     }
 }
 
+/// The tenant identity assigned to another process, if any.
+///
+/// The discovery service uses this to scope resolution to the calling
+/// process's own tenant.
+pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String>> {
+    match hostcall_ready(HostcallRequest::ProcessTenant { process_id })? {
+        HostcallOutput::Tenant(tenant) => Ok(tenant),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessTenant: {other:?}"
+        ))),
+    }
+}
+
 /// Fills a buffer with cryptographically secure random bytes from the host.
 ///
 /// Used by TLS-terminating guests on wasm32 where no OS entropy source is
@@ -106,33 +119,6 @@ pub fn record_resolved_queue_for(
     .map(|_| ())
 }
 
-/// The calling process's own identity: process id and tenant scope.
-///
-/// System guests use this to verify handoff identities against their own
-/// tenant (e.g. the bridge-server refuses clients whose authenticated
-/// tenant scope differs from its own).
-pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
-    match hostcall_ready(HostcallRequest::SelfInfo)? {
-        HostcallOutput::SelfInfo { process_id, tenant } => Ok((process_id, tenant)),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for SelfInfo: {other:?}"
-        ))),
-    }
-}
-
-/// The tenant identity assigned to another process, if any.
-///
-/// The discovery service uses this to scope resolution to the calling
-/// process's own tenant.
-pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String>> {
-    match hostcall_ready(HostcallRequest::ProcessTenant { process_id })? {
-        HostcallOutput::Tenant(tenant) => Ok(tenant),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ProcessTenant: {other:?}"
-        ))),
-    }
-}
-
 /// Resolves the bootstrap-registered protocol handler for `scheme`
 /// (e.g. `sel-quic`) to its process id.
 ///
@@ -148,6 +134,20 @@ pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::Proce
         HostcallOutput::Empty => Ok(None),
         other => Err(GuestError::Host(format!(
             "unexpected hostcall output for ResolveProtocolHandler: {other:?}"
+        ))),
+    }
+}
+
+/// The calling process's own identity: process id and tenant scope.
+///
+/// System guests use this to verify handoff identities against their own
+/// tenant (e.g. the bridge-server refuses clients whose authenticated
+/// tenant scope differs from its own).
+pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
+    match hostcall_ready(HostcallRequest::SelfInfo)? {
+        HostcallOutput::SelfInfo { process_id, tenant } => Ok((process_id, tenant)),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for SelfInfo: {other:?}"
         ))),
     }
 }

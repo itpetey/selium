@@ -33,13 +33,27 @@ use std::{
     sync::Mutex,
 };
 
-/// The target the guest wasm artifacts are built for.
-const WASM_TARGET: &str = "wasm32-unknown-unknown";
-
 /// Serialises this test binary's nested `cargo build` calls; parallel tests
 /// within the binary don't thresh the target directory. Across test binaries,
 /// cargo's own target-directory lock does the same job.
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
+/// The target the guest wasm artifacts are built for.
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+#[derive(Clone, Copy)]
+enum Profile {
+    Debug,
+    Release,
+}
+
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Profile::Debug => f.write_str("debug"),
+            Profile::Release => f.write_str("release"),
+        }
+    }
+}
 
 /// Reads a guest's wasm module, preferring (and building) the release profile.
 ///
@@ -116,28 +130,13 @@ fn read_artifact(crate_name: &str, profile: &str, wasm_file: &str) -> Vec<u8> {
     })
 }
 
-fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is <workspace>/crates/runtime.
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn target_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"))
 }
 
-#[derive(Clone, Copy)]
-enum Profile {
-    Debug,
-    Release,
-}
-
-impl std::fmt::Display for Profile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Profile::Debug => f.write_str("debug"),
-            Profile::Release => f.write_str("release"),
-        }
-    }
+fn workspace_root() -> PathBuf {
+    // CARGO_MANIFEST_DIR is <workspace>/crates/runtime.
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }

@@ -17,11 +17,11 @@ use crate::{
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
+/// Principal tenant per `(process_id, queue shared id)` for host queues.
+pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
 /// Serving tenant tracked per (process_id, region_id) so FreeRegion can revoke
 /// the region's URI (minted under principal provenance).
 pub(crate) type RegionTenants = HashMap<(ProcessId, u64), String>;
-/// Principal tenant per `(process_id, queue shared id)` for host queues.
-pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Wait registry keyed by (process_id, region_id).
 pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;

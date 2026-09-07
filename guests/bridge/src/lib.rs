@@ -32,6 +32,9 @@ use selium_guest::{
     Process, ResourceListener, entrypoint, error, info, mark_ready, net::ByteStream, warn,
 };
 
+const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
+/// The `bridge-channel` module id and entrypoint this server spawns.
+const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
 /// Per-identity spawn bound (open question: exact concurrency/rate policy).
 const DEFAULT_SPAWN_BOUND_PER_IDENTITY: usize = 256;
 
@@ -43,6 +46,12 @@ const DEFAULT_SPAWN_BOUND_PER_IDENTITY: usize = 256;
 #[derive(Default)]
 pub struct IdentityGrantMap {
     by_fingerprint: HashMap<[u8; 32], Vec<CapabilityGrant>>,
+}
+
+/// Tracks per-identity spawn totals to bound stream-mint amplification.
+#[derive(Default)]
+pub struct SpawnBudget {
+    per_identity: HashMap<[u8; 32], usize>,
 }
 
 impl IdentityGrantMap {
@@ -68,41 +77,6 @@ impl IdentityGrantMap {
         map.insert(stub_fingerprint, tenant_acme_client_grants());
         map
     }
-}
-
-/// The stub client's data-plane grants: tenant-scoped shared memory, host
-/// queues, and network streams. A real identity source provisions these from
-/// policy rather than a fixed table.
-fn tenant_acme_client_grants() -> Vec<CapabilityGrant> {
-    vec![
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![
-                ResourceSelector::Tenant("acme".to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-            ],
-        ),
-        CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![
-                ResourceSelector::Tenant("acme".to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-            ],
-        ),
-        CapabilityGrant::new(
-            Capability::Network,
-            vec![
-                ResourceSelector::Tenant("acme".to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
-            ],
-        ),
-    ]
-}
-
-/// Tracks per-identity spawn totals to bound stream-mint amplification.
-#[derive(Default)]
-pub struct SpawnBudget {
-    per_identity: HashMap<[u8; 32], usize>,
 }
 
 impl SpawnBudget {
@@ -138,9 +112,14 @@ fn arg_u64(value: u64) -> Vec<u8> {
     bytes
 }
 
-/// The `bridge-channel` module id and entrypoint this server spawns.
-const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
-const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
+/// Attaches the delivered stream region then closes it, so the connector
+/// observes the close as EOF and FINs the client's stream.
+fn attach_then_close(shared_id: u64) {
+    match ByteStream::attach_blocking(shared_id) {
+        Ok(stream) => drop(stream),
+        Err(e) => warn!(shared_id, "bridge-server: attach-then-close failed: {e}"),
+    }
+}
 
 /// Bridge server entrypoint.
 ///
@@ -290,13 +269,33 @@ async fn bridge_server(listener: u64, discovery: u64) {
     }
 }
 
-/// Attaches the delivered stream region then closes it, so the connector
-/// observes the close as EOF and FINs the client's stream.
-fn attach_then_close(shared_id: u64) {
-    match ByteStream::attach_blocking(shared_id) {
-        Ok(stream) => drop(stream),
-        Err(e) => warn!(shared_id, "bridge-server: attach-then-close failed: {e}"),
-    }
+/// The stub client's data-plane grants: tenant-scoped shared memory, host
+/// queues, and network streams. A real identity source provisions these from
+/// policy rather than a fixed table.
+fn tenant_acme_client_grants() -> Vec<CapabilityGrant> {
+    vec![
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![
+                ResourceSelector::Tenant("acme".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+            ],
+        ),
+        CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![
+                ResourceSelector::Tenant("acme".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
+            ],
+        ),
+        CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::Tenant("acme".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+            ],
+        ),
+    ]
 }
 
 #[cfg(test)]

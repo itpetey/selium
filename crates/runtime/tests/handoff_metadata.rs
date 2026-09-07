@@ -29,6 +29,18 @@ fn backpressure_queue_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
+fn discovery_records_resolve(runtime: &Runtime, client: selium_abi::ProcessId, shared_id: u64) {
+    let discovery = spawn_guest(runtime, "discovery", Vec::new());
+    let (status, _op) = runtime.begin_hostcall(
+        discovery,
+        HostcallRequest::RecordResolvedQueueFor {
+            client_process_id: client,
+            shared_id,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+}
+
 /// A sender enqueues a connection with an opaque metadata payload; the
 /// receiver's `ConnectionInfo` surfaces exactly that payload.
 #[test]
@@ -38,7 +50,12 @@ fn handoff_metadata_delivered() {
     let sender = spawn_guest(&runtime, "meta-sender", backpressure_queue_grants());
     let receiver = spawn_guest(&runtime, "meta-receiver", backpressure_queue_grants());
 
-    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate { serving_tenant: None });
+    let (_, op_id) = runtime.begin_hostcall(
+        sender,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(sender, op_id)
     else {
@@ -99,7 +116,12 @@ fn handoff_no_metadata_yields_empty() {
     let sender = spawn_guest(&runtime, "meta-sender-empty", backpressure_queue_grants());
     let receiver = spawn_guest(&runtime, "meta-receiver-empty", backpressure_queue_grants());
 
-    let (_, op_id) = runtime.begin_hostcall(sender, HostcallRequest::HostQueueCreate { serving_tenant: None });
+    let (_, op_id) = runtime.begin_hostcall(
+        sender,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
     let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
         runtime.poll_hostcall(sender, op_id)
     else {
@@ -143,18 +165,6 @@ fn handoff_no_metadata_yields_empty() {
     };
 
     assert!(metadata.is_empty(), "absent metadata must surface as empty");
-}
-
-fn discovery_records_resolve(runtime: &Runtime, client: selium_abi::ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new());
-    let (status, _op) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
 }
 
 fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {

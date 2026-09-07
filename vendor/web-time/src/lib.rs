@@ -17,11 +17,10 @@
 //!   [`set_custom_time_source`] — the connector guests drive these from the
 //!   Selium host time hostcalls.
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use self::time::*;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use std::time::*;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod time;
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub use self::time::*;

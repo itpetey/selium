@@ -18,8 +18,6 @@
 //! cargo test -p selium-runtime --test discovery -- --ignored
 //! ```
 
-mod common;
-
 use selium_abi::{
     Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
     HostcallRequest, ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
@@ -30,6 +28,8 @@ use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
+
+mod common;
 
 #[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
 fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind) -> u64 {
@@ -247,6 +247,16 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
+fn discovery_probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-discovery-probe", "selium_discovery_probe.wasm")
+}
+
+fn discovery_wasm() -> Vec<u8> {
+    // The shared reader rebuilds the guest if its inputs changed (a no-op
+    // when fresh) and fails loudly if the build or the read fails.
+    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
+}
+
 fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
     let frames = runtime
         .kernel()
@@ -303,16 +313,6 @@ fn drain_revoke_uris(
         }
     }
     uris
-}
-
-fn discovery_wasm() -> Vec<u8> {
-    // The shared reader rebuilds the guest if its inputs changed (a no-op
-    // when fresh) and fails loudly if the build or the read fails.
-    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
-}
-
-fn discovery_probe_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-discovery-probe", "selium_discovery_probe.wasm")
 }
 
 /// A minimal guest serving the DNS connector's well-known URI: its

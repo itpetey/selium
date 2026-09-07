@@ -22,10 +22,9 @@ impl Runtime {
         // already stopped (or already reaped, when the failure path was
         // `cleanup_failed_process`); both are expected, not errors.
         if let Err(error) = self.kernel.processes().stop_process(process_id) {
-            let resuming_teardown =
-                matches!(error, selium_kernel::Error::ProcessStopped(_))
-                    || (matches!(error, selium_kernel::Error::NotFound(_))
-                        && self.process_authorities.lock().contains_key(&process_id));
+            let resuming_teardown = matches!(error, selium_kernel::Error::ProcessStopped(_))
+                || (matches!(error, selium_kernel::Error::NotFound(_))
+                    && self.process_authorities.lock().contains_key(&process_id));
             if !resuming_teardown {
                 return Err(error.into());
             }
@@ -42,7 +41,9 @@ impl Runtime {
             self.mailboxes.lock().remove(&process_id);
             if let Err(error) = self.cleanup_process_resources(process_id, authority.tenant.clone())
             {
-                self.process_authorities.lock().insert(process_id, authority);
+                self.process_authorities
+                    .lock()
+                    .insert(process_id, authority);
                 return Err(error);
             }
         }
@@ -252,7 +253,9 @@ impl Runtime {
         // process authority so a later `stop_process` retry can complete the
         // remaining revocations (its kernel record is already reaped below,
         // which `stop_process` tolerates for retained authorities).
-        let cleanup_failed = self.cleanup_process_resources(process_id, process_tenant).is_err();
+        let cleanup_failed = self
+            .cleanup_process_resources(process_id, process_tenant)
+            .is_err();
         drop(self.kernel.processes().reap_process(process_id));
         if !cleanup_failed {
             self.process_authorities.lock().remove(&process_id);
@@ -1163,9 +1166,7 @@ mod tests {
     /// over a full Park channel, so every synchronous publish surfaces
     /// `BufferFull` instead of silently succeeding (the real feed is a Drop
     /// channel, which never fails). Returns the original publisher.
-    fn swap_in_failing_publisher(
-        runtime: &Runtime,
-    ) -> Option<crate::runtime::DiscoveryPublisher> {
+    fn swap_in_failing_publisher(runtime: &Runtime) -> Option<crate::runtime::DiscoveryPublisher> {
         let full_channel = selium_shm::Channel::create_with_backpressure(
             64,
             selium_shm::ChannelBackpressure::Park,
@@ -1214,10 +1215,10 @@ mod tests {
             selium_abi::ResourceKind::PubSubTopic,
         )
         .expect("channel");
-        let writer = selium_shm::transport::ShmTransport::new(&channel, &channel)
-            .expect("writer transport");
-        let reader = selium_shm::transport::ShmTransport::new(&channel, &channel)
-            .expect("reader transport");
+        let writer =
+            selium_shm::transport::ShmTransport::new(&channel, &channel).expect("writer transport");
+        let reader =
+            selium_shm::transport::ShmTransport::new(&channel, &channel).expect("reader transport");
         let publisher =
             selium_wire::pubsub::Publisher::new(selium_wire::framed::FramedWrite::new(writer));
         *runtime.discovery_publisher.lock() = Some(publisher);
@@ -1313,7 +1314,9 @@ mod tests {
         // Every publish now fails: the failed-process teardown cannot revoke
         // the process node, but stays best-effort.
         swap_in_failing_publisher(&runtime);
-        runtime.cleanup_failed_process(pid).expect("best-effort cleanup");
+        runtime
+            .cleanup_failed_process(pid)
+            .expect("best-effort cleanup");
         assert_eq!(
             runtime.process_tenant(pid).as_deref(),
             Some("acme"),

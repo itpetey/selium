@@ -33,6 +33,7 @@ use rkyv::{
 };
 use thiserror::Error;
 
+pub mod client_identity;
 /// Layout constants for the guest wake mailbox shared with the host.
 pub mod mailbox {
     /// Byte offset of the ring head word.
@@ -52,15 +53,7 @@ pub mod mailbox {
     /// Total mailbox byte length.
     pub const BYTE_LEN: usize = RING_OFFSET + CAPACITY * SLOT_SIZE;
 }
-pub mod client_identity;
 pub mod uri;
-
-/// Maximum byte length of a `HostQueueSend` metadata payload. Senders
-/// exceeding this bound are rejected by the runtime before the payload
-/// reaches the kernel queue, bounding per-entry queue memory. Generous
-/// headroom over the ~45-byte [`client_identity::ClientIdentity`] encoding
-/// for future metadata users (e.g. HTTP identity hints).
-pub const METADATA_MAX_BYTES: usize = 4096;
 
 /// Identifier for a resource handle that is local to one process or host context.
 pub type LocalResourceId = u64;
@@ -83,6 +76,12 @@ pub const HOSTCALL_STATUS_OUTPUT_TOO_SMALL: u32 = 3;
 pub const HOSTCALL_STATUS_PENDING: u32 = 1;
 /// Packed status code for a ready hostcall.
 pub const HOSTCALL_STATUS_READY: u32 = 0;
+/// Maximum byte length of a `HostQueueSend` metadata payload. Senders
+/// exceeding this bound are rejected by the runtime before the payload
+/// reaches the kernel queue, bounding per-entry queue memory. Generous
+/// headroom over the ~45-byte [`client_identity::ClientIdentity`] encoding
+/// for future metadata users (e.g. HTTP identity hints).
+pub const METADATA_MAX_BYTES: usize = 4096;
 
 /// Marker trait for values that can be encoded with Selium's rkyv codec.
 pub trait RkyvEncode:
@@ -195,52 +194,6 @@ pub enum ResourceClass {
     GuestLog,
     /// Host-mediated connection queue resource.
     HostQueue,
-}
-
-impl ResourceClass {
-    /// Returns the lowercased typed URI segment for this class, drawn from the
-    /// closed segment vocabulary (`proc`, `region`, `queue`, …). This is the
-    /// single mapping between a resource class and the `<type>` segment of a
-    /// `sel://<tenant>/<type>/<id>` URI.
-    pub fn uri_segment(&self) -> &'static str {
-        match self {
-            Self::SharedRegion => "region",
-            Self::SharedMapping => "mapping",
-            Self::Signal => "signal",
-            Self::TcpListener => "listener",
-            Self::TcpStream => "stream",
-            Self::UdpSocket => "socket",
-            Self::DurableLog => "log",
-            Self::BlobStore => "blob",
-            Self::Process => "proc",
-            Self::ActivityLog => "activity",
-            Self::MeteringStream => "metering",
-            Self::GuestLog => "guest-log",
-            Self::HostQueue => "queue",
-        }
-    }
-
-    /// Returns the class named by a typed URI segment, if the segment is part
-    /// of the closed vocabulary. Inverse of [`Self::uri_segment`], used to
-    /// reserve class nouns so a leaf alias cannot shadow a type segment.
-    pub fn from_uri_segment(segment: &str) -> Option<Self> {
-        match segment {
-            "region" => Some(Self::SharedRegion),
-            "mapping" => Some(Self::SharedMapping),
-            "signal" => Some(Self::Signal),
-            "listener" => Some(Self::TcpListener),
-            "stream" => Some(Self::TcpStream),
-            "socket" => Some(Self::UdpSocket),
-            "log" => Some(Self::DurableLog),
-            "blob" => Some(Self::BlobStore),
-            "proc" => Some(Self::Process),
-            "activity" => Some(Self::ActivityLog),
-            "metering" => Some(Self::MeteringStream),
-            "guest-log" => Some(Self::GuestLog),
-            "queue" => Some(Self::HostQueue),
-            _ => None,
-        }
-    }
 }
 
 /// Context used to evaluate a capability grant.
@@ -1006,6 +959,52 @@ impl LocalityScope {
             Self::Host(expected) => {
                 matches!(actual, LocalityScope::Host(actual) if actual == expected)
             }
+        }
+    }
+}
+
+impl ResourceClass {
+    /// Returns the lowercased typed URI segment for this class, drawn from the
+    /// closed segment vocabulary (`proc`, `region`, `queue`, …). This is the
+    /// single mapping between a resource class and the `<type>` segment of a
+    /// `sel://<tenant>/<type>/<id>` URI.
+    pub fn uri_segment(&self) -> &'static str {
+        match self {
+            Self::SharedRegion => "region",
+            Self::SharedMapping => "mapping",
+            Self::Signal => "signal",
+            Self::TcpListener => "listener",
+            Self::TcpStream => "stream",
+            Self::UdpSocket => "socket",
+            Self::DurableLog => "log",
+            Self::BlobStore => "blob",
+            Self::Process => "proc",
+            Self::ActivityLog => "activity",
+            Self::MeteringStream => "metering",
+            Self::GuestLog => "guest-log",
+            Self::HostQueue => "queue",
+        }
+    }
+
+    /// Returns the class named by a typed URI segment, if the segment is part
+    /// of the closed vocabulary. Inverse of [`Self::uri_segment`], used to
+    /// reserve class nouns so a leaf alias cannot shadow a type segment.
+    pub fn from_uri_segment(segment: &str) -> Option<Self> {
+        match segment {
+            "region" => Some(Self::SharedRegion),
+            "mapping" => Some(Self::SharedMapping),
+            "signal" => Some(Self::Signal),
+            "listener" => Some(Self::TcpListener),
+            "stream" => Some(Self::TcpStream),
+            "socket" => Some(Self::UdpSocket),
+            "log" => Some(Self::DurableLog),
+            "blob" => Some(Self::BlobStore),
+            "proc" => Some(Self::Process),
+            "activity" => Some(Self::ActivityLog),
+            "metering" => Some(Self::MeteringStream),
+            "guest-log" => Some(Self::GuestLog),
+            "queue" => Some(Self::HostQueue),
+            _ => None,
         }
     }
 }

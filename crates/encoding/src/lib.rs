@@ -182,12 +182,6 @@ impl From<&(String, String)> for LabelWire {
     }
 }
 
-impl From<LabelWire> for (String, String) {
-    fn from(value: LabelWire) -> Self {
-        (value.key, value.value)
-    }
-}
-
 impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
     fn from(value: &selium_abi::ResourceTarget) -> Self {
         Self::new(
@@ -245,6 +239,12 @@ impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
                 targets.iter().map(ResourceTargetWire::from).collect(),
             ),
         }
+    }
+}
+
+impl From<LabelWire> for (String, String) {
+    fn from(value: LabelWire) -> Self {
+        (value.key, value.value)
     }
 }
 
@@ -405,39 +405,6 @@ impl HasSchema for selium_abi::InterfaceMetadata {
     const SCHEMA: SchemaDescriptor = InterfaceMetadataWireSchema;
 }
 
-/// Strict-decode failure naming a required property of the wire payload
-/// that is missing or invalid.
-fn invalid_wire<T>(required: &'static str) -> ::std::result::Result<T, InvalidFlatbuffer> {
-    InvalidFlatbuffer::new_missing_required(required)
-}
-
-/// Converts a wire resource target strictly: the class segment vocabulary
-/// is closed, so an unknown segment is a decode error rather than a silent
-/// default. Both in-fabric endpoints emit the closed set, so strictness
-/// never rejects legitimate traffic — it only surfaces foreign or buggy
-/// producers instead of silently misclassifying them.
-fn resource_target_try_from_wire(
-    wire: ResourceTargetWire,
-) -> ::std::result::Result<selium_abi::ResourceTarget, InvalidFlatbuffer> {
-    let class = match selium_abi::ResourceClass::from_uri_segment(&wire.class) {
-        Some(class) => class,
-        None => return invalid_wire("known resource class segment"),
-    };
-    Ok(selium_abi::ResourceTarget {
-        uri: wire.uri,
-        host_id: wire.host_id,
-        resource_id: wire.resource_id,
-        interface: wire.interface.map(selium_abi::InterfaceMetadata::from),
-        tenant: wire.tenant,
-        class,
-        labels: wire
-            .labels
-            .into_iter()
-            .map(<(String, String)>::from)
-            .collect(),
-    })
-}
-
 impl FlatMsg for selium_abi::ResourceTarget {
     fn encode(value: &Self) -> Vec<u8> {
         let wire = ResourceTargetWire::from(value);
@@ -452,6 +419,38 @@ impl FlatMsg for selium_abi::ResourceTarget {
 
 impl HasSchema for selium_abi::ResourceTarget {
     const SCHEMA: SchemaDescriptor = ResourceTargetWireSchema;
+}
+
+impl FlatMsg for selium_abi::DiscoveryRequest {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = DiscoveryRequestWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: DiscoveryRequestWire = FlatMsg::decode(bytes)?;
+        discovery_request_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::DiscoveryRequest {
+    const SCHEMA: SchemaDescriptor = DiscoveryRequestWireSchema;
+}
+
+impl FlatMsg for selium_abi::DiscoveryResponse {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = DiscoveryResponseWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: DiscoveryResponseWire = FlatMsg::decode(bytes)?;
+        discovery_response_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::DiscoveryResponse {
+    const SCHEMA: SchemaDescriptor = DiscoveryResponseWireSchema;
 }
 
 /// Converts a discovery request wire strictly: unknown variant tags and a
@@ -483,22 +482,6 @@ fn discovery_request_try_from_wire(
         }),
         _ => invalid_wire("known discovery request variant"),
     }
-}
-
-impl FlatMsg for selium_abi::DiscoveryRequest {
-    fn encode(value: &Self) -> Vec<u8> {
-        let wire = DiscoveryRequestWire::from(value);
-        FlatMsg::encode(&wire)
-    }
-
-    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
-        let wire: DiscoveryRequestWire = FlatMsg::decode(bytes)?;
-        discovery_request_try_from_wire(wire)
-    }
-}
-
-impl HasSchema for selium_abi::DiscoveryRequest {
-    const SCHEMA: SchemaDescriptor = DiscoveryRequestWireSchema;
 }
 
 /// Converts a discovery response wire strictly: unknown variant tags and a
@@ -533,20 +516,37 @@ fn discovery_response_try_from_wire(
     }
 }
 
-impl FlatMsg for selium_abi::DiscoveryResponse {
-    fn encode(value: &Self) -> Vec<u8> {
-        let wire = DiscoveryResponseWire::from(value);
-        FlatMsg::encode(&wire)
-    }
-
-    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
-        let wire: DiscoveryResponseWire = FlatMsg::decode(bytes)?;
-        discovery_response_try_from_wire(wire)
-    }
+/// Strict-decode failure naming a required property of the wire payload
+/// that is missing or invalid.
+fn invalid_wire<T>(required: &'static str) -> ::std::result::Result<T, InvalidFlatbuffer> {
+    InvalidFlatbuffer::new_missing_required(required)
 }
 
-impl HasSchema for selium_abi::DiscoveryResponse {
-    const SCHEMA: SchemaDescriptor = DiscoveryResponseWireSchema;
+/// Converts a wire resource target strictly: the class segment vocabulary
+/// is closed, so an unknown segment is a decode error rather than a silent
+/// default. Both in-fabric endpoints emit the closed set, so strictness
+/// never rejects legitimate traffic — it only surfaces foreign or buggy
+/// producers instead of silently misclassifying them.
+fn resource_target_try_from_wire(
+    wire: ResourceTargetWire,
+) -> ::std::result::Result<selium_abi::ResourceTarget, InvalidFlatbuffer> {
+    let class = match selium_abi::ResourceClass::from_uri_segment(&wire.class) {
+        Some(class) => class,
+        None => return invalid_wire("known resource class segment"),
+    };
+    Ok(selium_abi::ResourceTarget {
+        uri: wire.uri,
+        host_id: wire.host_id,
+        resource_id: wire.resource_id,
+        interface: wire.interface.map(selium_abi::InterfaceMetadata::from),
+        tenant: wire.tenant,
+        class,
+        labels: wire
+            .labels
+            .into_iter()
+            .map(<(String, String)>::from)
+            .collect(),
+    })
 }
 
 #[cfg(test)]

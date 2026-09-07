@@ -39,9 +39,22 @@ use selium_wire::{
     framed::{FramedRead, FramedWrite},
 };
 
+const OWN_RING_READERS: u64 = 1;
+/// The pipe's own contribution to the fabric ring's member counts: its
+/// single counting writer (the write adapter's) and single blocking reader
+/// (the read adapter's). "All inner peers gone" is observable as
+/// `writer_count == OWN_RING_WRITERS && reader_count == OWN_RING_READERS`.
+///
+/// Count-based liveness cannot distinguish "every inner peer left" from "no
+/// inner peer ever attached": a pipe bridging a memberless fabric finishes
+/// the client's stream (a clean FIN the client can retry) rather than
+/// parking forever. Non-blocking reader-only inner peers are invisible to
+/// the reader count; writers and blocking readers — the norms for fabric
+/// members — are both counted.
+const OWN_RING_WRITERS: u64 = 1;
+pub const TERMINATE_ATTACH_FAILED: u32 = 2;
 /// Termination codes carried by [`PipeControl::Terminate`].
 pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
-pub const TERMINATE_ATTACH_FAILED: u32 = 2;
 
 /// Typed per-stream control frames.
 ///
@@ -63,18 +76,6 @@ pub enum PipeControl {
     },
 }
 
-impl PipeControl {
-    /// Encodes the control frame to its framed payload bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        encode_rkyv(self).expect("encode PipeControl")
-    }
-
-    /// Decodes a control frame from framed payload bytes.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        decode_rkyv(bytes).ok()
-    }
-}
-
 /// A [`MessageTransport`] adapting the read half of the relayed byte stream.
 ///
 /// [`FramedRead`] only exercises the read side, so the write side is stubbed.
@@ -87,6 +88,38 @@ struct StreamReadTransport {
 /// [`FramedWrite`] only exercises the write side, so the read side is stubbed.
 struct StreamWriteTransport {
     writer: ByteStreamWriter,
+}
+
+/// A read-only [`MessageTransport`] over the fabric ring's blocking reader.
+///
+/// Holds **no writer** on the ring: the pipe's single counting writer lives
+/// in [`RingWriteTransport`], so the pipe's `writer_count` contribution is
+/// exactly one and "all inner writers gone" stays observable. The write
+/// side is stubbed — [`FramedRead`] only exercises the read side.
+struct RingReadTransport {
+    reader: BlockingReader,
+}
+
+/// A write-only [`MessageTransport`] over the fabric ring's blocking writer.
+///
+/// This is the pipe's **only counting writer** on the fabric ring: inner
+/// guests observe the pipe's membership (and its death, as a `writer_count`
+/// drop) through it. The read side is stubbed — [`FramedWrite`] only
+/// exercises the write side.
+struct RingWriteTransport {
+    writer: BlockingWriter,
+}
+
+impl PipeControl {
+    /// Encodes the control frame to its framed payload bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_rkyv(self).expect("encode PipeControl")
+    }
+
+    /// Decodes a control frame from framed payload bytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        decode_rkyv(bytes).ok()
+    }
 }
 
 impl tokio::io::AsyncRead for StreamReadTransport {
@@ -114,6 +147,28 @@ impl tokio::io::AsyncWrite for StreamReadTransport {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+impl MessageTransport for StreamReadTransport {
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<selium_wire::Result<bool>> {
+        Poll::Ready(Ok(true))
+    }
+
+    fn poll_peer_closed(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<selium_wire::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+
+    fn generation(&self) -> selium_wire::Result<u64> {
+        Ok(0)
     }
 }
 
@@ -148,28 +203,6 @@ impl tokio::io::AsyncWrite for StreamWriteTransport {
     }
 }
 
-impl MessageTransport for StreamReadTransport {
-    type Error = std::io::Error;
-
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<selium_wire::Result<bool>> {
-        Poll::Ready(Ok(true))
-    }
-
-    fn poll_peer_closed(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<selium_wire::Result<bool>> {
-        Poll::Ready(Ok(false))
-    }
-
-    fn generation(&self) -> selium_wire::Result<u64> {
-        Ok(0)
-    }
-}
-
 impl MessageTransport for StreamWriteTransport {
     type Error = std::io::Error;
 
@@ -190,26 +223,6 @@ impl MessageTransport for StreamWriteTransport {
     fn generation(&self) -> selium_wire::Result<u64> {
         Ok(0)
     }
-}
-
-/// A read-only [`MessageTransport`] over the fabric ring's blocking reader.
-///
-/// Holds **no writer** on the ring: the pipe's single counting writer lives
-/// in [`RingWriteTransport`], so the pipe's `writer_count` contribution is
-/// exactly one and "all inner writers gone" stays observable. The write
-/// side is stubbed — [`FramedRead`] only exercises the read side.
-struct RingReadTransport {
-    reader: BlockingReader,
-}
-
-/// A write-only [`MessageTransport`] over the fabric ring's blocking writer.
-///
-/// This is the pipe's **only counting writer** on the fabric ring: inner
-/// guests observe the pipe's membership (and its death, as a `writer_count`
-/// drop) through it. The read side is stubbed — [`FramedWrite`] only
-/// exercises the write side.
-struct RingWriteTransport {
-    writer: BlockingWriter,
 }
 
 impl tokio::io::AsyncRead for RingReadTransport {
@@ -237,6 +250,28 @@ impl tokio::io::AsyncWrite for RingReadTransport {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+impl MessageTransport for RingReadTransport {
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<selium_wire::Result<bool>> {
+        Poll::Ready(Ok(true))
+    }
+
+    fn poll_peer_closed(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<selium_wire::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+
+    fn generation(&self) -> selium_wire::Result<u64> {
+        Ok(0)
     }
 }
 
@@ -271,28 +306,6 @@ impl tokio::io::AsyncWrite for RingWriteTransport {
     }
 }
 
-impl MessageTransport for RingReadTransport {
-    type Error = std::io::Error;
-
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<selium_wire::Result<bool>> {
-        Poll::Ready(Ok(true))
-    }
-
-    fn poll_peer_closed(
-        self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<selium_wire::Result<bool>> {
-        Poll::Ready(Ok(false))
-    }
-
-    fn generation(&self) -> selium_wire::Result<u64> {
-        Ok(0)
-    }
-}
-
 impl MessageTransport for RingWriteTransport {
     type Error = std::io::Error;
 
@@ -313,13 +326,6 @@ impl MessageTransport for RingWriteTransport {
     fn generation(&self) -> selium_wire::Result<u64> {
         Ok(0)
     }
-}
-
-/// Sends a termination frame, best-effort (the writer is dropped after, closing
-/// the stream and surfacing EOF to the connector).
-async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
-    let payload = PipeControl::Terminate { code }.encode();
-    drop(stream_write.write_frame(&payload, 0));
 }
 
 /// The bridge pipe core: handshake → resolve/attach → splice → teardown.
@@ -396,37 +402,53 @@ where
     }
 }
 
-/// Copies frames from the relayed stream to the fabric ring (client → fabric).
-async fn pump_stream_to_ring(
-    mut stream_read: FramedRead<StreamReadTransport>,
-    mut ring_write: FramedWrite<RingWriteTransport>,
-) {
-    // Client FIN (stream EOF) ends the loop; dropping `ring_write` releases
-    // the fabric membership.
-    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
-        if ring_write
-            .write_frame_with_flags_async(&payload, tag, flags)
-            .await
-            .is_err()
-        {
-            break;
+/// Bridge channel entrypoint.
+///
+/// Arguments: the relayed byte-channel region `shared_id` (delivered by
+/// `bridge-server`) and the discovery handle for channel-URI resolution.
+#[entrypoint]
+async fn bridge_channel(shared_id: u64, discovery: u64) {
+    drop(selium_guest::log::init());
+    info!("bridge-channel: started");
+
+    let stream = match ByteStream::attach_blocking(shared_id) {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("bridge-channel: attach stream region failed: {e}");
+            return;
+        }
+    };
+
+    let mut ctx = match Context::from_raw(discovery).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!("bridge-channel: discovery attach failed: {e}");
+            return;
+        }
+    };
+
+    mark_ready();
+
+    bridge_pipe(stream, move |uri| async move {
+        let target = ctx
+            .lookup(&uri)
+            .await?
+            .ok_or_else(|| GuestError::Host(format!("channel not found: {uri}")))?;
+        Ok(target.resource_id)
+    })
+    .await;
+}
+
+/// Reads the next complete frame, yielding between attempts.
+async fn next_frame<M: MessageTransport>(reader: &mut FramedRead<M>) -> Option<(Vec<u8>, u32, u8)> {
+    loop {
+        match reader.read_frame() {
+            Ok(frame) => return Some(frame),
+            Err(WireError::BufferEmpty) => selium_guest::yield_now().await,
+            Err(_) => return None,
         }
     }
 }
-
-/// The pipe's own contribution to the fabric ring's member counts: its
-/// single counting writer (the write adapter's) and single blocking reader
-/// (the read adapter's). "All inner peers gone" is observable as
-/// `writer_count == OWN_RING_WRITERS && reader_count == OWN_RING_READERS`.
-///
-/// Count-based liveness cannot distinguish "every inner peer left" from "no
-/// inner peer ever attached": a pipe bridging a memberless fabric finishes
-/// the client's stream (a clean FIN the client can retry) rather than
-/// parking forever. Non-blocking reader-only inner peers are invisible to
-/// the reader count; writers and blocking readers — the norms for fabric
-/// members — are both counted.
-const OWN_RING_WRITERS: u64 = 1;
-const OWN_RING_READERS: u64 = 1;
 
 /// Copies frames from the fabric ring to the relayed stream (fabric → client).
 ///
@@ -470,52 +492,29 @@ async fn pump_ring_to_stream(
     }
 }
 
-/// Reads the next complete frame, yielding between attempts.
-async fn next_frame<M: MessageTransport>(reader: &mut FramedRead<M>) -> Option<(Vec<u8>, u32, u8)> {
-    loop {
-        match reader.read_frame() {
-            Ok(frame) => return Some(frame),
-            Err(WireError::BufferEmpty) => selium_guest::yield_now().await,
-            Err(_) => return None,
+/// Copies frames from the relayed stream to the fabric ring (client → fabric).
+async fn pump_stream_to_ring(
+    mut stream_read: FramedRead<StreamReadTransport>,
+    mut ring_write: FramedWrite<RingWriteTransport>,
+) {
+    // Client FIN (stream EOF) ends the loop; dropping `ring_write` releases
+    // the fabric membership.
+    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
+        if ring_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
         }
     }
 }
 
-/// Bridge channel entrypoint.
-///
-/// Arguments: the relayed byte-channel region `shared_id` (delivered by
-/// `bridge-server`) and the discovery handle for channel-URI resolution.
-#[entrypoint]
-async fn bridge_channel(shared_id: u64, discovery: u64) {
-    drop(selium_guest::log::init());
-    info!("bridge-channel: started");
-
-    let stream = match ByteStream::attach_blocking(shared_id) {
-        Ok(stream) => stream,
-        Err(e) => {
-            error!("bridge-channel: attach stream region failed: {e}");
-            return;
-        }
-    };
-
-    let mut ctx = match Context::from_raw(discovery).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            error!("bridge-channel: discovery attach failed: {e}");
-            return;
-        }
-    };
-
-    mark_ready();
-
-    bridge_pipe(stream, move |uri| async move {
-        let target = ctx
-            .lookup(&uri)
-            .await?
-            .ok_or_else(|| GuestError::Host(format!("channel not found: {uri}")))?;
-        Ok(target.resource_id)
-    })
-    .await;
+/// Sends a termination frame, best-effort (the writer is dropped after, closing
+/// the stream and surfacing EOF to the connector).
+async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
+    let payload = PipeControl::Terminate { code }.encode();
+    drop(stream_write.write_frame(&payload, 0));
 }
 
 #[cfg(test)]

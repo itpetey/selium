@@ -23,10 +23,10 @@ use std::{
 };
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-
-mod common;
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+
+mod common;
 
 fn all_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
     drain_logs(runtime, process_id)

@@ -993,7 +993,8 @@ impl Runtime {
                 // listener queue and still pass discovery's ownership
                 // validation. Registered under the principal tenant and
                 // revoked on process teardown.
-                let uri = crate::discovery::queue_registration_uri(&principal, descriptor.shared_id);
+                let uri =
+                    crate::discovery::queue_registration_uri(&principal, descriptor.shared_id);
                 let target = ResourceTarget {
                     uri: uri.clone(),
                     host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.

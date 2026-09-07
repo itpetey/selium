@@ -69,12 +69,12 @@ const QUIC_LISTEN_ADDR: &str = "0.0.0.0:4433";
 const REFUSE_ERROR_CODE: u32 = 0x100;
 /// Manifest name for the certificate chain PEM.
 const TLS_CERT_MANIFEST: &str = "cert-pem";
-/// Manifest name for the private key PEM.
-const TLS_KEY_MANIFEST: &str = "key-pem";
-/// Manifest name for the newline-separated client trust-anchor tenant list.
-const TLS_CLIENT_CA_TENANTS_MANIFEST: &str = "client-ca-tenants";
 /// Manifest prefix for a tenant's client CA anchor PEM (`client-ca-<tenant>`).
 const TLS_CLIENT_CA_MANIFEST_PREFIX: &str = "client-ca-";
+/// Manifest name for the newline-separated client trust-anchor tenant list.
+const TLS_CLIENT_CA_TENANTS_MANIFEST: &str = "client-ca-tenants";
+/// Manifest name for the private key PEM.
+const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
@@ -360,6 +360,92 @@ async fn connector_quic(ctx: Context) {
     }
 }
 
+/// Loads per-tenant client trust anchors from the TLS blob store.
+///
+/// **mTLS is opt-in**: an absent `client-ca-tenants` manifest disables client
+/// authentication (`Ok(None)`). When the manifest is present, every listed
+/// tenant's CA anchor must be loadable and valid — a configured but broken
+/// anchor set fails loudly rather than silently downgrading to no client auth.
+fn load_client_anchors(
+    store: &selium_guest::BlobStore,
+) -> Result<Option<ClientAnchorSet>, TlsError> {
+    use rustls_pki_types::CertificateDer;
+
+    let Some(tenants_blob_id) = store
+        .manifest(TLS_CLIENT_CA_TENANTS_MANIFEST)
+        .map_err(|e| {
+            error!("quic-connector: client anchor tenant list manifest failed: {e}");
+            TlsError::MissingClientAnchors
+        })?
+    else {
+        warn!("quic-connector: no client trust anchors configured; mTLS disabled");
+        return Ok(None);
+    };
+    let tenants_blob = store
+        .get(&tenants_blob_id)
+        .map_err(|e| {
+            error!("quic-connector: failed to read client anchor tenant list: {e}");
+            TlsError::MissingClientAnchors
+        })?
+        .ok_or_else(|| {
+            error!("quic-connector: client anchor tenant list is empty");
+            TlsError::MissingClientAnchors
+        })?;
+    let tenants_text = String::from_utf8(tenants_blob).map_err(|e| {
+        error!("quic-connector: client anchor tenant list is not UTF-8: {e}");
+        TlsError::InvalidClientAnchor
+    })?;
+
+    let mut anchors = Vec::new();
+    for tenant in tenants_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let manifest = format!("{TLS_CLIENT_CA_MANIFEST_PREFIX}{tenant}");
+        let blob_id = store
+            .manifest(&manifest)
+            .map_err(|e| {
+                error!("quic-connector: client anchor manifest '{manifest}' failed: {e}");
+                TlsError::MissingClientAnchors
+            })?
+            .ok_or_else(|| {
+                error!("quic-connector: missing client anchor for tenant {tenant}");
+                TlsError::MissingClientAnchors
+            })?;
+        let pem = store
+            .get(&blob_id)
+            .map_err(|e| {
+                error!("quic-connector: failed to read client anchor for {tenant}: {e}");
+                TlsError::MissingClientAnchors
+            })?
+            .ok_or_else(|| {
+                error!("quic-connector: client anchor blob for {tenant} is empty");
+                TlsError::MissingClientAnchors
+            })?;
+
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs: Vec<CertificateDer<'static>> = pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                error!("quic-connector: invalid client anchor PEM for {tenant}: {e}");
+                TlsError::InvalidClientAnchor
+            })?;
+        let ca = certs.into_iter().next().ok_or_else(|| {
+            error!("quic-connector: empty client anchor PEM for {tenant}");
+            TlsError::InvalidClientAnchor
+        })?;
+        anchors.push((tenant.to_string(), ca));
+    }
+
+    if anchors.is_empty() {
+        error!("quic-connector: client anchor tenant list has no tenants");
+        return Err(TlsError::MissingClientAnchors);
+    }
+
+    Ok(Some(ClientAnchorSet::new(anchors)?))
+}
+
 /// Loads the QUIC server TLS config and client trust anchors from storage via
 /// the connector's `Storage` grant. Fails loudly on missing or invalid
 /// material. Returns `None` anchors when mTLS is not configured (opt-in).
@@ -450,90 +536,4 @@ fn load_server_config() -> Result<(ServerConfig, Option<ClientAnchorSet>), TlsEr
     }
     let config = build_server_config(certs, key, anchors.as_ref())?;
     Ok((config, anchors))
-}
-
-/// Loads per-tenant client trust anchors from the TLS blob store.
-///
-/// **mTLS is opt-in**: an absent `client-ca-tenants` manifest disables client
-/// authentication (`Ok(None)`). When the manifest is present, every listed
-/// tenant's CA anchor must be loadable and valid — a configured but broken
-/// anchor set fails loudly rather than silently downgrading to no client auth.
-fn load_client_anchors(
-    store: &selium_guest::BlobStore,
-) -> Result<Option<ClientAnchorSet>, TlsError> {
-    use rustls_pki_types::CertificateDer;
-
-    let Some(tenants_blob_id) = store
-        .manifest(TLS_CLIENT_CA_TENANTS_MANIFEST)
-        .map_err(|e| {
-            error!("quic-connector: client anchor tenant list manifest failed: {e}");
-            TlsError::MissingClientAnchors
-        })?
-    else {
-        warn!("quic-connector: no client trust anchors configured; mTLS disabled");
-        return Ok(None);
-    };
-    let tenants_blob = store
-        .get(&tenants_blob_id)
-        .map_err(|e| {
-            error!("quic-connector: failed to read client anchor tenant list: {e}");
-            TlsError::MissingClientAnchors
-        })?
-        .ok_or_else(|| {
-            error!("quic-connector: client anchor tenant list is empty");
-            TlsError::MissingClientAnchors
-        })?;
-    let tenants_text = String::from_utf8(tenants_blob).map_err(|e| {
-        error!("quic-connector: client anchor tenant list is not UTF-8: {e}");
-        TlsError::InvalidClientAnchor
-    })?;
-
-    let mut anchors = Vec::new();
-    for tenant in tenants_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let manifest = format!("{TLS_CLIENT_CA_MANIFEST_PREFIX}{tenant}");
-        let blob_id = store
-            .manifest(&manifest)
-            .map_err(|e| {
-                error!("quic-connector: client anchor manifest '{manifest}' failed: {e}");
-                TlsError::MissingClientAnchors
-            })?
-            .ok_or_else(|| {
-                error!("quic-connector: missing client anchor for tenant {tenant}");
-                TlsError::MissingClientAnchors
-            })?;
-        let pem = store
-            .get(&blob_id)
-            .map_err(|e| {
-                error!("quic-connector: failed to read client anchor for {tenant}: {e}");
-                TlsError::MissingClientAnchors
-            })?
-            .ok_or_else(|| {
-                error!("quic-connector: client anchor blob for {tenant} is empty");
-                TlsError::MissingClientAnchors
-            })?;
-
-        let mut reader = std::io::BufReader::new(pem.as_slice());
-        let certs: Vec<CertificateDer<'static>> = pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                error!("quic-connector: invalid client anchor PEM for {tenant}: {e}");
-                TlsError::InvalidClientAnchor
-            })?;
-        let ca = certs.into_iter().next().ok_or_else(|| {
-            error!("quic-connector: empty client anchor PEM for {tenant}");
-            TlsError::InvalidClientAnchor
-        })?;
-        anchors.push((tenant.to_string(), ca));
-    }
-
-    if anchors.is_empty() {
-        error!("quic-connector: client anchor tenant list has no tenants");
-        return Err(TlsError::MissingClientAnchors);
-    }
-
-    Ok(Some(ClientAnchorSet::new(anchors)?))
 }

@@ -25,26 +25,18 @@ use super::ResourceClass;
 /// The scheme of internal `sel` URIs.
 pub const SEL_PREFIX: &str = "sel://";
 
-/// Parses a `sel://` URI into its `(tenant, path)` components.
+/// Builds the canonical external key for a server-name-only protocol (a bare
+/// normalised hostname).
+pub fn bare_external_name(name: &str) -> String {
+    normalize_host(name)
+}
+
+/// Builds the canonical external key for an HTTP route: `https://<host>/<path>`.
 ///
-/// `tenant` is the authority (empty for the root/system tenant); `path` is
-/// the remainder with leading and trailing `/` stripped (it may be empty or
-/// contain `/`-separated segments). Returns `None` for external names and
-/// other non-`sel` URIs.
-pub fn parse_sel(uri: &str) -> Option<(&str, &str)> {
-    let rest = uri.strip_prefix(SEL_PREFIX)?;
-    let (tenant, path) = rest.split_once('/').unwrap_or((rest, ""));
-    Some((tenant, path.trim_matches('/')))
-}
-
-/// Returns whether `uri` addresses the root/system tenant (`sel:///…`).
-pub fn is_root_uri(uri: &str) -> bool {
-    matches!(parse_sel(uri), Some((tenant, _)) if tenant.is_empty())
-}
-
-/// Builds a typed resource URI: `sel://<tenant>/<type>/<id>`.
-pub fn resource_uri(tenant: &str, class: ResourceClass, id: u64) -> String {
-    format!("{SEL_PREFIX}{tenant}/{}/{id}", class.uri_segment())
+/// `host` and `path` are normalised so the connector's lookup and the app
+/// guest's registration agree on one key.
+pub fn https_external_name(host: &str, path: &str) -> String {
+    normalize_external_name(&format!("https://{host}/{path}"))
 }
 
 /// Returns whether `segment` names a resource class (a reserved type segment).
@@ -52,54 +44,9 @@ pub fn is_class_segment(segment: &str) -> bool {
     ResourceClass::from_uri_segment(segment).is_some()
 }
 
-/// Parses a typed internal URI `sel://<tenant>/<type>/<id>` into
-/// `(tenant, class, id)`. Returns `None` for aliases, root well-known paths,
-/// and external names.
-pub fn parse_typed(uri: &str) -> Option<(&str, ResourceClass, u64)> {
-    let (tenant, path) = parse_sel(uri)?;
-    let (class_seg, id_seg) = path.split_once('/')?;
-    if id_seg.is_empty() || id_seg.contains('/') {
-        return None;
-    }
-    let class = ResourceClass::from_uri_segment(class_seg)?;
-    let id = id_seg.parse::<u64>().ok()?;
-    Some((tenant, class, id))
-}
-
-/// Parses a leaf alias `sel://<tenant>/<name>` into `(tenant, name)`.
-/// A class noun is reserved, so a name shadowing a type segment is rejected.
-pub fn parse_alias(uri: &str) -> Option<(&str, &str)> {
-    let (tenant, path) = parse_sel(uri)?;
-    if path.is_empty() || path.contains('/') {
-        return None;
-    }
-    if is_class_segment(path) {
-        return None;
-    }
-    Some((tenant, path))
-}
-
-/// Returns whether a `sel` path is a wildcard enumeration (`…/*`), and the
-/// non-wildcard prefix of the path (everything before the `/*`).
-pub fn wildcard_prefix(path: &str) -> Option<&str> {
-    let stripped = path.trim_end_matches('/');
-    let prefix = stripped.strip_suffix("*")?;
-    let prefix = prefix.trim_end_matches('/');
-    Some(prefix)
-}
-
-/// Normalises a host/authority value: lowercased, trailing dot stripped, and
-/// a numeric `:port` suffix removed.
-pub fn normalize_host(host: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    let host = host.strip_suffix('.').unwrap_or(&host);
-    if let Some((name, port)) = host.rsplit_once(':')
-        && port.chars().all(|c| c.is_ascii_digit())
-        && !name.is_empty()
-    {
-        return name.to_string();
-    }
-    host.to_string()
+/// Returns whether `uri` addresses the root/system tenant (`sel:///…`).
+pub fn is_root_uri(uri: &str) -> bool {
+    matches!(parse_sel(uri), Some((tenant, _)) if tenant.is_empty())
 }
 
 /// Normalises an external address to its canonical opaque key.
@@ -124,18 +71,71 @@ pub fn normalize_external_name(name: &str) -> String {
     }
 }
 
-/// Builds the canonical external key for an HTTP route: `https://<host>/<path>`.
-///
-/// `host` and `path` are normalised so the connector's lookup and the app
-/// guest's registration agree on one key.
-pub fn https_external_name(host: &str, path: &str) -> String {
-    normalize_external_name(&format!("https://{host}/{path}"))
+/// Normalises a host/authority value: lowercased, trailing dot stripped, and
+/// a numeric `:port` suffix removed.
+pub fn normalize_host(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if let Some((name, port)) = host.rsplit_once(':')
+        && port.chars().all(|c| c.is_ascii_digit())
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+    host.to_string()
 }
 
-/// Builds the canonical external key for a server-name-only protocol (a bare
-/// normalised hostname).
-pub fn bare_external_name(name: &str) -> String {
-    normalize_host(name)
+/// Parses a leaf alias `sel://<tenant>/<name>` into `(tenant, name)`.
+/// A class noun is reserved, so a name shadowing a type segment is rejected.
+pub fn parse_alias(uri: &str) -> Option<(&str, &str)> {
+    let (tenant, path) = parse_sel(uri)?;
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    if is_class_segment(path) {
+        return None;
+    }
+    Some((tenant, path))
+}
+
+/// Parses a `sel://` URI into its `(tenant, path)` components.
+///
+/// `tenant` is the authority (empty for the root/system tenant); `path` is
+/// the remainder with leading and trailing `/` stripped (it may be empty or
+/// contain `/`-separated segments). Returns `None` for external names and
+/// other non-`sel` URIs.
+pub fn parse_sel(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix(SEL_PREFIX)?;
+    let (tenant, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((tenant, path.trim_matches('/')))
+}
+
+/// Parses a typed internal URI `sel://<tenant>/<type>/<id>` into
+/// `(tenant, class, id)`. Returns `None` for aliases, root well-known paths,
+/// and external names.
+pub fn parse_typed(uri: &str) -> Option<(&str, ResourceClass, u64)> {
+    let (tenant, path) = parse_sel(uri)?;
+    let (class_seg, id_seg) = path.split_once('/')?;
+    if id_seg.is_empty() || id_seg.contains('/') {
+        return None;
+    }
+    let class = ResourceClass::from_uri_segment(class_seg)?;
+    let id = id_seg.parse::<u64>().ok()?;
+    Some((tenant, class, id))
+}
+
+/// Builds a typed resource URI: `sel://<tenant>/<type>/<id>`.
+pub fn resource_uri(tenant: &str, class: ResourceClass, id: u64) -> String {
+    format!("{SEL_PREFIX}{tenant}/{}/{id}", class.uri_segment())
+}
+
+/// Returns whether a `sel` path is a wildcard enumeration (`…/*`), and the
+/// non-wildcard prefix of the path (everything before the `/*`).
+pub fn wildcard_prefix(path: &str) -> Option<&str> {
+    let stripped = path.trim_end_matches('/');
+    let prefix = stripped.strip_suffix("*")?;
+    let prefix = prefix.trim_end_matches('/');
+    Some(prefix)
 }
 
 #[cfg(test)]

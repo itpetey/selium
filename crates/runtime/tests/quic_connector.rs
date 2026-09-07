@@ -169,7 +169,12 @@ fn quic_channel_handoff_golden_path() {
     );
 
     // 1. App creates its listener queue.
-    let (_, op_id) = runtime.begin_hostcall(app, HostcallRequest::HostQueueCreate { serving_tenant: None });
+    let (_, op_id) = runtime.begin_hostcall(
+        app,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
     let CompletionState::Ready(HostcallOutput::HostQueue(listener)) =
         runtime.poll_hostcall(app, op_id)
     else {

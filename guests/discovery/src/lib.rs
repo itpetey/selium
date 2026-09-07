@@ -49,16 +49,6 @@ pub struct DiscoveryStore {
     label_index: HashMap<(String, String), BTreeSet<String>>,
 }
 
-/// Returns whether a caller's tenant admits a target's tenant. The check is
-/// skipped when either side is absent (backward-compatible with root/system
-/// registrations and untracked tenants).
-fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
-    match (caller, target) {
-        (Some(caller), Some(target)) => caller == target,
-        _ => true,
-    }
-}
-
 impl DiscoveryStore {
     /// Stores a Tier-1 registration under its exact key, populates the
     /// ownership table from `owner`, and maintains the label index for typed
@@ -346,6 +336,22 @@ fn attach_feed_subscriber(
     Ok(Subscriber::new(framed, None))
 }
 
+/// Response used when the caller's tenant scope could not be verified
+/// (fail-closed): reads disclose nothing, writes are refused. A tenant
+/// *absence* (verified `None`, i.e. a root/system principal) is legitimate
+/// and scoped normally — only a failed lookup takes this path.
+fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
+    match request {
+        DiscoveryRequest::Resolve(_) => DiscoveryResponse::NotFound,
+        DiscoveryRequest::ResolvePrefix(_) | DiscoveryRequest::ResolveLabels { .. } => {
+            DiscoveryResponse::Resolved(Vec::new())
+        }
+        DiscoveryRequest::Register { .. } | DiscoveryRequest::Revoke { .. } => {
+            DiscoveryResponse::Forbidden
+        }
+    }
+}
+
 #[entrypoint]
 async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
     drop(selium_guest::log::init());
@@ -426,22 +432,6 @@ async fn feed_loop(
     }
 }
 
-/// Response used when the caller's tenant scope could not be verified
-/// (fail-closed): reads disclose nothing, writes are refused. A tenant
-/// *absence* (verified `None`, i.e. a root/system principal) is legitimate
-/// and scoped normally — only a failed lookup takes this path.
-fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
-    match request {
-        DiscoveryRequest::Resolve(_) => DiscoveryResponse::NotFound,
-        DiscoveryRequest::ResolvePrefix(_) | DiscoveryRequest::ResolveLabels { .. } => {
-            DiscoveryResponse::Resolved(Vec::new())
-        }
-        DiscoveryRequest::Register { .. } | DiscoveryRequest::Revoke { .. } => {
-            DiscoveryResponse::Forbidden
-        }
-    }
-}
-
 async fn handler(
     store: Rc<RefCell<DiscoveryStore>>,
     mut conn: selium_shm::rpc::RpcConnection<DiscoveryRequest, DiscoveryResponse>,
@@ -473,12 +463,10 @@ async fn handler(
                                         // Record the resolved queue id with the runtime so
                                         // the resolving client gains an authorisation basis
                                         // for cross-process `HostQueueAttach`.
-                                        if let Err(error) =
-                                            selium_guest::record_resolved_queue_for(
-                                                client_process_id,
-                                                target.resource_id,
-                                            )
-                                        {
+                                        if let Err(error) = selium_guest::record_resolved_queue_for(
+                                            client_process_id,
+                                            target.resource_id,
+                                        ) {
                                             selium_guest::warn!(
                                                 "resolve authorisation record failed: {error}"
                                             );
@@ -526,6 +514,16 @@ async fn handler(
                 break;
             }
         }
+    }
+}
+
+/// Returns whether a caller's tenant admits a target's tenant. The check is
+/// skipped when either side is absent (backward-compatible with root/system
+/// registrations and untracked tenants).
+fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
+    match (caller, target) {
+        (Some(caller), Some(target)) => caller == target,
+        _ => true,
     }
 }
 

@@ -38,6 +38,17 @@ pub struct ClientAnchor {
     verifier: Arc<dyn ClientCertVerifier>,
 }
 
+/// The set of configured per-tenant client trust anchors.
+///
+/// Building [`ClientAnchorSet`] with no anchors is a hard error: mTLS is
+/// endpoint-global, so a connector with no client trust anchors must refuse to
+/// serve rather than silently accept unauthenticated connections.
+#[derive(Clone)]
+pub struct ClientAnchorSet {
+    anchors: Arc<Vec<ClientAnchor>>,
+    union: Arc<dyn ClientCertVerifier>,
+}
+
 impl ClientAnchor {
     /// Builds a tenant anchor from a single CA certificate (the trust root
     /// for that tenant's client certificates), given its verifier.
@@ -61,17 +72,6 @@ impl ClientAnchor {
             .verify_client_cert(leaf, intermediates, now)
             .is_ok()
     }
-}
-
-/// The set of configured per-tenant client trust anchors.
-///
-/// Building [`ClientAnchorSet`] with no anchors is a hard error: mTLS is
-/// endpoint-global, so a connector with no client trust anchors must refuse to
-/// serve rather than silently accept unauthenticated connections.
-#[derive(Clone)]
-pub struct ClientAnchorSet {
-    anchors: Arc<Vec<ClientAnchor>>,
-    union: Arc<dyn ClientCertVerifier>,
 }
 
 impl ClientAnchorSet {

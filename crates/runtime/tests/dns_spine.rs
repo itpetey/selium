@@ -17,11 +17,11 @@
 use std::time::{Duration, Instant};
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector};
-
-mod common;
 use selium_encoding::FlatMsg;
 use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
+
+mod common;
 
 fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestDescriptor {
     SystemGuestDescriptor {

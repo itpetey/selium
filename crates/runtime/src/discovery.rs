@@ -7,10 +7,10 @@
 
 use selium_abi::{ProcessId, ResourceClass, uri};
 
-/// Generates the tier-1 registration URI for a typed resource:
-/// `sel://<tenant>/<type>/<id>` with a singular type segment.
-pub fn typed_registration_uri(tenant: &str, class: ResourceClass, id: u64) -> String {
-    uri::resource_uri(tenant, class, id)
+/// Generates the tier-1 registration URI for a process node:
+/// `sel://<tenant>/proc/<id>`.
+pub fn process_registration_uri(tenant: &str, process_id: ProcessId) -> String {
+    typed_registration_uri(tenant, ResourceClass::Process, process_id)
 }
 
 /// Generates the tier-1 registration URI for a host connection queue created
@@ -27,10 +27,10 @@ pub fn region_registration_uri(tenant: &str, region_id: u64) -> String {
     typed_registration_uri(tenant, ResourceClass::SharedRegion, region_id)
 }
 
-/// Generates the tier-1 registration URI for a process node:
-/// `sel://<tenant>/proc/<id>`.
-pub fn process_registration_uri(tenant: &str, process_id: ProcessId) -> String {
-    typed_registration_uri(tenant, ResourceClass::Process, process_id)
+/// Generates the tier-1 registration URI for a typed resource:
+/// `sel://<tenant>/<type>/<id>` with a singular type segment.
+pub fn typed_registration_uri(tenant: &str, class: ResourceClass, id: u64) -> String {
+    uri::resource_uri(tenant, class, id)
 }
 
 #[cfg(test)]

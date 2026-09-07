@@ -213,22 +213,6 @@ impl ResourceListener {
     }
 }
 
-/// Refuses a delivered handoff by attaching the region then closing it, so
-/// the sender observes EOF instead of parking on a region nobody attaches.
-/// Best-effort: a handoff value that is not an attachable region is simply
-/// discarded with a warning.
-fn refuse_handoff(shared_id: u64) {
-    match crate::net::bytes::ByteStream::attach_blocking(shared_id) {
-        Ok(stream) => drop(stream),
-        Err(error) => {
-            crate::warn!(
-                shared_id,
-                "handoff refusal could not attach region: {error}"
-            )
-        }
-    }
-}
-
 impl selium_wire::Rendezvous for ResourceListener {
     async fn send(&self, _shared_id: u64) -> selium_wire::error::Result<()> {
         Err(selium_wire::error::Error::Guest(
@@ -253,6 +237,22 @@ impl From<IncomingConnection> for selium_wire::rpc::IncomingConnection {
         Self {
             client_process_id: connection.client_process_id,
             shared_id: connection.shared_id,
+        }
+    }
+}
+
+/// Refuses a delivered handoff by attaching the region then closing it, so
+/// the sender observes EOF instead of parking on a region nobody attaches.
+/// Best-effort: a handoff value that is not an attachable region is simply
+/// discarded with a warning.
+fn refuse_handoff(shared_id: u64) {
+    match crate::net::bytes::ByteStream::attach_blocking(shared_id) {
+        Ok(stream) => drop(stream),
+        Err(error) => {
+            crate::warn!(
+                shared_id,
+                "handoff refusal could not attach region: {error}"
+            )
         }
     }
 }
