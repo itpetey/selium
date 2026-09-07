@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Build every crate in ./crates/ with the default (host) target, then every
+# crate in ./guests/ with the wasm32-unknown-unknown target. Finally, rebuild
+# the net-demo guest with genuine wasm atomics (nightly + shared memory),
+# which the ignored `fastpath_wake` test requires. The atomics build runs last
+# so the plain guest build above cannot overwrite it.
+#
+# Only workspace members are built: cargo metadata is used to skip crates that
+# exist on disk but are not (yet) listed in the root workspace `members`.
+# Package names are read from the `name` key in each crate's [package] section.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+# Workspace package manifest paths, from cargo metadata. Used only for
+# membership checks (e.g. guests/cluster is on disk but not a member yet).
+META="$(cargo metadata --no-deps --format-version 1)"
+
+# Prints the package name declared in a Cargo.toml's [package] section.
+read_crate_name() {
+  local manifest="$1"
+  awk '
+    /^\[package\]/ { in_pkg = 1; next }
+    /^\[/          { in_pkg = 0 }
+    in_pkg && /^name[[:space:]]*=/ {
+      sub(/^[^"]*"/, "", $0)   # drop everything up to the opening quote
+      sub(/".*$/, "", $0)     # drop from the closing quote onward
+      print
+      exit
+    }
+  ' "$manifest"
+}
+
+# True if the given absolute manifest path is a member of the workspace.
+# Quoted sections of a [[ ]] pattern are matched literally, so glob
+# characters in the path are safe.
+is_workspace_member() {
+  local manifest="$1"
+  [[ "$META" == *"\"manifest_path\":\"$manifest\""* ]]
+}
+
+# Usage: build_dir <base-dir> [extra cargo args...]
+# Finds every crate under <base-dir> (recursively) and builds all workspace
+# members among them in a single cargo invocation.
+build_dir() {
+  local base="$1"
+  shift
+  local base_abs="$ROOT/$base"
+  local specs=()
+
+  [ -d "$base_abs" ] || {
+    echo "error: $base_abs not found" >&2
+    exit 1
+  }
+
+  while IFS= read -r manifest; do
+    if ! is_workspace_member "$manifest"; then
+      echo "skipping $manifest (not a workspace member)" >&2
+      continue
+    fi
+    local name
+    name="$(read_crate_name "$manifest")"
+    if [ -z "$name" ]; then
+      echo "error: no package name found in $manifest" >&2
+      exit 1
+    fi
+    specs+=("-p" "$name")
+  done < <(find "$base_abs" -name Cargo.toml -type f | sort)
+
+  if [ "${#specs[@]}" -eq 0 ]; then
+    echo "error: no crates found under $base" >&2
+    exit 1
+  fi
+
+  echo "Building ${#specs[@]} crates from $base${*:+ with: $*}"
+  cargo build "${specs[@]}" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Atomics guest build
+# ---------------------------------------------------------------------------
+# The ignored `fastpath_wake` test needs a net-demo guest whose module both
+# (a) declares memory 0 shared with a maximum and (b) emits a genuine
+# `memory.atomic.notify` on the ring generation word. Matching CI's
+# shared-page-fastpath job:
+#
+# - `+atomics` must cover the ENTIRE dependency graph, not just the crates
+#   that emit atomics. wasm-ld refuses a `--shared-memory` link unless every
+#   object it consumes was compiled with `+atomics` (or `+bulk-memory`), and
+#   cargo has no per-package `-C target-feature` scoping, so RUSTFLAGS cannot
+#   be narrowed to selium-memory/selium-shm. Every crate in the invocation
+#   inherits the flag by requirement, not by mistake.
+#
+#   The observable consequence is rustc's
+#     warning: unstable feature specified for `-Ctarget-feature`: `atomics`
+#   emitted once per crate (cargo folds the rest into "1 duplicate").
+#   `+atomics` is a real but still-unstable target feature, and the warning
+#   is expected/harmless. It is a rustc session diagnostic rather than a
+#   named lint, so it cannot be `-A<lint>`-allowed; `-Awarnings` would also
+#   mask genuine diagnostics, so it is deliberately NOT used. Leave it noisy.
+#
+# - `-Zbuild-std` rebuilds std with the same `+atomics` feature. The prebuilt
+#   wasm std was compiled without it, and whichever std a `--shared-memory`
+#   link picks up must carry the feature or wasm-ld rejects the link. This is
+#   the part that needs the `rust-src` rustup component.
+#
+# - `--shared-memory` / `--max-memory` declare memory 0 shared with a maximum
+#   (the wasmtiny validator requirement). They only affect the final link.
+#
+# - `.cargo/config.toml` appends its own wasm32 `getrandom_backend="custom"`
+#   rustflag; it is combined with (never replaced by) the RUSTFLAGS below.
+ATOMICS_RUSTFLAGS="\
+-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+-C link-arg=--shared-memory \
+-C link-arg=--max-memory=1073741824"
+
+build_atomics_guest() {
+  local target="wasm32-unknown-unknown"
+  local sysroot
+
+  if ! rustc +nightly --version >/dev/null 2>&1; then
+    echo "error: the atomics guest build needs a nightly toolchain" >&2
+    echo "  rustup toolchain install nightly --component rust-src --target $target" >&2
+    exit 1
+  fi
+
+  sysroot="$(rustc +nightly --print sysroot)"
+  if [ ! -f "$sysroot/lib/rustlib/src/rust/library/Cargo.toml" ]; then
+    echo "error: the atomics guest build needs the rust-src component (for -Zbuild-std)" >&2
+    echo "  rustup component add rust-src --toolchain nightly" >&2
+    exit 1
+  fi
+
+  # The plain guest build above may have left a non-atomics artifact at the
+  # shared output path; removing it first forces cargo to re-emit the cached
+  # atomics module even when its fingerprint is otherwise still fresh.
+  echo "Building atomics net-demo guest"
+  rm -f "target/$target/debug/selium_net_demo.wasm"
+
+  RUSTFLAGS="$ATOMICS_RUSTFLAGS" \
+    cargo +nightly build -Zbuild-std=std,panic_abort \
+      --target "$target" \
+      -p selium-net-demo \
+      --features selium-guest/nightly-wasm-atomics
+}
+
+build_dir crates
+build_dir guests --target wasm32-unknown-unknown
+build_atomics_guest
