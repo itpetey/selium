@@ -34,7 +34,6 @@ exclude = ["vendor"]
 [workspace.package]
 version = "1.0.0-alpha.6"
 edition = "2024"
-description = "WASM-based compute and I/O platform for nextgen software stacks"
 readme = "README.md"
 homepage = "https://selium.com"
 repository = "https://github.com/seliumlabs/selium"

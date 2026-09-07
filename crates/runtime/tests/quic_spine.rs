@@ -450,9 +450,8 @@ fn payload(size: usize, seed: u8) -> Vec<u8> {
 /// debug optimization for the quinn defaults (and the test timeout) to
 /// tolerate.
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    // The shared reader prefers the release profile and fails loudly when
-    // the artifact is older than the guest's sources (stale guest wasm is
-    // not ABI-safe against the runtime and fails incomprehensibly).
+    // The shared reader builds the release profile (a no-op when fresh) and
+    // fails loudly if the build or the read fails.
     common::read_guest_wasm(crate_name, file_name)
 }
 

@@ -56,9 +56,8 @@ fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     }
 }
 
-/// Reads the spine-demo WASM module, failing loudly when it is missing or
-/// older than its sources (stale guest wasm is not ABI-safe against the
-/// runtime and fails incomprehensibly).
+/// Reads the spine-demo WASM module, rebuilding it if its inputs changed
+/// (a no-op when fresh) and failing loudly if the build or read fails.
 fn spine_demo_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-spine-demo", "selium_spine_demo.wasm")
 }

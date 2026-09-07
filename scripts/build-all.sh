@@ -2,8 +2,11 @@
 # Build every crate in ./crates/ with the default (host) target, then every
 # crate in ./guests/ with the wasm32-unknown-unknown target. Finally, rebuild
 # the net-demo guest with genuine wasm atomics (nightly + shared memory),
-# which the ignored `fastpath_wake` test requires. The atomics build runs last
-# so the plain guest build above cannot overwrite it.
+# which the ignored `fastpath_wake` test requires. The atomics artifact is
+# written to a distinct `selium_net_demo_atomics.wasm` (cargo can only emit
+# `selium_net_demo.wasm` for a crate named selium-net-demo, so the atomics
+# module is copied aside), and the plain `selium_net_demo.wasm` is restored
+# afterward — two artifact flavours cannot safely share one output path.
 #
 # Only workspace members are built: cargo metadata is used to skip crates that
 # exist on disk but are not (yet) listed in the root workspace `members`.
@@ -144,6 +147,17 @@ build_atomics_guest() {
       --target "$target" \
       -p selium-net-demo \
       --features selium-guest/nightly-wasm-atomics
+
+  # Cargo can only emit `selium_net_demo.wasm` for a crate named
+  # selium-net-demo, and two flavours (plain vs atomics) cannot safely share
+  # one output path. Keep the atomics module under its own name for
+  # `fastpath_wake`, then restore the plain module that `net_wake` (and the
+  # host demo) expect. The preceding build overwrote the plain artifact in
+  # place, so removing it forces cargo to re-emit it.
+  cp "target/$target/debug/selium_net_demo.wasm" \
+    "target/$target/debug/selium_net_demo_atomics.wasm"
+  rm -f "target/$target/debug/selium_net_demo.wasm"
+  cargo build --target "$target" -p selium-net-demo
 }
 
 build_dir crates

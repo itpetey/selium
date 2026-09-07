@@ -19,7 +19,9 @@
 //!
 //! `#[ignore]`d by default because it requires the atomics guest, which
 //! needs a nightly toolchain with `-Zbuild-std` and shared-memory link
-//! flags:
+//! flags. `scripts/build-all.sh` builds it and keeps the atomics module at
+//! `selium_net_demo_atomics.wasm` (the plain build keeps the
+//! `selium_net_demo.wasm` path); the underlying command is:
 //!
 //! ```sh
 //! RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals \
@@ -30,9 +32,9 @@
 //! cargo test -p selium-runtime --test fastpath_wake -- --ignored
 //! ```
 //!
-//! A stable-built (non-atomics) guest at the same path fails this test by
-//! design: its regions are not fast-path capable, so transition kicks fire
-//! and `kick_count` becomes non-zero.
+//! A stable-built (non-atomics) guest fails this test by design: its
+//! regions are not fast-path capable, so transition kicks fire and
+//! `kick_count` becomes non-zero.
 
 use std::{
     io::{Read, Write},
@@ -253,12 +255,8 @@ fn net_demo_wasm() -> Vec<u8> {
     let bytes = std::fs::read(&path).unwrap_or_else(|_error| {
         panic!(
             "atomics net demo guest not found at {}.\n\
-                 Build it first (see this test's module docs):\n  \
-                 RUSTFLAGS=\"-C target-feature=+atomics,+bulk-memory,+mutable-globals \
-                 -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824\" \\\n  \
-                 cargo +nightly build -Zbuild-std=std,panic_abort \
-                 --target wasm32-unknown-unknown -p selium-net-demo \
-                 --features selium-guest/nightly-wasm-atomics",
+                 Build it first with `scripts/build-all.sh` (needs a nightly \
+                 toolchain with the rust-src component for -Zbuild-std)",
             path.display()
         )
     });
@@ -271,22 +269,21 @@ fn net_demo_wasm() -> Vec<u8> {
          atomic notify = {atomic_notify}).\n\
          This test requires an atomics-capable guest and fails by design on a \
          stable (non-atomics) build.\n\
-         Rebuild it:\n  \
-         RUSTFLAGS=\"-C target-feature=+atomics,+bulk-memory,+mutable-globals \
-         -C link-arg=--shared-memory -C link-arg=--max-memory=1073741824\" \\\n  \
-         cargo +nightly build -Zbuild-std=std,panic_abort \
-         --target wasm32-unknown-unknown -p selium-net-demo \
-         --features selium-guest/nightly-wasm-atomics",
+         Rebuild it with `scripts/build-all.sh`.",
         path.display()
     );
     bytes
 }
 
 /// Returns the path to the compiled atomics net-demo WASM module.
+///
+/// The atomics build is kept at a distinct file name (`..._atomics.wasm`) by
+/// `scripts/build-all.sh`, because `cargo` emits `selium_net_demo.wasm` for a
+/// crate named `selium-net-demo` and the plain build must keep that path.
 fn net_demo_wasm_path() -> PathBuf {
     let target_dir =
         std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
-    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo.wasm")
+    PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_net_demo_atomics.wasm")
 }
 
 /// Minimal WASM scan for the fast-path signals: any memory entry declaring a

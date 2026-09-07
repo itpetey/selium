@@ -1,19 +1,24 @@
 //! Shared helpers for the wasm-guest integration tests.
 //!
-//! The spine-style tests load prebuilt `wasm32-unknown-unknown` guest modules
-//! from the target directory. Guest wasm is **not mixed-version safe**
-//! against the runtime: the guest ABI uses rkyv enums whose variant indices
-//! shift whenever a variant is inserted, so a wasm module built against older
-//! sources produces silent, incomprehensible failures at runtime (a guest
-//! whose hostcalls decode as the wrong variants — readiness timeouts, traps,
-//! or parked entrypoints) instead of a build error.
+//! The spine-style tests load `wasm32-unknown-unknown` guest modules from the
+//! target directory. Guest wasm is **not mixed-version safe** against the
+//! runtime: the guest ABI uses rkyv enums whose variant indices shift whenever
+//! a variant is inserted, so a wasm module built against older sources
+//! produces silent, incomprehensible failures at runtime (a guest whose
+//! hostcalls decode as the wrong variants — readiness timeouts, traps, or
+//! parked entrypoints) instead of a build error.
 //!
-//! [`read_guest_wasm`] and [`read_guest_wasm_debug`] therefore check the
-//! chosen artifact's mtime against the newest source file in the guest
-//! crate's transitive path-dependency tree, and fail loudly with the exact
-//! rebuild command when the artifact is older than its sources. The check is
-//! an mtime heuristic (mirroring cargo's own staleness logic): it can only
-//! false-positive into "please rebuild", never false-negative.
+//! [`read_guest_wasm`] and [`read_guest_wasm_debug`] therefore delegate
+//! freshness to cargo — the only source of truth for "does this artifact
+//! match its sources today". Before reading a module they run
+//! `cargo build --target wasm32-unknown-unknown -p <guest>` for the requested
+//! profile, which re-emits the wasm exactly when its inputs have changed and
+//! no-ops when it is already current. This is a content- and
+//! configuration-based check (source files, manifests, features, flags, rustc
+//! version, target), so it neither false-positives on cosmetic edits nor
+//! false-negatives on real ABI changes — unlike the previous mtime heuristic,
+//! which compared the artifact's modification time against the newest file in
+//! the dependency tree and could not tell a re-touch from a real change.
 
 // Each integration test binary compiles this module independently and uses
 // only the readers its guests need; per-binary, some readers are dead code.
@@ -23,254 +28,116 @@
 )]
 
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
-    time::SystemTime,
+    process::Command,
+    sync::Mutex,
 };
 
-/// Reads a guest's wasm module, preferring the release profile over debug
-/// (release is the recommended build for the interpreted-wasm spine tests).
+/// The target the guest wasm artifacts are built for.
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// Serialises this test binary's nested `cargo build` calls; parallel tests
+/// within the binary don't thresh the target directory. Across test binaries,
+/// cargo's own target-directory lock does the same job.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Reads a guest's wasm module, preferring (and building) the release profile.
 ///
-/// Panics with an actionable message when the module is missing or older
-/// than its sources.
-#[expect(
-    clippy::panic,
-    reason = "missing/stale build artifact is a hard test failure"
-)]
+/// Release is the recommended build for the interpreted-wasm spine tests that
+/// are too slow at debug optimization (e.g. the TLS handshake in quic_spine),
+/// and building it here also guarantees the artifact is fresh.
 pub fn read_guest_wasm(crate_name: &str, wasm_file: &str) -> Vec<u8> {
-    let (bytes, path) = read_profile(target_dir(), "release", wasm_file)
-        .or_else(|| read_profile(target_dir(), "debug", wasm_file))
-        .unwrap_or_else(|| {
-            panic!(
-                "{crate_name} guest not found (looked for {wasm_file} in release and debug).\
-                 \nBuild it first (release preferred):\
-                 \n  cargo build --release --target wasm32-unknown-unknown -p {crate_name}"
-            )
-        });
-    assert_fresh(crate_name, &path);
-    bytes
+    build_guest(crate_name, Profile::Release);
+    read_artifact(crate_name, "release", wasm_file)
 }
 
-/// Reads a guest's wasm module from the debug profile exactly.
+/// Reads a guest's wasm module from the debug profile exactly, building it
+/// first.
 ///
-/// For tests whose documented build recipe produces a debug artifact
-/// (e.g. the nightly-atomics guest build); using the release-preferred
-/// reader would let a plain release build shadow the special one.
-///
-/// Panics with an actionable message when the module is missing or older
-/// than its sources.
-#[expect(
-    clippy::panic,
-    reason = "missing/stale build artifact is a hard test failure"
-)]
+/// For tests whose documented build recipe produces a debug artifact; using
+/// the release-preferred reader would build and load the wrong profile.
 pub fn read_guest_wasm_debug(crate_name: &str, wasm_file: &str) -> Vec<u8> {
-    let (bytes, path) = read_profile(target_dir(), "debug", wasm_file).unwrap_or_else(|| {
-        panic!(
-            "{crate_name} guest not found (looked for {wasm_file} in debug).\
-                 \nBuild it first:\
-                 \n  cargo build --target wasm32-unknown-unknown -p {crate_name}"
-        )
-    });
-    assert_fresh(crate_name, &path);
-    bytes
+    build_guest(crate_name, Profile::Debug);
+    read_artifact(crate_name, "debug", wasm_file)
 }
 
-fn read_profile(target: PathBuf, profile: &str, wasm_file: &str) -> Option<(Vec<u8>, PathBuf)> {
-    let path = target
-        .join("wasm32-unknown-unknown")
-        .join(profile)
-        .join(wasm_file);
-    std::fs::read(&path).ok().map(|bytes| (bytes, path))
-}
-
-/// Fails loudly when the wasm artifact predates the newest source file in
-/// the guest crate's transitive path-dependency tree.
+/// Ensures the guest is built for `WASM_TARGET` in the requested profile by
+/// delegating to cargo. Cargo rebuilds only when the guest's inputs have
+/// actually changed; otherwise this is a cheap no-op and the existing artifact
+/// is already exactly what current sources produce.
 #[expect(
     clippy::panic,
-    reason = "a stale guest artifact fails the test with an actionable message"
+    reason = "a missing toolchain or failed guest build is a hard test failure"
 )]
-fn assert_fresh(crate_name: &str, wasm_path: &Path) {
-    let root = workspace_root();
-    let Some(crate_dir) = resolve_crate_dir(&root, crate_name) else {
-        // Cannot locate the sources to compare against; the missing-file
-        // case is handled by the readers, so stay permissive here.
-        return;
-    };
-    let (newest_mtime, newest_file) = newest_source_mtime(&root, &crate_dir);
-    let Some(wasm_mtime) = std::fs::metadata(wasm_path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-    else {
-        return;
-    };
-    if wasm_mtime < newest_mtime {
-        let profile = if wasm_path.to_string_lossy().contains("release") {
-            "--release "
-        } else {
-            ""
-        };
+fn build_guest(crate_name: &str, profile: Profile) {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let _guard = BUILD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(workspace_root())
+        .arg("build")
+        .args(["--target", WASM_TARGET])
+        .args(["--package", crate_name]);
+    if matches!(profile, Profile::Release) {
+        command.arg("--release");
+    }
+
+    let output = command.output().unwrap_or_else(|error| {
+        panic!("failed to run cargo to build the {crate_name} guest: {error}");
+    });
+    if !output.status.success() {
         panic!(
-            "stale guest artifact: {wasm} is older than the newest source file it was built \
-             from ({newest_file}).\
-             \nGuest wasm is NOT mixed-version safe against the runtime ABI (rkyv enum \
-             variants shift when the ABI changes), so a stale artifact fails at runtime \
-             with readiness timeouts or traps — not a build error.\
-             \nRebuild it:\
-             \n  cargo build {profile}--target wasm32-unknown-unknown -p {crate_name}",
-            wasm = wasm_path.display(),
-            newest_file = newest_file.display(),
+            "failed to build the {crate_name} guest ({profile}) for {WASM_TARGET}:\n\
+             {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }
 
-fn workspace_root() -> PathBuf {
-    let target = target_dir();
-    // <root>/target -> <root>
-    target.parent().map(Path::to_path_buf).unwrap_or(target)
-}
-
-fn target_dir() -> PathBuf {
-    std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_error| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target").to_string())
-        .into()
-}
-
-/// Locates a workspace crate's source directory from its package name by
-/// scanning guest and crate manifests.
-fn resolve_crate_dir(root: &Path, crate_name: &str) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    for group in ["guests", "crates"] {
-        let entries = std::fs::read_dir(root.join(group)).ok()?;
-        for entry in entries.flatten() {
-            candidates.push(entry.path());
-            // Nested manifests (e.g. crates/guest/macros).
-            if let Ok(nested) = std::fs::read_dir(entry.path().join("macros")) {
-                candidates.extend(nested.flatten().map(|child| child.path()));
-            }
-        }
-    }
-    candidates.into_iter().find(|dir| {
-        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
-        manifest
-            .lines()
-            .any(|line| line.trim() == format!("name = \"{crate_name}\""))
+/// Reads the built artifact, panicking (rather than silently mis-testing)
+/// when cargo succeeded but the expected wasm file is still absent — a sign
+/// the guest does not emit the `cdylib` this test expects.
+#[expect(
+    clippy::panic,
+    reason = "a missing build artifact is a hard test failure"
+)]
+fn read_artifact(crate_name: &str, profile: &str, wasm_file: &str) -> Vec<u8> {
+    let path = target_dir().join(WASM_TARGET).join(profile).join(wasm_file);
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "{crate_name} guest not found at {} after a successful build: {error}.\
+             \nExpected the crate to emit this `cdylib` artifact for {WASM_TARGET}.",
+            path.display()
+        )
     })
 }
 
-/// Newest source mtime across the crate dir, its transitive path
-/// dependencies, and the workspace root manifest + lockfile.
-fn newest_source_mtime(root: &Path, crate_dir: &Path) -> (SystemTime, PathBuf) {
-    let workspace_paths = workspace_path_entries(root);
-    let mut newest = (SystemTime::UNIX_EPOCH, PathBuf::new());
-    consider(&mut newest, &root.join("Cargo.toml"));
-    consider(&mut newest, &root.join("Cargo.lock"));
-
-    let mut visited = HashSet::new();
-    let mut stack = vec![crate_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if !visited.insert(dir.clone()) {
-            continue;
-        }
-        consider(&mut newest, &dir.join("Cargo.toml"));
-        consider_tree(&mut newest, &dir.join("src"));
-        let manifest = dir.join("Cargo.toml");
-        for dep_dir in parse_dependency_dirs(&manifest, &workspace_paths) {
-            stack.push(dep_dir);
-        }
-    }
-    (newest.0, newest.1)
+fn workspace_root() -> PathBuf {
+    // CARGO_MANIFEST_DIR is <workspace>/crates/runtime.
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Records `(dependency name, path)` for every workspace-manifest line
-/// carrying a local `path = "…"` (dependency tables and `[patch]` sections
-/// alike: patched path sources such as `wasmtiny` and vendored crates also
-/// invalidate guest builds).
-fn workspace_path_entries(root: &Path) -> Vec<(String, PathBuf)> {
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
-    manifest
-        .lines()
-        .filter_map(|line| {
-            let name = line.split('=').next()?.trim().to_string();
-            let path = extract_path_value(line, root)?;
-            Some((name, path))
-        })
-        .collect()
+fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
 }
 
-/// Extracts local `path = "…"` targets from a manifest line, resolved
-/// against the manifest's directory. Also resolves `name.workspace = true`
-/// dependencies through the workspace path entries by name.
-///
-/// Only build-relevant sections are honoured: `[dependencies]`,
-/// `[build-dependencies]`, `[workspace.dependencies]`, and `[patch.*]`.
-/// Dev-dependencies (e.g. a crate's native test harness) never affect the
-/// compiled guest wasm and would only produce false staleness positives.
-fn parse_dependency_dirs(manifest: &Path, workspace_paths: &[(String, PathBuf)]) -> Vec<PathBuf> {
-    let text = std::fs::read_to_string(manifest).unwrap_or_default();
-    let manifest_dir = manifest.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut dirs = Vec::new();
-    let mut in_relevant_section = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            in_relevant_section = trimmed.starts_with("[dependencies")
-                || trimmed.starts_with("[build-dependencies")
-                || trimmed.starts_with("[workspace.dependencies")
-                || trimmed.starts_with("[patch");
-            continue;
-        }
-        if !in_relevant_section {
-            continue;
-        }
-        if let Some(path) = extract_path_value(trimmed, &manifest_dir) {
-            dirs.push(path);
-            continue;
-        }
-        // `selium-foo.workspace = true` — resolve via the workspace path
-        // entries, which are keyed by dependency name.
-        if let Some(name) = trimmed.strip_suffix(".workspace = true")
-            && let Some((_, path)) = workspace_paths
-                .iter()
-                .find(|(dep_name, _)| dep_name == name)
-        {
-            dirs.push(path.clone());
-        }
-    }
-    dirs
+#[derive(Clone, Copy)]
+enum Profile {
+    Debug,
+    Release,
 }
 
-fn extract_path_value(line: &str, base: &Path) -> Option<PathBuf> {
-    let start = line.find("path = \"")? + "path = \"".len();
-    let rest = line.get(start..)?;
-    let end = rest.find('"')?;
-    let relative = rest.get(..end)?;
-    if relative.is_empty() {
-        return None;
-    }
-    let path = base.join(relative);
-    // Keep only existing directories: path entries may be conditional or
-    // target-specific.
-    path.is_dir().then_some(path)
-}
-
-fn consider(newest: &mut (SystemTime, PathBuf), path: &Path) {
-    if let Ok(mtime) = std::fs::metadata(path).and_then(|metadata| metadata.modified())
-        && mtime > newest.0
-    {
-        *newest = (mtime, path.to_path_buf());
-    }
-}
-
-fn consider_tree(newest: &mut (SystemTime, PathBuf), dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            consider_tree(newest, &path);
-        } else {
-            consider(newest, &path);
+impl std::fmt::Display for Profile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Profile::Debug => f.write_str("debug"),
+            Profile::Release => f.write_str("release"),
         }
     }
 }

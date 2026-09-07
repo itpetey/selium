@@ -169,9 +169,8 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
 }
 
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    // The shared reader fails loudly when the artifact is missing or older
-    // than the guest's sources (stale guest wasm is not ABI-safe against
-    // the runtime and fails incomprehensibly).
+    // The shared reader rebuilds the guest if its inputs changed (a no-op
+    // when fresh) and fails loudly if the build or the read fails.
     common::read_guest_wasm_debug(crate_name, file_name)
 }
 
