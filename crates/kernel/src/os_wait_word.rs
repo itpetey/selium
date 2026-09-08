@@ -102,15 +102,22 @@ unsafe fn wait_impl(ptr: *mut u8, expected: u32, timeout_ms: u64) -> bool {
             0,
         )
     };
-    let eagain = -(libc::EAGAIN as libc::c_long);
-    let eintr = -(libc::EINTR as libc::c_long);
-    match r {
-        0 => true, // woken by FUTEX_WAKE
+    // `libc::syscall` is the libc wrapper, not the raw instruction: it
+    // reports failure as -1 with the error in `errno` (both glibc and
+    // musl), never as the raw `-errno` value the kernel uses internally.
+    // A successful FUTEX_WAIT returns exactly 0, so -1 is unambiguous.
+    if r == 0 {
+        return true; // woken by FUTEX_WAKE
+    }
+    if r == -1 {
         // EAGAIN: value already differed (race); EINTR: spurious wake. Both
         // mean "re-check the word" rather than "timed out".
-        e if e == eagain || e == eintr => true,
-        _ => false, // ETIMEDOUT (or unexpected error): treat as timed out
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN) | Some(libc::EINTR)
+        );
     }
+    false // Unexpected non-libc return: treat as timed out
 }
 
 #[cfg(target_os = "windows")]
@@ -283,6 +290,8 @@ unsafe fn wake_impl(ptr: *mut u8, count: u32) -> u32 {
             0,
         )
     };
+    // Errors report as -1 (libc wrapper convention, see wait_impl) and fall
+    // through to 0 wake attempts delivered.
     u32::try_from(r).unwrap_or(0)
 }
 
