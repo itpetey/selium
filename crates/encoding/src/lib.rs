@@ -214,6 +214,12 @@ impl From<&selium_abi::ResourceTarget> for ResourceTargetWire {
     }
 }
 
+impl From<&(String, String)> for DomainEntryWire {
+    fn from(value: &(String, String)) -> Self {
+        Self::new(value.0.clone(), value.1.clone())
+    }
+}
+
 impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
     fn from(value: &selium_abi::DiscoveryRequest) -> Self {
         match value {
@@ -264,18 +270,6 @@ impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
     }
 }
 
-impl From<&(String, String)> for DomainEntryWire {
-    fn from(value: &(String, String)) -> Self {
-        Self::new(value.0.clone(), value.1.clone())
-    }
-}
-
-impl From<&DomainEntryWire> for (String, String) {
-    fn from(value: &DomainEntryWire) -> Self {
-        (value.domain.clone(), value.tenant.clone())
-    }
-}
-
 impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
     fn from(value: &selium_abi::DiscoveryResponse) -> Self {
         match value {
@@ -302,6 +296,12 @@ impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
                 domains.iter().map(DomainEntryWire::from).collect(),
             ),
         }
+    }
+}
+
+impl From<&DomainEntryWire> for (String, String) {
+    fn from(value: &DomainEntryWire) -> Self {
+        (value.domain.clone(), value.tenant.clone())
     }
 }
 

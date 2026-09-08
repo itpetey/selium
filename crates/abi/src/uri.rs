@@ -27,71 +27,6 @@ use super::ResourceClass;
 /// The scheme of internal `sel` URIs.
 pub const SEL_PREFIX: &str = "sel://";
 
-/// Returns whether `segment` names a resource class (a reserved type segment).
-pub fn is_class_segment(segment: &str) -> bool {
-    ResourceClass::from_uri_segment(segment).is_some()
-}
-
-/// Returns whether `uri` addresses the root/system tenant (`sel:///…`).
-pub fn is_root_uri(uri: &str) -> bool {
-    matches!(parse_sel(uri), Some((tenant, _)) if tenant.is_empty())
-}
-
-/// Returns whether a path segment is a valid DNS label: 1–63 octets of ASCII
-/// lowercase letters, digits, and hyphens, with no leading or trailing hyphen.
-///
-/// Wire names are DNS hostnames, so every projected segment must be a valid
-/// label. The reversal is a convention enforced only in
-/// [`resolve_wire_name`], but the projection helpers reject non-DNS-safe
-/// segments up front so a service can never register a path that cannot be
-/// projected to a wire name.
-pub fn is_dns_safe_label(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment.len() <= 63
-        && !segment.starts_with('-')
-        && !segment.ends_with('-')
-        && segment
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// Projects a named-service path into reversed DNS labels.
-///
-/// `["http", "prod"]` → `["prod", "http"]`. The projection applies only to
-/// named services: a class segment (a typed resource path such as
-/// `region/<id>`) or any non-DNS-safe segment yields `None`, so resource
-/// identity URIs never project to external wire names.
-pub fn labels_from_path(path: &str) -> Option<Vec<String>> {
-    let path = path.trim_matches('/');
-    if path.is_empty() {
-        return None;
-    }
-    let mut labels = Vec::new();
-    for segment in path.split('/').rev() {
-        if is_class_segment(segment) || !is_dns_safe_label(segment) {
-            return None;
-        }
-        labels.push(segment.to_string());
-    }
-    Some(labels)
-}
-
-/// Joins reversed DNS labels back into an internal path: `["prod", "http"]` →
-/// `"http/prod"`. Returns `None` when any label is not DNS-safe.
-pub fn path_from_labels(labels: &[&str]) -> Option<String> {
-    if labels.is_empty() {
-        return None;
-    }
-    let mut segments = Vec::with_capacity(labels.len());
-    for label in labels.iter().rev() {
-        if !is_dns_safe_label(label) {
-            return None;
-        }
-        segments.push(*label);
-    }
-    Some(segments.join("/"))
-}
-
 /// Advisory domain-to-tenant mapping, provisioned out-of-band (like client
 /// certificates). Used for routing and for scoping which tenant may register
 /// names under a domain. It is **not** an authentication source: identity
@@ -128,6 +63,124 @@ impl DomainTable {
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().map(|(d, t)| (d.as_str(), t.as_str()))
     }
+}
+
+/// Returns whether `segment` names a resource class (a reserved type segment).
+pub fn is_class_segment(segment: &str) -> bool {
+    ResourceClass::from_uri_segment(segment).is_some()
+}
+
+/// Returns whether a path segment is a valid DNS label: 1–63 octets of ASCII
+/// lowercase letters, digits, and hyphens, with no leading or trailing hyphen.
+///
+/// Wire names are DNS hostnames, so every projected segment must be a valid
+/// label. The reversal is a convention enforced only in
+/// [`resolve_wire_name`], but the projection helpers reject non-DNS-safe
+/// segments up front so a service can never register a path that cannot be
+/// projected to a wire name.
+pub fn is_dns_safe_label(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 63
+        && !segment.starts_with('-')
+        && !segment.ends_with('-')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Returns whether `uri` addresses the root/system tenant (`sel:///…`).
+pub fn is_root_uri(uri: &str) -> bool {
+    matches!(parse_sel(uri), Some((tenant, _)) if tenant.is_empty())
+}
+
+/// Projects a named-service path into reversed DNS labels.
+///
+/// `["http", "prod"]` → `["prod", "http"]`. The projection applies only to
+/// named services: a class segment (a typed resource path such as
+/// `region/<id>`) or any non-DNS-safe segment yields `None`, so resource
+/// identity URIs never project to external wire names.
+pub fn labels_from_path(path: &str) -> Option<Vec<String>> {
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    let mut labels = Vec::new();
+    for segment in path.split('/').rev() {
+        if is_class_segment(segment) || !is_dns_safe_label(segment) {
+            return None;
+        }
+        labels.push(segment.to_string());
+    }
+    Some(labels)
+}
+
+/// Normalises a host/authority value: lowercased, trailing dot stripped, and
+/// a numeric `:port` suffix removed.
+pub fn normalize_host(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if let Some((name, port)) = host.rsplit_once(':')
+        && port.chars().all(|c| c.is_ascii_digit())
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+    host.to_string()
+}
+
+/// Parses a leaf alias `sel://<tenant>/<name>` into `(tenant, name)`.
+/// A class noun is reserved, so a name shadowing a type segment is rejected.
+pub fn parse_alias(uri: &str) -> Option<(&str, &str)> {
+    let (tenant, path) = parse_sel(uri)?;
+    if path.is_empty() || path.contains('/') {
+        return None;
+    }
+    if is_class_segment(path) {
+        return None;
+    }
+    Some((tenant, path))
+}
+
+/// Parses a `sel://` URI into its `(tenant, path)` components.
+///
+/// `tenant` is the authority (empty for the root/system tenant); `path` is
+/// the remainder with leading and trailing `/` stripped (it may be empty or
+/// contain `/`-separated segments). Returns `None` for external names and
+/// other non-`sel` URIs.
+pub fn parse_sel(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix(SEL_PREFIX)?;
+    let (tenant, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((tenant, path.trim_matches('/')))
+}
+
+/// Parses a typed internal URI `sel://<tenant>/<type>/<id>` into
+/// `(tenant, class, id)`. Returns `None` for aliases, root well-known paths,
+/// and external names.
+pub fn parse_typed(uri: &str) -> Option<(&str, ResourceClass, u64)> {
+    let (tenant, path) = parse_sel(uri)?;
+    let (class_seg, id_seg) = path.split_once('/')?;
+    if id_seg.is_empty() || id_seg.contains('/') {
+        return None;
+    }
+    let class = ResourceClass::from_uri_segment(class_seg)?;
+    let id = id_seg.parse::<u64>().ok()?;
+    Some((tenant, class, id))
+}
+
+/// Joins reversed DNS labels back into an internal path: `["prod", "http"]` →
+/// `"http/prod"`. Returns `None` when any label is not DNS-safe.
+pub fn path_from_labels(labels: &[&str]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(labels.len());
+    for label in labels.iter().rev() {
+        if !is_dns_safe_label(label) {
+            return None;
+        }
+        segments.push(*label);
+    }
+    Some(segments.join("/"))
 }
 
 /// Resolves an external wire name into its `(tenant, path)` components.
@@ -184,59 +237,6 @@ pub fn resolve_wire_name(name: &str, domains: &DomainTable) -> Option<(String, V
         path.push((*label).to_string());
     }
     Some((tenant, path))
-}
-
-/// Normalises a host/authority value: lowercased, trailing dot stripped, and
-/// a numeric `:port` suffix removed.
-pub fn normalize_host(host: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    let host = host.strip_suffix('.').unwrap_or(&host);
-    if let Some((name, port)) = host.rsplit_once(':')
-        && port.chars().all(|c| c.is_ascii_digit())
-        && !name.is_empty()
-    {
-        return name.to_string();
-    }
-    host.to_string()
-}
-
-/// Parses a leaf alias `sel://<tenant>/<name>` into `(tenant, name)`.
-/// A class noun is reserved, so a name shadowing a type segment is rejected.
-pub fn parse_alias(uri: &str) -> Option<(&str, &str)> {
-    let (tenant, path) = parse_sel(uri)?;
-    if path.is_empty() || path.contains('/') {
-        return None;
-    }
-    if is_class_segment(path) {
-        return None;
-    }
-    Some((tenant, path))
-}
-
-/// Parses a `sel://` URI into its `(tenant, path)` components.
-///
-/// `tenant` is the authority (empty for the root/system tenant); `path` is
-/// the remainder with leading and trailing `/` stripped (it may be empty or
-/// contain `/`-separated segments). Returns `None` for external names and
-/// other non-`sel` URIs.
-pub fn parse_sel(uri: &str) -> Option<(&str, &str)> {
-    let rest = uri.strip_prefix(SEL_PREFIX)?;
-    let (tenant, path) = rest.split_once('/').unwrap_or((rest, ""));
-    Some((tenant, path.trim_matches('/')))
-}
-
-/// Parses a typed internal URI `sel://<tenant>/<type>/<id>` into
-/// `(tenant, class, id)`. Returns `None` for aliases, root well-known paths,
-/// and external names.
-pub fn parse_typed(uri: &str) -> Option<(&str, ResourceClass, u64)> {
-    let (tenant, path) = parse_sel(uri)?;
-    let (class_seg, id_seg) = path.split_once('/')?;
-    if id_seg.is_empty() || id_seg.contains('/') {
-        return None;
-    }
-    let class = ResourceClass::from_uri_segment(class_seg)?;
-    let id = id_seg.parse::<u64>().ok()?;
-    Some((tenant, class, id))
 }
 
 /// Builds a typed resource URI: `sel://<tenant>/<type>/<id>`.

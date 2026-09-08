@@ -76,19 +76,6 @@ impl Drop for HostcallFuture {
     }
 }
 
-/// The tenant identity assigned to another process, if any.
-///
-/// The discovery service uses this to scope resolution to the calling
-/// process's own tenant.
-pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String>> {
-    match hostcall_ready(HostcallRequest::ProcessTenant { process_id })? {
-        HostcallOutput::Tenant(tenant) => Ok(tenant),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ProcessTenant: {other:?}"
-        ))),
-    }
-}
-
 /// Returns whether `process_id` holds `capability`.
 ///
 /// Restricted to the discovery system guest: the runtime accepts this
@@ -110,16 +97,17 @@ pub fn process_capability(
     }
 }
 
-/// Records, on behalf of the discovery service, that `process_id` registered
-/// the route `uri`. The runtime accepts this hostcall only from the discovery
-/// system guest and uses the record to gate the readiness of role-declared
-/// system guests on discoverable self-registration.
-pub fn record_registration(process_id: selium_abi::ProcessId, uri: &str) -> Result<()> {
-    hostcall_ready(HostcallRequest::RecordRegistration {
-        process_id,
-        uri: uri.to_string(),
-    })
-    .map(|_| ())
+/// The tenant identity assigned to another process, if any.
+///
+/// The discovery service uses this to scope resolution to the calling
+/// process's own tenant.
+pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String>> {
+    match hostcall_ready(HostcallRequest::ProcessTenant { process_id })? {
+        HostcallOutput::Tenant(tenant) => Ok(tenant),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessTenant: {other:?}"
+        ))),
+    }
 }
 
 /// Fills a buffer with cryptographically secure random bytes from the host.
@@ -134,6 +122,18 @@ pub fn random_bytes(len: u32) -> Result<Vec<u8>> {
             "unexpected hostcall output for RandomBytes: {other:?}"
         ))),
     }
+}
+
+/// Records, on behalf of the discovery service, that `process_id` registered
+/// the route `uri`. The runtime accepts this hostcall only from the discovery
+/// system guest and uses the record to gate the readiness of role-declared
+/// system guests on discoverable self-registration.
+pub fn record_registration(process_id: selium_abi::ProcessId, uri: &str) -> Result<()> {
+    hostcall_ready(HostcallRequest::RecordRegistration {
+        process_id,
+        uri: uri.to_string(),
+    })
+    .map(|_| ())
 }
 
 /// Records, on behalf of the discovery service, that a discovery resolve

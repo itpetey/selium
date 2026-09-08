@@ -419,17 +419,6 @@ impl HttpStreamRequestHandle<'_> {
     }
 }
 
-/// Splits a slash-separated service path into route segments, ignoring
-/// empty segments. The path must project to DNS-safe wire labels —
-/// [`Context::serve`](crate::Context::serve) rejects typed resource paths
-/// (`region/7`) and non-DNS-safe segments up front.
-fn path_segments(path: &str) -> Vec<String> {
-    path.split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn http_target(
     listener: &ResourceListener,
     interface: Option<InterfaceMetadata>,
@@ -444,6 +433,17 @@ fn http_target(
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
     }
+}
+
+/// Splits a slash-separated service path into route segments, ignoring
+/// empty segments. The path must project to DNS-safe wire labels —
+/// [`Context::serve`](crate::Context::serve) rejects typed resource paths
+/// (`region/7`) and non-DNS-safe segments up front.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
