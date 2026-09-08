@@ -178,6 +178,31 @@ impl<M: MessageTransport> FramedRead<M> {
         }
     }
 
+    /// Polls for the next complete frame using the caller's task waker.
+    ///
+    /// The inner codec is polled with `cx`, so a `Pending` result parks the
+    /// task on the underlying transport's `AsyncRead` waker (a socket read on
+    /// native consumers) instead of a no-op waker or a yield loop. This is the
+    /// waker-honest read path used for transports without a generation counter.
+    pub fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<(Vec<u8>, u32, u8)>> {
+        if let Some(frame) = self.peeked.take() {
+            return Poll::Ready(Ok(frame));
+        }
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(item),
+            Poll::Ready(None) => Poll::Ready(Err(Error::Terminated)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Awaits the next complete frame, parking on the transport's read waker.
+    ///
+    /// Parks the task on the underlying transport's `AsyncRead` waker until a
+    /// complete frame arrives.
+    pub async fn read_frame_async(&mut self) -> Result<(Vec<u8>, u32, u8)> {
+        std::future::poll_fn(|cx| self.poll_frame(cx)).await
+    }
+
     /// Non-blocking check for peer-closed state.
     pub fn poll_peer_closed(&mut self) -> Result<bool> {
         let waker = futures::task::noop_waker();

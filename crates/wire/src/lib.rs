@@ -23,14 +23,17 @@ use std::{
 pub use error::{Error, Result};
 pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use pubsub::{Publisher, Subscriber};
-pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcRequest};
+pub use rpc::{Rendezvous, RpcClient, RpcConnection, RpcError, RpcRequest};
 pub use stream::{
     BidiReceiver, BidiRequestStream, BidiResponder, BidiSender, RpcBidiStream, RpcBidiStreamClient,
     RpcBidiStreamConnection, RpcBidiStreamRequest, RpcServerStream, RpcServerStreamClient,
     RpcServerStreamConnection, RpcServerStreamRequest,
 };
-pub use tables::LiveTable;
+pub use tables::{LiveTable, LiveTableMessage, LiveTableRecord};
 
+pub use control::{PipeControl, TERMINATE_ATTACH_FAILED, TERMINATE_BAD_HANDSHAKE};
+
+pub mod control;
 pub mod error;
 pub mod framed;
 pub mod pubsub;
@@ -68,8 +71,7 @@ pub trait MessageTransport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
 /// `observed_generation`, or parks the current task through the
 /// generation-wait callback installed by the reactor.
 ///
-/// Falls back to [`yield_now`] if no callback is installed (e.g. when
-/// running on Tokio without the guest reactor).
+/// Falls back to a waker wake if no callback is installed.
 pub(crate) async fn generation_wait(region_id: u64, observed_generation: u64) {
     let mut yielded = false;
     std::future::poll_fn(move |cx| {
@@ -85,23 +87,4 @@ pub(crate) async fn generation_wait(region_id: u64, observed_generation: u64) {
         }
     })
     .await
-}
-
-/// Yields execution back to the current executor once.
-///
-/// This is a generic, executor-agnostic yield that works on both Tokio and
-/// the guest cooperative task runner. It returns `Pending` once, allowing
-/// other runnable tasks to be polled before the current task is re-queued.
-pub(crate) async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(move |cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
 }

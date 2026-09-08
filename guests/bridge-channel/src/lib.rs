@@ -21,8 +21,6 @@ use std::{
 };
 
 use anyhow::Context as _;
-use rkyv::{Archive, Deserialize, Serialize};
-use selium_abi::{decode_rkyv, encode_rkyv};
 use selium_guest::{
     Context, GuestError, Result, entrypoint, info, mark_ready,
     net::{
@@ -39,6 +37,10 @@ use selium_wire::{
     error::Error as WireError,
     framed::{FramedRead, FramedWrite},
 };
+// The handshake/termination contract is now owned by `selium-wire`; the bridge
+// channel re-exports it so the shared type and its termination codes remain
+// available from this crate with no wire change.
+pub use selium_wire::{PipeControl, TERMINATE_ATTACH_FAILED, TERMINATE_BAD_HANDSHAKE};
 
 const OWN_RING_READERS: u64 = 1;
 /// The pipe's own contribution to the fabric ring's member counts: its
@@ -53,29 +55,6 @@ const OWN_RING_READERS: u64 = 1;
 /// the reader count; writers and blocking readers — the norms for fabric
 /// members — are both counted.
 const OWN_RING_WRITERS: u64 = 1;
-pub const TERMINATE_ATTACH_FAILED: u32 = 2;
-/// Termination codes carried by [`PipeControl::Terminate`].
-pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
-
-/// Typed per-stream control frames.
-///
-/// Layered on the `selium-wire` codec (an rkyv payload carried as a normal
-/// frame with tag 0 before data relay begins). Data frames are relayed
-/// verbatim and are never decoded as control frames.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub enum PipeControl {
-    /// A client request to bridge the given channel URI.
-    Handshake {
-        /// Discovery URI of the fabric channel to bridge.
-        uri: String,
-    },
-    /// A terminal failure reply; the stream closes after it.
-    Terminate {
-        /// Machine-readable termination code.
-        code: u32,
-    },
-}
 
 /// A [`MessageTransport`] adapting the read half of the relayed byte stream.
 ///
@@ -109,18 +88,6 @@ struct RingReadTransport {
 /// exercises the write side.
 struct RingWriteTransport {
     writer: BlockingWriter,
-}
-
-impl PipeControl {
-    /// Encodes the control frame to its framed payload bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        encode_rkyv(self).expect("encode PipeControl")
-    }
-
-    /// Decodes a control frame from framed payload bytes.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        decode_rkyv(bytes).ok()
-    }
 }
 
 impl tokio::io::AsyncRead for StreamReadTransport {
@@ -329,7 +296,8 @@ impl MessageTransport for RingWriteTransport {
     }
 }
 
-/// The bridge pipe core: handshake → resolve/attach → splice → teardown.
+/// The bridge pipe core: handshake → resolve/attach → accepted reply →
+/// splice → teardown.
 ///
 /// `resolve` maps a channel URI to that channel's shared region id (the
 /// discovery lookup in production). The function stays generic for the native
@@ -393,7 +361,13 @@ where
         }
     };
 
-    // 3. Splice until either half closes; `select!` cancels the loser, whose
+    // 3. Deterministic success reply: the channel is resolved and attached,
+    //    so the client may treat silence-after-handshake as a protocol
+    //    violation. Best-effort (a client that vanished needs no reply).
+    let accepted = PipeControl::Accepted.encode();
+    drop(stream_write.write_frame(&accepted, 0));
+
+    // 4. Splice until either half closes; `select!` cancels the loser, whose
     //    dropped halves release the fabric membership / finish the stream.
     let to_ring = pump_stream_to_ring(stream_read, ring_write);
     let to_stream = pump_ring_to_stream(ring_read, stream_write, channel);
@@ -800,7 +774,8 @@ mod tests {
             .expect("guest task must tear down on fabric close")
             .expect("guest task succeeds");
 
-        // The client observes the relayed frame followed by stream EOF.
+        // The client observes the accepted handshake reply, then the relayed
+        // frame, followed by stream EOF.
         let mut buf = Vec::new();
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             use tokio::io::AsyncReadExt;
@@ -810,9 +785,116 @@ mod tests {
         .expect("peer must observe stream finish promptly")
         .expect("peer read must succeed");
         assert!(n > 0, "relayed frame must reach the client before EOF");
-        assert!(buf.len() > FrameHeader::ENCODED_SIZE, "frame bytes present");
-        let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("header");
+
+        // First frame: the deterministic accepted reply (tag 0).
+        assert!(
+            buf.len() >= 2 * FrameHeader::ENCODED_SIZE,
+            "accepted + fabric frames present"
+        );
+        let accepted_header =
+            FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("accepted header");
+        assert_eq!(
+            accepted_header.tag, 0,
+            "accepted reply carries control tag 0"
+        );
+        let accepted_payload = &buf[FrameHeader::ENCODED_SIZE..accepted_frame_end(&buf)];
+        assert_eq!(
+            PipeControl::decode(accepted_payload).expect("accepted control frame"),
+            PipeControl::Accepted,
+            "successful handshake replies with an accepted frame"
+        );
+
+        // Second frame: the fabric frame relayed before the stream finish.
+        let fabric_frame = &buf[accepted_frame_end(&buf)..];
+        let header =
+            FrameHeader::decode(&fabric_frame[..FrameHeader::ENCODED_SIZE]).expect("header");
         assert_eq!(header.tag, 1, "fabric frame relayed before finish");
+    }
+
+    /// The handshake is deterministic: a successful resolve/attach replies
+    /// with a typed accepted control frame before the relay begins, so an
+    /// external client can surface handshake failures at channel open.
+    #[tokio::test]
+    async fn successful_handshake_replies_accepted_frame() {
+        setup();
+
+        // Fabric channel bridged by the guest (no inner peers needed).
+        let fabric = Channel::create_with_backpressure(
+            4096,
+            selium_shm::ChannelBackpressure::Park,
+            selium_abi::ResourceKind::SharedMemory,
+        )
+        .expect("fabric channel");
+        let fabric_region_id = fabric.region_id();
+
+        let (ring_to_guest, ring_from_guest, shared_id, _region) =
+            byte_channel::create(65_536, 65_536).expect("create");
+        let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
+        let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
+
+        let guest_task = tokio::spawn(bridge_pipe(guest_stream, move |_uri| async move {
+            Ok(fabric_region_id)
+        }));
+
+        let handshake = PipeControl::Handshake {
+            uri: "sel://acme/lobby".to_string(),
+        }
+        .encode();
+        write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
+            .await
+            .expect("write handshake");
+
+        // The client peer receives the accepted reply (the pipe keeps
+        // splicing until the client hangs up).
+        let mut buf = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 4096];
+            match peer.read(&mut chunk).await {
+                Ok(0) => panic!("pipe closed before replying"),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() >= FrameHeader::ENCODED_SIZE {
+                        let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE])
+                            .expect("reply header");
+                        if buf.len() >= FrameHeader::ENCODED_SIZE + header.len as usize {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => panic!("peer read failed"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "accepted reply timeout"
+            );
+        }
+        let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("header");
+        assert_eq!(header.tag, 0, "accepted reply carries control tag 0");
+        let payload =
+            &buf[FrameHeader::ENCODED_SIZE..FrameHeader::ENCODED_SIZE + header.len as usize];
+        assert_eq!(
+            PipeControl::decode(payload).expect("control frame"),
+            PipeControl::Accepted
+        );
+
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), guest_task)
+            .await
+            .expect("guest task completes within timeout")
+            .expect("guest task succeeds");
+    }
+
+    /// Returns the end offset of the first complete frame in `buf`, or panics
+    /// if the frame is truncated.
+    fn accepted_frame_end(buf: &[u8]) -> usize {
+        assert!(
+            buf.len() >= FrameHeader::ENCODED_SIZE,
+            "frame header present"
+        );
+        let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("header");
+        FrameHeader::ENCODED_SIZE + header.len as usize
     }
 
     /// 6.2 (uplift): killing a bridge-channel mid-pipe (here: aborting the

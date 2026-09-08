@@ -232,6 +232,55 @@ where
             return Poll::Ready(None);
         }
 
+        // Socket transports (no generation counter) park on the transport's
+        // read waker; rings use the generation-based read below.
+        if this.reply_reader.inner().region_id() == 0 {
+            loop {
+                match this.reply_reader.poll_frame(cx) {
+                    Poll::Ready(Ok((payload, tag, flags))) => {
+                        if tag != this.correlation {
+                            // Invariant: only one stream is active per client at
+                            // a time, so a foreign tag indicates a peer bug;
+                            // skip it and keep waiting for our tag.
+                            continue;
+                        }
+
+                        if FrameHeader::FLAG_STREAM_CANCEL & flags != 0 {
+                            this.done = true;
+                            return Poll::Ready(None);
+                        }
+
+                        if FrameHeader::FLAG_STREAM_ERROR & flags != 0 {
+                            this.done = true;
+                            let message = String::from_utf8_lossy(&payload).into_owned();
+                            return Poll::Ready(Some(Err(RpcError::Remote(message))));
+                        }
+
+                        let is_end = FrameHeader::FLAG_STREAM_END & flags != 0;
+                        if is_end {
+                            this.done = true;
+                        }
+                        if payload.is_empty() && is_end {
+                            return Poll::Ready(None);
+                        }
+
+                        return match FlatMsg::decode(&payload) {
+                            Ok(item) => Poll::Ready(Some(Ok(item))),
+                            Err(e) => {
+                                Poll::Ready(Some(Err(RpcError::Serialization(format!("{e}")))))
+                            }
+                        };
+                    }
+                    Poll::Ready(Err(Error::Terminated)) => {
+                        this.done = true;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
         match try_poll_ready(this.reply_reader) {
             Ok(true) => {
                 match this.reply_reader.read_frame() {
@@ -347,6 +396,36 @@ where
     pub async fn recv(
         &mut self,
     ) -> std::result::Result<RpcServerStreamRequest<'_, Req, Item, M>, RpcError> {
+        // Socket transports park on the transport's read waker.
+        if self.request_reader.inner().region_id() == 0 {
+            loop {
+                let (payload_bytes, correlation, flags) =
+                    match self.request_reader.read_frame_async().await {
+                        Ok(frame) => frame,
+                        Err(Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                        Err(e) => return Err(e.into()),
+                    };
+
+                // Skip stale lifecycle frames from previous streams: genuine
+                // requests never carry stream flags.
+                let lifecycle = FrameHeader::FLAG_STREAM_CANCEL
+                    | FrameHeader::FLAG_STREAM_END
+                    | FrameHeader::FLAG_STREAM_ITEM;
+                if flags & lifecycle != 0 {
+                    continue;
+                }
+
+                return Ok(RpcServerStreamRequest {
+                    reply_writer: &mut self.reply_writer,
+                    request_reader: &mut self.request_reader,
+                    payload_bytes,
+                    correlation,
+                    finished: false,
+                    _phantom: PhantomData,
+                });
+            }
+        }
+
         let region_id = self.request_reader.inner().region_id();
         let mut last_generation = self
             .request_reader
@@ -391,8 +470,6 @@ where
 
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
         }
     }
@@ -800,6 +877,50 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
     where
         Resp: FlatMsg,
     {
+        // Socket transports park on the transport's read waker.
+        if self.reader.inner().region_id() == 0 {
+            loop {
+                if self.done {
+                    return Ok(None);
+                }
+
+                let (payload, tag, flags) = match self.reader.read_frame_async().await {
+                    Ok(frame) => frame,
+                    Err(Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                    Err(e) => return Err(e.into()),
+                };
+
+                if tag != self.correlation {
+                    // Invariant: one active bidi session per connection pair;
+                    // skip foreign frames.
+                    continue;
+                }
+
+                if FrameHeader::FLAG_STREAM_CANCEL & flags != 0 {
+                    self.done = true;
+                    return Ok(None);
+                }
+
+                if FrameHeader::FLAG_STREAM_ERROR & flags != 0 {
+                    self.done = true;
+                    let message = String::from_utf8_lossy(&payload).into_owned();
+                    return Err(RpcError::Remote(message));
+                }
+
+                let is_end = FrameHeader::FLAG_STREAM_END & flags != 0;
+                if is_end {
+                    self.done = true;
+                }
+                if payload.is_empty() && is_end {
+                    return Ok(None);
+                }
+
+                return FlatMsg::decode(&payload)
+                    .map(Some)
+                    .map_err(|e| RpcError::Serialization(format!("{e}")));
+            }
+        }
+
         let region_id = self.reader.inner().region_id();
         let mut last_generation = self.reader.generation().unwrap_or(0).wrapping_sub(1);
 
@@ -857,8 +978,6 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
 
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
         }
     }
@@ -908,6 +1027,35 @@ where
     pub async fn recv(
         &mut self,
     ) -> std::result::Result<RpcBidiStreamRequest<'_, Req, Item, Resp, M>, RpcError> {
+        // Socket transports park on the transport's read waker.
+        if self.request_reader.inner().region_id() == 0 {
+            loop {
+                let (payload_bytes, correlation, flags) =
+                    match self.request_reader.read_frame_async().await {
+                        Ok(frame) => frame,
+                        Err(Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                        Err(e) => return Err(e.into()),
+                    };
+
+                // Skip stale lifecycle frames from previous sessions: genuine
+                // requests never carry stream flags.
+                let lifecycle = FrameHeader::FLAG_STREAM_CANCEL
+                    | FrameHeader::FLAG_STREAM_END
+                    | FrameHeader::FLAG_STREAM_ITEM;
+                if flags & lifecycle != 0 {
+                    continue;
+                }
+
+                return Ok(RpcBidiStreamRequest {
+                    reply_writer: &mut self.reply_writer,
+                    request_reader: &mut self.request_reader,
+                    payload_bytes,
+                    correlation,
+                    _phantom: PhantomData,
+                });
+            }
+        }
+
         let region_id = self.request_reader.inner().region_id();
         let mut last_generation = self
             .request_reader
@@ -950,8 +1098,6 @@ where
 
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
         }
     }
@@ -1165,6 +1311,50 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
     where
         Item: FlatMsg,
     {
+        // Socket transports park on the transport's read waker.
+        if self.reader.inner().region_id() == 0 {
+            loop {
+                if self.done {
+                    return Ok(None);
+                }
+
+                let (payload, tag, flags) = match self.reader.read_frame_async().await {
+                    Ok(frame) => frame,
+                    Err(Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                    Err(e) => return Err(e.into()),
+                };
+
+                if tag != self.correlation {
+                    // Invariant: one active bidi session per connection pair;
+                    // skip foreign frames.
+                    continue;
+                }
+
+                if FrameHeader::FLAG_STREAM_CANCEL & flags != 0 {
+                    self.done = true;
+                    return Ok(None);
+                }
+
+                if FrameHeader::FLAG_STREAM_ERROR & flags != 0 {
+                    self.done = true;
+                    let message = String::from_utf8_lossy(&payload).into_owned();
+                    return Err(RpcError::Remote(message));
+                }
+
+                let is_end = FrameHeader::FLAG_STREAM_END & flags != 0;
+                if is_end {
+                    self.done = true;
+                }
+                if payload.is_empty() && is_end {
+                    return Ok(None);
+                }
+
+                return FlatMsg::decode(&payload)
+                    .map(Some)
+                    .map_err(|e| RpcError::Serialization(format!("{e}")));
+            }
+        }
+
         let region_id = self.reader.inner().region_id();
         let mut last_generation = self.reader.generation().unwrap_or(0).wrapping_sub(1);
 
@@ -1222,8 +1412,6 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
 
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
         }
     }

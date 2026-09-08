@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/abi",
+  "crates/client",
   "crates/encoding",
   "crates/guest",
   "crates/guest/macros",
@@ -59,6 +60,7 @@ rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2", default-features = false }
 rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/abi", default-features = false }
+selium-client = { path = "crates/client", default-features = false }
 selium-encoding = { path = "crates/encoding", default-features = false }
 selium-guest = { path = "crates/guest", default-features = false }
 selium-guest-macros = { path = "crates/guest/macros", default-features = false }

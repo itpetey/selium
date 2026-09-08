@@ -129,6 +129,12 @@ where
         let encoded = FlatMsg::encode(&payload);
         self.request_writer.write_frame(&encoded, correlation)?;
 
+        // Socket transports (no generation counter) park on the transport's
+        // read waker; rings use the generation loop.
+        if self.reply_reader.inner().region_id() == 0 {
+            return self.await_reply_via_waker(correlation).await;
+        }
+
         let region_id = self.reply_reader.inner().region_id();
         let mut last_generation = self.reply_reader.generation().unwrap_or(0).wrapping_sub(1);
 
@@ -150,12 +156,30 @@ where
                 return Err(RpcError::ConnectionClosed);
             }
 
-            // Wait on generation change instead of busy-spinning.
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
+        }
+    }
+
+    /// Awaits the reply frame, parking on the transport's read waker.
+    async fn await_reply_via_waker(
+        &mut self,
+        correlation: u32,
+    ) -> std::result::Result<Rep, RpcError> {
+        loop {
+            let (payload_bytes, tag, _flags) = match self.reply_reader.read_frame_async().await {
+                Ok(frame) => frame,
+                Err(crate::Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                Err(e) => return Err(e.into()),
+            };
+
+            if tag != correlation {
+                continue;
+            }
+
+            return FlatMsg::decode(&payload_bytes)
+                .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")));
         }
     }
 }
@@ -187,6 +211,23 @@ where
 
     /// Receives the next request from the client.
     pub async fn recv(&mut self) -> std::result::Result<RpcRequest<'_, Req, Rep, M>, RpcError> {
+        // Socket transports park on the transport's read waker.
+        if self.request_reader.inner().region_id() == 0 {
+            let (payload_bytes, correlation, _flags) =
+                match self.request_reader.read_frame_async().await {
+                    Ok(frame) => frame,
+                    Err(Error::Terminated) => return Err(RpcError::ConnectionClosed),
+                    Err(e) => return Err(e.into()),
+                };
+
+            return Ok(RpcRequest {
+                reply_writer: &mut self.reply_writer,
+                payload_bytes,
+                correlation,
+                _phantom: PhantomData,
+            });
+        }
+
         let region_id = self.request_reader.inner().region_id();
         let mut last_generation = self
             .request_reader
@@ -218,11 +259,8 @@ where
                 return Err(RpcError::ConnectionClosed);
             }
 
-            // Wait on generation change instead of busy-spinning.
             if region_id != 0 {
                 crate::generation_wait(region_id, last_generation).await;
-            } else {
-                crate::yield_now().await;
             }
         }
     }

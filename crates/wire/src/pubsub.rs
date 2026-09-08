@@ -170,6 +170,20 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        // Socket transports (no generation counter) park on the transport's
+        // `AsyncRead` waker; rings use the generation-based read below.
+        if this.reader.inner().region_id() == 0 {
+            return match this.reader.poll_frame(cx) {
+                Poll::Ready(Ok((payload, _tag, _flags))) => match FlatMsg::decode(&payload) {
+                    Ok(value) => Poll::Ready(Some(Ok(value))),
+                    Err(e) => Poll::Ready(Some(Err(Error::SerializationFailed(format!("{e}"))))),
+                },
+                Poll::Ready(Err(Error::Terminated)) => Poll::Ready(None),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
         let has_frame = match this.reader.poll_ready() {
             Ok(ready) => ready,
             Err(Error::BufferEmpty) => false,

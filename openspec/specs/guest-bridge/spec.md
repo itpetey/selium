@@ -76,11 +76,11 @@ The bridge-server SHALL accept handoffs only from the registered `sel-quic` prot
 - **THEN** the handoff SHALL be refused without spawning a bridge-channel, and the delivered region SHALL be closed so the sender observes EOF
 
 ### Requirement: Typed Pipe Handshake
-Before relaying data frames, a bridge-channel SHALL read a typed handshake message naming the fabric channel to bridge (its discovery URI). Data frames SHALL be relayed only after a successful handshake.
+Before relaying data frames, a bridge-channel SHALL read a typed handshake message naming the fabric channel to bridge (its discovery URI). The handshake SHALL be deterministic: after reading the handshake, the bridge-channel SHALL send exactly one typed control reply — an acceptance frame once the channel is resolved and attached (immediately before the relay begins), or a termination frame describing the failure (followed by stream teardown). Data frames SHALL be relayed only after the acceptance reply.
 
 #### Scenario: Client opens a pipe
 - **WHEN** an external client sends a handshake message naming a channel URI on a stream
-- **THEN** the bridge-channel SHALL resolve and attach that channel before relaying further frames
+- **THEN** the bridge-channel SHALL resolve and attach that channel, reply with an acceptance control frame, and only then relay further frames
 
 #### Scenario: Pipe instantiation fails
 - **WHEN** the bridge-channel cannot resolve or attach the requested channel

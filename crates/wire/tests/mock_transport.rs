@@ -135,3 +135,101 @@ async fn pubsub_round_trip_over_mock_transport() {
     assert_eq!(received, Greeting("hello".to_string()));
     assert_eq!(writer_id, 7);
 }
+
+/// 1.2: a `Subscriber` awaited for the next message must park on the
+/// transport's read waker until a frame arrives — it must not complete early,
+/// and (unlike a generation/yield fallback) it must observe a frame that
+/// arrives after the await begins.
+#[tokio::test]
+async fn subscriber_parks_on_socket_until_frame_arrives() {
+    use futures::StreamExt;
+    use std::{sync::Arc, time::Duration};
+
+    let (client, server) = tokio::io::duplex(4096);
+    let mut publisher = Publisher::new(FramedWrite::new(MockTransport(client)));
+    let mut subscriber = Subscriber::new(FramedRead::new(MockTransport(server)), None);
+
+    // The write is gated behind a notify so delivery happens strictly after
+    // the subscriber has begun awaiting.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let gate = notify.clone();
+    let writer = tokio::spawn(async move {
+        gate.notified().await;
+        publisher
+            .publish(&Greeting("hello".to_string()))
+            .expect("publish");
+    });
+
+    // Nothing is available yet: awaiting must park, not complete.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), subscriber.next())
+            .await
+            .is_err(),
+        "subscriber must park until a frame arrives"
+    );
+
+    notify.notify_one();
+
+    let item = tokio::time::timeout(Duration::from_secs(5), subscriber.next())
+        .await
+        .expect("frame arrives after the write is released");
+    assert_eq!(
+        item.map(|message| message.expect("decode")),
+        Some(Greeting("hello".to_string()))
+    );
+
+    writer.await.expect("writer task");
+}
+
+/// 1.4: `LiveTable::sync_async` parks on the transport's read waker for
+/// remote writes instead of spinning, then applies the mutation to the local
+/// materialised view.
+#[tokio::test]
+async fn live_table_sync_async_reads_remote_writes_without_spinning() {
+    use selium_wire::tables::LiveTableMessage;
+    use std::{sync::Arc, time::Duration};
+
+    // The table's own publisher talks over an unrelated pair (the test drives
+    // remote writes only); the table's subscriber reads the remote pair.
+    let (own_write, _own_read) = tokio::io::duplex(64);
+    let (remote_write, remote_read) = tokio::io::duplex(4096);
+
+    let publisher = Publisher::new(FramedWrite::new(MockTransport(own_write)));
+    let subscriber = Subscriber::new(FramedRead::new(MockTransport(remote_read)), None);
+    let table = selium_wire::LiveTable::new(publisher, subscriber)
+        .expect("live table over mock transports");
+
+    // A remote publisher writes one mutation after a released gate.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let gate = notify.clone();
+    let mut remote = Publisher::new(FramedWrite::new(MockTransport(remote_write)));
+    let remote_task = tokio::spawn(async move {
+        gate.notified().await;
+        remote
+            .publish(&LiveTableMessage {
+                mutation_id: 1,
+                key: "alpha".to_string(),
+                value: Some(10u64),
+                expected_version: None,
+            })
+            .expect("remote publish");
+    });
+
+    // No remote write is available yet: sync_async must park, not return.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), table.sync_async())
+            .await
+            .is_err(),
+        "sync_async must park until a remote write arrives"
+    );
+
+    notify.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), table.sync_async())
+        .await
+        .expect("sync_async completes after the remote write")
+        .expect("sync_async applies the remote write");
+
+    assert_eq!(table.get(&"alpha".to_string()).expect("get"), Some(10u64));
+    remote_task.await.expect("remote task");
+}

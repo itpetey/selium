@@ -2,13 +2,13 @@
 //!
 //! Deploys the real `selium-discovery`, `selium-connector-quic`, and
 //! `selium-quic-demo` WASM guests and drives the full QUIC relay path
-//! end-to-end: an external, standards-compliant native quinn client (no
-//! Selium software) completes a TLS 1.3 handshake against the connector
-//! guest's quinn endpoint — running on wasm32 over the guest's
+//! end-to-end: a native `selium-client` (the SDK collapses the QUIC endpoint,
+//! TLS configuration, and handshake) completes a TLS 1.3 handshake against the
+//! connector guest's quinn endpoint — running on wasm32 over the guest's
 //! shared-memory `UdpSocket` and the connector's `AsyncUdpSocket` /
-//! `Runtime` adapters — and echoes byte-identical payloads on two
-//! concurrent bidirectional streams through per-stream shared-memory
-//! channels to the demo guest.
+//! `Runtime` adapters — and echoes byte-identical payloads on two concurrent
+//! bidirectional streams through per-stream shared-memory channels to the
+//! demo guest.
 //!
 //! This is the wasm32-level verification of the `quic-connector` capability:
 //! the native `selium-connector-quic` tests substitute tokio UDP/runtime
@@ -49,6 +49,7 @@ use std::{
 };
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
+use selium_client::ConnectOptions;
 use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
@@ -280,11 +281,13 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     let bound = format!("quic-demo: bound {SERVER_NAME}");
     let _ = wait_for_logs(&runtime, demo, &[(&bound, 1)], Duration::from_secs(30));
 
-    // External native quinn client — no Selium software anywhere on this
-    // side of the wire.
-    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind address"))
-        .expect("client endpoint");
-    client.set_default_client_config(trusting_client_config());
+    // A native `selium-client` SDK connection. The future is created here and
+    // awaited below (after the diagnostic collector starts) so handshake logs
+    // are still captured.
+    let connecting = selium_client::connect(
+        CONNECTOR_ADDR.parse().expect("connector address"),
+        client_options(),
+    );
 
     // Diagnostic collector: drains guest logs on a side thread so the
     // failure path never touches kernel locks (which can be held by a guest
@@ -312,13 +315,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
 
     // TLS 1.3 handshake against the wasm connector's quinn endpoint (the
     // production shm `AsyncUdpSocket` + guest `Runtime` adapters).
-    let connecting = client
-        .connect(
-            CONNECTOR_ADDR.parse().expect("connector address"),
-            SERVER_NAME,
-        )
-        .expect("connect");
-    let connection = match tokio::time::timeout(Duration::from_secs(240), connecting).await {
+    let client = match tokio::time::timeout(Duration::from_secs(240), connecting).await {
         Ok(result) => result.expect("client connection"),
         Err(_elapsed) => {
             let mut snapshot = collected.lock().expect("collector lock").clone();
@@ -328,6 +325,8 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     };
     stop_collector.store(true, std::sync::atomic::Ordering::Relaxed);
     collector.join().expect("collector thread");
+
+    let connection = client.connection().clone();
 
     // Warm-up: the TLS handshake runs on an interpreter, so its crypto
     // flights take seconds and poison the client's RTT estimate — quinn's
@@ -434,7 +433,6 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     runtime.stop_process(demo).expect("stop demo");
     runtime.stop_process(connector).expect("stop connector");
     runtime.stop_process(discovery).expect("stop discovery");
-    drop(connection);
     drop(client);
 }
 
@@ -482,34 +480,27 @@ fn seed_tls_blob_store(runtime: &Runtime) {
         .expect("key manifest");
 }
 
-/// Builds a client TLS config that trusts the connector's self-signed test
-/// certificate, with a patient transport config: the wasm32 guests run on
-/// an interpreter, so the TLS handshake takes far longer than the quinn
-/// defaults assume.
-fn trusting_client_config() -> quinn::ClientConfig {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(CERT_PEM))
-        .collect::<std::io::Result<_>>()
-        .expect("parse certificate PEM");
-    assert!(!certs.is_empty(), "test certificate PEM contains a cert");
-
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(cert).expect("trust test certificate");
-    }
-    let mut config =
-        quinn::ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config");
-
+/// Builds the `selium-client` connection options: trust the connector's
+/// self-signed test certificate, with a patient transport config (the wasm32
+/// guests run on an interpreter, so the TLS handshake takes far longer than
+/// the quinn defaults assume).
+fn client_options() -> ConnectOptions {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
         300_000u32,
     ))));
     // The wasm32 guest processes each packet on an interpreter: round trips
-    // are tens of milliseconds (release) to seconds (debug). A large
-    // initial RTT keeps the handshake patient but strangles the client's
-    // congestion window (slow start adds one MSS per RTT); keep it modest.
+    // are tens of milliseconds (release) to seconds (debug). A large initial
+    // RTT keeps the handshake patient but strangles the client's congestion
+    // window (slow start adds one MSS per RTT); keep it modest.
     transport.initial_rtt(Duration::from_millis(250));
-    config.transport_config(Arc::new(transport));
-    config
+
+    ConnectOptions {
+        server_name: SERVER_NAME.to_string(),
+        server_root: selium_client::certificates_from_pem(CERT_PEM).expect("parse certificate PEM"),
+        identity: None,
+        transport: Some(Arc::new(transport)),
+    }
 }
 
 /// Polls a guest's log channel until every `(needle, count)` pair is

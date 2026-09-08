@@ -192,6 +192,125 @@ where
         }
     }
 
+    /// Drains the subscriber to pick up remote writes, then awaits the next
+    /// remote write.
+    ///
+    /// Applies every already-buffered mutation, then parks the task on the
+    /// transport's `AsyncRead` waker until the next mutation arrives.
+    pub async fn sync_async(&self) -> Result<()> {
+        self.sync()?;
+        std::future::poll_fn(|cx| self.poll_next_message(cx)).await
+    }
+
+    /// Applies the next remote mutation, parking on the caller's waker.
+    ///
+    /// Synchronous poll so the `RefCell` borrows never cross an `await` point.
+    fn poll_next_message(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        let mut subscriber = self.subscriber.borrow_mut();
+        match subscriber.read_with_tag() {
+            Ok((msg, _writer_id)) => {
+                drop(subscriber);
+                apply_message_to(&mut self.local.borrow_mut(), msg);
+                std::task::Poll::Ready(Ok(()))
+            }
+            Err(Error::BufferEmpty) => match subscriber.reader_mut().poll_frame(cx) {
+                std::task::Poll::Ready(Ok((payload, _tag, _flags))) => {
+                    drop(subscriber);
+                    let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                                format!("{e}"),
+                            )));
+                        }
+                    };
+                    apply_message_to(&mut self.local.borrow_mut(), msg);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Inserts or updates a value.
+    ///
+    /// Publishes the mutation, then parks on the transport's read waker until
+    /// this table's own mutation is replayed, applying intervening remote
+    /// mutations in order.
+    pub async fn set_async(&self, key: K, value: V) -> Result<()> {
+        self.publish_and_await(key, Some(value), None).await?;
+        Ok(())
+    }
+
+    /// Deletes a value, then awaits its replay.
+    pub async fn delete_async(&self, key: K) -> Result<()> {
+        self.publish_and_await(key, None, None).await?;
+        Ok(())
+    }
+
+    /// Publishes one mutation and parks until its own replay is applied.
+    async fn publish_and_await(
+        &self,
+        key: K,
+        value: Option<V>,
+        expected_version: Option<u64>,
+    ) -> Result<ApplyOutcome> {
+        let mutation_id = {
+            let mut publisher = self.publisher.borrow_mut();
+            let mutation_id = publisher.allocate_mutation_id();
+            let msg = LiveTableMessage {
+                mutation_id,
+                key,
+                value,
+                expected_version,
+            };
+            publisher.publish(&msg)?;
+            mutation_id
+        };
+        let own_writer_id = self.publisher.borrow().writer_id();
+        std::future::poll_fn(|cx| self.poll_own_mutation(mutation_id, own_writer_id, cx)).await
+    }
+
+    /// Applies mutations until this table's own `mutation_id` is replayed.
+    ///
+    /// Synchronous poll so the `RefCell` borrows never cross an `await` point.
+    fn poll_own_mutation(
+        &self,
+        mutation_id: u64,
+        own_writer_id: u32,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ApplyOutcome>> {
+        loop {
+            let (msg, writer_id) = {
+                let mut subscriber = self.subscriber.borrow_mut();
+                match subscriber.reader_mut().poll_frame(cx) {
+                    std::task::Poll::Ready(Ok((payload, tag, _flags))) => {
+                        drop(subscriber);
+                        let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                                    format!("{e}"),
+                                )));
+                            }
+                        };
+                        (msg, tag)
+                    }
+                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            };
+
+            let is_own_mutation = writer_id == own_writer_id && msg.mutation_id == mutation_id;
+            let outcome = apply_message_to(&mut self.local.borrow_mut(), msg);
+            if is_own_mutation {
+                return std::task::Poll::Ready(Ok(outcome));
+            }
+        }
+    }
+
     fn sync_until_own_mutation(&self, mutation_id: u64) -> Result<ApplyOutcome> {
         let own_writer_id = self.publisher.borrow().writer_id();
         let mut subscriber = self.subscriber.borrow_mut();

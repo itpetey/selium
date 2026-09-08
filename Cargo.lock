@@ -767,12 +767,24 @@ name = "selium-bridge-channel"
 version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
- "rkyv",
  "selium-abi",
  "selium-guest",
  "selium-memory",
  "selium-shm",
  "selium-wire",
+ "tokio",
+]
+
+[[package]]
+name = "selium-client"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "futures",
+ "quinn",
+ "rustls-pemfile",
+ "selium-encoding",
+ "selium-wire",
+ "thiserror",
  "tokio",
 ]
 
@@ -977,8 +989,8 @@ dependencies = [
  "clap",
  "parking_lot",
  "quinn",
- "rustls-pemfile",
  "selium-abi",
+ "selium-client",
  "selium-encoding",
  "selium-kernel",
  "selium-memory",
@@ -1022,6 +1034,7 @@ dependencies = [
  "bytes",
  "flatbuffers",
  "futures",
+ "rkyv",
  "selium-abi",
  "selium-encoding",
  "selium-guest-macros",
