@@ -25,6 +25,7 @@ syn = { workspace = true, features = ["clone-impls", "full", "parsing", "printin
 [dev-dependencies]
 selium-guest = { path = ".." }
 selium-runtime = { path = "../../runtime" }
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 trybuild.workspace = true

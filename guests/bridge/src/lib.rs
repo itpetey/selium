@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::{Context as _, bail};
 use selium_abi::{
     Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector, ResourceTarget,
     client_identity::ClientIdentity,
@@ -130,7 +131,7 @@ fn attach_then_close(shared_id: u64) {
 /// listener and self-registers its serving route via [`Context::serve`]; the
 /// runtime no longer provisions the route or injects a listener argument.
 #[entrypoint]
-async fn bridge_server(mut ctx: Context) {
+async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("bridge-server: started");
 
@@ -138,46 +139,29 @@ async fn bridge_server(mut ctx: Context) {
     // for any other tenant are refused (the connector derives the identity's
     // tenant from the verifying trust anchor, but a client verified by
     // another tenant's anchor must not reach this tenant's bridge).
-    let own_tenant = match selium_guest::self_info() {
-        Ok((_, Some(tenant))) => tenant,
-        Ok((_, None)) => {
-            error!("bridge-server: no tenant scope provisioned; refusing to serve");
-            return;
-        }
-        Err(e) => {
-            error!("bridge-server: self info failed: {e}");
-            return;
-        }
+    let (_, own_tenant) =
+        selium_guest::self_info().with_context(|| "bridge-server: self info failed")?;
+    let Some(own_tenant) = own_tenant else {
+        bail!("bridge-server: no tenant scope provisioned; refusing to serve");
     };
 
     // The server creates its own listener: self-registration replaces the
     // runtime's well-known-URI queue minting.
-    let mut listener = match ResourceListener::create() {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!("bridge-server: create listener failed: {e}");
-            return;
-        }
-    };
+    let mut listener =
+        ResourceListener::create().with_context(|| "bridge-server: create listener failed")?;
 
     // Pin the QUIC connector: handoff metadata is sender-controlled, so an
     // unpinned listener would let any guest that resolves and attaches the
     // bridge route forge an authenticated identity and mint grants. Handoffs
     // from any process other than the registered `sel-quic` handler are
     // refused by the listener.
-    let connector = match selium_guest::resolve_protocol_handler("sel-quic") {
-        Ok(Some(connector)) => connector,
-        Ok(None) => {
-            error!(
+    let connector = selium_guest::resolve_protocol_handler("sel-quic")
+        .with_context(|| "bridge-server: connector resolve failed")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
                 "bridge-server: no sel-quic protocol handler registered; refusing to serve unpinned handoffs"
-            );
-            return;
-        }
-        Err(e) => {
-            error!("bridge-server: connector resolve failed: {e}");
-            return;
-        }
-    };
+            )
+        })?;
     listener.expect_sender(connector);
 
     // Register the serving route (`sel://<tenant>/bridge`) from one declaration.
@@ -190,17 +174,13 @@ async fn bridge_server(mut ctx: Context) {
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
     };
-    if let Err(e) = ctx
-        .serve(Serve {
-            path: vec!["bridge".to_string()],
-            target,
-            default: false,
-        })
-        .await
-    {
-        error!("bridge-server: serve failed: {e}");
-        return;
-    }
+    ctx.serve(Serve {
+        path: vec!["bridge".to_string()],
+        target,
+        default: false,
+    })
+    .await
+    .with_context(|| "bridge-server: serve failed")?;
 
     let identity_source = IdentityGrantMap::stub();
     let mut budget = SpawnBudget::default();
@@ -274,10 +254,7 @@ async fn bridge_server(mut ctx: Context) {
         match Process::start(
             BRIDGE_CHANNEL_MODULE,
             BRIDGE_CHANNEL_ENTRYPOINT,
-            vec![
-                arg_u64(ctx.raw_handle()),
-                arg_u64(incoming.shared_id),
-            ],
+            vec![arg_u64(ctx.raw_handle()), arg_u64(incoming.shared_id)],
             child_grants,
         ) {
             Ok(_child) => info!(

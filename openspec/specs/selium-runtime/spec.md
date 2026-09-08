@@ -110,8 +110,13 @@ When a guest instance terminates, `selium-runtime` SHALL automatically clean up 
 - **THEN** the runtime rolls back the bootstrap and reports `ReadinessUnsatisfied` naming that guest
 
 #### Scenario: Application guest receives discovery handle
+
 - **WHEN** the runtime bootstraps an application guest
-- **THEN** the guest's entrypoint SHALL receive the discovery `shared_id` as a u64 argument, which it passes to `Context::from_raw`
+- **THEN** the guest's entrypoint SHALL receive the discovery `shared_id`
+  as the first entrypoint argument slot, and the entrypoint macro's
+  generated glue SHALL construct the `Context` from it for
+  `Context`-leading entrypoints (guests do not call `Context::from_raw`
+  themselves)
 
 ### Requirement: Runtime discovery RPC session
 `selium-runtime` SHALL hold an `RpcClient<DiscoveryRequest, DiscoveryResponse>` connected to the discovery guest, established during bootstrap alongside the existing discovery queue for guest `Context` connections. This session SHALL be used for authoritative Tier-1 resource registration.
@@ -159,11 +164,22 @@ The runtime SHALL validate that the `shared_id` in a `GuestLogRegister` hostcall
 - **THEN** the runtime SHALL return an error without attaching
 
 ### Requirement: Discovery handle passed to guest entrypoints
-The runtime SHALL continue to pass the discovery host queue `shared_id` to guest entrypoints for `Context::from_raw` (existing behaviour, unchanged). The runtime's own authoritative discovery RPC session SHALL be separate from the guest-facing discovery queue.
+
+The runtime SHALL prepend the discovery host queue `shared_id` as the
+first entrypoint argument slot (existing behaviour, unchanged). For
+`Context`-leading entrypoints, the `#[entrypoint]` macro constructs the
+`Context` from that slot via `Context::from_raw`; guests do not call
+`Context::from_raw` in their own code. The runtime's own authoritative
+discovery RPC session SHALL be separate from the guest-facing discovery
+queue.
 
 #### Scenario: Application guest receives discovery handle (unchanged)
+
 - **WHEN** the runtime bootstraps an application guest
-- **THEN** the guest's entrypoint SHALL receive the discovery `shared_id` as a u64 argument for `Context::from_raw`
+- **THEN** the guest's entrypoint SHALL receive the discovery `shared_id`
+  as the first argument slot
+- **AND** the entrypoint macro SHALL construct the leading `Context` from
+  that slot for `Context`-declaring entrypoints
 
 ### Requirement: Grant Admission and Evaluation
 `selium-runtime` SHALL reject, at spawn or `ProcessStart`, any grant

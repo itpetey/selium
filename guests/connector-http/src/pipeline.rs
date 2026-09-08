@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, VecDeque};
 use futures::{StreamExt, stream::FuturesUnordered};
 use selium_abi::ResourceTarget;
 use selium_proto_http::{HttpRequest, HttpResponse, HttpStreamItem, HttpTrailer};
+use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
@@ -122,13 +123,16 @@ pub enum ReplyEvent {
 }
 
 /// Errors surfaced by session establishment and forwarding.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ForwardError {
     /// Attaching to the route's host queue failed (stale route).
+    #[error("attach: {0}")]
     Attach(String),
     /// Establishing the typed session failed.
+    #[error("connect: {0}")]
     Connect(String),
     /// Sending the request or relaying reply events failed.
+    #[error("send: {0}")]
     Send(String),
 }
 
@@ -191,18 +195,6 @@ impl ReplyEvent {
         )
     }
 }
-
-impl std::fmt::Display for ForwardError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ForwardError::Attach(msg) => write!(f, "attach: {msg}"),
-            ForwardError::Connect(msg) => write!(f, "connect: {msg}"),
-            ForwardError::Send(msg) => write!(f, "send: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ForwardError {}
 
 impl CorrelationMap {
     fn new() -> Self {

@@ -50,6 +50,7 @@
 use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
+use thiserror::Error;
 
 use crate::{Context, GuestError, ResourceListener, Serve};
 
@@ -88,13 +89,16 @@ pub struct HttpRequestHandle<'a> {
 }
 
 /// Errors that can occur during typed HTTP serving.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum HttpServeError {
     /// Failed to accept an incoming connection.
+    #[error("accept error: {0}")]
     Accept(String),
     /// The remote connection was closed.
+    #[error("connection closed")]
     ConnectionClosed,
     /// An RPC-level error occurred.
+    #[error("RPC error: {0}")]
     Rpc(RpcError),
 }
 
@@ -272,18 +276,6 @@ impl HttpRequestHandle<'_> {
     }
 }
 
-impl std::fmt::Display for HttpServeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Accept(msg) => write!(f, "accept error: {msg}"),
-            Self::ConnectionClosed => write!(f, "connection closed"),
-            Self::Rpc(e) => write!(f, "RPC error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for HttpServeError {}
-
 impl HttpServeStream {
     /// Serve a named route and register it with discovery as a streamed
     /// HTTP route: the target carries the [`HTTP_STREAM_INTERFACE`] marker,
@@ -438,7 +430,10 @@ fn path_segments(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn http_target(listener: &ResourceListener, interface: Option<InterfaceMetadata>) -> ResourceTarget {
+fn http_target(
+    listener: &ResourceListener,
+    interface: Option<InterfaceMetadata>,
+) -> ResourceTarget {
     ResourceTarget {
         // Pinned by `serve` to the derived internal route URI.
         uri: String::new(),
@@ -455,10 +450,7 @@ fn http_target(listener: &ResourceListener, interface: Option<InterfaceMetadata>
 mod tests {
     #[test]
     fn bind_paths_split_into_route_segments() {
-        assert_eq!(
-            super::path_segments("api"),
-            vec!["api".to_string()]
-        );
+        assert_eq!(super::path_segments("api"), vec!["api".to_string()]);
         assert_eq!(super::path_segments("http/prod"), vec!["http", "prod"]);
         assert!(super::path_segments("").is_empty());
         assert!(super::path_segments("/").is_empty());

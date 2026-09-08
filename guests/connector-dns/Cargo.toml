@@ -15,6 +15,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow = { workspace = true, features = ["std"] }
 parking_lot.workspace = true
 selium-guest.workspace = true
 selium-proto-dns.workspace = true

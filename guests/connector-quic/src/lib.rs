@@ -33,11 +33,14 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
+use anyhow::Context as _;
 use quinn::ServerConfig;
 use rustls_pemfile as pemfile;
 use selium_guest::{
     Context, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
 };
+use thiserror::Error;
+
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
 // wasm32-unknown-unknown — the backend actually used is getrandom's `custom`
@@ -78,31 +81,24 @@ const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TlsError {
+    #[error("TLS storage unavailable")]
     StorageUnavailable,
+    #[error("TLS certificate not found")]
     MissingCertificate,
+    #[error("TLS private key not found")]
     MissingKey,
+    #[error("invalid TLS certificate")]
     InvalidCertificate,
+    #[error("invalid TLS private key")]
     InvalidKey,
+    #[error("no client trust anchors configured")]
     MissingClientAnchors,
+    #[error("invalid client trust anchor")]
     InvalidClientAnchor,
+    #[error("TLS configuration error")]
     ConfigError,
-}
-
-impl std::fmt::Display for TlsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TlsError::StorageUnavailable => write!(f, "TLS storage unavailable"),
-            TlsError::MissingCertificate => write!(f, "TLS certificate not found"),
-            TlsError::MissingKey => write!(f, "TLS private key not found"),
-            TlsError::InvalidCertificate => write!(f, "invalid TLS certificate"),
-            TlsError::InvalidKey => write!(f, "invalid TLS private key"),
-            TlsError::MissingClientAnchors => write!(f, "no client trust anchors configured"),
-            TlsError::InvalidClientAnchor => write!(f, "invalid client trust anchor"),
-            TlsError::ConfigError => write!(f, "TLS configuration error"),
-        }
-    }
 }
 
 /// Builds a quinn server endpoint from an abstract UDP socket and runtime.
@@ -280,77 +276,53 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 /// and the quinn endpoint accepts connections. Each accepted connection is
 /// routed by SNI and served by its own relay task.
 #[entrypoint]
-async fn connector_quic(mut ctx: Context) {
+async fn connector_quic(mut ctx: Context) -> anyhow::Result<()> {
     #[cfg(target_arch = "wasm32")]
     register_wasm_time_source();
 
     drop(selium_guest::log::init());
     info!("quic-connector: started");
 
-    let (server_config, anchors) = match load_server_config() {
-        Ok((config, anchors)) => {
-            if anchors.is_some() {
-                info!("quic-connector: TLS configured (mTLS client authentication)");
-            } else {
-                info!("quic-connector: TLS configured (client authentication disabled)");
-            }
-            (config, anchors)
-        }
-        Err(e) => {
-            error!("quic-connector: TLS setup failed: {e}");
-            error!("quic-connector: refusing to serve QUIC without TLS material");
-            return;
-        }
-    };
+    let (server_config, anchors) = load_server_config().with_context(
+        || "quic-connector: TLS setup failed; refusing to serve QUIC without TLS material",
+    )?;
+    if anchors.is_some() {
+        info!("quic-connector: TLS configured (mTLS client authentication)");
+    } else {
+        info!("quic-connector: TLS configured (client authentication disabled)");
+    }
 
-    let local_addr: SocketAddr = match QUIC_LISTEN_ADDR.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!("quic-connector: invalid listen address: {e}");
-            return;
-        }
-    };
+    let local_addr: SocketAddr = QUIC_LISTEN_ADDR
+        .parse()
+        .with_context(|| "quic-connector: invalid listen address")?;
 
-    let socket = match UdpSocket::bind(QUIC_LISTEN_ADDR).await {
-        Ok(socket) => socket,
-        Err(e) => {
-            error!("quic-connector: UDP bind failed: {e}");
-            return;
-        }
-    };
+    let socket = UdpSocket::bind(QUIC_LISTEN_ADDR)
+        .await
+        .with_context(|| "quic-connector: UDP bind failed")?;
 
     let quic_socket = QuicUdpSocket::new(socket, local_addr);
-    let endpoint = match build_endpoint(
+    let endpoint = build_endpoint(
         Arc::new(quic_socket),
         Arc::new(ConnectorRuntime),
         Some(server_config),
-    ) {
-        Ok(endpoint) => endpoint,
-        Err(e) => {
-            error!("quic-connector: endpoint creation failed: {e}");
-            return;
-        }
-    };
+    )
+    .with_context(|| "quic-connector: endpoint creation failed")?;
 
     info!("quic-connector: listening on {QUIC_LISTEN_ADDR}");
     mark_ready();
 
     // Fetch the advisory domain table once, so SNI resolution can project
     // wire names onto the tenant tree locally before the discovery lookup.
-    let domains = match ctx.load_domains().await {
-        Ok(domains) => domains,
-        Err(e) => {
-            error!("quic-connector: failed to load domain table: {e}");
-            return;
-        }
-    };
+    let domains = ctx
+        .load_domains()
+        .await
+        .with_context(|| "quic-connector: failed to load domain table")?;
     let resolver: ResolverHandle =
         Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx, domains)));
 
     loop {
-        let incoming = match endpoint.accept().await {
-            Some(incoming) => incoming,
-            None => return,
+        let Some(incoming) = endpoint.accept().await else {
+            break;
         };
 
         let connection = match incoming.await {
@@ -368,6 +340,8 @@ async fn connector_quic(mut ctx: Context) {
             handle_connection(connection, resolver, anchors).await;
         });
     }
+
+    Ok(())
 }
 
 /// Loads per-tenant client trust anchors from the TLS blob store.

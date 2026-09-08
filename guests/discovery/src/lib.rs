@@ -12,6 +12,7 @@ use std::{
     cell::RefCell, collections::BTreeMap, collections::BTreeSet, collections::HashMap, rc::Rc,
 };
 
+use anyhow::Context as _;
 use selium_abi::{
     Capability, DiscoveryRequest, DiscoveryResponse, ProcessId, ResourceTarget, decode_rkyv, uri,
 };
@@ -383,8 +384,7 @@ impl DiscoveryStore {
             // point at an owned typed target that currently exists; the alias
             // backref keeps the cascade, so revoking the typed target revokes
             // the route too.
-            let canonical =
-                uri::resource_uri(tenant, target.class.clone(), target.resource_id);
+            let canonical = uri::resource_uri(tenant, target.class.clone(), target.resource_id);
             if !self.registrations.contains_key(&canonical) {
                 // The claimed target is not registered (e.g. it was already
                 // revoked); a dangling route would resolve to nothing.
@@ -530,25 +530,15 @@ fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
 }
 
 #[entrypoint]
-async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) {
+async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     selium_guest::info!(guest = "selium-discovery", "system guest booting");
 
-    let feed_subscriber = match attach_feed_subscriber(feed_region_id) {
-        Ok(s) => s,
-        Err(error) => {
-            selium_guest::error!("failed to attach discovery feed subscriber: {error}");
-            return;
-        }
-    };
+    let feed_subscriber = attach_feed_subscriber(feed_region_id)
+        .with_context(|| "failed to attach discovery feed subscriber")?;
 
-    let listener = match selium_guest::ResourceListener::attach(listener_shared_id) {
-        Ok(l) => l,
-        Err(error) => {
-            selium_guest::error!("failed to attach discovery listener: {error}");
-            return;
-        }
-    };
+    let listener = selium_guest::ResourceListener::attach(listener_shared_id)
+        .with_context(|| "failed to attach discovery listener")?;
 
     selium_guest::info!(
         feed_region_id,

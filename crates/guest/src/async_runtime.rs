@@ -162,21 +162,39 @@ where
     }
 }
 
-/// Runs an entrypoint future that produces a value and aborts the process
-/// if polling panics. Returns the future's output after the reactor parks.
-pub fn run_entrypoint_with_result<F, T>(future: F) -> T
+/// Runs an entrypoint future that produces a `Result` and aborts the
+/// process if polling panics.
+///
+/// Returns the future's output once the reactor stalls: the value the task
+/// produced if it completed, or `Ok(())` when it parked without completing.
+/// A parked entrypoint is the normal state for a long-running service
+/// (e.g. a guest accepting connections forever) or an entrypoint waiting
+/// on host-delivered events: the export must return an exit code
+/// immediately, so `Ok(())` (no error observed) is reported and the task
+/// stays on the reactor, driven by later guest polls.
+///
+/// Errors are logged inside the task when it completes — before or after
+/// the reactor first stalls — because a late `Err` can no longer reach the
+/// already-returned exit code; the log is the only surfacing channel.
+pub fn run_entrypoint_with_result<F, E>(future: F) -> Result<(), E>
 where
-    F: Future<Output = T> + 'static,
+    F: Future<Output = Result<(), E>> + 'static,
+    E: core::fmt::Display,
 {
-    let join = spawn(future);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        poll_safely();
-    }));
+    let join = spawn(async move {
+        match future.await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::error!("{error}");
+                Err(error)
+            }
+        }
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_safely));
     if result.is_err() {
         std::process::abort();
     }
-    join.take_result()
-        .expect("entrypoint task must have completed")
+    join.take_result().unwrap_or(Ok(()))
 }
 
 /// Spawns a future onto the cooperative guest task runner.
@@ -494,5 +512,51 @@ mod tests {
 
         assert_eq!(*polls.borrow(), 2);
         assert_eq!(join.state.borrow().result, Some(()));
+    }
+
+    /// Display-only error type for the `run_entrypoint_with_result` tests.
+    #[derive(Debug)]
+    struct EntrypointError(&'static str);
+
+    impl core::fmt::Display for EntrypointError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    #[test]
+    fn result_entrypoint_that_parks_returns_ok_before_completion() {
+        let ran = Rc::new(RefCell::new(false));
+        let flag = Rc::clone(&ran);
+        // One cooperative yield parks the task before it completes: the
+        // entrypoint export must observe `Ok(())` (no error) while the task
+        // stays on the reactor — a long-running service entrypoint parks
+        // here indefinitely.
+        let result = run_entrypoint_with_result(async move {
+            yield_now().await;
+            *flag.borrow_mut() = true;
+            Ok::<(), EntrypointError>(())
+        });
+
+        assert!(matches!(result, Ok(())));
+        assert!(
+            !*ran.borrow(),
+            "task must not have completed before the park"
+        );
+
+        // A later poll (the host-driven `__selium_guest_poll` path) drives
+        // the parked entrypoint to completion.
+        poll_reactor();
+        assert!(
+            *ran.borrow(),
+            "later poll must complete the parked entrypoint"
+        );
+    }
+
+    #[test]
+    fn result_entrypoint_that_fails_returns_err() {
+        let result: Result<(), EntrypointError> =
+            run_entrypoint_with_result(async { Err(EntrypointError("boom")) });
+        assert!(matches!(result, Err(error) if error.0 == "boom"));
     }
 }

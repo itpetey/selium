@@ -11,6 +11,7 @@
 //!    outbound ring, then parks on a second read so the reactor stalls
 //!    right after having written outbound frames.
 
+use anyhow::{Context as _, bail};
 use selium_guest::{
     entrypoint, error, info,
     net::tcp::{TcpListener, TcpStream},
@@ -18,30 +19,19 @@ use selium_guest::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[entrypoint]
-async fn net_demo() {
+async fn net_demo() -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("net-demo started");
 
-    let listener = match TcpListener::bind("127.0.0.1:0") {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!("net-demo: bind failed: {e}");
-            return;
-        }
-    };
+    let listener = TcpListener::bind("127.0.0.1:0").with_context(|| "net-demo: bind failed")?;
     // Readiness anchor for the integration test.
     info!("net-demo: bound");
 
-    let mut stream: TcpStream = match listener.accept().await {
-        Ok(stream) => {
-            info!("net-demo: accepted");
-            stream
-        }
-        Err(e) => {
-            error!("net-demo: accept failed: {e}");
-            return;
-        }
-    };
+    let mut stream: TcpStream = listener
+        .accept()
+        .await
+        .with_context(|| "net-demo: accept failed")?;
+    info!("net-demo: accepted");
 
     // Park on the inbound ring until the test writes request bytes. The
     // wake must come from the host's WaitRegister/mailbox bridge, not from
@@ -49,27 +39,21 @@ async fn net_demo() {
     let mut buf = [0_u8; 64];
     match stream.read(&mut buf).await {
         Ok(0) => {
-            error!("net-demo: unexpected EOF before request");
-            return;
+            bail!("net-demo: unexpected EOF before request");
         }
         Ok(n) => {
             info!("net-demo: read done ({n} bytes)");
-            let chunk = match buf.get(..n) {
-                Some(chunk) => chunk,
-                None => {
-                    error!("net-demo: read returned out-of-bounds length {n}");
-                    return;
-                }
+            let Some(chunk) = buf.get(..n) else {
+                bail!("net-demo: read returned out-of-bounds length {n}");
             };
-            if let Err(e) = stream.write_all(chunk).await {
-                error!("net-demo: echo write failed: {e}");
-                return;
-            }
+            stream
+                .write_all(chunk)
+                .await
+                .with_context(|| "net-demo: echo write failed")?;
             drop(stream.flush().await);
         }
         Err(e) => {
-            error!("net-demo: read failed: {e}");
-            return;
+            return Err(anyhow::anyhow!("net-demo: read failed: {e}"));
         }
     }
 
@@ -82,4 +66,6 @@ async fn net_demo() {
         Ok(n) => info!("net-demo: second read done ({n} bytes)"),
         Err(e) => error!("net-demo: second read failed: {e}"),
     }
+
+    Ok(())
 }

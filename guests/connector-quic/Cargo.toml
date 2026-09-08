@@ -15,6 +15,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anyhow = { workspace = true, features = ["std"] }
 getrandom.workspace = true
 parking_lot.workspace = true
 quinn = { workspace = true, features = ["rustls-ring"] }
@@ -25,6 +26,7 @@ selium-guest.workspace = true
 selium-memory.workspace = true
 selium-shm.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
 tracing.workspace = true
 web-time.workspace = true

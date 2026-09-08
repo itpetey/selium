@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use selium_guest::{
     Context, GuestError, entrypoint, error, info, mark_ready,
     net::quic::{QuicServe, QuicStream},
@@ -75,32 +76,24 @@ async fn echo_stream(stream: QuicStream) {
 /// Serves QUIC byte streams relayed by the connector: register the route with
 /// discovery, then echo each accepted stream.
 #[entrypoint]
-async fn quic_demo(ctx: Context) {
+async fn quic_demo(ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("quic-demo: booting");
 
     let mut ctx = ctx;
-    let mut serve = match bind_with_retry(&mut ctx, SERVE_NAME).await {
-        Ok(serve) => serve,
-        Err(e) => {
-            error!("quic-demo: bind failed: {e}");
-            return;
-        }
-    };
+    let mut serve = bind_with_retry(&mut ctx, SERVE_NAME)
+        .await
+        .with_context(|| "quic-demo: bind failed")?;
     info!("quic-demo: bound {SERVE_NAME}");
     mark_ready();
 
     loop {
-        match serve.accept().await {
-            Ok(stream) => {
-                info!("quic-demo: accepted stream");
-                spawn(echo_stream(stream));
-            }
-            Err(e) => {
-                error!("quic-demo: accept failed: {e}");
-                return;
-            }
-        }
+        let stream = serve
+            .accept()
+            .await
+            .with_context(|| "quic-demo: accept failed")?;
+        info!("quic-demo: accepted stream");
+        spawn(echo_stream(stream));
     }
 }
 

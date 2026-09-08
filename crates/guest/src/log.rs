@@ -10,6 +10,7 @@ use selium_abi::{HostcallRequest, ResourceKind};
 use selium_encoding::FlatMsg;
 use selium_memory::FrameHeader;
 use selium_shm::channels::{Channel, ChannelBackpressure};
+use thiserror::Error;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{
     Layer, layer::Context, prelude::__tracing_subscriber_SubscriberExt as SubscriberExt,
@@ -42,9 +43,10 @@ struct EventVisitor {
 }
 
 /// Error type for log initialisation.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum InitError {
     /// Log channel creation failed.
+    #[error("channel creation failed: {0}")]
     Channel(String),
 }
 
@@ -129,16 +131,6 @@ impl Visit for EventVisitor {
         });
     }
 }
-
-impl std::fmt::Display for InitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Channel(msg) => write!(f, "channel creation failed: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for InitError {}
 
 thread_local! {
     /// Re-entrancy guard: suppresses log events triggered while forwarding.

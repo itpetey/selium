@@ -18,7 +18,7 @@ Provide procedural macros for Selium guest entrypoints and generated guest inter
 - **AND** the generated wrapper SHALL log the error via `selium_guest::error!` and return `1` when the user function returns `Err(e)`
 
 ### Requirement: Result Entrypoint Error Type Validation
-`selium-guest-macros` SHALL produce a clear compile error when an entrypoint returns `Result<(), E>` where `E` does not implement `std::error::Error`.
+`selium-guest-macros` SHALL produce a clear compile error when an entrypoint returns `Result<(), E>` where `E` does not implement `std::error::Error`. Error types derived with `thiserror::Error` satisfy this bound (the derive implements `std::error::Error`), and are the recommended form for guest custom error types.
 
 #### Scenario: Non-Error error type rejected
 - **WHEN** a guest defines `#[entrypoint] async fn main() -> Result<(), NotAnError>`
@@ -29,6 +29,10 @@ Provide procedural macros for Selium guest entrypoints and generated guest inter
 - **WHEN** a guest defines `#[entrypoint] async fn main() -> Result<(), anyhow::Error>`
 - **AND** `anyhow::Error` implements `std::error::Error`
 - **THEN** the macro SHALL accept the return type
+
+#### Scenario: Thiserror-derived error type accepted
+- **WHEN** a guest defines `#[derive(Debug, thiserror::Error)] #[error("{0}")] struct ConfigError(String);` and `#[entrypoint] async fn main() -> Result<(), ConfigError>`
+- **THEN** the macro SHALL accept the return type, because the derive implements `std::error::Error`
 
 ### Requirement: Backward Compatible Entrypoint Return Types
 `selium-guest-macros` SHALL continue to accept and generate code for entrypoints returning `()` without requiring any changes to existing guest code.
@@ -62,12 +66,32 @@ integer parameters (`u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`,
 `(u64, u64)` (address, length). Each integer parameter consumes one
 runtime argument slot; each pointer parameter consumes two slots (address
 then length), in declaration order. Any other parameter type SHALL
-produce a compile error.
+produce a compile error. For `Context`-leading entrypoints the wrapper
+SHALL construct the context from the first (discovery-handle) slot via
+`Context::from_raw`. When the entrypoint returns `Result<(), E>`, a failed
+construction SHALL propagate as the entrypoint's error value (the
+generated wrapper logs the error and returns 1); when the entrypoint
+returns `()`, a failed construction SHALL abort the guest.
 
 #### Scenario: Macro injects Context into entrypoint
 
 - **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context)`
 - **THEN** the macro SHALL generate a wrapper that calls `Context::from_raw(...)` and passes the result to `main`
+
+#### Scenario: Context bootstrap failure propagates for Result entrypoints
+
+- **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context) -> Result<(), anyhow::Error>`
+- **AND** `Context::from_raw` fails on the bootstrap handle
+- **THEN** the generated wrapper SHALL return the construction error via `?`
+- **AND** the entrypoint SHALL exit with code 1 after logging the error,
+  rather than panicking
+
+#### Scenario: Context bootstrap failure aborts unit entrypoints
+
+- **WHEN** a guest defines `#[entrypoint] async fn main(ctx: Context)`
+- **AND** `Context::from_raw` fails on the bootstrap handle
+- **THEN** the generated wrapper SHALL abort the guest (the `()` return
+  type provides no error channel)
 
 #### Scenario: Macro forwards raw u64 argument into entrypoint
 

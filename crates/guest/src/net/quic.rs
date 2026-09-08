@@ -248,10 +248,7 @@ mod tests {
 
     #[test]
     fn bind_paths_split_into_route_segments() {
-        assert_eq!(
-            path_segments("my-app"),
-            vec!["my-app".to_string()]
-        );
+        assert_eq!(path_segments("my-app"), vec!["my-app".to_string()]);
         assert_eq!(path_segments("http/prod"), vec!["http", "prod"]);
         // Empty and slash-only paths carry no segments; `serve` rejects them
         // (a named service must project to a wire name).

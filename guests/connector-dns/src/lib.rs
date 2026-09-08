@@ -19,11 +19,12 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use anyhow::{Context as _, bail};
 use correlate::{InFlight, response_from_parsed};
 use parking_lot::Mutex;
 use selium_guest::{
     Context, Datagram, Instant, ResourceClass, ResourceListener, ResourceTarget, Serve, Timer,
-    UdpSocket, debug, entrypoint, error, info, mark_ready, spawn, warn,
+    UdpSocket, debug, entrypoint, info, mark_ready, spawn, warn,
 };
 use selium_proto_dns::{DnsOutcome, DnsQuery, DnsResponse, wire};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
@@ -76,30 +77,20 @@ async fn accept_loop(
 /// the `dns/resolve` route in the root namespace — permitted only because the
 /// connector holds the system-registration capability.
 #[entrypoint]
-async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) {
+async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("dns-connector: starting");
 
     let Some(resolver_addr) = read_resolver(resolver) else {
-        error!("dns-connector: invalid resolver address argument");
-        return;
+        bail!("dns-connector: invalid resolver address argument");
     };
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(socket) => socket,
-        Err(e) => {
-            error!("dns-connector: udp bind failed: {e}");
-            return;
-        }
-    };
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .with_context(|| "dns-connector: udp bind failed")?;
 
-    let listener = match ResourceListener::create() {
-        Ok(listener) => listener,
-        Err(e) => {
-            error!("dns-connector: create listener failed: {e}");
-            return;
-        }
-    };
+    let listener =
+        ResourceListener::create().with_context(|| "dns-connector: create listener failed")?;
 
     // Self-register the `dns/resolve` route under the root namespace. The
     // connector runs as the root/platform tenant, so this requires the
@@ -113,17 +104,13 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) {
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
     };
-    if let Err(e) = ctx
-        .serve(Serve {
-            path: vec!["dns".to_string(), "resolve".to_string()],
-            target,
-            default: false,
-        })
-        .await
-    {
-        error!("dns-connector: serve failed: {e}");
-        return;
-    }
+    ctx.serve(Serve {
+        path: vec!["dns".to_string(), "resolve".to_string()],
+        target,
+        default: false,
+    })
+    .await
+    .with_context(|| "dns-connector: serve failed")?;
 
     mark_ready();
 
@@ -141,6 +128,8 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) {
         socket,
         resolver_addr,
     ));
+
+    Ok(())
 }
 
 /// Serves queries on one connection: forwards to the upstream resolver and

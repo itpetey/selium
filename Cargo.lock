@@ -754,6 +754,7 @@ dependencies = [
 name = "selium-bridge"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-abi",
  "selium-guest",
  "selium-memory",
@@ -765,6 +766,7 @@ dependencies = [
 name = "selium-bridge-channel"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "rkyv",
  "selium-abi",
  "selium-guest",
@@ -778,6 +780,7 @@ dependencies = [
 name = "selium-connector-dns"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "parking_lot",
  "selium-guest",
  "selium-proto-dns",
@@ -789,6 +792,7 @@ dependencies = [
 name = "selium-connector-http"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "futures",
  "getrandom",
  "ring",
@@ -799,6 +803,7 @@ dependencies = [
  "selium-guest",
  "selium-proto-http",
  "selium-shm",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -809,6 +814,7 @@ dependencies = [
 name = "selium-connector-quic"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "getrandom",
  "parking_lot",
  "quinn",
@@ -820,6 +826,7 @@ dependencies = [
  "selium-memory",
  "selium-shm",
  "sha2",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -829,6 +836,7 @@ dependencies = [
 name = "selium-discovery"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-abi",
  "selium-guest",
  "selium-shm",
@@ -848,6 +856,7 @@ dependencies = [
 name = "selium-dns-demo"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-guest",
  "selium-proto-dns",
  "selium-shm",
@@ -893,6 +902,7 @@ dependencies = [
  "selium-guest",
  "selium-runtime",
  "syn 3.0.5",
+ "thiserror",
  "tokio",
  "tracing",
  "trybuild",
@@ -926,6 +936,7 @@ dependencies = [
 name = "selium-net-demo"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-guest",
  "tokio",
 ]
@@ -937,6 +948,7 @@ dependencies = [
  "flatbuffers",
  "selium-encoding",
  "selium-guest-macros",
+ "thiserror",
 ]
 
 [[package]]
@@ -952,6 +964,7 @@ dependencies = [
 name = "selium-quic-demo"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-guest",
  "tokio",
 ]
@@ -996,6 +1009,7 @@ dependencies = [
 name = "selium-spine-demo"
 version = "1.0.0-alpha.6"
 dependencies = [
+ "anyhow",
  "selium-guest",
  "selium-shm",
  "selium-wire",

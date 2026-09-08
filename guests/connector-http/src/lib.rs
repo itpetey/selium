@@ -15,11 +15,13 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use rustls_pemfile as pemfile;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use selium_guest::{
     Context, TcpListener, TcpStream, debug, entrypoint, error, info, mark_ready, spawn, warn,
 };
+use thiserror::Error;
 use tokio_rustls::TlsAcceptor;
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
@@ -46,27 +48,20 @@ const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum TlsError {
+    #[error("TLS storage unavailable")]
     StorageUnavailable,
+    #[error("TLS certificate not found")]
     MissingCertificate,
+    #[error("TLS private key not found")]
     MissingKey,
+    #[error("invalid TLS certificate")]
     InvalidCertificate,
+    #[error("invalid TLS private key")]
     InvalidKey,
+    #[error("TLS configuration error")]
     ConfigError,
-}
-
-impl std::fmt::Display for TlsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TlsError::StorageUnavailable => write!(f, "TLS storage unavailable"),
-            TlsError::MissingCertificate => write!(f, "TLS certificate not found"),
-            TlsError::MissingKey => write!(f, "TLS private key not found"),
-            TlsError::InvalidCertificate => write!(f, "invalid TLS certificate"),
-            TlsError::InvalidKey => write!(f, "invalid TLS private key"),
-            TlsError::ConfigError => write!(f, "TLS configuration error"),
-        }
-    }
 }
 
 /// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
@@ -118,7 +113,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 /// the windowed forwarding pipeline. Connections are served concurrently;
 /// one slow (or parked-on-backpressure) connection never blocks the others.
 #[entrypoint]
-async fn connector_http(mut ctx: Context) {
+async fn connector_http(mut ctx: Context) -> anyhow::Result<()> {
     // On wasm32 the host provides randomness and time through hostcalls;
     // register both backends before any TLS operation touches `ring`/
     // `getrandom` or `rustls-pki-types`/`web-time`.
@@ -143,40 +138,23 @@ async fn connector_http(mut ctx: Context) {
 
     // Load TLS configuration. This fails loudly on missing/invalid material
     // per spec: "loud failure on missing/invalid cert material".
-    let tls_config = match load_tls_config() {
-        Ok(cfg) => {
-            info!("http-connector: TLS configured");
-            cfg
-        }
-        Err(e) => {
-            error!("http-connector: TLS setup failed: {e}");
-            error!("http-connector: refusing to serve plaintext on TLS listener");
-            return;
-        }
-    };
+    let tls_config = load_tls_config().with_context(
+        || "http-connector: TLS setup failed; refusing to serve plaintext on TLS listener",
+    )?;
+    info!("http-connector: TLS configured");
 
-    let listener = match TcpListener::bind("0.0.0.0:443") {
-        Ok(l) => {
-            info!("http-connector: bound to 0.0.0.0:443");
-            l
-        }
-        Err(e) => {
-            error!("http-connector: bind failed: {e}");
-            return;
-        }
-    };
+    let listener =
+        TcpListener::bind("0.0.0.0:443").with_context(|| "http-connector: bind failed")?;
+    info!("http-connector: bound to 0.0.0.0:443");
 
     mark_ready();
 
     // Fetch the advisory domain table once, so Host resolution can project
     // wire names onto the tenant tree locally before the discovery lookup.
-    let domains = match ctx.load_domains().await {
-        Ok(domains) => domains,
-        Err(e) => {
-            error!("http-connector: failed to load domain table: {e}");
-            return;
-        }
-    };
+    let domains = ctx
+        .load_domains()
+        .await
+        .with_context(|| "http-connector: failed to load domain table")?;
     let acceptor = TlsAcceptor::from(tls_config);
     let resolver: ResolverHandle =
         Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx, domains)));

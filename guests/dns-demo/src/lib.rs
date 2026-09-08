@@ -8,6 +8,7 @@
 
 use std::net::SocketAddr;
 
+use anyhow::{Context as _, bail};
 use selium_guest::{Context, TcpStream, entrypoint, error, info, mark_ready};
 
 /// The name the demo resolves.
@@ -22,18 +23,14 @@ fn read_connect_addr(connect: (u64, u64)) -> Option<SocketAddr> {
 }
 
 #[entrypoint]
-async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) {
+async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("dns-demo: booting");
 
     // Resolve the name through the DNS connector route in discovery.
-    let addresses = match selium_guest::net::resolve(&mut ctx, DEMO_NAME).await {
-        Ok(addresses) => addresses,
-        Err(e) => {
-            error!("dns-demo: resolve failed: {e}");
-            return;
-        }
-    };
+    let addresses = selium_guest::net::resolve(&mut ctx, DEMO_NAME)
+        .await
+        .with_context(|| "dns-demo: resolve failed")?;
 
     for address in &addresses {
         info!("resolved {} -> {}", DEMO_NAME, address);
@@ -41,12 +38,8 @@ async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) {
 
     // Then connect to the resolved literal (the name's A record points at
     // loopback; the TCP test server listens on that address).
-    let connect_addr = match read_connect_addr(connect) {
-        Some(addr) => addr,
-        None => {
-            error!("dns-demo: invalid connect address argument");
-            return;
-        }
+    let Some(connect_addr) = read_connect_addr(connect) else {
+        bail!("dns-demo: invalid connect address argument");
     };
 
     match TcpStream::connect(&connect_addr.to_string()).await {
@@ -55,4 +48,5 @@ async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) {
     }
 
     mark_ready();
+    Ok(())
 }

@@ -132,10 +132,11 @@ impl SystemGuestDescriptor {
     /// Sets the discovery handle (host queue shared_id) for this guest.
     ///
     /// The discovery handle is prepended as the first entrypoint argument, so
-    /// guests whose leading parameter is a `Context` (or a `u64` discovery
-    /// handle) receive it ahead of any other declared arguments. Application
-    /// guests use this to connect to the discovery service via
-    /// `Context::from_raw(discovery_handle)`.
+    /// guests whose leading parameter is a `Context` receive it ahead of any
+    /// other declared arguments. The `#[entrypoint]` macro constructs the
+    /// context for `Context`-leading entrypoints via `Context::from_raw`;
+    /// entrypoints declaring an untyped leading `u64` receive the raw handle
+    /// directly.
     ///
     /// # Example
     ///

@@ -20,10 +20,11 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
+use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{decode_rkyv, encode_rkyv};
 use selium_guest::{
-    Context, GuestError, Result, entrypoint, error, info, mark_ready,
+    Context, GuestError, Result, entrypoint, info, mark_ready,
     net::{
         ByteStream,
         bytes::{ByteStreamReader, ByteStreamWriter},
@@ -408,17 +409,12 @@ where
 /// macro, used for channel-URI resolution) and the relayed byte-channel
 /// region `shared_id` (delivered by `bridge-server`).
 #[entrypoint]
-async fn bridge_channel(mut ctx: Context, shared_id: u64) {
+async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("bridge-channel: started");
 
-    let stream = match ByteStream::attach_blocking(shared_id) {
-        Ok(stream) => stream,
-        Err(e) => {
-            error!("bridge-channel: attach stream region failed: {e}");
-            return;
-        }
-    };
+    let stream = ByteStream::attach_blocking(shared_id)
+        .with_context(|| "bridge-channel: attach stream region failed")?;
 
     mark_ready();
 
@@ -430,6 +426,8 @@ async fn bridge_channel(mut ctx: Context, shared_id: u64) {
         Ok(target.resource_id)
     })
     .await;
+
+    Ok(())
 }
 
 /// Reads the next complete frame, yielding between attempts.

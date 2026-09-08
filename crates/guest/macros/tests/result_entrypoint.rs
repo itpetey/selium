@@ -1,15 +1,9 @@
 use selium_guest::{EntrypointMetadata, entrypoint};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{0}")]
 struct TestError(String);
-
-impl std::fmt::Display for TestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for TestError {}
 
 #[test]
 fn entrypoint_with_result_generates_metadata_and_returns_i32() {

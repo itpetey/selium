@@ -1,8 +1,9 @@
 //! Transport-agnostic typed RPC pattern.
 
-use std::{fmt, marker::PhantomData};
+use std::marker::PhantomData;
 
 use selium_encoding::FlatMsg;
+use thiserror::Error;
 
 use crate::{
     MessageTransport,
@@ -38,23 +39,30 @@ pub struct IncomingConnection {
 }
 
 /// Error type for RPC operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RpcError {
     /// The peer has closed the connection.
+    #[error("RPC connection closed")]
     ConnectionClosed,
     /// The shared region is invalid or corrupted.
+    #[error("invalid shared region")]
     InvalidRegion,
     /// The region layout does not match the expected structure.
+    #[error("region layout mismatch")]
     LayoutMismatch,
     /// The ring buffer is full.
+    #[error("RPC buffer full")]
     BufferFull,
     /// The ring buffer is empty.
+    #[error("RPC buffer empty")]
     BufferEmpty,
     /// Encoding or decoding failed.
+    #[error("serialization error: {0}")]
     Serialization(String),
     /// The remote peer terminated the stream with an application error.
     ///
     /// Carries the error message sent by the peer (stream-error frame).
+    #[error("remote stream error: {0}")]
     Remote(String),
 }
 
@@ -81,22 +89,6 @@ pub struct RpcRequest<'a, Req, Rep, M> {
     correlation: u32,
     _phantom: PhantomData<(Req, Rep)>,
 }
-
-impl fmt::Display for RpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ConnectionClosed => write!(f, "RPC connection closed"),
-            Self::InvalidRegion => write!(f, "invalid shared region"),
-            Self::LayoutMismatch => write!(f, "region layout mismatch"),
-            Self::BufferFull => write!(f, "RPC buffer full"),
-            Self::BufferEmpty => write!(f, "RPC buffer empty"),
-            Self::Serialization(msg) => write!(f, "serialization error: {msg}"),
-            Self::Remote(msg) => write!(f, "remote stream error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}
 
 impl From<Error> for RpcError {
     fn from(error: Error) -> Self {

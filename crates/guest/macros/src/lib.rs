@@ -227,11 +227,23 @@ fn generate_entrypoint(
             EntrypointParam::Context => {
                 let arg = &arg_idents[slot];
                 slot += 1;
-                prelude.push(quote! {
-                    let ctx = ::selium_guest::Context::from_raw(#arg as u64)
-                        .await
-                        .expect("failed to construct bootstrap context");
-                });
+                // A `Result`-returning entrypoint can fail gracefully on a
+                // bad bootstrap handle: propagate the `from_raw` error through
+                // `?` (the enclosing async block yields `Result<(), E>` and
+                // `GuestError: std::error::Error` converts into any released
+                // error type, e.g. `anyhow::Error`). Infallible `()` entrypoints
+                // have no error channel, so a failed handle aborts the guest.
+                let from_raw = match return_kind {
+                    EntrypointReturn::ResultUnit => quote! {
+                        let ctx = ::selium_guest::Context::from_raw(#arg as u64).await?;
+                    },
+                    EntrypointReturn::Unit => quote! {
+                        let ctx = ::selium_guest::Context::from_raw(#arg as u64)
+                            .await
+                            .expect("failed to construct bootstrap context");
+                    },
+                };
+                prelude.push(from_raw);
                 call_args.push(quote! { ctx });
             }
             EntrypointParam::Integer(ty) => {
@@ -365,17 +377,18 @@ fn make_wrapper_body(
         }
         EntrypointReturn::ResultUnit => {
             quote! {
+                // `run_entrypoint_with_result` logs the error itself,
+                // whenever the task completes — before or after the reactor
+                // first stalls — and returns `Ok(())` for an entrypoint that
+                // parked without completing (a long-running service): the
+                // export reports exit code 0 and the task keeps running on
+                // the reactor, driven by later polls.
                 let result = ::selium_guest::run_entrypoint_with_result(async move {
                     #inner_block
                 });
-                fn __selium_guest_assert_error<E: ::core::fmt::Display>(_: &::core::result::Result<(), E>) {}
-                __selium_guest_assert_error(&result);
                 match result {
                     ::core::result::Result::Ok(()) => 0,
-                    ::core::result::Result::Err(e) => {
-                        ::selium_guest::error!("{e}");
-                        1
-                    }
+                    ::core::result::Result::Err(_) => 1,
                 }
             }
         }

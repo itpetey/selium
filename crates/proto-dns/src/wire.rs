@@ -14,7 +14,9 @@
     reason = "parser offsets are bounds-checked before slicing"
 )]
 
-use std::{fmt, net::Ipv4Addr, net::Ipv6Addr};
+use std::{net::Ipv4Addr, net::Ipv6Addr};
+
+use thiserror::Error;
 
 use crate::{DnsOutcome, DnsQuery, DnsRecordType};
 
@@ -36,15 +38,19 @@ const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
 
 /// Errors produced by the wire codec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum WireError {
     /// The message is shorter than its header, a record, or a length field.
+    #[error("DNS message is shorter than expected")]
     Short,
     /// A name label exceeds 63 bytes, or the encoded name exceeds 255.
+    #[error("DNS name label or name is too long")]
     NameTooLong,
     /// A name contains an empty label or unsupported label type.
+    #[error("malformed DNS name")]
     Malformed,
     /// Name decompression exceeded the pointer-hopping guard.
+    #[error("DNS name compression pointer loop")]
     CompressionLoop,
 }
 
@@ -58,19 +64,6 @@ pub struct ParsedResponse {
     /// A/AAAA addresses carried by the answer section.
     pub addresses: Vec<String>,
 }
-
-impl fmt::Display for WireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WireError::Short => write!(f, "DNS message is shorter than expected"),
-            WireError::NameTooLong => write!(f, "DNS name label or name is too long"),
-            WireError::Malformed => write!(f, "malformed DNS name"),
-            WireError::CompressionLoop => write!(f, "DNS name compression pointer loop"),
-        }
-    }
-}
-
-impl std::error::Error for WireError {}
 
 impl DnsRecordType {
     /// Maps a record type to its IANA RR TYPE code.
