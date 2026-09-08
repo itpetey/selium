@@ -137,12 +137,20 @@ jobs:
           components: rust-src
           targets: wasm32-unknown-unknown
 
+      # Cargo can only emit selium_net_demo.wasm for a crate named
+      # selium-net-demo, but the fastpath_wake test resolves the atomics
+      # module at selium_net_demo_atomics.wasm (see net_demo_wasm_path in
+      # crates/runtime/tests/fastpath_wake.rs — the plain and atomics
+      # flavours cannot share one output path). Copy it aside, mirroring
+      # build_atomics_guest in scripts/build-all.sh.
       - name: build atomics guest
-        run: >-
-          cargo build -Zbuild-std=std,panic_abort
-          --target wasm32-unknown-unknown
-          -p selium-spine-demo -p selium-discovery -p selium-net-demo
-          --features selium-guest/nightly-wasm-atomics
+        run: |
+          cargo build -Zbuild-std=std,panic_abort \
+            --target wasm32-unknown-unknown \
+            -p selium-spine-demo -p selium-discovery -p selium-net-demo \
+            --features selium-guest/nightly-wasm-atomics
+          cp target/wasm32-unknown-unknown/debug/selium_net_demo.wasm \
+             target/wasm32-unknown-unknown/debug/selium_net_demo_atomics.wasm
         working-directory: proto/arch3
 
       # Task 5.1 of the shared-page-fastpath change: deploy the real
