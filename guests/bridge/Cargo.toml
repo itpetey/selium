@@ -1,5 +1,5 @@
 [package]
-name = "selium-bridge-server"
+name = "selium-bridge"
 version.workspace = true
 edition.workspace = true
 description = "Per-tenant bridge server system guest (authenticates clients, spawns bridge-channels)"

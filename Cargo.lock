@@ -751,6 +751,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-bridge"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "selium-abi",
+ "selium-guest",
+ "selium-memory",
+ "selium-shm",
+ "tokio",
+]
+
+[[package]]
 name = "selium-bridge-channel"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -760,17 +771,6 @@ dependencies = [
  "selium-memory",
  "selium-shm",
  "selium-wire",
- "tokio",
-]
-
-[[package]]
-name = "selium-bridge-server"
-version = "1.0.0-alpha.6"
-dependencies = [
- "selium-abi",
- "selium-guest",
- "selium-memory",
- "selium-shm",
  "tokio",
 ]
 
