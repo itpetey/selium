@@ -154,8 +154,7 @@ impl SessionFactory for MockFactory {
             .lock()
             .await
             .get(&target.uri)
-            .cloned()
-            .or_else(|| None);
+            .cloned();
         let behaviour = match behaviour {
             Some(b) => b,
             None => self.state.fallback.lock().await.clone().ok_or_else(|| {
