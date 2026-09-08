@@ -164,8 +164,14 @@ jobs:
         env:
           RUSTFLAGS: ""
 
+      # RUSTFLAGS must be cleared here too: wasm-tools is compiled for the
+      # host target, and the job-level wasm flags (+atomics,
+      # --shared-memory) poison a native link just as they do for the test
+      # step above.
       - name: install wasm-tools
         run: cargo install wasm-tools --locked --no-default-features --features print
+        env:
+          RUSTFLAGS: ""
 
       # The guest module must declare memory 0 shared with a maximum, or the
       # wasmtiny validator rejects atomic instructions and the fast path can
