@@ -24,14 +24,15 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
     let runtime = Runtime::default();
 
     // Bootstrap the connector (registered Tier-1 handler for `sel-quic`) and
-    // the bridge-server (provisioned with its well-known route,
-    // `sel://acme/bridge`) together: the runtime provisions the
-    // bridge-server's listener host queue, injects its shared id as the
-    // leading entrypoint argument, and registers the URI with discovery
-    // (4.2: bind registers with discovery).
+    // the bridge-server. The runtime no longer provisions the bridge-server's
+    // listener; the server creates its own queue and self-registers its route
+    // via `serve` (the subtree test below drives the hostcall substrate
+    // directly rather than the wasm entrypoint, so the registration is
+    // exercised at the queue-minting level).
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
+            domain_table: Vec::new(),
             system_guests: vec![
                 SystemGuestDescriptor {
                     name: "bridge-connector".to_string(),
@@ -52,7 +53,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant: None,
-                    well_known_uri: None,
+                    serving_role: None,
                     handlers: vec!["sel-quic".to_string()],
                 },
                 SystemGuestDescriptor {
@@ -60,7 +61,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
                     module_id: "bridge-server-module".to_string(),
                     module_bytes: module_with_entrypoint_args("boot", 1),
                     entrypoint: "boot".to_string(),
-                    arguments: Vec::new(),
+                    arguments: vec![selium_runtime::SystemGuestArg::Integer(0)],
                     grants: vec![
                         CapabilityGrant::new(
                             Capability::ProcessLifecycle,
@@ -78,7 +79,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant: Some("acme".to_string()),
-                    well_known_uri: Some("sel://acme/bridge".to_string()),
+                    serving_role: None,
                     handlers: Vec::new(),
                 },
             ],
@@ -92,16 +93,7 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
             .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
     };
     let connector = find("bridge-connector").process_id;
-    let bridge_server_guest = find("bridge-server");
-    let bridge_server = bridge_server_guest.process_id;
-    let listener_shared_id = bridge_server_guest
-        .well_known_listener
-        .expect("well-known route provisions a listener queue");
-    let (route_uri, route_shared_id) = runtime
-        .well_known_uri(bridge_server)
-        .expect("route registered with the runtime");
-    assert_eq!(route_uri, "sel://acme/bridge");
-    assert_eq!(route_shared_id, listener_shared_id);
+    let bridge_server = find("bridge-server").process_id;
 
     // The bridge-server pins its listener to the registered `sel-quic`
     // handler: handoffs from any other process must be refused. The handler
@@ -126,8 +118,25 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
         )
         .expect("register bridge-channel module");
 
-    // 1. The connector resolves the bridge route via discovery and attaches
-    //    the provisioned listener queue (gaining its own local handle).
+    // 1. The bridge-server creates its own listener queue (self-registration
+    //    replaces the runtime's well-known-URI queue minting). The queue is
+    //    minted under the server's own tenant (`acme`) and Tier-1 registered.
+    let (_, create_op) = runtime.begin_hostcall(
+        bridge_server,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
+    let CompletionState::Ready(HostcallOutput::HostQueue(server_listener)) =
+        runtime.poll_hostcall(bridge_server, create_op)
+    else {
+        panic!("bridge-server should create its own listener queue");
+    };
+    let listener_shared_id = server_listener.shared_id;
+
+    // 2. The connector resolves the bridge route via discovery and attaches
+    //    the server's listener queue (gaining its own local handle). The
+    //    resolving client gains an authorisation basis for the attach.
     discovery_records_resolve(&runtime, connector, listener_shared_id);
     let (_, attach_op) = runtime.begin_hostcall(
         connector,
@@ -139,20 +148,6 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
         runtime.poll_hostcall(connector, attach_op)
     else {
         panic!("connector should attach to the bridge queue");
-    };
-
-    // The bridge-server attaches its own provisioned listener queue (the
-    // guest-side equivalent: `ResourceListener::attach(listener_arg)`).
-    let (_, server_attach_op) = runtime.begin_hostcall(
-        bridge_server,
-        HostcallRequest::HostQueueAttach {
-            shared_id: listener_shared_id,
-        },
-    );
-    let CompletionState::Ready(HostcallOutput::HostQueue(server_listener)) =
-        runtime.poll_hostcall(bridge_server, server_attach_op)
-    else {
-        panic!("bridge-server should attach its provisioned listener queue");
     };
 
     let (_, alloc_op) = runtime.begin_hostcall(
@@ -185,8 +180,8 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
     );
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
 
-    // 3. The bridge-server receives it on the provisioned listener and
-    //    decodes the identity.
+    // 3. The bridge-server receives it on its own listener and decodes the
+    //    identity.
     let (_, recv_op) = runtime.begin_hostcall(
         bridge_server,
         HostcallRequest::HostQueueRecv {
@@ -309,6 +304,7 @@ fn spawn_guest(
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
+            domain_table: Vec::new(),
             system_guests: vec![SystemGuestDescriptor {
                 name: name.to_string(),
                 module_id: format!("{name}-module"),
@@ -319,7 +315,7 @@ fn spawn_guest(
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: tenant.map(str::to_string),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
         })

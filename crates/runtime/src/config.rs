@@ -46,14 +46,12 @@ pub struct SystemGuestDescriptor {
     /// Tenant identity for this guest. `None` means "platform tenant".
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
-    /// Well-known discovery URI this guest serves under the root tenant
-    /// (e.g. the DNS connector's `sel:///dns/resolve`). When set, the runtime
-    /// provisions the guest's channel at spawn time — exactly like the
-    /// discovery listener — by creating the host listener queue, injecting
-    /// its shared id as the leading entrypoint argument, granting attach
-    /// rights for it, and registering the URI with discovery. The
-    /// registration is revoked when the guest terminates.
-    pub well_known_uri: Option<String>,
+    /// Serving role this guest declares: the internal route URI it registers
+    /// itself (e.g. `sel:///dns/resolve` or `sel://acme/bridge`). When set,
+    /// readiness additionally requires the registration to be observable in
+    /// discovery (recorded by the discovery service), replacing the runtime's
+    /// old well-known-URI provisioning. `mark_ready()` stays a bare signal.
+    pub serving_role: Option<String>,
     /// Protocol handler names this guest serves (e.g. `sel-http` for
     /// `selium-connector-http`). The runtime records these so serve-side
     /// guests can pin their listeners to the handler process via
@@ -69,6 +67,9 @@ pub struct RuntimeConfig {
     /// When true, the runtime creates the discovery pub/sub feed ring and
     /// discovery listener, and wires them into the discovery system guest.
     pub start_discovery: bool,
+    /// Out-of-band domain→tenant mapping, seeded into the discovery service
+    /// at startup (advisory: routes and scopes names, never authenticates).
+    pub domain_table: Vec<(String, String)>,
 }
 
 /// Guest successfully started during bootstrap.
@@ -78,10 +79,6 @@ pub struct BootstrappedGuest {
     pub name: String,
     /// Process id assigned to the guest.
     pub process_id: ProcessId,
-    /// Shared id of the host listener queue provisioned for a guest with a
-    /// [`SystemGuestDescriptor::well_known_uri`], if any. Deployers use this
-    /// to grant other guests attach rights for the well-known channel.
-    pub well_known_listener: Option<u64>,
 }
 
 /// Report returned after bootstrapping system guests.
@@ -127,16 +124,18 @@ impl SystemGuestDescriptor {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         }
     }
 
     /// Sets the discovery handle (host queue shared_id) for this guest.
     ///
-    /// The discovery handle is passed as the first entrypoint argument.
-    /// Application guests use this to connect to the discovery service
-    /// via `Context::from_raw(discovery_handle)`.
+    /// The discovery handle is prepended as the first entrypoint argument, so
+    /// guests whose leading parameter is a `Context` (or a `u64` discovery
+    /// handle) receive it ahead of any other declared arguments. Application
+    /// guests use this to connect to the discovery service via
+    /// `Context::from_raw(discovery_handle)`.
     ///
     /// # Example
     ///
@@ -159,7 +158,7 @@ impl SystemGuestDescriptor {
     /// app_guest.dependencies.push("discovery".to_string());
     /// ```
     pub fn set_discovery_handle(&mut self, shared_id: u64) {
-        self.arguments = vec![SystemGuestArg::Integer(shared_id)];
+        self.arguments.insert(0, SystemGuestArg::Integer(shared_id));
     }
 
     /// Sets both the discovery feed ring region id and the discovery RPC
@@ -207,7 +206,7 @@ mod tests {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         };
         assert!(descriptor.arguments.is_empty());

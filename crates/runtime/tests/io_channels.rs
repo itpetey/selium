@@ -238,9 +238,10 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap");
     report.guests[0].process_id

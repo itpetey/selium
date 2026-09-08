@@ -332,6 +332,7 @@ impl Runtime {
                     uri,
                     target,
                     owner: Some(process_id),
+                    root_service: false,
                 };
                 let bytes = encode_rkyv(&request).map_err(|error| {
                     AbiError::new(
@@ -871,7 +872,7 @@ impl Runtime {
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant,
-                    well_known_uri: None,
+                    serving_role: None,
                     handlers: Vec::new(),
                 };
                 let child = self
@@ -1008,6 +1009,7 @@ impl Runtime {
                     uri,
                     target,
                     owner: Some(process_id),
+                    root_service: false,
                 };
                 let bytes = encode_rkyv(&request).map_err(|error| {
                     AbiError::new(
@@ -1122,6 +1124,24 @@ impl Runtime {
                 }
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
+            HostcallRequest::RecordRegistration {
+                process_id: registered_process,
+                uri,
+            } => {
+                // Only the discovery system guest may report registrations;
+                // the record gates role-declared readiness.
+                let discovery = *self.discovery_process.lock();
+                if discovery != Some(process_id) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "RecordRegistration denied for process {process_id}: only the discovery service may record registrations",
+                        ),
+                    ));
+                }
+                self.record_registration(registered_process, uri);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
             HostcallRequest::SelfInfo => Ok(HostOperationState::Ready(HostcallOutput::SelfInfo {
                 process_id,
                 tenant: self.process_tenant(process_id),
@@ -1129,6 +1149,26 @@ impl Runtime {
             HostcallRequest::ProcessTenant { process_id } => Ok(HostOperationState::Ready(
                 HostcallOutput::Tenant(self.process_tenant(process_id)),
             )),
+            HostcallRequest::ProcessCapability {
+                process_id: target_process_id,
+                capability,
+            } => {
+                // Only the discovery system guest may probe another process's
+                // grants; it uses the check to gate root-registration requests.
+                let discovery = *self.discovery_process.lock();
+                if discovery != Some(process_id) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "ProcessCapability denied for process {process_id}: only the discovery service may probe process capabilities",
+                        ),
+                    ));
+                }
+                let held = self.authorises(target_process_id, capability, &ScopeContext::default());
+                Ok(HostOperationState::Ready(HostcallOutput::U64(u64::from(
+                    held,
+                ))))
+            }
             HostcallRequest::ResolveProtocolHandler { scheme } => {
                 // Handler registrations are Tier-1 (bootstrap-published), so
                 // this lookup cannot be forged by guests. Serve-side guests
@@ -1730,7 +1770,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn hostcall test guest")
@@ -1753,7 +1793,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: tenant.map(str::to_string),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn hostcall test guest")
@@ -1787,7 +1827,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn rollover guest");
@@ -2180,7 +2220,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn tenant-a guest");
@@ -2203,7 +2243,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("beta".to_string()),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn tenant-b guest");
@@ -2267,7 +2307,7 @@ mod tests {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         });
 
@@ -2626,9 +2666,10 @@ mod tests {
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
                     tenant: None,
-                    well_known_uri: None,
+                    serving_role: None,
                     handlers: vec!["sel-quic".to_string()],
                 }],
+                domain_table: Vec::new(),
             })
             .expect("bootstrap connector");
         let connector = report.guests.first().expect("connector").process_id;
@@ -2799,7 +2840,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("empty selector grant should be accepted");
@@ -2844,7 +2885,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn guesser");
@@ -2934,7 +2975,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn explicit-b");
@@ -3122,7 +3163,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn contain-parent");
@@ -3312,6 +3353,61 @@ mod tests {
                 assert!(descriptor.local_id > 0);
             }
             other => panic!("expected HostQueue output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_registration_is_denied_for_non_discovery_callers() {
+        // Only the discovery system guest may report registrations: the
+        // record gates role-declared readiness, so a random guest forging
+        // records would bypass the readiness gate.
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(&runtime, Vec::new());
+
+        // Pretend a different process is the discovery guest.
+        *runtime.discovery_process.lock() = Some(guest.process_id + 1);
+
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::RecordRegistration {
+                process_id: guest.process_id,
+                uri: "sel:///dns/resolve".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        // No registration was recorded for the forged report.
+        assert!(!runtime.has_registration(guest.process_id, "sel:///dns/resolve"));
+    }
+
+    #[test]
+    fn process_capability_is_denied_for_non_discovery_callers() {
+        // Only the discovery system guest may probe another process's
+        // grants: it uses the check to gate root-registration requests, and
+        // exposing it broadly would leak grant state.
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(&runtime, Vec::new());
+
+        *runtime.discovery_process.lock() = Some(guest.process_id + 1);
+
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::ProcessCapability {
+                process_id: guest.process_id,
+                capability: Capability::SystemRegistration,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
         }
     }
 }

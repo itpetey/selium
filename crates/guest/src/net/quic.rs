@@ -1,8 +1,15 @@
 //! Byte-transport QUIC serve API for application guests.
 //!
-//! This module is the app-guest side of the QUIC connector: register a
-//! a bare server name with discovery and accept per-stream byte
-//! channels from the connector, then frame the bytes with any user schema.
+//! This module is the app-guest side of the QUIC connector: serve a named
+//! route with discovery and accept per-stream byte channels from the
+//! connector, then frame the bytes with any user schema.
+//!
+//! A route is declared as a slash-separated service path under the guest's
+//! own tenant (`"my-app"` or `"http/prod"`); the single `serve` declaration
+//! derives both the internal path (`sel://<tenant>/my-app`) and the wire
+//! name the connector matches against the QUIC handshake's SNI
+//! (`my-app.<tenant>`, or `my-app.<owned-domain>` when the tenant's domain
+//! is provisioned).
 //!
 //! ## Capability model
 //!
@@ -29,6 +36,8 @@
 //!
 //! #[entrypoint]
 //! async fn my_app(mut ctx: Context) {
+//!     // Serves `sel://<tenant>/my-app`; clients connect with SNI
+//!     // `my-app.<tenant>` (or `my-app.<owned-domain>`).
 //!     let mut serve = QuicServe::bind(&mut ctx, "my-app")
 //!         .await
 //!         .expect("bind failed");
@@ -52,7 +61,7 @@ use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{Context, GuestError, ResourceListener};
+use crate::{Context, GuestError, ResourceListener, Serve};
 
 /// Protocol handler name for QUIC routes. Used to pin serve listeners to the
 /// QUIC connector's handoffs; not a URI scheme.
@@ -62,9 +71,9 @@ pub const QUIC_STREAM_INTERFACE: &str = "selium.quic/stream";
 
 /// A byte-transport QUIC serve handle.
 ///
-/// Wraps a [`ResourceListener`] and a discovery registration for a
-/// a bare server name (`my-app`). Each accepted stream is a [`QuicStream`] byte
-/// channel from the connector.
+/// Wraps a [`ResourceListener`] and a discovery route registration for a
+/// named service path (`my-app` under the guest's tenant). Each accepted
+/// stream is a [`QuicStream`] byte channel from the connector.
 pub struct QuicServe {
     listener: ResourceListener,
     uri: String,
@@ -92,12 +101,16 @@ pub enum QuicServeError {
 }
 
 impl QuicServe {
-    /// Binds to a bare server name and registers it with discovery.
+    /// Serves a named route and registers it with discovery.
     ///
-    /// The `name` is an opaque external name (a normalised hostname, e.g.
-    /// `my-app`); discovery stores and matches it exactly. The runtime
-    /// allocates a host queue for the listener and registers the name→queue
-    /// mapping with discovery.
+    /// The `path` is a slash-separated service path under the guest's own
+    /// tenant (`"my-app"` or `"http/prod"`); every segment must project to a
+    /// DNS-safe wire label. The single declaration derives the internal
+    /// route (`sel://<tenant>/my-app`) and the wire name the connector
+    /// matches against the connection's SNI (`my-app.<tenant>`, or
+    /// `my-app.<owned-domain>` when the advisory domain table maps the
+    /// tenant). The guest creates its own listener; the runtime provisions
+    /// nothing on its behalf.
     ///
     /// The listener is **pinned to the registered `sel-quic` protocol
     /// handler** (the QUIC connector): handoffs from any other process are
@@ -108,20 +121,24 @@ impl QuicServe {
     ///
     /// The guest requires a channel attach grant but **no `Network` grant** —
     /// QUIC is terminated and relayed by the connector.
-    pub async fn bind(ctx: &mut Context, name: &str) -> Result<Self, GuestError> {
-        let name = selium_abi::uri::normalize_external_name(name);
-
+    ///
+    /// A guest running in the root/system tenant (an empty tenant label)
+    /// additionally requires the system-registration capability to serve.
+    pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
         super::pin_to_scheme_handler(&mut listener, QUIC_SCHEME)?;
 
-        let target = quic_target(&listener, &name);
-        ctx.register(&name, target).await?;
+        let target = quic_target(&listener);
+        let uri = ctx
+            .serve(Serve {
+                path: path_segments(path),
+                target,
+                default: false,
+            })
+            .await?;
 
-        Ok(Self {
-            listener,
-            uri: name.to_string(),
-        })
+        Ok(Self { listener, uri })
     }
 
     /// Accepts the next delivered stream region from the connector.
@@ -142,7 +159,8 @@ impl QuicServe {
         Ok(QuicStream { inner: stream })
     }
 
-    /// Returns the URI subtree this handle is bound to.
+    /// Returns the internal route URI this handle is bound to
+    /// (`sel://<tenant>/<path>`).
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -189,9 +207,21 @@ impl AsyncWrite for QuicStream {
     }
 }
 
-fn quic_target(listener: &ResourceListener, name: &str) -> ResourceTarget {
+/// Splits a slash-separated service path into route segments, ignoring
+/// empty segments. The path must project to DNS-safe wire labels —
+/// [`Context::serve`](crate::Context::serve) rejects typed resource paths
+/// (`region/7`) and non-DNS-safe segments up front.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn quic_target(listener: &ResourceListener) -> ResourceTarget {
     ResourceTarget {
-        uri: name.to_string(),
+        // Pinned by `serve` to the derived internal route URI.
+        uri: String::new(),
         host_id: String::new(),
         resource_id: listener.descriptor().shared_id,
         interface: Some(InterfaceMetadata {
@@ -217,12 +247,31 @@ mod tests {
     }
 
     #[test]
-    fn bind_normalises_server_names() {
+    fn bind_paths_split_into_route_segments() {
         assert_eq!(
-            selium_abi::uri::normalize_external_name("Example.COM."),
-            "example.com"
+            path_segments("my-app"),
+            vec!["my-app".to_string()]
         );
-        assert_eq!(selium_abi::uri::normalize_external_name("my-app"), "my-app");
+        assert_eq!(path_segments("http/prod"), vec!["http", "prod"]);
+        // Empty and slash-only paths carry no segments; `serve` rejects them
+        // (a named service must project to a wire name).
+        assert!(path_segments("").is_empty());
+        assert!(path_segments("/").is_empty());
+    }
+
+    #[test]
+    fn bind_paths_must_project_to_wire_names() {
+        // Typed resource paths and non-DNS-safe segments never project;
+        // `serve` rejects them before reaching discovery.
+        assert!(selium_abi::uri::labels_from_path("region/7").is_none());
+        assert!(selium_abi::uri::labels_from_path("My_App").is_none());
+        // A served path projects to the wire name the connector matches
+        // against SNI: `["http", "prod"]` under tenant `acme` →
+        // `prod.http.acme`.
+        assert_eq!(
+            selium_abi::uri::labels_from_path("my-app"),
+            Some(vec!["my-app".to_string()])
+        );
     }
 
     #[tokio::test]

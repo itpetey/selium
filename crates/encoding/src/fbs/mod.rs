@@ -10,6 +10,8 @@ pub mod selium {
     pub use self::label_generated::*;
     mod resource_target_generated;
     pub use self::resource_target_generated::*;
+    mod domain_entry_generated;
+    pub use self::domain_entry_generated::*;
     mod discovery_request_generated;
     pub use self::discovery_request_generated::*;
     mod discovery_response_generated;

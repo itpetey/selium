@@ -120,6 +120,20 @@ pub struct ResourceTargetWire {
     pub labels: Vec<LabelWire>,
 }
 
+/// Wire type for a single advisory domain-to-tenant mapping, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/discovery.fbs",
+    ty = "selium.discovery.DomainEntry",
+    binding = "selium_encoding::fbs::selium::discovery::DomainEntry"
+)]
+pub struct DomainEntryWire {
+    /// Domain (e.g. `example.com`).
+    pub domain: String,
+    /// Tenant the domain maps to (e.g. `acme`).
+    pub tenant: String,
+}
+
 /// Wire type for DiscoveryRequest, backed by Flatbuffers.
 #[derive(Debug, Clone, PartialEq)]
 #[schema(
@@ -129,7 +143,7 @@ pub struct ResourceTargetWire {
 )]
 pub struct DiscoveryRequestWire {
     /// Variant discriminator (0 = Resolve, 1 = Register, 2 = Revoke,
-    /// 3 = ResolvePrefix, 4 = ResolveLabels).
+    /// 3 = ResolvePrefix, 4 = ResolveLabels, 5 = ListDomains).
     pub variant: u8,
     /// URI to resolve or register (Resolve, ResolvePrefix, Register, Revoke).
     pub uri: String,
@@ -139,6 +153,8 @@ pub struct DiscoveryRequestWire {
     pub value: String,
     /// Target resource for registration (used by Register variant).
     pub target: Option<ResourceTargetWire>,
+    /// Root-service designation for the registration (Register variant).
+    pub root_service: bool,
 }
 
 /// Wire type for DiscoveryResponse, backed by Flatbuffers.
@@ -150,12 +166,14 @@ pub struct DiscoveryRequestWire {
 )]
 pub struct DiscoveryResponseWire {
     /// Variant discriminator (0 = Found, 1 = NotFound, 2 = Registered,
-    /// 3 = Revoked, 4 = Forbidden, 5 = Resolved).
+    /// 3 = Revoked, 4 = Forbidden, 5 = Resolved, 6 = Domains).
     pub variant: u8,
     /// The discovered resource (used by Found variant).
     pub target: Option<ResourceTargetWire>,
     /// The matched resources (used by Resolved variant).
     pub targets: Vec<ResourceTargetWire>,
+    /// The provisioned domain table (used by Domains variant).
+    pub domains: Vec<DomainEntryWire>,
 }
 
 impl From<selium_abi::AbiError> for EncodingError {
@@ -200,43 +218,88 @@ impl From<&selium_abi::DiscoveryRequest> for DiscoveryRequestWire {
     fn from(value: &selium_abi::DiscoveryRequest) -> Self {
         match value {
             selium_abi::DiscoveryRequest::Resolve(uri) => {
-                Self::new(0, uri.clone(), String::new(), String::new(), None)
+                Self::new(0, uri.clone(), String::new(), String::new(), None, false)
             }
             selium_abi::DiscoveryRequest::ResolvePrefix(uri) => {
-                Self::new(3, uri.clone(), String::new(), String::new(), None)
+                Self::new(3, uri.clone(), String::new(), String::new(), None, false)
             }
             selium_abi::DiscoveryRequest::ResolveLabels {
                 key,
                 value: value_str,
-            } => Self::new(4, String::new(), key.clone(), value_str.clone(), None),
-            selium_abi::DiscoveryRequest::Register { uri, target, .. } => Self::new(
+            } => Self::new(
+                4,
+                String::new(),
+                key.clone(),
+                value_str.clone(),
+                None,
+                false,
+            ),
+            selium_abi::DiscoveryRequest::Register {
+                uri,
+                target,
+                root_service,
+                ..
+            } => Self::new(
                 1,
                 uri.clone(),
                 String::new(),
                 String::new(),
                 Some(ResourceTargetWire::from(target)),
+                *root_service,
             ),
             selium_abi::DiscoveryRequest::Revoke { uri } => {
-                Self::new(2, uri.clone(), String::new(), String::new(), None)
+                Self::new(2, uri.clone(), String::new(), String::new(), None, false)
+            }
+            selium_abi::DiscoveryRequest::ListDomains => {
+                Self::new(5, String::new(), String::new(), String::new(), None, false)
+            }
+            // Tier-1-only operations (published over the runtime→discovery
+            // rkyv feed, never the flatbuffers RPC wire) map to Resolve with
+            // no URI; they still round-trip structurally.
+            selium_abi::DiscoveryRequest::RevokeByOwner { .. }
+            | selium_abi::DiscoveryRequest::SeedDomain { .. } => {
+                Self::new(0, String::new(), String::new(), String::new(), None, false)
             }
         }
+    }
+}
+
+impl From<&(String, String)> for DomainEntryWire {
+    fn from(value: &(String, String)) -> Self {
+        Self::new(value.0.clone(), value.1.clone())
+    }
+}
+
+impl From<&DomainEntryWire> for (String, String) {
+    fn from(value: &DomainEntryWire) -> Self {
+        (value.domain.clone(), value.tenant.clone())
     }
 }
 
 impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
     fn from(value: &selium_abi::DiscoveryResponse) -> Self {
         match value {
-            selium_abi::DiscoveryResponse::Found(target) => {
-                Self::new(0, Some(ResourceTargetWire::from(target)), Vec::new())
-            }
-            selium_abi::DiscoveryResponse::NotFound => Self::new(1, None, Vec::new()),
-            selium_abi::DiscoveryResponse::Registered => Self::new(2, None, Vec::new()),
-            selium_abi::DiscoveryResponse::Revoked => Self::new(3, None, Vec::new()),
-            selium_abi::DiscoveryResponse::Forbidden => Self::new(4, None, Vec::new()),
+            selium_abi::DiscoveryResponse::Found(target) => Self::new(
+                0,
+                Some(ResourceTargetWire::from(target)),
+                Vec::new(),
+                Vec::new(),
+            ),
+            selium_abi::DiscoveryResponse::NotFound => Self::new(1, None, Vec::new(), Vec::new()),
+            selium_abi::DiscoveryResponse::Registered => Self::new(2, None, Vec::new(), Vec::new()),
+            selium_abi::DiscoveryResponse::Revoked => Self::new(3, None, Vec::new(), Vec::new()),
+            selium_abi::DiscoveryResponse::Forbidden => Self::new(4, None, Vec::new(), Vec::new()),
             selium_abi::DiscoveryResponse::Resolved(targets) => Self::new(
                 5,
                 None,
                 targets.iter().map(ResourceTargetWire::from).collect(),
+                Vec::new(),
+            ),
+            selium_abi::DiscoveryResponse::Domains(domains) => Self::new(
+                6,
+                None,
+                Vec::new(),
+                domains.iter().map(DomainEntryWire::from).collect(),
             ),
         }
     }
@@ -472,6 +535,7 @@ fn discovery_request_try_from_wire(
                 // The RPC wire never carries a Tier-1 owner; guests always
                 // register on their own behalf.
                 owner: None,
+                root_service: wire.root_service,
             })
         }
         2 => Ok(selium_abi::DiscoveryRequest::Revoke { uri: wire.uri }),
@@ -480,6 +544,7 @@ fn discovery_request_try_from_wire(
             key: wire.key,
             value: wire.value,
         }),
+        5 => Ok(selium_abi::DiscoveryRequest::ListDomains),
         _ => invalid_wire("known discovery request variant"),
     }
 }
@@ -511,6 +576,14 @@ fn discovery_response_try_from_wire(
                 .map(resource_target_try_from_wire)
                 .collect::<::std::result::Result<Vec<_>, _>>()?;
             Ok(selium_abi::DiscoveryResponse::Resolved(targets))
+        }
+        6 => {
+            let domains = wire
+                .domains
+                .into_iter()
+                .map(|entry| (entry.domain, entry.tenant))
+                .collect();
+            Ok(selium_abi::DiscoveryResponse::Domains(domains))
         }
         _ => invalid_wire("known discovery response variant"),
     }
@@ -725,6 +798,7 @@ mod tests {
             key: String::new(),
             value: String::new(),
             target: None,
+            root_service: false,
         };
         let bytes = FlatMsg::encode(&wire);
         let result: ::std::result::Result<selium_abi::DiscoveryRequest, InvalidFlatbuffer> =
@@ -742,6 +816,7 @@ mod tests {
             key: String::new(),
             value: String::new(),
             target: None,
+            root_service: false,
         };
         let bytes = FlatMsg::encode(&wire);
         let result: ::std::result::Result<selium_abi::DiscoveryRequest, InvalidFlatbuffer> =
@@ -757,6 +832,7 @@ mod tests {
             variant: 77,
             target: None,
             targets: Vec::new(),
+            domains: Vec::new(),
         };
         let bytes = FlatMsg::encode(&wire);
         let result: ::std::result::Result<selium_abi::DiscoveryResponse, InvalidFlatbuffer> =
@@ -772,6 +848,7 @@ mod tests {
             variant: 0,
             target: None,
             targets: Vec::new(),
+            domains: Vec::new(),
         };
         let bytes = FlatMsg::encode(&wire);
         let result: ::std::result::Result<selium_abi::DiscoveryResponse, InvalidFlatbuffer> =

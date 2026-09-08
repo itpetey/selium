@@ -113,7 +113,7 @@ fn spawn_with_grants(
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         })
         .expect("spawn net test guest")
@@ -274,7 +274,7 @@ fn uri_prefix_without_network_class_rejected_at_spawn() {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     });
 

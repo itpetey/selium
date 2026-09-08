@@ -14,6 +14,7 @@ pub enum DiscoveryResponseOffset {}
 ///   3 = Revoked
 ///   4 = Forbidden
 ///   5 = Resolved(targets)
+///   6 = Domains(domains)
 pub struct DiscoveryResponse<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -30,6 +31,7 @@ impl<'a> DiscoveryResponse<'a> {
   pub const VT_VARIANT: ::flatbuffers::VOffsetT = 4;
   pub const VT_TARGET: ::flatbuffers::VOffsetT = 6;
   pub const VT_TARGETS: ::flatbuffers::VOffsetT = 8;
+  pub const VT_DOMAINS: ::flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -41,12 +43,31 @@ impl<'a> DiscoveryResponse<'a> {
     args: &'args DiscoveryResponseArgs<'args>
   ) -> ::flatbuffers::WIPOffset<DiscoveryResponse<'bldr>> {
     let mut builder = DiscoveryResponseBuilder::new(_fbb);
+    if let Some(x) = args.domains { builder.add_domains(x); }
     if let Some(x) = args.targets { builder.add_targets(x); }
     if let Some(x) = args.target { builder.add_target(x); }
     builder.add_variant(args.variant);
     builder.finish()
   }
 
+  pub fn unpack(&self) -> DiscoveryResponseT {
+    let variant = self.variant();
+    let target = self.target().map(|x| {
+      alloc::boxed::Box::new(x.unpack())
+    });
+    let targets = self.targets().map(|x| {
+      x.iter().map(|t| t.unpack()).collect()
+    });
+    let domains = self.domains().map(|x| {
+      x.iter().map(|t| t.unpack()).collect()
+    });
+    DiscoveryResponseT {
+      variant,
+      target,
+      targets,
+      domains,
+    }
+  }
 
   /// Variant discriminator.
   #[inline]
@@ -72,6 +93,14 @@ impl<'a> DiscoveryResponse<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ResourceTarget>>>>(DiscoveryResponse::VT_TARGETS, None)}
   }
+  /// The provisioned domain table (used by the Domains variant).
+  #[inline]
+  pub fn domains(&self) -> Option<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<DomainEntry<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<DomainEntry>>>>(DiscoveryResponse::VT_DOMAINS, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryResponse<'_> {
@@ -83,6 +112,7 @@ impl ::flatbuffers::Verifiable for DiscoveryResponse<'_> {
      .visit_field::<u8>("variant", Self::VT_VARIANT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResourceTarget>>("target", Self::VT_TARGET, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<ResourceTarget>>>>("targets", Self::VT_TARGETS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<DomainEntry>>>>("domains", Self::VT_DOMAINS, false)?
      .finish();
     Ok(())
   }
@@ -91,6 +121,7 @@ pub struct DiscoveryResponseArgs<'a> {
     pub variant: u8,
     pub target: Option<::flatbuffers::WIPOffset<ResourceTarget<'a>>>,
     pub targets: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<ResourceTarget<'a>>>>>,
+    pub domains: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<DomainEntry<'a>>>>>,
 }
 impl<'a> Default for DiscoveryResponseArgs<'a> {
   #[inline]
@@ -99,6 +130,7 @@ impl<'a> Default for DiscoveryResponseArgs<'a> {
       variant: 0,
       target: None,
       targets: None,
+      domains: None,
     }
   }
 }
@@ -121,6 +153,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryResponseBuilder<'a, 
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryResponse::VT_TARGETS, targets);
   }
   #[inline]
+  pub fn add_domains(&mut self, domains: ::flatbuffers::WIPOffset<::flatbuffers::Vector<'b , ::flatbuffers::ForwardsUOffset<DomainEntry<'b >>>>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryResponse::VT_DOMAINS, domains);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryResponseBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DiscoveryResponseBuilder {
@@ -141,7 +177,49 @@ impl ::core::fmt::Debug for DiscoveryResponse<'_> {
       ds.field("variant", &self.variant());
       ds.field("target", &self.target());
       ds.field("targets", &self.targets());
+      ds.field("domains", &self.domains());
       ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveryResponseT {
+  pub variant: u8,
+  pub target: Option<alloc::boxed::Box<ResourceTargetT>>,
+  pub targets: Option<alloc::vec::Vec<ResourceTargetT>>,
+  pub domains: Option<alloc::vec::Vec<DomainEntryT>>,
+}
+impl Default for DiscoveryResponseT {
+  fn default() -> Self {
+    Self {
+      variant: 0,
+      target: None,
+      targets: None,
+      domains: None,
+    }
+  }
+}
+impl DiscoveryResponseT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<DiscoveryResponse<'b>> {
+    let variant = self.variant;
+    let target = self.target.as_ref().map(|x|{
+      x.pack(_fbb)
+    });
+    let targets = self.targets.as_ref().map(|x|{
+      let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
+    });
+    let domains = self.domains.as_ref().map(|x|{
+      let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
+    });
+    DiscoveryResponse::create(_fbb, &DiscoveryResponseArgs{
+      variant,
+      target,
+      targets,
+      domains,
+    })
   }
 }
 #[inline]

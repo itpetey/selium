@@ -138,6 +138,11 @@ pub enum Capability {
     /// per-tenant bridge-server) that spawn children carrying an external
     /// client's grants.
     DelegateGrants,
+    /// Permission to register routes in the root/system tenant (`sel:///…`),
+    /// replacing the runtime's well-known-URI provisioning. Without this grant
+    /// a guest's `serve` registration in the root namespace is forbidden by
+    /// discovery.
+    SystemRegistration,
 }
 
 /// Identity of a resource in either local-handle or shared-resource space.
@@ -508,12 +513,32 @@ pub enum DiscoveryRequest {
         /// Owning process, populated by Tier-1 runtime registrations so the
         /// store can validate Tier-2 ownership without parsing the URI.
         owner: Option<ProcessId>,
+        /// Marks the registration as the tenant's root service, so the bare
+        /// domain (apex) resolves to it.
+        root_service: bool,
     },
     /// Remove a URI→target mapping.
     Revoke {
         /// URI to revoke.
         uri: String,
     },
+    /// Revoke every route owned by a process (published by the runtime when
+    /// the process exits). Owner-keyed revocation lives in discovery, not in a
+    /// runtime-maintained side map.
+    RevokeByOwner {
+        /// Process whose owner-keyed registrations are revoked.
+        process_id: ProcessId,
+    },
+    /// Seed an out-of-band domain→tenant mapping (Tier-1 publish only).
+    SeedDomain {
+        /// Domain to map (e.g. `example.com`).
+        domain: String,
+        /// Tenant the domain maps to (e.g. `acme`).
+        tenant: String,
+    },
+    /// Request the provisioned domain→tenant table. Used by connectors to
+    /// obtain a copy for local wire-name resolution.
+    ListDomains,
 }
 
 /// Response from the discovery service.
@@ -533,6 +558,8 @@ pub enum DiscoveryResponse {
     Revoked,
     /// The caller is not authorised to register the given target.
     Forbidden,
+    /// The provisioned domain→tenant table, returned for [`DiscoveryRequest::ListDomains`].
+    Domains(Vec<(String, String)>),
 }
 
 /// Host operation requested by a guest.
@@ -741,6 +768,25 @@ pub enum HostcallRequest {
     ProcessTenant {
         /// Process whose tenant to look up.
         process_id: ProcessId,
+    },
+    /// Returns whether a process holds a capability. Restricted to the
+    /// discovery system guest so it can gate root-registration requests
+    /// against the caller's grants.
+    ProcessCapability {
+        /// Process whose grants to check.
+        process_id: ProcessId,
+        /// Capability to check.
+        capability: Capability,
+    },
+    /// Records that a route was registered by a process, so the runtime can
+    /// gate the readiness of a role-declared system guest on its registration
+    /// being observable in discovery. Restricted to the discovery system
+    /// guest.
+    RecordRegistration {
+        /// Process that registered the route.
+        process_id: ProcessId,
+        /// Internal URI the route was registered under.
+        uri: String,
     },
     /// Free a previously allocated shared memory region.
     FreeRegion {
@@ -1635,6 +1681,7 @@ mod tests {
                 labels: Vec::new(),
             },
             owner: Some(42),
+            root_service: false,
         };
         let encoded = encode_rkyv(&request).expect("encode");
         let decoded: DiscoveryRequest = decode_rkyv(&encoded).expect("decode");

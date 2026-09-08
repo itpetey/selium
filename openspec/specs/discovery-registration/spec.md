@@ -5,7 +5,7 @@ Discovery registration enables Selium guests and the runtime to register, revoke
 ## Requirements
 
 ### Requirement: Discovery URI registration
-The discovery service SHALL accept `DiscoveryRequest::Register { uri, target }` and store the mapping in its registry. It SHALL accept `DiscoveryRequest::Revoke { uri }` and remove the mapping. Both SHALL respond with a confirmation: `DiscoveryResponse::Registered` or `DiscoveryResponse::Revoked`.
+The discovery service SHALL accept `DiscoveryRequest::Register { uri, target }`, record the registering process as the route's owner, and store the mapping in its registry. It SHALL accept `DiscoveryRequest::Revoke { uri }` and remove the mapping. Both SHALL respond with a confirmation: `DiscoveryResponse::Registered` or `DiscoveryResponse::Revoked`.
 
 #### Scenario: Caller registers a URI
 - **WHEN** a caller sends `DiscoveryRequest::Register { uri: "sel://tenant/logs/app", target }` to the discovery service
@@ -25,6 +25,10 @@ The discovery service SHALL accept `DiscoveryRequest::Register { uri, target }` 
 #### Scenario: Revoke on unknown URI
 - **WHEN** a caller revokes a URI that is not registered
 - **THEN** the discovery service SHALL respond with `DiscoveryResponse::Revoked` (idempotent)
+
+#### Scenario: Owner revoked on exit
+- **WHEN** the process that owns a registration exits or is killed
+- **THEN** the discovery service SHALL revoke the process's registrations without a runtime-maintained map of well-known URIs
 
 ### Requirement: Guest custom URI validation
 A guest (Tier-2) SHALL be permitted to register a URI only within the guest's own tenant (a non-root tenant) and only for a target resource the guest owns. Registration into the root tenant (empty tenant) SHALL be rejected. A guest MAY register leaf aliases for a target it owns, under its own tenant. A leaf alias SHALL be accepted only when the claimed target's typed registration currently exists and the claimed class matches the class of the resource the caller owns; external names SHALL meet the same class-match requirement.
@@ -132,17 +136,6 @@ The discovery service SHALL support prefix listing under the typed schema, for e
 - **WHEN** a guest in tenant "beta" queries `sel://acme/region/*`
 - **THEN** the discovery service SHALL NOT return tenant "acme"'s targets
 
-### Requirement: External Name Registry
-External bindings SHALL register their public address as an opaque name-to-target key, for example `https://acme.com/path/`, or a bare hostname for server-name-only protocols. The discovery service SHALL store and match external names opaquely, without interpreting their scheme or path; the serving connector is responsible for normalizing incoming addresses to the registered key.
-
-#### Scenario: External address resolves
-- **WHEN** a connector registers `https://acme.com/path/` as the key for a serving guest
-- **THEN** resolving that key SHALL return the serving guest's target
-
-#### Scenario: Opaque matching is exact after normalization
-- **WHEN** the connector normalizes an incoming address to the canonical registered key
-- **THEN** the lookup SHALL match, and a differently-but-non-equivalently-spelled key SHALL NOT match
-
 ### Requirement: Process Node Addressing
 Every process SHALL be addressable as a typed entry `sel://<tenant>/proc/<id>` from spawn until teardown, even when the process has allocated no resources.
 
@@ -175,3 +168,47 @@ A guest (Tier-2) SHALL be permitted to revoke only custom registrations — leaf
 #### Scenario: Revoking an unknown key returns NotFound
 - **WHEN** a guest sends `DiscoveryRequest::Revoke` for a key that is not registered
 - **THEN** the discovery service SHALL respond `DiscoveryResponse::NotFound`
+
+### Requirement: External name resolution through addressing
+The discovery service SHALL resolve external wire names through the unified addressing resolver: derive the tenant from the domain-to-tenant table (or the synthetic tenant label), reverse the remaining labels into a path, and resolve that path. Resolution SHALL fail closed for unknown tenants or paths.
+
+#### Scenario: Wire name resolves to a tenant route
+- **WHEN** discovery resolves `bridge.acme`
+- **THEN** it SHALL derive tenant `acme`, reverse the label into path `["bridge"]`, and resolve `sel://acme/bridge`
+
+#### Scenario: Registered domain wire name resolves
+- **WHEN** discovery resolves `bridge.example.com` and `example.com -> acme` is provisioned
+- **THEN** it SHALL resolve `sel://acme/bridge`
+
+### Requirement: Advisory domain scoping
+The discovery service SHALL consult the advisory domain-to-tenant table when accepting registrations under a domain, refusing a registration under a domain not owned by the registering tenant. The table SHALL NOT be treated as an authentication boundary.
+
+#### Scenario: Tenant registers within its domain
+- **WHEN** a tenant owning `example.com` registers a service
+- **THEN** the registration SHALL produce the wire name under `example.com`
+
+#### Scenario: Foreign domain registration refused
+- **WHEN** a tenant attempts to register a name under a domain it does not own
+- **THEN** the discovery service SHALL refuse the registration
+
+### Requirement: Serve-based route registration
+`Context` SHALL provide a `serve` method that registers a named route from a resource the guest created itself. The route SHALL derive from a path (for example `["bridge"]`) plus the guest's tenant, producing both the internal path (`sel://<tenant>/bridge`) and the wire name (`bridge.<tenant>`, or `bridge.<owned-domain>` when the domain table maps the tenant). The method SHALL optionally accept a root-service flag for apex aliasing.
+
+#### Scenario: Guest registers its own route
+- **WHEN** a guest calls `ctx.serve(Serve { path: ["bridge"], target, default: false }).await`
+- **THEN** discovery SHALL store the route resolvable as `sel://<tenant>/bridge` and `bridge.<tenant>`
+
+#### Scenario: Route registration derives wire name from the domain table
+- **WHEN** the guest's tenant owns a registered domain and serves a path
+- **THEN** the wire name under that domain SHALL also resolve to the route
+
+### Requirement: Root registration capability-gated
+Registration in the root/system tenant SHALL be permitted only when the guest holds the corresponding registration capability, replacing the runtime's special-case well-known URI provisioning.
+
+#### Scenario: Root registration requires capability
+- **WHEN** a guest without the system-registration capability attempts to register in the root tenant
+- **THEN** the request SHALL be forbidden
+
+#### Scenario: Capability-holding guest registers in root
+- **WHEN** a guest holding the system-registration capability registers in the root tenant
+- **THEN** the registration SHALL be accepted

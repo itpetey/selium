@@ -283,6 +283,7 @@ fn runtime_with_discovery_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>)
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
             system_guests: vec![],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap discovery");
     assert!(report.guests.is_empty());
@@ -309,7 +310,7 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         })
         .expect("spawn guest")

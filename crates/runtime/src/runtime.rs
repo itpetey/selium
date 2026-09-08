@@ -95,10 +95,11 @@ pub struct Runtime {
     /// so kernel-side sends (e.g. an accepted connection enqueued by the
     /// network poller) can wake the parked receiving guest.
     pub(crate) queue_waiters: Arc<Mutex<HashMap<u64, u64>>>,
-    /// Well-known discovery URIs provisioned at spawn time, keyed by the
-    /// serving process: `(uri, listener shared id)`. Revoked (and the entry
-    /// removed) when the process terminates.
-    pub(crate) well_known_uris: Arc<Mutex<HashMap<ProcessId, (String, u64)>>>,
+    /// Internal route URIs a process has registered with discovery, recorded
+    /// by the discovery system guest via `RecordRegistration`. Used to gate
+    /// the readiness of a role-declared system guest on its registration
+    /// being observable in discovery. Cleared when the process terminates.
+    pub(crate) process_registrations: Arc<Mutex<HashMap<ProcessId, HashSet<String>>>>,
     /// Protocol schemes a booted system guest handles (e.g. `sel-http`),
     /// keyed by process id. Revoked when the process terminates.
     pub(crate) handler_schemes: Arc<Mutex<HashMap<ProcessId, Vec<String>>>>,
@@ -150,7 +151,7 @@ impl Runtime {
             process_fastpath: Arc::new(Mutex::new(HashMap::new())),
             kick_counts: Arc::new(Mutex::new(HashMap::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
-            well_known_uris: Arc::new(Mutex::new(HashMap::new())),
+            process_registrations: Arc::new(Mutex::new(HashMap::new())),
             handler_schemes: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
             timer_handle: Arc::new(std::sync::OnceLock::new()),
@@ -188,10 +189,23 @@ impl Runtime {
         *self.discovery_listener_shared_id.lock()
     }
 
-    /// Returns the well-known discovery URI provisioned for `process_id`, if
-    /// any, together with its host listener queue shared id.
-    pub fn well_known_uri(&self, process_id: ProcessId) -> Option<(String, u64)> {
-        self.well_known_uris.lock().get(&process_id).cloned()
+    /// Records a route registration for `process_id`, as reported by the
+    /// discovery system guest. Used to gate role-declared readiness on
+    /// discoverable self-registration.
+    pub(crate) fn record_registration(&self, process_id: ProcessId, uri: String) {
+        self.process_registrations
+            .lock()
+            .entry(process_id)
+            .or_default()
+            .insert(uri);
+    }
+
+    /// Returns whether `process_id` has a recorded registration for `uri`.
+    pub fn has_registration(&self, process_id: ProcessId, uri: &str) -> bool {
+        self.process_registrations
+            .lock()
+            .get(&process_id)
+            .is_some_and(|uris| uris.contains(uri))
     }
 
     /// Publishes a raw rkyv-encoded discovery operation to the discovery feed.

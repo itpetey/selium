@@ -37,6 +37,18 @@ impl<'a> InterfaceMetadata<'a> {
     builder.finish()
   }
 
+  pub fn unpack(&self) -> InterfaceMetadataT {
+    let name = self.name().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let methods = self.methods().map(|x| {
+      x.iter().map(|s| alloc::string::ToString::to_string(s)).collect()
+    });
+    InterfaceMetadataT {
+      name,
+      methods,
+    }
+  }
 
   /// Interface name.
   #[inline]
@@ -116,5 +128,36 @@ impl ::core::fmt::Debug for InterfaceMetadata<'_> {
       ds.field("name", &self.name());
       ds.field("methods", &self.methods());
       ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceMetadataT {
+  pub name: Option<alloc::string::String>,
+  pub methods: Option<alloc::vec::Vec<alloc::string::String>>,
+}
+impl Default for InterfaceMetadataT {
+  fn default() -> Self {
+    Self {
+      name: None,
+      methods: None,
+    }
+  }
+}
+impl InterfaceMetadataT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<InterfaceMetadata<'b>> {
+    let name = self.name.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let methods = self.methods.as_ref().map(|x|{
+      let w: alloc::vec::Vec<_> = x.iter().map(|s| _fbb.create_string(s)).collect();_fbb.create_vector(&w)
+    });
+    InterfaceMetadata::create(_fbb, &InterfaceMetadataArgs{
+      name,
+      methods,
+    })
   }
 }

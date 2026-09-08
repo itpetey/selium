@@ -5,10 +5,10 @@
 //! metadata carries the authenticated client identity (`tenant` +
 //! fingerprint). The bridge server:
 //!
-//! - binds its serving route (`sel://<tenant>/bridge`) — provisioned by
-//!   the runtime via the `well_known_uri` descriptor field, which injects the
-//!   listener queue's shared id as the leading entrypoint argument and
-//!   registers the URI with discovery;
+//! - creates its own listener and registers its serving route
+//!   (`sel://<tenant>/bridge`) with discovery via `Context::serve`, deriving
+//!   both the internal path and the wire names (`bridge.<tenant>`,
+//!   `bridge.<owned-domain>`) from that one declaration;
 //! - resolves the handoff's identity to a grant set via an interim identity
 //!   source (a [`IdentityGrantMap`] here; the identity guest's RPC surface is
 //!   deferred as a design open question);
@@ -25,11 +25,12 @@
 use std::collections::HashMap;
 
 use selium_abi::{
-    Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
+    Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector, ResourceTarget,
     client_identity::ClientIdentity,
 };
 use selium_guest::{
-    Process, ResourceListener, entrypoint, error, info, mark_ready, net::ByteStream, warn,
+    Context, Process, ResourceListener, Serve, entrypoint, error, info, mark_ready,
+    net::ByteStream, warn,
 };
 
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
@@ -123,14 +124,13 @@ fn attach_then_close(shared_id: u64) {
 
 /// Bridge server entrypoint.
 ///
-/// Arguments: the host-provisioned listener queue id (injected by the runtime
-/// for this guest's `well_known_uri` route) and the discovery handle (set in
-/// the descriptor's `arguments` so the server can hand it to spawned
-/// bridge-channels). Deployers wire the descriptor as:
-/// `well_known_uri = "sel://<tenant>/bridge"` plus
-/// `arguments = [Integer(discovery_handle)]`.
+/// The server receives its bootstrap discovery `Context` (built by the
+/// entrypoint macro) and hands the underlying discovery handle to spawned
+/// bridge-channels via [`Context::raw_handle`]. The server creates its own
+/// listener and self-registers its serving route via [`Context::serve`]; the
+/// runtime no longer provisions the route or injects a listener argument.
 #[entrypoint]
-async fn bridge_server(listener: u64, discovery: u64) {
+async fn bridge_server(mut ctx: Context) {
     drop(selium_guest::log::init());
     info!("bridge-server: started");
 
@@ -150,10 +150,12 @@ async fn bridge_server(listener: u64, discovery: u64) {
         }
     };
 
-    let mut listener = match ResourceListener::attach(listener) {
+    // The server creates its own listener: self-registration replaces the
+    // runtime's well-known-URI queue minting.
+    let mut listener = match ResourceListener::create() {
         Ok(listener) => listener,
         Err(e) => {
-            error!("bridge-server: attach listener failed: {e}");
+            error!("bridge-server: create listener failed: {e}");
             return;
         }
     };
@@ -177,6 +179,28 @@ async fn bridge_server(listener: u64, discovery: u64) {
         }
     };
     listener.expect_sender(connector);
+
+    // Register the serving route (`sel://<tenant>/bridge`) from one declaration.
+    let target = ResourceTarget {
+        uri: String::new(), // pinned by `serve` to the derived internal path
+        host_id: String::new(),
+        resource_id: listener.descriptor().shared_id,
+        interface: None,
+        tenant: Some(own_tenant.clone()),
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
+    };
+    if let Err(e) = ctx
+        .serve(Serve {
+            path: vec!["bridge".to_string()],
+            target,
+            default: false,
+        })
+        .await
+    {
+        error!("bridge-server: serve failed: {e}");
+        return;
+    }
 
     let identity_source = IdentityGrantMap::stub();
     let mut budget = SpawnBudget::default();
@@ -250,7 +274,10 @@ async fn bridge_server(listener: u64, discovery: u64) {
         match Process::start(
             BRIDGE_CHANNEL_MODULE,
             BRIDGE_CHANNEL_ENTRYPOINT,
-            vec![arg_u64(incoming.shared_id), arg_u64(discovery)],
+            vec![
+                arg_u64(ctx.raw_handle()),
+                arg_u64(incoming.shared_id),
+            ],
             child_grants,
         ) {
             Ok(_child) => info!(

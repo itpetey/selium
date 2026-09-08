@@ -35,14 +35,23 @@ table ResourceTarget {
     labels: [Label];
 }
 
+/// A single advisory domain-to-tenant mapping.
+table DomainEntry {
+    /// Domain (e.g. `example.com`).
+    domain: string;
+    /// Tenant the domain maps to (e.g. `acme`).
+    tenant: string;
+}
+
 /// Discovery request message.
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
-///   1 = Register { uri, target }
+///   1 = Register { uri, target, root_service }
 ///   2 = Revoke { uri }
 ///   3 = ResolvePrefix(uri)
 ///   4 = ResolveLabels { key, value }
+///   5 = ListDomains
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
@@ -54,6 +63,8 @@ table DiscoveryRequest {
     value: string;
     /// Target resource for registration (used by Register variant).
     target: ResourceTarget;
+    /// Marks the registration as the tenant's root service (Register variant).
+    root_service: bool;
 }
 
 /// Discovery response message.
@@ -65,6 +76,7 @@ table DiscoveryRequest {
 ///   3 = Revoked
 ///   4 = Forbidden
 ///   5 = Resolved(targets)
+///   6 = Domains(domains)
 table DiscoveryResponse {
     /// Variant discriminator.
     variant: ubyte;
@@ -72,6 +84,8 @@ table DiscoveryResponse {
     target: ResourceTarget;
     /// The matched resources (used by Resolved variant).
     targets: [ResourceTarget];
+    /// The provisioned domain table (used by the Domains variant).
+    domains: [DomainEntry];
 }
 
 root_type DiscoveryResponse;

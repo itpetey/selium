@@ -1,12 +1,14 @@
 //! DNS resolution spine test.
 //!
-//! Deploys the real `selium-connector-dns` and `selium-dns-demo` WASM guests
-//! against a loopback fake DNS resolver and asserts the resolution data path
-//! end-to-end: the demo guest resolves `example.test` through the connector
-//! (typed `DnsQuery` → UDP/53 → typed `DnsResponse`) and then connects to the
-//! resolved literal.
+//! Deploys the real `selium-discovery`, `selium-connector-dns`, and
+//! `selium-dns-demo` WASM guests against a loopback fake DNS resolver and
+//! asserts the resolution data path end-to-end: the connector creates its own
+//! listener and self-registers the `dns/resolve` route (under its
+//! system-registration grant), and the demo guest resolves `example.test`
+//! through discovery (lookup `dns/resolve` → typed `DnsQuery` → UDP/53 →
+//! typed `DnsResponse`) and then connects to the resolved literal.
 //!
-//! `#[ignore]`d by default because it requires both guests built for
+//! `#[ignore]`d by default because it requires the guests built for
 //! `wasm32-unknown-unknown` first:
 //!
 //! ```sh
@@ -16,10 +18,12 @@
 
 use std::time::{Duration, Instant};
 
-use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector};
+use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_encoding::FlatMsg;
 use selium_proto_dns::RESOLVE_URI;
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
+use selium_runtime::{
+    ReadinessCondition, Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor,
+};
 
 mod common;
 
@@ -29,8 +33,8 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
         module_id: "dns-connector-module".to_string(),
         module_bytes,
         entrypoint: "dns_connector".to_string(),
-        // Only the resolver pointer argument: the runtime injects the
-        // well-known listener as the leading integer argument.
+        // Only the resolver pointer argument: bootstrap prepends the discovery
+        // handle for this Context-first entrypoint.
         arguments: vec![SystemGuestArg::Pointer(resolver.into_bytes())],
         grants: vec![
             CapabilityGrant::new(
@@ -41,11 +45,17 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
                 Capability::SharedMemory,
                 vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            // Self-registration in the root namespace requires the capability.
+            CapabilityGrant::new(Capability::SystemRegistration, vec![]),
         ],
-        dependencies: Vec::new(),
+        dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: Some(RESOLVE_URI.to_string()),
+        serving_role: Some(RESOLVE_URI.to_string()),
         handlers: Vec::new(),
     }
 }
@@ -54,20 +64,15 @@ fn connector_wasm() -> Vec<u8> {
     read_wasm("selium-connector-dns", "selium_connector_dns.wasm")
 }
 
-fn demo_descriptor(
-    module_bytes: Vec<u8>,
-    connector: u64,
-    connect: String,
-) -> SystemGuestDescriptor {
+fn demo_descriptor(module_bytes: Vec<u8>, connect: String) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "dns-demo".to_string(),
         module_id: "dns-demo-module".to_string(),
         module_bytes,
         entrypoint: "resolve_demo".to_string(),
-        arguments: vec![
-            SystemGuestArg::Integer(connector),
-            SystemGuestArg::Pointer(connect.into_bytes()),
-        ],
+        // Only the connect pointer argument: bootstrap prepends the discovery
+        // handle for this Context-first entrypoint.
+        arguments: vec![SystemGuestArg::Pointer(connect.into_bytes())],
         grants: vec![
             CapabilityGrant::new(
                 Capability::Network,
@@ -79,21 +84,50 @@ fn demo_descriptor(
             ),
             CapabilityGrant::new(
                 Capability::HostQueue,
-                vec![ResourceSelector::ExplicitResource(
-                    ResourceIdentity::Shared(connector),
-                )],
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        dependencies: Vec::new(),
+        dependencies: vec!["dns-connector".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
 
 fn demo_wasm() -> Vec<u8> {
     read_wasm("selium-dns-demo", "selium_dns_demo.wasm")
+}
+
+/// The discovery system guest, exactly as the `discovery` integration test
+/// deploys it.
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn discovery_wasm() -> Vec<u8> {
+    read_wasm("selium-discovery", "selium_discovery.wasm")
 }
 
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
@@ -115,40 +149,44 @@ fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
 // whose host-side wake is driven by `tokio::spawn`, so the test provides a
 // Tokio runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the connector and demo guests built for wasm32-unknown-unknown"]
+#[ignore = "requires the discovery, connector and demo guests built for wasm32-unknown-unknown"]
 async fn guest_resolves_via_connector_then_connects_by_literal() {
     let runtime = Runtime::default();
 
-    // The connector's well-known channel is provisioned by the runtime at
-    // spawn time (host listener queue + leading entrypoint argument +
-    // discovery registration), exactly like the discovery listener.
     let resolver_addr = spawn_fake_dns_resolver();
     // A loopback TCP server the demo connects to after resolving.
     let tcp_addr = spawn_fake_tcp_server();
 
-    let connector = runtime
-        .spawn_system_guest(connector_descriptor(
-            connector_wasm(),
-            format!("udp://{resolver_addr}"),
-        ))
-        .expect("bootstrap dns connector");
-    let connector_listener_id = connector
-        .well_known_listener
-        .expect("runtime provisions the connector's well-known listener");
+    let report = runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: true,
+            domain_table: Vec::new(),
+            system_guests: vec![
+                discovery_descriptor(discovery_wasm()),
+                connector_descriptor(connector_wasm(), format!("udp://{resolver_addr}")),
+                demo_descriptor(demo_wasm(), tcp_addr.to_string()),
+            ],
+        })
+        .expect("bootstrap discovery, connector and demo guests");
 
-    let demo = runtime
-        .spawn_system_guest(demo_descriptor(
-            demo_wasm(),
-            connector_listener_id,
-            tcp_addr.to_string(),
-        ))
-        .expect("bootstrap dns demo");
+    let find = |name: &str| {
+        report
+            .guests
+            .iter()
+            .find(|guest| guest.name == name)
+            .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
+            .process_id
+    };
+
+    // The connector self-registered `dns/resolve` before it was admitted ready.
+    let demo = find("dns-demo");
+    let connector = find("dns-connector");
 
     // The demo resolves the name through the connector and then connects to
     // the literal; both surface as guest log markers.
     wait_for_logs(
         &runtime,
-        demo.process_id,
+        demo,
         &[
             "resolved example.test -> 127.0.0.1",
             "connected to 127.0.0.1",
@@ -156,16 +194,22 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
         Duration::from_secs(10),
     );
 
-    let logs = drain_logs(&runtime, demo.process_id);
+    let logs = drain_logs(&runtime, demo);
     assert!(
         !logs.iter().any(|message| message.contains("failed")),
         "demo guest logged an error: {logs:?}"
     );
 
-    runtime.stop_process(demo.process_id).expect("stop demo");
-    runtime
-        .stop_process(connector.process_id)
-        .expect("stop connector");
+    let connector_logs = drain_logs(&runtime, connector);
+    assert!(
+        !connector_logs
+            .iter()
+            .any(|message| message.contains("failed")),
+        "dns-connector guest logged an error: {connector_logs:?}"
+    );
+
+    runtime.stop_process(demo).expect("stop demo");
+    runtime.stop_process(connector).expect("stop connector");
 }
 
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {

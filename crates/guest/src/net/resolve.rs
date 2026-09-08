@@ -1,9 +1,9 @@
 //! Typed name resolution via the DNS connector.
 //!
-//! Resolving is a thin RPC client to the connector's well-known channel:
-//! discovery attach, one unary [`DnsQuery`] → [`DnsResponse`] round-trip,
-//! and a typed outcome mapped to an address list or error. No guest code
-//! touches the DNS wire format.
+//! Resolving is a thin RPC client to the connector's self-registered
+//! `dns/resolve` route: discovery lookup, one unary [`DnsQuery`] →
+//! [`DnsResponse`] round-trip, and a typed outcome mapped to an address list
+//! or error. No guest code touches the DNS wire format.
 
 use std::net::IpAddr;
 

@@ -1,8 +1,11 @@
 //! Discovery system guest.
 //!
 //! The store is a fed index over one deterministic URI taxonomy:
-//! `sel://<tenant>/<type>/<id>` (typed), `sel://<tenant>/<name>` (leaf alias),
-//! and opaque external names (`https://…`, bare hostnames). Everything is
+//! `sel://<tenant>/<type>/<id>` (typed), `sel://<tenant>/<path…>` (named
+//! service routes), and leaf aliases. External wire names are projections of
+//! this space: `resolve_wire_name` strips the tenant domain (longest match
+//! against the advisory domain table, defaulting to the synthetic tenant
+//! label) and reverses the remaining labels into a path. Everything is
 //! tenant-scoped; the empty tenant is the reserved root namespace.
 
 use std::{
@@ -10,7 +13,7 @@ use std::{
 };
 
 use selium_abi::{
-    DiscoveryRequest, DiscoveryResponse, ProcessId, ResourceTarget, decode_rkyv, uri,
+    Capability, DiscoveryRequest, DiscoveryResponse, ProcessId, ResourceTarget, decode_rkyv, uri,
 };
 use selium_guest::{InterfaceMetadata, entrypoint, pattern_interface};
 use selium_shm::{Channel, transport::ShmTransport};
@@ -31,8 +34,8 @@ pub trait DiscoveryControl {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryStore {
-    /// Exact-key registrations: typed URIs, root well-known URIs, and opaque
-    /// external names.
+    /// Exact-key registrations: typed URIs, root well-known URIs, and named
+    /// service routes (`sel://<tenant>/<path…>`).
     registrations: BTreeMap<String, ResourceTarget>,
     /// Ownership table: maps `(process_id, resource_id)` pairs to the
     /// resource's class, populated by Tier-1 (runtime) registrations. Used
@@ -47,9 +50,29 @@ pub struct DiscoveryStore {
     alias_backrefs: HashMap<String, Vec<String>>,
     /// Label index: `(key, value)` → canonical typed URIs.
     label_index: HashMap<(String, String), BTreeSet<String>>,
+    /// Advisory domain→tenant table, provisioned out-of-band (Tier-1 seed).
+    /// Routes and scopes names; never authenticates.
+    domains: uri::DomainTable,
+    /// Owning process per registered route key (typed URIs, named-service
+    /// routes, aliases, and translated wire-name registrations). Used for
+    /// owner-keyed revocation on process exit.
+    route_owners: HashMap<String, ProcessId>,
+    /// Root-service designation per tenant: the bare domain (apex) resolves
+    /// to this internal URI.
+    root_services: HashMap<String, String>,
 }
 
 impl DiscoveryStore {
+    /// Seeds the advisory domain→tenant table (out-of-band provisioning).
+    pub fn seed_domain(&mut self, domain: &str, tenant: &str) {
+        self.domains.seed(domain, tenant);
+    }
+
+    /// Returns whether the domain table maps `domain`.
+    pub fn domain_tenant(&self, domain: &str) -> Option<&str> {
+        self.domains.get(domain)
+    }
+
     /// Stores a Tier-1 registration under its exact key, populates the
     /// ownership table from `owner`, and maintains the label index for typed
     /// targets.
@@ -57,6 +80,7 @@ impl DiscoveryStore {
         if let Some(process_id) = owner {
             self.ownership
                 .insert((process_id, target.resource_id), target.class.clone());
+            self.route_owners.insert(target.uri.clone(), process_id);
         }
         if uri::parse_typed(&target.uri).is_some() {
             for (key, value) in &target.labels {
@@ -73,10 +97,12 @@ impl DiscoveryStore {
     /// to it and cleaning its label index entries.
     fn revoke_key(&mut self, key: &str) {
         let removed = self.registrations.remove(key);
-        // Reverse alias revocation: revoking a target revokes its aliases.
+        // Reverse alias revocation: revoking a target revokes its aliases
+        // (and, for single-segment routes registered under those alias keys,
+        // their exact-key entries too).
         if let Some(aliases) = self.alias_backrefs.remove(key) {
             for alias in aliases {
-                self.aliases.remove(&alias);
+                self.revoke_alias(&alias);
             }
         }
         // Drop label index entries referencing the removed target.
@@ -90,6 +116,8 @@ impl DiscoveryStore {
         for label in empty_labels {
             self.label_index.remove(&label);
         }
+        // Clean up the root-service designation if it pointed here.
+        self.root_services.retain(|_, uri| uri != key);
         // Clean up ownership entries for resources no longer referenced.
         if let Some(target) = removed {
             let still_referenced = self
@@ -101,10 +129,15 @@ impl DiscoveryStore {
                     .retain(|(_, rid), _| *rid != target.resource_id);
             }
         }
+        self.route_owners.remove(key);
     }
 
     /// Removes an alias registration (guest/Tier-2 alias, or a Tier-1
     /// revoke-by-alias-key). Returns the alias's canonical key, if any.
+    ///
+    /// A single-segment named-service route is registered both as an exact
+    /// key (the caller's serving target) and as an alias (the cascade
+    /// backref), so revoking it must remove both.
     fn revoke_alias(&mut self, alias: &str) {
         if let Some(canonical) = self.aliases.remove(alias)
             && let Some(backrefs) = self.alias_backrefs.get_mut(&canonical)
@@ -112,6 +145,28 @@ impl DiscoveryStore {
             backrefs.retain(|a| a != alias);
             if backrefs.is_empty() {
                 self.alias_backrefs.remove(&canonical);
+            }
+        }
+        self.registrations.remove(alias);
+        self.route_owners.remove(alias);
+        self.root_services.retain(|_, uri| uri != alias);
+    }
+
+    /// Revokes every route owned by a process, keyed by the owner recorded at
+    /// registration time. This is owner-keyed revocation living in discovery:
+    /// there is no runtime side map of guest-registered routes.
+    pub fn revoke_by_owner(&mut self, process_id: ProcessId) {
+        let owned_keys: Vec<String> = self
+            .route_owners
+            .iter()
+            .filter(|(_, owner)| **owner == process_id)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for key in owned_keys {
+            if self.aliases.contains_key(&key) {
+                self.revoke_alias(&key);
+            } else {
+                self.revoke_key(&key);
             }
         }
     }
@@ -128,16 +183,53 @@ impl DiscoveryStore {
             DiscoveryRequest::Revoke { uri } => {
                 self.revoke_key(&uri);
             }
+            DiscoveryRequest::RevokeByOwner { process_id } => {
+                self.revoke_by_owner(process_id);
+            }
+            DiscoveryRequest::SeedDomain { domain, tenant } => {
+                self.seed_domain(&domain, &tenant);
+            }
             // Query variants never arrive over the feed.
             DiscoveryRequest::Resolve(_)
             | DiscoveryRequest::ResolvePrefix(_)
-            | DiscoveryRequest::ResolveLabels { .. } => {}
+            | DiscoveryRequest::ResolveLabels { .. }
+            | DiscoveryRequest::ListDomains => {}
         }
     }
 
-    /// Resolves an exact URI (typed, root well-known, leaf alias, or external
-    /// name) with optional tenant scoping.
+    /// Resolves an exact URI (typed, named-service route, leaf alias, or
+    /// external wire name) with optional tenant scoping.
+    ///
+    /// An external wire name is translated through the unified resolver: the
+    /// tenant domain is stripped (longest domain-table match, falling back to
+    /// the synthetic tenant label), the remaining labels are reversed into a
+    /// path, and that internal path is resolved. The bare domain (apex)
+    /// resolves through the tenant's designated root service.
     pub fn resolve_exact(&self, uri: &str, caller_tenant: Option<&str>) -> Option<ResourceTarget> {
+        match self.resolve_internal(uri, caller_tenant) {
+            Some(target) => Some(target),
+            None => {
+                // External wire name: translate to an internal path.
+                if uri::parse_sel(uri).is_some() {
+                    return None;
+                }
+                let (tenant, path) = uri::resolve_wire_name(uri, &self.domains)?;
+                if !tenant_admits(caller_tenant, Some(&tenant)) {
+                    return None;
+                }
+                if path.is_empty() {
+                    let root_service = self.root_services.get(&tenant)?;
+                    return self.resolve_internal(root_service, caller_tenant);
+                }
+                let internal = format!("{}{}/{}", uri::SEL_PREFIX, tenant, path.join("/"));
+                self.resolve_internal(&internal, caller_tenant)
+            }
+        }
+    }
+
+    /// Resolves an internal `sel://` URI: exact registration first, then leaf
+    /// aliases, with tenant scoping.
+    fn resolve_internal(&self, uri: &str, caller_tenant: Option<&str>) -> Option<ResourceTarget> {
         if let Some(target) = self.registrations.get(uri) {
             return tenant_admits(caller_tenant, target.tenant.as_deref()).then(|| target.clone());
         }
@@ -207,70 +299,138 @@ impl DiscoveryStore {
         results
     }
 
+    /// Translates and validates a registration's URI into its internal
+    /// `sel://` form: wire-name projection, advisory domain scoping, root
+    /// capability gating, tenant admission, typed-segment rejection, and
+    /// ownership of the claimed target. Returns the internal URI to register
+    /// under, or `None` when the registration is not admitted.
+    pub fn registration_uri(
+        &self,
+        raw: &str,
+        caller: ProcessId,
+        caller_tenant: Option<&str>,
+        root_allowed: bool,
+        resource_id: u64,
+        class: &selium_abi::ResourceClass,
+    ) -> Option<String> {
+        let uri_str = match uri::parse_sel(raw) {
+            Some(_) => raw.to_string(),
+            None => {
+                let (domain_tenant, path) = uri::resolve_wire_name(raw, &self.domains)?;
+                if domain_tenant.is_empty() {
+                    if !root_allowed {
+                        return None;
+                    }
+                } else if !tenant_admits(caller_tenant, Some(&domain_tenant)) {
+                    // Foreign domain: the mapping does not own this tenant.
+                    return None;
+                }
+                if path.is_empty() {
+                    // A bare domain designates no service of its own.
+                    return None;
+                }
+                format!("{}{}/{}", uri::SEL_PREFIX, domain_tenant, path.join("/"))
+            }
+        };
+        let (tenant, path) = uri::parse_sel(&uri_str)?;
+        if tenant.is_empty() && !root_allowed {
+            return None;
+        }
+        if !tenant_admits(caller_tenant, Some(tenant)) {
+            return None;
+        }
+        let first = path.split('/').next()?;
+        if first.is_empty() || uri::is_class_segment(first) {
+            // Typed URIs are minted by the runtime; guests may not register
+            // them directly.
+            return None;
+        }
+        if self.ownership.get(&(caller, resource_id)) != Some(class) {
+            return None;
+        }
+        Some(uri_str)
+    }
+
     /// Applies a guest (Tier-2) registration with the full validation chain:
-    /// root namespace rejection, leaf-alias/typed rules, then ownership
-    /// (including the claimed resource class) and target existence for
-    /// aliases.
+    /// wire-name translation and domain scoping, root capability gating,
+    /// leaf-alias/typed rules, then ownership (including the claimed resource
+    /// class) and target existence for aliases.
     pub fn apply_register(
         &mut self,
         caller: ProcessId,
         caller_tenant: Option<&str>,
         target: ResourceTarget,
+        root_allowed: bool,
+        root_service: bool,
     ) -> DiscoveryResponse {
-        // A guest may never register inside the root namespace.
-        if uri::is_root_uri(&target.uri) {
+        let Some(uri_str) = self.registration_uri(
+            &target.uri,
+            caller,
+            caller_tenant,
+            root_allowed,
+            target.resource_id,
+            &target.class,
+        ) else {
             return DiscoveryResponse::Forbidden;
-        }
+        };
+        let (tenant, path) = uri::parse_sel(&uri_str).expect("registration_uri is a sel uri");
 
-        if let Some((tenant, _name)) = uri::parse_alias(&target.uri) {
-            // Leaf alias: must live under the caller's own tenant and point
-            // at an owned resource of the claimed class whose typed
-            // registration currently exists.
-            if !tenant_admits(caller_tenant, Some(tenant)) {
-                return DiscoveryResponse::Forbidden;
-            }
-            if self.ownership.get(&(caller, target.resource_id)) != Some(&target.class) {
-                return DiscoveryResponse::Forbidden;
-            }
-            let canonical = uri::resource_uri(tenant, target.class, target.resource_id);
+        // A named-service route (single- or multi-segment): an exact-key
+        // registration storing the caller's full target, so resolution
+        // returns the serving target with its interface metadata intact.
+        if !path.contains('/') {
+            // A single-segment route shares the leaf-alias namespace and must
+            // point at an owned typed target that currently exists; the alias
+            // backref keeps the cascade, so revoking the typed target revokes
+            // the route too.
+            let canonical =
+                uri::resource_uri(tenant, target.class.clone(), target.resource_id);
             if !self.registrations.contains_key(&canonical) {
                 // The claimed target is not registered (e.g. it was already
-                // revoked); a dangling alias would resolve to nothing.
+                // revoked); a dangling route would resolve to nothing.
                 return DiscoveryResponse::NotFound;
             }
-            let alias = target.uri.clone();
-            self.aliases.insert(alias.clone(), canonical.clone());
-            self.alias_backrefs
-                .entry(canonical)
-                .or_default()
-                .push(alias);
-            DiscoveryResponse::Registered
-        } else if uri::parse_sel(&target.uri).is_some() {
-            // Typed URIs are minted by the runtime; guests may not register
-            // them directly.
-            DiscoveryResponse::Forbidden
-        } else {
-            // Opaque external name: validated by ownership (the caller must
-            // own a resource of the claimed class), stored and matched
-            // exactly.
-            if self.ownership.get(&(caller, target.resource_id)) != Some(&target.class) {
-                return DiscoveryResponse::Forbidden;
+            self.aliases.insert(uri_str.clone(), canonical.clone());
+            let backrefs = self.alias_backrefs.entry(canonical).or_default();
+            if !backrefs.contains(&uri_str) {
+                backrefs.push(uri_str.clone());
             }
-            self.registrations.insert(target.uri.clone(), target);
-            DiscoveryResponse::Registered
         }
+        // Pin the stored target to the derived internal route URI, so the
+        // registration is keyed identically however the caller spelled the
+        // name (internal path or wire name projection).
+        let mut target = target;
+        target.uri = uri_str.clone();
+        self.registrations.insert(uri_str.clone(), target);
+        self.route_owners.insert(uri_str.clone(), caller);
+        if root_service {
+            self.root_services.insert(tenant.to_string(), uri_str);
+        }
+        DiscoveryResponse::Registered
     }
 
-    /// Applies a guest (Tier-2) revocation. Guests may revoke only custom
-    /// registrations (leaf aliases and opaque external names) they own,
-    /// within their own tenant; typed URIs are runtime-minted and revoked
-    /// over the Tier-1 feed; unknown keys report `NotFound`.
+    /// Applies a guest (Tier-2) revocation. Guests may revoke only the
+    /// registrations they own, within their own tenant; typed URIs are
+    /// runtime-minted and revoked over the Tier-1 feed; unknown keys report
+    /// `NotFound`.
     pub fn apply_revoke(
         &mut self,
         caller: ProcessId,
         caller_tenant: Option<&str>,
         uri: &str,
     ) -> DiscoveryResponse {
+        // Translate an external wire name to the internal route it projects
+        // to, so a guest can revoke by wire name.
+        if !uri::parse_sel(uri).is_some() {
+            return match uri::resolve_wire_name(uri, &self.domains) {
+                Some((tenant, path)) if !path.is_empty() => {
+                    let internal = format!("{}{}/{}", uri::SEL_PREFIX, tenant, path.join("/"));
+                    self.apply_revoke(caller, caller_tenant, &internal)
+                }
+                _ => DiscoveryResponse::NotFound,
+            };
+        }
+
         // Guests may not revoke the root namespace.
         if uri::is_root_uri(uri) {
             return DiscoveryResponse::Forbidden;
@@ -293,12 +453,16 @@ impl DiscoveryStore {
             }
             self.revoke_alias(uri);
             DiscoveryResponse::Revoked
-        } else if uri::parse_sel(uri).is_some() {
-            // Typed URIs are runtime-minted; only the Tier-1 feed revokes
-            // them.
-            DiscoveryResponse::Forbidden
-        } else {
-            // Opaque external name: the caller must own the target resource.
+        } else if let Some((tenant, path)) = uri::parse_sel(uri) {
+            if uri::is_class_segment(path.split('/').next().unwrap_or("")) {
+                // Typed URIs are runtime-minted; only the Tier-1 feed revokes
+                // them.
+                return DiscoveryResponse::Forbidden;
+            }
+            // Named-service route: the caller must own the target resource.
+            if !tenant_admits(caller_tenant, Some(tenant)) {
+                return DiscoveryResponse::Forbidden;
+            }
             let Some(target) = self.registrations.get(uri).cloned() else {
                 return DiscoveryResponse::NotFound;
             };
@@ -307,7 +471,18 @@ impl DiscoveryStore {
             }
             self.revoke_key(uri);
             DiscoveryResponse::Revoked
+        } else {
+            DiscoveryResponse::NotFound
         }
+    }
+
+    /// Returns the provisioned domain→tenant entries for a `ListDomains`
+    /// request.
+    pub fn domain_entries(&self) -> Vec<(String, String)> {
+        self.domains
+            .entries()
+            .map(|(domain, tenant)| (domain.to_string(), tenant.to_string()))
+            .collect()
     }
 
     pub fn ingest_interface_metadata(&mut self, uri: &str, metadata: InterfaceMetadata) -> bool {
@@ -346,9 +521,11 @@ fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
         DiscoveryRequest::ResolvePrefix(_) | DiscoveryRequest::ResolveLabels { .. } => {
             DiscoveryResponse::Resolved(Vec::new())
         }
-        DiscoveryRequest::Register { .. } | DiscoveryRequest::Revoke { .. } => {
-            DiscoveryResponse::Forbidden
-        }
+        DiscoveryRequest::ListDomains => DiscoveryResponse::Domains(Vec::new()),
+        DiscoveryRequest::Register { .. }
+        | DiscoveryRequest::Revoke { .. }
+        | DiscoveryRequest::RevokeByOwner { .. }
+        | DiscoveryRequest::SeedDomain { .. } => DiscoveryResponse::Forbidden,
     }
 }
 
@@ -486,16 +663,62 @@ async fn handler(
                                     store.resolve_labels(&key, &value, caller_tenant.as_deref());
                                 DiscoveryResponse::Resolved(targets)
                             }
-                            DiscoveryRequest::Register { target, .. } => store.apply_register(
-                                client_process_id,
-                                caller_tenant.as_deref(),
+                            DiscoveryRequest::Register {
                                 target,
-                            ),
+                                root_service,
+                                ..
+                            } => {
+                                // Root-namespace registrations (a `sel:///…`
+                                // URI or a single-label wire name) require the
+                                // system-registration capability.
+                                let root_candidate = uri::is_root_uri(&target.uri)
+                                    || !uri::parse_sel(&target.uri).is_some();
+                                let root_allowed = root_candidate
+                                    && selium_guest::process_capability(
+                                        client_process_id,
+                                        Capability::SystemRegistration,
+                                    )
+                                    .unwrap_or(false);
+                                let registered_uri = store.registration_uri(
+                                    &target.uri,
+                                    client_process_id,
+                                    caller_tenant.as_deref(),
+                                    root_allowed,
+                                    target.resource_id,
+                                    &target.class,
+                                );
+                                let response = store.apply_register(
+                                    client_process_id,
+                                    caller_tenant.as_deref(),
+                                    target,
+                                    root_allowed,
+                                    root_service,
+                                );
+                                // Record the registration with the runtime (on
+                                // success) so role-declared readiness can be
+                                // gated on discoverable self-registration.
+                                if matches!(response, DiscoveryResponse::Registered)
+                                    && let Some(uri) = registered_uri
+                                    && let Err(error) =
+                                        selium_guest::record_registration(client_process_id, &uri)
+                                {
+                                    selium_guest::warn!("registration record failed: {error}");
+                                }
+                                response
+                            }
                             DiscoveryRequest::Revoke { uri } => store.apply_revoke(
                                 client_process_id,
                                 caller_tenant.as_deref(),
                                 &uri,
                             ),
+                            DiscoveryRequest::ListDomains => {
+                                DiscoveryResponse::Domains(store.domain_entries())
+                            }
+                            // Tier-1-only operations never arrive over RPC.
+                            DiscoveryRequest::SeedDomain { .. }
+                            | DiscoveryRequest::RevokeByOwner { .. } => {
+                                DiscoveryResponse::Forbidden
+                            }
                         },
                         Err(error) => {
                             selium_guest::warn!("discovery payload decode failed: {error}");
@@ -619,23 +842,53 @@ mod tests {
     }
 
     #[test]
-    fn alias_resolves_to_the_typed_target() {
+    fn single_segment_route_resolves_to_the_serving_target() {
         let mut store = DiscoveryStore::default();
         store.store(process("acme", 123, vec![]), Some(123));
-        store.apply_register(
+        let route = target(
+            "sel://acme/proxy",
             123,
             Some("acme"),
-            target(
-                "sel://acme/proxy",
-                123,
-                Some("acme"),
-                selium_abi::ResourceClass::Process,
-            ),
+            selium_abi::ResourceClass::Process,
         );
+        store.apply_register(123, Some("acme"), route.clone(), false, false);
 
+        // A single-segment route is an exact-key registration of the caller's
+        // own target (same resource as the typed registration, carrying the
+        // route URI and any interface metadata), not a bare pointer that
+        // resolves to the typed target.
         assert_eq!(
             store.resolve_exact("sel://acme/proxy", Some("acme")),
-            Some(process("acme", 123, vec![]))
+            Some(route)
+        );
+    }
+
+    #[test]
+    fn single_segment_route_preserves_interface_metadata() {
+        // A single-segment serve (e.g. `HttpServeStream::bind(ctx, "api")`)
+        // carries an interface marker on its target; resolution must return
+        // the caller's target so the marker survives (a bare alias pointer
+        // to the typed registration would drop it).
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        let mut route = target(
+            "sel://acme/api",
+            7,
+            Some("acme"),
+            selium_abi::ResourceClass::HostQueue,
+        );
+        route.interface = Some(InterfaceMetadata {
+            name: "selium.http/stream".to_string(),
+            methods: Vec::new(),
+        });
+        store.apply_register(42, Some("acme"), route.clone(), false, false);
+
+        let resolved = store
+            .resolve_exact("api.acme", Some("acme"))
+            .expect("route resolves");
+        assert_eq!(
+            resolved.interface.expect("interface marker survives"),
+            route.interface.unwrap()
         );
     }
 
@@ -652,6 +905,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
 
         store.revoke_key("sel://acme/region/456");
@@ -681,6 +936,8 @@ mod tests {
                 None,
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
         assert!(
@@ -704,6 +961,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
     }
@@ -723,6 +982,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
         assert!(
@@ -746,6 +1007,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
     }
@@ -766,6 +1029,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
     }
@@ -825,73 +1090,130 @@ mod tests {
     }
 
     #[test]
-    fn external_name_is_stored_and_matched_exactly() {
+    fn wire_name_resolves_through_addressing() {
         let mut store = DiscoveryStore::default();
         store.store(queue("acme", 7), Some(42));
-
-        let external = target(
-            "https://acme.com/path",
+        // A named-service route: the tenant's queue under the path `bridge`.
+        let bridge = target(
+            "sel://acme/bridge",
             7,
-            None,
+            Some("acme"),
             selium_abi::ResourceClass::HostQueue,
         );
-        let response = store.apply_register(42, Some("acme"), external.clone());
-        assert!(matches!(response, DiscoveryResponse::Registered));
+        assert!(matches!(
+            store.apply_register(42, Some("acme"), bridge.clone(), false, false),
+            DiscoveryResponse::Registered
+        ));
 
+        // The synthetic label resolves without any table entry, mapping
+        // `bridge.acme` onto the internal `sel://acme/bridge` route. The
+        // resolved target is the route's own registration (same queue
+        // resource, carrying the route URI and interface metadata).
         assert_eq!(
-            store.resolve_exact("https://acme.com/path", Some("acme")),
-            Some(external)
+            store.resolve_exact("bridge.acme", Some("acme")),
+            store.resolve_exact("sel://acme/bridge", Some("acme"))
         );
-        // A non-equivalently-spelled key does not match (opaque exact match).
-        assert!(
-            store
-                .resolve_exact("https://acme.com/path/", Some("acme"))
-                .is_none()
+        assert_eq!(
+            store.resolve_exact("bridge.acme", Some("acme")),
+            Some(bridge)
         );
-        assert!(
-            store
-                .resolve_exact("http://acme.com/path", Some("acme"))
-                .is_none()
+        // Unknown traffic does not contact the synthetic namespace.
+        assert_eq!(store.resolve_exact("bridge.beta", Some("acme")), None);
+    }
+
+    #[test]
+    fn registered_domain_wire_name_resolves() {
+        let mut store = DiscoveryStore::default();
+        store.seed_domain("example.com", "acme");
+        store.store(queue("acme", 7), Some(42));
+        let bridge = target(
+            "sel://acme/bridge",
+            7,
+            Some("acme"),
+            selium_abi::ResourceClass::HostQueue,
+        );
+        store.apply_register(42, Some("acme"), bridge.clone(), false, false);
+
+        // `example.com -> acme` is provisioned, so `bridge.example.com`
+        // reverses into path `["bridge"]` within tenant `acme`.
+        assert_eq!(
+            store.resolve_exact("bridge.example.com", Some("acme")),
+            Some(bridge)
         );
     }
 
     #[test]
-    fn external_name_registration_requires_ownership() {
+    fn domain_table_covers_unknown_and_provisioned_cases() {
+        let mut store = DiscoveryStore::default();
+        assert_eq!(store.domain_tenant("example.com"), None);
+
+        store.seed_domain("example.com", "acme");
+        assert_eq!(store.domain_tenant("example.com"), Some("acme"));
+        assert_eq!(store.domain_tenant("example.org"), None);
+    }
+
+    #[test]
+    fn tier1_seed_domain_populates_the_table() {
+        // The runtime publishes SeedDomain over the Tier-1 feed; the store
+        // applies it as out-of-band provisioning.
+        let mut store = DiscoveryStore::default();
+        store.apply_tier1_event(DiscoveryRequest::SeedDomain {
+            domain: "example.com".to_string(),
+            tenant: "acme".to_string(),
+        });
+        assert_eq!(store.domain_tenant("example.com"), Some("acme"));
+    }
+
+    #[test]
+    fn tier1_revoke_by_owner_revokes_guest_routes() {
+        // A process exit arrives as a Tier-1 RevokeByOwner event; the store
+        // revokes every route the owner registered, with no runtime side map.
         let mut store = DiscoveryStore::default();
         store.store(queue("acme", 7), Some(42));
-
-        // Process 99 does not own resource 7.
-        let response = store.apply_register(
-            99,
-            Some("acme"),
-            target(
-                "https://acme.com/path",
-                7,
-                None,
-                selium_abi::ResourceClass::HostQueue,
-            ),
-        );
-        assert!(matches!(response, DiscoveryResponse::Forbidden));
-    }
-
-    #[test]
-    fn external_name_class_must_match_the_owned_resource() {
-        let mut store = DiscoveryStore::default();
-        store.store(region("acme", 7), Some(42));
-
-        // Process 42 owns resource 7 as a SharedRegion; claiming it is a
-        // HostQueue must not pass, even for the owner.
-        let response = store.apply_register(
+        store.apply_register(
             42,
             Some("acme"),
             target(
-                "https://acme.com/path",
+                "sel://acme/bridge",
                 7,
-                None,
+                Some("acme"),
                 selium_abi::ResourceClass::HostQueue,
             ),
+            false,
+            false,
+        );
+        assert!(store.resolve_exact("bridge.acme", Some("acme")).is_some());
+
+        store.apply_tier1_event(DiscoveryRequest::RevokeByOwner { process_id: 42 });
+        assert_eq!(store.resolve_exact("bridge.acme", Some("acme")), None);
+    }
+
+    #[test]
+    fn foreign_domain_registration_is_refused() {
+        let mut store = DiscoveryStore::default();
+        store.seed_domain("example.com", "acme");
+        store.store(queue("beta", 7), Some(99));
+
+        // Tenant `beta` attempts to register a name under `example.com`, a
+        // domain owned by `acme`: the derived tenant does not admit the
+        // caller, so the registration is refused.
+        let response = store.apply_register(
+            99,
+            Some("beta"),
+            target(
+                "bridge.example.com",
+                7,
+                Some("beta"),
+                selium_abi::ResourceClass::HostQueue,
+            ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
+        assert_eq!(
+            store.resolve_exact("bridge.example.com", Some("acme")),
+            None
+        );
     }
 
     #[test]
@@ -909,21 +1231,19 @@ mod tests {
     fn guest_revokes_their_own_custom_uri() {
         let mut store = DiscoveryStore::default();
         store.store(queue("acme", 7), Some(42));
-        let external = target(
-            "https://acme.com/path",
+        let route = target(
+            "sel://acme/bridge",
             7,
-            None,
+            Some("acme"),
             selium_abi::ResourceClass::HostQueue,
         );
-        store.apply_register(42, Some("acme"), external);
+        store.apply_register(42, Some("acme"), route, false, false);
 
-        let response = store.apply_revoke(42, Some("acme"), "https://acme.com/path");
+        // Revocation accepts the wire name and translates it to the internal
+        // route it projects onto.
+        let response = store.apply_revoke(42, Some("acme"), "bridge.acme");
         assert!(matches!(response, DiscoveryResponse::Revoked));
-        assert!(
-            store
-                .resolve_exact("https://acme.com/path", Some("acme"))
-                .is_none()
-        );
+        assert_eq!(store.resolve_exact("bridge.acme", Some("acme")), None);
     }
 
     #[test]
@@ -961,6 +1281,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(registered, DiscoveryResponse::Registered));
 
@@ -987,6 +1309,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
 
         // Process 99 does not own resource 7, so it may not revoke the alias.
@@ -1000,26 +1324,22 @@ mod tests {
     }
 
     #[test]
-    fn guest_cannot_revoke_an_external_name_it_does_not_own() {
+    fn guest_cannot_revoke_a_route_it_does_not_own() {
         let mut store = DiscoveryStore::default();
         store.store(queue("acme", 7), Some(42));
-        store.apply_register(
-            42,
+        let bridge = target(
+            "sel://acme/bridge",
+            7,
             Some("acme"),
-            target(
-                "https://acme.com/path",
-                7,
-                None,
-                selium_abi::ResourceClass::HostQueue,
-            ),
+            selium_abi::ResourceClass::HostQueue,
         );
+        store.apply_register(42, Some("acme"), bridge.clone(), false, false);
 
-        let response = store.apply_revoke(99, Some("acme"), "https://acme.com/path");
+        let response = store.apply_revoke(99, Some("acme"), "bridge.acme");
         assert!(matches!(response, DiscoveryResponse::Forbidden));
-        assert!(
-            store
-                .resolve_exact("https://acme.com/path", Some("acme"))
-                .is_some()
+        assert_eq!(
+            store.resolve_exact("bridge.acme", Some("acme")),
+            Some(bridge)
         );
     }
 
@@ -1028,7 +1348,7 @@ mod tests {
         let mut store = DiscoveryStore::default();
         store.store(region("acme", 7), Some(42));
 
-        let response = store.apply_revoke(42, Some("acme"), "https://unknown.example/path");
+        let response = store.apply_revoke(42, Some("acme"), "sel://acme/nowhere");
         assert!(matches!(response, DiscoveryResponse::NotFound));
     }
 
@@ -1048,6 +1368,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::Process,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::Forbidden));
     }
@@ -1071,6 +1393,8 @@ mod tests {
                 Some("acme"),
                 selium_abi::ResourceClass::SharedRegion,
             ),
+            false,
+            false,
         );
         assert!(matches!(response, DiscoveryResponse::NotFound));
     }
@@ -1112,6 +1436,7 @@ mod tests {
                 labels: Vec::new(),
             },
             owner: None,
+            root_service: false,
         };
         assert!(matches!(
             denied_response(&register),
@@ -1149,20 +1474,23 @@ mod tests {
                 .is_some()
         );
 
-        // Alias: the owning process registers a leaf alias for the region.
-        let alias = target(
+        // Route: the owning process registers a single-segment route
+        // (`sel://acme/cache`) for the region. Resolution returns the
+        // route's own registration — same resource, route URI — and
+        // revoking the typed registration cascades to the route below.
+        let route = target(
             "sel://acme/cache",
             7,
             Some("acme"),
             selium_abi::ResourceClass::SharedRegion,
         );
         assert!(matches!(
-            store.apply_register(123, Some("acme"), alias),
+            store.apply_register(123, Some("acme"), route.clone(), false, false),
             DiscoveryResponse::Registered
         ));
         assert_eq!(
             store.resolve_exact("sel://acme/cache", Some("acme")),
-            Some(region("acme", 7))
+            Some(route)
         );
 
         // Label query: the process node carries `app=web`.
@@ -1187,6 +1515,137 @@ mod tests {
             store
                 .resolve_exact("sel://acme/proc/123", Some("acme"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn owner_exit_revokes_owned_routes() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        store.apply_register(
+            42,
+            Some("acme"),
+            target(
+                "sel://acme/bridge",
+                7,
+                Some("acme"),
+                selium_abi::ResourceClass::HostQueue,
+            ),
+            false,
+            false,
+        );
+        assert!(store.resolve_exact("bridge.acme", Some("acme")).is_some());
+
+        // Owner-keyed revocation: the owning process exits and discovery
+        // revokes its routes without a runtime-maintained side map.
+        store.revoke_by_owner(42);
+        assert_eq!(store.resolve_exact("bridge.acme", Some("acme")), None);
+        assert_eq!(store.resolve_exact("sel://acme/bridge", Some("acme")), None);
+    }
+
+    #[test]
+    fn root_registration_requires_capability() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("", 7), Some(42));
+
+        // Without the system-registration capability, a root-namespace route
+        // is refused.
+        let denied = store.apply_register(
+            42,
+            None,
+            target(
+                "sel:///dns/resolve",
+                7,
+                None,
+                selium_abi::ResourceClass::HostQueue,
+            ),
+            false,
+            false,
+        );
+        assert!(matches!(denied, DiscoveryResponse::Forbidden));
+
+        // With the capability, the same registration is accepted.
+        let allowed = store.apply_register(
+            42,
+            None,
+            target(
+                "sel:///dns/resolve",
+                7,
+                None,
+                selium_abi::ResourceClass::HostQueue,
+            ),
+            true,
+            false,
+        );
+        assert!(matches!(allowed, DiscoveryResponse::Registered));
+        assert!(store.resolve_exact("sel:///dns/resolve", None).is_some());
+    }
+
+    #[test]
+    fn root_service_designation_resolves_the_apex() {
+        let mut store = DiscoveryStore::default();
+        store.seed_domain("example.com", "acme");
+        store.store(queue("acme", 7), Some(42));
+        // The tenant designates `["http", "prod"]` as its root service.
+        store.apply_register(
+            42,
+            Some("acme"),
+            target(
+                "sel://acme/http/prod",
+                7,
+                Some("acme"),
+                selium_abi::ResourceClass::HostQueue,
+            ),
+            false,
+            true,
+        );
+
+        // The bare domain resolves to the designated root service.
+        assert_eq!(
+            store.resolve_exact("example.com", Some("acme")),
+            Some(target(
+                "sel://acme/http/prod",
+                7,
+                Some("acme"),
+                selium_abi::ResourceClass::HostQueue,
+            ))
+        );
+    }
+
+    #[test]
+    fn wire_name_registration_produces_the_same_route_as_serve() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        // A guest registers a bare wire name; it translates to the internal
+        // path and is resolvable both ways.
+        let route = target(
+            "bridge.acme",
+            7,
+            Some("acme"),
+            selium_abi::ResourceClass::HostQueue,
+        );
+        let response = store.apply_register(42, Some("acme"), route.clone(), false, false);
+        assert!(matches!(response, DiscoveryResponse::Registered));
+        // Both spellings resolve to the same route registration, whose target
+        // is keyed by the derived internal path (the wire name is a
+        // projection, not a second key).
+        assert_eq!(
+            store.resolve_exact("bridge.acme", Some("acme")),
+            Some(target(
+                "sel://acme/bridge",
+                7,
+                Some("acme"),
+                selium_abi::ResourceClass::HostQueue,
+            ))
+        );
+        assert_eq!(
+            store.resolve_exact("sel://acme/bridge", Some("acme")),
+            Some(target(
+                "sel://acme/bridge",
+                7,
+                Some("acme"),
+                selium_abi::ResourceClass::HostQueue,
+            ))
         );
     }
 }

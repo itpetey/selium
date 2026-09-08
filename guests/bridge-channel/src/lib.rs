@@ -404,10 +404,11 @@ where
 
 /// Bridge channel entrypoint.
 ///
-/// Arguments: the relayed byte-channel region `shared_id` (delivered by
-/// `bridge-server`) and the discovery handle for channel-URI resolution.
+/// Arguments: the bootstrap discovery `Context` (built by the entrypoint
+/// macro, used for channel-URI resolution) and the relayed byte-channel
+/// region `shared_id` (delivered by `bridge-server`).
 #[entrypoint]
-async fn bridge_channel(shared_id: u64, discovery: u64) {
+async fn bridge_channel(mut ctx: Context, shared_id: u64) {
     drop(selium_guest::log::init());
     info!("bridge-channel: started");
 
@@ -415,14 +416,6 @@ async fn bridge_channel(shared_id: u64, discovery: u64) {
         Ok(stream) => stream,
         Err(e) => {
             error!("bridge-channel: attach stream region failed: {e}");
-            return;
-        }
-    };
-
-    let mut ctx = match Context::from_raw(discovery).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            error!("bridge-channel: discovery attach failed: {e}");
             return;
         }
     };

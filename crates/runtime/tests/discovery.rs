@@ -24,7 +24,6 @@ use selium_abi::{
     decode_rkyv,
 };
 use selium_encoding::FlatMsg;
-use selium_proto_dns::RESOLVE_URI;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
@@ -69,6 +68,7 @@ fn discovery_bootstrap_slice_end_to_end() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
+            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(discovery_wasm),
                 discovery_probe_descriptor(probe_wasm),
@@ -143,49 +143,27 @@ fn discovery_bootstrap_slice_end_to_end() {
         "expected Tier-1 register URI {expected_uri}, got: {registered:?}"
     );
 
-    // --- Well-known connector channel provisioning ---
-    // Spawn a stub guest standing in for the DNS connector after attaching
-    // the subscriber, so its provision-time Register is observable on the
-    // feed. The runtime provisions the channel (host listener queue +
-    // leading entrypoint argument) and publishes the well-known URI.
-    let stub = runtime
-        .spawn_system_guest(well_known_stub_descriptor())
-        .expect("spawn well-known stub");
-    let stub_listener = stub
-        .well_known_listener
-        .expect("runtime provisions the well-known listener");
-    assert_eq!(
-        runtime.well_known_uri(stub.process_id),
-        Some((RESOLVE_URI.to_string(), stub_listener))
-    );
-    let registered = drain_register_uris(&mut subscriber);
-    assert!(
-        registered.contains(RESOLVE_URI),
-        "expected well-known register URI {RESOLVE_URI}, got: {registered:?}"
-    );
-
     // --- 2.4: Assert revocation ---
-    // Stop the probe process — the runtime must publish Revoke events.
+    // Stop the probe process — the runtime must publish Revoke events for
+    // the typed registrations it minted, plus a single owner-keyed
+    // RevokeByOwner (revocation of any routes the process registered itself
+    // lives in discovery, keyed by the recorded owner — there is no runtime
+    // side map of guest-registered routes).
     runtime
         .stop_process(probe_guest.process_id)
         .expect("stop probe process");
 
-    let revoked = drain_revoke_uris(&mut subscriber);
+    let (revoked, revoked_owners) = drain_revoke_events(&mut subscriber);
     assert!(
         revoked.contains(&expected_uri),
         "expected revoke for {expected_uri}, got: {revoked:?}"
     );
-
-    // Stopping the well-known stub revokes its well-known URI too.
-    runtime
-        .stop_process(stub.process_id)
-        .expect("stop well-known stub");
-    let revoked = drain_revoke_uris(&mut subscriber);
     assert!(
-        revoked.contains(RESOLVE_URI),
-        "expected revoke for {RESOLVE_URI}, got: {revoked:?}"
+        revoked_owners.contains(&probe_guest.process_id),
+        "expected owner-keyed revoke for process {}, got: {:?}",
+        probe_guest.process_id,
+        revoked_owners
     );
-    assert!(runtime.well_known_uri(stub.process_id).is_none());
 
     // Verify the probe process is fully gone.
     assert_eq!(runtime.loaded_guest_count(), 1); // only discovery remains
@@ -217,7 +195,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
@@ -242,7 +220,7 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
@@ -295,43 +273,32 @@ fn drain_register_uris(
 }
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_revoke_uris(
+fn drain_revoke_events(
     subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
-) -> std::collections::HashSet<String> {
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<ProcessId>,
+) {
     let mut uris = std::collections::HashSet::new();
+    let mut owners = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
             Ok((bytes, _tag)) => {
                 let request: DiscoveryRequest =
                     decode_rkyv(&bytes).expect("decode discovery request");
-                if let DiscoveryRequest::Revoke { uri } = request {
-                    uris.insert(uri);
+                match request {
+                    DiscoveryRequest::Revoke { uri } => {
+                        uris.insert(uri);
+                    }
+                    DiscoveryRequest::RevokeByOwner { process_id } => {
+                        owners.insert(process_id);
+                    }
+                    _ => {}
                 }
             }
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    uris
-}
-
-/// A minimal guest serving the DNS connector's well-known URI: its
-/// entrypoint takes the runtime-injected listener id (one `i64` param).
-fn well_known_stub_descriptor() -> SystemGuestDescriptor {
-    let module_bytes = wat::parse_str(r#"(module (func (export "boot") (param i64)))"#)
-        .expect("compile well-known stub wat");
-
-    SystemGuestDescriptor {
-        name: "dns-stub".to_string(),
-        module_id: "dns-stub-module".to_string(),
-        module_bytes,
-        entrypoint: "boot".to_string(),
-        arguments: Vec::new(), // populated by provisioning via the well-known listener
-        grants: Vec::new(),    // provisioning adds the listener HostQueue grant
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        well_known_uri: Some(RESOLVE_URI.to_string()),
-        handlers: Vec::new(),
-    }
+    (uris, owners)
 }

@@ -47,6 +47,36 @@ impl<'a> ResourceTarget<'a> {
     builder.finish()
   }
 
+  pub fn unpack(&self) -> ResourceTargetT {
+    let uri = self.uri().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let host_id = self.host_id().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let resource_id = self.resource_id();
+    let interface = self.interface().map(|x| {
+      alloc::boxed::Box::new(x.unpack())
+    });
+    let tenant = self.tenant().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let class = self.class().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let labels = self.labels().map(|x| {
+      x.iter().map(|t| t.unpack()).collect()
+    });
+    ResourceTargetT {
+      uri,
+      host_id,
+      resource_id,
+      interface,
+      tenant,
+      class,
+      labels,
+    }
+  }
 
   /// URI of the resource.
   #[inline]
@@ -206,5 +236,64 @@ impl ::core::fmt::Debug for ResourceTarget<'_> {
       ds.field("class", &self.class());
       ds.field("labels", &self.labels());
       ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceTargetT {
+  pub uri: Option<alloc::string::String>,
+  pub host_id: Option<alloc::string::String>,
+  pub resource_id: u64,
+  pub interface: Option<alloc::boxed::Box<InterfaceMetadataT>>,
+  pub tenant: Option<alloc::string::String>,
+  pub class: Option<alloc::string::String>,
+  pub labels: Option<alloc::vec::Vec<LabelT>>,
+}
+impl Default for ResourceTargetT {
+  fn default() -> Self {
+    Self {
+      uri: None,
+      host_id: None,
+      resource_id: 0,
+      interface: None,
+      tenant: None,
+      class: None,
+      labels: None,
+    }
+  }
+}
+impl ResourceTargetT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<ResourceTarget<'b>> {
+    let uri = self.uri.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let host_id = self.host_id.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let resource_id = self.resource_id;
+    let interface = self.interface.as_ref().map(|x|{
+      x.pack(_fbb)
+    });
+    let tenant = self.tenant.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let class = self.class.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let labels = self.labels.as_ref().map(|x|{
+      let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
+    });
+    ResourceTarget::create(_fbb, &ResourceTargetArgs{
+      uri,
+      host_id,
+      resource_id,
+      interface,
+      tenant,
+      class,
+      labels,
+    })
   }
 }

@@ -217,9 +217,10 @@ fn foundation_crates_work_together_through_hostcalls() {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap runtime");
     assert_eq!(report.guests.len(), 1);
@@ -262,9 +263,10 @@ fn hostcalls_enforce_session_grants() {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap runtime");
 
@@ -425,7 +427,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         })
         .expect("spawn owner");
@@ -445,7 +447,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         })
         .expect("spawn resolver");
@@ -465,7 +467,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         })
         .expect("spawn intruder");
@@ -716,9 +718,10 @@ fn spawn_guest(
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap guest");
     report.guests[0].process_id

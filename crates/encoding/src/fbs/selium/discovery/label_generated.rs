@@ -37,6 +37,18 @@ impl<'a> Label<'a> {
     builder.finish()
   }
 
+  pub fn unpack(&self) -> LabelT {
+    let key = self.key().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let value = self.value().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    LabelT {
+      key,
+      value,
+    }
+  }
 
   /// Label key.
   #[inline]
@@ -116,5 +128,36 @@ impl ::core::fmt::Debug for Label<'_> {
       ds.field("key", &self.key());
       ds.field("value", &self.value());
       ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelT {
+  pub key: Option<alloc::string::String>,
+  pub value: Option<alloc::string::String>,
+}
+impl Default for LabelT {
+  fn default() -> Self {
+    Self {
+      key: None,
+      value: None,
+    }
+  }
+}
+impl LabelT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<Label<'b>> {
+    let key = self.key.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let value = self.value.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    Label::create(_fbb, &LabelArgs{
+      key,
+      value,
+    })
   }
 }

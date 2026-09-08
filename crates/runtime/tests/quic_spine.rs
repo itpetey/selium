@@ -110,7 +110,7 @@ fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: vec!["sel-quic".to_string()],
     }
 }
@@ -122,6 +122,8 @@ fn connector_wasm() -> Vec<u8> {
 /// The echo demo app guest. Note the grants: HostQueue (create its listener,
 /// attach the discovery listener) + SharedMemory (attach delivered stream
 /// regions) — **no `Network` grant**: QUIC is terminated by the connector.
+/// `SystemRegistration` lets the root-tenant demo register its synthetic
+/// `localhost` route under the root namespace.
 fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "quic-demo".to_string(),
@@ -138,11 +140,12 @@ fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::SharedMemory,
                 vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
+            CapabilityGrant::new(Capability::SystemRegistration, vec![]),
         ],
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
@@ -174,7 +177,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
@@ -250,6 +253,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
                 connector_descriptor(connector_wasm()),
                 demo_descriptor(demo_wasm()),
             ],
+            domain_table: Vec::new(),
         })
         .expect("bootstrap discovery, connector and demo guests");
 

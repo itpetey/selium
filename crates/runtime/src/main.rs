@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
                 dependencies: app.dependencies.clone(),
                 readiness,
                 tenant: app.tenant.clone(),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
         })
@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
     let config = RuntimeConfig {
         start_discovery: cli.start_discovery,
         system_guests: guests,
+        domain_table: Vec::new(),
     };
     let report = runtime.bootstrap_system_guests(config)?;
 
@@ -155,7 +156,7 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         dependencies: Vec::new(),
         readiness: ReadinessCondition::Immediate,
         tenant: None,
-        well_known_uri: None,
+        serving_role: None,
         handlers: Vec::new(),
     }
 }
@@ -266,6 +267,7 @@ async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
             system_guests: vec![net_demo_descriptor(module_bytes)],
+            domain_table: Vec::new(),
         })
         .map_err(|error| anyhow::anyhow!("bootstrap: {error}"))?;
     #[expect(

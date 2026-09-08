@@ -1,10 +1,10 @@
 //! DNS egress connector system guest.
 //!
 //! Performs real DNS over UDP/53 on behalf of other guests, exposing name
-//! resolution as a typed, capability-gated RPC on a well-known channel. The
-//! connector holds the network authority (`Network + UdpSocket`); resolving
-//! guests hold only a channel grant for the well-known channel, which the
-//! runtime provisions at boot (like the discovery listener).
+//! resolution as a typed, capability-gated RPC on a route it registers
+//! itself. The connector holds the network authority (`Network + UdpSocket`);
+//! resolving guests hold only a channel grant, resolving `dns/resolve`
+//! through discovery rather than attaching a runtime-provisioned channel.
 //!
 //! # Architecture
 //!
@@ -22,8 +22,8 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use correlate::{InFlight, response_from_parsed};
 use parking_lot::Mutex;
 use selium_guest::{
-    Datagram, Instant, ResourceListener, Timer, UdpSocket, debug, entrypoint, error, info,
-    mark_ready, spawn, warn,
+    Context, Datagram, Instant, ResourceClass, ResourceListener, ResourceTarget, Serve, Timer,
+    UdpSocket, debug, entrypoint, error, info, mark_ready, spawn, warn,
 };
 use selium_proto_dns::{DnsOutcome, DnsQuery, DnsResponse, wire};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
@@ -70,14 +70,13 @@ async fn accept_loop(
 
 /// Entrypoint for the DNS connector system guest.
 ///
-/// Receives its well-known channel as a host-provisioned listener queue
-/// (`listener`) and the upstream resolver address as a pointer argument
-/// (`(address, length)` over `udp://<resolver>:53` bytes), binds a raw UDP
-/// socket, and serves typed [`DnsQuery`]s. The well-known URI registration is
-/// performed at provision time by the runtime, exactly like the discovery
-/// listener's channel.
+/// Receives a discovery `Context` and the upstream resolver address as a
+/// pointer argument (`(address, length)` over `udp://<resolver>:53` bytes),
+/// binds a raw UDP socket, creates its own listener queue, and self-registers
+/// the `dns/resolve` route in the root namespace — permitted only because the
+/// connector holds the system-registration capability.
 #[entrypoint]
-async fn dns_connector(listener: u64, resolver: (u64, u64)) {
+async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) {
     drop(selium_guest::log::init());
     info!("dns-connector: starting");
 
@@ -94,13 +93,37 @@ async fn dns_connector(listener: u64, resolver: (u64, u64)) {
         }
     };
 
-    let listener = match ResourceListener::attach(listener) {
+    let listener = match ResourceListener::create() {
         Ok(listener) => listener,
         Err(e) => {
-            error!("dns-connector: attach listener failed: {e}");
+            error!("dns-connector: create listener failed: {e}");
             return;
         }
     };
+
+    // Self-register the `dns/resolve` route under the root namespace. The
+    // connector runs as the root/platform tenant, so this requires the
+    // system-registration capability (enforced by discovery).
+    let target = ResourceTarget {
+        uri: String::new(), // pinned by `serve` to the derived internal path
+        host_id: String::new(),
+        resource_id: listener.descriptor().shared_id,
+        interface: None,
+        tenant: None,
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
+    };
+    if let Err(e) = ctx
+        .serve(Serve {
+            path: vec!["dns".to_string(), "resolve".to_string()],
+            target,
+            default: false,
+        })
+        .await
+    {
+        error!("dns-connector: serve failed: {e}");
+        return;
+    }
 
     mark_ready();
 

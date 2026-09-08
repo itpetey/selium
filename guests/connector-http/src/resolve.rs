@@ -1,13 +1,18 @@
 //! Discovery-based route resolution with caching.
 //!
-//! The connector holds no routing table: routes live in discovery as
-//! live-table entries registered by app guests. The resolver caches
+//! The connector holds no routing table: routes live in discovery as named
+//! service routes registered by app guests via
+//! [`Context::serve`](selium_guest::Context::serve). A request's Host is
+//! projected through the unified
+//! [`uri::resolve_wire_name`](selium_abi::uri::resolve_wire_name) into a
+//! tenant and base path, and the request path is then resolved within that
+//! tenant's namespace against the internal routes. The resolver caches
 //! lookups per connection-worker and evicts on attach failure, so a stale
 //! entry costs one failed request and forces a fresh lookup.
 
 use std::{collections::HashMap, sync::Arc};
 
-use selium_abi::uri;
+use selium_abi::uri::{self, DomainTable};
 use selium_guest::Context;
 
 /// Test support: re-exports helpers for integration tests in `tests/`.
@@ -26,6 +31,7 @@ pub type ResolverHandle = Arc<tokio::sync::Mutex<RouteResolver>>;
 /// Resolves Host + path to a serving channel via discovery lookups.
 pub struct RouteResolver {
     ctx: Option<Context>,
+    domains: DomainTable,
     cache: HashMap<String, CachedRoute>,
 }
 
@@ -43,10 +49,12 @@ pub enum ResolveError {
 }
 
 impl RouteResolver {
-    /// Creates a resolver backed by the connector's discovery context.
-    pub fn new(ctx: Context) -> Self {
+    /// Creates a resolver backed by the connector's discovery context and the
+    /// provisioned advisory domain table.
+    pub fn new(ctx: Context, domains: DomainTable) -> Self {
         Self {
             ctx: Some(ctx),
+            domains,
             cache: HashMap::new(),
         }
     }
@@ -78,7 +86,11 @@ impl RouteResolver {
                 _created_at_ms: 0,
             },
         );
-        Self { ctx: None, cache }
+        Self {
+            ctx: None,
+            domains: DomainTable::new(),
+            cache,
+        }
     }
 
     /// Creates an empty resolver with no context and no routes.
@@ -86,6 +98,7 @@ impl RouteResolver {
     pub fn empty() -> Self {
         Self {
             ctx: None,
+            domains: DomainTable::new(),
             cache: HashMap::new(),
         }
     }
@@ -104,15 +117,26 @@ impl RouteResolver {
                 },
             );
         }
-        Self { ctx: None, cache }
+        Self {
+            ctx: None,
+            domains: DomainTable::new(),
+            cache,
+        }
     }
 
     /// Resolves the serving target for a Host + path pair.
     ///
-    /// Tries the exact external-name key first, then each parent subtree
-    /// (longest prefix first), then the host root — matching app guests'
-    /// registered external names. The Host header is normalised to the
-    /// canonical `https://<host>/<path>` key.
+    /// The Host is projected through the unified resolver into a tenant and
+    /// base path (`bridge.example.com` → tenant `acme` under `example.com`,
+    /// base path `bridge`), then the request path is resolved within that
+    /// tenant: exact base+path internal route first, then each parent
+    /// subtree (longest prefix first), then the base route itself.
+    ///
+    /// An apex Host (the bare registered domain, deriving an empty base
+    /// path) belongs to the tenant's designated root service: it is
+    /// resolved first and handles the request path itself. Without a
+    /// designated root service, the request path resolves within the
+    /// tenant's namespace directly.
     pub async fn resolve(
         &mut self,
         host: &str,
@@ -128,36 +152,10 @@ impl RouteResolver {
             return Err(ResolveError::NotFound);
         };
 
-        let clean_path = path.trim_start_matches('/').trim_end_matches('/');
-        let discovery_uri = route_uri(&host, clean_path);
-
-        match ctx.lookup(&discovery_uri).await {
-            Ok(Some(target)) => {
-                self.cache.insert(
-                    cache_key,
-                    CachedRoute {
-                        target: target.clone(),
-                        _created_at_ms: 0,
-                    },
-                );
-                Ok(target)
-            }
-            Ok(None) => self.resolve_parent(&host, path).await,
-            Err(e) => {
-                tracing::warn!("discovery lookup failed for {discovery_uri}: {e}");
-                Err(ResolveError::NotFound)
-            }
-        }
-    }
-
-    async fn resolve_parent(
-        &mut self,
-        host: &str,
-        path: &str,
-    ) -> Result<selium_abi::ResourceTarget, ResolveError> {
-        let Some(ref mut ctx) = self.ctx else {
+        let Some((tenant, base_labels)) = uri::resolve_wire_name(&host, &self.domains) else {
             return Err(ResolveError::NotFound);
         };
+        let base = base_labels.join("/");
 
         let segments: Vec<&str> = path
             .trim_matches('/')
@@ -165,20 +163,34 @@ impl RouteResolver {
             .filter(|s| !s.is_empty())
             .collect();
 
-        for len in (1..=segments.len()).rev() {
-            let prefix = segments
-                .iter()
-                .take(len)
-                .copied()
-                .collect::<Vec<_>>()
-                .join("/");
-            let uri = route_uri(host, &prefix);
+        // Apex: the bare domain maps to the tenant's designated root
+        // service, which then owns every request path on the domain. The
+        // lookup is answered by discovery (wire name → root service); the
+        // root service handles the URL path itself.
+        if base.is_empty() {
+            match ctx.lookup(&host).await {
+                Ok(Some(target)) => {
+                    self.cache.insert(
+                        cache_key.clone(),
+                        CachedRoute {
+                            target: target.clone(),
+                            _created_at_ms: 0,
+                        },
+                    );
+                    return Ok(target);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("discovery apex lookup failed for {host}: {e}");
+                }
+            }
+        }
 
+        for uri in candidate_uris(&tenant, &base, &segments) {
             match ctx.lookup(&uri).await {
                 Ok(Some(target)) => {
-                    let orig_key = format!("{}:{}", host, path);
                     self.cache.insert(
-                        orig_key,
+                        cache_key.clone(),
                         CachedRoute {
                             target: target.clone(),
                             _created_at_ms: 0,
@@ -194,28 +206,27 @@ impl RouteResolver {
             }
         }
 
-        let root_uri = route_uri(host, "");
-        match ctx.lookup(&root_uri).await {
-            Ok(Some(target)) => {
-                let orig_key = format!("{}:{}", host, path);
-                self.cache.insert(
-                    orig_key,
-                    CachedRoute {
-                        target: target.clone(),
-                        _created_at_ms: 0,
-                    },
-                );
-                Ok(target)
-            }
-            _ => Err(ResolveError::NotFound),
-        }
+        Err(ResolveError::NotFound)
     }
 }
 
-/// Builds the canonical `https://` external-name key for a normalised host
-/// and a trimmed path (`""` or no leading/trailing slash).
-fn route_uri(host: &str, path: &str) -> String {
-    uri::https_external_name(host, path)
+/// Builds the internal route candidates for a tenant, a wire-name base
+/// path, and the request path segments: exact base+segments first, then
+/// each parent subtree (longest prefix first), then the base route itself.
+/// A bare tenant root (empty base and no request path) is not addressable.
+fn candidate_uris(tenant: &str, base: &str, segments: &[&str]) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(segments.len() + 1);
+    for len in (0..=segments.len()).rev() {
+        let suffix = segments.get(..len).unwrap_or_default().join("/");
+        let internal_path = match (base.is_empty(), suffix.is_empty()) {
+            (true, true) => continue, // bare tenant root is not addressable
+            (true, false) => suffix,
+            (false, true) => base.to_string(),
+            (false, false) => format!("{base}/{suffix}"),
+        };
+        candidates.push(format!("{}{}/{}", uri::SEL_PREFIX, tenant, internal_path));
+    }
+    candidates
 }
 
 #[cfg(test)]
@@ -223,21 +234,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_uri_builds_canonical_external_names() {
-        assert_eq!(route_uri("example.com", "api"), "https://example.com/api");
-        assert_eq!(route_uri("example.com", ""), "https://example.com");
+    fn host_derives_tenant_and_path() {
+        let mut table = DomainTable::new();
+        table.seed("example.com", "acme");
+        assert_eq!(
+            uri::resolve_wire_name("bridge.example.com", &table),
+            Some(("acme".to_string(), vec!["bridge".to_string()]))
+        );
+        assert_eq!(
+            uri::resolve_wire_name("bridge.acme", &table),
+            Some(("acme".to_string(), vec!["bridge".to_string()]))
+        );
     }
 
     fn make_target(id: u64) -> selium_abi::ResourceTarget {
         selium_abi::ResourceTarget {
-            uri: "https://example.com/test".to_string(),
+            uri: "sel://acme/bridge".to_string(),
             host_id: String::new(),
             resource_id: id,
             interface: None,
-            tenant: None,
+            tenant: Some("acme".to_string()),
             class: selium_abi::ResourceClass::HostQueue,
             labels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn candidates_walk_longest_internal_path_first() {
+        // Host `bridge.example.com` (base `bridge`) + `/api/v2` resolves
+        // base+path first, then parents, then the base route.
+        assert_eq!(
+            candidate_uris("acme", "bridge", &["api", "v2"]),
+            vec![
+                "sel://acme/bridge/api/v2",
+                "sel://acme/bridge/api",
+                "sel://acme/bridge",
+            ]
+        );
+        // A deeper base composes the same way.
+        assert_eq!(
+            candidate_uris("acme", "http/prod", &[]),
+            vec!["sel://acme/http/prod"]
+        );
+    }
+
+    #[test]
+    fn apex_candidates_fall_back_to_tenant_namespace_paths() {
+        // An apex host (empty base) with no designated root service falls
+        // back to the tenant's own namespace paths; the bare tenant root is
+        // not addressable.
+        assert_eq!(
+            candidate_uris("acme", "", &["healthz"]),
+            vec!["sel://acme/healthz"]
+        );
+        assert!(candidate_uris("acme", "", &[]).is_empty());
+    }
+
+    #[test]
+    fn apex_wire_name_derives_an_empty_base() {
+        // The apex branch is reached only via a registered domain: the bare
+        // domain strips to (tenant, no labels), which is what triggers the
+        // root-service lookup in `resolve`.
+        let mut table = DomainTable::new();
+        table.seed("example.com", "acme");
+        assert_eq!(
+            uri::resolve_wire_name("example.com", &table),
+            Some(("acme".to_string(), Vec::new()))
+        );
+        // The root service itself is designated in discovery; resolving the
+        // bare wire name maps the apex onto it (store-level coverage:
+        // `root_service_designation_resolves_the_apex`).
     }
 
     #[test]

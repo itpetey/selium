@@ -59,6 +59,7 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
                 vec![ResourceSelector::Locality(LocalityScope::Cluster)],
             )],
         )],
+        domain_table: Vec::new(),
     };
 
     let report = runtime

@@ -232,17 +232,6 @@ then length).
 - **WHEN** a pointer-argument payload cannot be written into the guest's linear memory
 - **THEN** the runtime SHALL fail the bootstrap with a descriptive error rather than truncating or silently dropping the payload
 
-### Requirement: Well-Known Connector Channel Provisioning
-`selium-runtime` SHALL provision the well-known channel of a system guest whose descriptor declares a well-known URI (for example the DNS connector's `sel:///dns/resolve`): it SHALL create the host listener queue, inject the queue's shared id as the leading entrypoint argument, grant the guest attach rights for it, register the URI with discovery at provision time, and publish a revocation for the URI when the guest terminates. A well-known guest SHALL NOT also receive the discovery handle argument.
-
-#### Scenario: Well-known channel provisioned at spawn time
-- **WHEN** a system guest descriptor declares a well-known URI under the root tenant
-- **THEN** the runtime SHALL create a host listener queue, pass its shared id as the first entrypoint argument, grant the guest attach rights for it, and publish a discovery `Register` for the URI targeting that queue
-
-#### Scenario: Well-known URI revoked at teardown
-- **WHEN** the guest serving a well-known URI terminates
-- **THEN** the runtime SHALL publish a discovery `Revoke` for that URI before reclaiming the process's resources
-
 ### Requirement: Process Node Registration
 The runtime SHALL publish a Tier-1 registration for a process node `sel://<tenant>/proc/<id>` when a process is spawned, and a revocation when the process is cleaned up, so every process is discoverable even before it allocates any resource.
 

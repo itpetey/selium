@@ -89,6 +89,39 @@ pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String
     }
 }
 
+/// Returns whether `process_id` holds `capability`.
+///
+/// Restricted to the discovery system guest: the runtime accepts this
+/// hostcall only from the process booted under the `"discovery"` name, so the
+/// discovery service can gate root-registration requests against the caller's
+/// grants without any other guest probing grant state.
+pub fn process_capability(
+    process_id: selium_abi::ProcessId,
+    capability: selium_abi::Capability,
+) -> Result<bool> {
+    match hostcall_ready(HostcallRequest::ProcessCapability {
+        process_id,
+        capability,
+    })? {
+        HostcallOutput::U64(value) => Ok(value != 0),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessCapability: {other:?}"
+        ))),
+    }
+}
+
+/// Records, on behalf of the discovery service, that `process_id` registered
+/// the route `uri`. The runtime accepts this hostcall only from the discovery
+/// system guest and uses the record to gate the readiness of role-declared
+/// system guests on discoverable self-registration.
+pub fn record_registration(process_id: selium_abi::ProcessId, uri: &str) -> Result<()> {
+    hostcall_ready(HostcallRequest::RecordRegistration {
+        process_id,
+        uri: uri.to_string(),
+    })
+    .map(|_| ())
+}
+
 /// Fills a buffer with cryptographically secure random bytes from the host.
 ///
 /// Used by TLS-terminating guests on wasm32 where no OS entropy source is

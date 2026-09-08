@@ -62,10 +62,13 @@ impl Runtime {
                             ResourceIdentity::Shared(listener_shared_id),
                         )],
                     ));
-                } else if descriptor.arguments.is_empty() && descriptor.well_known_uri.is_none() {
-                    // Other guests also need the discovery handle. Guests with
-                    // a well-known channel receive their provisioned listener
-                    // as the leading argument instead (injected at spawn).
+                } else if matches!(
+                    descriptor.arguments.first(),
+                    None | Some(SystemGuestArg::Pointer(_))
+                ) {
+                    // Every non-discovery guest whose leading parameter is the
+                    // discovery Context (empty args) or a Context followed by a
+                    // pointer argument gets the discovery handle prepended.
                     descriptor.set_discovery_handle(listener_shared_id);
                     // Other guests also need explicit grant for the discovery listener.
                     descriptor.grants.push(CapabilityGrant::new(
@@ -76,6 +79,12 @@ impl Runtime {
                     ));
                 }
             }
+        }
+
+        // Seed the out-of-band domain→tenant table into discovery (a no-op
+        // when discovery is not enabled).
+        for (domain, tenant) in &config.domain_table {
+            self.publish_seed_domain(domain, tenant)?;
         }
 
         let mut pending = BTreeMap::new();
@@ -122,7 +131,16 @@ impl Runtime {
                     return Err(error);
                 }
             };
-            if !self.wait_for_readiness(bootstrapped.process_id, &descriptor.readiness) {
+            // A role-declared system guest is ready only when its declared
+            // route is observable in discovery (recorded by the discovery
+            // service), on top of the ordinary readiness signal.
+            let role_registered = match descriptor.serving_role.as_deref() {
+                Some(role) => self.wait_for_registration(bootstrapped.process_id, role),
+                None => true,
+            };
+            if !self.wait_for_readiness(bootstrapped.process_id, &descriptor.readiness)
+                || !role_registered
+            {
                 drop(self.stop_process(bootstrapped.process_id));
                 self.rollback_bootstrapped(&report);
                 return Err(Error::ReadinessUnsatisfied(descriptor.name));
@@ -132,6 +150,35 @@ impl Runtime {
         }
 
         Ok(report)
+    }
+
+    /// Publishes an out-of-band domain→tenant seed event to the discovery
+    /// feed. A no-op when discovery is not enabled.
+    fn publish_seed_domain(&self, domain: &str, tenant: &str) -> Result<()> {
+        let request = DiscoveryRequest::SeedDomain {
+            domain: domain.to_string(),
+            tenant: tenant.to_string(),
+        };
+        let bytes = encode_rkyv(&request)
+            .map_err(|error| Error::Host(format!("discovery encode failed: {error}")))?;
+        self.publish_discovery_event(bytes)
+    }
+
+    /// Waits until the discovery service has recorded a registration for
+    /// `role_uri` by `process_id`, with the same timeout budget as the
+    /// ordinary readiness poll. `mark_ready()` carries no payload; readiness
+    /// is verified by observing the registration record in discovery.
+    fn wait_for_registration(&self, process_id: selium_abi::ProcessId, role_uri: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_READINESS_TIMEOUT_MS);
+        loop {
+            if self.has_registration(process_id, role_uri) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(DEFAULT_READINESS_POLL_MS));
+        }
     }
 
     /// Creates the discovery pub/sub feed ring and RPC listener.
@@ -178,32 +225,9 @@ impl Runtime {
     /// Starts and records a single system guest.
     pub fn spawn_system_guest(
         &self,
-        mut descriptor: SystemGuestDescriptor,
+        descriptor: SystemGuestDescriptor,
     ) -> Result<BootstrappedGuest> {
         self.validate_grants(&descriptor.grants)?;
-
-        // Provision the well-known channel, if the descriptor declares one:
-        // create the host listener queue, inject its shared id as the leading
-        // entrypoint argument, and grant the guest attach rights for it.
-        // Registration with discovery happens below, once the guest is up.
-        let well_known = match &descriptor.well_known_uri {
-            Some(uri) => {
-                let queues = self.kernel.queues();
-                let memory = self.kernel.memory();
-                let listener = queues.create_host_queue(&memory);
-                descriptor
-                    .arguments
-                    .insert(0, SystemGuestArg::Integer(listener.shared_id));
-                descriptor.grants.push(CapabilityGrant::new(
-                    Capability::HostQueue,
-                    vec![ResourceSelector::ExplicitResource(
-                        ResourceIdentity::Shared(listener.shared_id),
-                    )],
-                ));
-                Some((uri.clone(), listener.shared_id))
-            }
-            None => None,
-        };
 
         let process = self.kernel.processes().start_process(
             descriptor.module_id.clone(),
@@ -293,17 +317,6 @@ impl Runtime {
             return Err(error);
         }
 
-        // Register the well-known URI with discovery now that the guest is up.
-        // Publishing is a no-op when discovery is not enabled (the queue and
-        // argument injection above still apply).
-        if let Some((uri, listener_shared_id)) = well_known.clone()
-            && let Err(error) =
-                self.register_well_known_uri(process.local_id, uri, listener_shared_id)
-        {
-            self.cleanup_failed_process(process.local_id)?;
-            return Err(error);
-        }
-
         // Remember the protocol schemes this guest handles so serve-side
         // guests can pin it via `ResolveProtocolHandler`.
         if !descriptor.handlers.is_empty() {
@@ -315,45 +328,7 @@ impl Runtime {
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,
-            well_known_listener: well_known.map(|(_, listener)| listener),
         })
-    }
-
-    /// Records and publishes the well-known registration for a spawned system
-    /// guest: the URI maps to the provisioned listener queue so guests can
-    /// resolve it and attach with a channel grant.
-    fn register_well_known_uri(
-        &self,
-        process_id: selium_abi::ProcessId,
-        uri: String,
-        listener_shared_id: u64,
-    ) -> Result<()> {
-        let target = ResourceTarget {
-            uri: uri.clone(),
-            host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
-            resource_id: listener_shared_id,
-            interface: None,
-            tenant: self.process_tenant(process_id),
-            class: ResourceClass::HostQueue,
-            labels: Vec::new(),
-        };
-        let request = DiscoveryRequest::Register {
-            uri: uri.clone(),
-            target,
-            owner: None,
-        };
-        let bytes = encode_rkyv(&request)
-            .map_err(|error| Error::Host(format!("discovery encode failed: {error}")))?;
-        self.publish_discovery_event(bytes)?;
-        self.well_known_uris
-            .lock()
-            .insert(process_id, (uri.clone(), listener_shared_id));
-        self.kernel.processes().record_activity(ActivityEvent {
-            kind: selium_abi::ActivityKind::GuestBootstrapped,
-            process_id: Some(process_id),
-            message: format!("well-known uri={uri} listener={listener_shared_id}"),
-        });
-        Ok(())
     }
 
     /// Records and publishes the process-node registration for a spawned
@@ -379,6 +354,7 @@ impl Runtime {
             uri,
             target,
             owner: Some(process_id),
+            root_service: false,
         };
         let bytes = encode_rkyv(&request)
             .map_err(|error| Error::Host(format!("process discovery encode failed: {error}")))?;
@@ -507,9 +483,10 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         };
 
         let report = runtime
@@ -542,7 +519,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn bridged guest");
@@ -574,9 +551,10 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         };
 
         let report = runtime
@@ -609,9 +587,10 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             }],
+            domain_table: Vec::new(),
         };
 
         let err = runtime
@@ -624,19 +603,27 @@ mod tests {
     }
 
     #[test]
-    fn well_known_channel_is_provisioned_injected_and_revoked() {
-        // The entrypoint echoes its first argument, proving the runtime
-        // injected the provisioned listener id as the leading argument.
+    fn role_declared_readiness_requires_observable_registration() {
+        let runtime = Runtime::default();
+        // No registration recorded yet → the declared role is not observable.
+        assert!(!runtime.has_registration(42, "sel:///dns/resolve"));
+        // Once discovery records the registration, readiness is satisfied.
+        runtime.record_registration(42, "sel:///dns/resolve".to_string());
+        assert!(runtime.has_registration(42, "sel:///dns/resolve"));
+    }
+
+    #[test]
+    fn silent_role_guest_fails_readiness() {
+        // A role-declared guest whose registration is never observable in
+        // discovery does not reach ready.
         let runtime = Runtime::default();
         let config = RuntimeConfig {
             start_discovery: false,
+            domain_table: Vec::new(),
             system_guests: vec![SystemGuestDescriptor {
-                name: "well-known".to_string(),
-                module_id: "well-known-module".to_string(),
-                module_bytes: module_with_entrypoint(
-                    "boot",
-                    "(param i64) (result i64) local.get 0",
-                ),
+                name: "silent".to_string(),
+                module_id: "silent-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", "(result i32) i32.const 0"),
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(
@@ -646,36 +633,17 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: Some("sel:///dns/resolve".to_string()),
+                serving_role: Some("sel:///dns/resolve".to_string()),
                 handlers: Vec::new(),
             }],
         };
 
-        let report = runtime
+        let err = runtime
             .bootstrap_system_guests(config)
-            .expect("bootstrap guest");
-        let guest = &report.guests[0];
-        let listener = guest
-            .well_known_listener
-            .expect("runtime provisions the well-known listener");
-
-        // The listener id was injected as the leading entrypoint argument.
-        assert_eq!(
-            runtime
-                .entrypoint_results(guest.process_id)
-                .expect("entrypoint results"),
-            vec![WasmValue::I64(listener as i64)]
-        );
-
-        // The registration is recorded (and revoked on teardown).
-        assert_eq!(
-            runtime.well_known_uri(guest.process_id),
-            Some(("sel:///dns/resolve".to_string(), listener))
-        );
-        runtime.stop_process(guest.process_id).expect("stop guest");
+            .expect_err("a silent role guest must not be admitted as ready");
         assert!(
-            runtime.well_known_uri(guest.process_id).is_none(),
-            "well-known registration must be revoked at teardown"
+            matches!(err, Error::ReadinessUnsatisfied(ref name) if name == "silent"),
+            "expected ReadinessUnsatisfied, got {err:?}"
         );
     }
 }

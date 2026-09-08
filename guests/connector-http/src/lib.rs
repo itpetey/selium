@@ -118,7 +118,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 /// the windowed forwarding pipeline. Connections are served concurrently;
 /// one slow (or parked-on-backpressure) connection never blocks the others.
 #[entrypoint]
-async fn connector_http(ctx: Context) {
+async fn connector_http(mut ctx: Context) {
     // On wasm32 the host provides randomness and time through hostcalls;
     // register both backends before any TLS operation touches `ring`/
     // `getrandom` or `rustls-pki-types`/`web-time`.
@@ -168,8 +168,18 @@ async fn connector_http(ctx: Context) {
 
     mark_ready();
 
+    // Fetch the advisory domain table once, so Host resolution can project
+    // wire names onto the tenant tree locally before the discovery lookup.
+    let domains = match ctx.load_domains().await {
+        Ok(domains) => domains,
+        Err(e) => {
+            error!("http-connector: failed to load domain table: {e}");
+            return;
+        }
+    };
     let acceptor = TlsAcceptor::from(tls_config);
-    let resolver: ResolverHandle = Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx)));
+    let resolver: ResolverHandle =
+        Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx, domains)));
     let config = ConnectionConfig::default();
 
     loop {

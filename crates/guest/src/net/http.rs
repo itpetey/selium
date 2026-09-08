@@ -1,8 +1,16 @@
 //! Typed HTTP serve API for application guests.
 //!
-//! This module is the app-guest side of the HTTP connector: register a
-//! protocol-aware URI subtree with discovery, accept typed RPC connections,
-//! and handle `HttpRequest` → `HttpResponse` in a loop.
+//! This module is the app-guest side of the HTTP connector: serve a named
+//! route with discovery, accept typed RPC connections, and handle
+//! `HttpRequest` → `HttpResponse` in a loop.
+//!
+//! A route is declared as a slash-separated service path under the guest's
+//! own tenant (`"api"` or `"http/prod"`); the single `serve` declaration
+//! derives the internal route (`sel://<tenant>/api`) and the wire names the
+//! connector matches against the request Host (`api.<tenant>`, or
+//! `api.<owned-domain>` when the tenant's domain is provisioned). The
+//! request path resolves within the tenant's namespace relative to that
+//! route, longest prefix first.
 //!
 //! ## Capability Model
 //!
@@ -23,7 +31,9 @@
 //!
 //! #[entrypoint]
 //! async fn my_app(mut ctx: Context) {
-//!     let mut serve = HttpServe::bind(&mut ctx, "https://example.com/api")
+//!     // Serves `sel://<tenant>/api`; requests for `api.<tenant>/…` (or
+//!     // `api.<owned-domain>/…`) route here.
+//!     let mut serve = HttpServe::bind(&mut ctx, "api")
 //!         .await
 //!         .expect("bind failed");
 //!
@@ -41,7 +51,7 @@ use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
 
-use crate::{Context, GuestError, ResourceListener};
+use crate::{Context, GuestError, ResourceListener, Serve};
 
 /// Protocol handler name for HTTP routes. Used to pin serve listeners to the
 /// HTTP connector's handoffs; not a URI scheme.
@@ -55,8 +65,8 @@ pub const HTTP_STREAM_INTERFACE: &str = "selium.http/stream";
 
 /// A typed HTTP serve handle.
 ///
-/// Wraps a `ResourceListener` and discovery registration for a URI subtree.
-/// Each accepted connection is a typed `RpcConnection<HttpRequest, HttpResponse>`
+/// Wraps a `ResourceListener` and a discovery route registration for a named
+/// service path. Each accepted connection is a typed `RpcConnection<HttpRequest, HttpResponse>`
 /// that carries schema-encoded HTTP messages.
 pub struct HttpServe {
     listener: ResourceListener,
@@ -101,11 +111,13 @@ pub enum HttpServeError {
 /// ## Example
 ///
 /// ```ignore
-/// use selium_guest::{net::http::HttpServeStream, entrypoint};
+/// use selium_guest::{net::http::HttpServeStream, entrypoint, Context};
 ///
 /// #[entrypoint]
 /// async fn my_app(mut ctx: Context) {
-///     let mut serve = HttpServeStream::bind(&mut ctx, "https://example.com/events")
+///     // Serves `sel://<tenant>/events`; requests for `events.<tenant>/…`
+///     // (or `events.<owned-domain>/…`) route here as streamed responses.
+///     let mut serve = HttpServeStream::bind(&mut ctx, "events")
 ///         .await
 ///         .expect("bind failed");
 ///
@@ -143,30 +155,42 @@ pub struct HttpStreamRequestHandle<'a> {
 }
 
 impl HttpServe {
-    /// Bind to an external address and register it with discovery.
+    /// Serve a named route and register it with discovery.
     ///
-    /// The `uri` is an opaque external name such as `https://my-app/api`;
-    /// discovery stores and matches it exactly. The runtime allocates a host
-    /// queue for the listener and registers the name→queue mapping with the
-    /// discovery service.
+    /// The `path` is a slash-separated service path under the guest's own
+    /// tenant (`"api"` or `"http/prod"`); every segment must project to a
+    /// DNS-safe wire label. The single declaration derives the internal
+    /// route (`sel://<tenant>/api`) and the wire names the connector
+    /// matches against the request Host (`api.<tenant>`, or
+    /// `api.<owned-domain>` when the advisory domain table maps the
+    /// tenant). The request path then resolves within the tenant's
+    /// namespace relative to that route, longest prefix first. The guest
+    /// creates its own listener; the runtime provisions nothing on its
+    /// behalf.
     ///
-    /// The guest requires a channel attach grant but **no `Network` grant**
-    /// — networking is handled by the connector.
+    /// The guest requires a channel attach grant but **no `Network` grant** —
+    /// networking is handled by the connector.
     ///
     /// The listener is **pinned to the registered `sel-http` protocol
     /// handler** (the HTTP connector): handoffs from any other process are
     /// refused, since handoff metadata is sender-controlled. Binding fails
     /// when no connector is registered.
-    pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
-        let uri = selium_abi::uri::normalize_external_name(uri);
-
-        // Allocate a host queue for incoming connections (synchronous).
+    ///
+    /// A guest running in the root/system tenant (an empty tenant label)
+    /// additionally requires the system-registration capability to serve.
+    pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
         super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
 
-        let target = http_target(&listener, &uri, None);
-        ctx.register(&uri, target).await?;
+        let target = http_target(&listener, None);
+        let uri = ctx
+            .serve(Serve {
+                path: path_segments(path),
+                target,
+                default: false,
+            })
+            .await?;
 
         Ok(Self {
             listener,
@@ -192,7 +216,8 @@ impl HttpServe {
         Ok(HttpConnection { conn })
     }
 
-    /// Returns the URI subtree this handle is bound to.
+    /// Returns the internal route URI this handle is bound to
+    /// (`sel://<tenant>/<path>`).
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -260,31 +285,33 @@ impl std::fmt::Display for HttpServeError {
 impl std::error::Error for HttpServeError {}
 
 impl HttpServeStream {
-    /// Bind to an external address and register it with discovery as a
-    /// streamed HTTP route.
+    /// Serve a named route and register it with discovery as a streamed
+    /// HTTP route: the target carries the [`HTTP_STREAM_INTERFACE`] marker,
+    /// so the connector establishes server-streaming sessions for matching
+    /// requests.
     ///
-    /// The guest requires a channel attach grant but **no `Network`
-    /// grant** — networking is handled by the connector.
-    ///
-    /// The listener is **pinned to the registered `sel-http` protocol
-    /// handler** (the HTTP connector): handoffs from any other process are
-    /// refused. Binding fails when no connector is registered.
-    pub async fn bind(ctx: &mut Context, uri: &str) -> Result<Self, GuestError> {
-        let uri = selium_abi::uri::normalize_external_name(uri);
-
+    /// The `path` is a slash-separated service path under the guest's own
+    /// tenant; see [`HttpServe::bind`] for the derived names and the
+    /// capability model.
+    pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
         super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
 
         let target = http_target(
             &listener,
-            &uri,
             Some(InterfaceMetadata {
                 name: HTTP_STREAM_INTERFACE.to_string(),
                 methods: Vec::new(),
             }),
         );
-        ctx.register(&uri, target).await?;
+        let uri = ctx
+            .serve(Serve {
+                path: path_segments(path),
+                target,
+                default: false,
+            })
+            .await?;
 
         Ok(Self {
             listener,
@@ -306,7 +333,8 @@ impl HttpServeStream {
         Ok(HttpStreamConnection { conn })
     }
 
-    /// Returns the URI subtree this handle is bound to.
+    /// Returns the internal route URI this handle is bound to
+    /// (`sel://<tenant>/<path>`).
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -399,18 +427,40 @@ impl HttpStreamRequestHandle<'_> {
     }
 }
 
-fn http_target(
-    listener: &ResourceListener,
-    uri: &str,
-    interface: Option<InterfaceMetadata>,
-) -> ResourceTarget {
+/// Splits a slash-separated service path into route segments, ignoring
+/// empty segments. The path must project to DNS-safe wire labels —
+/// [`Context::serve`](crate::Context::serve) rejects typed resource paths
+/// (`region/7`) and non-DNS-safe segments up front.
+fn path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn http_target(listener: &ResourceListener, interface: Option<InterfaceMetadata>) -> ResourceTarget {
     ResourceTarget {
-        uri: uri.to_string(),
+        // Pinned by `serve` to the derived internal route URI.
+        uri: String::new(),
         host_id: String::new(),
         resource_id: listener.descriptor().shared_id,
         interface,
         tenant: None,
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bind_paths_split_into_route_segments() {
+        assert_eq!(
+            super::path_segments("api"),
+            vec!["api".to_string()]
+        );
+        assert_eq!(super::path_segments("http/prod"), vec!["http", "prod"]);
+        assert!(super::path_segments("").is_empty());
+        assert!(super::path_segments("/").is_empty());
     }
 }

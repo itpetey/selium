@@ -319,17 +319,15 @@ impl Runtime {
             }
         }
 
-        // Revoke any well-known URI provisioned for this process, so a
-        // terminated connector's channel stops resolving. Staged like the
-        // region revocations above.
-        let well_known = self.well_known_uris.lock().get(&process_id).cloned();
-        if let Some((uri, _listener_shared_id)) = well_known {
-            let request = DiscoveryRequest::Revoke { uri };
-            let bytes = encode_rkyv(&request)
-                .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
-            self.publish_discovery_event(bytes)?;
-            self.well_known_uris.lock().remove(&process_id);
-        }
+        // Owner-keyed revocation: ask discovery to revoke every route the
+        // process registered itself (via `serve`). There is no runtime side
+        // map of guest-registered routes — discovery records each route's
+        // owner and revokes them on this event.
+        let request = DiscoveryRequest::RevokeByOwner { process_id };
+        let bytes = encode_rkyv(&request)
+            .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
+        self.publish_discovery_event(bytes)?;
+        self.process_registrations.lock().remove(&process_id);
 
         // Revoke tier-1 registrations for host queues created by this
         // process, under the principal tenant each queue was minted for.
@@ -1062,7 +1060,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn guest");
@@ -1111,7 +1109,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn owner-a");
@@ -1130,7 +1128,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn owner-b");
@@ -1197,7 +1195,7 @@ mod tests {
                 dependencies: Vec::new(),
                 readiness: ReadinessCondition::Immediate,
                 tenant: Some(tenant.to_string()),
-                well_known_uri: None,
+                serving_role: None,
                 handlers: Vec::new(),
             })
             .expect("spawn guest")
@@ -1259,6 +1257,7 @@ mod tests {
             .bootstrap_system_guests(crate::RuntimeConfig {
                 start_discovery: true,
                 system_guests: Vec::new(),
+                domain_table: Vec::new(),
             })
             .expect("bootstrap discovery");
         let pid = spawn_tenant_guest(&runtime, "retry-guest", "acme");
@@ -1307,6 +1306,7 @@ mod tests {
             .bootstrap_system_guests(crate::RuntimeConfig {
                 start_discovery: true,
                 system_guests: Vec::new(),
+                domain_table: Vec::new(),
             })
             .expect("bootstrap discovery");
         let pid = spawn_tenant_guest(&runtime, "failed-guest", "acme");
@@ -1358,7 +1358,7 @@ mod tests {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         });
         assert!(
@@ -1383,7 +1383,7 @@ mod tests {
             dependencies: Vec::new(),
             readiness: ReadinessCondition::Immediate,
             tenant: None,
-            well_known_uri: None,
+            serving_role: None,
             handlers: Vec::new(),
         });
         assert!(admitted.is_ok(), "tenant-scoped DelegateGrants is admitted");

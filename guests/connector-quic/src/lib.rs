@@ -280,7 +280,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 /// and the quinn endpoint accepts connections. Each accepted connection is
 /// routed by SNI and served by its own relay task.
 #[entrypoint]
-async fn connector_quic(ctx: Context) {
+async fn connector_quic(mut ctx: Context) {
     #[cfg(target_arch = "wasm32")]
     register_wasm_time_source();
 
@@ -335,7 +335,17 @@ async fn connector_quic(ctx: Context) {
     info!("quic-connector: listening on {QUIC_LISTEN_ADDR}");
     mark_ready();
 
-    let resolver: ResolverHandle = Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx)));
+    // Fetch the advisory domain table once, so SNI resolution can project
+    // wire names onto the tenant tree locally before the discovery lookup.
+    let domains = match ctx.load_domains().await {
+        Ok(domains) => domains,
+        Err(e) => {
+            error!("quic-connector: failed to load domain table: {e}");
+            return;
+        }
+    };
+    let resolver: ResolverHandle =
+        Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx, domains)));
 
     loop {
         let incoming = match endpoint.accept().await {

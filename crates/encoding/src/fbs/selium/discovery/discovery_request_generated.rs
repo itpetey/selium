@@ -9,10 +9,11 @@ pub enum DiscoveryRequestOffset {}
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
-///   1 = Register { uri, target }
+///   1 = Register { uri, target, root_service }
 ///   2 = Revoke { uri }
 ///   3 = ResolvePrefix(uri)
 ///   4 = ResolveLabels { key, value }
+///   5 = ListDomains
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -31,6 +32,7 @@ impl<'a> DiscoveryRequest<'a> {
   pub const VT_KEY: ::flatbuffers::VOffsetT = 8;
   pub const VT_VALUE: ::flatbuffers::VOffsetT = 10;
   pub const VT_TARGET: ::flatbuffers::VOffsetT = 12;
+  pub const VT_ROOT_SERVICE: ::flatbuffers::VOffsetT = 14;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -46,10 +48,35 @@ impl<'a> DiscoveryRequest<'a> {
     if let Some(x) = args.value { builder.add_value(x); }
     if let Some(x) = args.key { builder.add_key(x); }
     if let Some(x) = args.uri { builder.add_uri(x); }
+    builder.add_root_service(args.root_service);
     builder.add_variant(args.variant);
     builder.finish()
   }
 
+  pub fn unpack(&self) -> DiscoveryRequestT {
+    let variant = self.variant();
+    let uri = self.uri().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let key = self.key().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let value = self.value().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let target = self.target().map(|x| {
+      alloc::boxed::Box::new(x.unpack())
+    });
+    let root_service = self.root_service();
+    DiscoveryRequestT {
+      variant,
+      uri,
+      key,
+      value,
+      target,
+      root_service,
+    }
+  }
 
   /// Variant discriminator.
   #[inline]
@@ -91,6 +118,14 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<ResourceTarget>>(DiscoveryRequest::VT_TARGET, None)}
   }
+  /// Marks the registration as the tenant's root service (Register variant).
+  #[inline]
+  pub fn root_service(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(DiscoveryRequest::VT_ROOT_SERVICE, Some(false)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
@@ -104,6 +139,7 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("key", Self::VT_KEY, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("value", Self::VT_VALUE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResourceTarget>>("target", Self::VT_TARGET, false)?
+     .visit_field::<bool>("root_service", Self::VT_ROOT_SERVICE, false)?
      .finish();
     Ok(())
   }
@@ -114,6 +150,7 @@ pub struct DiscoveryRequestArgs<'a> {
     pub key: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub value: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub target: Option<::flatbuffers::WIPOffset<ResourceTarget<'a>>>,
+    pub root_service: bool,
 }
 impl<'a> Default for DiscoveryRequestArgs<'a> {
   #[inline]
@@ -124,6 +161,7 @@ impl<'a> Default for DiscoveryRequestArgs<'a> {
       key: None,
       value: None,
       target: None,
+      root_service: false,
     }
   }
 }
@@ -154,6 +192,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryRequestBuilder<'a, '
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<ResourceTarget>>(DiscoveryRequest::VT_TARGET, target);
   }
   #[inline]
+  pub fn add_root_service(&mut self, root_service: bool) {
+    self.fbb_.push_slot::<bool>(DiscoveryRequest::VT_ROOT_SERVICE, root_service, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DiscoveryRequestBuilder {
@@ -176,6 +218,58 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
       ds.field("key", &self.key());
       ds.field("value", &self.value());
       ds.field("target", &self.target());
+      ds.field("root_service", &self.root_service());
       ds.finish()
+  }
+}
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveryRequestT {
+  pub variant: u8,
+  pub uri: Option<alloc::string::String>,
+  pub key: Option<alloc::string::String>,
+  pub value: Option<alloc::string::String>,
+  pub target: Option<alloc::boxed::Box<ResourceTargetT>>,
+  pub root_service: bool,
+}
+impl Default for DiscoveryRequestT {
+  fn default() -> Self {
+    Self {
+      variant: 0,
+      uri: None,
+      key: None,
+      value: None,
+      target: None,
+      root_service: false,
+    }
+  }
+}
+impl DiscoveryRequestT {
+  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
+    &self,
+    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
+  ) -> ::flatbuffers::WIPOffset<DiscoveryRequest<'b>> {
+    let variant = self.variant;
+    let uri = self.uri.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let key = self.key.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let value = self.value.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let target = self.target.as_ref().map(|x|{
+      x.pack(_fbb)
+    });
+    let root_service = self.root_service;
+    DiscoveryRequest::create(_fbb, &DiscoveryRequestArgs{
+      variant,
+      uri,
+      key,
+      value,
+      target,
+      root_service,
+    })
   }
 }
