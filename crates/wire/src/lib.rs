@@ -20,6 +20,7 @@ use std::{
     task::{Context, Poll},
 };
 
+pub use control::{PipeControl, TERMINATE_ATTACH_FAILED, TERMINATE_BAD_HANDSHAKE};
 pub use error::{Error, Result};
 pub use framed::{FrameCodec, FramedRead, FramedWrite};
 pub use pubsub::{Publisher, Subscriber};
@@ -30,8 +31,6 @@ pub use stream::{
     RpcServerStreamConnection, RpcServerStreamRequest,
 };
 pub use tables::{LiveTable, LiveTableMessage, LiveTableRecord};
-
-pub use control::{PipeControl, TERMINATE_ATTACH_FAILED, TERMINATE_BAD_HANDSHAKE};
 
 pub mod control;
 pub mod error;

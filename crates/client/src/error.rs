@@ -5,9 +5,8 @@
 //! [`Error::Wire`] variant; where the client can enrich (termination codes,
 //! RPC failures) it maps to dedicated variants instead.
 
-use thiserror::Error;
-
 use selium_wire::{RpcError, TERMINATE_ATTACH_FAILED, TERMINATE_BAD_HANDSHAKE};
+use thiserror::Error;
 
 /// Result type for `selium-client` operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,15 +42,6 @@ pub enum Error {
     Terminated(u32),
 }
 
-/// Maps a bridge termination code to its typed error variant.
-pub(crate) fn termination_error(code: u32) -> Error {
-    match code {
-        TERMINATE_BAD_HANDSHAKE => Error::BadHandshake,
-        TERMINATE_ATTACH_FAILED => Error::AttachFailed,
-        other => Error::Terminated(other),
-    }
-}
-
 impl From<selium_wire::Error> for Error {
     fn from(error: selium_wire::Error) -> Self {
         // Enrich where the client has its own variant; pass the rest through.
@@ -73,5 +63,14 @@ impl From<RpcError> for Error {
             RpcError::BufferFull => Error::Wire(selium_wire::Error::BufferFull),
             RpcError::BufferEmpty => Error::Wire(selium_wire::Error::BufferEmpty),
         }
+    }
+}
+
+/// Maps a bridge termination code to its typed error variant.
+pub(crate) fn termination_error(code: u32) -> Error {
+    match code {
+        TERMINATE_BAD_HANDSHAKE => Error::BadHandshake,
+        TERMINATE_ATTACH_FAILED => Error::AttachFailed,
+        other => Error::Terminated(other),
     }
 }

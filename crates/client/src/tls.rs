@@ -2,16 +2,27 @@
 
 use std::sync::Arc;
 
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::rustls::{
-    RootCertStore,
-    client::WebPkiServerVerifier,
-    crypto::ring::default_provider,
-    pki_types::{CertificateDer, PrivateKeyDer},
-    version::TLS13,
+use quinn::{
+    crypto::rustls::QuicClientConfig,
+    rustls::{
+        RootCertStore,
+        client::WebPkiServerVerifier,
+        crypto::ring::default_provider,
+        pki_types::{CertificateDer, PrivateKeyDer},
+        version::TLS13,
+    },
 };
 
 use crate::error::{Error, Result};
+
+/// A client certificate chain and private key for mutual TLS.
+#[derive(Debug)]
+pub struct ClientIdentity {
+    /// The client's certificate chain, leaf first, DER-encoded.
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    /// The private key matching the leaf certificate, DER-encoded.
+    pub key: PrivateKeyDer<'static>,
+}
 
 /// Connection options: the server certificate to trust and an optional
 /// client identity to present for mutual TLS.
@@ -28,15 +39,6 @@ pub struct ConnectOptions {
     /// Optional QUIC transport configuration (idle timeout, RTT, flow control,
     /// ...). Defaults to quinn's settings when `None`.
     pub transport: Option<Arc<quinn::TransportConfig>>,
-}
-
-/// A client certificate chain and private key for mutual TLS.
-#[derive(Debug)]
-pub struct ClientIdentity {
-    /// The client's certificate chain, leaf first, DER-encoded.
-    pub cert_chain: Vec<CertificateDer<'static>>,
-    /// The private key matching the leaf certificate, DER-encoded.
-    pub key: PrivateKeyDer<'static>,
 }
 
 /// Builds a [`quinn::ClientConfig`] from the supplied options.

@@ -24,21 +24,20 @@ use selium_wire::{
     framed::{FramedRead, FramedWrite},
 };
 
-pub mod error;
-pub mod tls;
-pub mod transport;
-
 pub use crate::error::{Error, Result};
+// Re-export the encoding surface so users import message bindings from the
+// client alone (see the "Encoding Re-exports" requirement).
+pub use selium_encoding;
+pub use selium_encoding::FlatMsg;
 pub use tls::{
     ClientIdentity, ConnectOptions, build_client_config, certificates_from_pem,
     private_key_from_pem,
 };
 pub use transport::QuicTransport;
 
-// Re-export the encoding surface so users import message bindings from the
-// client alone (see the "Encoding Re-exports" requirement).
-pub use selium_encoding;
-pub use selium_encoding::FlatMsg;
+pub mod error;
+pub mod tls;
+pub mod transport;
 
 /// A typed subscriber, yielding decoded messages as a [`Stream`].
 ///
@@ -46,6 +45,65 @@ pub use selium_encoding::FlatMsg;
 /// onto the crate error type.
 pub struct Subscriber<T> {
     inner: selium_wire::Subscriber<T, QuicTransport>,
+}
+
+/// A typed publisher, writing encoded messages as frames to its channel.
+///
+/// Implements [`Sink`] with the crate error type and also offers an
+/// infallible-await [`publish`](Self::publish) for simple senders. Distinct
+/// publishers on one topic SHOULD take distinct
+/// [`writer_id`](Self::set_writer_id)s so live-table replay can tell them
+/// apart.
+pub struct Publisher<T> {
+    inner: selium_wire::Publisher<T, QuicTransport>,
+}
+
+/// A typed request/response RPC client over its channel.
+pub struct RpcClient<Req, Rep> {
+    inner: selium_wire::RpcClient<Req, Rep, QuicTransport>,
+}
+
+/// A typed server-streaming RPC client over its channel.
+pub struct RpcServerStreamClient<Req, Item> {
+    inner: selium_wire::RpcServerStreamClient<Req, Item, QuicTransport>,
+}
+
+/// A live server-stream received in response to a request.
+pub struct RpcServerStream<'a, Item> {
+    inner: selium_wire::RpcServerStream<'a, Item, QuicTransport>,
+}
+
+/// A typed bidirectional-streaming RPC client over its channel.
+pub struct RpcBidiStreamClient<Req, Item, Resp> {
+    inner: selium_wire::RpcBidiStreamClient<Req, Item, Resp, QuicTransport>,
+}
+
+/// An established bidirectional-streaming session on the client side.
+pub struct RpcBidiStream<'a, Item, Resp> {
+    inner: selium_wire::RpcBidiStream<'a, Item, Resp, QuicTransport>,
+}
+
+/// The send half of a bidi session, obtained via [`RpcBidiStream::split`].
+pub struct BidiSender<'a, Item> {
+    inner: selium_wire::BidiSender<'a, Item, QuicTransport>,
+}
+
+/// The receive half of a bidi session, obtained via [`RpcBidiStream::split`].
+pub struct BidiReceiver<'a, Resp> {
+    inner: selium_wire::BidiReceiver<'a, Resp, QuicTransport>,
+}
+
+/// A live table projected from a pub/sub topic.
+pub struct LiveTable<K, V> {
+    inner: selium_wire::LiveTable<K, V, QuicTransport>,
+}
+
+/// A connected Selium client: one QUIC connection plus the handles to open
+/// channels on it.
+pub struct Client {
+    // Owned so the connection stays alive until the client is dropped.
+    _endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
 }
 
 impl<T> Subscriber<T> {
@@ -64,17 +122,6 @@ impl<T: FlatMsg + Unpin> Stream for Subscriber<T> {
             .poll_next(cx)
             .map(|item| item.map(|result| result.map_err(Error::from)))
     }
-}
-
-/// A typed publisher, writing encoded messages as frames to its channel.
-///
-/// Implements [`Sink`] with the crate error type and also offers an
-/// infallible-await [`publish`](Self::publish) for simple senders. Distinct
-/// publishers on one topic SHOULD take distinct
-/// [`writer_id`](Self::set_writer_id)s so live-table replay can tell them
-/// apart.
-pub struct Publisher<T> {
-    inner: selium_wire::Publisher<T, QuicTransport>,
 }
 
 impl<T: FlatMsg> Publisher<T> {
@@ -122,21 +169,11 @@ impl<T: FlatMsg + Unpin> Sink<T> for Publisher<T> {
     }
 }
 
-/// A typed request/response RPC client over its channel.
-pub struct RpcClient<Req, Rep> {
-    inner: selium_wire::RpcClient<Req, Rep, QuicTransport>,
-}
-
 impl<Req: FlatMsg, Rep: FlatMsg> RpcClient<Req, Rep> {
     /// Sends one request and awaits its correlated reply.
     pub async fn request(&mut self, payload: Req) -> Result<Rep> {
         self.inner.request(payload).await.map_err(Error::from)
     }
-}
-
-/// A typed server-streaming RPC client over its channel.
-pub struct RpcServerStreamClient<Req, Item> {
-    inner: selium_wire::RpcServerStreamClient<Req, Item, QuicTransport>,
 }
 
 impl<Req: FlatMsg, Item: FlatMsg> RpcServerStreamClient<Req, Item> {
@@ -148,11 +185,6 @@ impl<Req: FlatMsg, Item: FlatMsg> RpcServerStreamClient<Req, Item> {
             .map(|inner| RpcServerStream { inner })
             .map_err(Error::from)
     }
-}
-
-/// A live server-stream received in response to a request.
-pub struct RpcServerStream<'a, Item> {
-    inner: selium_wire::RpcServerStream<'a, Item, QuicTransport>,
 }
 
 impl<Item: FlatMsg + Unpin> RpcServerStream<'_, Item> {
@@ -172,11 +204,6 @@ impl<Item: FlatMsg + Unpin> Stream for RpcServerStream<'_, Item> {
     }
 }
 
-/// A typed bidirectional-streaming RPC client over its channel.
-pub struct RpcBidiStreamClient<Req, Item, Resp> {
-    inner: selium_wire::RpcBidiStreamClient<Req, Item, Resp, QuicTransport>,
-}
-
 impl<Req: FlatMsg, Item: FlatMsg, Resp: FlatMsg> RpcBidiStreamClient<Req, Item, Resp> {
     /// Sends the opening request and returns the bidi session handle.
     pub async fn connect(&mut self, req: Req) -> Result<RpcBidiStream<'_, Item, Resp>> {
@@ -186,11 +213,6 @@ impl<Req: FlatMsg, Item: FlatMsg, Resp: FlatMsg> RpcBidiStreamClient<Req, Item, 
             .map(|inner| RpcBidiStream { inner })
             .map_err(Error::from)
     }
-}
-
-/// An established bidirectional-streaming session on the client side.
-pub struct RpcBidiStream<'a, Item, Resp> {
-    inner: selium_wire::RpcBidiStream<'a, Item, Resp, QuicTransport>,
 }
 
 impl<Item, Resp> RpcBidiStream<'_, Item, Resp> {
@@ -207,11 +229,6 @@ impl<Item, Resp> RpcBidiStream<'_, Item, Resp> {
             BidiReceiver { inner: receiver },
         )
     }
-}
-
-/// The send half of a bidi session, obtained via [`RpcBidiStream::split`].
-pub struct BidiSender<'a, Item> {
-    inner: selium_wire::BidiSender<'a, Item, QuicTransport>,
 }
 
 impl<Item: FlatMsg> BidiSender<'_, Item> {
@@ -236,11 +253,6 @@ impl<Item: FlatMsg> BidiSender<'_, Item> {
     }
 }
 
-/// The receive half of a bidi session, obtained via [`RpcBidiStream::split`].
-pub struct BidiReceiver<'a, Resp> {
-    inner: selium_wire::BidiReceiver<'a, Resp, QuicTransport>,
-}
-
 impl<Resp: FlatMsg> BidiReceiver<'_, Resp> {
     /// Returns `true` once the receiving direction has ended.
     pub fn is_closed(&self) -> bool {
@@ -256,11 +268,6 @@ impl<Resp: FlatMsg> BidiReceiver<'_, Resp> {
     pub fn try_recv(&mut self) -> Result<Option<Resp>> {
         self.inner.try_recv().map_err(Error::from)
     }
-}
-
-/// A live table projected from a pub/sub topic.
-pub struct LiveTable<K, V> {
-    inner: selium_wire::LiveTable<K, V, QuicTransport>,
 }
 
 impl<K, V> LiveTable<K, V>
@@ -327,14 +334,6 @@ where
     pub async fn delete_async(&self, key: K) -> Result<()> {
         self.inner.delete_async(key).await.map_err(Error::from)
     }
-}
-
-/// A connected Selium client: one QUIC connection plus the handles to open
-/// channels on it.
-pub struct Client {
-    // Owned so the connection stays alive until the client is dropped.
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
 }
 
 impl Client {

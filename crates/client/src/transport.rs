@@ -14,9 +14,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
 use selium_wire::{MessageTransport, Result as WireResult};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A [`MessageTransport`] over one side (or both sides) of a QUIC stream.
 pub struct QuicTransport {

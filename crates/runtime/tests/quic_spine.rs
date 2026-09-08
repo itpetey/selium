@@ -77,6 +77,29 @@ const SERVER_NAME: &str = "localhost";
 /// per stream" assertion counts these too; keep the two in sync.
 const WARMUP_ROUNDS: usize = 12;
 
+/// Builds the `selium-client` connection options: trust the connector's
+/// self-signed test certificate, with a patient transport config (the wasm32
+/// guests run on an interpreter, so the TLS handshake takes far longer than
+/// the quinn defaults assume).
+fn client_options() -> ConnectOptions {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
+        300_000u32,
+    ))));
+    // The wasm32 guest processes each packet on an interpreter: round trips
+    // are tens of milliseconds (release) to seconds (debug). A large initial
+    // RTT keeps the handshake patient but strangles the client's congestion
+    // window (slow start adds one MSS per RTT); keep it modest.
+    transport.initial_rtt(Duration::from_millis(250));
+
+    ConnectOptions {
+        server_name: SERVER_NAME.to_string(),
+        server_root: selium_client::certificates_from_pem(CERT_PEM).expect("parse certificate PEM"),
+        identity: None,
+        transport: Some(Arc::new(transport)),
+    }
+}
+
 /// The QUIC connector system guest. Empty arguments + no well-known URI mean
 /// bootstrap injects the discovery handle as the leading entrypoint argument
 /// (consumed by the `Context` parameter) and grants attach rights for the
@@ -478,29 +501,6 @@ fn seed_tls_blob_store(runtime: &Runtime) {
     storage
         .set_manifest(store.local_id, "key-pem", key_id)
         .expect("key manifest");
-}
-
-/// Builds the `selium-client` connection options: trust the connector's
-/// self-signed test certificate, with a patient transport config (the wasm32
-/// guests run on an interpreter, so the TLS handshake takes far longer than
-/// the quinn defaults assume).
-fn client_options() -> ConnectOptions {
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
-        300_000u32,
-    ))));
-    // The wasm32 guest processes each packet on an interpreter: round trips
-    // are tens of milliseconds (release) to seconds (debug). A large initial
-    // RTT keeps the handshake patient but strangles the client's congestion
-    // window (slow start adds one MSS per RTT); keep it modest.
-    transport.initial_rtt(Duration::from_millis(250));
-
-    ConnectOptions {
-        server_name: SERVER_NAME.to_string(),
-        server_root: selium_client::certificates_from_pem(CERT_PEM).expect("parse certificate PEM"),
-        identity: None,
-        transport: Some(Arc::new(transport)),
-    }
 }
 
 /// Polls a guest's log channel until every `(needle, count)` pair is

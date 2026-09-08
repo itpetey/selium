@@ -37,6 +37,7 @@ use selium_wire::{
     error::Error as WireError,
     framed::{FramedRead, FramedWrite},
 };
+
 // The handshake/termination contract is now owned by `selium-wire`; the bridge
 // channel re-exports it so the shared type and its termination codes remain
 // available from this crate with no wire change.

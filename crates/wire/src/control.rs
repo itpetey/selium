@@ -11,10 +11,10 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{decode_rkyv, encode_rkyv};
 
-/// Termination code for a malformed or missing client handshake.
-pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
 /// Termination code for a channel the bridge could not resolve or attach.
 pub const TERMINATE_ATTACH_FAILED: u32 = 2;
+/// Termination code for a malformed or missing client handshake.
+pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
 
 /// Typed per-stream control frames.
 ///
