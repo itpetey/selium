@@ -47,6 +47,16 @@
 
 ## 7. External API Guest
 
+> **Superseded by `implement-control-plane`.** The `selium-external-api` text
+> protocol and raw-TCP listener are removed; the guest is renamed and re-spec'd
+> as `selium-control-plane`, which serves typed FlatBuffers
+> `ControlRequest`/`ControlResponse` over the bridge (no text grammar, no
+> `TcpListener`). The text-protocol and TCP-listener implementation tasks in
+> this section (7.1a–7.1f, 7.4c, 7.4d) are therefore no longer actionable.
+> Decomposition and delegation (`DelegatedInteraction` semantics) moved into
+> the `control-plane` capability; `SchedulerRequest`/`SchedulerResponse` moved
+> into `selium-abi`.
+
 ### 7.1 External listener (previously blocked — now unblocked)
 
 The kernel's `tcp_bind()` → `tcp_accept_loop()` → `run_proxy()` infrastructure already exists in `network_runtime.rs`, and the guest SDK exposes `TcpListener::bind()` + `TcpListener::accept()` + `TcpStream` (with `AsyncRead`/`AsyncWrite`). No additional runtime bridge is needed.
@@ -108,7 +118,7 @@ The native state-machine helpers and tests are not sufficient completion evidenc
 
 Public Rust functions in guest crates are not host-visible interfaces unless they are called by the entrypoint, exported as Wasm functions, or surfaced through a concrete host resource such as a request exchange, durable log, topic, or live table.
 
-The external-api listener (7.1) was previously marked blocked on the assumption that no guest accept API or runtime network bridge existed. As of `complete-pubsub-external-api-and-cleanup-warnings`, the kernel's `tcp_bind()` → `tcp_accept_loop()` → `run_proxy()` infrastructure in `network_runtime.rs` provides the host-side proxy, and the guest SDK's `TcpListener::bind()` + `TcpListener::accept()` + `TcpStream` (with `AsyncRead`/`AsyncWrite`) provides the guest-side API. The remaining work is guest-side entrypoint wiring and capability grants, not new runtime infrastructure.
+The external-api listener (7.1) was previously marked blocked on the assumption that no guest accept API or runtime network bridge existed. That reasoning is moot: `implement-control-plane` supersedes this section and removes the raw-TCP text listener entirely. The remaining text-protocol/TCP-listener tasks here are not actionable.
 
 Scheduler dispatch (7.3e) remains blocked on the scheduler guest implementing `SchedulerPlace`/`SchedulerStop`/`SchedulerScale` RPC handlers (section 5). Until then, `deploy`, `start`, `stop`, and `scale` commands log and return success without side effects; only `resolve` works end-to-end.
 

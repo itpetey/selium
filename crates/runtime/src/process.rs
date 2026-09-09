@@ -285,6 +285,17 @@ impl Runtime {
         // The process's fast-path capability vote is moot once it is gone.
         self.process_fastpath.lock().remove(&process_id);
 
+        // Its region attachments are moot too: drop it from every
+        // attachment set so a later spawn of the same id cannot inherit
+        // wake-registration rights for regions it never attached.
+        {
+            let mut region_attachments = self.region_attachments.lock();
+            for attachers in region_attachments.values_mut() {
+                attachers.remove(&process_id);
+            }
+            region_attachments.retain(|_, attachers| !attachers.is_empty());
+        }
+
         // Revoke the process node first, so the process becomes unresolvable
         // before its resources are reclaimed.
         let tenant = process_tenant.as_deref().unwrap_or_default();
@@ -450,6 +461,34 @@ impl Runtime {
             .entry((resource_class, shared_id))
             .or_default()
             .insert(process_id);
+    }
+
+    /// Records that `process_id` mapped the shared region `region_id`
+    /// (at `AttachRegion`), so its parked readers can register generation
+    /// wakes on it (see [`crate::runtime::Runtime::region_attachments`]).
+    pub(crate) fn record_region_attachment(&self, process_id: ProcessId, region_id: u64) {
+        self.region_attachments
+            .lock()
+            .entry(region_id)
+            .or_default()
+            .insert(process_id);
+    }
+
+    /// Returns whether `process_id` owns or has attached the shared
+    /// region `region_id` — both carry a live mapping, so both may
+    /// register generation waits and announce generation advances on it.
+    pub(crate) fn owns_or_attached_region(&self, process_id: ProcessId, region_id: u64) -> bool {
+        let owns = self
+            .shared_resource_owners
+            .lock()
+            .get(&(ResourceClass::SharedRegion, region_id))
+            .is_some_and(|owners| owners.contains(&process_id));
+        let attached = self
+            .region_attachments
+            .lock()
+            .get(&region_id)
+            .is_some_and(|attachers| attachers.contains(&process_id));
+        owns || attached
     }
 
     pub(crate) fn release_local_handle(

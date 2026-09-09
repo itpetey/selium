@@ -562,6 +562,207 @@ pub enum DiscoveryResponse {
     Domains(Vec<(String, String)>),
 }
 
+/// A deployment's desired state as recorded by the control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct Deployment {
+    /// Workload identifier.
+    pub workload_id: String,
+    /// Desired replica count.
+    pub replicas: u32,
+    /// Module reference: a blob-store manifest name or blob identity.
+    pub module: String,
+}
+
+/// A pipeline binding between workload endpoints, recorded as desired state.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct PipelineBinding {
+    /// Binding name.
+    pub name: String,
+    /// Source side of the binding.
+    pub from: String,
+    /// Destination side of the binding.
+    pub to: String,
+}
+
+/// A control-plane desired-state record appended to the durable log.
+///
+/// The control plane's durable log is the store of record for accepted
+/// intent; the deployment and pipeline projections are rebuilt from it on
+/// replay.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum DesiredStateRecord {
+    /// A deployment desired-state write.
+    Deployment(Deployment),
+    /// A pipeline-binding desired-state write.
+    PipelineBinding(PipelineBinding),
+    /// A workload stop: a tombstone removing the deployment from the
+    /// projection, so replay does not resurrect a stopped workload.
+    Stop {
+        /// Workload identifier.
+        workload_id: String,
+    },
+}
+
+/// Request sent to the control-plane service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ControlRequest {
+    /// Record a deployment's desired state (delegating placement to the scheduler).
+    Deploy {
+        /// Workload identifier.
+        workload_id: String,
+        /// Desired replica count.
+        replicas: u32,
+        /// Module reference (manifest name or blob identity).
+        module: String,
+    },
+    /// Scale a workload's desired state.
+    Scale {
+        /// Workload identifier.
+        workload_id: String,
+        /// New desired replica count.
+        replicas: u32,
+    },
+    /// Stop a workload.
+    Stop {
+        /// Workload identifier.
+        workload_id: String,
+    },
+    /// Resolve a URI through discovery.
+    Resolve {
+        /// URI to resolve.
+        uri: String,
+    },
+    /// Upload module bytes to the blob store and record a manifest.
+    Upload {
+        /// Manifest name for the stored module.
+        manifest: String,
+        /// Module bytes to store.
+        bytes: Vec<u8>,
+    },
+    /// Read the last accepted desired state for a workload.
+    Status {
+        /// Workload identifier.
+        workload_id: String,
+    },
+}
+
+/// A target returned by a control-plane resolve. The resolve projection of a
+/// discovered resource: enough to attach (resource id, host) without the full
+/// `ResourceTarget` taxonomy (class, tenant, interface, labels), which stays in
+/// discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ResolvedTarget {
+    /// URI of the resource.
+    pub uri: String,
+    /// Host id where the resource resides.
+    pub host_id: String,
+    /// Resource identifier.
+    pub resource_id: u64,
+}
+
+/// Outcome of a single delegated interaction.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct DelegationStatus {
+    /// Delegated step name (e.g. `scheduler` or `discovery`).
+    pub step: String,
+    /// Whether the delegated interaction was applied (not deferred/stubbed).
+    pub applied: bool,
+    /// Step context, human-readable but typed on the wire.
+    pub context: String,
+}
+
+/// Response from the control-plane service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ControlResponse {
+    /// A module was uploaded and stored under its manifest name.
+    Uploaded {
+        /// Manifest name for the stored module.
+        manifest: String,
+    },
+    /// A desired-state request was accepted and recorded.
+    Accepted {
+        /// Workload identifier.
+        workload_id: String,
+        /// Recorded replica count.
+        replicas: u32,
+        /// Recorded module reference.
+        module: String,
+        /// Outcome of the primary delegated interaction.
+        delegated: DelegationStatus,
+    },
+    /// The last accepted desired state for the requested workload.
+    Status {
+        /// The deployment if one is recorded, else `None`.
+        deployment: Option<Deployment>,
+    },
+    /// A resolve request's outcome.
+    Resolved {
+        /// The resolved target, or `None` when the URI was not found.
+        target: Option<ResolvedTarget>,
+    },
+    /// A typed failure naming the failed step and its context.
+    Error {
+        /// Step that failed (e.g. `scheduler`, `discovery`, `storage`).
+        step: String,
+        /// Context describing the failure.
+        context: String,
+    },
+}
+
+/// Request sent to the scheduler service.
+///
+/// Moved from the superseded external-api guest stub (which deferred these
+/// types to `selium-abi` pending the scheduler guest crate).
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum SchedulerRequest {
+    /// Ask the scheduler to place a workload.
+    Place {
+        /// Workload identifier.
+        workload_id: String,
+        /// Desired replica count.
+        replicas: u32,
+    },
+    /// Ask the scheduler to scale a workload.
+    Scale {
+        /// Workload identifier.
+        workload_id: String,
+        /// New desired replica count.
+        replicas: u32,
+    },
+    /// Ask the scheduler to stop a workload.
+    Stop {
+        /// Workload identifier.
+        workload_id: String,
+    },
+}
+
+/// Response from the scheduler service.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum SchedulerResponse {
+    /// The scheduler applied the request.
+    Applied,
+    /// The scheduler accepted the intent but is not yet online; the request
+    /// is recorded as desired state and reconciled once it lands.
+    Deferred {
+        /// Why application is deferred.
+        reason: String,
+    },
+    /// The scheduler refused the request.
+    Rejected {
+        /// Rejection reason.
+        reason: String,
+    },
+}
+
 /// Host operation requested by a guest.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck(), attr(allow(missing_docs)))]

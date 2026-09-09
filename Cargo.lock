@@ -845,6 +845,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-control-plane"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "anyhow",
+ "selium-abi",
+ "selium-encoding",
+ "selium-guest",
+ "selium-memory",
+ "selium-shm",
+ "selium-wire",
+ "tokio",
+]
+
+[[package]]
 name = "selium-discovery"
 version = "1.0.0-alpha.6"
 dependencies = [

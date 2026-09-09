@@ -65,6 +65,15 @@ pub struct Runtime {
     pub(crate) queue_tenants: Arc<Mutex<QueueTenants>>,
     /// Wait registry: guest tasks parked on host-writable rings.
     pub(crate) wait_registry: Arc<Mutex<WaitRegistry>>,
+    /// Region attachments: every process that mapped a shared region,
+    /// recorded at `AttachRegion` and removed at process cleanup. Wake
+    /// registration (`WaitRegister`/`GenerationAdvance`) authorises both
+    /// owners and attachers: an attacher holds a live mapping of the
+    /// region, so its parked readers must be woken by a writer's
+    /// generation bump — notably a guest that attaches a region a peer
+    /// allocated and handed off through a queue it does not own (the
+    /// bridge channel attaching the connector's relayed stream region).
+    pub(crate) region_attachments: Arc<Mutex<HashMap<u64, HashSet<ProcessId>>>>,
     /// Wait targets for active network outbound proxy threads.
     /// Each entry is `(shared_id, generation_offset)` — the absolute byte
     /// offset of the ring's generation word within the shared region — used
@@ -146,6 +155,7 @@ impl Runtime {
             region_tenants: Arc::new(Mutex::new(HashMap::new())),
             queue_tenants: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
+            region_attachments: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),
             fast_path_attachments: Arc::new(Mutex::new(HashMap::new())),
             process_fastpath: Arc::new(Mutex::new(HashMap::new())),

@@ -2,6 +2,11 @@
 // Combined module tree for Selium Flatbuffers namespaces.
 pub mod selium {
   use super::*;
+  pub mod control {
+    use super::*;
+    mod control_generated;
+    pub use self::control_generated::*;
+  }
   pub mod discovery {
     use super::*;
     mod interface_metadata_generated;
@@ -32,5 +37,10 @@ pub mod selium {
     pub use self::log_record_generated::*;
     mod span_generated;
     pub use self::span_generated::*;
+  }
+  pub mod scheduler {
+    use super::*;
+    mod scheduler_generated;
+    pub use self::scheduler_generated::*;
   }
 }

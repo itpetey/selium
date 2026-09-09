@@ -526,6 +526,10 @@ impl Runtime {
                     .attach_shared_region(region_id)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::SharedMapping, local_id);
+                // Record the attachment so the attacher's parked readers can
+                // register generation wakes on this region: it holds a live
+                // mapping from here until its cleanup.
+                self.record_region_attachment(process_id, region_id);
 
                 let len = self
                     .kernel
@@ -1363,17 +1367,13 @@ impl Runtime {
                 region_id,
                 generation: _,
             } => {
-                // Reject if the process has not attached this region.
-                let owns = self
-                    .shared_resource_owners
-                    .lock()
-                    .get(&(ResourceClass::SharedRegion, region_id))
-                    .is_some_and(|owners| owners.contains(&process_id));
-                if !owns {
+                // Reject if the process neither owns nor attached this
+                // region: wake registration requires a live mapping.
+                if !self.owns_or_attached_region(process_id, region_id) {
                     return Err(AbiError::new(
                         AbiErrorCode::PermissionDenied,
                         format!(
-                            "WaitRegister denied: process {process_id} has not attached region {region_id}"
+                            "WaitRegister denied: process {process_id} has neither attached nor owns region {region_id}"
                         ),
                     ));
                 }
@@ -1388,17 +1388,13 @@ impl Runtime {
                 generation,
             } => {
                 // Mirrors WaitRegister authorisation: only a process that
-                // attached the region may advance (and thereby wake) it.
-                let owns = self
-                    .shared_resource_owners
-                    .lock()
-                    .get(&(ResourceClass::SharedRegion, region_id))
-                    .is_some_and(|owners| owners.contains(&process_id));
-                if !owns {
+                // owns or attached the region may advance (and thereby
+                // wake) it.
+                if !self.owns_or_attached_region(process_id, region_id) {
                     return Err(AbiError::new(
                         AbiErrorCode::PermissionDenied,
                         format!(
-                            "GenerationAdvance denied: process {process_id} has not attached region {region_id}"
+                            "GenerationAdvance denied: process {process_id} has neither attached nor owns region {region_id}"
                         ),
                     ));
                 }

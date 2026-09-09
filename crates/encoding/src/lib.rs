@@ -176,6 +176,119 @@ pub struct DiscoveryResponseWire {
     pub domains: Vec<DomainEntryWire>,
 }
 
+/// Wire type for a control-plane resolved target, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.ResolvedTarget",
+    binding = "selium_encoding::fbs::selium::control::ResolvedTarget"
+)]
+pub struct ResolvedTargetWire {
+    /// URI of the resource.
+    pub uri: String,
+    /// Host id where the resource resides.
+    pub host_id: String,
+    /// Resource identifier.
+    pub resource_id: u64,
+}
+
+/// Wire type for ControlRequest, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.ControlRequest",
+    binding = "selium_encoding::fbs::selium::control::ControlRequest"
+)]
+pub struct ControlRequestWire {
+    /// Variant discriminator (0 = Deploy, 1 = Scale, 2 = Stop, 3 = Resolve,
+    /// 4 = Upload, 5 = Status).
+    pub variant: u8,
+    /// Workload identifier (Deploy, Scale, Stop, Status variants).
+    pub workload_id: String,
+    /// Replica count (Deploy, Scale variants).
+    pub replicas: u32,
+    /// Module reference (Deploy variant).
+    pub module: String,
+    /// URI to resolve (Resolve variant).
+    pub uri: String,
+    /// Manifest name for an uploaded module (Upload variant).
+    pub manifest: String,
+    /// Uploaded module bytes (Upload variant).
+    pub bytes: Vec<u8>,
+}
+
+/// Wire type for a control-plane deployment desired state, backed by
+/// Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.Deployment",
+    binding = "selium_encoding::fbs::selium::control::Deployment"
+)]
+pub struct DeploymentWire {
+    /// Workload identifier.
+    pub workload_id: String,
+    /// Desired replica count.
+    pub replicas: u32,
+    /// Module reference.
+    pub module: String,
+}
+
+/// Wire type for ControlResponse, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.ControlResponse",
+    binding = "selium_encoding::fbs::selium::control::ControlResponse"
+)]
+pub struct ControlResponseWire {
+    /// Variant discriminator (0 = Uploaded, 1 = Accepted, 2 = StatusFound,
+    /// 3 = StatusNotFound, 4 = ResolvedFound, 5 = ResolvedNotFound, 6 = Error).
+    pub variant: u8,
+    /// Deployment desired state (Accepted, StatusFound variants).
+    pub deployment: Option<DeploymentWire>,
+    /// Manifest name for an uploaded module (Uploaded variant).
+    pub manifest: String,
+    /// Whether the primary delegation was applied (Accepted variant).
+    pub applied: bool,
+    /// Delegation step name (Accepted, Error variants).
+    pub step: String,
+    /// Delegation or error context (Accepted, Error variants).
+    pub context: String,
+    /// Resolved target (ResolvedFound variant).
+    pub target: Option<ResolvedTargetWire>,
+}
+
+/// Wire type for SchedulerRequest, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/scheduler.fbs",
+    ty = "selium.scheduler.SchedulerRequest",
+    binding = "selium_encoding::fbs::selium::scheduler::SchedulerRequest"
+)]
+pub struct SchedulerRequestWire {
+    /// Variant discriminator (0 = Place, 1 = Scale, 2 = Stop).
+    pub variant: u8,
+    /// Workload identifier.
+    pub workload_id: String,
+    /// Replica count (Place, Scale variants).
+    pub replicas: u32,
+}
+
+/// Wire type for SchedulerResponse, backed by Flatbuffers.
+#[derive(Debug, Clone, PartialEq)]
+#[schema(
+    path = "schemas/scheduler.fbs",
+    ty = "selium.scheduler.SchedulerResponse",
+    binding = "selium_encoding::fbs::selium::scheduler::SchedulerResponse"
+)]
+pub struct SchedulerResponseWire {
+    /// Variant discriminator (0 = Applied, 1 = Deferred, 2 = Rejected).
+    pub variant: u8,
+    /// Human-readable reason (Deferred, Rejected variants).
+    pub reason: String,
+}
+
 impl From<selium_abi::AbiError> for EncodingError {
     fn from(error: selium_abi::AbiError) -> Self {
         Self::Framing(error)
@@ -308,6 +421,221 @@ impl From<&DomainEntryWire> for (String, String) {
 impl From<LabelWire> for (String, String) {
     fn from(value: LabelWire) -> Self {
         (value.key, value.value)
+    }
+}
+
+impl From<&selium_abi::ResolvedTarget> for ResolvedTargetWire {
+    fn from(value: &selium_abi::ResolvedTarget) -> Self {
+        Self::new(value.uri.clone(), value.host_id.clone(), value.resource_id)
+    }
+}
+
+impl From<ResolvedTargetWire> for selium_abi::ResolvedTarget {
+    fn from(value: ResolvedTargetWire) -> Self {
+        Self {
+            uri: value.uri,
+            host_id: value.host_id,
+            resource_id: value.resource_id,
+        }
+    }
+}
+
+impl From<&selium_abi::Deployment> for DeploymentWire {
+    fn from(value: &selium_abi::Deployment) -> Self {
+        Self::new(
+            value.workload_id.clone(),
+            value.replicas,
+            value.module.clone(),
+        )
+    }
+}
+
+impl From<DeploymentWire> for selium_abi::Deployment {
+    fn from(value: DeploymentWire) -> Self {
+        Self {
+            workload_id: value.workload_id,
+            replicas: value.replicas,
+            module: value.module,
+        }
+    }
+}
+
+impl From<&selium_abi::ControlRequest> for ControlRequestWire {
+    fn from(value: &selium_abi::ControlRequest) -> Self {
+        match value {
+            selium_abi::ControlRequest::Deploy {
+                workload_id,
+                replicas,
+                module,
+            } => Self::new(
+                0,
+                workload_id.clone(),
+                *replicas,
+                module.clone(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            ),
+            selium_abi::ControlRequest::Scale {
+                workload_id,
+                replicas,
+            } => Self::new(
+                1,
+                workload_id.clone(),
+                *replicas,
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            ),
+            selium_abi::ControlRequest::Stop { workload_id } => Self::new(
+                2,
+                workload_id.clone(),
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            ),
+            selium_abi::ControlRequest::Resolve { uri } => Self::new(
+                3,
+                String::new(),
+                0,
+                String::new(),
+                uri.clone(),
+                String::new(),
+                Vec::new(),
+            ),
+            selium_abi::ControlRequest::Upload { manifest, bytes } => Self::new(
+                4,
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                manifest.clone(),
+                bytes.clone(),
+            ),
+            selium_abi::ControlRequest::Status { workload_id } => Self::new(
+                5,
+                workload_id.clone(),
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                Vec::new(),
+            ),
+        }
+    }
+}
+
+impl From<&selium_abi::ControlResponse> for ControlResponseWire {
+    fn from(value: &selium_abi::ControlResponse) -> Self {
+        match value {
+            selium_abi::ControlResponse::Uploaded { manifest } => Self::new(
+                0,
+                None,
+                manifest.clone(),
+                false,
+                String::new(),
+                String::new(),
+                None,
+            ),
+            selium_abi::ControlResponse::Accepted {
+                workload_id,
+                replicas,
+                module,
+                delegated,
+            } => Self::new(
+                1,
+                Some(DeploymentWire::from(&selium_abi::Deployment {
+                    workload_id: workload_id.clone(),
+                    replicas: *replicas,
+                    module: module.clone(),
+                })),
+                String::new(),
+                delegated.applied,
+                delegated.step.clone(),
+                delegated.context.clone(),
+                None,
+            ),
+            selium_abi::ControlResponse::Status {
+                deployment: Some(deployment),
+            } => Self::new(
+                2,
+                Some(DeploymentWire::from(deployment)),
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
+                None,
+            ),
+            selium_abi::ControlResponse::Status { deployment: None } => Self::new(
+                3,
+                None,
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
+                None,
+            ),
+            selium_abi::ControlResponse::Resolved {
+                target: Some(target),
+            } => Self::new(
+                4,
+                None,
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
+                Some(ResolvedTargetWire::from(target)),
+            ),
+            selium_abi::ControlResponse::Resolved { target: None } => Self::new(
+                5,
+                None,
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
+                None,
+            ),
+            selium_abi::ControlResponse::Error { step, context } => Self::new(
+                6,
+                None,
+                String::new(),
+                false,
+                step.clone(),
+                context.clone(),
+                None,
+            ),
+        }
+    }
+}
+
+impl From<&selium_abi::SchedulerRequest> for SchedulerRequestWire {
+    fn from(value: &selium_abi::SchedulerRequest) -> Self {
+        match value {
+            selium_abi::SchedulerRequest::Place {
+                workload_id,
+                replicas,
+            } => Self::new(0, workload_id.clone(), *replicas),
+            selium_abi::SchedulerRequest::Scale {
+                workload_id,
+                replicas,
+            } => Self::new(1, workload_id.clone(), *replicas),
+            selium_abi::SchedulerRequest::Stop { workload_id } => {
+                Self::new(2, workload_id.clone(), 0)
+            }
+        }
+    }
+}
+
+impl From<&selium_abi::SchedulerResponse> for SchedulerResponseWire {
+    fn from(value: &selium_abi::SchedulerResponse) -> Self {
+        match value {
+            selium_abi::SchedulerResponse::Applied => Self::new(0, String::new()),
+            selium_abi::SchedulerResponse::Deferred { reason } => Self::new(1, reason.clone()),
+            selium_abi::SchedulerResponse::Rejected { reason } => Self::new(2, reason.clone()),
+        }
     }
 }
 
@@ -514,6 +842,205 @@ impl FlatMsg for selium_abi::DiscoveryResponse {
 
 impl HasSchema for selium_abi::DiscoveryResponse {
     const SCHEMA: SchemaDescriptor = DiscoveryResponseWireSchema;
+}
+
+impl FlatMsg for selium_abi::ResolvedTarget {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = ResolvedTargetWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: ResolvedTargetWire = FlatMsg::decode(bytes)?;
+        Ok(Self::from(wire))
+    }
+}
+
+impl HasSchema for selium_abi::ResolvedTarget {
+    const SCHEMA: SchemaDescriptor = ResolvedTargetWireSchema;
+}
+
+impl FlatMsg for selium_abi::ControlRequest {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = ControlRequestWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: ControlRequestWire = FlatMsg::decode(bytes)?;
+        control_request_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::ControlRequest {
+    const SCHEMA: SchemaDescriptor = ControlRequestWireSchema;
+}
+
+impl FlatMsg for selium_abi::ControlResponse {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = ControlResponseWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: ControlResponseWire = FlatMsg::decode(bytes)?;
+        control_response_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::ControlResponse {
+    const SCHEMA: SchemaDescriptor = ControlResponseWireSchema;
+}
+
+impl FlatMsg for selium_abi::SchedulerRequest {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = SchedulerRequestWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: SchedulerRequestWire = FlatMsg::decode(bytes)?;
+        scheduler_request_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::SchedulerRequest {
+    const SCHEMA: SchemaDescriptor = SchedulerRequestWireSchema;
+}
+
+impl FlatMsg for selium_abi::SchedulerResponse {
+    fn encode(value: &Self) -> Vec<u8> {
+        let wire = SchedulerResponseWire::from(value);
+        FlatMsg::encode(&wire)
+    }
+
+    fn decode(bytes: &[u8]) -> ::std::result::Result<Self, InvalidFlatbuffer> {
+        let wire: SchedulerResponseWire = FlatMsg::decode(bytes)?;
+        scheduler_response_try_from_wire(wire)
+    }
+}
+
+impl HasSchema for selium_abi::SchedulerResponse {
+    const SCHEMA: SchemaDescriptor = SchedulerResponseWireSchema;
+}
+
+/// Converts a control request wire strictly: unknown variant tags are decode
+/// errors rather than silently reinterpreted defaults.
+fn control_request_try_from_wire(
+    wire: ControlRequestWire,
+) -> ::std::result::Result<selium_abi::ControlRequest, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::ControlRequest::Deploy {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+            module: wire.module,
+        }),
+        1 => Ok(selium_abi::ControlRequest::Scale {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+        }),
+        2 => Ok(selium_abi::ControlRequest::Stop {
+            workload_id: wire.workload_id,
+        }),
+        3 => Ok(selium_abi::ControlRequest::Resolve { uri: wire.uri }),
+        4 => Ok(selium_abi::ControlRequest::Upload {
+            manifest: wire.manifest,
+            bytes: wire.bytes,
+        }),
+        5 => Ok(selium_abi::ControlRequest::Status {
+            workload_id: wire.workload_id,
+        }),
+        _ => invalid_wire("known control request variant"),
+    }
+}
+
+/// Converts a control response wire strictly: unknown variant tags and a
+/// `ResolvedFound` without a target are decode errors rather than silently
+/// reinterpreted defaults.
+fn control_response_try_from_wire(
+    wire: ControlResponseWire,
+) -> ::std::result::Result<selium_abi::ControlResponse, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::ControlResponse::Uploaded {
+            manifest: wire.manifest,
+        }),
+        1 => {
+            let deployment = match wire.deployment {
+                Some(deployment) => deployment,
+                None => return invalid_wire("Accepted deployment"),
+            };
+            Ok(selium_abi::ControlResponse::Accepted {
+                workload_id: deployment.workload_id,
+                replicas: deployment.replicas,
+                module: deployment.module,
+                delegated: selium_abi::DelegationStatus {
+                    step: wire.step,
+                    applied: wire.applied,
+                    context: wire.context,
+                },
+            })
+        }
+        2 => match wire.deployment {
+            Some(deployment) => Ok(selium_abi::ControlResponse::Status {
+                deployment: Some(selium_abi::Deployment::from(deployment)),
+            }),
+            None => invalid_wire("StatusFound deployment"),
+        },
+        3 => Ok(selium_abi::ControlResponse::Status { deployment: None }),
+        4 => {
+            let target = match wire.target {
+                Some(target) => target,
+                None => return invalid_wire("ResolvedFound target"),
+            };
+            Ok(selium_abi::ControlResponse::Resolved {
+                target: Some(selium_abi::ResolvedTarget::from(target)),
+            })
+        }
+        5 => Ok(selium_abi::ControlResponse::Resolved { target: None }),
+        6 => Ok(selium_abi::ControlResponse::Error {
+            step: wire.step,
+            context: wire.context,
+        }),
+        _ => invalid_wire("known control response variant"),
+    }
+}
+
+/// Converts a scheduler request wire strictly: unknown variant tags are decode
+/// errors rather than silently reinterpreted defaults.
+fn scheduler_request_try_from_wire(
+    wire: SchedulerRequestWire,
+) -> ::std::result::Result<selium_abi::SchedulerRequest, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::SchedulerRequest::Place {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+        }),
+        1 => Ok(selium_abi::SchedulerRequest::Scale {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+        }),
+        2 => Ok(selium_abi::SchedulerRequest::Stop {
+            workload_id: wire.workload_id,
+        }),
+        _ => invalid_wire("known scheduler request variant"),
+    }
+}
+
+/// Converts a scheduler response wire strictly: unknown variant tags are decode
+/// errors rather than silently reinterpreted defaults.
+fn scheduler_response_try_from_wire(
+    wire: SchedulerResponseWire,
+) -> ::std::result::Result<selium_abi::SchedulerResponse, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::SchedulerResponse::Applied),
+        1 => Ok(selium_abi::SchedulerResponse::Deferred {
+            reason: wire.reason,
+        }),
+        2 => Ok(selium_abi::SchedulerResponse::Rejected {
+            reason: wire.reason,
+        }),
+        _ => invalid_wire("known scheduler response variant"),
+    }
 }
 
 /// Converts a discovery request wire strictly: unknown variant tags and a
@@ -854,5 +1381,145 @@ mod tests {
         let result: ::std::result::Result<selium_abi::DiscoveryResponse, InvalidFlatbuffer> =
             FlatMsg::decode(&bytes);
         assert!(result.is_err(), "Found without target must fail decode");
+    }
+
+    #[test]
+    fn control_request_deploy_round_trips() {
+        let request = selium_abi::ControlRequest::Deploy {
+            workload_id: "api".to_string(),
+            replicas: 3,
+            module: "api/v1".to_string(),
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: selium_abi::ControlRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_request_scale_round_trips() {
+        let request = selium_abi::ControlRequest::Scale {
+            workload_id: "api".to_string(),
+            replicas: 5,
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: selium_abi::ControlRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_request_upload_round_trips_bytes() {
+        let request = selium_abi::ControlRequest::Upload {
+            manifest: "api/v1".to_string(),
+            bytes: vec![0x00, 0x61, 0x73, 0x6d],
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: selium_abi::ControlRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_request_status_round_trips() {
+        let request = selium_abi::ControlRequest::Status {
+            workload_id: "api".to_string(),
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: selium_abi::ControlRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_response_accepted_round_trips() {
+        let response = selium_abi::ControlResponse::Accepted {
+            workload_id: "api".to_string(),
+            replicas: 3,
+            module: "api/v1".to_string(),
+            delegated: selium_abi::DelegationStatus {
+                step: "scheduler".to_string(),
+                applied: false,
+                context: "scheduler service not yet online".to_string(),
+            },
+        };
+        let bytes = FlatMsg::encode(&response);
+        let decoded: selium_abi::ControlResponse = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn control_response_resolved_round_trips() {
+        let response = selium_abi::ControlResponse::Resolved {
+            target: Some(selium_abi::ResolvedTarget {
+                uri: "sel://acme/bridge".to_string(),
+                host_id: "host-a".to_string(),
+                resource_id: 42,
+            }),
+        };
+        let bytes = FlatMsg::encode(&response);
+        let decoded: selium_abi::ControlResponse = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn control_response_error_round_trips() {
+        let response = selium_abi::ControlResponse::Error {
+            step: "discovery".to_string(),
+            context: "delegation failed".to_string(),
+        };
+        let bytes = FlatMsg::encode(&response);
+        let decoded: selium_abi::ControlResponse = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn scheduler_request_place_round_trips() {
+        let request = selium_abi::SchedulerRequest::Place {
+            workload_id: "api".to_string(),
+            replicas: 3,
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: selium_abi::SchedulerRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn scheduler_response_deferred_round_trips() {
+        let response = selium_abi::SchedulerResponse::Deferred {
+            reason: "scheduler not yet online".to_string(),
+        };
+        let bytes = FlatMsg::encode(&response);
+        let decoded: selium_abi::SchedulerResponse = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, response);
+    }
+
+    /// Strict decode: an unknown control request variant tag is a decode
+    /// error, not a silently reinterpreted default variant.
+    #[test]
+    fn unknown_control_request_variant_is_decode_error() {
+        let wire = ControlRequestWire {
+            variant: 42,
+            workload_id: String::new(),
+            replicas: 0,
+            module: String::new(),
+            uri: String::new(),
+            manifest: String::new(),
+            bytes: Vec::new(),
+        };
+        let bytes = FlatMsg::encode(&wire);
+        let result: ::std::result::Result<selium_abi::ControlRequest, InvalidFlatbuffer> =
+            FlatMsg::decode(&bytes);
+        assert!(result.is_err(), "unknown variant tag must fail decode");
+    }
+
+    /// Strict decode: an unknown scheduler response variant tag is a decode
+    /// error, not a silently reinterpreted default variant.
+    #[test]
+    fn unknown_scheduler_response_variant_is_decode_error() {
+        let wire = SchedulerResponseWire {
+            variant: 77,
+            reason: String::new(),
+        };
+        let bytes = FlatMsg::encode(&wire);
+        let result: ::std::result::Result<selium_abi::SchedulerResponse, InvalidFlatbuffer> =
+            FlatMsg::decode(&bytes);
+        assert!(result.is_err(), "unknown variant tag must fail decode");
     }
 }

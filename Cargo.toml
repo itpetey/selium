@@ -18,6 +18,7 @@ members = [
   "guests/connector-dns",
   "guests/connector-http",
   "guests/connector-quic",
+  "guests/control-plane",
   "guests/discovery",
   "guests/discovery-probe",
   "guests/dns-demo",
@@ -27,10 +28,9 @@ members = [
 ]
 exclude = ["vendor"]
 # Frozen during the spine rebuild (kept in-tree for later increments):
-#   "crates/guests/cluster"
-#   "crates/guests/external-api"
-#   "crates/guests/scheduler"
-#   "crates/guests/supervisor"
+#   "guests/cluster"
+#   "guests/scheduler"
+#   "guests/supervisor"
 
 [workspace.package]
 version = "1.0.0-alpha.6"

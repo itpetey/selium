@@ -1,8 +1,4 @@
-## Purpose
-
-Define the reference bridge guest that terminates external QUIC connections and transparently proxies `selium-wire` frames into shared-memory rings, enabling external clients to communicate with inner guests through the Selium fabric.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Transparent Frame Proxy
 A bridge-channel SHALL be a transparent relay: `selium-wire` frames SHALL pass through unchanged between the relayed QUIC stream and the bound target (the fabric channel, or the request/reply rings of a rendezvoused session). Correlation IDs (frame tags), payload bytes, and frame flags SHALL be preserved end-to-end. The bridge-channel SHALL NOT decode or re-encode payload contents.
@@ -12,68 +8,12 @@ A bridge-channel SHALL be a transparent relay: `selium-wire` frames SHALL pass t
 - **THEN** the inner guest receives the request with correlation tag 7
 - **AND** the reply the inner guest sends with tag 7 SHALL arrive at the external client with tag 7
 
-### Requirement: Bridge Enforces Capability Grants
-A bridge-channel SHALL be subject to the same `CapabilityGrant`/`ResourceSelector` system as any other guest, holding the grants of the client whose identity it was spawned for. The runtime SHALL reject `AttachRegion` calls for channels the client has not been granted, and the bridge-channel SHALL surface the denial to the external client as a termination frame.
-
-#### Scenario: Bridge attempts to attach to unauthorized channel
-- **WHEN** a bridge-channel calls `AttachRegion` for a channel the client lacks grants for
-- **THEN** the host SHALL return an error
-- **AND** the bridge-channel SHALL close the pipe, sending the failure to the external client
-
-### Requirement: Bridge Failure Isolation
-A bridge-channel crash or supervisor kill SHALL only affect that pipe's stream and its fabric-channel memberships. Inner guests SHALL see `writer_count == 0` (or `PeerClosed`) on affected rings. Other bridge-channels and inner guests SHALL be unaffected.
-
-#### Scenario: Bridge crashes
-- **WHEN** a bridge-channel panics or is killed by the supervisor
-- **THEN** inner guests attached to its rings SHALL detect `writer_count == 0` through normal disconnect detection
-- **AND** no other bridge-channel or guest SHALL be affected
-
-### Requirement: Bridge Is Deployable Guest Code
-The bridge-server and bridge-channel SHALL be implemented as standard WASM guests using `selium-guest`. They SHALL NOT depend on the deleted `selium-quic` crate; QUIC termination SHALL be provided by `quic-connector`. They SHALL NOT require special runtime modifications beyond the generic handoff metadata (`IncomingConnection.metadata`) and the `DelegateGrants` capability introduced by this change.
-
-#### Scenario: Bridge deployed via normal guest lifecycle
-- **WHEN** the platform starts a bridge-server and it spawns bridge-channel guests via `Process::start` holding the client's grants
-- **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initializes a pipe and relays frames to/from channels within its grants
-
-### Requirement: Per-Tenant Bridge Server
-The system SHALL support a `bridge-server` system guest deployed one per tenant. The bridge-server SHALL register a `sel://<tenant>/bridge` serving route (a leaf alias under its own tenant) so the QUIC connector delivers bridge-bound connections to it as per-stream handoffs. The bridge-server SHALL NOT terminate QUIC itself and SHALL NOT relay stream bytes.
-
-#### Scenario: Bridge traffic routed to the tenant's bridge-server
-- **WHEN** an external client presents an SNI matching a tenant's registered bridge route
-- **THEN** the connector SHALL deliver the connection's streams to that tenant's bridge-server
-
-#### Scenario: Bridge-server holds no data plane
-- **WHEN** a bridge-server receives a stream handoff
-- **THEN** it SHALL forward the handoff to a bridge-channel process rather than relaying bytes itself
-
 ### Requirement: Per-Stream Bridge Channel Process
 For each delivered stream, the bridge-server SHALL spawn exactly one `bridge-channel` process holding the resolved client grants and the stream's shared region id. A bridge-channel SHALL bridge exactly one QUIC stream to exactly one served target: one fabric channel (transparent splice) or one RPC session rendezvoused into a served host queue.
 
 #### Scenario: One bridge-channel per stream
 - **WHEN** a connection carries N streams
 - **THEN** the bridge-server SHALL spawn N bridge-channel processes, each responsible for one stream
-
-### Requirement: Identity to Grant Resolution
-The bridge-server SHALL resolve a handoff's authenticated TLS identity — tenant scope and key fingerprint — to a capability grant set before spawning. The identity's tenant scope SHALL match the bridge-server's own tenant; identities resolved for any other tenant SHALL be refused. When the identity is unknown, the bridge-server SHALL close the delivered stream and SHALL NOT spawn a bridge-channel.
-
-#### Scenario: Known identity resolves grants and spawns
-- **WHEN** a handoff carries an identity present in the identity source
-- **THEN** the bridge-server SHALL spawn a bridge-channel holding that identity's grants
-
-#### Scenario: Unknown identity refused
-- **WHEN** a handoff carries an identity not present in the identity source
-- **THEN** the bridge-server SHALL close the delivered stream without spawning a bridge-channel
-
-#### Scenario: Cross-tenant identity refused
-- **WHEN** a handoff carries an identity whose tenant scope differs from the bridge-server's own tenant
-- **THEN** the bridge-server SHALL close the delivered stream without spawning a bridge-channel
-
-### Requirement: Pinned Connector Handoffs
-The bridge-server SHALL accept handoffs only from the registered `sel-quic` protocol handler (the QUIC connector), resolved from the runtime's bootstrap-authoritative handler registry. Handoffs from any other process — including a guest that resolves the bridge route via discovery and attaches the queue with forged identity metadata — SHALL be refused. The bridge-server SHALL fail loudly at startup when no handler is registered, rather than serving unpinned handoffs.
-
-#### Scenario: Forged handoff refused
-- **WHEN** a process other than the pinned connector delivers a handoff to the bridge-server's listener
-- **THEN** the handoff SHALL be refused without spawning a bridge-channel, and the delivered region SHALL be closed so the sender observes EOF
 
 ### Requirement: Typed Pipe Handshake
 Before relaying data frames, a bridge-channel SHALL read a typed handshake message naming the fabric channel to bridge (its discovery URI). The handshake SHALL be deterministic: after reading the handshake, the bridge-channel SHALL send exactly one typed control reply — an acceptance frame once the target is resolved and the pipe is established (immediately before the relay begins), or a termination frame describing the failure (followed by stream teardown). Data frames SHALL be relayed only after the acceptance reply.
@@ -108,12 +48,7 @@ Closing either end of a pipe SHALL tear down the whole pipe and terminate the br
 - **WHEN** the fabric channel closes (all inner peers gone)
 - **THEN** the bridge-channel SHALL finish or reset the client's stream and terminate
 
-### Requirement: Bounded Spawn
-The bridge-server SHALL enforce a bound on bridge-channel spawns (for example per-identity or per-tenant concurrency) so an external client cannot exhaust the scheduler by opening many streams.
-
-#### Scenario: Spawn bound exceeded
-- **WHEN** a client attempts to open more streams than the configured bound permits
-- **THEN** the bridge-server SHALL refuse the additional streams
+## ADDED Requirements
 
 ### Requirement: Host-Queue RPC Rendezvous
 For a handshake URI that resolves to a host-queue target, the bridge-channel SHALL establish an RPC session on the external client's behalf, mirroring the internal `rpc::connect` path: allocate a two-ring shared-memory session region, splice the client's stream into it (request frames stream → request ring; reply ring → stream), and enqueue the session's shared id into the served queue. The handoff metadata SHALL carry the resolved client identity once guest-spawned processes can receive pointer arguments (today guest `Process::start` carries integer arguments only); until then the metadata is empty and authorization rests on the runtime's capability enforcement at queue attach. The session region SHALL be freed on pipe teardown so the serving guest observes session end, mirroring an internal client's drop.

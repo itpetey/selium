@@ -1,0 +1,74 @@
+// FlatBuffers schema for control-plane service messages.
+//
+// The control plane serves typed request/reply over the bridge; this schema
+// is shared by the control-plane guest and external clients, mirroring the
+// discovery schema's variant-discriminated table shape.
+namespace selium.control;
+
+// A target returned by a resolve request. Carried inline so the control
+// schema does not depend on the discovery schema's ResourceTarget.
+table ResolvedTarget {
+    uri: string;
+    host_id: string;
+    resource_id: ulong;
+}
+
+// A deployment's desired state (workload identifier, replicas, module).
+table Deployment {
+    workload_id: string;
+    replicas: uint;
+    module: string;
+}
+
+// Control-plane request message.
+//
+// Variant tag values:
+//   0 = Deploy { workload_id, replicas, module }
+//   1 = Scale { workload_id, replicas }
+//   2 = Stop { workload_id }
+//   3 = Resolve { uri }
+//   4 = Upload { manifest, bytes }
+//   5 = Status { workload_id }
+table ControlRequest {
+    variant: ubyte;
+    // Workload identifier (Deploy, Scale, Stop, Status variants).
+    workload_id: string;
+    // Replica count (Deploy, Scale variants).
+    replicas: uint;
+    // Module reference: blob manifest name or blob identity (Deploy variant).
+    module: string;
+    // URI to resolve (Resolve variant).
+    uri: string;
+    // Manifest name for an uploaded module (Upload variant).
+    manifest: string;
+    // Uploaded module bytes (Upload variant).
+    bytes: [ubyte];
+}
+
+// Control-plane response message.
+//
+// Variant tag values:
+//   0 = Uploaded { manifest }
+//   1 = Accepted { deployment, applied, step, context }
+//   2 = StatusFound { deployment }
+//   3 = StatusNotFound
+//   4 = ResolvedFound { target }
+//   5 = ResolvedNotFound
+//   6 = Error { step, context }
+table ControlResponse {
+    variant: ubyte;
+    // Deployment desired state (Accepted, StatusFound variants).
+    deployment: Deployment;
+    // Manifest name for an uploaded module (Uploaded variant).
+    manifest: string;
+    // Whether the primary delegation was applied (Accepted variant).
+    applied: bool;
+    // Delegation step name (Accepted, Error variants).
+    step: string;
+    // Delegation or error context (Accepted, Error variants).
+    context: string;
+    // Resolved target (ResolvedFound variant).
+    target: ResolvedTarget;
+}
+
+root_type ControlRequest;

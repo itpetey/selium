@@ -236,20 +236,8 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             continue;
         }
 
-        // Confer the client's grants plus a tenant-scoped ExplicitResource
-        // grant so the child may attach the handed-off stream region. The
-        // grant carries the tenant selector because delegation only admits
-        // child grants that are tenant-scoped within the DelegateGrants
-        // fence (unscoped grants fall through to the subset check, which
-        // the server cannot satisfy for a region it merely handed off).
-        let mut child_grants = grants;
-        child_grants.push(CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![
-                ResourceSelector::Tenant(own_tenant.clone()),
-                ResourceSelector::ExplicitResource(ResourceIdentity::Shared(incoming.shared_id)),
-            ],
-        ));
+        let child_grants =
+            bridge_channel_grants(grants, &own_tenant, ctx.raw_handle(), incoming.shared_id);
 
         match Process::start(
             BRIDGE_CHANNEL_MODULE,
@@ -271,6 +259,45 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Builds the grant set conferred on a spawned bridge-channel: the client's
+/// resolved grants plus two tenant-scoped `ExplicitResource` grants —
+///
+/// - **SharedMemory** for the handed-off stream region, so the child can
+///   attach the relayed byte channel (a region the server itself merely
+///   handed off);
+/// - **HostQueue** for the discovery listener queue, so the child can build
+///   its own discovery client from the forwarded handle:
+///   `Context::from_raw` attaches the listener queue, exactly as
+///   bootstrap-spawned guests do via their injected discovery grant.
+///
+/// Both explicit grants carry the tenant selector because delegation only
+/// admits child grants that are tenant-scoped within the `DelegateGrants`
+/// fence (unscoped grants fall through to the subset check, which the
+/// server cannot satisfy for resources it does not own).
+fn bridge_channel_grants(
+    client_grants: Vec<CapabilityGrant>,
+    tenant: &str,
+    discovery_listener: u64,
+    stream_region: u64,
+) -> Vec<CapabilityGrant> {
+    let mut child_grants = client_grants;
+    child_grants.push(CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![
+            ResourceSelector::Tenant(tenant.to_string()),
+            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(stream_region)),
+        ],
+    ));
+    child_grants.push(CapabilityGrant::new(
+        Capability::HostQueue,
+        vec![
+            ResourceSelector::Tenant(tenant.to_string()),
+            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(discovery_listener)),
+        ],
+    ));
+    child_grants
 }
 
 /// The stub client's data-plane grants: tenant-scoped shared memory, host
@@ -317,6 +344,48 @@ mod tests {
         map.insert(fp, grants());
         let resolved = map.grants_for(&fp).expect("known identity");
         assert_eq!(resolved.len(), 3);
+    }
+
+    /// A spawned bridge-channel receives the client's grants plus the two
+    /// tenant-scoped `ExplicitResource` grants it needs: the handed-off
+    /// stream region and the discovery listener queue (the child builds its
+    /// own discovery client via `Context::from_raw`).
+    #[test]
+    fn child_grants_cover_stream_region_and_discovery_listener() {
+        const DISCOVERY_LISTENER: u64 = 100;
+        const STREAM_REGION: u64 = 200;
+
+        let child = bridge_channel_grants(grants(), "acme", DISCOVERY_LISTENER, STREAM_REGION);
+
+        // The client's grants are conferred unchanged.
+        assert_eq!(child.len(), grants().len() + 2);
+
+        // Every conferred grant is tenant-scoped (the DelegateGrants fence
+        // admits only tenant-scoped child grants).
+        assert!(child.iter().all(|grant| {
+            grant
+                .selectors
+                .iter()
+                .any(|selector| matches!(selector, ResourceSelector::Tenant(t) if t == "acme"))
+        }));
+
+        let explicit = |capability: Capability, id: u64| {
+            child.iter().any(|grant| {
+                grant.capability == capability
+                    && grant.selectors.iter().any(|selector| {
+                        *selector
+                            == ResourceSelector::ExplicitResource(ResourceIdentity::Shared(id))
+                    })
+            })
+        };
+        assert!(
+            explicit(Capability::SharedMemory, STREAM_REGION),
+            "child may attach the handed-off stream region: {child:?}"
+        );
+        assert!(
+            explicit(Capability::HostQueue, DISCOVERY_LISTENER),
+            "child may attach the discovery listener queue: {child:?}"
+        );
     }
 
     #[test]

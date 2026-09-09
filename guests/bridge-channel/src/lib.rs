@@ -1,19 +1,28 @@
 //! Per-stream bridge channel system guest.
 //!
 //! A bridge channel bridges exactly one external QUIC stream to exactly one
-//! fabric channel. It receives a relayed two-ring byte-channel region id as its
-//! entrypoint argument (delivered by `bridge-server` via the queue handoff),
-//! reads a typed handshake frame naming the fabric channel URI, resolves and
-//! attaches that channel, and then splices `selium-wire` frames between the
-//! relayed byte stream and the fabric ring — preserving correlation tags,
-//! flags, and payload bytes verbatim (it never inspects application payloads).
+//! served target, dispatching on the resolved target's class:
 //!
-//! Closing either end tears down the whole pipe: a client FIN drops the fabric
-//! membership and exits; a fabric close finishes the client's stream and exits.
+//! - **channel targets** are spliced transparently: `selium-wire` frames
+//!   pass unchanged between the relayed byte stream and the fabric ring
+//!   (pub/sub, live tables) — correlation tags, flags, and payload bytes
+//!   are preserved verbatim;
+//! - **host-queue targets** (RPC serving listeners) are rendezvoused: the
+//!   pipe allocates a two-ring session region on the external client's
+//!   behalf (a remote QUIC client cannot make hostcalls), enqueues the
+//!   session id into the served queue, and relays frames between the
+//!   stream and the session rings — the same session shape the serving
+//!   guest's `rpc::accept` attaches for internal clients.
+//!
+//! In both modes the pipe never inspects application payloads. Closing either
+//! end tears down the whole pipe: a client FIN drops the fabric membership
+//! (or frees the session region, so the serving guest observes session end)
+//! and exits; a fabric/session close finishes the client's stream and exits.
 //!
 //! This crate is a deployable guest, but its core ([`bridge_pipe`]) is
-//! dependency-injected (the channel resolver) and exercised natively by unit
-//! tests with the heap region provider, mirroring the connector's `stream.rs`.
+//! dependency-injected (the target resolver and the queue enqueue) and
+//! exercised natively by unit tests with the heap region provider, mirroring
+//! the connector's `stream.rs`.
 
 use std::{
     pin::Pin,
@@ -21,16 +30,18 @@ use std::{
 };
 
 use anyhow::Context as _;
+use selium_abi::{ResourceClass, ResourceTarget};
 use selium_guest::{
-    Context, GuestError, Result, entrypoint, info, mark_ready,
+    Context, GuestError, ResourceSender, Result, entrypoint, info, mark_ready,
     net::{
         ByteStream,
         bytes::{ByteStreamReader, ByteStreamWriter},
     },
 };
 use selium_shm::{
-    Channel,
+    Channel, byte_channel,
     channels::{BlockingReader, BlockingWriter},
+    free_region,
 };
 use selium_wire::{
     MessageTransport,
@@ -56,6 +67,25 @@ const OWN_RING_READERS: u64 = 1;
 /// the reader count; writers and blocking readers — the norms for fabric
 /// members — are both counted.
 const OWN_RING_WRITERS: u64 = 1;
+
+/// Session ring capacity for a rendezvoused RPC session, per direction.
+///
+/// A frame larger than the ring can never be relayed (Park backpressure
+/// parks the writer forever), so this bounds single request/reply frames
+/// for external RPC clients. It is deliberately sized above the internal
+/// `rpc::connect` defaults so module uploads admit through the control
+/// surface; the two rings are per external stream and freed on teardown.
+const SESSION_RING_CAPACITY: u64 = 1 << 20;
+/// Accept signal on a session's request ring: the pipe's own writer plus
+/// the serving guest's request-transport writer. Observing it guarantees
+/// the server's request reader is already registered (a transport registers
+/// its eager reader before its writer), so no relayed frame can fall behind
+/// the reader's start position.
+const SESSION_ACCEPT_WRITERS: u64 = 2;
+/// The serving guest's writers on a session's reply ring: the pipe holds
+/// none, so the count reaching zero after accept means the server's side
+/// of the session has ended.
+const SESSION_SERVER_WRITERS: u64 = 1;
 
 /// A [`MessageTransport`] adapting the read half of the relayed byte stream.
 ///
@@ -297,22 +327,37 @@ impl MessageTransport for RingWriteTransport {
     }
 }
 
-/// The bridge pipe core: handshake → resolve/attach → accepted reply →
-/// splice → teardown.
+/// The bridge pipe core: handshake → resolve → dispatch (splice or
+/// rendezvous) → accepted reply → relay → teardown.
 ///
-/// `resolve` maps a channel URI to that channel's shared region id (the
-/// discovery lookup in production). The function stays generic for the native
-/// test seam; the entrypoint supplies the discovery-backed resolver.
-pub async fn bridge_pipe<Resolve, Fut>(stream: ByteStream, resolve: Resolve)
-where
+/// `resolve` maps a target URI to its served target (the discovery lookup
+/// in production); the target's class selects the pipe mode:
+///
+/// - channel targets: a transparent splice into the channel ring — frames
+///   pass through unchanged (pub/sub, live tables);
+/// - host-queue targets: an RPC rendezvous — the pipe establishes a
+///   session region on the external client's behalf and enqueues it into
+///   the served queue (`enqueue` performs the host-queue handoff the
+///   internal `rpc::connect` performs client-side), because a remote QUIC
+///   client cannot make hostcalls.
+///
+/// Both closures stay generic for the native test seam; the entrypoint
+/// supplies the discovery-backed resolver and the `ResourceSender` enqueue.
+pub async fn bridge_pipe<Resolve, Fut, Enqueue, EnqFut>(
+    stream: ByteStream,
+    resolve: Resolve,
+    enqueue: Enqueue,
+) where
     Resolve: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<u64>>,
+    Fut: std::future::Future<Output = Result<ResourceTarget>>,
+    Enqueue: FnOnce(u64, u64) -> EnqFut,
+    EnqFut: std::future::Future<Output = Result<()>>,
 {
     let (reader, writer) = stream.split();
     let mut stream_read = FramedRead::new(StreamReadTransport { reader });
     let mut stream_write = FramedWrite::new(StreamWriteTransport { writer });
 
-    // 1. Typed pipe handshake: the first stream frame names the channel URI.
+    // 1. Typed pipe handshake: the first stream frame names the target URI.
     let Some((handshake_payload, _, _)) = next_frame(&mut stream_read).await else {
         // Client closed before the handshake; nothing more to do.
         return;
@@ -324,16 +369,43 @@ where
             return;
         }
     };
+    selium_guest::info!("bridge-channel: handshake for {uri}");
 
-    // 2. Resolve + attach the fabric channel ring. Resolution is
-    // tenant-scoped by the bridge channel's grants.
-    let region_id = match resolve(uri).await {
-        Ok(region_id) => region_id,
+    // 2. Resolve the served target. Resolution is tenant-scoped by the
+    //    bridge channel's grants.
+    let target = match resolve(uri).await {
+        Ok(target) => target,
         Err(_) => {
             terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
             return;
         }
     };
+    selium_guest::info!(
+        "bridge-channel: resolved target class={:?} id={}",
+        target.class,
+        target.resource_id
+    );
+
+    // 3. Dispatch on the target's class: host-queue serving listeners take
+    //    the RPC rendezvous; everything else keeps the transparent splice.
+    match target.class {
+        ResourceClass::HostQueue => {
+            rendezvous_pipe(stream_read, stream_write, move |session_id| {
+                enqueue(target.resource_id, session_id)
+            })
+            .await;
+        }
+        _ => splice_pipe(stream_read, stream_write, target.resource_id).await,
+    }
+}
+
+/// Transparent splice into a fabric channel ring (the original pipe):
+/// attach, accepted reply, then relay until either half closes.
+async fn splice_pipe(
+    stream_read: FramedRead<StreamReadTransport>,
+    mut stream_write: FramedWrite<StreamWriteTransport>,
+    region_id: u64,
+) {
     let channel = match Channel::attach(region_id) {
         Ok(channel) => channel,
         Err(_) => {
@@ -362,14 +434,14 @@ where
         }
     };
 
-    // 3. Deterministic success reply: the channel is resolved and attached,
-    //    so the client may treat silence-after-handshake as a protocol
-    //    violation. Best-effort (a client that vanished needs no reply).
+    // Deterministic success reply: the channel is resolved and attached,
+    // so the client may treat silence-after-handshake as a protocol
+    // violation. Best-effort (a client that vanished needs no reply).
     let accepted = PipeControl::Accepted.encode();
     drop(stream_write.write_frame(&accepted, 0));
 
-    // 4. Splice until either half closes; `select!` cancels the loser, whose
-    //    dropped halves release the fabric membership / finish the stream.
+    // Splice until either half closes; `select!` cancels the loser, whose
+    // dropped halves release the fabric membership / finish the stream.
     let to_ring = pump_stream_to_ring(stream_read, ring_write);
     let to_stream = pump_ring_to_stream(ring_read, stream_write, channel);
     tokio::select! {
@@ -378,10 +450,160 @@ where
     }
 }
 
+/// RPC rendezvous into a served host queue: the pipe plays the internal
+/// [`rpc::connect`](selium_shm::rpc) client role on the external client's
+/// behalf.
+///
+/// Allocates a two-ring session region (request ring client → server, reply
+/// ring server → client — the layout the serving guest's `rpc::accept`
+/// attaches), enqueues the session id into the served queue via `enqueue`,
+/// replies accepted, and relays frames between the stream and the session
+/// rings without decoding them. Teardown frees the session region (the pipe
+/// is its allocator), so the serving guest observes session end —
+/// mirroring an internal client's drop.
+async fn rendezvous_pipe<Enqueue, EnqFut>(
+    stream_read: FramedRead<StreamReadTransport>,
+    mut stream_write: FramedWrite<StreamWriteTransport>,
+    enqueue: Enqueue,
+) where
+    Enqueue: FnOnce(u64) -> EnqFut,
+    EnqFut: std::future::Future<Output = Result<()>>,
+{
+    // 1. Allocate the session region, mirroring `rpc::connect`.
+    let (request_channel, reply_channel, session_id, _region) =
+        match byte_channel::create(SESSION_RING_CAPACITY, SESSION_RING_CAPACITY) {
+            Ok(created) => created,
+            Err(_) => {
+                terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+                return;
+            }
+        };
+
+    // 3. Rendezvous: enqueue the session id into the served queue. The
+    //    serving guest dequeues the handoff and `rpc::accept`s the region.
+    if enqueue(session_id).await.is_err() {
+        drop(free_region(session_id));
+        terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+        return;
+    }
+    selium_guest::info!("bridge-channel: session {session_id} enqueued");
+
+    // Session adapters: the pipe's client-role membership — one counting
+    // writer on the request ring, one blocking reader on the reply ring.
+    let session_write = match request_channel.blocking_writer() {
+        Ok(writer) => FramedWrite::new(RingWriteTransport { writer }),
+        Err(_) => {
+            drop(free_region(session_id));
+            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+            return;
+        }
+    };
+    let session_read = match reply_channel.blocking_reader() {
+        Ok(reader) => FramedRead::new(RingReadTransport { reader }),
+        Err(_) => {
+            drop(free_region(session_id));
+            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+            return;
+        }
+    };
+
+    // 3. Deterministic success reply: the session is enqueued, so the pipe
+    //    is established. The serving guest accepts at its own pace; the
+    //    accept gates in the pumps order the first relayed frame after
+    //    the server's readers (same contract as `rpc::connect`'s
+    //    accept wait). Best-effort (a client that vanished needs no reply).
+    let accepted = PipeControl::Accepted.encode();
+    drop(stream_write.write_frame(&accepted, 0));
+
+    // 4. Relay until either half closes; `select!` cancels the loser.
+    let to_ring = pump_stream_to_session(stream_read, session_write, request_channel);
+    let to_stream = pump_session_to_stream(session_read, stream_write, reply_channel);
+    tokio::select! {
+        _ = to_ring => {}
+        _ = to_stream => {}
+    }
+
+    // 5. Teardown: free the session region so the serving guest observes
+    //    session end (its ring mappings disappear), mirroring
+    //    `OwnedRpcClient`'s drop semantics. Best-effort: a peer that freed
+    //    first is fine.
+    drop(free_region(session_id));
+}
+
+/// Relays frames stream → request ring (client → server), gated on the
+/// serving guest's accept.
+///
+/// The gate mirrors `rpc::connect`'s accept wait: a blocking reader starts
+/// at the ring tail at registration, so a frame written before the server
+/// registers its reader is invisible to it forever. Waiting for the second
+/// writer makes first-frame ordering deterministic. A serving guest that
+/// never accepts parks the pipe here — the honest backpressure outcome for
+/// a route nobody serves, identical to an internal client.
+async fn pump_stream_to_session(
+    mut stream_read: FramedRead<StreamReadTransport>,
+    mut session_write: FramedWrite<RingWriteTransport>,
+    request_channel: Channel,
+) {
+    loop {
+        match request_channel.ring().region().load_writer_count() {
+            Ok(count) if count >= SESSION_ACCEPT_WRITERS => break,
+            Ok(_) => YieldOnce(false).await,
+            Err(_) => return,
+        }
+    }
+    // Client FIN (stream EOF) ends the loop; dropping `session_write`
+    // releases the request-ring membership.
+    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
+        if session_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Relays frames reply ring → stream (server → client), gated on the
+/// serving guest's accept and ending when the server's side of the session
+/// closes.
+async fn pump_session_to_stream(
+    mut session_read: FramedRead<RingReadTransport>,
+    mut stream_write: FramedWrite<StreamWriteTransport>,
+    reply_channel: Channel,
+) {
+    // Accept gate on the reply ring: wait until the server's reply
+    // transport writer has joined. Observing it guarantees the server's
+    // reply reader is already registered; afterwards the reader's own
+    // EOF semantics apply (before the gate passes, an empty reply ring
+    // means "not accepted yet", not "session ended" — the pipe holds no
+    // reply writer, so the ring's writer count is zero until accept).
+    loop {
+        match reply_channel.ring().region().load_writer_count() {
+            Ok(count) if count >= SESSION_SERVER_WRITERS => break,
+            Ok(_) => YieldOnce(false).await,
+            Err(_) => return,
+        }
+    }
+    // Session end (all server writers gone → ring EOF) finishes the
+    // client's stream; a failing stream write ends the relay the other
+    // way. Both halves park through the generation-wait mechanism, so a
+    // serving guest in another process drives the relay.
+    while let Ok((payload, tag, flags)) = session_read.read_frame_async().await {
+        if stream_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 /// Bridge channel entrypoint.
 ///
 /// Arguments: the bootstrap discovery `Context` (built by the entrypoint
-/// macro, used for channel-URI resolution) and the relayed byte-channel
+/// macro, used for target-URI resolution) and the relayed byte-channel
 /// region `shared_id` (delivered by `bridge-server`).
 #[entrypoint]
 async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> {
@@ -393,27 +615,92 @@ async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> 
 
     mark_ready();
 
-    bridge_pipe(stream, move |uri| async move {
-        let target = ctx
-            .lookup(&uri)
-            .await?
-            .ok_or_else(|| GuestError::Host(format!("channel not found: {uri}")))?;
-        Ok(target.resource_id)
-    })
+    bridge_pipe(
+        stream,
+        move |uri| async move {
+            let target = ctx
+                .lookup(&uri)
+                .await?
+                .ok_or_else(|| GuestError::Host(format!("target not found: {uri}")))?;
+            Ok(target)
+        },
+        // The queue handoff for a rendezvoused session. The handoff metadata
+        // is empty today: the resolved client identity cannot yet be
+        // forwarded to a guest-spawned child (guest `Process::start` carries
+        // integer arguments only), and serving guests authorize via the
+        // runtime's capability enforcement, not the metadata. Identity
+        // pass-through lands with pointer-argument spawn support.
+        |queue_id, session_id| async move {
+            let sender = ResourceSender::attach(queue_id)?;
+            sender.send_with_metadata(session_id, Vec::new()).await
+        },
+    )
     .await;
 
     Ok(())
 }
 
-/// Reads the next complete frame, yielding between attempts.
+/// Reads the next complete frame, parking on the transport's read waker
+/// until one arrives.
+///
+/// The relayed stream and the session rings are shared with other
+/// processes, and a `yield_now` spin parks the task until the next
+/// host-driven reactor entry — which never arrives for a pure
+/// shared-memory wait. `read_frame_async` instead parks through the
+/// generation-wait mechanism, so a peer's write (or close) re-polls this
+/// guest through the runtime's wake path. Any read failure (peer EOF or
+/// transport error) ends the frame stream.
 async fn next_frame<M: MessageTransport>(reader: &mut FramedRead<M>) -> Option<(Vec<u8>, u32, u8)> {
-    loop {
-        match reader.read_frame() {
-            Ok(frame) => return Some(frame),
-            Err(WireError::BufferEmpty) => selium_guest::yield_now().await,
-            Err(_) => return None,
+    reader.read_frame_async().await.ok()
+}
+
+/// Yields once and re-checks, keeping the reactor alive while the
+/// (concurrent) serving guest completes its accept.
+///
+/// Mirrors `rpc::connect`'s accept wait: a transport registration on the
+/// far side advances no generation counter, so there is nothing to park
+/// on — the condition is re-checked in a self-waking spin until the
+/// serving guest's writer lands. Identical to an internal client's
+/// behaviour for a route that never accepts.
+struct YieldOnce(bool);
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
     }
+}
+
+/// Parks until the fabric ring's generation advances, so an inner peer's
+/// write or close re-polls the pump.
+///
+/// Registers the task's waker through the generation-wait mechanism (the
+/// same park `BlockingReader` uses); a close bumps the generation too, so
+/// the quiesce check in the caller re-runs on every wake. Falls back to a
+/// self-wake when no generation callbacks are installed (native tests
+/// without the guest runtime), preserving cooperative-yield behaviour.
+async fn wait_for_ring_advance(region: &selium_shm::ChannelRegion) {
+    let region_id = region.region_id();
+    let mut observed = region.load_generation().unwrap_or(0);
+    std::future::poll_fn(move |cx| {
+        let current = region.load_generation().unwrap_or(0);
+        if current != observed {
+            observed = current;
+            return Poll::Ready(());
+        }
+        if !selium_memory::register_generation_wait(region_id, observed, cx.waker()) {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Copies frames from the fabric ring to the relayed stream (fabric → client).
@@ -451,7 +738,10 @@ async fn pump_ring_to_stream(
                 if writers <= OWN_RING_WRITERS && readers <= OWN_RING_READERS {
                     break;
                 }
-                selium_guest::yield_now().await;
+                // An inner peer is still attached: park until the ring
+                // advances (its next write — or its close, which also
+                // bumps the generation — re-polls the quiesce check).
+                wait_for_ring_advance(fabric.ring().region()).await;
             }
             Err(_) => break,
         }
@@ -495,6 +785,49 @@ mod tests {
         drop(selium_memory::set_region_provider(Box::new(
             selium_memory::HeapRegionProvider::new(),
         )));
+    }
+
+    /// A resolved channel target (the splice path).
+    fn channel_target(resource_id: u64) -> ResourceTarget {
+        ResourceTarget {
+            uri: "sel://acme/lobby".to_string(),
+            host_id: String::new(),
+            resource_id,
+            interface: None,
+            tenant: Some("acme".to_string()),
+            class: ResourceClass::SharedRegion,
+            labels: Vec::new(),
+        }
+    }
+
+    /// A resolved host-queue target (the rendezvous path).
+    fn queue_target(resource_id: u64) -> ResourceTarget {
+        ResourceTarget {
+            uri: "sel://acme/control".to_string(),
+            host_id: String::new(),
+            resource_id,
+            interface: None,
+            tenant: Some("acme".to_string()),
+            class: ResourceClass::HostQueue,
+            labels: Vec::new(),
+        }
+    }
+
+    /// A resolver that resolves any URI to the given channel target.
+    fn channel_resolver(
+        resource_id: u64,
+    ) -> impl FnOnce(String) -> std::future::Ready<Result<ResourceTarget>> {
+        move |_uri| std::future::ready(Ok(channel_target(resource_id)))
+    }
+
+    /// A resolver that always fails (target not found / denied).
+    fn failing_resolver() -> impl FnOnce(String) -> std::future::Ready<Result<ResourceTarget>> {
+        move |_uri| std::future::ready(Err(GuestError::Host("denied".to_string())))
+    }
+
+    /// An enqueue seam for splice-path tests (never invoked).
+    fn unused_enqueue() -> impl FnOnce(u64, u64) -> std::future::Ready<Result<()>> {
+        |_queue_id, _session_id| std::future::ready(Ok(()))
     }
 
     fn connector_peer(
@@ -579,9 +912,11 @@ mod tests {
         let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
 
         // Drive the guest pipe against the fixed fabric channel.
-        let guest_task = tokio::spawn(bridge_pipe(guest_stream, move |_uri| async move {
-            Ok(fabric_region_id)
-        }));
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            channel_resolver(fabric_region_id),
+            unused_enqueue(),
+        ));
 
         // Client sends the typed handshake frame, then a data frame (tag 7).
         let handshake = PipeControl::Handshake {
@@ -628,9 +963,11 @@ mod tests {
         let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
 
         // Resolver always fails (channel not found / denied).
-        let guest_task = tokio::spawn(bridge_pipe(guest_stream, |_uri| async move {
-            Err(GuestError::Host("denied".to_string()))
-        }));
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            failing_resolver(),
+            unused_enqueue(),
+        ));
 
         // Send a valid handshake; the guest replies with a termination frame
         // then closes the stream.
@@ -737,9 +1074,11 @@ mod tests {
         let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
         let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
 
-        let guest_task = tokio::spawn(bridge_pipe(guest_stream, move |_uri| async move {
-            Ok(fabric_region_id)
-        }));
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            channel_resolver(fabric_region_id),
+            unused_enqueue(),
+        ));
 
         // Handshake so the pipe attaches the fabric channel.
         let handshake = PipeControl::Handshake {
@@ -833,9 +1172,11 @@ mod tests {
         let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
         let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
 
-        let guest_task = tokio::spawn(bridge_pipe(guest_stream, move |_uri| async move {
-            Ok(fabric_region_id)
-        }));
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            channel_resolver(fabric_region_id),
+            unused_enqueue(),
+        ));
 
         let handshake = PipeControl::Handshake {
             uri: "sel://acme/lobby".to_string(),
@@ -939,17 +1280,21 @@ mod tests {
             byte_channel::create(65_536, 65_536).expect("create");
         let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
         let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
-        let killed_task = tokio::spawn(bridge_pipe(guest_stream, move |_uri| async move {
-            Ok(fabric_region_id)
-        }));
+        let killed_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            channel_resolver(fabric_region_id),
+            unused_enqueue(),
+        ));
 
         let (s_ring_to, s_ring_from, s_shared, _s_region) =
             byte_channel::create(65_536, 65_536).expect("create sibling channel");
         let mut sibling_peer = connector_peer(s_shared, &s_ring_from, &s_ring_to);
         let sibling_stream = ByteStream::attach_blocking(s_shared).expect("sibling attach");
-        let sibling_task = tokio::spawn(bridge_pipe(sibling_stream, move |_uri| async move {
-            Ok(sibling_region_id)
-        }));
+        let sibling_task = tokio::spawn(bridge_pipe(
+            sibling_stream,
+            channel_resolver(sibling_region_id),
+            unused_enqueue(),
+        ));
 
         // Both pipes complete the handshake.
         let handshake = PipeControl::Handshake {
@@ -1038,5 +1383,258 @@ mod tests {
         framed.extend_from_slice(&header.encode());
         framed.extend_from_slice(payload);
         writer.write_all(&framed).await
+    }
+
+    /// Reads one complete frame from a byte channel, returning its payload,
+    /// correlation tag, and flags.
+    async fn read_raw_frame<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<(Vec<u8>, u32, u8)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if buf.len() >= FrameHeader::ENCODED_SIZE {
+                let header =
+                    FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("frame header");
+                let end = FrameHeader::ENCODED_SIZE + header.len as usize;
+                if buf.len() >= end {
+                    let payload = buf[FrameHeader::ENCODED_SIZE..end].to_vec();
+                    return Ok((payload, header.tag, header.flags));
+                }
+            }
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "frame truncated",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// 8.2: an external RPC client reaches a served host queue through the
+    /// rendezvous — the pipe allocates the session region, enqueues it into
+    /// the served queue, and relays a correlated typed request/reply
+    /// between the stream and the serving guest's `rpc::accept` session.
+    #[tokio::test]
+    async fn rendezvous_round_trips_typed_rpc_frames_and_frees_session() {
+        setup();
+
+        // Served-queue stand-in: the enqueue seam records the handoff the
+        // way a real queue delivers it to the serving guest.
+        let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+        const QUEUE_ID: u64 = 4242;
+
+        // Relay byte channel between the "connector" (this test) and the guest.
+        let (ring_to_guest, ring_from_guest, shared_id, _region) =
+            byte_channel::create(65_536, 65_536).expect("create");
+        let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
+        let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
+
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            // The served target is a host-queue listener (e.g. the control
+            // plane's `control.<tenant>` route).
+            move |_uri| std::future::ready(Ok(queue_target(QUEUE_ID))),
+            move |queue_id, session_id| async move {
+                handoff_tx
+                    .send((queue_id, session_id))
+                    .map_err(|error| GuestError::Host(format!("handoff channel closed: {error}")))
+            },
+        ));
+
+        // Client handshake naming the control route.
+        let handshake = PipeControl::Handshake {
+            uri: "sel://acme/control".to_string(),
+        }
+        .encode();
+        write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
+            .await
+            .expect("write handshake");
+
+        // The serving guest dequeues the handoff: the session was enqueued
+        // into the served queue under the right queue id.
+        let (queue_id, session_id) = handoff_rx.recv().await.expect("handoff delivered");
+        assert_eq!(queue_id, QUEUE_ID);
+
+        // The serving guest accepts the session (the control plane's
+        // `rpc::accept` path).
+        let mut server: selium_shm::rpc::RpcConnection<String, String> =
+            selium_shm::rpc::accept(selium_wire::rpc::IncomingConnection {
+                client_process_id: 7,
+                shared_id: session_id,
+            })
+            .expect("server accept");
+        let server_task = tokio::spawn(async move {
+            let request = server.recv().await.expect("server recv");
+            assert_eq!(request.payload().expect("server decode"), "ping");
+            request.reply("pong".to_string()).await.expect("reply");
+        });
+
+        // The external client's request frame (correlation tag 7).
+        write_raw_frame(&mut peer, b"ping", 7, FrameHeader::FLAG_READY)
+            .await
+            .expect("write request");
+        server_task.await.expect("server task");
+
+        // The client receives the deterministic accepted reply, then the
+        // correlated response.
+        let (payload, tag, _) = read_raw_frame(&mut peer).await.expect("accepted frame");
+        assert_eq!(
+            PipeControl::decode(&payload).expect("control frame"),
+            PipeControl::Accepted
+        );
+        assert_eq!(tag, 0);
+        let (payload, tag, _) = read_raw_frame(&mut peer).await.expect("reply frame");
+        assert_eq!(payload, b"pong".to_vec());
+        assert_eq!(tag, 7, "correlation tag preserved through the session");
+
+        // Client FIN: the pipe tears down and frees the session region, so
+        // the serving guest observes session end rather than a leak.
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), guest_task)
+            .await
+            .expect("guest task completes within timeout")
+            .expect("guest task succeeds");
+        assert!(
+            byte_channel::attach(session_id).is_err(),
+            "session region freed on teardown"
+        );
+    }
+
+    /// 8.2/8.3: an enqueue failure (queue unavailable / attach denied)
+    /// yields the typed termination frame and reclaims the session region.
+    #[tokio::test]
+    async fn rendezvous_enqueue_failure_terminates_and_frees_session() {
+        setup();
+
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+
+        let (ring_to_guest, ring_from_guest, shared_id, _region) =
+            byte_channel::create(65_536, 65_536).expect("create");
+        let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
+        let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
+
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            move |_uri| std::future::ready(Ok(queue_target(77))),
+            move |_queue_id, session_id| async move {
+                // Record the session so the test can observe the reclaim,
+                // then fail the handoff.
+                session_tx.send(session_id).expect("record session id");
+                Err(GuestError::Host("queue unavailable".to_string()))
+            },
+        ));
+
+        let handshake = PipeControl::Handshake {
+            uri: "sel://acme/control".to_string(),
+        }
+        .encode();
+        write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
+            .await
+            .expect("write handshake");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), guest_task)
+            .await
+            .expect("guest task completes within timeout")
+            .expect("guest task succeeds");
+
+        // The session region is reclaimed after the failed handoff.
+        let session_id = session_rx.recv().await.expect("session id recorded");
+        assert!(
+            byte_channel::attach(session_id).is_err(),
+            "session region reclaimed on enqueue failure"
+        );
+
+        // The client observes the typed termination frame then EOF.
+        let mut buf = Vec::new();
+        peer.read_to_end(&mut buf).await.expect("read stream");
+        assert!(
+            buf.len() >= FrameHeader::ENCODED_SIZE,
+            "termination frame present"
+        );
+        let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("frame header");
+        assert_eq!(header.tag, 0);
+        let payload = &buf[FrameHeader::ENCODED_SIZE..accepted_frame_end(&buf)];
+        assert_eq!(
+            PipeControl::decode(payload).expect("control frame"),
+            PipeControl::Terminate {
+                code: TERMINATE_ATTACH_FAILED
+            }
+        );
+    }
+
+    /// 8.3 (server-side session end): when the serving guest ends the
+    /// session after serving a request, the client's stream finishes
+    /// without a client FIN — the pipe observes the reply ring quiesce,
+    /// tears down, and frees the session region.
+    #[tokio::test]
+    async fn server_session_end_finishes_client_stream() {
+        setup();
+
+        let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+
+        let (ring_to_guest, ring_from_guest, shared_id, _region) =
+            byte_channel::create(65_536, 65_536).expect("create");
+        let mut peer = connector_peer(shared_id, &ring_from_guest, &ring_to_guest);
+        let guest_stream = ByteStream::attach_blocking(shared_id).expect("guest attach");
+
+        let guest_task = tokio::spawn(bridge_pipe(
+            guest_stream,
+            move |_uri| std::future::ready(Ok(queue_target(4242))),
+            move |queue_id, session_id| async move {
+                handoff_tx
+                    .send((queue_id, session_id))
+                    .map_err(|error| GuestError::Host(format!("handoff channel closed: {error}")))
+            },
+        ));
+
+        let handshake = PipeControl::Handshake {
+            uri: "sel://acme/control".to_string(),
+        }
+        .encode();
+        write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
+            .await
+            .expect("write handshake");
+
+        let (_, session_id) = handoff_rx.recv().await.expect("handoff delivered");
+
+        let mut server: selium_shm::rpc::RpcConnection<String, String> =
+            selium_shm::rpc::accept(selium_wire::rpc::IncomingConnection {
+                client_process_id: 7,
+                shared_id: session_id,
+            })
+            .expect("server accept");
+        // Serve one request, then end the session by dropping the
+        // connection (the serving guest's loop exit path).
+        let server_task = tokio::spawn(async move {
+            let request = server.recv().await.expect("server recv");
+            request.reply("done".to_string()).await.expect("reply");
+        });
+
+        write_raw_frame(&mut peer, b"ping", 3, FrameHeader::FLAG_READY)
+            .await
+            .expect("write request");
+        server_task.await.expect("server task");
+
+        // No client FIN: the pipe must tear down on the session end alone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), guest_task)
+            .await
+            .expect("pipe tears down on session end")
+            .expect("guest task succeeds");
+        assert!(
+            byte_channel::attach(session_id).is_err(),
+            "session region freed on session end"
+        );
+
+        // The client observed the accepted reply, the response frame, and
+        // then stream EOF (finished by the pipe).
+        let mut buf = Vec::new();
+        peer.read_to_end(&mut buf).await.expect("read stream");
+        assert!(
+            buf.len() >= 2 * FrameHeader::ENCODED_SIZE,
+            "accepted + response frames present before EOF"
+        );
     }
 }
