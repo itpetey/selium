@@ -123,6 +123,45 @@ fn attach_then_close(shared_id: u64) {
     }
 }
 
+/// Builds the grant set conferred on a spawned bridge-channel: the client's
+/// resolved grants plus two tenant-scoped `ExplicitResource` grants —
+///
+/// - **SharedMemory** for the handed-off stream region, so the child can
+///   attach the relayed byte channel (a region the server itself merely
+///   handed off);
+/// - **HostQueue** for the discovery listener queue, so the child can build
+///   its own discovery client from the forwarded handle:
+///   `Context::from_raw` attaches the listener queue, exactly as
+///   bootstrap-spawned guests do via their injected discovery grant.
+///
+/// Both explicit grants carry the tenant selector because delegation only
+/// admits child grants that are tenant-scoped within the `DelegateGrants`
+/// fence (unscoped grants fall through to the subset check, which the
+/// server cannot satisfy for resources it does not own).
+fn bridge_channel_grants(
+    client_grants: Vec<CapabilityGrant>,
+    tenant: &str,
+    discovery_listener: u64,
+    stream_region: u64,
+) -> Vec<CapabilityGrant> {
+    let mut child_grants = client_grants;
+    child_grants.push(CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![
+            ResourceSelector::Tenant(tenant.to_string()),
+            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(stream_region)),
+        ],
+    ));
+    child_grants.push(CapabilityGrant::new(
+        Capability::HostQueue,
+        vec![
+            ResourceSelector::Tenant(tenant.to_string()),
+            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(discovery_listener)),
+        ],
+    ));
+    child_grants
+}
+
 /// Bridge server entrypoint.
 ///
 /// The server receives its bootstrap discovery `Context` (built by the
@@ -259,45 +298,6 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             }
         }
     }
-}
-
-/// Builds the grant set conferred on a spawned bridge-channel: the client's
-/// resolved grants plus two tenant-scoped `ExplicitResource` grants —
-///
-/// - **SharedMemory** for the handed-off stream region, so the child can
-///   attach the relayed byte channel (a region the server itself merely
-///   handed off);
-/// - **HostQueue** for the discovery listener queue, so the child can build
-///   its own discovery client from the forwarded handle:
-///   `Context::from_raw` attaches the listener queue, exactly as
-///   bootstrap-spawned guests do via their injected discovery grant.
-///
-/// Both explicit grants carry the tenant selector because delegation only
-/// admits child grants that are tenant-scoped within the `DelegateGrants`
-/// fence (unscoped grants fall through to the subset check, which the
-/// server cannot satisfy for resources it does not own).
-fn bridge_channel_grants(
-    client_grants: Vec<CapabilityGrant>,
-    tenant: &str,
-    discovery_listener: u64,
-    stream_region: u64,
-) -> Vec<CapabilityGrant> {
-    let mut child_grants = client_grants;
-    child_grants.push(CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![
-            ResourceSelector::Tenant(tenant.to_string()),
-            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(stream_region)),
-        ],
-    ));
-    child_grants.push(CapabilityGrant::new(
-        Capability::HostQueue,
-        vec![
-            ResourceSelector::Tenant(tenant.to_string()),
-            ResourceSelector::ExplicitResource(ResourceIdentity::Shared(discovery_listener)),
-        ],
-    ));
-    child_grants
 }
 
 /// The stub client's data-plane grants: tenant-scoped shared memory, host

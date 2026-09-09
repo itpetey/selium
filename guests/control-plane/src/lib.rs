@@ -36,12 +36,12 @@ use selium_guest::{
 };
 use selium_shm::rpc;
 
-/// The internal route segment the control plane serves under.
-pub const CONTROL_PATH: &str = "control";
-/// Durable log name holding the control plane's desired-state records.
-pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
 /// Blob store name holding uploaded module bytes.
 pub const CONTROL_BLOB_STORE: &str = "selium.control-plane.modules";
+/// Durable log name holding the control plane's desired-state records.
+pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
+/// The internal route segment the control plane serves under.
+pub const CONTROL_PATH: &str = "control";
 
 /// The desired-state read model: deployments and pipeline bindings projected
 /// from the control plane's durable log.
@@ -53,6 +53,17 @@ pub struct ControlPlaneState {
     deployments: BTreeMap<String, Deployment>,
     pipelines: BTreeMap<String, PipelineBinding>,
 }
+
+/// Scheduler delegation seam.
+///
+/// Day-1 boundary: the scheduler guest's RPC service is not yet online
+/// (`implement-system-guests` §5), so delegation returns a typed deferred
+/// status — recording intent without pretending it was applied. When the
+/// scheduler service lands, this becomes a
+/// `selium_shm::rpc::RpcClient<SchedulerRequest, SchedulerResponse>` resolved
+/// through discovery; this method is the seam that client replaces.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchedulerClient;
 
 impl ControlPlaneState {
     /// Applies one desired-state record (a log entry, in replay order).
@@ -96,31 +107,6 @@ impl ControlPlaneState {
     }
 }
 
-/// Appends a desired-state record to the durable log and applies it to the
-/// projection, keeping the store of record and the read model in step.
-fn record(
-    log: &DurableLog,
-    state: &RefCell<ControlPlaneState>,
-    record: DesiredStateRecord,
-) -> selium_guest::Result<()> {
-    let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
-    let payload = encode_rkyv(&record)?;
-    log.append(timestamp_ms, Vec::new(), payload)?;
-    state.borrow_mut().apply_record(record);
-    Ok(())
-}
-
-/// Scheduler delegation seam.
-///
-/// Day-1 boundary: the scheduler guest's RPC service is not yet online
-/// (`implement-system-guests` §5), so delegation returns a typed deferred
-/// status — recording intent without pretending it was applied. When the
-/// scheduler service lands, this becomes a
-/// `selium_shm::rpc::RpcClient<SchedulerRequest, SchedulerResponse>` resolved
-/// through discovery; this method is the seam that client replaces.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SchedulerClient;
-
 impl SchedulerClient {
     /// Delegates one scheduler interaction, returning its typed outcome.
     pub fn delegate(&self, request: SchedulerRequest) -> selium_guest::Result<SchedulerResponse> {
@@ -134,25 +120,59 @@ impl SchedulerClient {
     }
 }
 
-/// Maps a scheduler response to a typed delegation status.
-fn delegation_status(response: SchedulerResponse) -> DelegationStatus {
-    match response {
-        SchedulerResponse::Applied => DelegationStatus {
-            step: "scheduler".to_string(),
-            applied: true,
-            context: "applied".to_string(),
-        },
-        SchedulerResponse::Deferred { reason } => DelegationStatus {
-            step: "scheduler".to_string(),
-            applied: false,
-            context: reason,
-        },
-        SchedulerResponse::Rejected { reason } => DelegationStatus {
-            step: "scheduler".to_string(),
-            applied: false,
-            context: reason,
-        },
-    }
+/// Returns whether a client's grant set admits an attach to the control
+/// surface: a tenant-scoped host-queue admission (the serving listener's
+/// resource class).
+///
+/// This mirrors the grant matrix the runtime enforces at attach time. It is a
+/// grant-matrix evaluation, not an ad-hoc identity check — the control plane
+/// never parses client identity to admit a session.
+pub fn admit_control_client(grants: &[CapabilityGrant], tenant: &str) -> bool {
+    let scope = ScopeContext {
+        tenant: Some(tenant.to_string()),
+        resource_class: Some(ResourceClass::HostQueue),
+        ..ScopeContext::default()
+    };
+    grants
+        .iter()
+        .any(|grant| grant.capability == Capability::HostQueue && grant.allows(&scope))
+}
+
+/// The grant set assigned to the control-plane guest: storage (durable log and
+/// module blob store), shared memory (the RPC session rings), and host queue
+/// (the serving listener plus the pre-connected discovery RPC client). All
+/// scoped to the guest's own tenant.
+pub fn control_plane_grants(tenant: &str) -> Vec<CapabilityGrant> {
+    vec![
+        CapabilityGrant::new(
+            Capability::Storage,
+            vec![
+                ResourceSelector::Tenant(tenant.to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::DurableLog),
+            ],
+        ),
+        CapabilityGrant::new(
+            Capability::Storage,
+            vec![
+                ResourceSelector::Tenant(tenant.to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::BlobStore),
+            ],
+        ),
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![
+                ResourceSelector::Tenant(tenant.to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+            ],
+        ),
+        CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![
+                ResourceSelector::Tenant(tenant.to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
+            ],
+        ),
+    ]
 }
 
 /// Maps a discovery lookup outcome to a typed resolve response.
@@ -191,6 +211,157 @@ fn accept_delegated(
             step: "scheduler".to_string(),
             context: format!("{error}"),
         },
+    }
+}
+
+/// Control-plane entrypoint.
+///
+/// Creates its own listener, registers the `control` serving route with
+/// discovery, and reports readiness only after the route is registered —
+/// mirroring `bridge-server`'s self-registration — then accepts typed
+/// shared-memory RPC sessions (mirroring `discovery`).
+#[entrypoint]
+async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
+    drop(selium_guest::log::init());
+    info!("control-plane: started");
+
+    // The served surface is `control.<tenant>`; without a tenant scope there
+    // is no wire name to serve under, so refuse to serve.
+    let (_, own_tenant) =
+        selium_guest::self_info().with_context(|| "control-plane: self info failed")?;
+    let Some(own_tenant) = own_tenant else {
+        bail!("control-plane: no tenant scope provisioned; refusing to serve");
+    };
+
+    let log = DurableLog::open(CONTROL_LOG).with_context(|| "control-plane: log open failed")?;
+    let blobs = BlobStore::open(CONTROL_BLOB_STORE)
+        .with_context(|| "control-plane: blob store open failed")?;
+    let mut desired = ControlPlaneState::default();
+    desired
+        .rebuild(&log)
+        .with_context(|| "control-plane: projection rebuild failed")?;
+    let state = Rc::new(RefCell::new(desired));
+
+    // The server creates its own listener: self-registration replaces the
+    // runtime's well-known-URI queue minting.
+    let listener =
+        ResourceListener::create().with_context(|| "control-plane: create listener failed")?;
+
+    // Register the serving route (`sel://<tenant>/control`, wire name
+    // `control.<tenant>`) from one declaration.
+    let target = ResourceTarget {
+        uri: String::new(), // pinned by `serve` to the derived internal path
+        host_id: String::new(),
+        resource_id: listener.descriptor().shared_id,
+        interface: None,
+        tenant: Some(own_tenant.clone()),
+        class: ResourceClass::HostQueue,
+        labels: Vec::new(),
+    };
+    ctx.serve(Serve {
+        path: vec![CONTROL_PATH.to_string()],
+        target,
+        default: false,
+    })
+    .await
+    .with_context(|| "control-plane: serve failed")?;
+
+    // Ready only after the route is registered.
+    mark_ready();
+
+    let discovery_handle = ctx.raw_handle();
+
+    loop {
+        let incoming = match listener.recv().await {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                warn!("control-plane: accept failed: {error}");
+                continue;
+            }
+        };
+        let connection = match rpc::accept::<ControlRequest, ControlResponse>(incoming.into()) {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!("control-plane: rpc accept failed: {error}");
+                continue;
+            }
+        };
+        spawn(handle_connection(
+            connection,
+            discovery_handle,
+            state.clone(),
+            log.clone(),
+            blobs.clone(),
+        ));
+    }
+}
+
+/// Maps a scheduler response to a typed delegation status.
+fn delegation_status(response: SchedulerResponse) -> DelegationStatus {
+    match response {
+        SchedulerResponse::Applied => DelegationStatus {
+            step: "scheduler".to_string(),
+            applied: true,
+            context: "applied".to_string(),
+        },
+        SchedulerResponse::Deferred { reason } => DelegationStatus {
+            step: "scheduler".to_string(),
+            applied: false,
+            context: reason,
+        },
+        SchedulerResponse::Rejected { reason } => DelegationStatus {
+            step: "scheduler".to_string(),
+            applied: false,
+            context: reason,
+        },
+    }
+}
+
+/// Serves one accepted RPC session: each request is decoded (`request.payload`
+/// is the typed decode; a failure becomes a typed serialization error rather
+/// than any text-grammar interpretation), handled, and replied to over the
+/// session's reply ring.
+async fn handle_connection(
+    mut connection: rpc::RpcConnection<ControlRequest, ControlResponse>,
+    discovery_handle: u64,
+    state: Rc<RefCell<ControlPlaneState>>,
+    log: DurableLog,
+    blobs: BlobStore,
+) {
+    // Each connection builds its own discovery client for `Resolve`; the
+    // bootstrap context cannot be shared across concurrent handlers.
+    let mut ctx = match Context::from_raw(discovery_handle).await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            warn!("control-plane: discovery client failed: {error}");
+            return;
+        }
+    };
+
+    loop {
+        match connection.recv().await {
+            Ok(request) => {
+                let response = match request.payload() {
+                    Ok(payload) => handle_request(&mut ctx, &log, &blobs, &state, payload).await,
+                    Err(error) => {
+                        warn!("control-plane: request decode failed: {error}");
+                        ControlResponse::Error {
+                            step: "decode".to_string(),
+                            context: format!("{error}"),
+                        }
+                    }
+                };
+                if request.reply(response).await.is_err() {
+                    warn!("control-plane: reply failed");
+                    break;
+                }
+            }
+            Err(rpc::RpcError::ConnectionClosed) => break,
+            Err(error) => {
+                warn!("control-plane: recv failed: {error}");
+                break;
+            }
+        }
     }
 }
 
@@ -295,189 +466,18 @@ async fn handle_request(
     }
 }
 
-/// The grant set assigned to the control-plane guest: storage (durable log and
-/// module blob store), shared memory (the RPC session rings), and host queue
-/// (the serving listener plus the pre-connected discovery RPC client). All
-/// scoped to the guest's own tenant.
-pub fn control_plane_grants(tenant: &str) -> Vec<CapabilityGrant> {
-    vec![
-        CapabilityGrant::new(
-            Capability::Storage,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::DurableLog),
-            ],
-        ),
-        CapabilityGrant::new(
-            Capability::Storage,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::BlobStore),
-            ],
-        ),
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-            ],
-        ),
-        CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-            ],
-        ),
-    ]
-}
-
-/// Returns whether a client's grant set admits an attach to the control
-/// surface: a tenant-scoped host-queue admission (the serving listener's
-/// resource class).
-///
-/// This mirrors the grant matrix the runtime enforces at attach time. It is a
-/// grant-matrix evaluation, not an ad-hoc identity check — the control plane
-/// never parses client identity to admit a session.
-pub fn admit_control_client(grants: &[CapabilityGrant], tenant: &str) -> bool {
-    let scope = ScopeContext {
-        tenant: Some(tenant.to_string()),
-        resource_class: Some(ResourceClass::HostQueue),
-        ..ScopeContext::default()
-    };
-    grants
-        .iter()
-        .any(|grant| grant.capability == Capability::HostQueue && grant.allows(&scope))
-}
-
-/// Serves one accepted RPC session: each request is decoded (`request.payload`
-/// is the typed decode; a failure becomes a typed serialization error rather
-/// than any text-grammar interpretation), handled, and replied to over the
-/// session's reply ring.
-async fn handle_connection(
-    mut connection: rpc::RpcConnection<ControlRequest, ControlResponse>,
-    discovery_handle: u64,
-    state: Rc<RefCell<ControlPlaneState>>,
-    log: DurableLog,
-    blobs: BlobStore,
-) {
-    // Each connection builds its own discovery client for `Resolve`; the
-    // bootstrap context cannot be shared across concurrent handlers.
-    let mut ctx = match Context::from_raw(discovery_handle).await {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            warn!("control-plane: discovery client failed: {error}");
-            return;
-        }
-    };
-
-    loop {
-        match connection.recv().await {
-            Ok(request) => {
-                let response = match request.payload() {
-                    Ok(payload) => handle_request(&mut ctx, &log, &blobs, &state, payload).await,
-                    Err(error) => {
-                        warn!("control-plane: request decode failed: {error}");
-                        ControlResponse::Error {
-                            step: "decode".to_string(),
-                            context: format!("{error}"),
-                        }
-                    }
-                };
-                if request.reply(response).await.is_err() {
-                    warn!("control-plane: reply failed");
-                    break;
-                }
-            }
-            Err(rpc::RpcError::ConnectionClosed) => break,
-            Err(error) => {
-                warn!("control-plane: recv failed: {error}");
-                break;
-            }
-        }
-    }
-}
-
-/// Control-plane entrypoint.
-///
-/// Creates its own listener, registers the `control` serving route with
-/// discovery, and reports readiness only after the route is registered —
-/// mirroring `bridge-server`'s self-registration — then accepts typed
-/// shared-memory RPC sessions (mirroring `discovery`).
-#[entrypoint]
-async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
-    drop(selium_guest::log::init());
-    info!("control-plane: started");
-
-    // The served surface is `control.<tenant>`; without a tenant scope there
-    // is no wire name to serve under, so refuse to serve.
-    let (_, own_tenant) =
-        selium_guest::self_info().with_context(|| "control-plane: self info failed")?;
-    let Some(own_tenant) = own_tenant else {
-        bail!("control-plane: no tenant scope provisioned; refusing to serve");
-    };
-
-    let log = DurableLog::open(CONTROL_LOG).with_context(|| "control-plane: log open failed")?;
-    let blobs = BlobStore::open(CONTROL_BLOB_STORE)
-        .with_context(|| "control-plane: blob store open failed")?;
-    let mut desired = ControlPlaneState::default();
-    desired
-        .rebuild(&log)
-        .with_context(|| "control-plane: projection rebuild failed")?;
-    let state = Rc::new(RefCell::new(desired));
-
-    // The server creates its own listener: self-registration replaces the
-    // runtime's well-known-URI queue minting.
-    let listener =
-        ResourceListener::create().with_context(|| "control-plane: create listener failed")?;
-
-    // Register the serving route (`sel://<tenant>/control`, wire name
-    // `control.<tenant>`) from one declaration.
-    let target = ResourceTarget {
-        uri: String::new(), // pinned by `serve` to the derived internal path
-        host_id: String::new(),
-        resource_id: listener.descriptor().shared_id,
-        interface: None,
-        tenant: Some(own_tenant.clone()),
-        class: ResourceClass::HostQueue,
-        labels: Vec::new(),
-    };
-    ctx.serve(Serve {
-        path: vec![CONTROL_PATH.to_string()],
-        target,
-        default: false,
-    })
-    .await
-    .with_context(|| "control-plane: serve failed")?;
-
-    // Ready only after the route is registered.
-    mark_ready();
-
-    let discovery_handle = ctx.raw_handle();
-
-    loop {
-        let incoming = match listener.recv().await {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                warn!("control-plane: accept failed: {error}");
-                continue;
-            }
-        };
-        let connection = match rpc::accept::<ControlRequest, ControlResponse>(incoming.into()) {
-            Ok(connection) => connection,
-            Err(error) => {
-                warn!("control-plane: rpc accept failed: {error}");
-                continue;
-            }
-        };
-        spawn(handle_connection(
-            connection,
-            discovery_handle,
-            state.clone(),
-            log.clone(),
-            blobs.clone(),
-        ));
-    }
+/// Appends a desired-state record to the durable log and applies it to the
+/// projection, keeping the store of record and the read model in step.
+fn record(
+    log: &DurableLog,
+    state: &RefCell<ControlPlaneState>,
+    record: DesiredStateRecord,
+) -> selium_guest::Result<()> {
+    let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
+    let payload = encode_rkyv(&record)?;
+    log.append(timestamp_ms, Vec::new(), payload)?;
+    state.borrow_mut().apply_record(record);
+    Ok(())
 }
 
 #[cfg(test)]

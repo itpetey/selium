@@ -67,7 +67,12 @@ const OWN_RING_READERS: u64 = 1;
 /// the reader count; writers and blocking readers — the norms for fabric
 /// members — are both counted.
 const OWN_RING_WRITERS: u64 = 1;
-
+/// Accept signal on a session's request ring: the pipe's own writer plus
+/// the serving guest's request-transport writer. Observing it guarantees
+/// the server's request reader is already registered (a transport registers
+/// its eager reader before its writer), so no relayed frame can fall behind
+/// the reader's start position.
+const SESSION_ACCEPT_WRITERS: u64 = 2;
 /// Session ring capacity for a rendezvoused RPC session, per direction.
 ///
 /// A frame larger than the ring can never be relayed (Park backpressure
@@ -76,12 +81,6 @@ const OWN_RING_WRITERS: u64 = 1;
 /// `rpc::connect` defaults so module uploads admit through the control
 /// surface; the two rings are per external stream and freed on teardown.
 const SESSION_RING_CAPACITY: u64 = 1 << 20;
-/// Accept signal on a session's request ring: the pipe's own writer plus
-/// the serving guest's request-transport writer. Observing it guarantees
-/// the server's request reader is already registered (a transport registers
-/// its eager reader before its writer), so no relayed frame can fall behind
-/// the reader's start position.
-const SESSION_ACCEPT_WRITERS: u64 = 2;
 /// The serving guest's writers on a session's reply ring: the pipe holds
 /// none, so the count reaching zero after accept means the server's side
 /// of the session has ended.
@@ -120,6 +119,16 @@ struct RingReadTransport {
 struct RingWriteTransport {
     writer: BlockingWriter,
 }
+
+/// Yields once and re-checks, keeping the reactor alive while the
+/// (concurrent) serving guest completes its accept.
+///
+/// Mirrors `rpc::connect`'s accept wait: a transport registration on the
+/// far side advances no generation counter, so there is nothing to park
+/// on — the condition is re-checked in a self-waking spin until the
+/// serving guest's writer lands. Identical to an internal client's
+/// behaviour for a route that never accepts.
+struct YieldOnce(bool);
 
 impl tokio::io::AsyncRead for StreamReadTransport {
     fn poll_read(
@@ -327,6 +336,20 @@ impl MessageTransport for RingWriteTransport {
     }
 }
 
+impl std::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
 /// The bridge pipe core: handshake → resolve → dispatch (splice or
 /// rendezvous) → accepted reply → relay → teardown.
 ///
@@ -399,54 +422,190 @@ pub async fn bridge_pipe<Resolve, Fut, Enqueue, EnqFut>(
     }
 }
 
-/// Transparent splice into a fabric channel ring (the original pipe):
-/// attach, accepted reply, then relay until either half closes.
-async fn splice_pipe(
-    stream_read: FramedRead<StreamReadTransport>,
+/// Bridge channel entrypoint.
+///
+/// Arguments: the bootstrap discovery `Context` (built by the entrypoint
+/// macro, used for target-URI resolution) and the relayed byte-channel
+/// region `shared_id` (delivered by `bridge-server`).
+#[entrypoint]
+async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> {
+    drop(selium_guest::log::init());
+    info!("bridge-channel: started");
+
+    let stream = ByteStream::attach_blocking(shared_id)
+        .with_context(|| "bridge-channel: attach stream region failed")?;
+
+    mark_ready();
+
+    bridge_pipe(
+        stream,
+        move |uri| async move {
+            let target = ctx
+                .lookup(&uri)
+                .await?
+                .ok_or_else(|| GuestError::Host(format!("target not found: {uri}")))?;
+            Ok(target)
+        },
+        // The queue handoff for a rendezvoused session. The handoff metadata
+        // is empty today: the resolved client identity cannot yet be
+        // forwarded to a guest-spawned child (guest `Process::start` carries
+        // integer arguments only), and serving guests authorize via the
+        // runtime's capability enforcement, not the metadata. Identity
+        // pass-through lands with pointer-argument spawn support.
+        |queue_id, session_id| async move {
+            let sender = ResourceSender::attach(queue_id)?;
+            sender.send_with_metadata(session_id, Vec::new()).await
+        },
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Reads the next complete frame, parking on the transport's read waker
+/// until one arrives.
+///
+/// The relayed stream and the session rings are shared with other
+/// processes, and a `yield_now` spin parks the task until the next
+/// host-driven reactor entry — which never arrives for a pure
+/// shared-memory wait. `read_frame_async` instead parks through the
+/// generation-wait mechanism, so a peer's write (or close) re-polls this
+/// guest through the runtime's wake path. Any read failure (peer EOF or
+/// transport error) ends the frame stream.
+async fn next_frame<M: MessageTransport>(reader: &mut FramedRead<M>) -> Option<(Vec<u8>, u32, u8)> {
+    reader.read_frame_async().await.ok()
+}
+
+/// Copies frames from the fabric ring to the relayed stream (fabric → client).
+///
+/// The fabric half ends when the ring read errors, or when the ring quiesces:
+/// no data is pending and only the pipe's own members remain (every inner
+/// writer and blocking reader is gone). `fabric` is moved in so the quiesce
+/// check can read the live member counts.
+async fn pump_ring_to_stream(
+    mut ring_read: FramedRead<RingReadTransport>,
     mut stream_write: FramedWrite<StreamWriteTransport>,
-    region_id: u64,
+    fabric: Channel,
 ) {
-    let channel = match Channel::attach(region_id) {
-        Ok(channel) => channel,
-        Err(_) => {
-            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
-            return;
+    // Fabric close ends the loop; dropping `stream_write` finishes the client
+    // stream.
+    loop {
+        match ring_read.read_frame() {
+            Ok((payload, tag, flags)) => {
+                if stream_write
+                    .write_frame_with_flags_async(&payload, tag, flags)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(WireError::BufferEmpty) => {
+                // No data pending. If only the pipe's own members remain,
+                // the fabric is closed: every inner writer and blocking
+                // reader is gone, so nothing further can ever arrive.
+                // Finish the client's stream instead of parking in
+                // BufferEmpty forever.
+                let writers = fabric.ring().region().load_writer_count().unwrap_or(0);
+                let readers = fabric.ring().region().read_reader_count().unwrap_or(0);
+                if writers <= OWN_RING_WRITERS && readers <= OWN_RING_READERS {
+                    break;
+                }
+                // An inner peer is still attached: park until the ring
+                // advances (its next write — or its close, which also
+                // bumps the generation — re-polls the quiesce check).
+                wait_for_ring_advance(fabric.ring().region()).await;
+            }
+            Err(_) => break,
         }
-    };
+    }
+}
 
-    // Fabric ring adapters, split read/write so the pipe contributes exactly
-    // ONE counting writer (the write transport's): inner guests see the
-    // pipe's membership via writer_count (its death is visible as a count
-    // drop), and the pipe can observe "all inner writers gone" as
-    // writer_count == OWN_RING_WRITERS (only itself remains).
-    let ring_read = match channel.blocking_reader() {
-        Ok(reader) => FramedRead::new(RingReadTransport { reader }),
-        Err(_) => {
-            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
-            return;
+/// Relays frames reply ring → stream (server → client), gated on the
+/// serving guest's accept and ending when the server's side of the session
+/// closes.
+async fn pump_session_to_stream(
+    mut session_read: FramedRead<RingReadTransport>,
+    mut stream_write: FramedWrite<StreamWriteTransport>,
+    reply_channel: Channel,
+) {
+    // Accept gate on the reply ring: wait until the server's reply
+    // transport writer has joined. Observing it guarantees the server's
+    // reply reader is already registered; afterwards the reader's own
+    // EOF semantics apply (before the gate passes, an empty reply ring
+    // means "not accepted yet", not "session ended" — the pipe holds no
+    // reply writer, so the ring's writer count is zero until accept).
+    loop {
+        match reply_channel.ring().region().load_writer_count() {
+            Ok(count) if count >= SESSION_SERVER_WRITERS => break,
+            Ok(_) => YieldOnce(false).await,
+            Err(_) => return,
         }
-    };
-    let ring_write = match channel.blocking_writer() {
-        Ok(writer) => FramedWrite::new(RingWriteTransport { writer }),
-        Err(_) => {
-            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
-            return;
+    }
+    // Session end (all server writers gone → ring EOF) finishes the
+    // client's stream; a failing stream write ends the relay the other
+    // way. Both halves park through the generation-wait mechanism, so a
+    // serving guest in another process drives the relay.
+    while let Ok((payload, tag, flags)) = session_read.read_frame_async().await {
+        if stream_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
         }
-    };
+    }
+}
 
-    // Deterministic success reply: the channel is resolved and attached,
-    // so the client may treat silence-after-handshake as a protocol
-    // violation. Best-effort (a client that vanished needs no reply).
-    let accepted = PipeControl::Accepted.encode();
-    drop(stream_write.write_frame(&accepted, 0));
+/// Copies frames from the relayed stream to the fabric ring (client → fabric).
+async fn pump_stream_to_ring(
+    mut stream_read: FramedRead<StreamReadTransport>,
+    mut ring_write: FramedWrite<RingWriteTransport>,
+) {
+    // Client FIN (stream EOF) ends the loop; dropping `ring_write` releases
+    // the fabric membership.
+    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
+        if ring_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
 
-    // Splice until either half closes; `select!` cancels the loser, whose
-    // dropped halves release the fabric membership / finish the stream.
-    let to_ring = pump_stream_to_ring(stream_read, ring_write);
-    let to_stream = pump_ring_to_stream(ring_read, stream_write, channel);
-    tokio::select! {
-        _ = to_ring => {}
-        _ = to_stream => {}
+/// Relays frames stream → request ring (client → server), gated on the
+/// serving guest's accept.
+///
+/// The gate mirrors `rpc::connect`'s accept wait: a blocking reader starts
+/// at the ring tail at registration, so a frame written before the server
+/// registers its reader is invisible to it forever. Waiting for the second
+/// writer makes first-frame ordering deterministic. A serving guest that
+/// never accepts parks the pipe here — the honest backpressure outcome for
+/// a route nobody serves, identical to an internal client.
+async fn pump_stream_to_session(
+    mut stream_read: FramedRead<StreamReadTransport>,
+    mut session_write: FramedWrite<RingWriteTransport>,
+    request_channel: Channel,
+) {
+    loop {
+        match request_channel.ring().region().load_writer_count() {
+            Ok(count) if count >= SESSION_ACCEPT_WRITERS => break,
+            Ok(_) => YieldOnce(false).await,
+            Err(_) => return,
+        }
+    }
+    // Client FIN (stream EOF) ends the loop; dropping `session_write`
+    // releases the request-ring membership.
+    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
+        if session_write
+            .write_frame_with_flags_async(&payload, tag, flags)
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -530,152 +689,62 @@ async fn rendezvous_pipe<Enqueue, EnqFut>(
     drop(free_region(session_id));
 }
 
-/// Relays frames stream → request ring (client → server), gated on the
-/// serving guest's accept.
-///
-/// The gate mirrors `rpc::connect`'s accept wait: a blocking reader starts
-/// at the ring tail at registration, so a frame written before the server
-/// registers its reader is invisible to it forever. Waiting for the second
-/// writer makes first-frame ordering deterministic. A serving guest that
-/// never accepts parks the pipe here — the honest backpressure outcome for
-/// a route nobody serves, identical to an internal client.
-async fn pump_stream_to_session(
-    mut stream_read: FramedRead<StreamReadTransport>,
-    mut session_write: FramedWrite<RingWriteTransport>,
-    request_channel: Channel,
-) {
-    loop {
-        match request_channel.ring().region().load_writer_count() {
-            Ok(count) if count >= SESSION_ACCEPT_WRITERS => break,
-            Ok(_) => YieldOnce(false).await,
-            Err(_) => return,
-        }
-    }
-    // Client FIN (stream EOF) ends the loop; dropping `session_write`
-    // releases the request-ring membership.
-    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
-        if session_write
-            .write_frame_with_flags_async(&payload, tag, flags)
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-/// Relays frames reply ring → stream (server → client), gated on the
-/// serving guest's accept and ending when the server's side of the session
-/// closes.
-async fn pump_session_to_stream(
-    mut session_read: FramedRead<RingReadTransport>,
+/// Transparent splice into a fabric channel ring (the original pipe):
+/// attach, accepted reply, then relay until either half closes.
+async fn splice_pipe(
+    stream_read: FramedRead<StreamReadTransport>,
     mut stream_write: FramedWrite<StreamWriteTransport>,
-    reply_channel: Channel,
+    region_id: u64,
 ) {
-    // Accept gate on the reply ring: wait until the server's reply
-    // transport writer has joined. Observing it guarantees the server's
-    // reply reader is already registered; afterwards the reader's own
-    // EOF semantics apply (before the gate passes, an empty reply ring
-    // means "not accepted yet", not "session ended" — the pipe holds no
-    // reply writer, so the ring's writer count is zero until accept).
-    loop {
-        match reply_channel.ring().region().load_writer_count() {
-            Ok(count) if count >= SESSION_SERVER_WRITERS => break,
-            Ok(_) => YieldOnce(false).await,
-            Err(_) => return,
+    let channel = match Channel::attach(region_id) {
+        Ok(channel) => channel,
+        Err(_) => {
+            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+            return;
         }
-    }
-    // Session end (all server writers gone → ring EOF) finishes the
-    // client's stream; a failing stream write ends the relay the other
-    // way. Both halves park through the generation-wait mechanism, so a
-    // serving guest in another process drives the relay.
-    while let Ok((payload, tag, flags)) = session_read.read_frame_async().await {
-        if stream_write
-            .write_frame_with_flags_async(&payload, tag, flags)
-            .await
-            .is_err()
-        {
-            break;
+    };
+
+    // Fabric ring adapters, split read/write so the pipe contributes exactly
+    // ONE counting writer (the write transport's): inner guests see the
+    // pipe's membership via writer_count (its death is visible as a count
+    // drop), and the pipe can observe "all inner writers gone" as
+    // writer_count == OWN_RING_WRITERS (only itself remains).
+    let ring_read = match channel.blocking_reader() {
+        Ok(reader) => FramedRead::new(RingReadTransport { reader }),
+        Err(_) => {
+            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+            return;
         }
+    };
+    let ring_write = match channel.blocking_writer() {
+        Ok(writer) => FramedWrite::new(RingWriteTransport { writer }),
+        Err(_) => {
+            terminate(&mut stream_write, TERMINATE_ATTACH_FAILED).await;
+            return;
+        }
+    };
+
+    // Deterministic success reply: the channel is resolved and attached,
+    // so the client may treat silence-after-handshake as a protocol
+    // violation. Best-effort (a client that vanished needs no reply).
+    let accepted = PipeControl::Accepted.encode();
+    drop(stream_write.write_frame(&accepted, 0));
+
+    // Splice until either half closes; `select!` cancels the loser, whose
+    // dropped halves release the fabric membership / finish the stream.
+    let to_ring = pump_stream_to_ring(stream_read, ring_write);
+    let to_stream = pump_ring_to_stream(ring_read, stream_write, channel);
+    tokio::select! {
+        _ = to_ring => {}
+        _ = to_stream => {}
     }
 }
 
-/// Bridge channel entrypoint.
-///
-/// Arguments: the bootstrap discovery `Context` (built by the entrypoint
-/// macro, used for target-URI resolution) and the relayed byte-channel
-/// region `shared_id` (delivered by `bridge-server`).
-#[entrypoint]
-async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> {
-    drop(selium_guest::log::init());
-    info!("bridge-channel: started");
-
-    let stream = ByteStream::attach_blocking(shared_id)
-        .with_context(|| "bridge-channel: attach stream region failed")?;
-
-    mark_ready();
-
-    bridge_pipe(
-        stream,
-        move |uri| async move {
-            let target = ctx
-                .lookup(&uri)
-                .await?
-                .ok_or_else(|| GuestError::Host(format!("target not found: {uri}")))?;
-            Ok(target)
-        },
-        // The queue handoff for a rendezvoused session. The handoff metadata
-        // is empty today: the resolved client identity cannot yet be
-        // forwarded to a guest-spawned child (guest `Process::start` carries
-        // integer arguments only), and serving guests authorize via the
-        // runtime's capability enforcement, not the metadata. Identity
-        // pass-through lands with pointer-argument spawn support.
-        |queue_id, session_id| async move {
-            let sender = ResourceSender::attach(queue_id)?;
-            sender.send_with_metadata(session_id, Vec::new()).await
-        },
-    )
-    .await;
-
-    Ok(())
-}
-
-/// Reads the next complete frame, parking on the transport's read waker
-/// until one arrives.
-///
-/// The relayed stream and the session rings are shared with other
-/// processes, and a `yield_now` spin parks the task until the next
-/// host-driven reactor entry — which never arrives for a pure
-/// shared-memory wait. `read_frame_async` instead parks through the
-/// generation-wait mechanism, so a peer's write (or close) re-polls this
-/// guest through the runtime's wake path. Any read failure (peer EOF or
-/// transport error) ends the frame stream.
-async fn next_frame<M: MessageTransport>(reader: &mut FramedRead<M>) -> Option<(Vec<u8>, u32, u8)> {
-    reader.read_frame_async().await.ok()
-}
-
-/// Yields once and re-checks, keeping the reactor alive while the
-/// (concurrent) serving guest completes its accept.
-///
-/// Mirrors `rpc::connect`'s accept wait: a transport registration on the
-/// far side advances no generation counter, so there is nothing to park
-/// on — the condition is re-checked in a self-waking spin until the
-/// serving guest's writer lands. Identical to an internal client's
-/// behaviour for a route that never accepts.
-struct YieldOnce(bool);
-
-impl std::future::Future for YieldOnce {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
+/// Sends a termination frame, best-effort (the writer is dropped after, closing
+/// the stream and surfacing EOF to the connector).
+async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
+    let payload = PipeControl::Terminate { code }.encode();
+    drop(stream_write.write_frame(&payload, 0));
 }
 
 /// Parks until the fabric ring's generation advances, so an inner peer's
@@ -701,76 +770,6 @@ async fn wait_for_ring_advance(region: &selium_shm::ChannelRegion) {
         Poll::Pending
     })
     .await
-}
-
-/// Copies frames from the fabric ring to the relayed stream (fabric → client).
-///
-/// The fabric half ends when the ring read errors, or when the ring quiesces:
-/// no data is pending and only the pipe's own members remain (every inner
-/// writer and blocking reader is gone). `fabric` is moved in so the quiesce
-/// check can read the live member counts.
-async fn pump_ring_to_stream(
-    mut ring_read: FramedRead<RingReadTransport>,
-    mut stream_write: FramedWrite<StreamWriteTransport>,
-    fabric: Channel,
-) {
-    // Fabric close ends the loop; dropping `stream_write` finishes the client
-    // stream.
-    loop {
-        match ring_read.read_frame() {
-            Ok((payload, tag, flags)) => {
-                if stream_write
-                    .write_frame_with_flags_async(&payload, tag, flags)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Err(WireError::BufferEmpty) => {
-                // No data pending. If only the pipe's own members remain,
-                // the fabric is closed: every inner writer and blocking
-                // reader is gone, so nothing further can ever arrive.
-                // Finish the client's stream instead of parking in
-                // BufferEmpty forever.
-                let writers = fabric.ring().region().load_writer_count().unwrap_or(0);
-                let readers = fabric.ring().region().read_reader_count().unwrap_or(0);
-                if writers <= OWN_RING_WRITERS && readers <= OWN_RING_READERS {
-                    break;
-                }
-                // An inner peer is still attached: park until the ring
-                // advances (its next write — or its close, which also
-                // bumps the generation — re-polls the quiesce check).
-                wait_for_ring_advance(fabric.ring().region()).await;
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Copies frames from the relayed stream to the fabric ring (client → fabric).
-async fn pump_stream_to_ring(
-    mut stream_read: FramedRead<StreamReadTransport>,
-    mut ring_write: FramedWrite<RingWriteTransport>,
-) {
-    // Client FIN (stream EOF) ends the loop; dropping `ring_write` releases
-    // the fabric membership.
-    while let Some((payload, tag, flags)) = next_frame(&mut stream_read).await {
-        if ring_write
-            .write_frame_with_flags_async(&payload, tag, flags)
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-/// Sends a termination frame, best-effort (the writer is dropped after, closing
-/// the stream and surfacing EOF to the connector).
-async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
-    let payload = PipeControl::Terminate { code }.encode();
-    drop(stream_write.write_frame(&payload, 0));
 }
 
 #[cfg(test)]

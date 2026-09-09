@@ -412,51 +412,9 @@ impl From<&selium_abi::DiscoveryResponse> for DiscoveryResponseWire {
     }
 }
 
-impl From<&DomainEntryWire> for (String, String) {
-    fn from(value: &DomainEntryWire) -> Self {
-        (value.domain.clone(), value.tenant.clone())
-    }
-}
-
-impl From<LabelWire> for (String, String) {
-    fn from(value: LabelWire) -> Self {
-        (value.key, value.value)
-    }
-}
-
 impl From<&selium_abi::ResolvedTarget> for ResolvedTargetWire {
     fn from(value: &selium_abi::ResolvedTarget) -> Self {
         Self::new(value.uri.clone(), value.host_id.clone(), value.resource_id)
-    }
-}
-
-impl From<ResolvedTargetWire> for selium_abi::ResolvedTarget {
-    fn from(value: ResolvedTargetWire) -> Self {
-        Self {
-            uri: value.uri,
-            host_id: value.host_id,
-            resource_id: value.resource_id,
-        }
-    }
-}
-
-impl From<&selium_abi::Deployment> for DeploymentWire {
-    fn from(value: &selium_abi::Deployment) -> Self {
-        Self::new(
-            value.workload_id.clone(),
-            value.replicas,
-            value.module.clone(),
-        )
-    }
-}
-
-impl From<DeploymentWire> for selium_abi::Deployment {
-    fn from(value: DeploymentWire) -> Self {
-        Self {
-            workload_id: value.workload_id,
-            replicas: value.replicas,
-            module: value.module,
-        }
     }
 }
 
@@ -525,6 +483,16 @@ impl From<&selium_abi::ControlRequest> for ControlRequestWire {
                 Vec::new(),
             ),
         }
+    }
+}
+
+impl From<&selium_abi::Deployment> for DeploymentWire {
+    fn from(value: &selium_abi::Deployment) -> Self {
+        Self::new(
+            value.workload_id.clone(),
+            value.replicas,
+            value.module.clone(),
+        )
     }
 }
 
@@ -635,6 +603,38 @@ impl From<&selium_abi::SchedulerResponse> for SchedulerResponseWire {
             selium_abi::SchedulerResponse::Applied => Self::new(0, String::new()),
             selium_abi::SchedulerResponse::Deferred { reason } => Self::new(1, reason.clone()),
             selium_abi::SchedulerResponse::Rejected { reason } => Self::new(2, reason.clone()),
+        }
+    }
+}
+
+impl From<&DomainEntryWire> for (String, String) {
+    fn from(value: &DomainEntryWire) -> Self {
+        (value.domain.clone(), value.tenant.clone())
+    }
+}
+
+impl From<LabelWire> for (String, String) {
+    fn from(value: LabelWire) -> Self {
+        (value.key, value.value)
+    }
+}
+
+impl From<ResolvedTargetWire> for selium_abi::ResolvedTarget {
+    fn from(value: ResolvedTargetWire) -> Self {
+        Self {
+            uri: value.uri,
+            host_id: value.host_id,
+            resource_id: value.resource_id,
+        }
+    }
+}
+
+impl From<DeploymentWire> for selium_abi::Deployment {
+    fn from(value: DeploymentWire) -> Self {
+        Self {
+            workload_id: value.workload_id,
+            replicas: value.replicas,
+            module: value.module,
         }
     }
 }
@@ -1005,44 +1005,6 @@ fn control_response_try_from_wire(
     }
 }
 
-/// Converts a scheduler request wire strictly: unknown variant tags are decode
-/// errors rather than silently reinterpreted defaults.
-fn scheduler_request_try_from_wire(
-    wire: SchedulerRequestWire,
-) -> ::std::result::Result<selium_abi::SchedulerRequest, InvalidFlatbuffer> {
-    match wire.variant {
-        0 => Ok(selium_abi::SchedulerRequest::Place {
-            workload_id: wire.workload_id,
-            replicas: wire.replicas,
-        }),
-        1 => Ok(selium_abi::SchedulerRequest::Scale {
-            workload_id: wire.workload_id,
-            replicas: wire.replicas,
-        }),
-        2 => Ok(selium_abi::SchedulerRequest::Stop {
-            workload_id: wire.workload_id,
-        }),
-        _ => invalid_wire("known scheduler request variant"),
-    }
-}
-
-/// Converts a scheduler response wire strictly: unknown variant tags are decode
-/// errors rather than silently reinterpreted defaults.
-fn scheduler_response_try_from_wire(
-    wire: SchedulerResponseWire,
-) -> ::std::result::Result<selium_abi::SchedulerResponse, InvalidFlatbuffer> {
-    match wire.variant {
-        0 => Ok(selium_abi::SchedulerResponse::Applied),
-        1 => Ok(selium_abi::SchedulerResponse::Deferred {
-            reason: wire.reason,
-        }),
-        2 => Ok(selium_abi::SchedulerResponse::Rejected {
-            reason: wire.reason,
-        }),
-        _ => invalid_wire("known scheduler response variant"),
-    }
-}
-
 /// Converts a discovery request wire strictly: unknown variant tags and a
 /// `Register` without a target are decode errors rather than silently
 /// reinterpreted defaults.
@@ -1147,6 +1109,44 @@ fn resource_target_try_from_wire(
             .map(<(String, String)>::from)
             .collect(),
     })
+}
+
+/// Converts a scheduler request wire strictly: unknown variant tags are decode
+/// errors rather than silently reinterpreted defaults.
+fn scheduler_request_try_from_wire(
+    wire: SchedulerRequestWire,
+) -> ::std::result::Result<selium_abi::SchedulerRequest, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::SchedulerRequest::Place {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+        }),
+        1 => Ok(selium_abi::SchedulerRequest::Scale {
+            workload_id: wire.workload_id,
+            replicas: wire.replicas,
+        }),
+        2 => Ok(selium_abi::SchedulerRequest::Stop {
+            workload_id: wire.workload_id,
+        }),
+        _ => invalid_wire("known scheduler request variant"),
+    }
+}
+
+/// Converts a scheduler response wire strictly: unknown variant tags are decode
+/// errors rather than silently reinterpreted defaults.
+fn scheduler_response_try_from_wire(
+    wire: SchedulerResponseWire,
+) -> ::std::result::Result<selium_abi::SchedulerResponse, InvalidFlatbuffer> {
+    match wire.variant {
+        0 => Ok(selium_abi::SchedulerResponse::Applied),
+        1 => Ok(selium_abi::SchedulerResponse::Deferred {
+            reason: wire.reason,
+        }),
+        2 => Ok(selium_abi::SchedulerResponse::Rejected {
+            reason: wire.reason,
+        }),
+        _ => invalid_wire("known scheduler response variant"),
+    }
 }
 
 #[cfg(test)]

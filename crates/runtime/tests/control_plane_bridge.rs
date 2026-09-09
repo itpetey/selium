@@ -73,16 +73,228 @@ const CLIENT_CERT_PEM: &[u8] =
     include_bytes!("../../../guests/connector-quic/tests/fixtures/client_cert.pem");
 const CLIENT_KEY_PEM: &[u8] =
     include_bytes!("../../../guests/connector-quic/tests/fixtures/client_key.pem");
-
 /// The connector's fixed listener (its `QUIC_LISTEN_ADDR` const).
 const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
 /// The control plane's served route, named in the bridge handshake.
 const CONTROL_URI: &str = "sel://acme/control";
+/// The day-1 scheduler seam's typed deferred context.
+const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
 /// SNI / TLS server name: the synthetic tenant wire name for the acme
 /// bridge route (resolved by the connector to `sel://acme/bridge`).
 const SERVER_NAME: &str = "bridge.acme";
-/// The day-1 scheduler seam's typed deferred context.
-const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
+
+fn bridge_channel_wasm() -> Vec<u8> {
+    read_wasm("selium-bridge-channel", "selium_bridge_channel.wasm")
+}
+
+/// The bridge server system guest: tenant `acme`, self-registered
+/// `sel://acme/bridge` route, pinned to the `sel-quic` connector. Its
+/// process-lifecycle and delegation grants let it spawn bridge-channels
+/// under the client's conferred grants.
+fn bridge_server_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "bridge-server".to_string(),
+        module_id: "bridge-server-module".to_string(),
+        module_bytes,
+        entrypoint: "bridge_server".to_string(),
+        arguments: Vec::new(), // discovery handle injected by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::ProcessLifecycle,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+            ),
+            CapabilityGrant::new(
+                Capability::DelegateGrants,
+                vec![ResourceSelector::Tenant("acme".to_string())],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+        ],
+        // The server pins its listener to the registered `sel-quic`
+        // handler, so the connector must be up first.
+        dependencies: vec!["discovery".to_string(), "quic-connector".to_string()],
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: Some("acme".to_string()),
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn bridge_wasm() -> Vec<u8> {
+    read_wasm("selium-bridge", "selium_bridge.wasm")
+}
+
+/// Builds the `selium-client` connection options: trust the connector's
+/// bridge-route certificate, present the bridge test client's identity for
+/// mTLS, and keep the transport patient (the wasm32 guests run on an
+/// interpreter, so the TLS handshake takes far longer than the quinn
+/// defaults assume).
+fn client_options() -> ConnectOptions {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
+        300_000u32,
+    ))));
+    transport.initial_rtt(Duration::from_millis(250));
+
+    ConnectOptions {
+        server_name: SERVER_NAME.to_string(),
+        server_root: selium_client::certificates_from_pem(BRIDGE_CERT_PEM)
+            .expect("parse bridge certificate PEM"),
+        identity: Some(selium_client::ClientIdentity {
+            cert_chain: selium_client::certificates_from_pem(CLIENT_CERT_PEM)
+                .expect("parse client certificate PEM"),
+            key: selium_client::private_key_from_pem(CLIENT_KEY_PEM).expect("parse client key PEM"),
+        }),
+        transport: Some(Arc::new(transport)),
+    }
+}
+
+/// The QUIC connector system guest, exactly as the QUIC spine test deploys
+/// it: Tier-1 `sel-quic` protocol handler, TLS material from the
+/// `tls-certs` blob store, and a fixed UDP listener.
+fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "quic-connector".to_string(),
+        module_id: "quic-connector-module".to_string(),
+        module_bytes,
+        entrypoint: "connector_quic".to_string(),
+        arguments: Vec::new(), // discovery handle injected by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Network,
+                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+            ),
+        ],
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        serving_role: None,
+        handlers: vec!["sel-quic".to_string()],
+    }
+}
+
+fn connector_wasm() -> Vec<u8> {
+    read_wasm("selium-connector-quic", "selium_connector_quic.wasm")
+}
+
+/// The control-plane system guest, exactly as the control-plane bootstrap
+/// test deploys it: storage (durable log + module blob store), shared
+/// memory (RPC session rings), and host queue (serving listener), all
+/// tenant-scoped.
+fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "control-plane".to_string(),
+        module_id: "control-plane-module".to_string(),
+        module_bytes,
+        entrypoint: "control_plane_main".to_string(),
+        arguments: Vec::new(), // discovery handle injected by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::DurableLog),
+                ],
+            ),
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::BlobStore),
+                ],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+                ],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![
+                    ResourceSelector::Tenant("acme".to_string()),
+                    ResourceSelector::ResourceClass(ResourceClass::HostQueue),
+                ],
+            ),
+        ],
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: Some("acme".to_string()),
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn control_plane_wasm() -> Vec<u8> {
+    read_wasm("selium-control-plane", "selium_control_plane.wasm")
+}
+
+/// The discovery system guest, exactly as the discovery integration test
+/// deploys it: the guest is named `"discovery"` so bootstrap wires the feed
+/// region and listener handle into its arguments and grants.
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+fn discovery_wasm() -> Vec<u8> {
+    read_wasm("selium-discovery", "selium_discovery.wasm")
+}
+
+/// Drains a guest's log channel and decodes each frame as a `LogRecord`.
+fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .kernel()
+        .processes()
+        .drain_log_channel(process_id)
+        .expect("drain log channel")
+        .iter()
+        .map(|frame| {
+            selium_encoding::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
 
 /// Golden path: external mTLS client → connector → bridge server →
 /// bridge-channel rendezvous → control plane's served route, exchanging a
@@ -322,181 +534,12 @@ async fn external_client_reaches_control_plane_through_the_bridge() {
     runtime.stop_process(discovery).expect("stop discovery");
 }
 
-/// Builds the `selium-client` connection options: trust the connector's
-/// bridge-route certificate, present the bridge test client's identity for
-/// mTLS, and keep the transport patient (the wasm32 guests run on an
-/// interpreter, so the TLS handshake takes far longer than the quinn
-/// defaults assume).
-fn client_options() -> ConnectOptions {
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
-        300_000u32,
-    ))));
-    transport.initial_rtt(Duration::from_millis(250));
-
-    ConnectOptions {
-        server_name: SERVER_NAME.to_string(),
-        server_root: selium_client::certificates_from_pem(BRIDGE_CERT_PEM)
-            .expect("parse bridge certificate PEM"),
-        identity: Some(selium_client::ClientIdentity {
-            cert_chain: selium_client::certificates_from_pem(CLIENT_CERT_PEM)
-                .expect("parse client certificate PEM"),
-            key: selium_client::private_key_from_pem(CLIENT_KEY_PEM).expect("parse client key PEM"),
-        }),
-        transport: Some(Arc::new(transport)),
-    }
-}
-
-/// The QUIC connector system guest, exactly as the QUIC spine test deploys
-/// it: Tier-1 `sel-quic` protocol handler, TLS material from the
-/// `tls-certs` blob store, and a fixed UDP listener.
-fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "quic-connector".to_string(),
-        module_id: "quic-connector-module".to_string(),
-        module_bytes,
-        entrypoint: "connector_quic".to_string(),
-        arguments: Vec::new(), // discovery handle injected by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Network,
-                vec![ResourceSelector::ResourceClass(ResourceClass::UdpSocket)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
-            ),
-        ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        serving_role: None,
-        handlers: vec!["sel-quic".to_string()],
-    }
-}
-
-/// The bridge server system guest: tenant `acme`, self-registered
-/// `sel://acme/bridge` route, pinned to the `sel-quic` connector. Its
-/// process-lifecycle and delegation grants let it spawn bridge-channels
-/// under the client's conferred grants.
-fn bridge_server_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "bridge-server".to_string(),
-        module_id: "bridge-server-module".to_string(),
-        module_bytes,
-        entrypoint: "bridge_server".to_string(),
-        arguments: Vec::new(), // discovery handle injected by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::ProcessLifecycle,
-                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
-            ),
-            CapabilityGrant::new(
-                Capability::DelegateGrants,
-                vec![ResourceSelector::Tenant("acme".to_string())],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-        ],
-        // The server pins its listener to the registered `sel-quic`
-        // handler, so the connector must be up first.
-        dependencies: vec!["discovery".to_string(), "quic-connector".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some("acme".to_string()),
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// The discovery system guest, exactly as the discovery integration test
-/// deploys it: the guest is named `"discovery"` so bootstrap wires the feed
-/// region and listener handle into its arguments and grants.
-fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_feed_and_handle
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// The control-plane system guest, exactly as the control-plane bootstrap
-/// test deploys it: storage (durable log + module blob store), shared
-/// memory (RPC session rings), and host queue (serving listener), all
-/// tenant-scoped.
-fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "control-plane".to_string(),
-        module_id: "control-plane-module".to_string(),
-        module_bytes,
-        entrypoint: "control_plane_main".to_string(),
-        arguments: Vec::new(), // discovery handle injected by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::DurableLog),
-                ],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::BlobStore),
-                ],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-                ],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-                ],
-            ),
-        ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some("acme".to_string()),
-        serving_role: None,
-        handlers: Vec::new(),
-    }
+/// Reads a guest's wasm module, preferring (and building) the release
+/// profile: this test drives a TLS 1.3 handshake through the wasm
+/// interpreter, which is too slow at debug optimization for the quinn
+/// timeouts.
+fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
+    common::read_guest_wasm(crate_name, file_name)
 }
 
 /// Provisions the connector's TLS material into the `tls-certs` blob store:
@@ -535,22 +578,6 @@ fn seed_tls_blob_store(runtime: &Runtime) {
         .expect("client anchor tenant list manifest");
 }
 
-/// Drains a guest's log channel and decodes each frame as a `LogRecord`.
-fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
-        .iter()
-        .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
-}
-
 /// Polls a guest's log channel until every `(needle, count)` pair is
 /// satisfied, then returns every drained message.
 #[expect(clippy::panic, reason = "test helper")]
@@ -575,32 +602,4 @@ fn wait_for_logs(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
-}
-
-/// Reads a guest's wasm module, preferring (and building) the release
-/// profile: this test drives a TLS 1.3 handshake through the wasm
-/// interpreter, which is too slow at debug optimization for the quinn
-/// timeouts.
-fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    common::read_guest_wasm(crate_name, file_name)
-}
-
-fn bridge_wasm() -> Vec<u8> {
-    read_wasm("selium-bridge", "selium_bridge.wasm")
-}
-
-fn bridge_channel_wasm() -> Vec<u8> {
-    read_wasm("selium-bridge-channel", "selium_bridge_channel.wasm")
-}
-
-fn connector_wasm() -> Vec<u8> {
-    read_wasm("selium-connector-quic", "selium_connector_quic.wasm")
-}
-
-fn control_plane_wasm() -> Vec<u8> {
-    read_wasm("selium-control-plane", "selium_control_plane.wasm")
-}
-
-fn discovery_wasm() -> Vec<u8> {
-    read_wasm("selium-discovery", "selium_discovery.wasm")
 }
