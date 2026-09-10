@@ -23,8 +23,7 @@ use selium_abi::{
     RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
-use selium_service::DiscoveryRequest;
-use selium_service::FlatMsg;
+use selium_service::{DiscoveryRequest, FlatMsg};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 

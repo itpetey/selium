@@ -26,14 +26,14 @@ pub use selium_abi::{
 };
 // Re-export service message types and encoding types.
 pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
+// Re-export transport-agnostic memory primitives.
+pub use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
 pub use selium_service::{
     DiscoveryRequest, DiscoveryResponse, FieldEncoder, FlatMsg, HasSchema, InterfaceMetadata,
     ResourceTarget, SchemaDescriptor,
     codec::{decode_typed, encode_typed},
     log::{LogField, LogLevel, LogRecord, LogSpan},
 };
-// Re-export transport-agnostic memory primitives.
-pub use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
 pub use tracing::{debug, error, info, trace, warn};
 
 pub mod args;

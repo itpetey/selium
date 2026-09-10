@@ -21,6 +21,19 @@ pub mod log;
 // Allow generated schema bindings to refer to this crate by name.
 extern crate self as selium_service;
 
+/// Termination code for a channel the bridge could not resolve or attach.
+pub const TERMINATE_ATTACH_FAILED: u32 = 2;
+/// Termination code for a malformed or missing client handshake.
+pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
+
+/// Decode hook for non-schema field types that map onto a Flatbuffers scalar
+/// or string field (selected with `#[schema(codec)]`), where decoding may be
+/// strict and fail.
+pub trait FieldDecoder: Sized {
+    /// Decode the field from its `string` accessor.
+    fn decode_field(value: Option<&str>) -> Result<Self, InvalidFlatbuffer>;
+}
+
 /// Helper for encoding schema fields into Flatbuffers-ready values.
 pub trait FieldEncoder {
     /// Output type written into Flatbuffers args or vectors.
@@ -53,14 +66,6 @@ pub trait StringFieldValue {
     fn into_owned(self) -> String;
 }
 
-/// Decode hook for non-schema field types that map onto a Flatbuffers scalar
-/// or string field (selected with `#[schema(codec)]`), where decoding may be
-/// strict and fail.
-pub trait FieldDecoder: Sized {
-    /// Decode the field from its `string` accessor.
-    fn decode_field(value: Option<&str>) -> Result<Self, InvalidFlatbuffer>;
-}
-
 /// Error type for encoding/framing operations.
 #[derive(Debug, Error)]
 pub enum EncodingError {
@@ -80,10 +85,6 @@ pub struct SchemaDescriptor {
     /// 16-byte content hash identifying the schema.
     pub hash: [u8; 16],
 }
-
-// ---------------------------------------------------------------------------
-// Service message types
-// ---------------------------------------------------------------------------
 
 /// Metadata describing a resource interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,11 +477,6 @@ pub enum SchedulerResponse {
         reason: String,
     },
 }
-
-/// Termination code for a channel the bridge could not resolve or attach.
-pub const TERMINATE_ATTACH_FAILED: u32 = 2;
-/// Termination code for a malformed or missing client handshake.
-pub const TERMINATE_BAD_HANDSHAKE: u32 = 1;
 
 /// Typed per-stream control frames shared between the external client and the
 /// bridge channel.
