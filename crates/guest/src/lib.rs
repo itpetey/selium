@@ -21,17 +21,17 @@ pub use crate::{
     time::{Instant, Timer, now},
 };
 pub use selium_abi::{
-    Capability, CapabilityGrant, DiscoveryRequest, DiscoveryResponse, EntrypointMetadata,
-    InterfaceMetadata, LocalityScope, RegionProt, ResourceClass, ResourceIdentity,
-    ResourceSelector, ResourceTarget, ScopeContext,
+    Capability, CapabilityGrant, EntrypointMetadata, LocalityScope, RegionProt, ResourceClass,
+    ResourceIdentity, ResourceSelector, ScopeContext,
 };
-// Re-export encoding types.
-pub use selium_encoding::{
-    FieldEncoder, FlatMsg, HasSchema, SchemaDescriptor,
+// Re-export service message types and encoding types.
+pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
+pub use selium_service::{
+    DiscoveryRequest, DiscoveryResponse, FieldEncoder, FlatMsg, HasSchema, InterfaceMetadata,
+    ResourceTarget, SchemaDescriptor,
     codec::{decode_typed, encode_typed},
     log::{LogField, LogLevel, LogRecord, LogSpan},
 };
-pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
 // Re-export transport-agnostic memory primitives.
 pub use selium_memory::{RING_HEADER_SIZE, RegionMapping, SHARED_REGION_MAGIC, WASM_PAGE_SIZE};
 pub use tracing::{debug, error, info, trace, warn};

@@ -96,7 +96,14 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     match item {
         Item::Struct(st) => expand_struct(st, fbs_path, fqname, binding_path, hash_lit, wire_ident),
-        Item::Enum(en) => expand_enum(en, fqname, binding_path, hash_lit),
+        Item::Enum(en) => {
+            if data_enum_has_fields(&en) {
+                expand_data_enum(en, fqname, binding_path, hash_lit)
+                    .unwrap_or_else(|error| error.into_compile_error().into())
+            } else {
+                expand_enum(en, fqname, binding_path, hash_lit)
+            }
+        }
         other => syn::Error::new_spanned(other, "#[schema] requires a struct or enum")
             .to_compile_error()
             .into(),
@@ -149,11 +156,16 @@ fn decode_field(field: &syn::Field) -> proc_macro2::TokenStream {
                 decode_vec_field(id, inner, true)
             } else {
                 let ident = &tp.path.segments.last().unwrap().ident;
-                if ident == "String" {
+                if has_schema_codec(field) {
+                    quote! { #id: #enc::FieldDecoder::decode_field(view.#id())? }
+                } else if ident == "String" {
                     quote! { #id: #enc::StringFieldValue::into_owned(view.#id()) }
                 } else if is_scalar_ident(ident) {
                     quote! { #id: view.#id() }
                 } else {
+                    // A FlatBuffers native enum field (a unit-only enum bound to
+                    // an `enum` type): `view.#id()` already yields the binding
+                    // and `from_flatbuffer` is infallible.
                     quote! { #id: #tp::from_flatbuffer(view.#id()) }
                 }
             }
@@ -174,7 +186,12 @@ fn decode_option_field(id: &syn::Ident, inner: &syn::Type) -> proc_macro2::Token
         if is_scalar_ident(ident) {
             return quote! { #id: view.#id() };
         }
-        return quote! { #id: view.#id().map(#tp::from_flatbuffer) };
+        return quote! {
+            #id: match view.#id() {
+                Some(value) => Some(#tp::from_flatbuffer(value)?),
+                None => None,
+            }
+        };
     }
 
     quote! { #id: view.#id() }
@@ -214,13 +231,27 @@ fn decode_vec_field(
         }
     }
 
-    let map_expr =
-        quote! { value.iter().map(#inner::from_flatbuffer).collect::<::std::vec::Vec<_>>() };
+    let map_expr = quote! {
+        value
+            .iter()
+            .map(#inner::from_flatbuffer)
+            .collect::<::std::result::Result<::std::vec::Vec<_>, flatbuffers::InvalidFlatbuffer>>()?
+    };
     if is_required {
-        return quote! { #id: view.#id().map(|value| #map_expr).unwrap_or_default() };
+        return quote! {
+            #id: match view.#id() {
+                Some(value) => #map_expr,
+                None => ::std::vec::Vec::new(),
+            }
+        };
     }
 
-    quote! { #id: view.#id().map(|value| #map_expr) }
+    quote! {
+        #id: match view.#id() {
+            Some(value) => Some(#map_expr),
+            None => None,
+        }
+    }
 }
 
 fn encode_field(field: &syn::Field) -> proc_macro2::TokenStream {
@@ -340,19 +371,17 @@ fn encode_vec_field(
 
 /// Returns the path prefix for encoding types.
 ///
-/// When the macro is used inside `selium-guest` itself, we need `crate::encoding`
-/// instead of `selium_guest::encoding`. When used inside `selium-encoding`, the
-/// types live at the crate root. When used inside `selium-wire`, the types are
-/// provided by the `selium-encoding` dependency. We detect this via
+/// The types live at the `selium-service` crate root. Inside `selium-service`
+/// itself they are referred to as `crate`; every other consumer refers to them
+/// through the `selium_service` dependency. We detect this via
 /// `CARGO_CRATE_NAME`.
 fn encoding_path() -> proc_macro2::TokenStream {
     match std::env::var("CARGO_CRATE_NAME").as_deref() {
-        Ok("selium_guest") => quote! { crate::encoding },
-        Ok("selium_encoding") => quote! { crate },
-        Ok("selium_wire") => quote! { selium_encoding },
-        Ok("selium_proto_http") => quote! { selium_encoding },
-        Ok("selium_proto_dns") => quote! { selium_encoding },
-        _ => quote! { selium_guest::encoding },
+        Ok("selium_service") => quote! { crate },
+        Ok("selium_wire") => quote! { selium_service },
+        Ok("selium_proto_http") => quote! { selium_service },
+        Ok("selium_proto_dns") => quote! { selium_service },
+        _ => quote! { selium_service },
     }
 }
 
@@ -487,6 +516,521 @@ fn expand_enum(
     expanded.into()
 }
 
+/// Returns whether an enum has data-carrying variants (named fields or tuple
+/// payloads), distinguishing it from a unit-only enum bound to a FlatBuffers
+/// native enum type.
+fn data_enum_has_fields(en: &ItemEnum) -> bool {
+    en.variants.iter().any(|variant| match &variant.fields {
+        syn::Fields::Named(named) => !named.named.is_empty(),
+        syn::Fields::Unnamed(_) => true,
+        syn::Fields::Unit => false,
+    })
+}
+
+/// Classified field shape of a data-carrying enum variant.
+enum DataFieldKind {
+    /// `String` table field.
+    String,
+    /// Primitive numeric/bool table field.
+    Scalar,
+    /// `Vec<u8>` table field.
+    Bytes,
+    /// `Option<String>` table field.
+    OptionString,
+    /// `Option<scalar>` table field encoded with a zero sentinel.
+    OptionScalar,
+    /// Nested `#[schema]` message field (required or optional).
+    Nested { optional: bool },
+    /// `Vec<T>` of nested `#[schema]` messages.
+    NestedVec,
+    /// `#[schema(skip)]`: omitted on encode, defaulted on decode.
+    Skip,
+}
+
+/// One declared field inside a data-carrying variant.
+struct DataField {
+    /// The Rust field name; `None` for a single unnamed-field (tuple) variant.
+    ident: Option<syn::Ident>,
+    /// The FlatBuffers table field name it maps to.
+    wire_name: String,
+    /// The field's declared Rust type.
+    ty: syn::Type,
+    kind: DataFieldKind,
+}
+
+/// The declared shape of a data-carrying variant.
+enum DataVariantShape {
+    Unit,
+    Named(Vec<DataField>),
+    Tuple(Box<DataField>),
+}
+
+/// One processed data-carrying variant.
+struct DataVariant {
+    ident: syn::Ident,
+    tag: u8,
+    shape: DataVariantShape,
+}
+
+/// Strips the schema-related attributes (`schema`, `tag`, `field`) from a list,
+/// keeping doc comments and any user attributes.
+fn strip_schema_attrs(attrs: &[syn::Attribute]) -> Vec<syn::Attribute> {
+    attrs
+        .iter()
+        .filter(|attr| {
+            !(attr.path().is_ident("schema")
+                || attr.path().is_ident("tag")
+                || attr.path().is_ident("field"))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Reads the `#[tag(n)]` override on a variant, if present.
+fn variant_tag(variant: &syn::Variant) -> syn::Result<Option<u8>> {
+    for attr in &variant.attrs {
+        if attr.path().is_ident("tag") {
+            let lit: syn::LitInt = attr.parse_args().map_err(|error| {
+                syn::Error::new_spanned(attr, format!("#[tag] expects an integer literal: {error}"))
+            })?;
+            let tag = lit.base10_parse::<u8>().map_err(|_| {
+                syn::Error::new_spanned(attr, "tag must be within the u8 range (0..=255)")
+            })?;
+            return Ok(Some(tag));
+        }
+    }
+    Ok(None)
+}
+
+/// Reads a `#[field("wire_name")]` rename attribute, if present.
+fn field_rename(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if attr.path().is_ident("field") {
+            let lit: syn::LitStr = attr.parse_args().map_err(|error| {
+                syn::Error::new_spanned(attr, format!("#[field] expects a string literal: {error}"))
+            })?;
+            return Ok(Some(lit.value()));
+        }
+    }
+    Ok(None)
+}
+
+/// Returns whether a field carries `#[schema(skip)]`.
+fn has_schema_skip(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        attr.path().is_ident("schema")
+            && matches!(
+                attr.meta,
+                syn::Meta::List(ref list) if list.tokens.to_string().trim() == "skip"
+            )
+    })
+}
+
+/// Returns whether a field carries `#[schema(codec)]`, marking a foreign
+/// (non-schema) field type whose decode is strict and fallible via
+/// `FieldDecoder`.
+fn has_schema_codec(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        attr.path().is_ident("schema")
+            && matches!(
+                attr.meta,
+                syn::Meta::List(ref list) if list.tokens.to_string().trim() == "codec"
+            )
+    })
+}
+
+fn is_string_type(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(tp) if tp.path.get_ident().is_some_and(|id| id == "String"))
+}
+
+fn is_u8_type(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(tp) if tp.path.get_ident().is_some_and(|id| id == "u8"))
+}
+
+/// Classifies a data-carrying variant field against the supported field shapes.
+fn classify_data_field(field: &syn::Field) -> syn::Result<DataFieldKind> {
+    if has_schema_skip(field) {
+        return Ok(DataFieldKind::Skip);
+    }
+    let syn::Type::Path(tp) = &field.ty else {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "#[schema] data enums require path-typed or `Option`-wrapped fields",
+        ));
+    };
+    if let Some(inner) = option_inner(tp) {
+        if is_string_type(inner) {
+            Ok(DataFieldKind::OptionString)
+        } else if is_scalar_type(inner) {
+            Ok(DataFieldKind::OptionScalar)
+        } else {
+            Ok(DataFieldKind::Nested { optional: true })
+        }
+    } else if let Some(inner) = vec_inner(tp) {
+        if is_u8_type(inner) {
+            Ok(DataFieldKind::Bytes)
+        } else if is_string_type(inner) || is_scalar_type(inner) {
+            Err(syn::Error::new_spanned(
+                &field.ty,
+                "#[schema] data enums support `Vec<u8>` and vectors of nested `#[schema]` messages",
+            ))
+        } else {
+            Ok(DataFieldKind::NestedVec)
+        }
+    } else if is_string_type(&field.ty) {
+        Ok(DataFieldKind::String)
+    } else if is_scalar_type(&field.ty) {
+        Ok(DataFieldKind::Scalar)
+    } else {
+        Ok(DataFieldKind::Nested { optional: false })
+    }
+}
+
+/// Builds the `BindingArgs` path for a table `Binding` path.
+fn binding_args_path(binding_path: &SynPath) -> SynPath {
+    let binding_ident = binding_path.segments.last().unwrap().ident.clone();
+    let args_ident = format_ident!("{}Args", binding_ident);
+    let mut segments = binding_path.segments.clone();
+    segments.pop();
+    segments.push(syn::PathSegment {
+        ident: args_ident,
+        arguments: syn::PathArguments::None,
+    });
+    SynPath {
+        leading_colon: binding_path.leading_colon,
+        segments,
+    }
+}
+
+/// Emits the FlatMsg/HasSchema codec for a data-carrying enum bound to a
+/// flattened `variant: ubyte` table.
+fn expand_data_enum(
+    en: ItemEnum,
+    fqname: String,
+    binding_path: SynPath,
+    hash_lit: syn::LitByteStr,
+) -> syn::Result<TokenStream> {
+    // Cleaned enum: strip schema/tag/field attributes, keep everything else.
+    let mut en2 = en.clone();
+    en2.attrs = strip_schema_attrs(&en.attrs);
+    for variant in &mut en2.variants {
+        let attrs = strip_schema_attrs(&variant.attrs);
+        variant.attrs = attrs;
+        match &mut variant.fields {
+            syn::Fields::Named(named) => {
+                for field in &mut named.named {
+                    let attrs = strip_schema_attrs(&field.attrs);
+                    field.attrs = attrs;
+                }
+            }
+            syn::Fields::Unnamed(unnamed) => {
+                for field in &mut unnamed.unnamed {
+                    let attrs = strip_schema_attrs(&field.attrs);
+                    field.attrs = attrs;
+                }
+            }
+            syn::Fields::Unit => {}
+        }
+    }
+
+    // Assign tags and classify every variant.
+    let mut used_tags = std::collections::HashSet::new();
+    let mut variants: Vec<DataVariant> = Vec::with_capacity(en.variants.len());
+    for (index, variant) in en.variants.iter().enumerate() {
+        let tag = match variant_tag(variant)? {
+            Some(tag) => tag,
+            None => u8::try_from(index).map_err(|_| {
+                syn::Error::new_spanned(
+                    variant,
+                    "too many variants; #[schema] tags must fit within the u8 range",
+                )
+            })?,
+        };
+        if !used_tags.insert(tag) {
+            return Err(syn::Error::new_spanned(
+                variant,
+                format!("duplicate #[tag] value {tag}"),
+            ));
+        }
+
+        let shape = match &variant.fields {
+            syn::Fields::Unit => DataVariantShape::Unit,
+            syn::Fields::Named(named) => {
+                let mut fields = Vec::with_capacity(named.named.len());
+                for field in &named.named {
+                    let ident = field.ident.clone().expect("named field has an ident");
+                    let wire_name = match field_rename(&field.attrs)? {
+                        Some(name) => name,
+                        None => ident.to_string(),
+                    };
+                    let kind = classify_data_field(field)?;
+                    fields.push(DataField {
+                        ident: Some(ident),
+                        wire_name,
+                        ty: field.ty.clone(),
+                        kind,
+                    });
+                }
+                DataVariantShape::Named(fields)
+            }
+            syn::Fields::Unnamed(unnamed) => {
+                let field = unnamed.unnamed.first().ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        variant,
+                        "#[schema] data enum tuple variants require a single field",
+                    )
+                })?;
+                let wire_name = field_rename(&variant.attrs)?.ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        variant,
+                        "single unnamed-field variants require #[field(\"wire_name\")]",
+                    )
+                })?;
+                let kind = classify_data_field(field)?;
+                DataVariantShape::Tuple(Box::new(DataField {
+                    ident: None,
+                    wire_name,
+                    ty: field.ty.clone(),
+                    kind,
+                }))
+            }
+        };
+
+        variants.push(DataVariant {
+            ident: variant.ident.clone(),
+            tag,
+            shape,
+        });
+    }
+
+    let enum_ident = &en.ident;
+    let schema_ident = format_ident!("{}Schema", enum_ident);
+    let fq_lit = fqname.clone();
+    let binding_path_ts = quote! { #binding_path };
+    let args_path = binding_args_path(&binding_path);
+    let enc = encoding_path();
+    let unknown_lit = syn::LitStr::new(
+        &format!("known {enum_ident} variant"),
+        proc_macro2::Span::call_site(),
+    );
+
+    // Encode arms.
+    let encode_arms = variants.iter().map(|variant| {
+        let ident = &variant.ident;
+        let tag = variant.tag;
+        match &variant.shape {
+            DataVariantShape::Unit => quote! {
+                Self::#ident => { args.variant = #tag; }
+            },
+            DataVariantShape::Named(fields) => {
+                let pats = fields
+                    .iter()
+                    .filter(|field| !matches!(field.kind, DataFieldKind::Skip))
+                    .map(|field| field.ident.clone().unwrap());
+                let stmts = fields
+                    .iter()
+                    .filter_map(|field| encode_data_field(field, field.ident.as_ref().unwrap()));
+                quote! {
+                    Self::#ident { #(#pats,)* .. } => {
+                        args.variant = #tag;
+                        #(#stmts)*
+                    }
+                }
+            }
+            DataVariantShape::Tuple(field) => {
+                let value = format_ident!("value");
+                let stmt = encode_data_field(field, &value).expect("tuple fields are encodable");
+                quote! {
+                    Self::#ident(value) => {
+                        args.variant = #tag;
+                        #stmt
+                    }
+                }
+            }
+        }
+    });
+
+    // Decode arms.
+    let decode_arms = variants.iter().map(|variant| {
+        let ident = &variant.ident;
+        let tag = variant.tag;
+        match &variant.shape {
+            DataVariantShape::Unit => quote! { #tag => Ok(Self::#ident), },
+            DataVariantShape::Named(fields) => {
+                let inits = fields.iter().map(|field| {
+                    let name = field.ident.as_ref().unwrap();
+                    let expr = decode_data_field(field);
+                    quote! { #name: #expr }
+                });
+                quote! { #tag => Ok(Self::#ident { #(#inits),* }), }
+            }
+            DataVariantShape::Tuple(field) => {
+                let expr = decode_data_field(field);
+                quote! { #tag => Ok(Self::#ident(#expr)), }
+            }
+        }
+    });
+
+    let expanded = quote! {
+        #en2
+
+        #[allow(non_upper_case_globals)]
+        pub const #schema_ident: #enc::SchemaDescriptor = #enc::SchemaDescriptor {
+            fqname: #fq_lit,
+            hash: *#hash_lit,
+        };
+
+        impl #enc::HasSchema for #enum_ident {
+            const SCHEMA: #enc::SchemaDescriptor = #schema_ident;
+        }
+
+        impl #enum_ident {
+            pub fn write_flatbuffer<'bldr, A: flatbuffers::Allocator + 'bldr>(
+                &self,
+                builder: &mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+            ) -> flatbuffers::WIPOffset<#binding_path_ts<'bldr>> {
+                let mut args = #args_path::default();
+                match self {
+                    #(#encode_arms)*
+                }
+                #binding_path_ts::create(builder, &args)
+            }
+
+            pub fn from_flatbuffer(
+                view: #binding_path_ts<'_>,
+            ) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+                match view.variant() {
+                    #(#decode_arms)*
+                    _ => {
+                        return ::flatbuffers::InvalidFlatbuffer::new_missing_required(#unknown_lit);
+                    }
+                }
+            }
+        }
+
+        impl #enc::FlatMsg for #enum_ident {
+            fn encode(value: &Self) -> Vec<u8> {
+                let mut builder = flatbuffers::FlatBufferBuilder::new();
+                let root = value.write_flatbuffer(&mut builder);
+                builder.finish(root, None);
+                builder.finished_data().to_vec()
+            }
+
+            fn decode(
+                bytes: &[u8],
+            ) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+                let view = flatbuffers::root::<#binding_path_ts<'_>>(bytes)?;
+                Self::from_flatbuffer(view)
+            }
+        }
+    };
+
+    Ok(expanded.into())
+}
+
+/// Returns the encode statement for one variant field binding, or `None` for a
+/// skipped field.
+fn encode_data_field(field: &DataField, bind: &syn::Ident) -> Option<proc_macro2::TokenStream> {
+    let wire_ident = format_ident!("{}", field.wire_name);
+    let statement = match field.kind {
+        DataFieldKind::Skip => return None,
+        DataFieldKind::String => quote! { args.#wire_ident = Some(builder.create_string(#bind)); },
+        DataFieldKind::Scalar => quote! { args.#wire_ident = *#bind; },
+        DataFieldKind::Bytes => quote! { args.#wire_ident = Some(builder.create_vector(#bind)); },
+        DataFieldKind::OptionString => {
+            quote! { args.#wire_ident = #bind.as_ref().map(|value| builder.create_string(value)); }
+        }
+        DataFieldKind::OptionScalar => {
+            quote! { args.#wire_ident = #bind.unwrap_or_default(); }
+        }
+        DataFieldKind::Nested { optional: false } => {
+            quote! { args.#wire_ident = Some(#bind.write_flatbuffer(builder)); }
+        }
+        DataFieldKind::Nested { optional: true } => {
+            quote! { args.#wire_ident = #bind.as_ref().map(|value| value.write_flatbuffer(builder)); }
+        }
+        DataFieldKind::NestedVec => {
+            let offsets_ident = format_ident!("{}_offsets", field.wire_name);
+            quote! {
+                let #offsets_ident: ::std::vec::Vec<_> = #bind
+                    .iter()
+                    .map(|item| item.write_flatbuffer(builder))
+                    .collect();
+                args.#wire_ident = Some(builder.create_vector(&#offsets_ident));
+            }
+        }
+    };
+    Some(statement)
+}
+
+/// Returns the decode expression for one variant field. Skipped fields decode
+/// to their `Default` value; required nested fields decode strictly.
+fn decode_data_field(field: &DataField) -> proc_macro2::TokenStream {
+    let wire_ident = format_ident!("{}", field.wire_name);
+    let wire_name_lit = syn::LitStr::new(&field.wire_name, proc_macro2::Span::call_site());
+    let enc = encoding_path();
+    match field.kind {
+        DataFieldKind::Skip => quote! { ::core::default::Default::default() },
+        DataFieldKind::String => quote! { #enc::StringFieldValue::into_owned(view.#wire_ident()) },
+        DataFieldKind::Scalar => quote! { view.#wire_ident() },
+        DataFieldKind::Bytes => {
+            quote! { view.#wire_ident().map(|value| value.bytes().to_vec()).unwrap_or_default() }
+        }
+        DataFieldKind::OptionString => quote! { view.#wire_ident().map(|value| value.to_string()) },
+        DataFieldKind::OptionScalar => {
+            quote! { { let value = view.#wire_ident(); (value != 0).then_some(value) } }
+        }
+        DataFieldKind::Nested { optional: false } => {
+            let ty = &field.ty;
+            quote! {
+                match view.#wire_ident() {
+                    Some(value) => #ty::from_flatbuffer(value)?,
+                    None => {
+                        return ::flatbuffers::InvalidFlatbuffer::new_missing_required(#wire_name_lit);
+                    }
+                }
+            }
+        }
+        DataFieldKind::Nested { optional: true } => {
+            let ty = nested_inner_of_field(field);
+            quote! {
+                match view.#wire_ident() {
+                    Some(value) => Some(#ty::from_flatbuffer(value)?),
+                    None => None,
+                }
+            }
+        }
+        DataFieldKind::NestedVec => {
+            let inner = vec_inner_of_field(field);
+            quote! {
+                match view.#wire_ident() {
+                    Some(value) => value
+                        .iter()
+                        .map(#inner::from_flatbuffer)
+                        .collect::<::std::result::Result<::std::vec::Vec<_>, flatbuffers::InvalidFlatbuffer>>()?,
+                    None => ::std::vec::Vec::new(),
+                }
+            }
+        }
+    }
+}
+
+/// Returns the inner element type of a `Vec<T>` data-enum field.
+fn vec_inner_of_field(field: &DataField) -> &syn::Type {
+    let syn::Type::Path(tp) = &field.ty else {
+        unreachable!("NestedVec field is a path type");
+    };
+    vec_inner(tp).expect("NestedVec field is a Vec")
+}
+
+/// Returns the inner type of an `Option<T>` data-enum field.
+fn nested_inner_of_field(field: &DataField) -> &syn::Type {
+    let syn::Type::Path(tp) = &field.ty else {
+        unreachable!("optional nested field is a path type");
+    };
+    option_inner(tp).expect("optional nested field is an Option")
+}
+
 fn expand_struct(
     st: ItemStruct,
     fbs_path: String,
@@ -539,6 +1083,17 @@ fn expand_struct_direct(
         .filter(|attr| !attr.path().is_ident("schema"))
         .cloned()
         .collect();
+    if let syn::Fields::Named(named) = &mut st2.fields {
+        for field in &mut named.named {
+            let attrs = field
+                .attrs
+                .iter()
+                .filter(|attr| !attr.path().is_ident("schema"))
+                .cloned()
+                .collect();
+            field.attrs = attrs;
+        }
+    }
     let struct_ident = st.ident.clone();
     let schema_ident = syn::Ident::new(
         &format!("{}Schema", struct_ident),
@@ -621,8 +1176,10 @@ fn expand_struct_direct(
                 #binding_path_ts::create(builder, &args)
             }
 
-            pub fn from_flatbuffer(view: #binding_path_ts<'_>) -> Self {
-                Self { #( #decode_fields, )* }
+            pub fn from_flatbuffer(
+                view: #binding_path_ts<'_>,
+            ) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
+                Ok(Self { #( #decode_fields, )* })
             }
         }
 
@@ -636,7 +1193,7 @@ fn expand_struct_direct(
 
             fn decode(bytes: &[u8]) -> ::std::result::Result<Self, flatbuffers::InvalidFlatbuffer> {
                 let view = flatbuffers::root::<#binding_path_ts<'_>>(bytes)?;
-                Ok(Self::from_flatbuffer(view))
+                Self::from_flatbuffer(view)
             }
         }
     };

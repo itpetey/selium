@@ -2,8 +2,8 @@
 
 use std::pin::Pin;
 
-use selium_encoding::FlatMsg;
 use selium_memory::FrameHeader;
+use selium_service::FlatMsg;
 use selium_wire::{
     FramedRead, FramedWrite, MessageTransport, Publisher, Subscriber, error::Result,
 };

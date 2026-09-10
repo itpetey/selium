@@ -117,7 +117,7 @@ impl DnsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_encoding::{FlatMsg, HasSchema};
+    use selium_service::{FlatMsg, HasSchema};
 
     fn round_trip<T: FlatMsg + Clone + PartialEq + std::fmt::Debug>(value: &T) {
         let encoded = T::encode(value);

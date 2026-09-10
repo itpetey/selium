@@ -26,13 +26,14 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, bail};
 use selium_abi::{
-    Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector, ResourceTarget,
+    Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
     client_identity::ClientIdentity,
 };
 use selium_guest::{
     Context, Process, ResourceListener, Serve, entrypoint, error, info, mark_ready,
     net::ByteStream, warn,
 };
+use selium_service::ResourceTarget;
 
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 /// The `bridge-channel` module id and entrypoint this server spawns.

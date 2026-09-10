@@ -13,10 +13,9 @@ use std::{
 };
 
 use anyhow::Context as _;
-use selium_abi::{
-    Capability, DiscoveryRequest, DiscoveryResponse, ProcessId, ResourceTarget, decode_rkyv, uri,
-};
+use selium_abi::{Capability, ProcessId, uri};
 use selium_guest::{InterfaceMetadata, entrypoint, pattern_interface};
+use selium_service::{DiscoveryRequest, DiscoveryResponse, DomainEntry, ResourceTarget};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
@@ -84,9 +83,9 @@ impl DiscoveryStore {
             self.route_owners.insert(target.uri.clone(), process_id);
         }
         if uri::parse_typed(&target.uri).is_some() {
-            for (key, value) in &target.labels {
+            for label in &target.labels {
                 self.label_index
-                    .entry((key.clone(), value.clone()))
+                    .entry((label.key.clone(), label.value.clone()))
                     .or_default()
                     .insert(target.uri.clone());
             }
@@ -478,10 +477,13 @@ impl DiscoveryStore {
 
     /// Returns the provisioned domain→tenant entries for a `ListDomains`
     /// request.
-    pub fn domain_entries(&self) -> Vec<(String, String)> {
+    pub fn domain_entries(&self) -> Vec<DomainEntry> {
         self.domains
             .entries()
-            .map(|(domain, tenant)| (domain.to_string(), tenant.to_string()))
+            .map(|(domain, tenant)| DomainEntry {
+                domain: domain.to_string(),
+                tenant: tenant.to_string(),
+            })
             .collect()
     }
 
@@ -500,7 +502,7 @@ pub fn interface_metadata() -> InterfaceMetadata {
 
 fn attach_feed_subscriber(
     feed_region_id: u64,
-) -> selium_guest::Result<Subscriber<Vec<u8>, ShmTransport>> {
+) -> selium_guest::Result<Subscriber<DiscoveryRequest, ShmTransport>> {
     let channel = Channel::attach(feed_region_id)
         .map_err(|error| selium_guest::GuestError::Host(error.to_string()))?;
     let transport = ShmTransport::new(&channel, &channel)
@@ -578,16 +580,11 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
 
 async fn feed_loop(
     store: Rc<RefCell<DiscoveryStore>>,
-    mut subscriber: Subscriber<Vec<u8>, ShmTransport>,
+    mut subscriber: Subscriber<DiscoveryRequest, ShmTransport>,
 ) {
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => match decode_rkyv::<DiscoveryRequest>(&bytes) {
-                Ok(request) => store.borrow_mut().apply_tier1_event(request),
-                Err(error) => {
-                    selium_guest::warn!("discovery feed decode failed: {error}");
-                }
-            },
+            Ok((request, _tag)) => store.borrow_mut().apply_tier1_event(request),
             Err(selium_wire::error::Error::BufferEmpty) => {
                 selium_guest::yield_now().await;
             }
@@ -743,6 +740,7 @@ fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selium_service::Label;
 
     fn target(
         uri: &str,
@@ -788,7 +786,10 @@ mod tests {
         );
         t.labels = labels
             .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| Label {
+                key: k.to_string(),
+                value: v.to_string(),
+            })
             .collect();
         t
     }
@@ -1034,11 +1035,12 @@ mod tests {
 
         let matches = store.resolve_labels("app", "web", Some("acme"));
         assert_eq!(matches.len(), 2);
-        assert!(
-            matches
-                .iter()
-                .all(|t| t.labels.contains(&("app".to_string(), "web".to_string())))
-        );
+        assert!(matches.iter().all(|t| {
+            t.labels.contains(&Label {
+                key: "app".to_string(),
+                value: "web".to_string(),
+            })
+        }));
     }
 
     #[test]
@@ -1391,7 +1393,7 @@ mod tests {
 
     #[test]
     fn denied_response_fails_closed_per_variant() {
-        use selium_abi::ResourceTarget;
+        use selium_service::ResourceTarget;
 
         let resolve = DiscoveryRequest::Resolve("sel://acme/region/7".to_string());
         assert!(matches!(

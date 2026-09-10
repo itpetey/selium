@@ -5,9 +5,9 @@ use std::{
 };
 
 use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, ResourceClass, ResourceIdentity,
-    ResourceSelector, ResourceTarget, encode_rkyv,
+    ActivityEvent, Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
 };
+use selium_service::{DiscoveryRequest, ResourceTarget};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
@@ -159,9 +159,7 @@ impl Runtime {
             domain: domain.to_string(),
             tenant: tenant.to_string(),
         };
-        let bytes = encode_rkyv(&request)
-            .map_err(|error| Error::Host(format!("discovery encode failed: {error}")))?;
-        self.publish_discovery_event(bytes)
+        self.publish_discovery_event(request)
     }
 
     /// Waits until the discovery service has recorded a registration for
@@ -356,9 +354,7 @@ impl Runtime {
             owner: Some(process_id),
             root_service: false,
         };
-        let bytes = encode_rkyv(&request)
-            .map_err(|error| Error::Host(format!("process discovery encode failed: {error}")))?;
-        self.publish_discovery_event(bytes)?;
+        self.publish_discovery_event(request)?;
         Ok(())
     }
 

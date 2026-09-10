@@ -14,7 +14,7 @@ categories.workspace = true
 futures = { workspace = true, features = ["std"] }
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-ring"] }
 rustls-pemfile = { workspace = true, features = ["std"] }
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-wire.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

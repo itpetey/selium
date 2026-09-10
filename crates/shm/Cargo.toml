@@ -12,7 +12,7 @@ categories.workspace = true
 
 [dependencies]
 selium-abi.workspace = true
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-memory.workspace = true
 selium-wire.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

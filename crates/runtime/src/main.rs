@@ -3,9 +3,9 @@ use std::{fs, path::PathBuf, time::Duration};
 use anyhow::Result;
 use clap::Parser;
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_encoding::FlatMsg;
 use selium_kernel::Kernel;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_service::FlatMsg;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
             .drain_log_channel(guest_report.process_id)
             .map_err(|error| anyhow::anyhow!("drain log channel: {error}"))?;
         for frame in &frames {
-            let record = selium_encoding::log::LogRecord::decode(frame)
+            let record = selium_service::log::LogRecord::decode(frame)
                 .map_err(|error| anyhow::anyhow!("decode log record: {error}"))?;
             println!("  {}", record.message);
         }
@@ -301,7 +301,7 @@ async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
                     .drain_log_channel(process_id)
                     .map_err(|error| anyhow::anyhow!("drain log channel: {error}"))?;
                 for frame in &frames {
-                    let record = selium_encoding::log::LogRecord::decode(frame)
+                    let record = selium_service::log::LogRecord::decode(frame)
                         .map_err(|error| anyhow::anyhow!("decode log record: {error}"))?;
                     println!("  [guest] {}", record.message);
                 }

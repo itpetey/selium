@@ -51,12 +51,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::{
-    Capability, CapabilityGrant, ControlRequest, ControlResponse, DelegationStatus, Deployment,
-    ResourceClass, ResourceSelector,
-};
+use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_client::{ConnectOptions, FlatMsg as _};
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_service::{ControlRequest, ControlResponse, DelegationStatus, Deployment};
 
 mod common;
 
@@ -289,7 +287,7 @@ fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
         .expect("drain log channel")
         .iter()
         .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
+            selium_service::log::LogRecord::decode(frame)
                 .expect("decode log record")
                 .message
         })
@@ -333,7 +331,7 @@ async fn external_client_reaches_control_plane_through_the_bridge() {
                     && let Ok(messages) = runtime.kernel().processes().drain_log_channel(process_id)
                 {
                     logs.extend(messages.into_iter().filter_map(|frame| {
-                        selium_encoding::log::LogRecord::decode(&frame)
+                        selium_service::log::LogRecord::decode(&frame)
                             .ok()
                             .map(|record| format!("pid {process_id}: {}", record.message))
                     }));
@@ -417,7 +415,7 @@ async fn external_client_reaches_control_plane_through_the_bridge() {
                 && let Ok(messages) = runtime.kernel().processes().drain_log_channel(process_id)
             {
                 snapshot.extend(messages.into_iter().filter_map(|frame| {
-                    selium_encoding::log::LogRecord::decode(&frame)
+                    selium_service::log::LogRecord::decode(&frame)
                         .ok()
                         .map(|record| format!("pid {process_id}: {}", record.message))
                 }));

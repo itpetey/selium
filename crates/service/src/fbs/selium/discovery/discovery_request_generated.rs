@@ -9,11 +9,13 @@ pub enum DiscoveryRequestOffset {}
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
-///   1 = Register { uri, target, root_service }
+///   1 = Register { uri, target, root_service, owner }
 ///   2 = Revoke { uri }
 ///   3 = ResolvePrefix(uri)
 ///   4 = ResolveLabels { key, value }
 ///   5 = ListDomains
+///   6 = RevokeByOwner { process_id }
+///   7 = SeedDomain { domain, tenant }
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -33,6 +35,10 @@ impl<'a> DiscoveryRequest<'a> {
   pub const VT_VALUE: ::flatbuffers::VOffsetT = 10;
   pub const VT_TARGET: ::flatbuffers::VOffsetT = 12;
   pub const VT_ROOT_SERVICE: ::flatbuffers::VOffsetT = 14;
+  pub const VT_OWNER: ::flatbuffers::VOffsetT = 16;
+  pub const VT_PROCESS_ID: ::flatbuffers::VOffsetT = 18;
+  pub const VT_DOMAIN: ::flatbuffers::VOffsetT = 20;
+  pub const VT_TENANT: ::flatbuffers::VOffsetT = 22;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -44,6 +50,10 @@ impl<'a> DiscoveryRequest<'a> {
     args: &'args DiscoveryRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<DiscoveryRequest<'bldr>> {
     let mut builder = DiscoveryRequestBuilder::new(_fbb);
+    builder.add_process_id(args.process_id);
+    builder.add_owner(args.owner);
+    if let Some(x) = args.tenant { builder.add_tenant(x); }
+    if let Some(x) = args.domain { builder.add_domain(x); }
     if let Some(x) = args.target { builder.add_target(x); }
     if let Some(x) = args.value { builder.add_value(x); }
     if let Some(x) = args.key { builder.add_key(x); }
@@ -68,6 +78,14 @@ impl<'a> DiscoveryRequest<'a> {
       alloc::boxed::Box::new(x.unpack())
     });
     let root_service = self.root_service();
+    let owner = self.owner();
+    let process_id = self.process_id();
+    let domain = self.domain().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
+    let tenant = self.tenant().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
     DiscoveryRequestT {
       variant,
       uri,
@@ -75,6 +93,10 @@ impl<'a> DiscoveryRequest<'a> {
       value,
       target,
       root_service,
+      owner,
+      process_id,
+      domain,
+      tenant,
     }
   }
 
@@ -126,6 +148,38 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<bool>(DiscoveryRequest::VT_ROOT_SERVICE, Some(false)).unwrap()}
   }
+  /// Owning process for a Tier-1 registration (Register variant); 0 = None.
+  #[inline]
+  pub fn owner(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(DiscoveryRequest::VT_OWNER, Some(0)).unwrap()}
+  }
+  /// Process whose owner-keyed registrations are revoked (RevokeByOwner variant).
+  #[inline]
+  pub fn process_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(DiscoveryRequest::VT_PROCESS_ID, Some(0)).unwrap()}
+  }
+  /// Domain to seed (SeedDomain variant).
+  #[inline]
+  pub fn domain(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_DOMAIN, None)}
+  }
+  /// Tenant the domain maps to (SeedDomain variant).
+  #[inline]
+  pub fn tenant(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_TENANT, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
@@ -140,6 +194,10 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("value", Self::VT_VALUE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResourceTarget>>("target", Self::VT_TARGET, false)?
      .visit_field::<bool>("root_service", Self::VT_ROOT_SERVICE, false)?
+     .visit_field::<u64>("owner", Self::VT_OWNER, false)?
+     .visit_field::<u64>("process_id", Self::VT_PROCESS_ID, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("domain", Self::VT_DOMAIN, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
      .finish();
     Ok(())
   }
@@ -151,6 +209,10 @@ pub struct DiscoveryRequestArgs<'a> {
     pub value: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub target: Option<::flatbuffers::WIPOffset<ResourceTarget<'a>>>,
     pub root_service: bool,
+    pub owner: u64,
+    pub process_id: u64,
+    pub domain: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for DiscoveryRequestArgs<'a> {
   #[inline]
@@ -162,6 +224,10 @@ impl<'a> Default for DiscoveryRequestArgs<'a> {
       value: None,
       target: None,
       root_service: false,
+      owner: 0,
+      process_id: 0,
+      domain: None,
+      tenant: None,
     }
   }
 }
@@ -196,6 +262,22 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryRequestBuilder<'a, '
     self.fbb_.push_slot::<bool>(DiscoveryRequest::VT_ROOT_SERVICE, root_service, false);
   }
   #[inline]
+  pub fn add_owner(&mut self, owner: u64) {
+    self.fbb_.push_slot::<u64>(DiscoveryRequest::VT_OWNER, owner, 0);
+  }
+  #[inline]
+  pub fn add_process_id(&mut self, process_id: u64) {
+    self.fbb_.push_slot::<u64>(DiscoveryRequest::VT_PROCESS_ID, process_id, 0);
+  }
+  #[inline]
+  pub fn add_domain(&mut self, domain: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_DOMAIN, domain);
+  }
+  #[inline]
+  pub fn add_tenant(&mut self, tenant: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_TENANT, tenant);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DiscoveryRequestBuilder {
@@ -219,6 +301,10 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
       ds.field("value", &self.value());
       ds.field("target", &self.target());
       ds.field("root_service", &self.root_service());
+      ds.field("owner", &self.owner());
+      ds.field("process_id", &self.process_id());
+      ds.field("domain", &self.domain());
+      ds.field("tenant", &self.tenant());
       ds.finish()
   }
 }
@@ -231,6 +317,10 @@ pub struct DiscoveryRequestT {
   pub value: Option<alloc::string::String>,
   pub target: Option<alloc::boxed::Box<ResourceTargetT>>,
   pub root_service: bool,
+  pub owner: u64,
+  pub process_id: u64,
+  pub domain: Option<alloc::string::String>,
+  pub tenant: Option<alloc::string::String>,
 }
 impl Default for DiscoveryRequestT {
   fn default() -> Self {
@@ -241,6 +331,10 @@ impl Default for DiscoveryRequestT {
       value: None,
       target: None,
       root_service: false,
+      owner: 0,
+      process_id: 0,
+      domain: None,
+      tenant: None,
     }
   }
 }
@@ -263,6 +357,14 @@ impl DiscoveryRequestT {
       x.pack(_fbb)
     });
     let root_service = self.root_service;
+    let owner = self.owner;
+    let process_id = self.process_id;
+    let domain = self.domain.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
+    let tenant = self.tenant.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
     DiscoveryRequest::create(_fbb, &DiscoveryRequestArgs{
       variant,
       uri,
@@ -270,6 +372,10 @@ impl DiscoveryRequestT {
       value,
       target,
       root_service,
+      owner,
+      process_id,
+      domain,
+      tenant,
     })
   }
 }

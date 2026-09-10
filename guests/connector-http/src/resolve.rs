@@ -14,6 +14,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use selium_abi::uri::{self, DomainTable};
 use selium_guest::Context;
+use selium_service::ResourceTarget;
 
 /// Test support: re-exports helpers for integration tests in `tests/`.
 /// Test utilities — not for production use.
@@ -37,7 +38,7 @@ pub struct RouteResolver {
 
 #[derive(Clone)]
 struct CachedRoute {
-    target: selium_abi::ResourceTarget,
+    target: ResourceTarget,
     _created_at_ms: u64,
 }
 
@@ -76,7 +77,7 @@ impl RouteResolver {
     /// Creates a RouteResolver with a pre-populated cache entry.
     /// Test utility — bypasses discovery lookup so tests can exercise cache
     /// semantics without a running discovery service.
-    pub fn with_cached_route(host: &str, path: &str, target: selium_abi::ResourceTarget) -> Self {
+    pub fn with_cached_route(host: &str, path: &str, target: ResourceTarget) -> Self {
         let mut cache = HashMap::new();
         let cache_key = format!("{}:{}", host, path);
         cache.insert(
@@ -105,7 +106,7 @@ impl RouteResolver {
 
     /// Creates a resolver with several pre-populated cache entries,
     /// keyed by path for one host. Test utility.
-    pub fn with_routes(host: &str, routes: HashMap<String, selium_abi::ResourceTarget>) -> Self {
+    pub fn with_routes(host: &str, routes: HashMap<String, ResourceTarget>) -> Self {
         let mut cache = HashMap::new();
         for (path, target) in routes {
             let cache_key = format!("{}:{}", host, path);
@@ -141,7 +142,7 @@ impl RouteResolver {
         &mut self,
         host: &str,
         path: &str,
-    ) -> Result<selium_abi::ResourceTarget, ResolveError> {
+    ) -> Result<ResourceTarget, ResolveError> {
         let host = uri::normalize_host(host);
         let cache_key = format!("{}:{}", host, path);
         if let Some(route) = self.cache.get(&cache_key) {
@@ -247,8 +248,8 @@ mod tests {
         );
     }
 
-    fn make_target(id: u64) -> selium_abi::ResourceTarget {
-        selium_abi::ResourceTarget {
+    fn make_target(id: u64) -> ResourceTarget {
+        ResourceTarget {
             uri: "sel://acme/bridge".to_string(),
             host_id: String::new(),
             resource_id: id,

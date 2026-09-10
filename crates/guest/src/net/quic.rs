@@ -57,7 +57,8 @@ use std::{
 };
 
 use super::bytes::ByteStream;
-use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
+use selium_abi::ResourceClass;
+use selium_service::{InterfaceMetadata, ResourceTarget};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 

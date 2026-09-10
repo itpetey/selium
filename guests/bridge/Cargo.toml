@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow = { workspace = true, features = ["std"] }
 selium-abi.workspace = true
 selium-guest.workspace = true
+selium-service.workspace = true
 
 [dev-dependencies]
 selium-memory.workspace = true

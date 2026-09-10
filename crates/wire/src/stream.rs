@@ -12,8 +12,8 @@ use std::{
 };
 
 use futures::Stream;
-use selium_encoding::FlatMsg;
 use selium_memory::FrameHeader;
+use selium_service::FlatMsg;
 
 use crate::{
     MessageTransport,

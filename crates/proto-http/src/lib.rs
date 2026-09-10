@@ -215,7 +215,7 @@ impl HttpStreamItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_encoding::FlatMsg;
+    use selium_service::FlatMsg;
 
     fn round_trip<T: FlatMsg + Clone + PartialEq + std::fmt::Debug>(value: &T) {
         let encoded = T::encode(value);
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn has_schema_verification() {
-        use selium_encoding::HasSchema;
+        use selium_service::HasSchema;
         // Every schema type should report its FQ name
         assert_eq!(HttpRequest::SCHEMA.fqname, "selium.http.HttpRequest");
         assert_eq!(HttpResponse::SCHEMA.fqname, "selium.http.HttpResponse");

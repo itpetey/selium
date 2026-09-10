@@ -134,7 +134,7 @@ pub fn pattern_interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         pub fn #metadata_fn() -> ::selium_guest::InterfaceMetadata {
             ::selium_guest::InterfaceMetadata::new(
-                stringify!(#ident),
+                stringify!(#ident).to_string(),
                 vec![#(::std::string::String::from(#methods)),*],
             )
         }

@@ -9,7 +9,7 @@
 //! as typed errors at open ([`Error::AttachFailed`],
 //! [`Error::BadHandshake`]), not on first use. Message types are supplied by
 //! the caller as Flatbuffers-backed [`FlatMsg`] values (re-exported here
-//! alongside the `selium-encoding` crate), and every handle surfaces this
+//! alongside the `selium-service` crate), and every handle surfaces this
 //! crate's [`Error`] type.
 
 use std::{
@@ -27,8 +27,8 @@ use selium_wire::{
 pub use crate::error::{Error, Result};
 // Re-export the encoding surface so users import message bindings from the
 // client alone (see the "Encoding Re-exports" requirement).
-pub use selium_encoding;
-pub use selium_encoding::FlatMsg;
+pub use selium_service;
+pub use selium_service::FlatMsg;
 pub use tls::{
     ClientIdentity, ConnectOptions, build_client_config, certificates_from_pem,
     private_key_from_pem,
@@ -347,8 +347,8 @@ impl Client {
         let mut framed = FramedWrite::new(QuicTransport::write_only(send));
         let handshake = PipeControl::Handshake {
             uri: uri.to_string(),
-        }
-        .encode();
+        };
+        let handshake = FlatMsg::encode(&handshake);
         framed.write_frame(&handshake, 0)?;
         let (send, _) = framed.into_inner().into_parts();
         send.ok_or_else(|| Error::Io(std::io::Error::other("send half missing")))
@@ -371,9 +371,9 @@ impl Client {
             }
             Err(e) => return Err(Error::from(e)),
         };
-        match PipeControl::decode(&payload) {
-            Some(PipeControl::Accepted) => Ok(reader),
-            Some(PipeControl::Terminate { code }) => Err(crate::error::termination_error(code)),
+        match FlatMsg::decode(&payload) {
+            Ok(PipeControl::Accepted) => Ok(reader),
+            Ok(PipeControl::Terminate { code }) => Err(crate::error::termination_error(code)),
             // Anything else (or an undecodable reply) violates the contract.
             _ => Err(Error::BadHandshake),
         }

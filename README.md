@@ -83,7 +83,7 @@ are not in the workspace and do not build.
 | Crate | Role |
 | --- | --- |
 | `crates/core/abi` | Canonical host↔guest contract: capabilities, scopes, hostcall payloads, framing |
-| `crates/core/encoding` | FlatBuffers message encoding, log record types, schema bindings |
+| `crates/service` | Service message types and FlatBuffers codecs (schema bindings, log record types) |
 | `crates/core/memory` | `RegionMapping`/`RegionProvider` shared-memory abstraction |
 | `crates/core/shm` | Shared-memory ring channels (`Channel`, `RingBuf`, blocking/non-blocking readers/writers) |
 | `crates/core/wire` | Transport-agnostic framing + pub/sub, RPC, live-table patterns |

@@ -47,8 +47,9 @@
 //! }
 //! ```
 
-use selium_abi::{InterfaceMetadata, ResourceClass, ResourceTarget};
+use selium_abi::ResourceClass;
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem};
+use selium_service::{InterfaceMetadata, ResourceTarget};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
 use thiserror::Error;
 

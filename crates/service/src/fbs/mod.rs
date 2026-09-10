@@ -4,8 +4,20 @@ pub mod selium {
   use super::*;
   pub mod control {
     use super::*;
-    mod control_generated;
-    pub use self::control_generated::*;
+    mod resolved_target_generated;
+    pub use self::resolved_target_generated::*;
+    mod deployment_generated;
+    pub use self::deployment_generated::*;
+    mod delegation_status_generated;
+    pub use self::delegation_status_generated::*;
+    mod control_request_generated;
+    pub use self::control_request_generated::*;
+    mod control_response_generated;
+    pub use self::control_response_generated::*;
+    mod pipeline_binding_generated;
+    pub use self::pipeline_binding_generated::*;
+    mod desired_state_record_generated;
+    pub use self::desired_state_record_generated::*;
   }
   pub mod discovery {
     use super::*;
@@ -37,6 +49,11 @@ pub mod selium {
     pub use self::log_record_generated::*;
     mod span_generated;
     pub use self::span_generated::*;
+  }
+  pub mod pipe {
+    use super::*;
+    mod pipe_control_generated;
+    pub use self::pipe_control_generated::*;
   }
   pub mod scheduler {
     use super::*;

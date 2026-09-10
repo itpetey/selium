@@ -24,8 +24,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use futures::{StreamExt, stream::FuturesUnordered};
-use selium_abi::ResourceTarget;
 use selium_proto_http::{HttpRequest, HttpResponse, HttpStreamItem, HttpTrailer};
+use selium_service::ResourceTarget;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},

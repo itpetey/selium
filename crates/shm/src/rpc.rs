@@ -13,7 +13,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use selium_encoding::FlatMsg;
+use selium_service::FlatMsg;
 use selium_wire::{
     error::{Error, Result},
     framed::{FramedRead, FramedWrite},
@@ -446,7 +446,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct PongMsg(String);
 
-    impl selium_encoding::FlatMsg for PingMsg {
+    impl selium_service::FlatMsg for PingMsg {
         fn encode(value: &Self) -> Vec<u8> {
             value.0.clone().into_bytes()
         }
@@ -458,7 +458,7 @@ mod tests {
         }
     }
 
-    impl selium_encoding::FlatMsg for PongMsg {
+    impl selium_service::FlatMsg for PongMsg {
         fn encode(value: &Self) -> Vec<u8> {
             value.0.clone().into_bytes()
         }

@@ -6,11 +6,11 @@ use std::{
 };
 
 use selium_abi::{
-    AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest,
-    GuestLogEntry, HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ResourceTarget, ScopeContext, TaskId, encode_rkyv,
+    AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, GuestLogEntry,
+    HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass, ResourceIdentity,
+    ResourceSelector, ScopeContext, TaskId,
 };
-use selium_encoding::{FlatMsg, log::LogRecord};
+use selium_service::{DiscoveryRequest, FlatMsg, ResourceTarget, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
 
 use crate::{ReadinessCondition, SystemGuestDescriptor, error::kernel_error, runtime::Runtime};
@@ -334,13 +334,7 @@ impl Runtime {
                     owner: Some(process_id),
                     root_service: false,
                 };
-                let bytes = encode_rkyv(&request).map_err(|error| {
-                    AbiError::new(
-                        AbiErrorCode::Internal,
-                        format!("discovery encode failed: {error}"),
-                    )
-                })?;
-                if let Err(error) = self.publish_discovery_event(bytes) {
+                if let Err(error) = self.publish_discovery_event(request) {
                     return Err(AbiError::new(
                         AbiErrorCode::Internal,
                         format!("discovery publish failed: {error}"),
@@ -402,13 +396,7 @@ impl Runtime {
                 if let Some(tenant) = self.region_tenants.lock().remove(&(process_id, region_id)) {
                     let uri = crate::discovery::region_registration_uri(&tenant, region_id);
                     let request = DiscoveryRequest::Revoke { uri };
-                    let bytes = encode_rkyv(&request).map_err(|error| {
-                        AbiError::new(
-                            AbiErrorCode::Internal,
-                            format!("discovery encode failed: {error}"),
-                        )
-                    })?;
-                    if let Err(error) = self.publish_discovery_event(bytes) {
+                    if let Err(error) = self.publish_discovery_event(request) {
                         return Err(AbiError::new(
                             AbiErrorCode::Internal,
                             format!("discovery publish failed: {error}"),
@@ -1015,13 +1003,7 @@ impl Runtime {
                     owner: Some(process_id),
                     root_service: false,
                 };
-                let bytes = encode_rkyv(&request).map_err(|error| {
-                    AbiError::new(
-                        AbiErrorCode::Internal,
-                        format!("discovery encode failed: {error}"),
-                    )
-                })?;
-                if let Err(error) = self.publish_discovery_event(bytes) {
+                if let Err(error) = self.publish_discovery_event(request) {
                     return Err(AbiError::new(
                         AbiErrorCode::Internal,
                         format!("discovery publish failed: {error}"),

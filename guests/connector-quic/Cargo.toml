@@ -24,6 +24,7 @@ rustls-pki-types = { workspace = true, features = ["web"] }
 selium-abi.workspace = true
 selium-guest.workspace = true
 selium-memory.workspace = true
+selium-service.workspace = true
 selium-shm.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

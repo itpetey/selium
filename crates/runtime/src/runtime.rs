@@ -6,6 +6,7 @@ use std::{
 use parking_lot::Mutex;
 use selium_abi::{OperationId, ProcessId, ResourceClass, TaskId};
 use selium_kernel::Kernel;
+use selium_service::DiscoveryRequest;
 use selium_shm::transport::ShmTransport;
 use selium_wire::pubsub::Publisher;
 
@@ -15,7 +16,7 @@ use crate::{
 };
 
 /// Publisher for the runtime→discovery pub/sub feed.
-pub(crate) type DiscoveryPublisher = Publisher<Vec<u8>, ShmTransport>;
+pub(crate) type DiscoveryPublisher = Publisher<DiscoveryRequest, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Principal tenant per `(process_id, queue shared id)` for host queues.
 pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
@@ -218,15 +219,15 @@ impl Runtime {
             .is_some_and(|uris| uris.contains(uri))
     }
 
-    /// Publishes a raw rkyv-encoded discovery operation to the discovery feed.
+    /// Publishes a typed discovery operation to the discovery feed.
     ///
     /// Returns `Ok(())` if discovery is enabled and the publish succeeds. If
     /// discovery is not enabled, this is a no-op.
-    pub(crate) fn publish_discovery_event(&self, bytes: Vec<u8>) -> Result<()> {
+    pub(crate) fn publish_discovery_event(&self, request: DiscoveryRequest) -> Result<()> {
         let mut publisher = self.discovery_publisher.lock();
         if let Some(ref mut publisher) = *publisher {
             publisher
-                .publish(&bytes)
+                .publish(&request)
                 .map_err(|error| crate::Error::Host(format!("discovery publish failed: {error}")))
         } else {
             Ok(())

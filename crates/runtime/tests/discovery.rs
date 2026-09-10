@@ -19,12 +19,12 @@
 //! ```
 
 use selium_abi::{
-    Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
-    HostcallRequest, ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
-    decode_rkyv,
+    Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
+    RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
-use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_service::DiscoveryRequest;
+use selium_service::FlatMsg;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
@@ -48,7 +48,7 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
     }
 }
 
-fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<Vec<u8>, ShmTransport> {
+fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<DiscoveryRequest, ShmTransport> {
     let feed_region_id = runtime
         .discovery_feed_region_id()
         .expect("discovery feed region id");
@@ -244,7 +244,7 @@ fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
     frames
         .iter()
         .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
+            selium_service::log::LogRecord::decode(frame)
                 .expect("decode log record")
                 .message
         })
@@ -253,14 +253,12 @@ fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
 fn drain_register_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> std::collections::HashSet<String> {
     let mut uris = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
+            Ok((request, _tag)) => {
                 if let DiscoveryRequest::Register { uri, .. } = request {
                     uris.insert(uri);
                 }
@@ -274,7 +272,7 @@ fn drain_register_uris(
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
 fn drain_revoke_events(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<ProcessId>,
@@ -283,19 +281,15 @@ fn drain_revoke_events(
     let mut owners = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
-                match request {
-                    DiscoveryRequest::Revoke { uri } => {
-                        uris.insert(uri);
-                    }
-                    DiscoveryRequest::RevokeByOwner { process_id } => {
-                        owners.insert(process_id);
-                    }
-                    _ => {}
+            Ok((request, _tag)) => match request {
+                DiscoveryRequest::Revoke { uri } => {
+                    uris.insert(uri);
                 }
-            }
+                DiscoveryRequest::RevokeByOwner { process_id } => {
+                    owners.insert(process_id);
+                }
+                _ => {}
+            },
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }

@@ -43,8 +43,8 @@ use std::{
 };
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_encoding::FlatMsg;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_service::FlatMsg;
 
 /// Drains the guest's log channel and decodes each frame as a `LogRecord`.
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
@@ -55,7 +55,7 @@ fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
         .expect("drain log channel")
         .iter()
         .map(|frame| {
-            selium_encoding::log::LogRecord::decode(frame)
+            selium_service::log::LogRecord::decode(frame)
                 .expect("decode log record")
                 .message
         })

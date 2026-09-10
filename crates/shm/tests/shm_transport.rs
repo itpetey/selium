@@ -1,8 +1,8 @@
 //! End-to-end smoke test for `selium-wire` patterns over `selium-shm` transports.
 
 use selium_abi::ResourceKind;
-use selium_encoding::FlatMsg;
 use selium_memory::FrameHeader;
+use selium_service::FlatMsg;
 use selium_shm::{Channel, ChannelBackpressure, ShmTransport};
 use selium_wire::{
     FramedRead, FramedWrite,

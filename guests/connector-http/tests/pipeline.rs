@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use selium_abi::{ResourceClass, ResourceTarget};
+use selium_abi::ResourceClass;
 use selium_connector_http::{
     pipeline::{
         ConnectionConfig, ForwardError, ForwardSession, ReplyEvent, ReplySink, SessionFactory,
@@ -22,6 +22,7 @@ use selium_connector_http::{
     resolve::test_support::RouteResolver as TestRouteResolver,
 };
 use selium_proto_http::{HttpHeader, HttpRequest, HttpResponse, HttpStreamItem, HttpTrailer};
+use selium_service::ResourceTarget;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, Notify},

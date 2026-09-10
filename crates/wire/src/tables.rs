@@ -2,8 +2,8 @@
 
 use std::{cell::RefCell, collections::HashMap, hash::Hash};
 
-use selium_encoding::FlatMsg;
 use selium_guest_macros::schema;
+use selium_service::FlatMsg;
 
 use crate::{
     MessageTransport,
@@ -14,9 +14,9 @@ use crate::{
 /// A table mutation published over a pub/sub topic.
 #[derive(Debug, Clone, PartialEq)]
 #[schema(
-    path = concat!(env!("CARGO_MANIFEST_DIR"), "/../encoding/schemas/live_table.fbs"),
+    path = concat!(env!("CARGO_MANIFEST_DIR"), "/../service/schemas/live_table.fbs"),
     ty = "selium.live_table.LiveTableMessage",
-    binding = "selium_encoding::fbs::selium::live_table::LiveTableMessage",
+    binding = "selium_service::fbs::selium::live_table::LiveTableMessage",
     wire = LiveTableMessageWire
 )]
 pub struct LiveTableMessage<K, V> {

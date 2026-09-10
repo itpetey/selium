@@ -17,9 +17,8 @@ ignored = ["flatbuffers"]
 bytes.workspace = true
 flatbuffers.workspace = true
 futures = { workspace = true, features = ["std"] }
-rkyv = { workspace = true, features = ["bytecheck", "std"] }
 selium-abi.workspace = true
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-guest-macros.workspace = true
 selium-memory.workspace = true
 thiserror.workspace = true

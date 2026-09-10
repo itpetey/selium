@@ -20,6 +20,13 @@ table Deployment {
     module: string;
 }
 
+// The outcome of a single delegated interaction (e.g. scheduler placement).
+table DelegationStatus {
+    step: string;
+    applied: bool;
+    context: string;
+}
+
 // Control-plane request message.
 //
 // Variant tag values:
@@ -49,26 +56,53 @@ table ControlRequest {
 //
 // Variant tag values:
 //   0 = Uploaded { manifest }
-//   1 = Accepted { deployment, applied, step, context }
-//   2 = StatusFound { deployment }
-//   3 = StatusNotFound
-//   4 = ResolvedFound { target }
-//   5 = ResolvedNotFound
-//   6 = Error { step, context }
+//   1 = Accepted { workload_id, replicas, module, delegated }
+//   2 = Status { deployment }
+//   3 = Resolved { target }
+//   4 = Error { step, context }
 table ControlResponse {
     variant: ubyte;
-    // Deployment desired state (Accepted, StatusFound variants).
-    deployment: Deployment;
     // Manifest name for an uploaded module (Uploaded variant).
     manifest: string;
-    // Whether the primary delegation was applied (Accepted variant).
-    applied: bool;
-    // Delegation step name (Accepted, Error variants).
+    // Workload identifier (Accepted variant).
+    workload_id: string;
+    // Recorded replica count (Accepted variant).
+    replicas: uint;
+    // Recorded module reference (Accepted variant).
+    module: string;
+    // Delegation outcome (Accepted variant).
+    delegated: DelegationStatus;
+    // Deployment desired state (Status variant).
+    deployment: Deployment;
+    // Step name (Error variant).
     step: string;
-    // Delegation or error context (Accepted, Error variants).
+    // Error context (Error variant).
     context: string;
-    // Resolved target (ResolvedFound variant).
+    // Resolved target (Resolved variant).
     target: ResolvedTarget;
+}
+
+// A pipeline binding between workload endpoints, recorded as desired state.
+table PipelineBinding {
+    name: string;
+    from: string;
+    to: string;
+}
+
+// A control-plane desired-state record appended to the durable log.
+//
+// Variant tag values:
+//   0 = Deployment(deployment)
+//   1 = PipelineBinding(binding)
+//   2 = Stop { workload_id }
+table DesiredStateRecord {
+    variant: ubyte;
+    // Deployment desired state (Deployment variant).
+    deployment: Deployment;
+    // Pipeline binding (PipelineBinding variant).
+    pipeline: PipelineBinding;
+    // Workload identifier (Stop variant).
+    workload_id: string;
 }
 
 root_type ControlRequest;

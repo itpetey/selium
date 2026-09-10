@@ -15,7 +15,7 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "help", "std"] }
 parking_lot.workspace = true
 selium-abi.workspace = true
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-kernel.workspace = true
 selium-memory.workspace = true
 selium-shm.workspace = true
@@ -28,7 +28,7 @@ wasmtiny.workspace = true
 [dev-dependencies]
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-ring"] }
 selium-client.workspace = true
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-proto-dns.workspace = true
 wat.workspace = true
 

@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, DiscoveryRequest, LocalityScope, ProcessId,
-    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, TaskId, encode_rkyv,
+    ActivityEvent, Capability, CapabilityGrant, LocalityScope, ProcessId, ResourceClass,
+    ResourceIdentity, ResourceSelector, ScopeContext, TaskId,
 };
+use selium_service::DiscoveryRequest;
 use tracing::debug;
 use wasmtiny::WasmValue;
 
@@ -301,9 +302,7 @@ impl Runtime {
         let tenant = process_tenant.as_deref().unwrap_or_default();
         let node_uri = crate::discovery::process_registration_uri(tenant, process_id);
         let request = DiscoveryRequest::Revoke { uri: node_uri };
-        let bytes = encode_rkyv(&request)
-            .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
-        self.publish_discovery_event(bytes)?;
+        self.publish_discovery_event(request)?;
 
         // Revoke all region registrations minted for this process, publishing
         // Revoke operations to the discovery feed under the serving tenant.
@@ -322,10 +321,7 @@ impl Runtime {
             if let Some(serving_tenant) = serving_tenant {
                 let uri = crate::discovery::region_registration_uri(&serving_tenant, key.1);
                 let request = DiscoveryRequest::Revoke { uri };
-                let bytes = encode_rkyv(&request).map_err(|error| {
-                    crate::Error::Host(format!("discovery encode failed: {error}"))
-                })?;
-                self.publish_discovery_event(bytes)?;
+                self.publish_discovery_event(request)?;
                 self.region_tenants.lock().remove(&key);
             }
         }
@@ -335,9 +331,7 @@ impl Runtime {
         // map of guest-registered routes — discovery records each route's
         // owner and revokes them on this event.
         let request = DiscoveryRequest::RevokeByOwner { process_id };
-        let bytes = encode_rkyv(&request)
-            .map_err(|error| crate::Error::Host(format!("discovery encode failed: {error}")))?;
-        self.publish_discovery_event(bytes)?;
+        self.publish_discovery_event(request)?;
         self.process_registrations.lock().remove(&process_id);
 
         // Revoke tier-1 registrations for host queues created by this
@@ -356,10 +350,7 @@ impl Runtime {
                 let request = DiscoveryRequest::Revoke {
                     uri: crate::discovery::queue_registration_uri(&principal, key.1),
                 };
-                let bytes = encode_rkyv(&request).map_err(|error| {
-                    crate::Error::Host(format!("discovery encode failed: {error}"))
-                })?;
-                self.publish_discovery_event(bytes)?;
+                self.publish_discovery_event(request)?;
                 self.queue_tenants.lock().remove(&key);
             }
         }
@@ -1245,7 +1236,8 @@ mod tests {
     /// to its channel, so a retried teardown's revocations are observable.
     fn swap_in_working_publisher(
         runtime: &Runtime,
-    ) -> selium_wire::pubsub::Subscriber<Vec<u8>, selium_shm::transport::ShmTransport> {
+    ) -> selium_wire::pubsub::Subscriber<DiscoveryRequest, selium_shm::transport::ShmTransport>
+    {
         let channel = selium_shm::Channel::create_with_backpressure(
             64 * 1024,
             selium_shm::ChannelBackpressure::Drop,
@@ -1268,16 +1260,14 @@ mod tests {
     /// Drains every discovery event currently readable from the subscriber.
     fn drain_feed(
         subscriber: &mut selium_wire::pubsub::Subscriber<
-            Vec<u8>,
+            DiscoveryRequest,
             selium_shm::transport::ShmTransport,
         >,
     ) -> Vec<DiscoveryRequest> {
         let mut events = Vec::new();
         loop {
             match subscriber.read_with_tag() {
-                Ok((bytes, _tag)) => {
-                    events.push(selium_abi::decode_rkyv(&bytes).expect("decode event"));
-                }
+                Ok((request, _tag)) => events.push(request),
                 Err(selium_wire::error::Error::BufferEmpty) => break,
                 Err(error) => panic!("feed read failed: {error}"),
             }

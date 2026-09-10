@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::{Sink, Stream};
-use selium_encoding::FlatMsg;
+use selium_service::FlatMsg;
 
 use crate::{
     MessageTransport,

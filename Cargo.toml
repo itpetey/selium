@@ -3,7 +3,7 @@ resolver = "3"
 members = [
   "crates/abi",
   "crates/client",
-  "crates/encoding",
+  "crates/service",
   "crates/guest",
   "crates/guest/macros",
   "crates/kernel",
@@ -61,7 +61,7 @@ rustls-pemfile = { version = "2", default-features = false }
 rustls-pki-types = { version = "1", default-features = false }
 selium-abi = { path = "crates/abi", default-features = false }
 selium-client = { path = "crates/client", default-features = false }
-selium-encoding = { path = "crates/encoding", default-features = false }
+selium-service = { path = "crates/service", default-features = false }
 selium-guest = { path = "crates/guest", default-features = false }
 selium-guest-macros = { path = "crates/guest/macros", default-features = false }
 selium-kernel = { path = "crates/kernel", default-features = false }

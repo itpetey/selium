@@ -24,6 +24,7 @@ rustls-pki-types = { workspace = true, features = ["web"] }
 selium-abi.workspace = true
 selium-guest.workspace = true
 selium-proto-http.workspace = true
+selium-service.workspace = true
 selium-shm.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "sync"] }

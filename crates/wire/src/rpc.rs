@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-use selium_encoding::FlatMsg;
+use selium_service::FlatMsg;
 use thiserror::Error;
 
 use crate::{

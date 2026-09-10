@@ -7,8 +7,8 @@
 use std::{cell::Cell, sync::OnceLock};
 
 use selium_abi::{HostcallRequest, ResourceKind};
-use selium_encoding::FlatMsg;
 use selium_memory::FrameHeader;
+use selium_service::FlatMsg;
 use selium_shm::channels::{Channel, ChannelBackpressure};
 use thiserror::Error;
 use tracing::field::{Field, Visit};
@@ -19,7 +19,7 @@ use tracing_subscriber::{
 
 use crate::hostcall::hostcall_ready;
 
-pub use selium_encoding::log::{LogField, LogLevel, LogRecord, LogSpan};
+pub use selium_service::log::{LogField, LogLevel, LogRecord, LogSpan};
 
 /// Default log channel capacity in bytes (512 KB, matching prior art).
 const DEFAULT_LOG_CAPACITY: u64 = 512 * 1024;

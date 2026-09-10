@@ -15,6 +15,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use selium_abi::uri::{self, DomainTable};
 use selium_guest::Context;
+use selium_service::ResourceTarget;
 
 /// Shared handle to the SNI route resolver, cloned into each connection task.
 pub type ResolverHandle = Arc<tokio::sync::Mutex<RouteResolver>>;
@@ -28,7 +29,7 @@ pub struct RouteResolver {
 
 #[derive(Clone)]
 struct CachedRoute {
-    target: selium_abi::ResourceTarget,
+    target: ResourceTarget,
     _created_at_ms: u64,
 }
 
@@ -79,7 +80,7 @@ impl RouteResolver {
     /// Creates a resolver with a pre-populated cache entry — bypasses
     /// discovery lookup so tests can exercise cache semantics without a
     /// running discovery service.
-    pub fn with_cached_route(name: &str, target: selium_abi::ResourceTarget) -> Self {
+    pub fn with_cached_route(name: &str, target: ResourceTarget) -> Self {
         let mut cache = HashMap::new();
         cache.insert(
             name.to_string(),
@@ -101,10 +102,7 @@ impl RouteResolver {
     /// projected through the unified wire-name resolver into an internal
     /// route, which is then resolved via discovery. Resolution happens once
     /// per connection; the connector caches the result.
-    pub async fn resolve(
-        &mut self,
-        server_name: &str,
-    ) -> Result<selium_abi::ResourceTarget, ResolveError> {
+    pub async fn resolve(&mut self, server_name: &str) -> Result<ResourceTarget, ResolveError> {
         let name = normalize_sni(server_name);
         if let Some(route) = self.cache.get(&name) {
             return Ok(route.target.clone());
@@ -205,8 +203,8 @@ mod tests {
         assert!(matches!(result, Err(ResolveError::NotFound)));
     }
 
-    fn make_target(id: u64) -> selium_abi::ResourceTarget {
-        selium_abi::ResourceTarget {
+    fn make_target(id: u64) -> ResourceTarget {
+        ResourceTarget {
             uri: "sel://acme/bridge".to_string(),
             host_id: String::new(),
             resource_id: id,

@@ -5,11 +5,11 @@
 //! region allocation with tenant-scoped delegation, and teardown revocation.
 
 use selium_abi::{
-    AbiErrorCode, Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
-    HostcallRequest, ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
-    decode_rkyv,
+    AbiErrorCode, Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest,
+    ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
@@ -102,7 +102,7 @@ fn discovery_lifecycle_over_the_feed() {
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
 fn drain_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -111,18 +111,15 @@ fn drain_uris(
     let mut revoked = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest = decode_rkyv(&bytes).expect("decode request");
-                match request {
-                    DiscoveryRequest::Register { uri, .. } => {
-                        registered.insert(uri);
-                    }
-                    DiscoveryRequest::Revoke { uri } => {
-                        revoked.insert(uri);
-                    }
-                    _ => {}
+            Ok((request, _tag)) => match request {
+                DiscoveryRequest::Register { uri, .. } => {
+                    registered.insert(uri);
                 }
-            }
+                DiscoveryRequest::Revoke { uri } => {
+                    revoked.insert(uri);
+                }
+                _ => {}
+            },
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
@@ -210,7 +207,7 @@ fn root_process_allocates_for_any_tenant_without_delegation() {
 }
 
 /// Creates a runtime with the discovery feed enabled and a subscriber on it.
-fn runtime_with_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>) {
+fn runtime_with_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTransport>) {
     let runtime = Runtime::default();
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {

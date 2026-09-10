@@ -16,7 +16,7 @@ ignored-paths = ["macros/tests/ui/*.rs", "macros/tests/ui-pass/*.rs"]
 [dependencies]
 futures = { workspace = true, features = ["std"] }
 selium-abi.workspace = true
-selium-encoding.workspace = true
+selium-service.workspace = true
 selium-guest-macros = { path = "macros" }
 selium-memory.workspace = true
 selium-proto-dns.workspace = true

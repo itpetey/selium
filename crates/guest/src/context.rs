@@ -1,7 +1,5 @@
-use selium_abi::{
-    DiscoveryRequest, DiscoveryResponse, ResourceTarget,
-    uri::{self, DomainTable},
-};
+use selium_abi::uri::{self, DomainTable};
+use selium_service::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
 use selium_shm::rpc::{self, OwnedRpcClient};
 
 use crate::{GuestError, resource::ResourceSender};
@@ -116,8 +114,8 @@ impl Context {
         match response {
             DiscoveryResponse::Domains(entries) => {
                 let mut table = DomainTable::new();
-                for (domain, tenant) in entries {
-                    table.seed(domain, tenant);
+                for entry in entries {
+                    table.seed(entry.domain, entry.tenant);
                 }
                 Ok(table)
             }

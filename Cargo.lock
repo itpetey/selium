@@ -758,6 +758,7 @@ dependencies = [
  "selium-abi",
  "selium-guest",
  "selium-memory",
+ "selium-service",
  "selium-shm",
  "tokio",
 ]
@@ -770,6 +771,7 @@ dependencies = [
  "selium-abi",
  "selium-guest",
  "selium-memory",
+ "selium-service",
  "selium-shm",
  "selium-wire",
  "tokio",
@@ -782,7 +784,7 @@ dependencies = [
  "futures",
  "quinn",
  "rustls-pemfile",
- "selium-encoding",
+ "selium-service",
  "selium-wire",
  "thiserror",
  "tokio",
@@ -814,6 +816,7 @@ dependencies = [
  "selium-abi",
  "selium-guest",
  "selium-proto-http",
+ "selium-service",
  "selium-shm",
  "thiserror",
  "tokio",
@@ -836,6 +839,7 @@ dependencies = [
  "selium-abi",
  "selium-guest",
  "selium-memory",
+ "selium-service",
  "selium-shm",
  "sha2",
  "thiserror",
@@ -850,9 +854,9 @@ version = "1.0.0-alpha.6"
 dependencies = [
  "anyhow",
  "selium-abi",
- "selium-encoding",
  "selium-guest",
  "selium-memory",
+ "selium-service",
  "selium-shm",
  "selium-wire",
  "tokio",
@@ -865,6 +869,7 @@ dependencies = [
  "anyhow",
  "selium-abi",
  "selium-guest",
+ "selium-service",
  "selium-shm",
  "selium-wire",
 ]
@@ -889,27 +894,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "selium-encoding"
-version = "1.0.0-alpha.6"
-dependencies = [
- "flatbuffers",
- "selium-abi",
- "selium-guest-macros",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "selium-guest"
 version = "1.0.0-alpha.6"
 dependencies = [
  "futures",
  "selium-abi",
- "selium-encoding",
  "selium-guest-macros",
  "selium-memory",
  "selium-proto-dns",
  "selium-proto-http",
+ "selium-service",
  "selium-shm",
  "selium-wire",
  "thiserror",
@@ -972,8 +966,8 @@ name = "selium-proto-dns"
 version = "1.0.0-alpha.6"
 dependencies = [
  "flatbuffers",
- "selium-encoding",
  "selium-guest-macros",
+ "selium-service",
  "thiserror",
 ]
 
@@ -982,8 +976,8 @@ name = "selium-proto-http"
 version = "1.0.0-alpha.6"
 dependencies = [
  "flatbuffers",
- "selium-encoding",
  "selium-guest-macros",
+ "selium-service",
 ]
 
 [[package]]
@@ -1005,10 +999,10 @@ dependencies = [
  "quinn",
  "selium-abi",
  "selium-client",
- "selium-encoding",
  "selium-kernel",
  "selium-memory",
  "selium-proto-dns",
+ "selium-service",
  "selium-shm",
  "selium-wire",
  "thiserror",
@@ -1019,14 +1013,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-service"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "flatbuffers",
+ "selium-abi",
+ "selium-guest-macros",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "selium-shm"
 version = "1.0.0-alpha.6"
 dependencies = [
  "flatbuffers",
  "futures",
  "selium-abi",
- "selium-encoding",
  "selium-memory",
+ "selium-service",
  "selium-wire",
  "tokio",
 ]
@@ -1048,11 +1053,10 @@ dependencies = [
  "bytes",
  "flatbuffers",
  "futures",
- "rkyv",
  "selium-abi",
- "selium-encoding",
  "selium-guest-macros",
  "selium-memory",
+ "selium-service",
  "thiserror",
  "tokio",
  "tokio-util",

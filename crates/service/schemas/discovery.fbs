@@ -47,11 +47,13 @@ table DomainEntry {
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
-///   1 = Register { uri, target, root_service }
-///   2 = Revoke { uri }
-///   3 = ResolvePrefix(uri)
-///   4 = ResolveLabels { key, value }
-///   5 = ListDomains
+///   1 = ResolvePrefix(uri)
+///   2 = ResolveLabels { key, value }
+///   3 = Register { uri, target, owner, root_service }
+///   4 = Revoke { uri }
+///   5 = RevokeByOwner { process_id }
+///   6 = SeedDomain { domain, tenant }
+///   7 = ListDomains
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
@@ -65,17 +67,25 @@ table DiscoveryRequest {
     target: ResourceTarget;
     /// Marks the registration as the tenant's root service (Register variant).
     root_service: bool;
+    /// Owning process for a Tier-1 registration (Register variant); 0 = None.
+    owner: ulong;
+    /// Process whose owner-keyed registrations are revoked (RevokeByOwner variant).
+    process_id: ulong;
+    /// Domain to seed (SeedDomain variant).
+    domain: string;
+    /// Tenant the domain maps to (SeedDomain variant).
+    tenant: string;
 }
 
 /// Discovery response message.
 ///
 /// Variant tag values:
 ///   0 = Found(target)
-///   1 = NotFound
-///   2 = Registered
-///   3 = Revoked
-///   4 = Forbidden
-///   5 = Resolved(targets)
+///   1 = Resolved(targets)
+///   2 = NotFound
+///   3 = Registered
+///   4 = Revoked
+///   5 = Forbidden
 ///   6 = Domains(domains)
 table DiscoveryResponse {
     /// Variant discriminator.

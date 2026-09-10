@@ -10,11 +10,11 @@
 //! - Drop backpressure channel semantics
 
 use selium_abi::{
-    Capability, CapabilityGrant, CompletionState, DiscoveryRequest, HostcallOutput,
-    HostcallRequest, ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
-    decode_rkyv,
+    Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
+    RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
@@ -116,14 +116,12 @@ fn deprecated_guest_log_write_still_functions() {
 /// Drains all currently available Register events from the discovery feed and
 /// returns the set of URI strings they contain.
 fn drain_register_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> std::collections::HashSet<String> {
     let mut uris = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
+            Ok((request, _tag)) => {
                 if let DiscoveryRequest::Register { uri, .. } = request {
                     uris.insert(uri);
                 }
@@ -138,14 +136,12 @@ fn drain_register_uris(
 /// Drains all currently available Revoke events from the discovery feed and
 /// returns the set of URI strings they contain.
 fn drain_revoke_uris(
-    subscriber: &mut Subscriber<Vec<u8>, ShmTransport>,
+    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> std::collections::HashSet<String> {
     let mut uris = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((bytes, _tag)) => {
-                let request: DiscoveryRequest =
-                    decode_rkyv(&bytes).expect("decode discovery request");
+            Ok((request, _tag)) => {
                 if let DiscoveryRequest::Revoke { uri } = request {
                     uris.insert(uri);
                 }
@@ -277,7 +273,7 @@ fn process_termination_publishes_discovery_revoke_events() {
 /// subscriber attached to the feed ring. The runtime installs its own
 /// kernel-backed region provider, so this helper does not install the heap
 /// provider first.
-fn runtime_with_discovery_feed() -> (Runtime, Subscriber<Vec<u8>, ShmTransport>) {
+fn runtime_with_discovery_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTransport>) {
     let runtime = Runtime::default();
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {

@@ -426,7 +426,7 @@ fn flat_msg_and_encoding_are_re_exported() {
     assert_eq!(decoded, "hello");
 
     // The encoding crate itself is reachable for schema types.
-    let _: Option<selium_client::selium_encoding::EncodingError> = None;
+    let _: Option<selium_client::selium_service::EncodingError> = None;
 }
 
 /// Reads the handshake frame from a bridge peer, asserts its URI, and replies
@@ -439,12 +439,12 @@ async fn handshake_and_accept(
     let (payload, tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
     assert_eq!(tag, 0, "handshake carries control tag 0");
     assert_eq!(
-        PipeControl::decode(&payload).expect("control frame"),
+        <PipeControl as FlatMsg>::decode(&payload).expect("control frame"),
         PipeControl::Handshake {
             uri: uri.to_string()
         }
     );
-    let accepted = PipeControl::Accepted.encode();
+    let accepted = FlatMsg::encode(&PipeControl::Accepted);
     writer.write_frame(&accepted, 0).expect("accepted reply");
 }
 
@@ -459,12 +459,12 @@ async fn handshake_and_terminate(
     let (payload, tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
     assert_eq!(tag, 0, "handshake carries control tag 0");
     assert_eq!(
-        PipeControl::decode(&payload).expect("control frame"),
+        <PipeControl as FlatMsg>::decode(&payload).expect("control frame"),
         PipeControl::Handshake {
             uri: uri.to_string()
         }
     );
-    let terminate = PipeControl::Terminate { code }.encode();
+    let terminate = FlatMsg::encode(&PipeControl::Terminate { code });
     writer.write_frame(&terminate, 0).expect("terminate reply");
 }
 

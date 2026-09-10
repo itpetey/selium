@@ -30,7 +30,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use selium_abi::{ResourceClass, ResourceTarget};
+use selium_abi::ResourceClass;
 use selium_guest::{
     Context, GuestError, ResourceSender, Result, entrypoint, info, mark_ready,
     net::{
@@ -38,6 +38,7 @@ use selium_guest::{
         bytes::{ByteStreamReader, ByteStreamWriter},
     },
 };
+use selium_service::{FlatMsg, ResourceTarget};
 use selium_shm::{
     Channel, byte_channel,
     channels::{BlockingReader, BlockingWriter},
@@ -385,8 +386,8 @@ pub async fn bridge_pipe<Resolve, Fut, Enqueue, EnqFut>(
         // Client closed before the handshake; nothing more to do.
         return;
     };
-    let uri = match PipeControl::decode(&handshake_payload) {
-        Some(PipeControl::Handshake { uri }) => uri,
+    let uri = match FlatMsg::decode(&handshake_payload) {
+        Ok(PipeControl::Handshake { uri }) => uri,
         _ => {
             terminate(&mut stream_write, TERMINATE_BAD_HANDSHAKE).await;
             return;
@@ -671,7 +672,7 @@ async fn rendezvous_pipe<Enqueue, EnqFut>(
     //    accept gates in the pumps order the first relayed frame after
     //    the server's readers (same contract as `rpc::connect`'s
     //    accept wait). Best-effort (a client that vanished needs no reply).
-    let accepted = PipeControl::Accepted.encode();
+    let accepted = FlatMsg::encode(&PipeControl::Accepted);
     drop(stream_write.write_frame(&accepted, 0));
 
     // 4. Relay until either half closes; `select!` cancels the loser.
@@ -727,7 +728,7 @@ async fn splice_pipe(
     // Deterministic success reply: the channel is resolved and attached,
     // so the client may treat silence-after-handshake as a protocol
     // violation. Best-effort (a client that vanished needs no reply).
-    let accepted = PipeControl::Accepted.encode();
+    let accepted = FlatMsg::encode(&PipeControl::Accepted);
     drop(stream_write.write_frame(&accepted, 0));
 
     // Splice until either half closes; `select!` cancels the loser, whose
@@ -743,7 +744,7 @@ async fn splice_pipe(
 /// Sends a termination frame, best-effort (the writer is dropped after, closing
 /// the stream and surfacing EOF to the connector).
 async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
-    let payload = PipeControl::Terminate { code }.encode();
+    let payload = FlatMsg::encode(&PipeControl::Terminate { code });
     drop(stream_write.write_frame(&payload, 0));
 }
 
@@ -918,10 +919,9 @@ mod tests {
         ));
 
         // Client sends the typed handshake frame, then a data frame (tag 7).
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/lobby".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -970,10 +970,9 @@ mod tests {
 
         // Send a valid handshake; the guest replies with a termination frame
         // then closes the stream.
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/forbidden".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -997,7 +996,7 @@ mod tests {
         let header = FrameHeader::decode(&buf[..FrameHeader::ENCODED_SIZE]).expect("frame header");
         assert_eq!(header.tag, 0);
         let payload = &buf[FrameHeader::ENCODED_SIZE..];
-        let control = PipeControl::decode(payload).expect("control frame");
+        let control: PipeControl = FlatMsg::decode(payload).expect("control frame");
         assert_eq!(
             control,
             PipeControl::Terminate {
@@ -1080,10 +1079,9 @@ mod tests {
         ));
 
         // Handshake so the pipe attaches the fabric channel.
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/lobby".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -1138,7 +1136,7 @@ mod tests {
         );
         let accepted_payload = &buf[FrameHeader::ENCODED_SIZE..accepted_frame_end(&buf)];
         assert_eq!(
-            PipeControl::decode(accepted_payload).expect("accepted control frame"),
+            <PipeControl as FlatMsg>::decode(accepted_payload).expect("accepted control frame"),
             PipeControl::Accepted,
             "successful handshake replies with an accepted frame"
         );
@@ -1177,10 +1175,9 @@ mod tests {
             unused_enqueue(),
         ));
 
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/lobby".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -1216,7 +1213,7 @@ mod tests {
         let payload =
             &buf[FrameHeader::ENCODED_SIZE..FrameHeader::ENCODED_SIZE + header.len as usize];
         assert_eq!(
-            PipeControl::decode(payload).expect("control frame"),
+            <PipeControl as FlatMsg>::decode(payload).expect("control frame"),
             PipeControl::Accepted
         );
 
@@ -1296,10 +1293,9 @@ mod tests {
         ));
 
         // Both pipes complete the handshake.
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/lobby".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("killed pipe handshake");
@@ -1444,10 +1440,9 @@ mod tests {
         ));
 
         // Client handshake naming the control route.
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/control".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -1481,7 +1476,7 @@ mod tests {
         // correlated response.
         let (payload, tag, _) = read_raw_frame(&mut peer).await.expect("accepted frame");
         assert_eq!(
-            PipeControl::decode(&payload).expect("control frame"),
+            <PipeControl as FlatMsg>::decode(&payload).expect("control frame"),
             PipeControl::Accepted
         );
         assert_eq!(tag, 0);
@@ -1526,10 +1521,9 @@ mod tests {
             },
         ));
 
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/control".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");
@@ -1557,7 +1551,7 @@ mod tests {
         assert_eq!(header.tag, 0);
         let payload = &buf[FrameHeader::ENCODED_SIZE..accepted_frame_end(&buf)];
         assert_eq!(
-            PipeControl::decode(payload).expect("control frame"),
+            <PipeControl as FlatMsg>::decode(payload).expect("control frame"),
             PipeControl::Terminate {
                 code: TERMINATE_ATTACH_FAILED
             }
@@ -1589,10 +1583,9 @@ mod tests {
             },
         ));
 
-        let handshake = PipeControl::Handshake {
+        let handshake = FlatMsg::encode(&PipeControl::Handshake {
             uri: "sel://acme/control".to_string(),
-        }
-        .encode();
+        });
         write_raw_frame(&mut peer, &handshake, 0, FrameHeader::FLAG_READY)
             .await
             .expect("write handshake");

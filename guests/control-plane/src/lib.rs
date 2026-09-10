@@ -25,14 +25,14 @@
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use anyhow::{Context as _, bail};
-use selium_abi::{
-    Capability, CapabilityGrant, ControlRequest, ControlResponse, DelegationStatus, Deployment,
-    DesiredStateRecord, PipelineBinding, ResolvedTarget, ResourceClass, ResourceSelector,
-    ResourceTarget, SchedulerRequest, SchedulerResponse, ScopeContext, decode_rkyv, encode_rkyv,
-};
+use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector, ScopeContext};
 use selium_guest::{
     BlobStore, Context, DurableLog, ResourceListener, Serve, debug, entrypoint, info, mark_ready,
     spawn, warn,
+};
+use selium_service::{
+    ControlRequest, ControlResponse, DelegationStatus, Deployment, DesiredStateRecord, FlatMsg,
+    PipelineBinding, ResolvedTarget, ResourceTarget, SchedulerRequest, SchedulerResponse,
 };
 use selium_shm::rpc;
 
@@ -96,7 +96,7 @@ impl ControlPlaneState {
     fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
         let records = log.replay(None, u32::MAX)?;
         for record in records {
-            match decode_rkyv::<DesiredStateRecord>(&record.payload) {
+            match FlatMsg::decode(&record.payload) {
                 Ok(desired) => self.apply_record(desired),
                 Err(error) => {
                     warn!("control-plane: skipping undecodable desired-state record: {error}");
@@ -474,7 +474,7 @@ fn record(
     record: DesiredStateRecord,
 ) -> selium_guest::Result<()> {
     let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
-    let payload = encode_rkyv(&record)?;
+    let payload = FlatMsg::encode(&record);
     log.append(timestamp_ms, Vec::new(), payload)?;
     state.borrow_mut().apply_record(record);
     Ok(())
@@ -538,8 +538,8 @@ mod tests {
     #[test]
     fn deployment_intent_is_recorded_in_projection() {
         let record = DesiredStateRecord::Deployment(deployment("api", 3, "api/v1"));
-        let payload = encode_rkyv(&record).expect("encode record");
-        let decoded: DesiredStateRecord = decode_rkyv(&payload).expect("decode record");
+        let payload = FlatMsg::encode(&record);
+        let decoded: DesiredStateRecord = FlatMsg::decode(&payload).expect("decode record");
 
         let mut state = ControlPlaneState::default();
         state.apply_record(decoded);
