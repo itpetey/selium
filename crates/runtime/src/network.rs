@@ -373,6 +373,16 @@ fn proxy_outbound_tcp(
     let mut seen_writer = false;
 
     while running.load(Ordering::Relaxed) {
+        // Snapshot the generation *before* draining. The drain loop below
+        // must never gate frame delivery on generation, but the value we
+        // park on has to be older than any write that lands after our last
+        // read: otherwise a write + kick arriving between `read_frame`
+        // returning `None` and the generation read would leave us parked on
+        // the new generation with the kick already consumed.
+        let current_generation = reader
+            .generation()
+            .map_err(|e| crate::Error::Host(e.to_string()))?;
+
         // Drain whatever is available first. Generation bookkeeping is only
         // used to decide when to park — never to skip frames — so frames
         // written before this thread started are still delivered.
@@ -397,10 +407,6 @@ fn proxy_outbound_tcp(
                 }
             }
         }
-
-        let current_generation = reader
-            .generation()
-            .map_err(|e| crate::Error::Host(e.to_string()))?;
 
         if !saw_frame {
             // Nothing available: check whether writers are still connected.
@@ -443,6 +449,13 @@ fn proxy_outbound_udp(
     let mut seen_writer = false;
 
     while running.load(Ordering::Relaxed) {
+        // Snapshot the generation *before* draining; see proxy_outbound_tcp
+        // for why the value we park on must be older than any write arriving
+        // after our last read.
+        let current_generation = reader
+            .generation()
+            .map_err(|e| crate::Error::Host(e.to_string()))?;
+
         // Drain whatever is available first; see proxy_outbound_tcp for why
         // generation bookkeeping must not gate frame delivery.
         let mut saw_frame = false;
@@ -492,10 +505,6 @@ fn proxy_outbound_udp(
                 }
             }
         }
-
-        let current_generation = reader
-            .generation()
-            .map_err(|e| crate::Error::Host(e.to_string()))?;
 
         if !saw_frame {
             match reader.writer_count() {

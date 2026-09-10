@@ -14,6 +14,16 @@
 
 set -euo pipefail
 
+# `--atomics-only` builds just the nightly atomics net-demo guest. That is
+# what `scripts/test.sh -- --ignored` runs inside the container: the plain
+# guests are built on the fly by their own tests via `read_guest_wasm`, so
+# only the atomics flavour (which no test builds for itself) needs seeding.
+ATOMICS_ONLY=0
+if [[ "${1:-}" == "--atomics-only" ]]; then
+  ATOMICS_ONLY=1
+  shift
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -122,6 +132,9 @@ ATOMICS_RUSTFLAGS="\
 build_atomics_guest() {
   local target="wasm32-unknown-unknown"
   local sysroot
+  # Respect `CARGO_TARGET_DIR` (set to the container's persistent `/target`
+  # volume by scripts/test.sh); fall back to the workspace-local `target/`.
+  local target_root="${CARGO_TARGET_DIR:-$ROOT/target}"
 
   if ! rustc +nightly --version >/dev/null 2>&1; then
     echo "error: the atomics guest build needs a nightly toolchain" >&2
@@ -140,7 +153,7 @@ build_atomics_guest() {
   # shared output path; removing it first forces cargo to re-emit the cached
   # atomics module even when its fingerprint is otherwise still fresh.
   echo "Building atomics net-demo guest"
-  rm -f "target/$target/debug/selium_net_demo.wasm"
+  rm -f "$target_root/$target/debug/selium_net_demo.wasm"
 
   RUSTFLAGS="$ATOMICS_RUSTFLAGS" \
     cargo +nightly build -Zbuild-std=std,panic_abort \
@@ -154,11 +167,16 @@ build_atomics_guest() {
   # `fastpath_wake`, then restore the plain module that `net_wake` (and the
   # host demo) expect. The preceding build overwrote the plain artifact in
   # place, so removing it forces cargo to re-emit it.
-  cp "target/$target/debug/selium_net_demo.wasm" \
-    "target/$target/debug/selium_net_demo_atomics.wasm"
-  rm -f "target/$target/debug/selium_net_demo.wasm"
+  cp "$target_root/$target/debug/selium_net_demo.wasm" \
+    "$target_root/$target/debug/selium_net_demo_atomics.wasm"
+  rm -f "$target_root/$target/debug/selium_net_demo.wasm"
   cargo build --target "$target" -p selium-net-demo
 }
+
+if [ "$ATOMICS_ONLY" = "1" ]; then
+  build_atomics_guest
+  exit 0
+fi
 
 build_dir crates
 build_dir guests --target wasm32-unknown-unknown

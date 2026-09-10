@@ -103,6 +103,21 @@ if [ -n "${TOOLCHAIN:-}" ]; then
   TOOLCHAIN_SETUP="rustup toolchain install '$TOOLCHAIN' --component clippy >/dev/null; export RUSTUP_TOOLCHAIN='$TOOLCHAIN'"
 fi
 
+# The ignored wasm-guest integration tests (spine, discovery, net_wake,
+# control_plane, dns/quic spines, ...) build their guests for
+# wasm32-unknown-unknown on the fly; the QUIC guests pull `ring`, whose C
+# build needs clang; and fastpath_wake needs the atomics net-demo guest,
+# which is a nightly + build-std build (see scripts/build-all.sh). CI's
+# `test` job provisions none of these (the dedicated wasm jobs do), so
+# install/build them here only when ignored tests are requested.
+IGNORED_SETUP=":"
+for _arg in "$@"; do
+  if [[ "$_arg" == "--ignored" || "$_arg" == "--include-ignored" ]]; then
+    IGNORED_SETUP="rustup target add wasm32-unknown-unknown >/dev/null; apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq clang >/dev/null 2>&1; rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown >/dev/null; scripts/build-all.sh --atomics-only"
+    break
+  fi
+done
+
 echo "test.sh: image=$RUST_IMAGE workspace=$CONTAINER_WS"
 echo "test.sh: cargo test $*"
 
@@ -128,5 +143,6 @@ docker run --rm \
     # (e.g. channel = "stable") selects the toolchain rustup installs the
     # clippy component into.
     { '"$TOOLCHAIN_SETUP"'; }
+    { '"$IGNORED_SETUP"'; }
     exec cargo test "$@"
   ' bash "$@"
