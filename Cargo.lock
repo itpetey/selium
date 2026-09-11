@@ -778,6 +778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-cli"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "anyhow",
+ "clap",
+ "selium-client",
+ "tokio",
+]
+
+[[package]]
 name = "selium-client"
 version = "1.0.0-alpha.6"
 dependencies = [
