@@ -11,14 +11,14 @@
 //! minus its test harness — is deferred to a follow-up: this crate stays
 //! connection-agnostic and is exercised here against the typed seams only.
 
-mod cli;
-mod commands;
-
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use selium_client::selium_service::{ControlRequest, ControlResponse};
+
+mod cli;
+mod commands;
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();

@@ -5,54 +5,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// The Selium control-plane CLI.
-///
-/// Each invocation opens one QUIC connection, issues exactly one typed
-/// control request, renders the result as one output line, and exits.
-#[derive(Debug, Parser)]
-#[command(
-    name = "sel",
-    version,
-    about = "Drive the Selium control plane from the command line"
-)]
-pub struct Cli {
-    /// Tenant whose bridge and control route the CLI targets.
-    #[arg(long)]
-    pub tenant: String,
-
-    /// QUIC connector address (`host:port`).
-    #[arg(long)]
-    pub connector: String,
-
-    /// Server root certificate PEM to trust.
-    #[arg(long)]
-    pub ca: PathBuf,
-
-    /// Client certificate PEM presented for mutual TLS.
-    #[arg(long, requires = "client_key")]
-    pub client_cert: PathBuf,
-
-    /// Client private key PEM presented for mutual TLS.
-    #[arg(long, requires = "client_cert")]
-    pub client_key: PathBuf,
-
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-impl Cli {
-    /// The bridge-route server name (TLS SNI + certificate verification
-    /// name) derived from the tenant.
-    pub fn server_name(&self) -> String {
-        format!("bridge.{}", self.tenant)
-    }
-
-    /// The control route named in the bridge channel handshake.
-    pub fn control_route(&self) -> String {
-        format!("sel://{}/control", self.tenant)
-    }
-}
-
 /// One subcommand per control-plane verb, mapping one-to-one onto
 /// [`ControlRequest`](selium_client::selium_service::ControlRequest)
 /// variants.
@@ -110,4 +62,52 @@ pub enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+}
+
+/// The Selium control-plane CLI.
+///
+/// Each invocation opens one QUIC connection, issues exactly one typed
+/// control request, renders the result as one output line, and exits.
+#[derive(Debug, Parser)]
+#[command(
+    name = "sel",
+    version,
+    about = "Drive the Selium control plane from the command line"
+)]
+pub struct Cli {
+    /// Tenant whose bridge and control route the CLI targets.
+    #[arg(long)]
+    pub tenant: String,
+
+    /// QUIC connector address (`host:port`).
+    #[arg(long)]
+    pub connector: String,
+
+    /// Server root certificate PEM to trust.
+    #[arg(long)]
+    pub ca: PathBuf,
+
+    /// Client certificate PEM presented for mutual TLS.
+    #[arg(long, requires = "client_key")]
+    pub client_cert: PathBuf,
+
+    /// Client private key PEM presented for mutual TLS.
+    #[arg(long, requires = "client_cert")]
+    pub client_key: PathBuf,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+impl Cli {
+    /// The bridge-route server name (TLS SNI + certificate verification
+    /// name) derived from the tenant.
+    pub fn server_name(&self) -> String {
+        format!("bridge.{}", self.tenant)
+    }
+
+    /// The control route named in the bridge channel handshake.
+    pub fn control_route(&self) -> String {
+        format!("sel://{}/control", self.tenant)
+    }
 }

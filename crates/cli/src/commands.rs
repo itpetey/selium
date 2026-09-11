@@ -14,6 +14,38 @@ use selium_client::{
 
 use crate::cli::{Cli, Command};
 
+/// Builds [`ConnectOptions`] from the connection flags: the tenant-derived
+/// server name, the trusted server root, and the optional client identity.
+pub fn build_connect_options(cli: &Cli) -> Result<ConnectOptions> {
+    let ca_pem = std::fs::read(&cli.ca).with_context(|| {
+        format!(
+            "failed to read server root certificate {}",
+            cli.ca.display()
+        )
+    })?;
+    let server_root = selium_client::certificates_from_pem(&ca_pem)?;
+
+    let cert_pem = std::fs::read(&cli.client_cert).with_context(|| {
+        format!(
+            "failed to read client certificate {}",
+            cli.client_cert.display()
+        )
+    })?;
+    let key_pem = std::fs::read(&cli.client_key)
+        .with_context(|| format!("failed to read client key {}", cli.client_key.display()))?;
+    let identity = Some(ClientIdentity {
+        cert_chain: selium_client::certificates_from_pem(&cert_pem)?,
+        key: selium_client::private_key_from_pem(&key_pem)?,
+    });
+
+    Ok(ConnectOptions {
+        server_name: cli.server_name(),
+        server_root,
+        identity,
+        transport: None,
+    })
+}
+
 /// Builds the typed control request for a parsed command.
 ///
 /// `upload` reads its module bytes from `--file`; every other verb maps its
@@ -49,38 +81,6 @@ pub fn build_request(command: &Command) -> Result<ControlRequest> {
             })
         }
     }
-}
-
-/// Builds [`ConnectOptions`] from the connection flags: the tenant-derived
-/// server name, the trusted server root, and the optional client identity.
-pub fn build_connect_options(cli: &Cli) -> Result<ConnectOptions> {
-    let ca_pem = std::fs::read(&cli.ca).with_context(|| {
-        format!(
-            "failed to read server root certificate {}",
-            cli.ca.display()
-        )
-    })?;
-    let server_root = selium_client::certificates_from_pem(&ca_pem)?;
-
-    let cert_pem = std::fs::read(&cli.client_cert).with_context(|| {
-        format!(
-            "failed to read client certificate {}",
-            cli.client_cert.display()
-        )
-    })?;
-    let key_pem = std::fs::read(&cli.client_key)
-        .with_context(|| format!("failed to read client key {}", cli.client_key.display()))?;
-    let identity = Some(ClientIdentity {
-        cert_chain: selium_client::certificates_from_pem(&cert_pem)?,
-        key: selium_client::private_key_from_pem(&key_pem)?,
-    });
-
-    Ok(ConnectOptions {
-        server_name: cli.server_name(),
-        server_root,
-        identity,
-        transport: None,
-    })
 }
 
 /// Renders a control response into a human-readable line and an exit code.
