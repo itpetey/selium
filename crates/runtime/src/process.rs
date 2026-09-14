@@ -195,6 +195,7 @@ impl Runtime {
                 tenant,
                 parent,
                 resolved_queue_ids: HashSet::new(),
+                resolved_region_ids: HashSet::new(),
             },
         );
     }
@@ -578,6 +579,26 @@ impl Runtime {
                     "permission denied for capability {capability:?} (tenant: {tenant:?}, class: {:?}, identity: {resource_id:?})",
                     context.resource_class
                 ),
+            ))
+        }
+    }
+
+    pub(crate) fn require_capability(
+        &self,
+        process_id: ProcessId,
+        capability: Capability,
+    ) -> std::result::Result<(), selium_abi::AbiError> {
+        let tenant = self.process_tenant(process_id);
+        let context = ScopeContext {
+            tenant: tenant.clone(),
+            ..ScopeContext::default()
+        };
+        if self.authorises(process_id, capability.clone(), &context) {
+            Ok(())
+        } else {
+            Err(selium_abi::AbiError::new(
+                selium_abi::AbiErrorCode::PermissionDenied,
+                format!("permission denied for capability {capability:?} (tenant: {tenant:?})"),
             ))
         }
     }

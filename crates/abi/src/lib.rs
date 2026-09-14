@@ -133,6 +133,11 @@ pub enum Capability {
     /// a guest's `serve` registration in the root namespace is forbidden by
     /// discovery.
     SystemRegistration,
+    /// Permission to sign tenant CAs and user certificates through the signing
+    /// hostcalls (`SignTenantCa`, `SignUserCert`, `RevokeCa`). Bootstrap-
+    /// provisioned only: like `DelegateGrants`, it can never be conferred on a
+    /// child process. Held solely by the identity system guest.
+    MintCertificate,
 }
 
 /// Identity of a resource in either local-handle or shared-resource space.
@@ -750,6 +755,37 @@ pub enum HostcallRequest {
         /// Queue id returned to that process by the resolve.
         shared_id: SharedResourceId,
     },
+    /// Record that a discovery resolve performed by `client_process_id`
+    /// returned a shared region. Callable only by the discovery system
+    /// guest; the recorded id gives the resolving client an authorisation
+    /// basis for `AttachRegion` on a region it did not allocate (the basis
+    /// peer guests use to attach an identity guest's published live tables).
+    RecordResolvedRegionFor {
+        /// Process that performed the discovery resolve.
+        client_process_id: ProcessId,
+        /// Region id returned to that process by the resolve.
+        shared_id: SharedResourceId,
+    },
+    /// Sign a tenant CA: generate a host-held tenant CA keypair and sign it
+    /// via the online intermediate key. Returns the DER-encoded tenant CA
+    /// certificate; the private key never leaves the host.
+    SignTenantCa {
+        /// Tenant whose CA is minted.
+        tenant: String,
+    },
+    /// Sign a user leaf certificate from a client-supplied SPKI via that
+    /// tenant's CA key. Returns the DER-encoded leaf certificate.
+    SignUserCert {
+        /// Tenant whose CA key signs the leaf.
+        tenant: String,
+        /// DER-encoded SubjectPublicKeyInfo of the client-generated leaf key.
+        spki_der: Vec<u8>,
+    },
+    /// Revoke a tenant CA: delete its key from the host keyring.
+    RevokeCa {
+        /// Tenant whose CA key is revoked.
+        tenant: String,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.
@@ -837,6 +873,10 @@ pub enum HostcallOutput {
     },
     /// A tenant identity for [`HostcallRequest::ProcessTenant`].
     Tenant(Option<String>),
+    /// A DER-encoded X.509 public certificate returned by a signing hostcall
+    /// ([`HostcallRequest::SignTenantCa`] or [`HostcallRequest::SignUserCert`]).
+    /// Carries no private-key material.
+    Certificate(Vec<u8>),
 }
 
 /// Current completion state of a hostcall operation.
@@ -1327,11 +1367,25 @@ mod tests {
 
     #[test]
     fn capability_delegate_grants_round_trip() {
-        for capability in [Capability::DelegateGrants, Capability::HostQueue] {
+        for capability in [
+            Capability::DelegateGrants,
+            Capability::HostQueue,
+            Capability::MintCertificate,
+        ] {
             let encoded = encode_rkyv(&capability).expect("encode");
             let decoded: Capability = decode_rkyv(&encoded).expect("decode");
             assert_eq!(decoded, capability);
         }
+    }
+
+    #[test]
+    fn capability_mint_certificate_round_trip() {
+        // `MintCertificate` is rkyv-encodable like every other variant, so it
+        // carries the same ABI stability guarantee as the rest of the enum.
+        let capability = Capability::MintCertificate;
+        let encoded = encode_rkyv(&capability).expect("encode");
+        let decoded: Capability = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, Capability::MintCertificate);
     }
 
     #[test]
@@ -1393,6 +1447,68 @@ mod tests {
         let envelope = HostcallEnvelope {
             request: HostcallRequest::ResolveProtocolHandler {
                 scheme: "sel-quic".to_string(),
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn sign_tenant_ca_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::SignTenantCa {
+                tenant: "acme".to_string(),
+            },
+            task_id: Some(1),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn sign_user_cert_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::SignUserCert {
+                tenant: "acme".to_string(),
+                spki_der: vec![0x30, 0x82, 0x01, 0x02],
+            },
+            task_id: Some(2),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn revoke_ca_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::RevokeCa {
+                tenant: "acme".to_string(),
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn certificate_output_round_trip() {
+        let output = HostcallOutput::Certificate(vec![0x30, 0x03, 0x02, 0x01]);
+        let encoded = encode_rkyv(&output).expect("encode");
+        let decoded: HostcallOutput = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, output);
+    }
+
+    #[test]
+    fn record_resolved_region_for_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::RecordResolvedRegionFor {
+                client_process_id: 42,
+                shared_id: 7,
             },
             task_id: None,
         };

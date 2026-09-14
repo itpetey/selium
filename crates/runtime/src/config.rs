@@ -103,6 +103,10 @@ pub struct ProcessAuthority {
     /// calls. Provides an authorisation basis for cross-process
     /// `HostQueueAttach` without requiring an `ExplicitResource` grant.
     pub resolved_queue_ids: HashSet<u64>,
+    /// Region ids returned to this process by successful discovery Resolve
+    /// calls. Provides an authorisation basis for `AttachRegion` on a region
+    /// the process did not allocate (e.g. an identity guest's live tables).
+    pub resolved_region_ids: HashSet<u64>,
 }
 
 impl SystemGuestDescriptor {

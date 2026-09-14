@@ -30,7 +30,7 @@ pub use stream::{
     RpcBidiStreamConnection, RpcBidiStreamRequest, RpcServerStream, RpcServerStreamClient,
     RpcServerStreamConnection, RpcServerStreamRequest,
 };
-pub use tables::{LiveTable, LiveTableMessage, LiveTableRecord};
+pub use tables::{LiveTable, LiveTableMessage, LiveTableRecord, LiveTableView};
 
 pub mod control;
 pub mod error;

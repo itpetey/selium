@@ -23,6 +23,8 @@ members = [
   "guests/discovery",
   "guests/discovery-probe",
   "guests/dns-demo",
+  "guests/identity",
+  "guests/identity-onboard",
   "guests/net-demo",
   "guests/quic-demo",
   "guests/spine-demo",
@@ -55,6 +57,7 @@ parking_lot = { version = "0.12", default-features = false }
 proc-macro2 = { version = "1.0", default-features = false }
 quinn = { version = "0.11", default-features = false }
 quote = { version = "1.0", default-features = false }
+rcgen = { version = "0.14", default-features = false }
 ring = { version = "0.17", default-features = false }
 rkyv = { version = "0.8", default-features = false }
 rustls = { version = "0.23", default-features = false }
@@ -74,6 +77,7 @@ selium-wire = { path = "crates/wire", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 syn = { version = "3.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
+time = { version = "0.3", default-features = false }
 tokio = { version = "1.53", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
@@ -83,6 +87,7 @@ trybuild = { version = "1.0", default-features = false }
 wasmtiny = { version = "0.1", default-features = false }
 wat = { version = "1.258", default-features = false }
 web-time = "1.1"
+x509-parser = { version = "0.18", default-features = false }
 
 [workspace.lints.clippy]
 allow_attributes = "warn"

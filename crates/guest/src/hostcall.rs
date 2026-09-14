@@ -152,6 +152,59 @@ pub fn record_resolved_queue_for(
     .map(|_| ())
 }
 
+/// Records, on behalf of the discovery service, that a discovery resolve
+/// performed by `client_process_id` returned a shared region. The runtime
+/// accepts this hostcall only from the discovery system guest; the recorded
+/// id gives the resolving client an authorisation basis for `AttachRegion`
+/// on a region it did not allocate (e.g. an identity guest's live tables).
+pub fn record_resolved_region_for(
+    client_process_id: selium_abi::ProcessId,
+    shared_id: selium_abi::SharedResourceId,
+) -> Result<()> {
+    hostcall_ready(HostcallRequest::RecordResolvedRegionFor {
+        client_process_id,
+        shared_id,
+    })
+    .map(|_| ())
+}
+
+/// Mints a tenant CA through the host signing oracle, returning the
+/// DER-encoded tenant CA certificate. Requires the `MintCertificate`
+/// capability; the tenant CA private key never reaches the guest.
+pub fn sign_tenant_ca(tenant: &str) -> Result<Vec<u8>> {
+    match hostcall_ready(HostcallRequest::SignTenantCa {
+        tenant: tenant.to_string(),
+    })? {
+        HostcallOutput::Certificate(der) => Ok(der),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for SignTenantCa: {other:?}"
+        ))),
+    }
+}
+
+/// Signs a client-supplied SPKI into a short-TTL user leaf certificate,
+/// returning the DER-encoded leaf. Requires the `MintCertificate` capability.
+pub fn sign_user_cert(tenant: &str, spki_der: &[u8]) -> Result<Vec<u8>> {
+    match hostcall_ready(HostcallRequest::SignUserCert {
+        tenant: tenant.to_string(),
+        spki_der: spki_der.to_vec(),
+    })? {
+        HostcallOutput::Certificate(der) => Ok(der),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for SignUserCert: {other:?}"
+        ))),
+    }
+}
+
+/// Deletes a tenant CA key from the host keyring. Requires the
+/// `MintCertificate` capability.
+pub fn revoke_ca(tenant: &str) -> Result<()> {
+    hostcall_ready(HostcallRequest::RevokeCa {
+        tenant: tenant.to_string(),
+    })
+    .map(|_| ())
+}
+
 /// Resolves the bootstrap-registered protocol handler for `scheme`
 /// (e.g. `sel-quic`) to its process id.
 ///

@@ -36,9 +36,15 @@ use std::{net::SocketAddr, sync::Arc};
 use anyhow::Context as _;
 use quinn::ServerConfig;
 use rustls_pemfile as pemfile;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use selium_guest::{
     Context, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
 };
+use selium_shm::Channel;
+use selium_shm::transport::ShmTransport;
+use selium_wire::LiveTableView;
+use selium_wire::framed::FramedRead;
+use selium_wire::pubsub::Subscriber;
 use thiserror::Error;
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
@@ -71,14 +77,14 @@ const QUIC_LISTEN_ADDR: &str = "0.0.0.0:4433";
 const REFUSE_ERROR_CODE: u32 = 0x100;
 /// Manifest name for the certificate chain PEM.
 const TLS_CERT_MANIFEST: &str = "cert-pem";
-/// Manifest prefix for a tenant's client CA anchor PEM (`client-ca-<tenant>`).
-const TLS_CLIENT_CA_MANIFEST_PREFIX: &str = "client-ca-";
-/// Manifest name for the newline-separated client trust-anchor tenant list.
-const TLS_CLIENT_CA_TENANTS_MANIFEST: &str = "client-ca-tenants";
 /// Manifest name for the private key PEM.
 const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
+/// The identity guest's published anchor live-table route.
+const ANCHOR_TABLE_ROUTE: &str = "sel:///identity-anchors";
+/// Anchor-table key prefix: keys are `client-ca-<tenant>`.
+const ANCHOR_KEY_PREFIX: &str = "client-ca-";
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -268,28 +274,82 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 
 /// Entrypoint for the QUIC connector system guest.
 ///
+#[entrypoint]
+async fn connector_quic(ctx: Context) -> anyhow::Result<()> {
+    match connector_quic_inner(ctx).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            error!("quic-connector: startup failed: {e:#}");
+            Err(e)
+        }
+    }
+}
+
 /// Receives a discovery `Context` for SNI route resolution. On wasm32 the
 /// host provides randomness and time through hostcalls; both backends are
-/// registered before any TLS operation. Certificates are loaded from blob
-/// storage (loud failure on missing/invalid material), a UDP socket is bound,
-/// and the quinn endpoint accepts connections. Each accepted connection is
-/// routed by SNI and served by its own relay task.
-#[entrypoint]
-async fn connector_quic(mut ctx: Context) -> anyhow::Result<()> {
+/// registered before any TLS operation. The server's own certificate/key are
+/// loaded from blob storage (loud failure on missing/invalid material). Client
+/// trust anchors are **opt-in via identity deployment**: when the identity
+/// guest's anchor-table route is registered, the connector sources its client
+/// trust anchors from that live table, refuses every client certificate until
+/// identity's initial anchor state is applied, and rebuilds the union verifier
+/// whenever the table changes. When no identity guest is deployed (no
+/// anchor-table route registered), the connector serves without client
+/// authentication and stream handoffs carry empty identity metadata — the
+/// deployment's choice for public, unauthorised endpoints; identity-requiring
+/// guests (e.g. the bridge) then refuse those handoffs. A registered but
+/// unusable anchor source fails closed: the connector keeps serving but refuses
+/// every client certificate, never silently downgrading to no client
+/// authentication. A UDP socket is bound, and the quinn endpoint accepts
+/// connections; each accepted connection is routed by SNI and served by its
+/// own relay task.
+async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
     #[cfg(target_arch = "wasm32")]
     register_wasm_time_source();
 
     drop(selium_guest::log::init());
     info!("quic-connector: started");
 
-    let (server_config, anchors) = load_server_config().with_context(
+    let (certs, key) = load_server_identity().with_context(
         || "quic-connector: TLS setup failed; refusing to serve QUIC without TLS material",
     )?;
-    if anchors.is_some() {
-        info!("quic-connector: TLS configured (mTLS client authentication)");
-    } else {
-        info!("quic-connector: TLS configured (client authentication disabled)");
+
+    // Client authentication is opt-in via identity deployment. With identity
+    // deployed, trust anchors are live-table-sourced: the set starts empty —
+    // refusing every client certificate — until identity's initial anchor
+    // state is applied below; it never silently disables client
+    // authentication. Without identity, mTLS is off and handoffs carry empty
+    // identity metadata.
+    let mut anchors = None;
+    let mut anchor_table = None;
+    match attach_anchor_table(&mut ctx).await {
+        AnchorTableSource::Attached(table) => {
+            info!("quic-connector: client trust anchors sourced from the identity anchor table");
+            let set = ClientAnchorSet::empty()
+                .with_context(|| "quic-connector: empty anchor set build failed")?;
+            anchors = Some(set);
+            anchor_table = Some(*table);
+        }
+        AnchorTableSource::NotDeployed => {
+            info!(
+                "quic-connector: no identity guest deployed; serving without client authentication"
+            );
+        }
+        AnchorTableSource::Unavailable => {
+            // Fail closed: a registered-but-unusable anchor source must not
+            // downgrade to unauthenticated serving.
+            warn!(
+                "quic-connector: identity anchor table unusable; refusing all client certificates"
+            );
+            anchors = Some(
+                ClientAnchorSet::empty()
+                    .with_context(|| "quic-connector: empty anchor set build failed")?,
+            );
+        }
     }
+
+    let server_config = build_server_config(certs, key, anchors.as_ref())
+        .with_context(|| "quic-connector: TLS config build failed")?;
 
     let local_addr: SocketAddr = QUIC_LISTEN_ADDR
         .parse()
@@ -308,7 +368,6 @@ async fn connector_quic(mut ctx: Context) -> anyhow::Result<()> {
     .with_context(|| "quic-connector: endpoint creation failed")?;
 
     info!("quic-connector: listening on {QUIC_LISTEN_ADDR}");
-    mark_ready();
 
     // Fetch the advisory domain table once, so SNI resolution can project
     // wire names onto the tenant tree locally before the discovery lookup.
@@ -318,6 +377,24 @@ async fn connector_quic(mut ctx: Context) -> anyhow::Result<()> {
         .with_context(|| "quic-connector: failed to load domain table")?;
     let resolver: ResolverHandle =
         Arc::new(tokio::sync::Mutex::new(RouteResolver::new(ctx, domains)));
+
+    // Apply identity's initial anchor state before reporting ready, so the
+    // connector never reports ready with no anchor snapshot applied.
+    if let Some(table) = &anchor_table {
+        if let Err(e) = table.sync() {
+            warn!("quic-connector: initial anchor table sync failed: {e}");
+        }
+        if let Some(set) = &anchors
+            && let Err(e) = rebuild_anchors(set, table)
+        {
+            warn!("quic-connector: initial anchor rebuild failed: {e}");
+        }
+    }
+    mark_ready();
+
+    // Watch the anchor table and rebuild the union verifier on change.
+    let anchors = Arc::new(anchors);
+    spawn(anchor_refresher(anchor_table, anchors.clone()));
 
     loop {
         let Some(incoming) = endpoint.accept().await else {
@@ -334,106 +411,126 @@ async fn connector_quic(mut ctx: Context) -> anyhow::Result<()> {
 
         info!("quic-connector: QUIC handshake complete");
         let resolver = resolver.clone();
-        let anchors = anchors.clone();
+        let anchor_set = (*anchors).clone();
         spawn(async move {
-            handle_connection(connection, resolver, anchors).await;
+            handle_connection(connection, resolver, anchor_set).await;
         });
     }
 
     Ok(())
 }
 
-/// Loads per-tenant client trust anchors from the TLS blob store.
-///
-/// **mTLS is opt-in**: an absent `client-ca-tenants` manifest disables client
-/// authentication (`Ok(None)`). When the manifest is present, every listed
-/// tenant's CA anchor must be loadable and valid — a configured but broken
-/// anchor set fails loudly rather than silently downgrading to no client auth.
-fn load_client_anchors(
-    store: &selium_guest::BlobStore,
-) -> Result<Option<ClientAnchorSet>, TlsError> {
-    use rustls_pki_types::CertificateDer;
-
-    let Some(tenants_blob_id) = store
-        .manifest(TLS_CLIENT_CA_TENANTS_MANIFEST)
-        .map_err(|e| {
-            error!("quic-connector: client anchor tenant list manifest failed: {e}");
-            TlsError::MissingClientAnchors
-        })?
-    else {
-        warn!("quic-connector: no client trust anchors configured; mTLS disabled");
-        return Ok(None);
-    };
-    let tenants_blob = store
-        .get(&tenants_blob_id)
-        .map_err(|e| {
-            error!("quic-connector: failed to read client anchor tenant list: {e}");
-            TlsError::MissingClientAnchors
-        })?
-        .ok_or_else(|| {
-            error!("quic-connector: client anchor tenant list is empty");
-            TlsError::MissingClientAnchors
-        })?;
-    let tenants_text = String::from_utf8(tenants_blob).map_err(|e| {
-        error!("quic-connector: client anchor tenant list is not UTF-8: {e}");
-        TlsError::InvalidClientAnchor
-    })?;
-
-    let mut anchors = Vec::new();
-    for tenant in tenants_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let manifest = format!("{TLS_CLIENT_CA_MANIFEST_PREFIX}{tenant}");
-        let blob_id = store
-            .manifest(&manifest)
-            .map_err(|e| {
-                error!("quic-connector: client anchor manifest '{manifest}' failed: {e}");
-                TlsError::MissingClientAnchors
-            })?
-            .ok_or_else(|| {
-                error!("quic-connector: missing client anchor for tenant {tenant}");
-                TlsError::MissingClientAnchors
-            })?;
-        let pem = store
-            .get(&blob_id)
-            .map_err(|e| {
-                error!("quic-connector: failed to read client anchor for {tenant}: {e}");
-                TlsError::MissingClientAnchors
-            })?
-            .ok_or_else(|| {
-                error!("quic-connector: client anchor blob for {tenant} is empty");
-                TlsError::MissingClientAnchors
-            })?;
-
-        let mut reader = std::io::BufReader::new(pem.as_slice());
-        let certs: Vec<CertificateDer<'static>> = pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                error!("quic-connector: invalid client anchor PEM for {tenant}: {e}");
-                TlsError::InvalidClientAnchor
-            })?;
-        let ca = certs.into_iter().next().ok_or_else(|| {
-            error!("quic-connector: empty client anchor PEM for {tenant}");
-            TlsError::InvalidClientAnchor
-        })?;
-        anchors.push((tenant.to_string(), ca));
-    }
-
-    if anchors.is_empty() {
-        error!("quic-connector: client anchor tenant list has no tenants");
-        return Err(TlsError::MissingClientAnchors);
-    }
-
-    Ok(Some(ClientAnchorSet::new(anchors)?))
+/// The outcome of trying to attach the identity guest's anchor live table.
+enum AnchorTableSource {
+    /// Identity is deployed and its anchor table attached: mTLS is mandatory.
+    Attached(Box<LiveTableView<String, Vec<u8>, ShmTransport>>),
+    /// No identity anchor-table route is registered: the deployment opted out
+    /// of mTLS, so the connector serves without client authentication.
+    NotDeployed,
+    /// The route is registered but the table could not be attached: fail
+    /// closed by refusing every client certificate.
+    Unavailable,
 }
 
-/// Loads the QUIC server TLS config and client trust anchors from storage via
-/// the connector's `Storage` grant. Fails loudly on missing or invalid
-/// material. Returns `None` anchors when mTLS is not configured (opt-in).
-fn load_server_config() -> Result<(ServerConfig, Option<ClientAnchorSet>), TlsError> {
-    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+/// Attaches to the identity guest's published anchor live table, returning a
+/// read-only view of it. Distinguishes "identity not deployed" (mTLS opt-out)
+/// from "identity deployed but unusable" (fail closed).
+async fn attach_anchor_table(ctx: &mut Context) -> AnchorTableSource {
+    let target = match ctx.lookup(ANCHOR_TABLE_ROUTE).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            info!("quic-connector: no identity anchor table route registered");
+            return AnchorTableSource::NotDeployed;
+        }
+        Err(e) => {
+            warn!("quic-connector: anchor table resolve failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    let channel = match Channel::attach(target.resource_id) {
+        Ok(channel) => channel,
+        Err(e) => {
+            warn!("quic-connector: anchor table region attach failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    // Replay from the ring start: anchors may predate this attachment.
+    let transport = match ShmTransport::new_replay(&channel, &channel) {
+        Ok(transport) => transport,
+        Err(e) => {
+            warn!("quic-connector: anchor table transport failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    let subscriber = Subscriber::new(FramedRead::new(transport), None);
+    match LiveTableView::new(subscriber).map(Box::new) {
+        Ok(view) => AnchorTableSource::Attached(view),
+        Err(e) => {
+            warn!("quic-connector: anchor table view failed: {e}");
+            AnchorTableSource::Unavailable
+        }
+    }
+}
+
+/// Rebuilds the anchor set from the current table state. Keys are
+/// `client-ca-<tenant>`; tombstones (removed tenants) are skipped so their
+/// anchors drop out of the rebuilt union verifier.
+fn rebuild_anchors(
+    anchors: &ClientAnchorSet,
+    table: &LiveTableView<String, Vec<u8>, ShmTransport>,
+) -> anyhow::Result<()> {
+    let entries = table
+        .scan(usize::MAX)
+        .map_err(|e| anyhow::anyhow!("anchor table scan failed: {e}"))?;
+    let mut pairs = Vec::with_capacity(entries.len());
+    for (key, record) in entries {
+        let Some(cert_der) = record.value else {
+            continue;
+        };
+        let Some(tenant) = key.strip_prefix(ANCHOR_KEY_PREFIX) else {
+            warn!("quic-connector: ignoring non-anchor table key {key:?}");
+            continue;
+        };
+        pairs.push((tenant.to_string(), CertificateDer::from(cert_der)));
+    }
+    let count = pairs.len();
+    anchors
+        .replace(pairs)
+        .map_err(|e| anyhow::anyhow!("anchor replace failed: {e}"))?;
+    info!("quic-connector: rebuilt client anchor set ({count} anchors)");
+    Ok(())
+}
+
+/// Watches the anchor table and rebuilds the connector's union verifier on
+/// every change, so tenant onboarding and revocation take effect for the next
+/// handshake.
+async fn anchor_refresher(
+    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
+    anchors: Arc<Option<ClientAnchorSet>>,
+) {
+    let Some(table) = table else {
+        return;
+    };
+    let Some(anchors) = anchors.as_ref() else {
+        return;
+    };
+    loop {
+        if let Err(e) = table.sync_async().await {
+            warn!("quic-connector: anchor table wait failed: {e}");
+            selium_guest::yield_now().await;
+            continue;
+        }
+        if let Err(e) = rebuild_anchors(anchors, &table) {
+            warn!("quic-connector: anchor rebuild failed: {e}");
+        }
+    }
+}
+
+/// Loads the QUIC server's own identity (certificate chain + private key)
+/// from blob storage via the connector's `Storage` grant. Client trust anchors
+/// are not loaded here: they are sourced from the identity anchor live table.
+fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError>
+{
     use selium_guest::BlobStore;
 
     let store = BlobStore::open(TLS_STORE_NAME).map_err(|e| {
@@ -513,10 +610,5 @@ fn load_server_config() -> Result<(ServerConfig, Option<ClientAnchorSet>), TlsEr
         }
     };
 
-    let anchors = load_client_anchors(&store)?;
-    if anchors.is_some() {
-        info!("quic-connector: loaded client trust anchors (mTLS enabled)");
-    }
-    let config = build_server_config(certs, key, anchors.as_ref())?;
-    Ok((config, anchors))
+    Ok((certs, key))
 }

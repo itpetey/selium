@@ -74,6 +74,26 @@ impl ShmTransport {
         })
     }
 
+    /// Creates a transport whose read side replays the ring from position 0.
+    ///
+    /// Used by live-table consumers that attach after the writer has already
+    /// published mutations: they must materialise the full stream, not just
+    /// frames written after attachment (cf. [`Self::new`], whose reader starts
+    /// at the live tail).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking reader or writer cannot be created.
+    pub fn new_replay(read_channel: &Channel, write_channel: &Channel) -> Result<Self> {
+        let reader = Reader::Blocking(read_channel.blocking_reader_from(0)?);
+        let writer = write_channel.blocking_writer()?;
+        Ok(Self {
+            reader,
+            writer,
+            last_generation: 0,
+        })
+    }
+
     /// Returns a reference to the underlying writer.
     pub fn writer(&self) -> &BlockingWriter {
         &self.writer

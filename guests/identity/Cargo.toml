@@ -1,8 +1,8 @@
 [package]
-name = "selium-bridge"
+name = "selium-identity"
 version.workspace = true
 edition.workspace = true
-description = "Per-tenant bridge server system guest (authenticates clients, spawns bridge-channels)"
+description = "Selium identity system guest (PKI policy authority: tenant CA and user-certificate lifecycle, registries, anchor and grant publication)"
 readme.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -16,16 +16,16 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+rkyv = { workspace = true, features = ["alloc", "bytecheck"] }
 selium-abi.workspace = true
 selium-guest.workspace = true
 selium-service.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-selium-memory.workspace = true
-selium-shm.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true

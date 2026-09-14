@@ -16,14 +16,17 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use quinn::{
     ServerConfig,
     crypto::rustls::QuicServerConfig,
     rustls::{
-        RootCertStore,
+        DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore,
+        SignatureScheme,
+        client::danger::HandshakeSignatureValid,
         crypto::ring::default_provider,
         pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
-        server::{WebPkiClientVerifier, danger::ClientCertVerifier},
+        server::{WebPkiClientVerifier, danger::ClientCertVerified, danger::ClientCertVerifier},
         version,
     },
 };
@@ -38,15 +41,127 @@ pub struct ClientAnchor {
     verifier: Arc<dyn ClientCertVerifier>,
 }
 
-/// The set of configured per-tenant client trust anchors.
+/// The mutable inner state of the anchor set: the per-tenant anchors and the
+/// endpoint-global union verifier built from them.
+struct AnchorInner {
+    anchors: Vec<ClientAnchor>,
+    union: Arc<dyn ClientCertVerifier>,
+}
+
+impl AnchorInner {
+    /// Builds anchors from `(tenant, CA certificate)` pairs. An empty set
+    /// produces a deny-all verifier: the connector offers mandatory client
+    /// authentication but refuses every certificate until identity publishes.
+    fn build(anchors: Vec<(String, CertificateDer<'static>)>) -> Result<Self, TlsError> {
+        let mut union_roots = RootCertStore::empty();
+        let mut built = Vec::with_capacity(anchors.len());
+        for (tenant, cert) in anchors {
+            union_roots.add(cert.clone()).map_err(|e| {
+                tracing::error!("quic-connector: invalid client anchor for {tenant}: {e}");
+                TlsError::InvalidClientAnchor
+            })?;
+            let roots = RootCertStore::empty();
+            let verifier = per_tenant_verifier(roots, &cert, &tenant)?;
+            built.push(ClientAnchor::with_verifier(tenant, verifier));
+        }
+
+        let union: Arc<dyn ClientCertVerifier> = if built.is_empty() {
+            Arc::new(RefuseAllClientVerifier)
+        } else {
+            WebPkiClientVerifier::builder(Arc::new(union_roots))
+                .build()
+                .map_err(|e| {
+                    tracing::error!("quic-connector: client union verifier build failed: {e}");
+                    TlsError::InvalidClientAnchor
+                })?
+        };
+
+        Ok(Self {
+            anchors: built,
+            union,
+        })
+    }
+}
+
+/// Mandatory-client-auth verifier that refuses every certificate. The anchor
+/// set's empty state: before identity publishes its first tenant anchor the
+/// connector must refuse, never silently accept.
+#[derive(Debug)]
+struct RefuseAllClientVerifier;
+
+impl ClientCertVerifier for RefuseAllClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        Err(RustlsError::General(
+            "no client trust anchors configured".to_string(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::General(
+            "no client trust anchors configured".to_string(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(RustlsError::General(
+            "no client trust anchors configured".to_string(),
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+/// The set of client trust anchors, rebuilt live from the identity guest's
+/// published anchor table.
 ///
-/// Building [`ClientAnchorSet`] with no anchors is a hard error: mTLS is
-/// endpoint-global, so a connector with no client trust anchors must refuse to
-/// serve rather than silently accept unauthenticated connections.
+/// The set itself is a rustls [`ClientCertVerifier`], delegating every
+/// handshake to the *current* union verifier. Rebuilding the set (on tenant
+/// onboarding or revocation) therefore changes the anchoring for the next
+/// handshake without disturbing connections already authenticated.
+///
+/// Building a set with no anchors via [`ClientAnchorSet::new`] is a hard
+/// error (mTLS is endpoint-global, so a connector with no anchors must refuse
+/// to serve). [`ClientAnchorSet::empty`] is the live-table flow's starting
+/// state: it serves as a verifier that refuses every client until the first
+/// anchor state arrives.
 #[derive(Clone)]
 pub struct ClientAnchorSet {
-    anchors: Arc<Vec<ClientAnchor>>,
-    union: Arc<dyn ClientCertVerifier>,
+    inner: Arc<Mutex<AnchorInner>>,
+}
+
+impl std::fmt::Debug for ClientAnchorSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAnchorSet").finish_non_exhaustive()
+    }
 }
 
 impl ClientAnchor {
@@ -82,35 +197,31 @@ impl ClientAnchorSet {
         if anchors.is_empty() {
             return Err(TlsError::MissingClientAnchors);
         }
-
-        let mut union_roots = RootCertStore::empty();
-        let mut built = Vec::with_capacity(anchors.len());
-        for (tenant, cert) in anchors {
-            union_roots.add(cert.clone()).map_err(|e| {
-                tracing::error!("quic-connector: invalid client anchor for {tenant}: {e}");
-                TlsError::InvalidClientAnchor
-            })?;
-            let roots = RootCertStore::empty();
-            let verifier = per_tenant_verifier(roots, &cert, &tenant)?;
-            built.push(ClientAnchor::with_verifier(tenant, verifier));
-        }
-
-        let union = WebPkiClientVerifier::builder(Arc::new(union_roots))
-            .build()
-            .map_err(|e| {
-                tracing::error!("quic-connector: client union verifier build failed: {e}");
-                TlsError::InvalidClientAnchor
-            })?;
-
         Ok(Self {
-            anchors: Arc::new(built),
-            union,
+            inner: Arc::new(Mutex::new(AnchorInner::build(anchors)?)),
         })
     }
 
-    /// Returns the endpoint-global union client verifier (mandatory).
-    pub fn union_verifier(&self) -> Arc<dyn ClientCertVerifier> {
-        self.union.clone()
+    /// Builds an empty (refusing) anchor set: the start state for the
+    /// live-table flow before identity has published any tenant anchor.
+    pub fn empty() -> Result<Self, TlsError> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(AnchorInner::build(Vec::new())?)),
+        })
+    }
+
+    /// Rebuilds the anchor set from `(tenant, CA certificate)` pairs. An empty
+    /// set is admitted (the connector keeps serving but refuses every client
+    /// certificate). The change takes effect for the next handshake.
+    pub fn replace(&self, anchors: Vec<(String, CertificateDer<'static>)>) -> Result<(), TlsError> {
+        let inner = AnchorInner::build(anchors)?;
+        *self.inner.lock() = inner;
+        Ok(())
+    }
+
+    /// Returns the current endpoint-global union client verifier.
+    fn current_union(&self) -> Arc<dyn ClientCertVerifier> {
+        self.inner.lock().union.clone()
     }
 
     /// Derives the authenticated identity for a `quinn::Connection`.
@@ -128,6 +239,8 @@ impl ClientAnchorSet {
         let fingerprint = spki_fingerprint(leaf)?;
         let intermediates = chain.get(1..).unwrap_or_default();
         let tenant = self
+            .inner
+            .lock()
             .anchors
             .iter()
             .find(|anchor| anchor.verifies(leaf, intermediates))
@@ -136,6 +249,54 @@ impl ClientAnchorSet {
             tenant,
             fingerprint,
         })
+    }
+}
+
+impl ClientCertVerifier for ClientAnchorSet {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, RustlsError> {
+        self.current_union()
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.current_union()
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.current_union()
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.current_union().supported_verify_schemes()
     }
 }
 
@@ -149,7 +310,11 @@ impl ClientAnchorSet {
 ///
 /// TLS 1.3 0-RTT early data stays **disabled** (the rustls default): early
 /// data is replayable across connections, and the connector relays stream
-/// bytes into the fabric under the authenticated client identity.
+/// bytes into the fabric under the authenticated client identity. TLS 1.3
+/// session resumption stays **disabled** too: rustls skips client
+/// authentication on PSK-resumed handshakes, so a resumption ticket would
+/// bypass both mandatory client authentication and anchor revocation — every
+/// connection runs the full certificate verification.
 pub fn build_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -164,7 +329,7 @@ pub fn build_server_config(
         })?;
     let rustls_config = match anchors {
         Some(anchors) => builder
-            .with_client_cert_verifier(anchors.union_verifier())
+            .with_client_cert_verifier(Arc::new(anchors.clone()))
             .with_single_cert(certs, key)
             .map_err(|e| {
                 tracing::error!("quic-connector: failed to build TLS config: {e}");
@@ -178,6 +343,16 @@ pub fn build_server_config(
                 TlsError::ConfigError
             })?,
     };
+
+    // Session resumption stays disabled: rustls skips client authentication
+    // on PSK-resumed TLS 1.3 handshakes, so a resumption ticket issued by a
+    // prior connection would let a client bypass certificate verification
+    // entirely — defeating both mandatory mTLS and anchor revocation. Every
+    // connection therefore runs the full certificate verification: the
+    // connector issues no TLS 1.3 tickets and stores no resumable sessions.
+    let mut rustls_config = rustls_config;
+    rustls_config.send_tls13_tickets = 0;
+    rustls_config.session_storage = Arc::new(quinn::rustls::server::NoServerSessionStorage {});
 
     let quic_crypto = QuicServerConfig::try_from(rustls_config).map_err(|e| {
         tracing::error!("quic-connector: QUIC crypto config rejected: {e}");
@@ -256,5 +431,107 @@ mod tests {
         let anchors = client_anchor();
         let server_cert = CertificateDer::from(SERVER_CERT_DER.to_vec());
         assert!(anchors.identity_from_chain(&[server_cert]).is_none());
+    }
+
+    #[test]
+    fn empty_set_refuses_valid_client_certificate() {
+        // The live-table flow's start state: before identity's initial
+        // anchor state arrives, the connector refuses every client
+        // certificate rather than silently disabling client authentication.
+        let set = ClientAnchorSet::empty().expect("empty anchor set");
+        let cert = CertificateDer::from(CLIENT_CERT_DER.to_vec());
+        let refused = set
+            .verify_client_cert(&cert, &[], UnixTime::now())
+            .expect_err("the empty anchor set must refuse a certificate a configured set accepts");
+        assert!(
+            refused.to_string().contains("no client trust anchors"),
+            "the refusal names the missing anchor state: {refused}"
+        );
+    }
+
+    /// Generates a tenant CA and a client leaf signed by it, as the identity
+    /// guest's signing oracle would (client key generated "client-side";
+    /// only the public half reaches the CA).
+    fn generated_tenant(
+        ca_cn: &str,
+        leaf_cn: &str,
+    ) -> (CertificateDer<'static>, CertificateDer<'static>) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+            PKCS_ECDSA_P256_SHA256,
+        };
+
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("ca key");
+        let mut ca_params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, ca_cn);
+        ca_params.distinguished_name = dn;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut leaf_params = CertificateParams::default();
+        let mut leaf_dn = DistinguishedName::new();
+        leaf_dn.push(DnType::CommonName, leaf_cn);
+        leaf_params.distinguished_name = leaf_dn;
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
+
+        (
+            CertificateDer::from(ca_cert.der().to_vec()),
+            CertificateDer::from(leaf.der().to_vec()),
+        )
+    }
+
+    #[test]
+    fn replace_propagates_anchor_addition_and_revocation() {
+        // New tenant anchor propagates: a rebuilt set accepts certificates
+        // chained to the new anchor.
+        let (ca_a, leaf_a) = generated_tenant("Tenant CA acme", "Client acme");
+        let (ca_b, leaf_b) = generated_tenant("Tenant CA beta", "Client beta");
+        let set = ClientAnchorSet::new(vec![("acme".to_string(), ca_a.clone())])
+            .expect("anchor set with acme");
+
+        assert_eq!(
+            set.identity_from_chain(std::slice::from_ref(&leaf_a))
+                .expect("acme leaf")
+                .tenant,
+            "acme"
+        );
+        set.verify_client_cert(&leaf_a, &[], UnixTime::now())
+            .expect("the union verifier accepts the acme leaf");
+
+        // Revoked tenant anchor propagates: after a rebuild without acme,
+        // its leaf is refused by both the union verifier and identity
+        // derivation, while a concurrently added tenant is accepted.
+        set.replace(vec![("beta".to_string(), ca_b)])
+            .expect("replace with beta only");
+        set.verify_client_cert(&leaf_a, &[], UnixTime::now())
+            .expect_err("the next handshake chained to the removed anchor is refused");
+        assert!(
+            set.identity_from_chain(std::slice::from_ref(&leaf_a))
+                .is_none()
+        );
+        assert_eq!(
+            set.identity_from_chain(std::slice::from_ref(&leaf_b))
+                .expect("beta leaf")
+                .tenant,
+            "beta"
+        );
+        set.verify_client_cert(&leaf_b, &[], UnixTime::now())
+            .expect("the union verifier accepts the concurrently added beta leaf");
+
+        // Full revocation (every anchor removed) refuses every client.
+        set.replace(Vec::new()).expect("replace with none");
+        set.verify_client_cert(&leaf_b, &[], UnixTime::now())
+            .expect_err("the fully revoked set refuses every client");
+        assert!(
+            set.identity_from_chain(std::slice::from_ref(&leaf_b))
+                .is_none()
+        );
     }
 }

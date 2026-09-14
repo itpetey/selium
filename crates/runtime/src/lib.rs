@@ -5,6 +5,7 @@ pub use config::{
     SystemGuestArg, SystemGuestDescriptor,
 };
 pub use error::{Error, Result};
+pub use keyring::{CaStore, InMemoryCaStore, KeyMaterial, Keyring, KeyringBootstrap, KeyringError};
 pub use runtime::Runtime;
 
 mod bootstrap;
@@ -13,6 +14,7 @@ pub mod discovery;
 mod error;
 mod host_functions;
 mod hostcall;
+pub mod keyring;
 mod mailbox;
 mod module_probe;
 mod network;

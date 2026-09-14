@@ -14,23 +14,30 @@ categories.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "help", "std"] }
 parking_lot.workspace = true
+rcgen = { workspace = true, features = ["crypto", "pem", "ring", "x509-parser"] }
+rustls-pki-types.workspace = true
 selium-abi.workspace = true
-selium-service.workspace = true
 selium-kernel.workspace = true
 selium-memory.workspace = true
+selium-service.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 wasmtiny.workspace = true
 
 [dev-dependencies]
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-ring"] }
+rcgen.workspace = true
 selium-client.workspace = true
-selium-service.workspace = true
+selium-identity = { path = "../../guests/identity" }
+selium-identity-onboard = { path = "../../guests/identity-onboard" }
 selium-proto-dns.workspace = true
+selium-service.workspace = true
 wat.workspace = true
+x509-parser.workspace = true
 
 [features]
 # Forwards the Stage 2 (per-OS wait-words) opt-in to the kernel, which in

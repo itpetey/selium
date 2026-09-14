@@ -39,7 +39,13 @@ impl Runtime {
             let (feed_region_id, listener_shared_id) = self.setup_discovery()?;
             (Some(feed_region_id), Some(listener_shared_id))
         } else {
-            (None, None)
+            // A bootstrap call against a runtime whose discovery service is
+            // already running (e.g. a follow-up spawn of additional system
+            // guests) still wires the discovery handle into the new guests.
+            (
+                self.discovery_feed_region_id(),
+                self.discovery_listener_shared_id(),
+            )
         };
 
         if let Some(listener_shared_id) = discovery_listener_shared_id {
@@ -256,10 +262,29 @@ impl Runtime {
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
             Ok(loaded_guest) => {
                 if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {
+                    // The guest's own error reporting is its log channel
+                    // (`run_entrypoint_with_result` logs the failing future's
+                    // error there); surface it in the activity log so a
+                    // bootstrap failure is diagnosable without a debugger.
+                    let guest_logs = self
+                        .kernel
+                        .processes()
+                        .drain_log_channel(process.local_id)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|frame| {
+                            selium_service::FlatMsg::decode(frame)
+                                .ok()
+                                .map(|record: selium_service::log::LogRecord| record.message)
+                        })
+                        .collect::<Vec<_>>();
                     self.kernel.processes().record_activity(ActivityEvent {
                         kind: selium_abi::ActivityKind::ProcessExited,
                         process_id: Some(process.local_id),
-                        message: format!("guest {} entrypoint returned error", descriptor.name),
+                        message: format!(
+                            "guest {} entrypoint returned error; guest logs: {guest_logs:?}",
+                            descriptor.name
+                        ),
                     });
                     self.cleanup_failed_process(process.local_id)?;
                     return Err(Error::EntrypointFailed(descriptor.name.clone()));

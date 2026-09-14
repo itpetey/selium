@@ -34,6 +34,13 @@ pub mod selium {
     mod discovery_response_generated;
     pub use self::discovery_response_generated::*;
   }
+  pub mod identity {
+    use super::*;
+    mod identity_request_generated;
+    pub use self::identity_request_generated::*;
+    mod identity_response_generated;
+    pub use self::identity_response_generated::*;
+  }
   pub mod live_table {
     use super::*;
     mod live_table_message_generated;

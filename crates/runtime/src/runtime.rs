@@ -11,8 +11,12 @@ use selium_shm::transport::ShmTransport;
 use selium_wire::pubsub::Publisher;
 
 use crate::{
-    bootstrap::LoadedGuest, config::ProcessAuthority, error::Result, hostcall::HostOperation,
-    mailbox::GuestMailbox, region_provider::RuntimeRegionProvider,
+    bootstrap::LoadedGuest,
+    config::ProcessAuthority,
+    error::{Error, Result},
+    hostcall::HostOperation,
+    mailbox::GuestMailbox,
+    region_provider::RuntimeRegionProvider,
 };
 
 /// Publisher for the runtime→discovery pub/sub feed.
@@ -124,6 +128,10 @@ pub struct Runtime {
     /// `tokio::spawn` would panic for lack of a thread-local reactor; the
     /// first handle observed on a Tokio thread is reused for those.
     pub(crate) timer_handle: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
+    /// Host-held PKI keyring backing the certificate-signing hostcalls.
+    /// Initialised at startup (see [`Runtime::initialize_keyring`]); the
+    /// signing hostcalls fail loudly while it is absent.
+    pub(crate) keyring: Arc<Mutex<Option<crate::keyring::Keyring>>>,
 }
 
 impl Runtime {
@@ -166,6 +174,7 @@ impl Runtime {
             handler_schemes: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
             timer_handle: Arc::new(std::sync::OnceLock::new()),
+            keyring: Arc::new(Mutex::new(None)),
         };
 
         // Initialise the mio network poller if possible (best-effort).
@@ -198,6 +207,30 @@ impl Runtime {
     /// Returns the shared id of the discovery RPC listener, if discovery was started.
     pub fn discovery_listener_shared_id(&self) -> Option<u64> {
         *self.discovery_listener_shared_id.lock()
+    }
+
+    /// Initialises the host PKI keyring from bootstrap material, failing
+    /// loudly when the intermediate is missing or invalid. Identity depends
+    /// on this at startup: a host that cannot sign tenant CAs must not
+    /// bootstrap the mint authority.
+    pub fn initialize_keyring(&self, bootstrap: crate::keyring::KeyringBootstrap) -> Result<()> {
+        let keyring = crate::keyring::Keyring::initialize(
+            Box::new(crate::keyring::InMemoryCaStore::default()),
+            bootstrap,
+        )
+        .map_err(|error| Error::Host(error.to_string()))?;
+        *self.keyring.lock() = Some(keyring);
+        Ok(())
+    }
+
+    /// Generates a fresh root + intermediate hierarchy and installs it as the
+    /// host keyring. The offline root is retained for operator bootstrap and
+    /// never referenced by a hostcall.
+    pub fn generate_keyring(&self) -> Result<()> {
+        let keyring =
+            crate::keyring::Keyring::generate().map_err(|error| Error::Host(error.to_string()))?;
+        *self.keyring.lock() = Some(keyring);
+        Ok(())
     }
 
     /// Records a route registration for `process_id`, as reported by the

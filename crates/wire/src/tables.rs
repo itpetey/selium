@@ -392,9 +392,119 @@ where
         .collect()
 }
 
+/// A read-only, materialised view of a live table projected from its pub/sub
+/// subscriber.
+///
+/// Consumers that never write (e.g. the connector's anchor table or the
+/// bridge's grant table, both published by the identity guest) attach only a
+/// subscriber and project the stream into a local map. Write-side operations
+/// are not available; the single writer is the publishing guest.
+pub struct LiveTableView<K, V, M> {
+    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>, M>>,
+    local: RefCell<HashMap<K, LiveTableRecord<V>>>,
+}
+
+impl<K, V, M> LiveTableView<K, V, M>
+where
+    K: FlatMsg + Clone + Eq + Hash,
+    V: FlatMsg + Clone,
+    M: MessageTransport,
+{
+    /// Creates a read-only view from a subscriber, draining any already-
+    /// buffered mutations into the local view.
+    pub fn new(subscriber: Subscriber<LiveTableMessage<K, V>, M>) -> Result<Self> {
+        let view = Self {
+            subscriber: RefCell::new(subscriber),
+            local: RefCell::new(HashMap::new()),
+        };
+        view.sync()?;
+        Ok(view)
+    }
+
+    /// Returns the value for a key from the local materialised view.
+    pub fn get(&self, key: &K) -> Result<Option<V>>
+    where
+        K: Eq + Hash,
+    {
+        Ok(self
+            .local
+            .borrow()
+            .get(key)
+            .and_then(|record| record.value.clone()))
+    }
+
+    /// Returns the record for a key, including its version.
+    pub fn get_record(&self, key: &K) -> Result<Option<LiveTableRecord<V>>>
+    where
+        K: Eq + Hash,
+    {
+        Ok(self.local.borrow().get(key).cloned())
+    }
+
+    /// Returns up to `limit` records from the local materialised view.
+    pub fn scan(&self, limit: usize) -> Result<Vec<(K, LiveTableRecord<V>)>>
+    where
+        K: Clone + Eq + Hash,
+    {
+        Ok(scan_entries(&self.local.borrow(), limit))
+    }
+
+    /// Drains the subscriber to pick up remote writes.
+    pub fn sync(&self) -> Result<()> {
+        let mut subscriber = self.subscriber.borrow_mut();
+        let mut local = self.local.borrow_mut();
+        loop {
+            match subscriber.read_with_tag() {
+                Ok((msg, _writer_id)) => {
+                    apply_message_to(&mut local, msg);
+                }
+                Err(Error::BufferEmpty) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Drains the subscriber, then awaits the next remote write.
+    pub async fn sync_async(&self) -> Result<()> {
+        self.sync()?;
+        std::future::poll_fn(|cx| self.poll_next_message(cx)).await
+    }
+
+    /// Applies the next remote mutation, parking on the caller's waker.
+    fn poll_next_message(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        let mut subscriber = self.subscriber.borrow_mut();
+        match subscriber.read_with_tag() {
+            Ok((msg, _writer_id)) => {
+                drop(subscriber);
+                apply_message_to(&mut self.local.borrow_mut(), msg);
+                std::task::Poll::Ready(Ok(()))
+            }
+            Err(Error::BufferEmpty) => match subscriber.reader_mut().poll_frame(cx) {
+                std::task::Poll::Ready(Ok((payload, _tag, _flags))) => {
+                    drop(subscriber);
+                    let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                                format!("{e}"),
+                            )));
+                        }
+                    };
+                    apply_message_to(&mut self.local.borrow_mut(), msg);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FramedRead, FramedWrite};
 
     #[test]
     fn apply_message_versions_records() {
@@ -544,5 +654,179 @@ mod tests {
 
         let live = scan_entries(&local, 2);
         assert_eq!(live.len(), 2);
+    }
+
+    /// In-memory duplex transport for the live-table view tests: the
+    /// publisher's writes land directly in the subscriber's read stream, no
+    /// shared-memory ring required.
+    struct TestTransport(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncRead for TestTransport {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for TestTransport {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl MessageTransport for TestTransport {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<bool>> {
+            // Let the actual read surface emptiness as BufferEmpty.
+            std::task::Poll::Ready(Ok(true))
+        }
+
+        fn poll_peer_closed(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<bool>> {
+            std::task::Poll::Ready(Ok(false))
+        }
+
+        fn generation(&self) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// The publisher and subscriber halves over the test duplex transport.
+    type TestPublisher = Publisher<LiveTableMessage<String, u64>, TestTransport>;
+    type TestSubscriber = Subscriber<LiveTableMessage<String, u64>, TestTransport>;
+
+    /// Builds a publisher writing into one duplex half and a subscriber
+    /// reading from the other, mirroring a publishing guest and a consumer
+    /// attached to its live table.
+    fn table_ends() -> (TestPublisher, TestSubscriber) {
+        let (writer, reader) = tokio::io::duplex(8 * 1024);
+        (
+            Publisher::new(FramedWrite::new(TestTransport(writer))),
+            Subscriber::new(FramedRead::new(TestTransport(reader)), None),
+        )
+    }
+
+    fn publish(
+        publisher: &mut TestPublisher,
+        mutation_id: u64,
+        key: &str,
+        value: Option<u64>,
+        expected_version: Option<u64>,
+    ) {
+        publisher
+            .publish(&LiveTableMessage {
+                mutation_id,
+                key: key.to_string(),
+                value,
+                expected_version,
+            })
+            .expect("publish");
+    }
+
+    #[test]
+    fn view_materialises_already_published_state() {
+        // A consumer attaching after the publisher has already written (e.g.
+        // the connector attaching to an identity table that carries
+        // replayed anchors) materialises the full stream from position 0.
+        let (mut publisher, subscriber) = table_ends();
+        publish(&mut publisher, 1, "client-ca-acme", Some(1), None);
+        publish(&mut publisher, 2, "client-ca-beta", Some(2), None);
+        publish(&mut publisher, 3, "client-ca-acme", None, None);
+
+        let view = LiveTableView::new(subscriber).expect("view");
+        assert_eq!(view.get(&"client-ca-acme".to_string()), Ok(None));
+        assert_eq!(
+            view.get(&"client-ca-beta".to_string()),
+            Ok(Some(2u64)),
+            "the tombstoned key is absent, the live key visible"
+        );
+        let scan = view.scan(usize::MAX).expect("scan");
+        assert_eq!(scan.len(), 1, "only live records are scanned");
+    }
+
+    #[test]
+    fn view_sync_picks_up_remote_writes() {
+        let (mut publisher, subscriber) = table_ends();
+        let view = LiveTableView::new(subscriber).expect("view");
+
+        // Nothing published yet: every key misses.
+        assert_eq!(view.get(&"client-ca-acme".to_string()), Ok(None));
+
+        publish(&mut publisher, 1, "client-ca-acme", Some(7), None);
+        view.sync().expect("sync");
+        assert_eq!(
+            view.get(&"client-ca-acme".to_string()),
+            Ok(Some(7u64)),
+            "a later remote write is visible after sync"
+        );
+        assert_eq!(
+            view.get_record(&"client-ca-acme".to_string())
+                .expect("record")
+                .map(|record| record.version),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn view_applies_cas_and_rejects_stale_updates() {
+        let (mut publisher, subscriber) = table_ends();
+        let view = LiveTableView::new(subscriber).expect("view");
+
+        publish(&mut publisher, 1, "alpha", Some(10), None);
+        publish(&mut publisher, 2, "alpha", Some(20), Some(1));
+        publish(&mut publisher, 3, "alpha", Some(30), Some(1));
+        view.sync().expect("sync");
+
+        assert_eq!(
+            view.get(&"alpha".to_string()),
+            Ok(Some(20u64)),
+            "the CAS-matching write applied; the stale one was rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_sync_async_parks_until_the_next_remote_write() {
+        let (publisher, subscriber) = table_ends();
+        let view = LiveTableView::new(subscriber).expect("view");
+
+        // Park the view on the (empty) stream, then publish from the other
+        // side: the parked view wakes and materialises the write.
+        let publisher = std::sync::Arc::new(tokio::sync::Mutex::new(publisher));
+        let writer = publisher.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let mut publisher = writer.lock().await;
+            publish(&mut publisher, 1, "client-ca-acme", Some(1), None);
+        });
+
+        view.sync_async().await.expect("sync_async");
+        assert_eq!(view.get(&"client-ca-acme".to_string()), Ok(Some(1u64)));
     }
 }

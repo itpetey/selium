@@ -624,15 +624,30 @@ async fn handler(
                             DiscoveryRequest::Resolve(uri) => {
                                 match store.resolve_exact(&uri, caller_tenant.as_deref()) {
                                     Some(target) => {
-                                        // Record the resolved queue id with the runtime so
-                                        // the resolving client gains an authorisation basis
-                                        // for cross-process `HostQueueAttach`.
+                                        // Record the resolved id with the runtime so
+                                        // the resolving client gains an authorisation
+                                        // basis for cross-process `HostQueueAttach`.
                                         if let Err(error) = selium_guest::record_resolved_queue_for(
                                             client_process_id,
                                             target.resource_id,
                                         ) {
                                             selium_guest::warn!(
                                                 "resolve authorisation record failed: {error}"
+                                            );
+                                        }
+                                        // A resolved shared region also gains an
+                                        // authorisation basis for `AttachRegion`, the
+                                        // path live-table consumers (connector, bridge)
+                                        // use to attach the identity guest's tables.
+                                        if target.class == selium_abi::ResourceClass::SharedRegion
+                                            && let Err(error) =
+                                                selium_guest::record_resolved_region_for(
+                                                    client_process_id,
+                                                    target.resource_id,
+                                                )
+                                        {
+                                            selium_guest::warn!(
+                                                "resolve region authorisation record failed: {error}"
                                             );
                                         }
                                         DiscoveryResponse::Found(target)

@@ -478,6 +478,109 @@ pub enum SchedulerResponse {
     },
 }
 
+/// Request sent to the identity service.
+///
+/// The identity guest serves the platform's sole mint authority. The two
+/// tiers — operator (tenant create/rotate/revoke) and tenant (issue that
+/// tenant's user certificates, manage its principals) — are distinguished by
+/// the identity guest from the caller's process tenant, never by a field in
+/// this message. Non-ABI payloads are byte vectors: `spki_der` is a DER
+/// SubjectPublicKeyInfo, `fingerprint` is the 32-byte SHA-256 leaf SPKI
+/// fingerprint, and `grants` is a rkyv-encoded baseline grant set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/identity.fbs",
+    ty = "selium.identity.IdentityRequest",
+    binding = "selium_service::fbs::selium::identity::IdentityRequest"
+)]
+pub enum IdentityRequest {
+    /// Onboard a tenant: mint its CA and publish its trust anchor.
+    MintTenantCa {
+        /// Tenant whose CA is minted.
+        tenant: String,
+    },
+    /// Rotate a tenant's CA: mint a successor and republish the anchor.
+    RotateTenantCa {
+        /// Tenant whose CA is rotated.
+        tenant: String,
+    },
+    /// Revoke a tenant: remove its anchor and delete its CA key.
+    RevokeTenant {
+        /// Tenant whose CA is revoked.
+        tenant: String,
+    },
+    /// Issue a short-TTL user leaf certificate from a client SPKI.
+    IssueUserCert {
+        /// Tenant whose CA signs the leaf.
+        tenant: String,
+        /// DER-encoded SubjectPublicKeyInfo of the client leaf key.
+        spki_der: Vec<u8>,
+    },
+    /// Record the baseline grant set for a principal's fingerprint.
+    SetPrincipalGrants {
+        /// Tenant the principal belongs to.
+        tenant: String,
+        /// SHA-256 fingerprint of the principal's leaf SPKI.
+        fingerprint: Vec<u8>,
+        /// rkyv-encoded baseline grant set.
+        grants: Vec<u8>,
+    },
+    /// Remove a principal's baseline grants.
+    RemovePrincipal {
+        /// Tenant the principal belongs to.
+        tenant: String,
+        /// SHA-256 fingerprint of the principal's leaf SPKI.
+        fingerprint: Vec<u8>,
+    },
+}
+
+/// Response from the identity service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/identity.fbs",
+    ty = "selium.identity.IdentityResponse",
+    binding = "selium_service::fbs::selium::identity::IdentityResponse"
+)]
+pub enum IdentityResponse {
+    /// A tenant CA was minted and its anchor published.
+    TenantRecorded {
+        /// The recorded tenant.
+        tenant: String,
+    },
+    /// A tenant CA was rotated and its anchor republished.
+    Rotated {
+        /// The rotated tenant.
+        tenant: String,
+    },
+    /// A tenant CA was revoked.
+    Revoked {
+        /// The revoked tenant.
+        tenant: String,
+    },
+    /// A user leaf certificate was issued.
+    UserCertIssued {
+        /// DER-encoded leaf certificate.
+        certificate_der: Vec<u8>,
+    },
+    /// A principal's baseline grants were recorded.
+    PrincipalRecorded {
+        /// The recorded principal's fingerprint.
+        fingerprint: Vec<u8>,
+    },
+    /// A principal's baseline grants were removed.
+    PrincipalRemoved {
+        /// The removed principal's fingerprint.
+        fingerprint: Vec<u8>,
+    },
+    /// A typed failure naming the failed step and its context.
+    Error {
+        /// Step that failed.
+        step: String,
+        /// Context describing the failure.
+        context: String,
+    },
+}
+
 /// Typed per-stream control frames shared between the external client and the
 /// bridge channel.
 ///
@@ -1089,6 +1192,96 @@ mod tests {
         builder.finish(root, None);
         let bytes = builder.finished_data().to_vec();
         let result: ::std::result::Result<PipeControl, InvalidFlatbuffer> = FlatMsg::decode(&bytes);
+        assert!(result.is_err(), "unknown variant tag must fail decode");
+    }
+
+    #[test]
+    fn identity_request_mint_tenant_ca_round_trips() {
+        let request = IdentityRequest::MintTenantCa {
+            tenant: "acme".to_string(),
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: IdentityRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn identity_request_issue_user_cert_round_trips() {
+        let request = IdentityRequest::IssueUserCert {
+            tenant: "acme".to_string(),
+            spki_der: vec![0x30, 0x82, 0x01, 0x02],
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: IdentityRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn identity_request_set_principal_grants_round_trips() {
+        let request = IdentityRequest::SetPrincipalGrants {
+            tenant: "acme".to_string(),
+            fingerprint: vec![0xAB; 32],
+            grants: vec![0x01, 0x02, 0x03],
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: IdentityRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn identity_request_remove_principal_round_trips() {
+        let request = IdentityRequest::RemovePrincipal {
+            tenant: "acme".to_string(),
+            fingerprint: vec![0xCD; 32],
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: IdentityRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn identity_response_round_trips() {
+        for response in [
+            IdentityResponse::TenantRecorded {
+                tenant: "acme".to_string(),
+            },
+            IdentityResponse::Revoked {
+                tenant: "acme".to_string(),
+            },
+            IdentityResponse::UserCertIssued {
+                certificate_der: vec![0x30, 0x82, 0x01, 0x00],
+            },
+            IdentityResponse::PrincipalRecorded {
+                fingerprint: vec![0xEF; 32],
+            },
+            IdentityResponse::Error {
+                step: "mint".to_string(),
+                context: "tenant CA not found".to_string(),
+            },
+        ] {
+            let bytes = FlatMsg::encode(&response);
+            let decoded: IdentityResponse = FlatMsg::decode(&bytes).expect("decode");
+            assert_eq!(decoded, response);
+        }
+    }
+
+    /// Strict decode: an unknown identity request variant tag is a decode
+    /// error, not a silently reinterpreted default variant.
+    #[test]
+    fn unknown_identity_request_variant_is_decode_error() {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let args = crate::fbs::selium::identity::IdentityRequestArgs {
+            variant: 77,
+            tenant: None,
+            spki_der: None,
+            fingerprint: None,
+            grants: None,
+        };
+        let root = crate::fbs::selium::identity::IdentityRequest::create(&mut builder, &args);
+        builder.finish(root, None);
+        let bytes = builder.finished_data().to_vec();
+        let result: ::std::result::Result<IdentityRequest, InvalidFlatbuffer> =
+            FlatMsg::decode(&bytes);
         assert!(result.is_err(), "unknown variant tag must fail decode");
     }
 

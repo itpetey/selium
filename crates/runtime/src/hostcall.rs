@@ -1110,6 +1110,74 @@ impl Runtime {
                 }
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
+            HostcallRequest::RecordResolvedRegionFor {
+                client_process_id,
+                shared_id,
+            } => {
+                // Only the discovery system guest may report a region resolve:
+                // a guest self-approving its own region attach would defeat
+                // `AttachRegion` authorisation.
+                let discovery = *self.discovery_process.lock();
+                if discovery != Some(process_id) {
+                    return Err(AbiError::new(
+                        AbiErrorCode::PermissionDenied,
+                        format!(
+                            "RecordResolvedRegionFor denied for process {process_id}: only the discovery service may record resolved regions",
+                        ),
+                    ));
+                }
+                let mut authorities = self.process_authorities.lock();
+                if let Some(auth) = authorities.get_mut(&client_process_id) {
+                    auth.resolved_region_ids.insert(shared_id);
+                }
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::SignTenantCa { tenant } => {
+                self.require_capability(process_id, Capability::MintCertificate)?;
+                let mut keyring = self.keyring.lock();
+                let keyring = keyring.as_mut().ok_or_else(|| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        "certificate signing keyring is not initialized",
+                    )
+                })?;
+                let cert_der = keyring
+                    .sign_tenant_ca(&tenant)
+                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                Ok(HostOperationState::Ready(HostcallOutput::Certificate(
+                    cert_der,
+                )))
+            }
+            HostcallRequest::SignUserCert { tenant, spki_der } => {
+                self.require_capability(process_id, Capability::MintCertificate)?;
+                let keyring = self.keyring.lock();
+                let keyring = keyring.as_ref().ok_or_else(|| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        "certificate signing keyring is not initialized",
+                    )
+                })?;
+                let cert_der = keyring
+                    .sign_user_cert(&tenant, &spki_der)
+                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                Ok(HostOperationState::Ready(HostcallOutput::Certificate(
+                    cert_der,
+                )))
+            }
+            HostcallRequest::RevokeCa { tenant } => {
+                self.require_capability(process_id, Capability::MintCertificate)?;
+                let mut keyring = self.keyring.lock();
+                let keyring = keyring.as_mut().ok_or_else(|| {
+                    AbiError::new(
+                        AbiErrorCode::Internal,
+                        "certificate signing keyring is not initialized",
+                    )
+                })?;
+                keyring
+                    .revoke_ca(&tenant)
+                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
             HostcallRequest::RecordRegistration {
                 process_id: registered_process,
                 uri,
@@ -1519,6 +1587,18 @@ impl Runtime {
             return Ok(());
         }
 
+        // Discovery resolve basis: a process that resolved this region via
+        // discovery gained an authorisation basis for attach (mirrors the
+        // queue resolve basis used by `HostQueueAttach`).
+        let was_resolved = self
+            .process_authorities
+            .lock()
+            .get(&process_id)
+            .is_some_and(|auth| auth.resolved_region_ids.contains(&region_id));
+        if was_resolved {
+            return Ok(());
+        }
+
         Err(AbiError::new(
             AbiErrorCode::PermissionDenied,
             format!(
@@ -1606,6 +1686,20 @@ impl Runtime {
             return Err(AbiError::new(
                 AbiErrorCode::PermissionDenied,
                 "DelegateGrants cannot be delegated to child processes",
+            ));
+        }
+
+        // `MintCertificate` mirrors `DelegateGrants`: it is bootstrap-
+        // provisioned only. A spawn that confers it on a child is denied even
+        // when the parent itself holds the capability, so mint authority can
+        // never be reproduced outside the identity guest.
+        if grants
+            .iter()
+            .any(|grant| grant.capability == Capability::MintCertificate)
+        {
+            return Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                "MintCertificate cannot be delegated to child processes",
             ));
         }
 
@@ -2608,6 +2702,297 @@ mod tests {
         assert!(matches!(
             runtime.poll_hostcall(parent.process_id, op),
             CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn mint_certificate_is_bootstrap_provisionable() {
+        let runtime = Runtime::default();
+
+        // Bootstrap provisioning admits the capability: a system guest holding
+        // `MintCertificate` starts normally and carries the grant in its
+        // persisted authority.
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::MintCertificate,
+                Vec::new(),
+            )],
+        );
+
+        assert!(
+            runtime
+                .restore_process_authority(bootstrapped.process_id)
+                .is_some_and(|authority| authority
+                    .grants
+                    .iter()
+                    .any(|grant| grant.capability == Capability::MintCertificate))
+        );
+    }
+
+    #[test]
+    fn mint_certificate_cannot_be_conferred_on_children() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        // A parent holding `MintCertificate` (bootstrap-provisioned) and
+        // `ProcessLifecycle` cannot confer mint authority on a child: the
+        // spawn is denied with a capability error, mirroring `DelegateGrants`.
+        let parent = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(Capability::MintCertificate, Vec::new()),
+            ],
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::MintCertificate,
+                    Vec::new(),
+                )],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "MintCertificate must never be conferred on a child process"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn signing_hostcalls_deny_without_mint_certificate() {
+        let runtime = Runtime::default();
+        runtime.generate_keyring().expect("generate keyring");
+
+        // A guest holding no `MintCertificate` grant is denied every signing
+        // hostcall with a capability error.
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+
+        for request in [
+            HostcallRequest::SignTenantCa {
+                tenant: "acme".to_string(),
+            },
+            HostcallRequest::SignUserCert {
+                tenant: "acme".to_string(),
+                spki_der: vec![0x30, 0x01],
+            },
+            HostcallRequest::RevokeCa {
+                tenant: "acme".to_string(),
+            },
+        ] {
+            let (status, op) = runtime.begin_hostcall(guest.process_id, request);
+            assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+            assert!(matches!(
+                runtime.poll_hostcall(guest.process_id, op),
+                CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+            ));
+        }
+    }
+
+    #[test]
+    fn signing_hostcalls_return_certificates_only() {
+        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
+
+        let runtime = Runtime::default();
+        runtime.generate_keyring().expect("generate keyring");
+
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::MintCertificate,
+                Vec::new(),
+            )],
+        );
+
+        // SignTenantCa returns a DER tenant CA certificate (no key material).
+        let (_, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::SignTenantCa {
+                tenant: "acme".to_string(),
+            },
+        );
+        let HostcallOutput::Certificate(tl_ca_der) = ready(&runtime, guest.process_id, op) else {
+            panic!("SignTenantCa must return a certificate");
+        };
+        assert!(!tl_ca_der.is_empty());
+
+        // SignUserCert signs a client SPKI, returning a DER leaf.
+        let client_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("client key");
+        let spki = client_key.subject_public_key_info();
+        let (_, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::SignUserCert {
+                tenant: "acme".to_string(),
+                spki_der: spki,
+            },
+        );
+        let HostcallOutput::Certificate(leaf_der) = ready(&runtime, guest.process_id, op) else {
+            panic!("SignUserCert must return a certificate");
+        };
+        assert!(!leaf_der.is_empty());
+
+        // RevokeCa returns empty, and a second revoke fails (key already gone).
+        let (_, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::RevokeCa {
+                tenant: "acme".to_string(),
+            },
+        );
+        assert_eq!(ready(&runtime, guest.process_id, op), HostcallOutput::Empty);
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::RevokeCa {
+                tenant: "acme".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        assert!(matches!(
+            runtime.poll_hostcall(guest.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::Internal
+        ));
+    }
+
+    #[test]
+    fn signing_hostcalls_fail_without_keyring() {
+        let runtime = Runtime::default();
+        // No keyring installed: the signing hostcall fails with an internal
+        // error instead of silently returning a fabricated certificate.
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::MintCertificate,
+                Vec::new(),
+            )],
+        );
+        let (status, op) = runtime.begin_hostcall(
+            guest.process_id,
+            HostcallRequest::SignTenantCa {
+                tenant: "acme".to_string(),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        assert!(matches!(
+            runtime.poll_hostcall(guest.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::Internal
+        ));
+    }
+
+    #[test]
+    fn record_resolved_region_grants_attach_authority() {
+        let runtime = Runtime::default();
+
+        let owner = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+        // The consumer needs a memory-declaring module so the final
+        // `AttachRegion` maps the region into its linear memory.
+        let consumer = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "consumer".to_string(),
+                module_id: "consumer-module".to_string(),
+                module_bytes: wat::parse_str(r#"(module (memory 1) (func (export "boot")))"#)
+                    .expect("compile consumer module"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn consumer");
+
+        let (_, alloc_op) = runtime.begin_hostcall(
+            owner.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        let HostcallOutput::RegionAlloc(alloc) = ready(&runtime, owner.process_id, alloc_op) else {
+            panic!("expected region allocation");
+        };
+
+        // A peer that neither owns nor resolved the region is denied at attach.
+        let (status, _) = runtime.begin_hostcall(
+            consumer.process_id,
+            HostcallRequest::AttachRegion {
+                region_id: alloc.region_id,
+                reader_slot: None,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        // A non-discovery process cannot mint the resolve basis for itself.
+        let (status, _) = runtime.begin_hostcall(
+            consumer.process_id,
+            HostcallRequest::RecordResolvedRegionFor {
+                client_process_id: consumer.process_id,
+                shared_id: alloc.region_id,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+        // The discovery system guest records the resolve basis on the
+        // consumer's behalf, after which attach is authorised.
+        let discovery =
+            spawn_with_grants_and_tenant(&runtime, "discovery", vec![], None).process_id;
+        let (status, _) = runtime.begin_hostcall(
+            discovery,
+            HostcallRequest::RecordResolvedRegionFor {
+                client_process_id: consumer.process_id,
+                shared_id: alloc.region_id,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let (status, op) = runtime.begin_hostcall(
+            consumer.process_id,
+            HostcallRequest::AttachRegion {
+                region_id: alloc.region_id,
+                reader_slot: None,
+                prot: selium_abi::RegionProt::ReadWrite,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(consumer.process_id, op),
+            CompletionState::Ready(HostcallOutput::RegionAttach(_))
         ));
     }
 

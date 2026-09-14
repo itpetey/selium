@@ -9,9 +9,9 @@
 //!   (`sel://<tenant>/bridge`) with discovery via `Context::serve`, deriving
 //!   both the internal path and the wire names (`bridge.<tenant>`,
 //!   `bridge.<owned-domain>`) from that one declaration;
-//! - resolves the handoff's identity to a grant set via an interim identity
-//!   source (a [`IdentityGrantMap`] here; the identity guest's RPC surface is
-//!   deferred as a design open question);
+//! - resolves the handoff's identity to a grant set from the identity guest's
+//!   published grant table (a `fingerprint -> baseline grants` live table read
+//!   via [`GrantTable`]), replacing the interim `IdentityGrantMap` stub;
 //! - spawns one `bridge-channel <shared_id, grants>` per stream, conferring the
 //!   client's grants plus an `ExplicitResource` for the handed-off region via
 //!   the `DelegateGrants` capability;
@@ -34,21 +34,26 @@ use selium_guest::{
     net::ByteStream, warn,
 };
 use selium_service::ResourceTarget;
+use selium_shm::Channel;
+use selium_shm::transport::ShmTransport;
+use selium_wire::LiveTableView;
+use selium_wire::framed::FramedRead;
+use selium_wire::pubsub::Subscriber;
 
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 /// The `bridge-channel` module id and entrypoint this server spawns.
 const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
 /// Per-identity spawn bound (open question: exact concurrency/rate policy).
 const DEFAULT_SPAWN_BOUND_PER_IDENTITY: usize = 256;
+/// The identity guest's published grant table route.
+const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
 
-/// Interrim identity source: maps a client key fingerprint to its grants. The
-/// deployed identity guest's RPC surface replaces this stub.
-///
-/// The stub recognises a single documented client (the bridge test client)
-/// and grants it the tenant's default data-plane capability set.
-#[derive(Default)]
-pub struct IdentityGrantMap {
-    by_fingerprint: HashMap<[u8; 32], Vec<CapabilityGrant>>,
+/// The identity-published grant table: a `fingerprint -> baseline grants` live
+/// table read at handoff conferral. Replaces the interim `IdentityGrantMap`
+/// stub. Until the table is attached (`Some`), every fingerprint is unknown and
+/// the bridge refuses the handoff — fail-closed, never conferring on absence.
+pub struct GrantTable {
+    table: Option<LiveTableView<Vec<u8>, Vec<u8>, ShmTransport>>,
 }
 
 /// Tracks per-identity spawn totals to bound stream-mint amplification.
@@ -57,28 +62,44 @@ pub struct SpawnBudget {
     per_identity: HashMap<[u8; 32], usize>,
 }
 
-impl IdentityGrantMap {
-    /// Inserts the grant set for a client fingerprint.
-    pub fn insert(&mut self, fingerprint: [u8; 32], grants: Vec<CapabilityGrant>) {
-        self.by_fingerprint.insert(fingerprint, grants);
+impl GrantTable {
+    /// Builds an empty (unattached) grant table: every lookup misses.
+    pub fn empty() -> Self {
+        Self { table: None }
     }
 
-    /// Returns the grants for a fingerprint, if the identity is known.
-    pub fn grants_for(&self, fingerprint: &[u8; 32]) -> Option<&[CapabilityGrant]> {
-        self.by_fingerprint.get(fingerprint).map(Vec::as_slice)
+    /// Attaches to the identity guest's published grant table route.
+    pub async fn attach(ctx: &mut Context) -> anyhow::Result<Self> {
+        let target = ctx
+            .lookup(GRANT_TABLE_ROUTE)
+            .await
+            .with_context(|| "bridge-server: identity grant table resolve failed")?
+            .ok_or_else(|| anyhow::anyhow!("identity grant table route not found"))?;
+        let channel = Channel::attach(target.resource_id)
+            .map_err(|e| anyhow::anyhow!("grant table region attach failed: {e}"))?;
+        // Replay from the ring start: grants may predate this attachment.
+        let transport = ShmTransport::new_replay(&channel, &channel)
+            .map_err(|e| anyhow::anyhow!("grant table transport failed: {e}"))?;
+        let subscriber = Subscriber::new(FramedRead::new(transport), None);
+        let table = LiveTableView::new(subscriber)
+            .map_err(|e| anyhow::anyhow!("grant table view construction failed: {e}"))?;
+        Ok(Self { table: Some(table) })
     }
 
-    /// Builds the interim stub identity source.
-    pub fn stub() -> Self {
-        let mut map = Self::default();
-        // SHA-256 of the SPKI of `guests/connector-quic/tests/fixtures/client_cert.pem`.
-        let stub_fingerprint: [u8; 32] = [
-            0x8b, 0x09, 0x39, 0x2b, 0x5d, 0xa0, 0x86, 0x8e, 0xd8, 0x35, 0xc8, 0x26, 0x93, 0x07,
-            0x77, 0x28, 0xb4, 0x60, 0x74, 0x2c, 0x17, 0x42, 0x9d, 0x66, 0xb4, 0xf5, 0x31, 0x04,
-            0xf2, 0x9c, 0x04, 0x67,
-        ];
-        map.insert(stub_fingerprint, tenant_acme_client_grants());
-        map
+    /// Drains any pending mutations into the local view. Best-effort.
+    pub fn sync(&mut self) {
+        if let Some(table) = &self.table
+            && let Err(e) = table.sync()
+        {
+            warn!("bridge-server: grant table sync failed: {e}");
+        }
+    }
+
+    /// Returns the baseline grants for a fingerprint, if known.
+    pub fn grants_for(&self, fingerprint: &[u8; 32]) -> Option<Vec<CapabilityGrant>> {
+        let table = self.table.as_ref()?;
+        let bytes = table.get(&fingerprint.to_vec()).ok().flatten()?;
+        selium_abi::decode_rkyv::<Vec<CapabilityGrant>>(&bytes).ok()
     }
 }
 
@@ -222,11 +243,19 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
     .await
     .with_context(|| "bridge-server: serve failed")?;
 
-    let identity_source = IdentityGrantMap::stub();
+    let mut grant_table = match GrantTable::attach(&mut ctx).await {
+        Ok(table) => table,
+        Err(error) => {
+            warn!("bridge-server: identity grant table unavailable: {error}");
+            GrantTable::empty()
+        }
+    };
     let mut budget = SpawnBudget::default();
     mark_ready();
 
     loop {
+        grant_table.sync();
+
         let incoming = match listener.recv().await {
             Ok(incoming) => incoming,
             Err(e) => {
@@ -255,10 +284,7 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             continue;
         }
 
-        let Some(grants) = identity_source
-            .grants_for(&identity.fingerprint)
-            .map(<[CapabilityGrant]>::to_vec)
-        else {
+        let Some(grants) = grant_table.grants_for(&identity.fingerprint) else {
             warn!(
                 tenant = %identity.tenant,
                 "bridge-server: refusing unknown client identity"
@@ -304,6 +330,7 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
 /// The stub client's data-plane grants: tenant-scoped shared memory, host
 /// queues, and network streams. A real identity source provisions these from
 /// policy rather than a fixed table.
+#[cfg(test)]
 fn tenant_acme_client_grants() -> Vec<CapabilityGrant> {
     vec![
         CapabilityGrant::new(
@@ -338,13 +365,24 @@ mod tests {
         tenant_acme_client_grants()
     }
 
+    /// The grant table decodes a published grant set from its rkyv-encoded
+    /// value; an empty table reports every fingerprint as unknown (the bridge
+    /// refuses the handoff rather than conferring on absence).
     #[test]
-    fn identity_map_returns_known_grants() {
-        let mut map = IdentityGrantMap::default();
-        let fp = [7u8; 32];
-        map.insert(fp, grants());
-        let resolved = map.grants_for(&fp).expect("known identity");
-        assert_eq!(resolved.len(), 3);
+    fn empty_grant_table_misses_every_fingerprint() {
+        let table = GrantTable::empty();
+        assert!(table.grants_for(&[0u8; 32]).is_none());
+        assert!(table.grants_for(&[7u8; 32]).is_none());
+    }
+
+    /// The grant-table encoding round-trips through the same codec the bridge
+    /// uses to decode the identity guest's published grant set.
+    #[test]
+    fn grant_encoding_round_trips_through_rkyv() {
+        let grants = grants();
+        let encoded = selium_abi::encode_rkyv(&grants).expect("encode");
+        let decoded: Vec<CapabilityGrant> = selium_abi::decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, grants);
     }
 
     /// A spawned bridge-channel receives the client's grants plus the two
@@ -387,12 +425,6 @@ mod tests {
             explicit(Capability::HostQueue, DISCOVERY_LISTENER),
             "child may attach the discovery listener queue: {child:?}"
         );
-    }
-
-    #[test]
-    fn identity_map_misses_unknown_fingerprint() {
-        let map = IdentityGrantMap::stub();
-        assert!(map.grants_for(&[0u8; 32]).is_none());
     }
 
     #[test]
