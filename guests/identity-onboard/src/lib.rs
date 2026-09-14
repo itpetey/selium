@@ -17,18 +17,17 @@ use selium_service::{IdentityRequest, IdentityResponse};
 use selium_shm::rpc;
 use sha2::{Digest, Sha256};
 
-/// Blob store + manifest the issued leaf is written to, for host-side pickup.
-const OUTPUT_STORE: &str = "selium.identity-onboard.out";
-const LEAF_MANIFEST: &str = "acme-leaf";
 /// The served identity route.
 const IDENTITY_ROUTE: &str = "sel:///identity";
-/// The tenant this driver onboards and revokes.
-const TENANT: &str = "acme";
-
+const LEAF_MANIFEST: &str = "acme-leaf";
 /// Entry mode: onboard the tenant, issue a user leaf, record grants.
 pub const MODE_ONBOARD: u64 = 0;
 /// Entry mode: revoke the tenant (removes its anchor, deletes its CA key).
 pub const MODE_REVOKE: u64 = 1;
+/// Blob store + manifest the issued leaf is written to, for host-side pickup.
+const OUTPUT_STORE: &str = "selium.identity-onboard.out";
+/// The tenant this driver onboards and revokes.
+const TENANT: &str = "acme";
 
 /// The baseline data-plane grants conferred on the onboarded principals:
 /// tenant-scoped shared memory, host queues, and network streams.
@@ -56,6 +55,23 @@ fn acme_client_grants() -> Vec<CapabilityGrant> {
             ],
         ),
     ]
+}
+
+/// Resolves the identity guest's serving route and connects to its tiered
+/// request surface.
+async fn identity_client(
+    ctx: &mut Context,
+) -> anyhow::Result<rpc::OwnedRpcClient<IdentityRequest, IdentityResponse>> {
+    let target = ctx
+        .lookup(IDENTITY_ROUTE)
+        .await
+        .with_context(|| "identity-onboard: identity route resolve failed")?
+        .ok_or_else(|| anyhow::anyhow!("identity-onboard: identity route not found"))?;
+    let sender = ResourceSender::attach(target.resource_id)
+        .with_context(|| "identity-onboard: identity listener attach failed")?;
+    rpc::connect::<IdentityRequest, IdentityResponse, _>(sender, 4096, 4096)
+        .await
+        .with_context(|| "identity-onboard: identity rpc connect failed")
 }
 
 /// Onboard `acme`, mint a user certificate from the supplied client SPKI, and
@@ -91,23 +107,6 @@ async fn onboard(mut ctx: Context, spki: (u64, u64), mode: u64) -> anyhow::Resul
 
     mark_ready();
     Ok(())
-}
-
-/// Resolves the identity guest's serving route and connects to its tiered
-/// request surface.
-async fn identity_client(
-    ctx: &mut Context,
-) -> anyhow::Result<rpc::OwnedRpcClient<IdentityRequest, IdentityResponse>> {
-    let target = ctx
-        .lookup(IDENTITY_ROUTE)
-        .await
-        .with_context(|| "identity-onboard: identity route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: identity route not found"))?;
-    let sender = ResourceSender::attach(target.resource_id)
-        .with_context(|| "identity-onboard: identity listener attach failed")?;
-    rpc::connect::<IdentityRequest, IdentityResponse, _>(sender, 4096, 4096)
-        .await
-        .with_context(|| "identity-onboard: identity rpc connect failed")
 }
 
 /// Onboards the tenant, issues a user leaf from the client SPKI, and records

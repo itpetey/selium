@@ -40,11 +40,8 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use selium_guest::{
     Context, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
 };
-use selium_shm::Channel;
-use selium_shm::transport::ShmTransport;
-use selium_wire::LiveTableView;
-use selium_wire::framed::FramedRead;
-use selium_wire::pubsub::Subscriber;
+use selium_shm::{Channel, transport::ShmTransport};
+use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 use thiserror::Error;
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
 // `wasm32_unknown_unknown_js` feature) so `SystemRandom` compiles on
@@ -68,6 +65,10 @@ pub mod runtime;
 pub mod stream;
 pub mod udp_adapter;
 
+/// Anchor-table key prefix: keys are `client-ca-<tenant>`.
+const ANCHOR_KEY_PREFIX: &str = "client-ca-";
+/// The identity guest's published anchor live-table route.
+const ANCHOR_TABLE_ROUTE: &str = "sel:///identity-anchors";
 /// Default listener address for the QUIC connector.
 ///
 /// Deferred policy: recorded in the connector's config, not spec behaviour
@@ -81,10 +82,6 @@ const TLS_CERT_MANIFEST: &str = "cert-pem";
 const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
-/// The identity guest's published anchor live-table route.
-const ANCHOR_TABLE_ROUTE: &str = "sel:///identity-anchors";
-/// Anchor-table key prefix: keys are `client-ca-<tenant>`.
-const ANCHOR_KEY_PREFIX: &str = "client-ca-";
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -104,6 +101,18 @@ pub enum TlsError {
     InvalidClientAnchor,
     #[error("TLS configuration error")]
     ConfigError,
+}
+
+/// The outcome of trying to attach the identity guest's anchor live table.
+enum AnchorTableSource {
+    /// Identity is deployed and its anchor table attached: mTLS is mandatory.
+    Attached(Box<LiveTableView<String, Vec<u8>, ShmTransport>>),
+    /// No identity anchor-table route is registered: the deployment opted out
+    /// of mTLS, so the connector serves without client authentication.
+    NotDeployed,
+    /// The route is registered but the table could not be attached: fail
+    /// closed by refusing every client certificate.
+    Unavailable,
 }
 
 /// Builds a quinn server endpoint from an abstract UDP socket and runtime.
@@ -272,6 +281,71 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
     Ok(())
 }
 
+/// Watches the anchor table and rebuilds the connector's union verifier on
+/// every change, so tenant onboarding and revocation take effect for the next
+/// handshake.
+async fn anchor_refresher(
+    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
+    anchors: Arc<Option<ClientAnchorSet>>,
+) {
+    let Some(table) = table else {
+        return;
+    };
+    let Some(anchors) = anchors.as_ref() else {
+        return;
+    };
+    loop {
+        if let Err(e) = table.sync_async().await {
+            warn!("quic-connector: anchor table wait failed: {e}");
+            selium_guest::yield_now().await;
+            continue;
+        }
+        if let Err(e) = rebuild_anchors(anchors, &table) {
+            warn!("quic-connector: anchor rebuild failed: {e}");
+        }
+    }
+}
+
+/// Attaches to the identity guest's published anchor live table, returning a
+/// read-only view of it. Distinguishes "identity not deployed" (mTLS opt-out)
+/// from "identity deployed but unusable" (fail closed).
+async fn attach_anchor_table(ctx: &mut Context) -> AnchorTableSource {
+    let target = match ctx.lookup(ANCHOR_TABLE_ROUTE).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            info!("quic-connector: no identity anchor table route registered");
+            return AnchorTableSource::NotDeployed;
+        }
+        Err(e) => {
+            warn!("quic-connector: anchor table resolve failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    let channel = match Channel::attach(target.resource_id) {
+        Ok(channel) => channel,
+        Err(e) => {
+            warn!("quic-connector: anchor table region attach failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    // Replay from the ring start: anchors may predate this attachment.
+    let transport = match ShmTransport::new_replay(&channel, &channel) {
+        Ok(transport) => transport,
+        Err(e) => {
+            warn!("quic-connector: anchor table transport failed: {e}");
+            return AnchorTableSource::Unavailable;
+        }
+    };
+    let subscriber = Subscriber::new(FramedRead::new(transport), None);
+    match LiveTableView::new(subscriber).map(Box::new) {
+        Ok(view) => AnchorTableSource::Attached(view),
+        Err(e) => {
+            warn!("quic-connector: anchor table view failed: {e}");
+            AnchorTableSource::Unavailable
+        }
+    }
+}
+
 /// Entrypoint for the QUIC connector system guest.
 ///
 #[entrypoint]
@@ -420,112 +494,6 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The outcome of trying to attach the identity guest's anchor live table.
-enum AnchorTableSource {
-    /// Identity is deployed and its anchor table attached: mTLS is mandatory.
-    Attached(Box<LiveTableView<String, Vec<u8>, ShmTransport>>),
-    /// No identity anchor-table route is registered: the deployment opted out
-    /// of mTLS, so the connector serves without client authentication.
-    NotDeployed,
-    /// The route is registered but the table could not be attached: fail
-    /// closed by refusing every client certificate.
-    Unavailable,
-}
-
-/// Attaches to the identity guest's published anchor live table, returning a
-/// read-only view of it. Distinguishes "identity not deployed" (mTLS opt-out)
-/// from "identity deployed but unusable" (fail closed).
-async fn attach_anchor_table(ctx: &mut Context) -> AnchorTableSource {
-    let target = match ctx.lookup(ANCHOR_TABLE_ROUTE).await {
-        Ok(Some(target)) => target,
-        Ok(None) => {
-            info!("quic-connector: no identity anchor table route registered");
-            return AnchorTableSource::NotDeployed;
-        }
-        Err(e) => {
-            warn!("quic-connector: anchor table resolve failed: {e}");
-            return AnchorTableSource::Unavailable;
-        }
-    };
-    let channel = match Channel::attach(target.resource_id) {
-        Ok(channel) => channel,
-        Err(e) => {
-            warn!("quic-connector: anchor table region attach failed: {e}");
-            return AnchorTableSource::Unavailable;
-        }
-    };
-    // Replay from the ring start: anchors may predate this attachment.
-    let transport = match ShmTransport::new_replay(&channel, &channel) {
-        Ok(transport) => transport,
-        Err(e) => {
-            warn!("quic-connector: anchor table transport failed: {e}");
-            return AnchorTableSource::Unavailable;
-        }
-    };
-    let subscriber = Subscriber::new(FramedRead::new(transport), None);
-    match LiveTableView::new(subscriber).map(Box::new) {
-        Ok(view) => AnchorTableSource::Attached(view),
-        Err(e) => {
-            warn!("quic-connector: anchor table view failed: {e}");
-            AnchorTableSource::Unavailable
-        }
-    }
-}
-
-/// Rebuilds the anchor set from the current table state. Keys are
-/// `client-ca-<tenant>`; tombstones (removed tenants) are skipped so their
-/// anchors drop out of the rebuilt union verifier.
-fn rebuild_anchors(
-    anchors: &ClientAnchorSet,
-    table: &LiveTableView<String, Vec<u8>, ShmTransport>,
-) -> anyhow::Result<()> {
-    let entries = table
-        .scan(usize::MAX)
-        .map_err(|e| anyhow::anyhow!("anchor table scan failed: {e}"))?;
-    let mut pairs = Vec::with_capacity(entries.len());
-    for (key, record) in entries {
-        let Some(cert_der) = record.value else {
-            continue;
-        };
-        let Some(tenant) = key.strip_prefix(ANCHOR_KEY_PREFIX) else {
-            warn!("quic-connector: ignoring non-anchor table key {key:?}");
-            continue;
-        };
-        pairs.push((tenant.to_string(), CertificateDer::from(cert_der)));
-    }
-    let count = pairs.len();
-    anchors
-        .replace(pairs)
-        .map_err(|e| anyhow::anyhow!("anchor replace failed: {e}"))?;
-    info!("quic-connector: rebuilt client anchor set ({count} anchors)");
-    Ok(())
-}
-
-/// Watches the anchor table and rebuilds the connector's union verifier on
-/// every change, so tenant onboarding and revocation take effect for the next
-/// handshake.
-async fn anchor_refresher(
-    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
-    anchors: Arc<Option<ClientAnchorSet>>,
-) {
-    let Some(table) = table else {
-        return;
-    };
-    let Some(anchors) = anchors.as_ref() else {
-        return;
-    };
-    loop {
-        if let Err(e) = table.sync_async().await {
-            warn!("quic-connector: anchor table wait failed: {e}");
-            selium_guest::yield_now().await;
-            continue;
-        }
-        if let Err(e) = rebuild_anchors(anchors, &table) {
-            warn!("quic-connector: anchor rebuild failed: {e}");
-        }
-    }
-}
-
 /// Loads the QUIC server's own identity (certificate chain + private key)
 /// from blob storage via the connector's `Storage` grant. Client trust anchors
 /// are not loaded here: they are sourced from the identity anchor live table.
@@ -611,4 +579,33 @@ fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer
     };
 
     Ok((certs, key))
+}
+
+/// Rebuilds the anchor set from the current table state. Keys are
+/// `client-ca-<tenant>`; tombstones (removed tenants) are skipped so their
+/// anchors drop out of the rebuilt union verifier.
+fn rebuild_anchors(
+    anchors: &ClientAnchorSet,
+    table: &LiveTableView<String, Vec<u8>, ShmTransport>,
+) -> anyhow::Result<()> {
+    let entries = table
+        .scan(usize::MAX)
+        .map_err(|e| anyhow::anyhow!("anchor table scan failed: {e}"))?;
+    let mut pairs = Vec::with_capacity(entries.len());
+    for (key, record) in entries {
+        let Some(cert_der) = record.value else {
+            continue;
+        };
+        let Some(tenant) = key.strip_prefix(ANCHOR_KEY_PREFIX) else {
+            warn!("quic-connector: ignoring non-anchor table key {key:?}");
+            continue;
+        };
+        pairs.push((tenant.to_string(), CertificateDer::from(cert_der)));
+    }
+    let count = pairs.len();
+    anchors
+        .replace(pairs)
+        .map_err(|e| anyhow::anyhow!("anchor replace failed: {e}"))?;
+    info!("quic-connector: rebuilt client anchor set ({count} anchors)");
+    Ok(())
 }

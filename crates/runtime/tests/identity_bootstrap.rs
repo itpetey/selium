@@ -18,71 +18,6 @@ use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_identity::identity_grants;
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
-}
-
-fn stub_descriptor(
-    name: &str,
-    grants: Vec<CapabilityGrant>,
-    dependencies: Vec<String>,
-) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: name.to_string(),
-        module_id: format!("{name}-module"),
-        module_bytes: module_with_entrypoint("boot"),
-        entrypoint: "boot".to_string(),
-        arguments: Vec::new(),
-        grants,
-        dependencies,
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// 7.1: the identity guest's grant set is admissible at bootstrap, carrying
-/// the `MintCertificate` capability (bootstrap-provisioned only) plus the
-/// system-registration grant for its root-namespace routes.
-#[test]
-fn identity_descriptor_grants_are_bootstrap_admissible() {
-    let runtime = Runtime::default();
-    runtime.generate_keyring().expect("generate keyring");
-
-    let guest = runtime
-        .spawn_system_guest(SystemGuestDescriptor {
-            name: "identity".to_string(),
-            module_id: "identity-module".to_string(),
-            module_bytes: module_with_entrypoint("boot"),
-            entrypoint: "boot".to_string(),
-            arguments: Vec::new(),
-            grants: identity_grants(),
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
-            tenant: None,
-            serving_role: None,
-            handlers: Vec::new(),
-        })
-        .expect("identity descriptor must be admissible at bootstrap");
-
-    let authority = runtime
-        .restore_process_authority(guest.process_id)
-        .expect("identity authority");
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::MintCertificate)
-    );
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::SystemRegistration)
-    );
-}
-
 /// 7.1: the connector and bridge depend on identity, and the runtime boots
 /// identity first even though the descriptor vector lists it last.
 #[test]
@@ -143,4 +78,69 @@ fn connector_and_bridge_boot_after_identity() {
         identity_pos < bridge_pos,
         "identity boots before the bridge"
     );
+}
+
+/// 7.1: the identity guest's grant set is admissible at bootstrap, carrying
+/// the `MintCertificate` capability (bootstrap-provisioned only) plus the
+/// system-registration grant for its root-namespace routes.
+#[test]
+fn identity_descriptor_grants_are_bootstrap_admissible() {
+    let runtime = Runtime::default();
+    runtime.generate_keyring().expect("generate keyring");
+
+    let guest = runtime
+        .spawn_system_guest(SystemGuestDescriptor {
+            name: "identity".to_string(),
+            module_id: "identity-module".to_string(),
+            module_bytes: module_with_entrypoint("boot"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: identity_grants(),
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            serving_role: None,
+            handlers: Vec::new(),
+        })
+        .expect("identity descriptor must be admissible at bootstrap");
+
+    let authority = runtime
+        .restore_process_authority(guest.process_id)
+        .expect("identity authority");
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::MintCertificate)
+    );
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::SystemRegistration)
+    );
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
+}
+
+fn stub_descriptor(
+    name: &str,
+    grants: Vec<CapabilityGrant>,
+    dependencies: Vec<String>,
+) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: name.to_string(),
+        module_id: format!("{name}-module"),
+        module_bytes: module_with_entrypoint("boot"),
+        entrypoint: "boot".to_string(),
+        arguments: Vec::new(),
+        grants,
+        dependencies,
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
 }

@@ -33,6 +33,16 @@ use time::{Duration, OffsetDateTime};
 /// alone after this window unless grants are removed first.
 const DEFAULT_LEAF_TTL: Duration = Duration::days(1);
 
+/// Pluggable backing for tenant CA keys.
+pub trait CaStore: Send + Sync {
+    /// Stores a tenant CA key.
+    fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError>;
+    /// Returns a tenant CA key, if present.
+    fn get(&self, tenant: &str) -> Option<&TenantCa>;
+    /// Removes and returns a tenant CA key, if present.
+    fn remove(&mut self, tenant: &str) -> Option<TenantCa>;
+}
+
 #[derive(Debug, Error)]
 pub enum KeyringError {
     #[error("no intermediate key material configured")]
@@ -75,20 +85,17 @@ pub struct TenantCa {
     pub(crate) key_der: Vec<u8>,
 }
 
-/// Pluggable backing for tenant CA keys.
-pub trait CaStore: Send + Sync {
-    /// Stores a tenant CA key.
-    fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError>;
-    /// Returns a tenant CA key, if present.
-    fn get(&self, tenant: &str) -> Option<&TenantCa>;
-    /// Removes and returns a tenant CA key, if present.
-    fn remove(&mut self, tenant: &str) -> Option<TenantCa>;
-}
-
 /// The in-process backing implementation.
 #[derive(Debug, Default)]
 pub struct InMemoryCaStore {
     by_tenant: HashMap<String, TenantCa>,
+}
+
+/// The host-held keyring.
+pub struct Keyring {
+    intermediate: KeyMaterial,
+    root: Option<KeyMaterial>,
+    tenant_cas: Box<dyn CaStore>,
 }
 
 impl CaStore for InMemoryCaStore {
@@ -104,13 +111,6 @@ impl CaStore for InMemoryCaStore {
     fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
         self.by_tenant.remove(tenant)
     }
-}
-
-/// The host-held keyring.
-pub struct Keyring {
-    intermediate: KeyMaterial,
-    root: Option<KeyMaterial>,
-    tenant_cas: Box<dyn CaStore>,
 }
 
 impl Keyring {
@@ -249,25 +249,6 @@ impl Keyring {
     }
 }
 
-/// Validates that stored material round-trips through a signing handle.
-fn validate_material(material: &KeyMaterial) -> Result<(), KeyringError> {
-    let key = KeyPair::try_from(material.key_der.as_slice()).map_err(|error| {
-        KeyringError::InvalidMaterial(format!("private key parse failed: {error}"))
-    })?;
-    let cert = CertificateDer::from(material.cert_der.clone());
-    let _issuer = Issuer::from_ca_cert_der(&cert, key).map_err(|error| {
-        KeyringError::InvalidMaterial(format!("certificate parse failed: {error}"))
-    })?;
-    Ok(())
-}
-
-fn material_from(cert: &Certificate, key: &KeyPair) -> KeyMaterial {
-    KeyMaterial {
-        cert_der: cert.der().to_vec(),
-        key_der: key.serialize_der(),
-    }
-}
-
 /// Parameters for a CA certificate: CA basic constraints plus key-cert-sign.
 fn ca_params(common_name: &str) -> CertificateParams {
     let mut params = CertificateParams::default();
@@ -281,6 +262,12 @@ fn ca_params(common_name: &str) -> CertificateParams {
     params
 }
 
+fn distinguished_name(common_name: &str) -> DistinguishedName {
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, common_name);
+    dn
+}
+
 /// Parameters for a user leaf: no CA bit, digital signature + client auth.
 fn leaf_params(tenant: &str) -> CertificateParams {
     let mut params = CertificateParams::default();
@@ -292,10 +279,23 @@ fn leaf_params(tenant: &str) -> CertificateParams {
     params
 }
 
-fn distinguished_name(common_name: &str) -> DistinguishedName {
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, common_name);
-    dn
+fn material_from(cert: &Certificate, key: &KeyPair) -> KeyMaterial {
+    KeyMaterial {
+        cert_der: cert.der().to_vec(),
+        key_der: key.serialize_der(),
+    }
+}
+
+/// Validates that stored material round-trips through a signing handle.
+fn validate_material(material: &KeyMaterial) -> Result<(), KeyringError> {
+    let key = KeyPair::try_from(material.key_der.as_slice()).map_err(|error| {
+        KeyringError::InvalidMaterial(format!("private key parse failed: {error}"))
+    })?;
+    let cert = CertificateDer::from(material.cert_der.clone());
+    let _issuer = Issuer::from_ca_cert_der(&cert, key).map_err(|error| {
+        KeyringError::InvalidMaterial(format!("certificate parse failed: {error}"))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

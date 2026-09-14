@@ -41,6 +41,30 @@ pub struct ClientAnchor {
     verifier: Arc<dyn ClientCertVerifier>,
 }
 
+/// Mandatory-client-auth verifier that refuses every certificate. The anchor
+/// set's empty state: before identity publishes its first tenant anchor the
+/// connector must refuse, never silently accept.
+#[derive(Debug)]
+struct RefuseAllClientVerifier;
+
+/// The set of client trust anchors, rebuilt live from the identity guest's
+/// published anchor table.
+///
+/// The set itself is a rustls [`ClientCertVerifier`], delegating every
+/// handshake to the *current* union verifier. Rebuilding the set (on tenant
+/// onboarding or revocation) therefore changes the anchoring for the next
+/// handshake without disturbing connections already authenticated.
+///
+/// Building a set with no anchors via [`ClientAnchorSet::new`] is a hard
+/// error (mTLS is endpoint-global, so a connector with no anchors must refuse
+/// to serve). [`ClientAnchorSet::empty`] is the live-table flow's starting
+/// state: it serves as a verifier that refuses every client until the first
+/// anchor state arrives.
+#[derive(Clone)]
+pub struct ClientAnchorSet {
+    inner: Arc<Mutex<AnchorInner>>,
+}
+
 /// The mutable inner state of the anchor set: the per-tenant anchors and the
 /// endpoint-global union verifier built from them.
 struct AnchorInner {
@@ -48,46 +72,30 @@ struct AnchorInner {
     union: Arc<dyn ClientCertVerifier>,
 }
 
-impl AnchorInner {
-    /// Builds anchors from `(tenant, CA certificate)` pairs. An empty set
-    /// produces a deny-all verifier: the connector offers mandatory client
-    /// authentication but refuses every certificate until identity publishes.
-    fn build(anchors: Vec<(String, CertificateDer<'static>)>) -> Result<Self, TlsError> {
-        let mut union_roots = RootCertStore::empty();
-        let mut built = Vec::with_capacity(anchors.len());
-        for (tenant, cert) in anchors {
-            union_roots.add(cert.clone()).map_err(|e| {
-                tracing::error!("quic-connector: invalid client anchor for {tenant}: {e}");
-                TlsError::InvalidClientAnchor
-            })?;
-            let roots = RootCertStore::empty();
-            let verifier = per_tenant_verifier(roots, &cert, &tenant)?;
-            built.push(ClientAnchor::with_verifier(tenant, verifier));
-        }
+impl ClientAnchor {
+    /// Builds a tenant anchor from a single CA certificate (the trust root
+    /// for that tenant's client certificates), given its verifier.
+    fn with_verifier(tenant: String, verifier: Arc<dyn ClientCertVerifier>) -> Self {
+        Self { tenant, verifier }
+    }
 
-        let union: Arc<dyn ClientCertVerifier> = if built.is_empty() {
-            Arc::new(RefuseAllClientVerifier)
-        } else {
-            WebPkiClientVerifier::builder(Arc::new(union_roots))
-                .build()
-                .map_err(|e| {
-                    tracing::error!("quic-connector: client union verifier build failed: {e}");
-                    TlsError::InvalidClientAnchor
-                })?
-        };
+    /// Returns this anchor's tenant scope.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
 
-        Ok(Self {
-            anchors: built,
-            union,
-        })
+    /// Returns whether this anchor verifies the presented client certificate.
+    pub fn verifies(
+        &self,
+        leaf: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) -> bool {
+        let now = UnixTime::now();
+        self.verifier
+            .verify_client_cert(leaf, intermediates, now)
+            .is_ok()
     }
 }
-
-/// Mandatory-client-auth verifier that refuses every certificate. The anchor
-/// set's empty state: before identity publishes its first tenant anchor the
-/// connector must refuse, never silently accept.
-#[derive(Debug)]
-struct RefuseAllClientVerifier;
 
 impl ClientCertVerifier for RefuseAllClientVerifier {
     fn offer_client_auth(&self) -> bool {
@@ -137,55 +145,6 @@ impl ClientCertVerifier for RefuseAllClientVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         vec![SignatureScheme::ECDSA_NISTP256_SHA256]
-    }
-}
-
-/// The set of client trust anchors, rebuilt live from the identity guest's
-/// published anchor table.
-///
-/// The set itself is a rustls [`ClientCertVerifier`], delegating every
-/// handshake to the *current* union verifier. Rebuilding the set (on tenant
-/// onboarding or revocation) therefore changes the anchoring for the next
-/// handshake without disturbing connections already authenticated.
-///
-/// Building a set with no anchors via [`ClientAnchorSet::new`] is a hard
-/// error (mTLS is endpoint-global, so a connector with no anchors must refuse
-/// to serve). [`ClientAnchorSet::empty`] is the live-table flow's starting
-/// state: it serves as a verifier that refuses every client until the first
-/// anchor state arrives.
-#[derive(Clone)]
-pub struct ClientAnchorSet {
-    inner: Arc<Mutex<AnchorInner>>,
-}
-
-impl std::fmt::Debug for ClientAnchorSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientAnchorSet").finish_non_exhaustive()
-    }
-}
-
-impl ClientAnchor {
-    /// Builds a tenant anchor from a single CA certificate (the trust root
-    /// for that tenant's client certificates), given its verifier.
-    fn with_verifier(tenant: String, verifier: Arc<dyn ClientCertVerifier>) -> Self {
-        Self { tenant, verifier }
-    }
-
-    /// Returns this anchor's tenant scope.
-    pub fn tenant(&self) -> &str {
-        &self.tenant
-    }
-
-    /// Returns whether this anchor verifies the presented client certificate.
-    pub fn verifies(
-        &self,
-        leaf: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-    ) -> bool {
-        let now = UnixTime::now();
-        self.verifier
-            .verify_client_cert(leaf, intermediates, now)
-            .is_ok()
     }
 }
 
@@ -297,6 +256,47 @@ impl ClientCertVerifier for ClientAnchorSet {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.current_union().supported_verify_schemes()
+    }
+}
+
+impl std::fmt::Debug for ClientAnchorSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAnchorSet").finish_non_exhaustive()
+    }
+}
+
+impl AnchorInner {
+    /// Builds anchors from `(tenant, CA certificate)` pairs. An empty set
+    /// produces a deny-all verifier: the connector offers mandatory client
+    /// authentication but refuses every certificate until identity publishes.
+    fn build(anchors: Vec<(String, CertificateDer<'static>)>) -> Result<Self, TlsError> {
+        let mut union_roots = RootCertStore::empty();
+        let mut built = Vec::with_capacity(anchors.len());
+        for (tenant, cert) in anchors {
+            union_roots.add(cert.clone()).map_err(|e| {
+                tracing::error!("quic-connector: invalid client anchor for {tenant}: {e}");
+                TlsError::InvalidClientAnchor
+            })?;
+            let roots = RootCertStore::empty();
+            let verifier = per_tenant_verifier(roots, &cert, &tenant)?;
+            built.push(ClientAnchor::with_verifier(tenant, verifier));
+        }
+
+        let union: Arc<dyn ClientCertVerifier> = if built.is_empty() {
+            Arc::new(RefuseAllClientVerifier)
+        } else {
+            WebPkiClientVerifier::builder(Arc::new(union_roots))
+                .build()
+                .map_err(|e| {
+                    tracing::error!("quic-connector: client union verifier build failed: {e}");
+                    TlsError::InvalidClientAnchor
+                })?
+        };
+
+        Ok(Self {
+            anchors: built,
+            union,
+        })
     }
 }
 

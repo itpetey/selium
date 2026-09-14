@@ -34,11 +34,8 @@ use selium_guest::{
     net::ByteStream, warn,
 };
 use selium_service::ResourceTarget;
-use selium_shm::Channel;
-use selium_shm::transport::ShmTransport;
-use selium_wire::LiveTableView;
-use selium_wire::framed::FramedRead;
-use selium_wire::pubsub::Subscriber;
+use selium_shm::{Channel, transport::ShmTransport};
+use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 /// The `bridge-channel` module id and entrypoint this server spawns.

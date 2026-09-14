@@ -58,6 +58,18 @@ pub struct LiveTable<K, V, M> {
     local: RefCell<HashMap<K, LiveTableRecord<V>>>,
 }
 
+/// A read-only, materialised view of a live table projected from its pub/sub
+/// subscriber.
+///
+/// Consumers that never write (e.g. the connector's anchor table or the
+/// bridge's grant table, both published by the identity guest) attach only a
+/// subscriber and project the stream into a local map. Write-side operations
+/// are not available; the single writer is the publishing guest.
+pub struct LiveTableView<K, V, M> {
+    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>, M>>,
+    local: RefCell<HashMap<K, LiveTableRecord<V>>>,
+}
+
 impl<K, V, M> LiveTable<K, V, M>
 where
     K: FlatMsg + Clone + Eq + Hash,
@@ -332,78 +344,6 @@ where
     }
 }
 
-fn apply_message_to<K, V>(
-    local: &mut HashMap<K, LiveTableRecord<V>>,
-    msg: LiveTableMessage<K, V>,
-) -> ApplyOutcome
-where
-    K: Eq + Hash,
-{
-    let actual = local
-        .get(&msg.key)
-        .map(|record| record.version)
-        .unwrap_or(0);
-    if let Some(expected) = msg.expected_version
-        && actual != expected
-    {
-        return ApplyOutcome::Conflict {
-            actual: local.get(&msg.key).map(|record| record.version),
-        };
-    }
-
-    let version = actual.saturating_add(1);
-    match msg.value {
-        Some(value) => {
-            local.insert(
-                msg.key,
-                LiveTableRecord {
-                    value: Some(value),
-                    version,
-                },
-            );
-            ApplyOutcome::Applied(version)
-        }
-        None => {
-            local.insert(
-                msg.key,
-                LiveTableRecord {
-                    value: None,
-                    version,
-                },
-            );
-            ApplyOutcome::Deleted(version)
-        }
-    }
-}
-
-fn scan_entries<K, V>(
-    local: &HashMap<K, LiveTableRecord<V>>,
-    limit: usize,
-) -> Vec<(K, LiveTableRecord<V>)>
-where
-    K: Clone + Eq + Hash,
-    V: Clone,
-{
-    local
-        .iter()
-        .filter(|(_, record)| record.value.is_some())
-        .map(|(key, record)| (key.clone(), record.clone()))
-        .take(limit)
-        .collect()
-}
-
-/// A read-only, materialised view of a live table projected from its pub/sub
-/// subscriber.
-///
-/// Consumers that never write (e.g. the connector's anchor table or the
-/// bridge's grant table, both published by the identity guest) attach only a
-/// subscriber and project the stream into a local map. Write-side operations
-/// are not available; the single writer is the publishing guest.
-pub struct LiveTableView<K, V, M> {
-    subscriber: RefCell<Subscriber<LiveTableMessage<K, V>, M>>,
-    local: RefCell<HashMap<K, LiveTableRecord<V>>>,
-}
-
 impl<K, V, M> LiveTableView<K, V, M>
 where
     K: FlatMsg + Clone + Eq + Hash,
@@ -499,6 +439,66 @@ where
             Err(e) => std::task::Poll::Ready(Err(e)),
         }
     }
+}
+
+fn apply_message_to<K, V>(
+    local: &mut HashMap<K, LiveTableRecord<V>>,
+    msg: LiveTableMessage<K, V>,
+) -> ApplyOutcome
+where
+    K: Eq + Hash,
+{
+    let actual = local
+        .get(&msg.key)
+        .map(|record| record.version)
+        .unwrap_or(0);
+    if let Some(expected) = msg.expected_version
+        && actual != expected
+    {
+        return ApplyOutcome::Conflict {
+            actual: local.get(&msg.key).map(|record| record.version),
+        };
+    }
+
+    let version = actual.saturating_add(1);
+    match msg.value {
+        Some(value) => {
+            local.insert(
+                msg.key,
+                LiveTableRecord {
+                    value: Some(value),
+                    version,
+                },
+            );
+            ApplyOutcome::Applied(version)
+        }
+        None => {
+            local.insert(
+                msg.key,
+                LiveTableRecord {
+                    value: None,
+                    version,
+                },
+            );
+            ApplyOutcome::Deleted(version)
+        }
+    }
+}
+
+fn scan_entries<K, V>(
+    local: &HashMap<K, LiveTableRecord<V>>,
+    limit: usize,
+) -> Vec<(K, LiveTableRecord<V>)>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    local
+        .iter()
+        .filter(|(_, record)| record.value.is_some())
+        .map(|(key, record)| (key.clone(), record.clone()))
+        .take(limit)
+        .collect()
 }
 
 #[cfg(test)]

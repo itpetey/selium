@@ -168,6 +168,48 @@ pub fn record_resolved_region_for(
     .map(|_| ())
 }
 
+/// Resolves the bootstrap-registered protocol handler for `scheme`
+/// (e.g. `sel-quic`) to its process id.
+///
+/// Handler registrations are Tier-1 (runtime-published at bootstrap), so the
+/// result cannot be forged by guests. Serve-side guests use it to pin the
+/// process legitimately allowed to deliver handoffs (see
+/// [`ResourceListener::expect_sender`](crate::ResourceListener::expect_sender)).
+pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::ProcessId>> {
+    match hostcall_ready(HostcallRequest::ResolveProtocolHandler {
+        scheme: scheme.to_string(),
+    })? {
+        HostcallOutput::U64(process_id) => Ok(Some(process_id)),
+        HostcallOutput::Empty => Ok(None),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ResolveProtocolHandler: {other:?}"
+        ))),
+    }
+}
+
+/// Deletes a tenant CA key from the host keyring. Requires the
+/// `MintCertificate` capability.
+pub fn revoke_ca(tenant: &str) -> Result<()> {
+    hostcall_ready(HostcallRequest::RevokeCa {
+        tenant: tenant.to_string(),
+    })
+    .map(|_| ())
+}
+
+/// The calling process's own identity: process id and tenant scope.
+///
+/// System guests use this to verify handoff identities against their own
+/// tenant (e.g. the bridge-server refuses clients whose authenticated
+/// tenant scope differs from its own).
+pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
+    match hostcall_ready(HostcallRequest::SelfInfo)? {
+        HostcallOutput::SelfInfo { process_id, tenant } => Ok((process_id, tenant)),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for SelfInfo: {other:?}"
+        ))),
+    }
+}
+
 /// Mints a tenant CA through the host signing oracle, returning the
 /// DER-encoded tenant CA certificate. Requires the `MintCertificate`
 /// capability; the tenant CA private key never reaches the guest.
@@ -192,48 +234,6 @@ pub fn sign_user_cert(tenant: &str, spki_der: &[u8]) -> Result<Vec<u8>> {
         HostcallOutput::Certificate(der) => Ok(der),
         other => Err(GuestError::Host(format!(
             "unexpected hostcall output for SignUserCert: {other:?}"
-        ))),
-    }
-}
-
-/// Deletes a tenant CA key from the host keyring. Requires the
-/// `MintCertificate` capability.
-pub fn revoke_ca(tenant: &str) -> Result<()> {
-    hostcall_ready(HostcallRequest::RevokeCa {
-        tenant: tenant.to_string(),
-    })
-    .map(|_| ())
-}
-
-/// Resolves the bootstrap-registered protocol handler for `scheme`
-/// (e.g. `sel-quic`) to its process id.
-///
-/// Handler registrations are Tier-1 (runtime-published at bootstrap), so the
-/// result cannot be forged by guests. Serve-side guests use it to pin the
-/// process legitimately allowed to deliver handoffs (see
-/// [`ResourceListener::expect_sender`](crate::ResourceListener::expect_sender)).
-pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::ProcessId>> {
-    match hostcall_ready(HostcallRequest::ResolveProtocolHandler {
-        scheme: scheme.to_string(),
-    })? {
-        HostcallOutput::U64(process_id) => Ok(Some(process_id)),
-        HostcallOutput::Empty => Ok(None),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ResolveProtocolHandler: {other:?}"
-        ))),
-    }
-}
-
-/// The calling process's own identity: process id and tenant scope.
-///
-/// System guests use this to verify handoff identities against their own
-/// tenant (e.g. the bridge-server refuses clients whose authenticated
-/// tenant scope differs from its own).
-pub fn self_info() -> Result<(selium_abi::ProcessId, Option<String>)> {
-    match hostcall_ready(HostcallRequest::SelfInfo)? {
-        HostcallOutput::SelfInfo { process_id, tenant } => Ok((process_id, tenant)),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for SelfInfo: {other:?}"
         ))),
     }
 }

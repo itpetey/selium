@@ -21,15 +21,14 @@ use std::time::Duration;
 
 use selium_runtime::{Runtime, RuntimeConfig};
 use selium_service::{ControlRequest, ControlResponse};
-
-mod common;
-mod spine_common;
-
 use spine_common::{
     CONNECTOR_ADDR, CONTROL_URI, SpinePortGuard, bridge_server_descriptor,
     client_options_no_identity, connector_descriptor, discovery_descriptor, drain_logs, read_wasm,
     seed_tls_blob_store, wait_for_logs,
 };
+
+mod common;
+mod spine_common;
 
 /// mTLS opt-in (task 5.1): with no identity guest deployed, the connector
 /// serves without client authentication and handoffs carry empty identity

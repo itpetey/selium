@@ -49,16 +49,15 @@ use selium_client::FlatMsg as _;
 use selium_identity_onboard::{MODE_ONBOARD, MODE_REVOKE};
 use selium_runtime::{Runtime, RuntimeConfig};
 use selium_service::{ControlRequest, ControlResponse, DelegationStatus, Deployment};
-
-mod common;
-mod spine_common;
-
 use spine_common::{
     CONNECTOR_ADDR, CONTROL_URI, SCHEDULER_DEFERRED, SpinePortGuard, bridge_server_descriptor,
     client_options, connector_descriptor, control_plane_descriptor, discovery_descriptor,
     drain_logs, identity_descriptor, operator_descriptor, read_issued_leaf, read_wasm,
     seed_tls_blob_store, wait_for_logs,
 };
+
+mod common;
+mod spine_common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the identity, discovery, connector, bridge and control-plane guests built for wasm32-unknown-unknown"]

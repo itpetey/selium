@@ -33,14 +33,14 @@ pub(crate) const BRIDGE_KEY_PEM: &[u8] =
 pub(crate) const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
 /// The control plane's served route, named in the bridge handshake.
 pub(crate) const CONTROL_URI: &str = "sel://acme/control";
+pub(crate) const LEAF_MANIFEST: &str = "acme-leaf";
+/// Blob store + manifest the onboarding guest writes the issued leaf to.
+pub(crate) const ONBOARD_STORE: &str = "selium.identity-onboard.out";
 /// The day-1 scheduler seam's typed deferred context.
 pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
 /// SNI / TLS server name: the synthetic tenant wire name for the acme
 /// bridge route (resolved by the connector to `sel://acme/bridge`).
 pub(crate) const SERVER_NAME: &str = "bridge.acme";
-/// Blob store + manifest the onboarding guest writes the issued leaf to.
-pub(crate) const ONBOARD_STORE: &str = "selium.identity-onboard.out";
-pub(crate) const LEAF_MANIFEST: &str = "acme-leaf";
 /// The tenant the onboarding guest mints and the client connects as.
 pub(crate) const TENANT: &str = "acme";
 
@@ -72,70 +72,26 @@ impl Drop for SpinePortGuard {
     }
 }
 
-pub(crate) fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    super::common::read_guest_wasm(crate_name, file_name)
-}
-
-/// The discovery system guest: RPC listener + registration feed.
-pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(),
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// The identity system guest: sole mint authority, keyring-backed signing,
-/// durable registries, and the anchor/grant live tables.
-pub(crate) fn identity_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "identity".to_string(),
-        module_id: "identity-module".to_string(),
-        module_bytes,
-        entrypoint: "identity_main".to_string(),
-        arguments: Vec::new(),
-        grants: selium_identity::identity_grants(),
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// The onboarding operator guest: receives the client SPKI pointer and an
-/// integer entry mode, and drives the identity guest's mint/issue/grant tiers
-/// (`MODE_ONBOARD`) or the revocation leg (`MODE_REVOKE`).
-pub(crate) fn operator_descriptor(
+/// The per-tenant bridge server, conferring from the identity grant table.
+pub(crate) fn bridge_server_descriptor(
     module_bytes: Vec<u8>,
-    spki: Vec<u8>,
-    mode: u64,
     dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
-        name: "identity-onboard".to_string(),
-        module_id: "identity-onboard-module".to_string(),
+        name: "bridge-server".to_string(),
+        module_id: "bridge-server-module".to_string(),
         module_bytes,
-        entrypoint: "onboard".to_string(),
-        arguments: vec![SystemGuestArg::Pointer(spki), SystemGuestArg::Integer(mode)],
+        entrypoint: "bridge_server".to_string(),
+        arguments: Vec::new(),
         grants: vec![
+            CapabilityGrant::new(
+                Capability::ProcessLifecycle,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+            ),
+            CapabilityGrant::new(
+                Capability::DelegateGrants,
+                vec![ResourceSelector::Tenant(TENANT.to_string())],
+            ),
             CapabilityGrant::new(
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
@@ -143,17 +99,40 @@ pub(crate) fn operator_descriptor(
             CapabilityGrant::new(
                 Capability::SharedMemory,
                 vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
             ),
         ],
         dependencies,
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
+        tenant: Some(TENANT.to_string()),
         serving_role: None,
         handlers: Vec::new(),
+    }
+}
+
+/// Builds the native client options: trust the connector's certificate and
+/// present the issued leaf + its generated key for mTLS.
+pub(crate) fn client_options(leaf_der: Vec<u8>, client_pkcs8: Vec<u8>) -> ConnectOptions {
+    ConnectOptions {
+        identity: Some(mtls_identity(leaf_der, client_pkcs8)),
+        ..client_options_no_identity()
+    }
+}
+
+/// Builds the native client options without a client identity (the mTLS-off
+/// deployment shape: no identity guest, no client authentication).
+pub(crate) fn client_options_no_identity() -> ConnectOptions {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
+        300_000u32,
+    ))));
+    transport.initial_rtt(Duration::from_millis(250));
+
+    ConnectOptions {
+        server_name: SERVER_NAME.to_string(),
+        server_root: selium_client::certificates_from_pem(BRIDGE_CERT_PEM)
+            .expect("parse bridge certificate PEM"),
+        identity: None,
+        transport: Some(Arc::new(transport)),
     }
 }
 
@@ -192,43 +171,6 @@ pub(crate) fn connector_descriptor(
         tenant: None,
         serving_role: None,
         handlers: vec!["sel-quic".to_string()],
-    }
-}
-
-/// The per-tenant bridge server, conferring from the identity grant table.
-pub(crate) fn bridge_server_descriptor(
-    module_bytes: Vec<u8>,
-    dependencies: Vec<String>,
-) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "bridge-server".to_string(),
-        module_id: "bridge-server-module".to_string(),
-        module_bytes,
-        entrypoint: "bridge_server".to_string(),
-        arguments: Vec::new(),
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::ProcessLifecycle,
-                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
-            ),
-            CapabilityGrant::new(
-                Capability::DelegateGrants,
-                vec![ResourceSelector::Tenant(TENANT.to_string())],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-        ],
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some(TENANT.to_string()),
-        serving_role: None,
-        handlers: Vec::new(),
     }
 }
 
@@ -278,40 +220,29 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
     }
 }
 
-/// Builds the native client options: trust the connector's certificate and
-/// present the issued leaf + its generated key for mTLS.
-pub(crate) fn client_options(leaf_der: Vec<u8>, client_pkcs8: Vec<u8>) -> ConnectOptions {
-    ConnectOptions {
-        identity: Some(mtls_identity(leaf_der, client_pkcs8)),
-        ..client_options_no_identity()
-    }
-}
-
-/// Builds the client identity payload from the issued leaf and its key.
-pub(crate) fn mtls_identity(leaf_der: Vec<u8>, client_pkcs8: Vec<u8>) -> ClientIdentity {
-    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-
-    ClientIdentity {
-        cert_chain: vec![CertificateDer::from(leaf_der)],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_pkcs8)),
-    }
-}
-
-/// Builds the native client options without a client identity (the mTLS-off
-/// deployment shape: no identity guest, no client authentication).
-pub(crate) fn client_options_no_identity() -> ConnectOptions {
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from(
-        300_000u32,
-    ))));
-    transport.initial_rtt(Duration::from_millis(250));
-
-    ConnectOptions {
-        server_name: SERVER_NAME.to_string(),
-        server_root: selium_client::certificates_from_pem(BRIDGE_CERT_PEM)
-            .expect("parse bridge certificate PEM"),
-        identity: None,
-        transport: Some(Arc::new(transport)),
+/// The discovery system guest: RPC listener + registration feed.
+pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
     }
 }
 
@@ -328,6 +259,109 @@ pub(crate) fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
                 .message
         })
         .collect()
+}
+
+/// The identity system guest: sole mint authority, keyring-backed signing,
+/// durable registries, and the anchor/grant live tables.
+pub(crate) fn identity_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "identity".to_string(),
+        module_id: "identity-module".to_string(),
+        module_bytes,
+        entrypoint: "identity_main".to_string(),
+        arguments: Vec::new(),
+        grants: selium_identity::identity_grants(),
+        dependencies: vec!["discovery".to_string()],
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+/// Builds the client identity payload from the issued leaf and its key.
+pub(crate) fn mtls_identity(leaf_der: Vec<u8>, client_pkcs8: Vec<u8>) -> ClientIdentity {
+    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    ClientIdentity {
+        cert_chain: vec![CertificateDer::from(leaf_der)],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_pkcs8)),
+    }
+}
+
+/// The onboarding operator guest: receives the client SPKI pointer and an
+/// integer entry mode, and drives the identity guest's mint/issue/grant tiers
+/// (`MODE_ONBOARD`) or the revocation leg (`MODE_REVOKE`).
+pub(crate) fn operator_descriptor(
+    module_bytes: Vec<u8>,
+    spki: Vec<u8>,
+    mode: u64,
+    dependencies: Vec<String>,
+) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "identity-onboard".to_string(),
+        module_id: "identity-onboard-module".to_string(),
+        module_bytes,
+        entrypoint: "onboard".to_string(),
+        arguments: vec![SystemGuestArg::Pointer(spki), SystemGuestArg::Integer(mode)],
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+            ),
+        ],
+        dependencies,
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+/// Reads the issued leaf the onboarding guest wrote to the blob store.
+pub(crate) fn read_issued_leaf(runtime: &Runtime) -> Vec<u8> {
+    let storage = runtime.kernel().storage();
+    let store = storage.open_blob_store(&runtime.kernel().memory(), ONBOARD_STORE);
+    let leaf_id = storage
+        .get_manifest(store.local_id, LEAF_MANIFEST)
+        .expect("leaf manifest lookup")
+        .expect("issued leaf manifest present");
+    storage
+        .get_blob(store.local_id, &leaf_id)
+        .expect("leaf blob lookup")
+        .expect("issued leaf blob present")
+}
+
+pub(crate) fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
+    super::common::read_guest_wasm(crate_name, file_name)
+}
+
+/// Provisions the connector's own TLS material (server certificate + key)
+/// into the `tls-certs` blob store. Client trust anchors are NOT seeded here —
+/// they come exclusively from the identity guest's anchor live table.
+pub(crate) fn seed_tls_blob_store(runtime: &Runtime) {
+    let storage = runtime.kernel().storage();
+    let store = storage.open_blob_store(&runtime.kernel().memory(), "tls-certs");
+    let cert_id = storage
+        .put_blob(store.local_id, BRIDGE_CERT_PEM.to_vec())
+        .expect("put bridge cert blob");
+    let key_id = storage
+        .put_blob(store.local_id, BRIDGE_KEY_PEM.to_vec())
+        .expect("put bridge key blob");
+    storage
+        .set_manifest(store.local_id, "cert-pem", cert_id)
+        .expect("cert manifest");
+    storage
+        .set_manifest(store.local_id, "key-pem", key_id)
+        .expect("key manifest");
 }
 
 #[expect(clippy::panic, reason = "test helper")]
@@ -352,38 +386,4 @@ pub(crate) fn wait_for_logs(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
-}
-
-/// Provisions the connector's own TLS material (server certificate + key)
-/// into the `tls-certs` blob store. Client trust anchors are NOT seeded here —
-/// they come exclusively from the identity guest's anchor live table.
-pub(crate) fn seed_tls_blob_store(runtime: &Runtime) {
-    let storage = runtime.kernel().storage();
-    let store = storage.open_blob_store(&runtime.kernel().memory(), "tls-certs");
-    let cert_id = storage
-        .put_blob(store.local_id, BRIDGE_CERT_PEM.to_vec())
-        .expect("put bridge cert blob");
-    let key_id = storage
-        .put_blob(store.local_id, BRIDGE_KEY_PEM.to_vec())
-        .expect("put bridge key blob");
-    storage
-        .set_manifest(store.local_id, "cert-pem", cert_id)
-        .expect("cert manifest");
-    storage
-        .set_manifest(store.local_id, "key-pem", key_id)
-        .expect("key manifest");
-}
-
-/// Reads the issued leaf the onboarding guest wrote to the blob store.
-pub(crate) fn read_issued_leaf(runtime: &Runtime) -> Vec<u8> {
-    let storage = runtime.kernel().storage();
-    let store = storage.open_blob_store(&runtime.kernel().memory(), ONBOARD_STORE);
-    let leaf_id = storage
-        .get_manifest(store.local_id, LEAF_MANIFEST)
-        .expect("leaf manifest lookup")
-        .expect("issued leaf manifest present");
-    storage
-        .get_blob(store.local_id, &leaf_id)
-        .expect("leaf blob lookup")
-        .expect("issued leaf blob present")
 }

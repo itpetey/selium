@@ -31,27 +31,28 @@ use selium_guest::{
     Context, DurableLog, ResourceListener, Serve, entrypoint, info, mark_ready, spawn, warn,
 };
 use selium_service::{FlatMsg, IdentityRequest, IdentityResponse, ResourceTarget};
-use selium_shm::transport::ShmTransport;
-use selium_shm::{Channel, ChannelBackpressure};
-use selium_wire::LiveTable;
-use selium_wire::framed::{FramedRead, FramedWrite};
-use selium_wire::pubsub::{Publisher, Subscriber};
+use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
+use selium_wire::{
+    LiveTable,
+    framed::{FramedRead, FramedWrite},
+    pubsub::{Publisher, Subscriber},
+};
 use sha2::{Digest, Sha256};
 
-/// Durable log name for the tenant registry.
-pub const TENANT_LOG: &str = "selium.identity.tenants";
-/// Durable log name for the principal registry.
-pub const PRINCIPAL_LOG: &str = "selium.identity.principals";
-/// Serving route path for the request surface (`sel:///identity`).
-pub const IDENTITY_PATH: &str = "identity";
+/// Anchor-table key prefix: the connector reads `client-ca-<tenant>` entries.
+pub const ANCHOR_KEY_PREFIX: &str = "client-ca-";
 /// Serving route path for the anchor live table (`sel:///identity-anchors`).
 pub const ANCHOR_TABLE_PATH: &str = "identity-anchors";
 /// Serving route path for the grant live table (`sel:///identity-grants`).
 pub const GRANT_TABLE_PATH: &str = "identity-grants";
-/// Anchor-table key prefix: the connector reads `client-ca-<tenant>` entries.
-pub const ANCHOR_KEY_PREFIX: &str = "client-ca-";
+/// Serving route path for the request surface (`sel:///identity`).
+pub const IDENTITY_PATH: &str = "identity";
+/// Durable log name for the principal registry.
+pub const PRINCIPAL_LOG: &str = "selium.identity.principals";
 /// Ring capacity for each live table.
 const TABLE_CAPACITY: u64 = 64 * 1024;
+/// Durable log name for the tenant registry.
+pub const TENANT_LOG: &str = "selium.identity.tenants";
 
 /// A tenant registry record appended to the durable log.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -100,6 +101,27 @@ pub struct TenantRegistry {
 #[derive(Debug, Clone, Default)]
 pub struct PrincipalRegistry {
     by_fingerprint: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+/// The caller's tier, derived from its process tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Tier {
+    /// Root/system principal: operator tier, may manage any tenant.
+    Operator,
+    /// Tenant-scoped principal: may act only on this tenant.
+    Tenant(String),
+    /// The caller's tenant could not be verified: every request is refused.
+    Denied,
+}
+
+/// Shared identity state handed to each request handler.
+struct IdentityState {
+    tenants: Rc<RefCell<TenantRegistry>>,
+    principals: Rc<RefCell<PrincipalRegistry>>,
+    tenant_log: DurableLog,
+    principal_log: DurableLog,
+    anchors: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
+    grants: Rc<LiveTable<Vec<u8>, Vec<u8>, ShmTransport>>,
 }
 
 impl TenantRegistry {
@@ -201,17 +223,6 @@ impl PrincipalRegistry {
     }
 }
 
-/// The caller's tier, derived from its process tenant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Tier {
-    /// Root/system principal: operator tier, may manage any tenant.
-    Operator,
-    /// Tenant-scoped principal: may act only on this tenant.
-    Tenant(String),
-    /// The caller's tenant could not be verified: every request is refused.
-    Denied,
-}
-
 impl Tier {
     /// Derives the tier from a verified caller tenant.
     pub fn from_tenant(tenant: Option<String>) -> Self {
@@ -236,14 +247,15 @@ impl Tier {
     }
 }
 
-/// Shared identity state handed to each request handler.
-struct IdentityState {
-    tenants: Rc<RefCell<TenantRegistry>>,
-    principals: Rc<RefCell<PrincipalRegistry>>,
-    tenant_log: DurableLog,
-    principal_log: DurableLog,
-    anchors: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
-    grants: Rc<LiveTable<Vec<u8>, Vec<u8>, ShmTransport>>,
+/// The anchor-table key for a tenant.
+pub fn anchor_key(tenant: &str) -> String {
+    format!("{ANCHOR_KEY_PREFIX}{tenant}")
+}
+
+/// SHA-256 of a client leaf SPKI.
+pub fn fingerprint_of(spki_der: &[u8]) -> Vec<u8> {
+    let digest = Sha256::digest(spki_der);
+    digest.as_slice().to_vec()
 }
 
 /// The grant set assigned to the identity guest: mint authority, storage (the
@@ -269,17 +281,6 @@ pub fn identity_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
-/// SHA-256 of a client leaf SPKI.
-pub fn fingerprint_of(spki_der: &[u8]) -> Vec<u8> {
-    let digest = Sha256::digest(spki_der);
-    digest.as_slice().to_vec()
-}
-
-/// The anchor-table key for a tenant.
-pub fn anchor_key(tenant: &str) -> String {
-    format!("{ANCHOR_KEY_PREFIX}{tenant}")
-}
-
 /// Builds one live table over its own `LiveTable` ring, returning the ring id
 /// and the table.
 fn create_live_table<K, V>(
@@ -303,17 +304,126 @@ where
     Ok((region_id, table))
 }
 
-/// Publishes a principal's grant set to the grant table. An empty grant set is
-/// a delete: the bridge treats an absent fingerprint as "refuse the handoff".
-fn publish_grants(
-    table: &LiveTable<Vec<u8>, Vec<u8>, ShmTransport>,
-    fingerprint: &[u8],
-    grants: &[u8],
-) -> selium_wire::Result<()> {
-    if grants.is_empty() {
-        table.delete(fingerprint.to_vec())
-    } else {
-        table.set(fingerprint.to_vec(), grants.to_vec())
+/// Serves one RPC session, deriving the tier once from the caller's tenant and
+/// enforcing it on every request.
+async fn handle_connection(
+    mut connection: selium_shm::rpc::RpcConnection<IdentityRequest, IdentityResponse>,
+    state: Rc<IdentityState>,
+) {
+    let tier = match selium_guest::process_tenant(connection.client_process_id()) {
+        Ok(tenant) => Tier::from_tenant(tenant),
+        Err(error) => {
+            warn!(
+                client = connection.client_process_id(),
+                "identity: could not resolve caller tenant: {error}"
+            );
+            Tier::Denied
+        }
+    };
+
+    loop {
+        match connection.recv().await {
+            Ok(request) => {
+                let response = match request.payload() {
+                    Ok(payload) => handle_request(payload, &tier, &state),
+                    Err(error) => {
+                        warn!("identity: request decode failed: {error}");
+                        IdentityResponse::Error {
+                            step: "decode".to_string(),
+                            context: format!("{error}"),
+                        }
+                    }
+                };
+                if let Err(error) = request.reply(response).await {
+                    warn!("identity: reply failed: {error}");
+                    break;
+                }
+            }
+            Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
+            Err(error) => {
+                warn!("identity: recv failed: {error}");
+                break;
+            }
+        }
+    }
+}
+
+/// Handles one decoded request, enforcing the caller's tier.
+fn handle_request(
+    request: IdentityRequest,
+    tier: &Tier,
+    state: &IdentityState,
+) -> IdentityResponse {
+    match request {
+        IdentityRequest::MintTenantCa { tenant } => {
+            if !tier.is_operator() {
+                return tier_refused("mint a tenant CA");
+            }
+            match mint_tenant_ca(&tenant, state) {
+                Ok(()) => IdentityResponse::TenantRecorded { tenant },
+                Err(context) => IdentityResponse::Error {
+                    step: "mint".to_string(),
+                    context,
+                },
+            }
+        }
+        IdentityRequest::RotateTenantCa { tenant } => {
+            if !tier.is_operator() {
+                return tier_refused("rotate a tenant CA");
+            }
+            match mint_tenant_ca(&tenant, state) {
+                Ok(()) => IdentityResponse::Rotated { tenant },
+                Err(context) => IdentityResponse::Error {
+                    step: "rotate".to_string(),
+                    context,
+                },
+            }
+        }
+        IdentityRequest::RevokeTenant { tenant } => {
+            if !tier.is_operator() {
+                return tier_refused("revoke a tenant");
+            }
+            match revoke_tenant(&tenant, state) {
+                Ok(()) => IdentityResponse::Revoked { tenant },
+                Err(context) => IdentityResponse::Error {
+                    step: "revoke".to_string(),
+                    context,
+                },
+            }
+        }
+        IdentityRequest::IssueUserCert { tenant, spki_der } => {
+            if !tier.admits_tenant(&tenant) {
+                return tier_refused("issue a user certificate");
+            }
+            match issue_user_cert(&tenant, &spki_der, state) {
+                Ok(certificate_der) => IdentityResponse::UserCertIssued { certificate_der },
+                Err(context) => IdentityResponse::Error {
+                    step: "issue".to_string(),
+                    context,
+                },
+            }
+        }
+        IdentityRequest::SetPrincipalGrants {
+            tenant,
+            fingerprint,
+            grants,
+        } => {
+            if !tier.admits_tenant(&tenant) {
+                return tier_refused("manage principals");
+            }
+            set_principal_grants(&tenant, &fingerprint, &grants, state);
+            IdentityResponse::PrincipalRecorded { fingerprint }
+        }
+        IdentityRequest::RemovePrincipal {
+            tenant,
+            fingerprint,
+        } => {
+            if !tier.admits_tenant(&tenant) {
+                return tier_refused("manage principals");
+            }
+            remove_principal(&tenant, &fingerprint, state);
+            IdentityResponse::PrincipalRemoved { fingerprint }
+        }
     }
 }
 
@@ -452,136 +562,27 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
     }
 }
 
-/// Serves one RPC session, deriving the tier once from the caller's tenant and
-/// enforcing it on every request.
-async fn handle_connection(
-    mut connection: selium_shm::rpc::RpcConnection<IdentityRequest, IdentityResponse>,
-    state: Rc<IdentityState>,
-) {
-    let tier = match selium_guest::process_tenant(connection.client_process_id()) {
-        Ok(tenant) => Tier::from_tenant(tenant),
-        Err(error) => {
-            warn!(
-                client = connection.client_process_id(),
-                "identity: could not resolve caller tenant: {error}"
-            );
-            Tier::Denied
-        }
-    };
-
-    loop {
-        match connection.recv().await {
-            Ok(request) => {
-                let response = match request.payload() {
-                    Ok(payload) => handle_request(payload, &tier, &state),
-                    Err(error) => {
-                        warn!("identity: request decode failed: {error}");
-                        IdentityResponse::Error {
-                            step: "decode".to_string(),
-                            context: format!("{error}"),
-                        }
-                    }
-                };
-                if let Err(error) = request.reply(response).await {
-                    warn!("identity: reply failed: {error}");
-                    break;
-                }
-            }
-            Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
-            Err(error) => {
-                warn!("identity: recv failed: {error}");
-                break;
-            }
-        }
-    }
-}
-
-/// Handles one decoded request, enforcing the caller's tier.
-fn handle_request(
-    request: IdentityRequest,
-    tier: &Tier,
+/// Issues a short-TTL leaf certificate from a client SPKI, recording the
+/// principal's fingerprint in the registry.
+fn issue_user_cert(
+    tenant: &str,
+    spki_der: &[u8],
     state: &IdentityState,
-) -> IdentityResponse {
-    match request {
-        IdentityRequest::MintTenantCa { tenant } => {
-            if !tier.is_operator() {
-                return tier_refused("mint a tenant CA");
-            }
-            match mint_tenant_ca(&tenant, state) {
-                Ok(()) => IdentityResponse::TenantRecorded { tenant },
-                Err(context) => IdentityResponse::Error {
-                    step: "mint".to_string(),
-                    context,
-                },
-            }
-        }
-        IdentityRequest::RotateTenantCa { tenant } => {
-            if !tier.is_operator() {
-                return tier_refused("rotate a tenant CA");
-            }
-            match mint_tenant_ca(&tenant, state) {
-                Ok(()) => IdentityResponse::Rotated { tenant },
-                Err(context) => IdentityResponse::Error {
-                    step: "rotate".to_string(),
-                    context,
-                },
-            }
-        }
-        IdentityRequest::RevokeTenant { tenant } => {
-            if !tier.is_operator() {
-                return tier_refused("revoke a tenant");
-            }
-            match revoke_tenant(&tenant, state) {
-                Ok(()) => IdentityResponse::Revoked { tenant },
-                Err(context) => IdentityResponse::Error {
-                    step: "revoke".to_string(),
-                    context,
-                },
-            }
-        }
-        IdentityRequest::IssueUserCert { tenant, spki_der } => {
-            if !tier.admits_tenant(&tenant) {
-                return tier_refused("issue a user certificate");
-            }
-            match issue_user_cert(&tenant, &spki_der, state) {
-                Ok(certificate_der) => IdentityResponse::UserCertIssued { certificate_der },
-                Err(context) => IdentityResponse::Error {
-                    step: "issue".to_string(),
-                    context,
-                },
-            }
-        }
-        IdentityRequest::SetPrincipalGrants {
-            tenant,
-            fingerprint,
-            grants,
-        } => {
-            if !tier.admits_tenant(&tenant) {
-                return tier_refused("manage principals");
-            }
-            set_principal_grants(&tenant, &fingerprint, &grants, state);
-            IdentityResponse::PrincipalRecorded { fingerprint }
-        }
-        IdentityRequest::RemovePrincipal {
-            tenant,
-            fingerprint,
-        } => {
-            if !tier.admits_tenant(&tenant) {
-                return tier_refused("manage principals");
-            }
-            remove_principal(&tenant, &fingerprint, state);
-            IdentityResponse::PrincipalRemoved { fingerprint }
-        }
-    }
-}
+) -> Result<Vec<u8>, String> {
+    let certificate_der =
+        selium_guest::sign_user_cert(tenant, spki_der).map_err(|error| format!("{error}"))?;
+    let fingerprint = fingerprint_of(spki_der);
 
-fn tier_refused(verb: &str) -> IdentityResponse {
-    IdentityResponse::Error {
-        step: "tier".to_string(),
-        context: format!(
-            "caller is not authorised to {verb}: a tenant-tier caller is scoped to its own tenant"
-        ),
-    }
+    // Record the fingerprint within the tenant; preserve any baseline grants
+    // already held by this principal across an issuance (a leaf rotation).
+    let grants = state
+        .principals
+        .borrow()
+        .grants(&fingerprint)
+        .cloned()
+        .unwrap_or_default();
+    record_principal(tenant, &fingerprint, &grants, state);
+    Ok(certificate_der)
 }
 
 /// Mints (or rotates) a tenant CA, recording it in the registry and publishing
@@ -615,6 +616,75 @@ fn mint_tenant_ca(tenant: &str, state: &IdentityState) -> Result<(), String> {
         .set(anchor_key(tenant), ca_cert_der)
         .map_err(|error| format!("anchor publish failed: {error}"))?;
     Ok(())
+}
+
+/// Publishes a principal's grant set to the grant table. An empty grant set is
+/// a delete: the bridge treats an absent fingerprint as "refuse the handoff".
+fn publish_grants(
+    table: &LiveTable<Vec<u8>, Vec<u8>, ShmTransport>,
+    fingerprint: &[u8],
+    grants: &[u8],
+) -> selium_wire::Result<()> {
+    if grants.is_empty() {
+        table.delete(fingerprint.to_vec())
+    } else {
+        table.set(fingerprint.to_vec(), grants.to_vec())
+    }
+}
+
+/// Appends a principal record and applies it to the projection.
+fn record_principal(tenant: &str, fingerprint: &[u8], grants: &[u8], state: &IdentityState) {
+    let timestamp_ms = selium_guest::time::now()
+        .map(|nanos| nanos / 1_000_000)
+        .unwrap_or_default();
+    let record = PrincipalRecord::Set {
+        tenant: tenant.to_string(),
+        fingerprint: fingerprint.to_vec(),
+        grants: grants.to_vec(),
+    };
+    match selium_abi::encode_rkyv(&record) {
+        Ok(payload) => {
+            if let Err(error) = state
+                .principal_log
+                .append(timestamp_ms, Vec::new(), payload)
+            {
+                warn!("identity: principal record append failed: {error}");
+            }
+        }
+        Err(error) => warn!("identity: principal record encode failed: {error}"),
+    }
+    state.principals.borrow_mut().apply_record(record);
+}
+
+/// Removes a principal's baseline grants.
+fn remove_principal(tenant: &str, fingerprint: &[u8], state: &IdentityState) {
+    let timestamp_ms = selium_guest::time::now()
+        .map(|nanos| nanos / 1_000_000)
+        .unwrap_or_default();
+    match selium_abi::encode_rkyv(&PrincipalRecord::Remove {
+        tenant: tenant.to_string(),
+        fingerprint: fingerprint.to_vec(),
+    }) {
+        Ok(payload) => {
+            if let Err(error) = state
+                .principal_log
+                .append(timestamp_ms, Vec::new(), payload)
+            {
+                warn!("identity: principal remove append failed: {error}");
+            }
+        }
+        Err(error) => warn!("identity: principal remove encode failed: {error}"),
+    }
+    state
+        .principals
+        .borrow_mut()
+        .apply_record(PrincipalRecord::Remove {
+            tenant: tenant.to_string(),
+            fingerprint: fingerprint.to_vec(),
+        });
+    if let Err(error) = state.grants.delete(fingerprint.to_vec()) {
+        warn!("identity: grant removal failed: {error}");
+    }
 }
 
 /// Revokes a tenant CA: deletes its key from the host keyring, records the
@@ -654,29 +724,6 @@ fn revoke_tenant(tenant: &str, state: &IdentityState) -> Result<(), String> {
     Ok(())
 }
 
-/// Issues a short-TTL leaf certificate from a client SPKI, recording the
-/// principal's fingerprint in the registry.
-fn issue_user_cert(
-    tenant: &str,
-    spki_der: &[u8],
-    state: &IdentityState,
-) -> Result<Vec<u8>, String> {
-    let certificate_der =
-        selium_guest::sign_user_cert(tenant, spki_der).map_err(|error| format!("{error}"))?;
-    let fingerprint = fingerprint_of(spki_der);
-
-    // Record the fingerprint within the tenant; preserve any baseline grants
-    // already held by this principal across an issuance (a leaf rotation).
-    let grants = state
-        .principals
-        .borrow()
-        .grants(&fingerprint)
-        .cloned()
-        .unwrap_or_default();
-    record_principal(tenant, &fingerprint, &grants, state);
-    Ok(certificate_der)
-}
-
 /// Records a principal's baseline grant set and publishes it to the grant table.
 fn set_principal_grants(tenant: &str, fingerprint: &[u8], grants: &[u8], state: &IdentityState) {
     record_principal(tenant, fingerprint, grants, state);
@@ -685,59 +732,13 @@ fn set_principal_grants(tenant: &str, fingerprint: &[u8], grants: &[u8], state: 
     }
 }
 
-/// Removes a principal's baseline grants.
-fn remove_principal(tenant: &str, fingerprint: &[u8], state: &IdentityState) {
-    let timestamp_ms = selium_guest::time::now()
-        .map(|nanos| nanos / 1_000_000)
-        .unwrap_or_default();
-    match selium_abi::encode_rkyv(&PrincipalRecord::Remove {
-        tenant: tenant.to_string(),
-        fingerprint: fingerprint.to_vec(),
-    }) {
-        Ok(payload) => {
-            if let Err(error) = state
-                .principal_log
-                .append(timestamp_ms, Vec::new(), payload)
-            {
-                warn!("identity: principal remove append failed: {error}");
-            }
-        }
-        Err(error) => warn!("identity: principal remove encode failed: {error}"),
+fn tier_refused(verb: &str) -> IdentityResponse {
+    IdentityResponse::Error {
+        step: "tier".to_string(),
+        context: format!(
+            "caller is not authorised to {verb}: a tenant-tier caller is scoped to its own tenant"
+        ),
     }
-    state
-        .principals
-        .borrow_mut()
-        .apply_record(PrincipalRecord::Remove {
-            tenant: tenant.to_string(),
-            fingerprint: fingerprint.to_vec(),
-        });
-    if let Err(error) = state.grants.delete(fingerprint.to_vec()) {
-        warn!("identity: grant removal failed: {error}");
-    }
-}
-
-/// Appends a principal record and applies it to the projection.
-fn record_principal(tenant: &str, fingerprint: &[u8], grants: &[u8], state: &IdentityState) {
-    let timestamp_ms = selium_guest::time::now()
-        .map(|nanos| nanos / 1_000_000)
-        .unwrap_or_default();
-    let record = PrincipalRecord::Set {
-        tenant: tenant.to_string(),
-        fingerprint: fingerprint.to_vec(),
-        grants: grants.to_vec(),
-    };
-    match selium_abi::encode_rkyv(&record) {
-        Ok(payload) => {
-            if let Err(error) = state
-                .principal_log
-                .append(timestamp_ms, Vec::new(), payload)
-            {
-                warn!("identity: principal record append failed: {error}");
-            }
-        }
-        Err(error) => warn!("identity: principal record encode failed: {error}"),
-    }
-    state.principals.borrow_mut().apply_record(record);
 }
 
 #[cfg(test)]
