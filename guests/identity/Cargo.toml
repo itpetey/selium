@@ -24,8 +24,5 @@ selium-shm.workspace = true
 selium-wire.workspace = true
 sha2.workspace = true
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-
 [lints]
 workspace = true
