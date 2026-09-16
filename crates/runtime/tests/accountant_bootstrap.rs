@@ -21,45 +21,6 @@ use selium_accountant::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
-}
-
-/// One module exporting both accounting entrypoints, mirroring the shipped
-/// `selium-accountant` crate (the entrypoint macro emits a distinct export per
-/// function).
-fn module_with_both_entrypoints() -> Vec<u8> {
-    wat::parse_str(
-        "(module
-            (func (export \"bookkeeper\"))
-            (func (export \"accountant\")))",
-    )
-    .expect("compile two-entrypoint wat")
-}
-
-fn descriptor(
-    name: &str,
-    module_id: &str,
-    module_bytes: &[u8],
-    entrypoint: &str,
-    grants: Vec<CapabilityGrant>,
-    dependencies: Vec<String>,
-) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: name.to_string(),
-        module_id: module_id.to_string(),
-        module_bytes: module_bytes.to_vec(),
-        entrypoint: entrypoint.to_string(),
-        arguments: Vec::new(),
-        grants,
-        dependencies,
-        readiness: ReadinessCondition::Immediate,
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
 /// 7.1: the accountant guest's grant set is admissible at bootstrap, carrying
 /// `QuotaWrite` (bootstrap-provisioned only), durable-log storage, and the
 /// system-registration grant for the root-namespace routes it serves.
@@ -99,41 +60,6 @@ fn accountant_descriptor_grants_are_bootstrap_admissible() {
             .grants
             .iter()
             .any(|grant| grant.capability == Capability::SystemRegistration)
-    );
-}
-
-/// 7.1: the bookkeeper guest's grant set is admissible at bootstrap, carrying
-/// `MeteringRead` and `ActivityRead` for telemetry reduction.
-#[test]
-fn bookkeeper_descriptor_grants_are_bootstrap_admissible() {
-    let runtime = Runtime::default();
-    let bytes = module_with_entrypoint(BOOKKEEPER_ENTRYPOINT);
-
-    let guest = runtime
-        .spawn_system_guest(descriptor(
-            "bookkeeper",
-            "bookkeeper-module",
-            &bytes,
-            BOOKKEEPER_ENTRYPOINT,
-            bookkeeper_grants(),
-            Vec::new(),
-        ))
-        .expect("bookkeeper descriptor must be admissible at bootstrap");
-
-    let authority = runtime
-        .restore_process_authority(guest.process_id)
-        .expect("bookkeeper authority");
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::MeteringRead)
-    );
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::ActivityRead)
     );
 }
 
@@ -209,4 +135,78 @@ fn bookkeeper_boots_before_accountant_from_the_same_module_bytes() {
         bookkeeper_pos < accountant_pos,
         "bookkeeper boots before the accountant"
     );
+}
+
+/// 7.1: the bookkeeper guest's grant set is admissible at bootstrap, carrying
+/// `MeteringRead` and `ActivityRead` for telemetry reduction.
+#[test]
+fn bookkeeper_descriptor_grants_are_bootstrap_admissible() {
+    let runtime = Runtime::default();
+    let bytes = module_with_entrypoint(BOOKKEEPER_ENTRYPOINT);
+
+    let guest = runtime
+        .spawn_system_guest(descriptor(
+            "bookkeeper",
+            "bookkeeper-module",
+            &bytes,
+            BOOKKEEPER_ENTRYPOINT,
+            bookkeeper_grants(),
+            Vec::new(),
+        ))
+        .expect("bookkeeper descriptor must be admissible at bootstrap");
+
+    let authority = runtime
+        .restore_process_authority(guest.process_id)
+        .expect("bookkeeper authority");
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::MeteringRead)
+    );
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::ActivityRead)
+    );
+}
+
+fn descriptor(
+    name: &str,
+    module_id: &str,
+    module_bytes: &[u8],
+    entrypoint: &str,
+    grants: Vec<CapabilityGrant>,
+    dependencies: Vec<String>,
+) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: name.to_string(),
+        module_id: module_id.to_string(),
+        module_bytes: module_bytes.to_vec(),
+        entrypoint: entrypoint.to_string(),
+        arguments: Vec::new(),
+        grants,
+        dependencies,
+        readiness: ReadinessCondition::Immediate,
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+/// One module exporting both accounting entrypoints, mirroring the shipped
+/// `selium-accountant` crate (the entrypoint macro emits a distinct export per
+/// function).
+fn module_with_both_entrypoints() -> Vec<u8> {
+    wat::parse_str(
+        "(module
+            (func (export \"bookkeeper\"))
+            (func (export \"accountant\")))",
+    )
+    .expect("compile two-entrypoint wat")
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
 }

@@ -42,17 +42,20 @@ impl Runtime {
         // first bootstrap of the runtime; unit tests that drive
         // `metering_tick` manually are unaffected (the projection is
         // idempotent — it re-derives observations from the accumulators).
-        if !self.metering_ticker_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if !self
+            .metering_ticker_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             let runtime = self.clone();
             std::thread::Builder::new()
                 .name("selium-metering-ticker".to_string())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    runtime.metering_tick();
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        runtime.metering_tick();
+                    }
                 })
-                .map_err(|error| {
-                    Error::Host(format!("metering ticker spawn failed: {error}"))
-                })?;
+                .map_err(|error| Error::Host(format!("metering ticker spawn failed: {error}")))?;
         }
         let (discovery_feed_region_id, discovery_listener_shared_id) = if config.start_discovery {
             let (feed_region_id, listener_shared_id) = self.setup_discovery()?;

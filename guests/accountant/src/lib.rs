@@ -39,18 +39,22 @@ use selium_wire::{
     pubsub::{Publisher, Subscriber},
 };
 
-/// Bookkeeper entrypoint export name.
-pub const BOOKKEEPER_ENTRYPOINT: &str = "bookkeeper";
+/// The accountant's published narrowing live table: `tenant -> rkyv-encoded
+/// Vec<Capability>` of capabilities to subtract at conferral.
+pub type NarrowingLiveTable = LiveTable<String, Vec<u8>, ShmTransport>;
+
 /// Accountant entrypoint export name.
 pub const ACCOUNTANT_ENTRYPOINT: &str = "accountant";
+/// Bookkeeper entrypoint export name.
+pub const BOOKKEEPER_ENTRYPOINT: &str = "bookkeeper";
 /// Serving route path for the bookkeeper's bucket topic (`sel:///accounting-buckets`).
 pub const BUCKET_TOPIC_PATH: &str = "accounting-buckets";
-/// Serving route path for the accountant's narrowing live table (`sel:///accounting-narrowing`).
-pub const NARROWING_TABLE_PATH: &str = "accounting-narrowing";
 /// Serving route path for the accountant's control surface (`sel:///accountant`).
 pub const CONTROL_PATH: &str = "accountant";
 /// Durable log name for the usage ledger (per-minute windows + policy records).
 pub const LEDGER_LOG: &str = "selium.accountant.ledger";
+/// Serving route path for the accountant's narrowing live table (`sel:///accounting-narrowing`).
+pub const NARROWING_TABLE_PATH: &str = "accounting-narrowing";
 /// Ring capacity for the bucket topic and narrowing table.
 const TOPIC_CAPACITY: u64 = 64 * 1024;
 /// Seconds in one billing window.
@@ -72,60 +76,6 @@ pub struct Usage {
     pub storage_bytes: u64,
     /// Bandwidth bytes.
     pub bandwidth_bytes: u64,
-}
-
-impl Usage {
-    /// Adds counter dimensions (`cpu`, `bandwidth`).
-    fn add_counters(&mut self, other: Usage) {
-        self.cpu_micros = self.cpu_micros.saturating_add(other.cpu_micros);
-        self.bandwidth_bytes = self.bandwidth_bytes.saturating_add(other.bandwidth_bytes);
-    }
-
-    /// Merges gauge dimensions (`memory`, `storage`) taking the peak reading.
-    fn merge_gauges(&mut self, other: Usage) {
-        self.memory_bytes = self.memory_bytes.max(other.memory_bytes);
-        self.storage_bytes = self.storage_bytes.max(other.storage_bytes);
-    }
-
-    /// Returns the per-dimension excess of `self` over `ceiling`.
-    pub fn over(&self, ceiling: Usage) -> Usage {
-        Usage {
-            cpu_micros: self.cpu_micros.saturating_sub(ceiling.cpu_micros),
-            memory_bytes: self.memory_bytes.saturating_sub(ceiling.memory_bytes),
-            storage_bytes: self.storage_bytes.saturating_sub(ceiling.storage_bytes),
-            bandwidth_bytes: self.bandwidth_bytes.saturating_sub(ceiling.bandwidth_bytes),
-        }
-    }
-
-    /// Returns whether any dimension exceeds `ceiling`.
-    pub fn exceeds(&self, ceiling: Usage) -> bool {
-        self.cpu_micros > ceiling.cpu_micros
-            || self.memory_bytes > ceiling.memory_bytes
-            || self.storage_bytes > ceiling.storage_bytes
-            || self.bandwidth_bytes > ceiling.bandwidth_bytes
-    }
-}
-
-impl From<&MeteringBucket> for Usage {
-    fn from(bucket: &MeteringBucket) -> Self {
-        Self {
-            cpu_micros: bucket.cpu_micros,
-            memory_bytes: bucket.memory_bytes,
-            storage_bytes: bucket.storage_bytes,
-            bandwidth_bytes: bucket.bandwidth_bytes,
-        }
-    }
-}
-
-impl From<&TenantPlan> for Usage {
-    fn from(plan: &TenantPlan) -> Self {
-        Self {
-            cpu_micros: plan.cpu_micros,
-            memory_bytes: plan.memory_bytes,
-            storage_bytes: plan.storage_bytes,
-            bandwidth_bytes: plan.bandwidth_bytes,
-        }
-    }
 }
 
 /// A record appended to the durable usage ledger.
@@ -195,6 +145,121 @@ pub struct Account {
     last_usage: Usage,
 }
 
+/// Enforcement state authored from an account: quota values and the narrowing
+/// set the bridge-server subtracts from baseline conferrals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enforcement {
+    /// Shared-memory ceiling.
+    pub memory_quota: u64,
+    /// Storage ceiling (authored for both durable-log and blob-store classes).
+    pub storage_quota: u64,
+    /// Capabilities to subtract from a tenant's baseline grants at conferral.
+    pub narrowing: Vec<Capability>,
+}
+
+/// The bookkeeper's retained per-process cumulative counters, kept to
+/// difference incremental consumption between ticks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CumulativeCounters {
+    /// Last observed cumulative cpu microseconds.
+    pub cpu_micros: u64,
+    /// Last observed cumulative bandwidth bytes.
+    pub bandwidth_bytes: u64,
+}
+
+/// One sample under reduction: a live process, its tenant, and its current
+/// metering observation.
+pub struct ProcessSample {
+    /// Sampled process.
+    pub process_id: ProcessId,
+    /// The process's tenant, when known.
+    pub tenant: Option<String>,
+    /// The current metering observation.
+    pub observation: MeteringObservation,
+}
+
+/// A per-minute billing window accumulating merged bookkeeper buckets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RollingWindow {
+    /// Window start second (minute-aligned).
+    pub start_s: u64,
+    /// Per-tenant windowed usage.
+    pub usage: HashMap<String, Usage>,
+}
+
+/// The replayed usage projection: per-tenant windowed history, plus the policy
+/// records that rebuild account state on restart.
+#[derive(Debug, Clone, Default)]
+pub struct AccountBook {
+    /// Per-tenant live account projection.
+    pub accounts: HashMap<String, Account>,
+    /// Per-tenant windowed usage history (window start second → usage/overage).
+    pub history: HashMap<String, Vec<(u64, Usage, Usage)>>,
+}
+
+/// Shared accounting state handed between the rolling loop and RPC handlers.
+struct Shared {
+    accounts: AccountBook,
+    ledger: DurableLog,
+    buckets: Subscriber<MeteringBucket, ShmTransport>,
+    narrowing: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
+    window: Option<RollingWindow>,
+}
+
+impl Usage {
+    /// Adds counter dimensions (`cpu`, `bandwidth`).
+    fn add_counters(&mut self, other: Usage) {
+        self.cpu_micros = self.cpu_micros.saturating_add(other.cpu_micros);
+        self.bandwidth_bytes = self.bandwidth_bytes.saturating_add(other.bandwidth_bytes);
+    }
+
+    /// Merges gauge dimensions (`memory`, `storage`) taking the peak reading.
+    fn merge_gauges(&mut self, other: Usage) {
+        self.memory_bytes = self.memory_bytes.max(other.memory_bytes);
+        self.storage_bytes = self.storage_bytes.max(other.storage_bytes);
+    }
+
+    /// Returns the per-dimension excess of `self` over `ceiling`.
+    pub fn over(&self, ceiling: Usage) -> Usage {
+        Usage {
+            cpu_micros: self.cpu_micros.saturating_sub(ceiling.cpu_micros),
+            memory_bytes: self.memory_bytes.saturating_sub(ceiling.memory_bytes),
+            storage_bytes: self.storage_bytes.saturating_sub(ceiling.storage_bytes),
+            bandwidth_bytes: self.bandwidth_bytes.saturating_sub(ceiling.bandwidth_bytes),
+        }
+    }
+
+    /// Returns whether any dimension exceeds `ceiling`.
+    pub fn exceeds(&self, ceiling: Usage) -> bool {
+        self.cpu_micros > ceiling.cpu_micros
+            || self.memory_bytes > ceiling.memory_bytes
+            || self.storage_bytes > ceiling.storage_bytes
+            || self.bandwidth_bytes > ceiling.bandwidth_bytes
+    }
+}
+
+impl From<&MeteringBucket> for Usage {
+    fn from(bucket: &MeteringBucket) -> Self {
+        Self {
+            cpu_micros: bucket.cpu_micros,
+            memory_bytes: bucket.memory_bytes,
+            storage_bytes: bucket.storage_bytes,
+            bandwidth_bytes: bucket.bandwidth_bytes,
+        }
+    }
+}
+
+impl From<&TenantPlan> for Usage {
+    fn from(plan: &TenantPlan) -> Self {
+        Self {
+            cpu_micros: plan.cpu_micros,
+            memory_bytes: plan.memory_bytes,
+            storage_bytes: plan.storage_bytes,
+            bandwidth_bytes: plan.bandwidth_bytes,
+        }
+    }
+}
+
 impl Account {
     /// The account state derived from policy and the last windowed usage.
     pub fn state(&self) -> AccountState {
@@ -243,145 +308,6 @@ impl Account {
     }
 }
 
-/// Enforcement state authored from an account: quota values and the narrowing
-/// set the bridge-server subtracts from baseline conferrals.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Enforcement {
-    /// Shared-memory ceiling.
-    pub memory_quota: u64,
-    /// Storage ceiling (authored for both durable-log and blob-store classes).
-    pub storage_quota: u64,
-    /// Capabilities to subtract from a tenant's baseline grants at conferral.
-    pub narrowing: Vec<Capability>,
-}
-
-/// Computes the enforcement state for an account: non-delinquent tenants are
-/// capped at the hard ceiling (the opt-in overage budget, zero means the plan
-/// is the hard cap); a delinquent tenant is zeroed and narrowed to nothing.
-pub fn enforcement_for(plan: Usage, overage: Usage, delinquent: bool) -> Enforcement {
-    let hard = Usage {
-        cpu_micros: plan.cpu_micros.saturating_add(overage.cpu_micros),
-        memory_bytes: plan.memory_bytes.saturating_add(overage.memory_bytes),
-        storage_bytes: plan.storage_bytes.saturating_add(overage.storage_bytes),
-        bandwidth_bytes: plan.bandwidth_bytes.saturating_add(overage.bandwidth_bytes),
-    };
-    if delinquent {
-        Enforcement {
-            memory_quota: 0,
-            storage_quota: 0,
-            narrowing: all_capabilities(),
-        }
-    } else {
-        Enforcement {
-            memory_quota: hard.memory_bytes,
-            storage_quota: hard.storage_bytes,
-            narrowing: Vec::new(),
-        }
-    }
-}
-
-/// Every capability variant: a delinquent tenant's narrowing set, so conferral
-/// reduces the baseline grants to nothing.
-pub fn all_capabilities() -> Vec<Capability> {
-    vec![
-        Capability::ProcessLifecycle,
-        Capability::SharedMemory,
-        Capability::Signal,
-        Capability::Network,
-        Capability::Storage,
-        Capability::SessionLifecycle,
-        Capability::ActivityRead,
-        Capability::MeteringRead,
-        Capability::GuestLogRead,
-        Capability::GuestLogWrite,
-        Capability::HostQueue,
-        Capability::DelegateGrants,
-        Capability::SystemRegistration,
-        Capability::MintCertificate,
-        Capability::QuotaWrite,
-    ]
-}
-
-/// The bookkeeper's retained per-process cumulative counters, kept to
-/// difference incremental consumption between ticks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CumulativeCounters {
-    /// Last observed cumulative cpu microseconds.
-    pub cpu_micros: u64,
-    /// Last observed cumulative bandwidth bytes.
-    pub bandwidth_bytes: u64,
-}
-
-/// One sample under reduction: a live process, its tenant, and its current
-/// metering observation.
-pub struct ProcessSample {
-    /// Sampled process.
-    pub process_id: ProcessId,
-    /// The process's tenant, when known.
-    pub tenant: Option<String>,
-    /// The current metering observation.
-    pub observation: MeteringObservation,
-}
-
-/// Reduces samples into per-tenant buckets: cumulative counters are differenced
-/// against the retained last-known value (loss-tolerant) and gauges are sampled
-/// directly. Processes without a known tenant are dropped.
-pub fn reduce_samples(
-    samples: &[ProcessSample],
-    last_counters: &mut HashMap<ProcessId, CumulativeCounters>,
-) -> HashMap<String, Usage> {
-    let mut buckets: HashMap<String, Usage> = HashMap::new();
-    for sample in samples {
-        let Some(tenant) = &sample.tenant else {
-            let _ = sample.process_id;
-            continue;
-        };
-        let last = last_counters
-            .get(&sample.process_id)
-            .copied()
-            .unwrap_or_default();
-        let cpu_delta = sample
-            .observation
-            .cpu_micros
-            .saturating_sub(last.cpu_micros);
-        let bandwidth_delta = sample
-            .observation
-            .bandwidth_bytes
-            .saturating_sub(last.bandwidth_bytes);
-        last_counters.insert(
-            sample.process_id,
-            CumulativeCounters {
-                cpu_micros: sample.observation.cpu_micros,
-                bandwidth_bytes: sample.observation.bandwidth_bytes,
-            },
-        );
-
-        let bucket = buckets.entry(tenant.clone()).or_default();
-        bucket.add_counters(Usage {
-            cpu_micros: cpu_delta,
-            memory_bytes: 0,
-            storage_bytes: 0,
-            bandwidth_bytes: bandwidth_delta,
-        });
-        bucket.merge_gauges(Usage {
-            cpu_micros: 0,
-            memory_bytes: sample.observation.memory_bytes,
-            storage_bytes: sample.observation.storage_bytes,
-            bandwidth_bytes: 0,
-        });
-    }
-    buckets
-}
-
-/// A per-minute billing window accumulating merged bookkeeper buckets.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RollingWindow {
-    /// Window start second (minute-aligned).
-    pub start_s: u64,
-    /// Per-tenant windowed usage.
-    pub usage: HashMap<String, Usage>,
-}
-
 impl RollingWindow {
     /// Merges a bookkeeper bucket into the window: counters accumulate and
     /// gauges take the peak reading across the window's samples.
@@ -419,16 +345,6 @@ impl RollingWindow {
         }
         records
     }
-}
-
-/// The replayed usage projection: per-tenant windowed history, plus the policy
-/// records that rebuild account state on restart.
-#[derive(Debug, Clone, Default)]
-pub struct AccountBook {
-    /// Per-tenant live account projection.
-    pub accounts: HashMap<String, Account>,
-    /// Per-tenant windowed usage history (window start second → usage/overage).
-    pub history: HashMap<String, Vec<(u64, Usage, Usage)>>,
 }
 
 impl AccountBook {
@@ -483,59 +399,6 @@ impl AccountBook {
         self.rebuild_payloads(payloads);
         Ok(())
     }
-}
-
-/// The grant set assigned to the bookkeeper: metering and activity readings,
-/// shared memory for the bucket topic, and root-namespace route registration.
-pub fn bookkeeper_grants() -> Vec<CapabilityGrant> {
-    vec![
-        CapabilityGrant::new(
-            Capability::MeteringRead,
-            vec![ResourceSelector::ResourceClass(
-                ResourceClass::MeteringStream,
-            )],
-        ),
-        CapabilityGrant::new(
-            Capability::ActivityRead,
-            vec![ResourceSelector::ResourceClass(ResourceClass::ActivityLog)],
-        ),
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
-    ]
-}
-
-/// The grant set assigned to the accountant: sole quota authorship, storage for
-/// the usage ledger, shared memory for the narrowing table, host queues for the
-/// control listener, and root-namespace route registration.
-pub fn accountant_grants() -> Vec<CapabilityGrant> {
-    vec![
-        CapabilityGrant::new(Capability::QuotaWrite, Vec::new()),
-        CapabilityGrant::new(
-            Capability::Storage,
-            vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
-        ),
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        ),
-        CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
-    ]
-}
-
-/// Shared accounting state handed between the rolling loop and RPC handlers.
-struct Shared {
-    accounts: AccountBook,
-    ledger: DurableLog,
-    buckets: Subscriber<MeteringBucket, ShmTransport>,
-    narrowing: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
-    window: Option<RollingWindow>,
 }
 
 impl Shared {
@@ -623,155 +486,145 @@ impl Shared {
     }
 }
 
-/// The accountant's published narrowing live table: `tenant -> rkyv-encoded
-/// Vec<Capability>` of capabilities to subtract at conferral.
-pub type NarrowingLiveTable = LiveTable<String, Vec<u8>, ShmTransport>;
-
-/// Builds one live table over its own `LiveTable` ring, returning the ring id
-/// and the table.
-fn create_live_table(capacity: u64) -> selium_wire::Result<(u64, NarrowingLiveTable)> {
-    let channel = Channel::create_with_backpressure(
-        capacity,
-        ChannelBackpressure::Drop,
-        ResourceKind::LiveTable,
-    )?;
-    let region_id = channel.region_id();
-    let write = ShmTransport::new(&channel, &channel)?;
-    let read = ShmTransport::new(&channel, &channel)?;
-    let table = LiveTable::new(
-        Publisher::new(FramedWrite::new(write)),
-        Subscriber::new(FramedRead::new(read), None),
-    )?;
-    Ok((region_id, table))
+/// The grant set assigned to the accountant: sole quota authorship, storage for
+/// the usage ledger, shared memory for the narrowing table, host queues for the
+/// control listener, and root-namespace route registration.
+pub fn accountant_grants() -> Vec<CapabilityGrant> {
+    vec![
+        CapabilityGrant::new(Capability::QuotaWrite, Vec::new()),
+        CapabilityGrant::new(
+            Capability::Storage,
+            vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
+        ),
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        ),
+        CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        ),
+        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+    ]
 }
 
-/// The minute-aligned window start second for a bucket, from the bookkeeper's
-/// publish-time stamp carried on the bucket — not the accountant's
-/// receive-time clock, so a lagging consumer attributes boundary-straddling
-/// buckets to the window the bookkeeper sampled them in.
-fn bucket_second(bucket: &MeteringBucket) -> u64 {
-    bucket.published_unix_s - (bucket.published_unix_s % WINDOW_SECS)
+/// Every capability variant: a delinquent tenant's narrowing set, so conferral
+/// reduces the baseline grants to nothing.
+pub fn all_capabilities() -> Vec<Capability> {
+    vec![
+        Capability::ProcessLifecycle,
+        Capability::SharedMemory,
+        Capability::Signal,
+        Capability::Network,
+        Capability::Storage,
+        Capability::SessionLifecycle,
+        Capability::ActivityRead,
+        Capability::MeteringRead,
+        Capability::GuestLogRead,
+        Capability::GuestLogWrite,
+        Capability::HostQueue,
+        Capability::DelegateGrants,
+        Capability::SystemRegistration,
+        Capability::MintCertificate,
+        Capability::QuotaWrite,
+    ]
 }
 
-/// Bookkeeper entrypoint: inventory, sampling, reduction, and publication on a
-/// one-second cadence.
-#[entrypoint(no_poll)]
-async fn bookkeeper(mut ctx: Context) -> anyhow::Result<()> {
-    drop(selium_guest::log::init());
-    info!("bookkeeper: started");
+/// The grant set assigned to the bookkeeper: metering and activity readings,
+/// shared memory for the bucket topic, and root-namespace route registration.
+pub fn bookkeeper_grants() -> Vec<CapabilityGrant> {
+    vec![
+        CapabilityGrant::new(
+            Capability::MeteringRead,
+            vec![ResourceSelector::ResourceClass(
+                ResourceClass::MeteringStream,
+            )],
+        ),
+        CapabilityGrant::new(
+            Capability::ActivityRead,
+            vec![ResourceSelector::ResourceClass(ResourceClass::ActivityLog)],
+        ),
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        ),
+        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+    ]
+}
 
-    // The bucket topic this host's bookkeeper publishes to.
-    let channel = Channel::create_with_backpressure(
-        TOPIC_CAPACITY,
-        ChannelBackpressure::Drop,
-        ResourceKind::PubSubTopic,
-    )
-    .with_context(|| "bookkeeper: bucket topic create failed")?;
-    let region_id = channel.region_id();
-    let transport = ShmTransport::new(&channel, &channel)
-        .map_err(|e| anyhow::anyhow!("bookkeeper: bucket transport failed: {e}"))?;
-    let mut publisher = Publisher::new(FramedWrite::new(transport));
-
-    let target = ResourceTarget {
-        uri: String::new(),
-        host_id: String::new(),
-        resource_id: region_id,
-        interface: None,
-        tenant: None,
-        class: ResourceClass::SharedRegion,
-        labels: Vec::new(),
+/// Computes the enforcement state for an account: non-delinquent tenants are
+/// capped at the hard ceiling (the opt-in overage budget, zero means the plan
+/// is the hard cap); a delinquent tenant is zeroed and narrowed to nothing.
+pub fn enforcement_for(plan: Usage, overage: Usage, delinquent: bool) -> Enforcement {
+    let hard = Usage {
+        cpu_micros: plan.cpu_micros.saturating_add(overage.cpu_micros),
+        memory_bytes: plan.memory_bytes.saturating_add(overage.memory_bytes),
+        storage_bytes: plan.storage_bytes.saturating_add(overage.storage_bytes),
+        bandwidth_bytes: plan.bandwidth_bytes.saturating_add(overage.bandwidth_bytes),
     };
-    ctx.serve(Serve {
-        path: vec![BUCKET_TOPIC_PATH.to_string()],
-        target,
-        default: false,
-    })
-    .await
-    .with_context(|| "bookkeeper: serve bucket topic failed")?;
-
-    // Live-process inventory, rebuilt from lifecycle activity events.
-    let mut inventory: HashMap<ProcessId, Option<String>> = HashMap::new();
-    let mut last_counters: HashMap<ProcessId, CumulativeCounters> = HashMap::new();
-    let mut activity_cursor = 0_usize;
-
-    mark_ready();
-
-    let mut next = Instant::now().map_err(|e| anyhow::anyhow!("bookkeeper: clock failed: {e}"))?;
-    loop {
-        next = next
-            .checked_add(Duration::from_secs(1))
-            .expect("bookkeeper tick overflow");
-        sync_inventory(&mut inventory, &mut activity_cursor);
-
-        // Sample every live process (resolving still-unknown tenants, e.g. a
-        // process started before its ProcessStarted event was observed).
-        let pids: Vec<ProcessId> = inventory.keys().copied().collect();
-        let mut samples = Vec::new();
-        for pid in pids {
-            let tenant = match inventory.get(&pid).cloned().flatten() {
-                Some(tenant) => Some(tenant),
-                None => match process_tenant(pid) {
-                    Ok(Some(tenant)) => {
-                        inventory.insert(pid, Some(tenant.clone()));
-                        Some(tenant)
-                    }
-                    _ => None,
-                },
-            };
-            match Metering::read(pid) {
-                Ok(Some(observation)) => samples.push(ProcessSample {
-                    process_id: pid,
-                    tenant,
-                    observation,
-                }),
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(
-                        process_id = pid,
-                        "bookkeeper: metering read failed: {error}"
-                    );
-                }
-            }
+    if delinquent {
+        Enforcement {
+            memory_quota: 0,
+            storage_quota: 0,
+            narrowing: all_capabilities(),
         }
-
-        let buckets = reduce_samples(&samples, &mut last_counters);
-        for (tenant, usage) in &buckets {
-            let bucket = MeteringBucket {
-                tenant: tenant.clone(),
-                cpu_micros: usage.cpu_micros,
-                memory_bytes: usage.memory_bytes,
-                storage_bytes: usage.storage_bytes,
-                bandwidth_bytes: usage.bandwidth_bytes,
-                // Publish-time stamp: the accountant buckets windows by this
-                // stamp, not by its receive-time clock.
-                published_unix_s: time::now().map(|nanos| nanos / 1_000_000_000).unwrap_or(0),
-            };
-            if let Err(error) = publisher.publish(&bucket) {
-                warn!(tenant, "bookkeeper: bucket publish failed: {error}");
-            }
+    } else {
+        Enforcement {
+            memory_quota: hard.memory_bytes,
+            storage_quota: hard.storage_bytes,
+            narrowing: Vec::new(),
         }
-
-        Timer::new(next).await;
     }
 }
 
-/// Syncs the process inventory from lifecycle activity events since `cursor`.
-fn sync_inventory(inventory: &mut HashMap<ProcessId, Option<String>>, cursor: &mut usize) {
-    for event in ActivityLog::read_from(*cursor).unwrap_or_default() {
-        *cursor = cursor.saturating_add(1);
-        let Some(process_id) = event.process_id else {
+/// Reduces samples into per-tenant buckets: cumulative counters are differenced
+/// against the retained last-known value (loss-tolerant) and gauges are sampled
+/// directly. Processes without a known tenant are dropped.
+pub fn reduce_samples(
+    samples: &[ProcessSample],
+    last_counters: &mut HashMap<ProcessId, CumulativeCounters>,
+) -> HashMap<String, Usage> {
+    let mut buckets: HashMap<String, Usage> = HashMap::new();
+    for sample in samples {
+        let Some(tenant) = &sample.tenant else {
+            let _ = sample.process_id;
             continue;
         };
-        match event.kind {
-            ActivityKind::ProcessStarted => {
-                inventory.entry(process_id).or_insert(None);
-            }
-            ActivityKind::ProcessExited | ActivityKind::ProcessStopped => {
-                inventory.remove(&process_id);
-            }
-            _ => {}
-        }
+        let last = last_counters
+            .get(&sample.process_id)
+            .copied()
+            .unwrap_or_default();
+        let cpu_delta = sample
+            .observation
+            .cpu_micros
+            .saturating_sub(last.cpu_micros);
+        let bandwidth_delta = sample
+            .observation
+            .bandwidth_bytes
+            .saturating_sub(last.bandwidth_bytes);
+        last_counters.insert(
+            sample.process_id,
+            CumulativeCounters {
+                cpu_micros: sample.observation.cpu_micros,
+                bandwidth_bytes: sample.observation.bandwidth_bytes,
+            },
+        );
+
+        let bucket = buckets.entry(tenant.clone()).or_default();
+        bucket.add_counters(Usage {
+            cpu_micros: cpu_delta,
+            memory_bytes: 0,
+            storage_bytes: 0,
+            bandwidth_bytes: bandwidth_delta,
+        });
+        bucket.merge_gauges(Usage {
+            cpu_micros: 0,
+            memory_bytes: sample.observation.memory_bytes,
+            storage_bytes: sample.observation.storage_bytes,
+            bandwidth_bytes: 0,
+        });
     }
+    buckets
 }
 
 /// Accountant entrypoint: ledger replay, window rolling, ceiling evaluation,
@@ -888,6 +741,227 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     }
 }
 
+/// Applies one operator/billing control to the shared state.
+fn apply_control(
+    shared: &Rc<RefCell<Shared>>,
+    control: AccountantControl,
+) -> AccountantControlResponse {
+    let (tenant, record) = match control {
+        AccountantControl::SetPlan { tenant, plan } => (
+            tenant.clone(),
+            LedgerRecord::SetPlan {
+                tenant,
+                plan: Usage::from(&plan),
+            },
+        ),
+        AccountantControl::SetOverage { tenant, overage } => (
+            tenant.clone(),
+            LedgerRecord::SetOverage {
+                tenant,
+                overage: Usage::from(&overage),
+            },
+        ),
+        AccountantControl::MarkDelinquent { tenant } => {
+            (tenant.clone(), LedgerRecord::Delinquent { tenant })
+        }
+        AccountantControl::MarkRestored { tenant } => {
+            (tenant.clone(), LedgerRecord::Restored { tenant })
+        }
+    };
+
+    {
+        let mut shared = shared.borrow_mut();
+        shared.apply_policy(&tenant, record);
+    }
+
+    AccountantControlResponse::Updated { tenant }
+}
+
+/// Bookkeeper entrypoint: inventory, sampling, reduction, and publication on a
+/// one-second cadence.
+#[entrypoint(no_poll)]
+async fn bookkeeper(mut ctx: Context) -> anyhow::Result<()> {
+    drop(selium_guest::log::init());
+    info!("bookkeeper: started");
+
+    // The bucket topic this host's bookkeeper publishes to.
+    let channel = Channel::create_with_backpressure(
+        TOPIC_CAPACITY,
+        ChannelBackpressure::Drop,
+        ResourceKind::PubSubTopic,
+    )
+    .with_context(|| "bookkeeper: bucket topic create failed")?;
+    let region_id = channel.region_id();
+    let transport = ShmTransport::new(&channel, &channel)
+        .map_err(|e| anyhow::anyhow!("bookkeeper: bucket transport failed: {e}"))?;
+    let mut publisher = Publisher::new(FramedWrite::new(transport));
+
+    let target = ResourceTarget {
+        uri: String::new(),
+        host_id: String::new(),
+        resource_id: region_id,
+        interface: None,
+        tenant: None,
+        class: ResourceClass::SharedRegion,
+        labels: Vec::new(),
+    };
+    ctx.serve(Serve {
+        path: vec![BUCKET_TOPIC_PATH.to_string()],
+        target,
+        default: false,
+    })
+    .await
+    .with_context(|| "bookkeeper: serve bucket topic failed")?;
+
+    // Live-process inventory, rebuilt from lifecycle activity events.
+    let mut inventory: HashMap<ProcessId, Option<String>> = HashMap::new();
+    let mut last_counters: HashMap<ProcessId, CumulativeCounters> = HashMap::new();
+    let mut activity_cursor = 0_usize;
+
+    mark_ready();
+
+    let mut next = Instant::now().map_err(|e| anyhow::anyhow!("bookkeeper: clock failed: {e}"))?;
+    loop {
+        next = next
+            .checked_add(Duration::from_secs(1))
+            .expect("bookkeeper tick overflow");
+        sync_inventory(&mut inventory, &mut activity_cursor);
+
+        // Sample every live process (resolving still-unknown tenants, e.g. a
+        // process started before its ProcessStarted event was observed).
+        let pids: Vec<ProcessId> = inventory.keys().copied().collect();
+        let mut samples = Vec::new();
+        for pid in pids {
+            let tenant = match inventory.get(&pid).cloned().flatten() {
+                Some(tenant) => Some(tenant),
+                None => match process_tenant(pid) {
+                    Ok(Some(tenant)) => {
+                        inventory.insert(pid, Some(tenant.clone()));
+                        Some(tenant)
+                    }
+                    _ => None,
+                },
+            };
+            match Metering::read(pid) {
+                Ok(Some(observation)) => samples.push(ProcessSample {
+                    process_id: pid,
+                    tenant,
+                    observation,
+                }),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        process_id = pid,
+                        "bookkeeper: metering read failed: {error}"
+                    );
+                }
+            }
+        }
+
+        let buckets = reduce_samples(&samples, &mut last_counters);
+        for (tenant, usage) in &buckets {
+            let bucket = MeteringBucket {
+                tenant: tenant.clone(),
+                cpu_micros: usage.cpu_micros,
+                memory_bytes: usage.memory_bytes,
+                storage_bytes: usage.storage_bytes,
+                bandwidth_bytes: usage.bandwidth_bytes,
+                // Publish-time stamp: the accountant buckets windows by this
+                // stamp, not by its receive-time clock.
+                published_unix_s: time::now().map(|nanos| nanos / 1_000_000_000).unwrap_or(0),
+            };
+            if let Err(error) = publisher.publish(&bucket) {
+                warn!(tenant, "bookkeeper: bucket publish failed: {error}");
+            }
+        }
+
+        Timer::new(next).await;
+    }
+}
+
+/// The minute-aligned window start second for a bucket, from the bookkeeper's
+/// publish-time stamp carried on the bucket — not the accountant's
+/// receive-time clock, so a lagging consumer attributes boundary-straddling
+/// buckets to the window the bookkeeper sampled them in.
+fn bucket_second(bucket: &MeteringBucket) -> u64 {
+    bucket.published_unix_s - (bucket.published_unix_s % WINDOW_SECS)
+}
+
+/// Builds one live table over its own `LiveTable` ring, returning the ring id
+/// and the table.
+fn create_live_table(capacity: u64) -> selium_wire::Result<(u64, NarrowingLiveTable)> {
+    let channel = Channel::create_with_backpressure(
+        capacity,
+        ChannelBackpressure::Drop,
+        ResourceKind::LiveTable,
+    )?;
+    let region_id = channel.region_id();
+    let write = ShmTransport::new(&channel, &channel)?;
+    let read = ShmTransport::new(&channel, &channel)?;
+    let table = LiveTable::new(
+        Publisher::new(FramedWrite::new(write)),
+        Subscriber::new(FramedRead::new(read), None),
+    )?;
+    Ok((region_id, table))
+}
+
+/// Serves one operator/billing control session. The operator tier is derived
+/// from the caller's process tenant: only a root/system principal may author
+/// plans, budgets, and billing-state transitions.
+async fn handle_control(
+    mut connection: selium_shm::rpc::RpcConnection<AccountantControl, AccountantControlResponse>,
+    shared: Rc<RefCell<Shared>>,
+) {
+    let operator = match process_tenant(connection.client_process_id()) {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(error) => {
+            warn!(
+                client = connection.client_process_id(),
+                "accountant: could not resolve caller tenant: {error}"
+            );
+            false
+        }
+    };
+
+    loop {
+        match connection.recv().await {
+            Ok(request) => {
+                let response = match request.payload() {
+                    Ok(_) if !operator => AccountantControlResponse::Error {
+                        context: "operator tier required".to_string(),
+                    },
+                    Ok(payload) => apply_control(&shared, payload),
+                    Err(error) => AccountantControlResponse::Error {
+                        context: format!("{error}"),
+                    },
+                };
+                if let Err(error) = request.reply(response).await {
+                    warn!("accountant: reply failed: {error}");
+                    break;
+                }
+            }
+            Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
+            Err(error) => {
+                warn!("accountant: recv failed: {error}");
+                break;
+            }
+        }
+    }
+}
+
+/// Rolls the current window into the ledger when its minute has elapsed,
+/// returning the rolled records (empty when the minute is still open).
+fn roll_due(shared: &mut Shared) -> Vec<LedgerRecord> {
+    match shared.window.take() {
+        Some(window) if window_complete(&window) => shared.roll_window(window),
+        window => {
+            shared.window = window;
+            Vec::new()
+        }
+    }
+}
+
 /// The rolling loop: drains bookkeeper buckets into the current minute window
 /// and rolls a completed window into the ledger, re-evaluating enforcement.
 async fn roll_loop(shared: Rc<RefCell<Shared>>) {
@@ -940,17 +1014,24 @@ async fn roll_loop(shared: Rc<RefCell<Shared>>) {
     }
 }
 
-    /// Rolls the current window into the ledger when its minute has elapsed,
-    /// returning the rolled records (empty when the minute is still open).
-    fn roll_due(shared: &mut Shared) -> Vec<LedgerRecord> {
-        match shared.window.take() {
-            Some(window) if window_complete(&window) => shared.roll_window(window),
-            window => {
-                shared.window = window;
-                Vec::new()
+/// Syncs the process inventory from lifecycle activity events since `cursor`.
+fn sync_inventory(inventory: &mut HashMap<ProcessId, Option<String>>, cursor: &mut usize) {
+    for event in ActivityLog::read_from(*cursor).unwrap_or_default() {
+        *cursor = cursor.saturating_add(1);
+        let Some(process_id) = event.process_id else {
+            continue;
+        };
+        match event.kind {
+            ActivityKind::ProcessStarted => {
+                inventory.entry(process_id).or_insert(None);
             }
+            ActivityKind::ProcessExited | ActivityKind::ProcessStopped => {
+                inventory.remove(&process_id);
+            }
+            _ => {}
         }
     }
+}
 
 /// Whether a window's minute has elapsed.
 fn window_complete(window: &RollingWindow) -> bool {
@@ -958,87 +1039,6 @@ fn window_complete(window: &RollingWindow) -> bool {
         .map(|nanos| nanos / 1_000_000_000)
         .map(|now_s| now_s >= window.start_s + WINDOW_SECS)
         .unwrap_or(false)
-}
-
-/// Serves one operator/billing control session. The operator tier is derived
-/// from the caller's process tenant: only a root/system principal may author
-/// plans, budgets, and billing-state transitions.
-async fn handle_control(
-    mut connection: selium_shm::rpc::RpcConnection<AccountantControl, AccountantControlResponse>,
-    shared: Rc<RefCell<Shared>>,
-) {
-    let operator = match process_tenant(connection.client_process_id()) {
-        Ok(None) => true,
-        Ok(Some(_)) => false,
-        Err(error) => {
-            warn!(
-                client = connection.client_process_id(),
-                "accountant: could not resolve caller tenant: {error}"
-            );
-            false
-        }
-    };
-
-    loop {
-        match connection.recv().await {
-            Ok(request) => {
-                let response = match request.payload() {
-                    Ok(_) if !operator => AccountantControlResponse::Error {
-                        context: "operator tier required".to_string(),
-                    },
-                    Ok(payload) => apply_control(&shared, payload),
-                    Err(error) => AccountantControlResponse::Error {
-                        context: format!("{error}"),
-                    },
-                };
-                if let Err(error) = request.reply(response).await {
-                    warn!("accountant: reply failed: {error}");
-                    break;
-                }
-            }
-            Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
-            Err(error) => {
-                warn!("accountant: recv failed: {error}");
-                break;
-            }
-        }
-    }
-}
-
-/// Applies one operator/billing control to the shared state.
-fn apply_control(
-    shared: &Rc<RefCell<Shared>>,
-    control: AccountantControl,
-) -> AccountantControlResponse {
-    let (tenant, record) = match control {
-        AccountantControl::SetPlan { tenant, plan } => (
-            tenant.clone(),
-            LedgerRecord::SetPlan {
-                tenant,
-                plan: Usage::from(&plan),
-            },
-        ),
-        AccountantControl::SetOverage { tenant, overage } => (
-            tenant.clone(),
-            LedgerRecord::SetOverage {
-                tenant,
-                overage: Usage::from(&overage),
-            },
-        ),
-        AccountantControl::MarkDelinquent { tenant } => {
-            (tenant.clone(), LedgerRecord::Delinquent { tenant })
-        }
-        AccountantControl::MarkRestored { tenant } => {
-            (tenant.clone(), LedgerRecord::Restored { tenant })
-        }
-    };
-
-    {
-        let mut shared = shared.borrow_mut();
-        shared.apply_policy(&tenant, record);
-    }
-
-    AccountantControlResponse::Updated { tenant }
 }
 
 #[cfg(test)]

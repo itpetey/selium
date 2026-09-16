@@ -20,19 +20,18 @@ use mio::{
     Events, Interest, Token,
     net::{TcpListener, TcpStream, UdpSocket},
 };
-
 use parking_lot::Mutex;
 use selium_shm::layout::RingWriter;
 
 /// Callback invoked when a TCP listener accepts a new connection.
 /// Receives a freshly accepted std TcpStream.
 pub type AcceptFn = Box<dyn Fn(StdTcpStream) + Send + 'static>;
-/// Callback invoked when the host advances a ring generation.
-pub type GenerationAdvanceFn = Box<dyn Fn(u64, u64) + Send + Sync + 'static>;
 /// Callback invoked with the byte count of each socket read, so the runtime
 /// can attribute bandwidth consumption to the owning process's metering
 /// counter (see `Runtime::record_bandwidth_usage`).
 pub type BandwidthFn = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+/// Callback invoked when the host advances a ring generation.
+pub type GenerationAdvanceFn = Box<dyn Fn(u64, u64) + Send + Sync + 'static>;
 
 /// Poller entry for a registered socket.
 enum PollerEntry {

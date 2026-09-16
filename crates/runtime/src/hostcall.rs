@@ -1816,7 +1816,8 @@ impl Runtime {
         // Transfer ownership: the sender's entry leaves its resource table,
         // the receiver's gains it.
         let mut shared_resource_owners = self.shared_resource_owners.lock();
-        if let Some(owners) = shared_resource_owners.get_mut(&(ResourceClass::SharedRegion, region_id))
+        if let Some(owners) =
+            shared_resource_owners.get_mut(&(ResourceClass::SharedRegion, region_id))
         {
             owners.remove(&sender_pid);
             owners.insert(receiver_pid);
@@ -3181,7 +3182,13 @@ mod tests {
         else {
             panic!("owner should create its queue");
         };
-        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 0);
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::HostQueue),
+            0
+        );
 
         // Author a two-item pipe ceiling for acme.
         runtime
@@ -3196,16 +3203,20 @@ mod tests {
             "queue-sender",
             vec![CapabilityGrant::new(
                 Capability::HostQueue,
-                vec![ResourceSelector::ExplicitResource(ResourceIdentity::Shared(
-                    queue.shared_id,
-                ))],
+                vec![ResourceSelector::ExplicitResource(
+                    ResourceIdentity::Shared(queue.shared_id),
+                )],
             )],
             None,
         )
         .process_id;
 
-        let (attach_status, attach_op) =
-            runtime.begin_hostcall(sender, HostcallRequest::HostQueueAttach { shared_id: queue.shared_id });
+        let (attach_status, attach_op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueAttach {
+                shared_id: queue.shared_id,
+            },
+        );
         assert_eq!(attach_status, selium_abi::HOSTCALL_STATUS_READY);
         let CompletionState::Ready(HostcallOutput::HostQueue(sender_queue)) =
             runtime.poll_hostcall(sender, attach_op)
@@ -3229,7 +3240,13 @@ mod tests {
         assert_eq!(first, selium_abi::HOSTCALL_STATUS_READY);
         let (second, _) = send(2);
         assert_eq!(second, selium_abi::HOSTCALL_STATUS_READY);
-        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 2);
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::HostQueue),
+            2
+        );
         let (third_status, third_op) = send(3);
         assert_eq!(third_status, selium_abi::HOSTCALL_STATUS_FAILED);
         assert!(matches!(
@@ -3239,14 +3256,24 @@ mod tests {
 
         // The owner receives one item: its slot is released and a further
         // send fits again.
-        let (recv_status, recv_op) =
-            runtime.begin_hostcall(owner, HostcallRequest::HostQueueRecv { local_id: queue.local_id });
+        let (recv_status, recv_op) = runtime.begin_hostcall(
+            owner,
+            HostcallRequest::HostQueueRecv {
+                local_id: queue.local_id,
+            },
+        );
         assert_eq!(recv_status, selium_abi::HOSTCALL_STATUS_READY);
         assert!(matches!(
             runtime.poll_hostcall(owner, recv_op),
             CompletionState::Ready(HostcallOutput::ConnectionInfo { value: 1, .. })
         ));
-        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 1);
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::HostQueue),
+            1
+        );
         let (fourth, _) = send(4);
         assert_eq!(fourth, selium_abi::HOSTCALL_STATUS_READY);
     }
@@ -3313,20 +3340,35 @@ mod tests {
         assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
 
         assert_eq!(
-            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
             65_536
         );
-        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 1);
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::HostQueue),
+            1
+        );
 
         // The worker dies: its region and queued item return to the quota.
         runtime.stop_process(guest).expect("stop worker");
         assert_eq!(
-            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
             0,
             "destroyed region's bytes must return to the tenant's quota"
         );
         assert_eq!(
-            runtime.kernel().quota().used("acme", ResourceClass::HostQueue),
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::HostQueue),
             0,
             "queued items of a dead owner must release their pipe slots"
         );
@@ -3386,9 +3428,9 @@ mod tests {
                 ),
                 CapabilityGrant::new(
                     Capability::HostQueue,
-                    vec![ResourceSelector::ExplicitResource(ResourceIdentity::Shared(
-                        queue.shared_id,
-                    ))],
+                    vec![ResourceSelector::ExplicitResource(
+                        ResourceIdentity::Shared(queue.shared_id),
+                    )],
                 ),
             ],
             Some("acme"),
@@ -3412,12 +3454,19 @@ mod tests {
             panic!("sender should allocate its region");
         };
         assert_eq!(
-            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
             65_536
         );
 
-        let (attach_status, attach_op) =
-            runtime.begin_hostcall(sender, HostcallRequest::HostQueueAttach { shared_id: queue.shared_id });
+        let (attach_status, attach_op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueAttach {
+                shared_id: queue.shared_id,
+            },
+        );
         assert_eq!(attach_status, selium_abi::HOSTCALL_STATUS_READY);
         let CompletionState::Ready(HostcallOutput::HostQueue(sender_queue)) =
             runtime.poll_hostcall(sender, attach_op)
@@ -3449,12 +3498,18 @@ mod tests {
 
         // The reservation followed the resource: acme's bytes moved to beta.
         assert_eq!(
-            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
             0,
             "the sender's reservation must move with the handed-off region"
         );
         assert_eq!(
-            runtime.kernel().quota().used("beta", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("beta", ResourceClass::SharedRegion),
             65_536,
             "the receiver's tenant inherits the region's reservation"
         );
@@ -3473,7 +3528,10 @@ mod tests {
             CompletionState::Ready(_)
         ));
         assert_eq!(
-            runtime.kernel().quota().used("beta", ResourceClass::SharedRegion),
+            runtime
+                .kernel()
+                .quota()
+                .used("beta", ResourceClass::SharedRegion),
             0
         );
 

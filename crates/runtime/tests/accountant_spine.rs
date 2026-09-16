@@ -65,68 +65,6 @@ fn accounting_descriptor(
     }
 }
 
-fn workload_descriptor() -> SystemGuestDescriptor {
-    // The stub entrypoint takes the bootstrap-prepended discovery-handle slot
-    // (every non-discovery guest's leading Context parameter).
-    let module_bytes = wat::parse_str("(module (memory 1) (func (export \"boot\") (param i64)))")
-        .expect("compile workload");
-    SystemGuestDescriptor {
-        name: "workload".to_string(),
-        module_id: "workload-module".to_string(),
-        module_bytes,
-        entrypoint: "boot".to_string(),
-        arguments: Vec::new(),
-        grants: vec![CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![
-                ResourceSelector::Tenant(TENANT.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-            ],
-        )],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
-        tenant: Some(TENANT.to_string()),
-        serving_role: None,
-        handlers: Vec::new(),
-    }
-}
-
-/// Polls the usage ledger until a `Window` record for `tenant` appears.
-#[expect(clippy::panic, reason = "test helper")]
-fn wait_for_ledger_window(
-    runtime: &Runtime,
-    tenant: &str,
-    timeout: Duration,
-    guest_pids: &[u64],
-) -> LedgerRecord {
-    let storage = runtime.kernel().storage();
-    let memory = runtime.kernel().memory();
-    let ledger = storage.open_log(&memory, LEDGER_LOG);
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        let records = storage
-            .replay_log(ledger.local_id, None, u32::MAX as usize)
-            .expect("replay usage ledger");
-        for record in records {
-            if let Ok(decoded) = selium_abi::decode_rkyv::<LedgerRecord>(&record.payload)
-                && matches!(&decoded, LedgerRecord::Window { tenant: t, .. } if t == tenant)
-            {
-                return decoded;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    // Surface every guest's retained logs on the way out: warnings are
-    // dropped when a guest log channel fills, so the failure mode would
-    // otherwise be invisible.
-    for pid in guest_pids {
-        for line in spine_common::drain_logs(runtime, *pid) {
-            println!("GUESTLOG {pid}: {line}");
-        }
-    }
-    panic!("timed out waiting for an {tenant} window in the usage ledger");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the discovery and accountant guests built for wasm32-unknown-unknown"]
 async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
@@ -243,5 +181,67 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
 
     for guest in report.guests {
         runtime.stop_process(guest.process_id).expect("stop guest");
+    }
+}
+
+/// Polls the usage ledger until a `Window` record for `tenant` appears.
+#[expect(clippy::panic, reason = "test helper")]
+fn wait_for_ledger_window(
+    runtime: &Runtime,
+    tenant: &str,
+    timeout: Duration,
+    guest_pids: &[u64],
+) -> LedgerRecord {
+    let storage = runtime.kernel().storage();
+    let memory = runtime.kernel().memory();
+    let ledger = storage.open_log(&memory, LEDGER_LOG);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let records = storage
+            .replay_log(ledger.local_id, None, u32::MAX as usize)
+            .expect("replay usage ledger");
+        for record in records {
+            if let Ok(decoded) = selium_abi::decode_rkyv::<LedgerRecord>(&record.payload)
+                && matches!(&decoded, LedgerRecord::Window { tenant: t, .. } if t == tenant)
+            {
+                return decoded;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Surface every guest's retained logs on the way out: warnings are
+    // dropped when a guest log channel fills, so the failure mode would
+    // otherwise be invisible.
+    for pid in guest_pids {
+        for line in spine_common::drain_logs(runtime, *pid) {
+            println!("GUESTLOG {pid}: {line}");
+        }
+    }
+    panic!("timed out waiting for an {tenant} window in the usage ledger");
+}
+
+fn workload_descriptor() -> SystemGuestDescriptor {
+    // The stub entrypoint takes the bootstrap-prepended discovery-handle slot
+    // (every non-discovery guest's leading Context parameter).
+    let module_bytes = wat::parse_str("(module (memory 1) (func (export \"boot\") (param i64)))")
+        .expect("compile workload");
+    SystemGuestDescriptor {
+        name: "workload".to_string(),
+        module_id: "workload-module".to_string(),
+        module_bytes,
+        entrypoint: "boot".to_string(),
+        arguments: Vec::new(),
+        grants: vec![CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![
+                ResourceSelector::Tenant(TENANT.to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
+            ],
+        )],
+        dependencies: Vec::new(),
+        readiness: ReadinessCondition::Immediate,
+        tenant: Some(TENANT.to_string()),
+        serving_role: None,
+        handlers: Vec::new(),
     }
 }

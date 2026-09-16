@@ -126,11 +126,10 @@ pub fn tcp_bind(
                     // never delivered, so tear the connection down loudly rather
                     // than letting it hang.
                     let bandwidth_rt = rt.clone();
-                    let bandwidth_cb: Option<selium_kernel::BandwidthFn> = Some(
-                        std::sync::Arc::new(move |bytes: u64| {
+                    let bandwidth_cb: Option<selium_kernel::BandwidthFn> =
+                        Some(std::sync::Arc::new(move |bytes: u64| {
                             bandwidth_rt.record_bandwidth_usage(owner_pid, bytes);
-                        }),
-                    );
+                        }));
                     let registration = match k.poller() {
                         Some(p) => p.register_tcp_stream(
                             stream,
@@ -171,8 +170,7 @@ pub fn tcp_bind(
                             Some(Box::new(move |bytes: u64| {
                                 drain_rt.record_bandwidth_usage(drain_pid, bytes);
                             })),
-                        ) {
-                        }
+                        ) {}
                         rt2.network_wait_keys
                             .lock()
                             .retain(|(sid, _)| *sid != shared_id);
@@ -236,11 +234,18 @@ pub fn tcp_connect(
     if let Some(poller) = kernel.poller() {
         let bandwidth_rt = runtime.clone();
         let bandwidth_pid = process_id;
-        let bandwidth_cb: Option<selium_kernel::BandwidthFn> = Some(std::sync::Arc::new(
-            move |bytes: u64| bandwidth_rt.record_bandwidth_usage(bandwidth_pid, bytes),
-        ));
+        let bandwidth_cb: Option<selium_kernel::BandwidthFn> =
+            Some(std::sync::Arc::new(move |bytes: u64| {
+                bandwidth_rt.record_bandwidth_usage(bandwidth_pid, bytes)
+            }));
         poller
-            .register_tcp_stream(std_stream, inbound_writer, shared_id, running.clone(), bandwidth_cb)
+            .register_tcp_stream(
+                std_stream,
+                inbound_writer,
+                shared_id,
+                running.clone(),
+                bandwidth_cb,
+            )
             .map_err(|e| crate::Error::Host(format!("poller register stream: {e}")))?;
     }
 

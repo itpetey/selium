@@ -33,15 +33,6 @@ struct QuotaState {
     used: u64,
 }
 
-impl Default for QuotaState {
-    fn default() -> Self {
-        Self {
-            limit: u64::MAX,
-            used: 0,
-        }
-    }
-}
-
 struct QuotaTableInner {
     quotas: Mutex<HashMap<(String, ResourceClass), QuotaState>>,
 }
@@ -62,9 +53,7 @@ impl QuotaTable {
     /// observed against it (frees already released their reservation).
     pub fn set(&self, tenant: impl Into<String>, class: ResourceClass, limit: u64) {
         let mut quotas = self.inner.quotas.lock();
-        let entry = quotas
-            .entry((tenant.into(), class))
-            .or_default();
+        let entry = quotas.entry((tenant.into(), class)).or_default();
         entry.limit = limit;
     }
 
@@ -138,9 +127,7 @@ impl QuotaTable {
             return;
         }
         let mut quotas = self.inner.quotas.lock();
-        let state = quotas
-            .entry((tenant.to_string(), class))
-            .or_default();
+        let state = quotas.entry((tenant.to_string(), class)).or_default();
         state.used = state.used.saturating_add(amount);
     }
 
@@ -157,6 +144,15 @@ impl QuotaTable {
             .get_mut(&(tenant.to_string(), class))
         {
             state.used = state.used.saturating_sub(amount);
+        }
+    }
+}
+
+impl Default for QuotaState {
+    fn default() -> Self {
+        Self {
+            limit: u64::MAX,
+            used: 0,
         }
     }
 }

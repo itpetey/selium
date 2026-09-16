@@ -61,6 +61,15 @@ pub struct SpawnBudget {
     per_identity: HashMap<[u8; 32], usize>,
 }
 
+/// The accountant-published narrowing table: `tenant -> rkyv-encoded
+/// Vec<Capability>` of capabilities the bridge subtracts from the
+/// identity-published baseline grants at conferral. Until the table is
+/// attached (`Some`), every tenant is un-narrowed (no-op), mirroring the
+/// grant table's fail-closed absence for unknown identities.
+pub struct NarrowingTable {
+    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
+}
+
 impl GrantTable {
     /// Builds an empty (unattached) grant table: every lookup misses.
     pub fn empty() -> Self {
@@ -102,13 +111,29 @@ impl GrantTable {
     }
 }
 
-/// The accountant-published narrowing table: `tenant -> rkyv-encoded
-/// Vec<Capability>` of capabilities the bridge subtracts from the
-/// identity-published baseline grants at conferral. Until the table is
-/// attached (`Some`), every tenant is un-narrowed (no-op), mirroring the
-/// grant table's fail-closed absence for unknown identities.
-pub struct NarrowingTable {
-    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
+impl SpawnBudget {
+    /// Attempts to acquire a spawn slot for `fingerprint`, bounded by `limit`.
+    /// The budget is a lifetime per-identity cap: the bridge server has no
+    /// child-exit signal, so true concurrency tracking is deferred to the
+    /// supervisor (see design open questions). Slots acquired for spawns
+    /// that fail are returned via [`Self::release`], so a failed spawn does
+    /// not permanently consume a client's budget.
+    pub fn try_acquire(&mut self, fingerprint: &[u8; 32], limit: usize) -> bool {
+        let count = self.per_identity.entry(*fingerprint).or_insert(0);
+        if *count >= limit {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Returns a spawn slot previously acquired by
+    /// [`Self::try_acquire`] (e.g. the spawn failed and never consumed it).
+    pub fn release(&mut self, fingerprint: &[u8; 32]) {
+        if let Some(count) = self.per_identity.get_mut(fingerprint) {
+            *count = count.saturating_sub(1);
+        }
+    }
 }
 
 impl NarrowingTable {
@@ -168,31 +193,6 @@ pub fn narrow_grants(
         .into_iter()
         .filter(|grant| !narrowing.contains(&grant.capability))
         .collect()
-}
-
-impl SpawnBudget {
-    /// Attempts to acquire a spawn slot for `fingerprint`, bounded by `limit`.
-    /// The budget is a lifetime per-identity cap: the bridge server has no
-    /// child-exit signal, so true concurrency tracking is deferred to the
-    /// supervisor (see design open questions). Slots acquired for spawns
-    /// that fail are returned via [`Self::release`], so a failed spawn does
-    /// not permanently consume a client's budget.
-    pub fn try_acquire(&mut self, fingerprint: &[u8; 32], limit: usize) -> bool {
-        let count = self.per_identity.entry(*fingerprint).or_insert(0);
-        if *count >= limit {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Returns a spawn slot previously acquired by
-    /// [`Self::try_acquire`] (e.g. the spawn failed and never consumed it).
-    pub fn release(&mut self, fingerprint: &[u8; 32]) {
-        if let Some(count) = self.per_identity.get_mut(fingerprint) {
-            *count = count.saturating_sub(1);
-        }
-    }
 }
 
 /// Encodes a `u64` entrypoint argument in the `WasmValue::I64` wire form.

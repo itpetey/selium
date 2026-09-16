@@ -110,6 +110,28 @@ pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String
     }
 }
 
+/// Removes a host-held quota counter for a tenant and resource class,
+/// restoring unrestricted allocation. Requires the `QuotaWrite` capability.
+pub fn quota_clear(tenant: &str, class: selium_abi::ResourceClass) -> Result<()> {
+    hostcall_ready(HostcallRequest::QuotaClear {
+        tenant: tenant.to_string(),
+        class,
+    })
+    .map(|_| ())
+}
+
+/// Stores a host-held quota counter for a tenant and resource class. Requires
+/// the bootstrap-provisioned, non-conferable `QuotaWrite` capability, held
+/// solely by the accounting guest.
+pub fn quota_set(tenant: &str, class: selium_abi::ResourceClass, limit: u64) -> Result<()> {
+    hostcall_ready(HostcallRequest::QuotaSet {
+        tenant: tenant.to_string(),
+        class,
+        limit,
+    })
+    .map(|_| ())
+}
+
 /// Fills a buffer with cryptographically secure random bytes from the host.
 ///
 /// Used by TLS-terminating guests on wasm32 where no OS entropy source is
@@ -192,28 +214,6 @@ pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::Proce
 pub fn revoke_ca(tenant: &str) -> Result<()> {
     hostcall_ready(HostcallRequest::RevokeCa {
         tenant: tenant.to_string(),
-    })
-    .map(|_| ())
-}
-
-/// Stores a host-held quota counter for a tenant and resource class. Requires
-/// the bootstrap-provisioned, non-conferable `QuotaWrite` capability, held
-/// solely by the accounting guest.
-pub fn quota_set(tenant: &str, class: selium_abi::ResourceClass, limit: u64) -> Result<()> {
-    hostcall_ready(HostcallRequest::QuotaSet {
-        tenant: tenant.to_string(),
-        class,
-        limit,
-    })
-    .map(|_| ())
-}
-
-/// Removes a host-held quota counter for a tenant and resource class,
-/// restoring unrestricted allocation. Requires the `QuotaWrite` capability.
-pub fn quota_clear(tenant: &str, class: selium_abi::ResourceClass) -> Result<()> {
-    hostcall_ready(HostcallRequest::QuotaClear {
-        tenant: tenant.to_string(),
-        class,
     })
     .map(|_| ())
 }

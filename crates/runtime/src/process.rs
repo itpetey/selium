@@ -520,9 +520,11 @@ impl Runtime {
                         .find(|(id, _)| *id == shared_id)
                         .cloned(),
                 ) {
-                    self.kernel
-                        .quota()
-                        .release(&tenant, ResourceClass::SharedRegion, u64::from(len));
+                    self.kernel.quota().release(
+                        &tenant,
+                        ResourceClass::SharedRegion,
+                        u64::from(len),
+                    );
                 }
             }
         }
