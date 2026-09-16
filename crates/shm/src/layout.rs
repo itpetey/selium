@@ -621,6 +621,57 @@ pub fn release_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()
     store_writer_slot(backend, slot, 0)
 }
 
+/// Weak-drains committed frames from a ring without holding a reader slot.
+///
+/// A "weak" drain never backpressures writers: it allocates no blocking
+/// reader slot, so writers can always advance and a full ring overwrites the
+/// oldest unread frames. When writers have overtaken `read_pos`, the drain
+/// snaps forward to the newest window (skipping what was already lost) and
+/// then reads every committed frame up to the write tail.
+///
+/// Returns the frame payloads (without headers) and the next read position.
+/// Dropping at an uncommitted frame (header not yet READY) returns the
+/// frames read so far: the caller retains the returned position and resumes
+/// from it on the next call.
+///
+/// This is the read handle for log drains and other fire-and-forget
+/// consumers where losing old records is acceptable but blocking a producer
+/// is not.
+///
+/// Known limitation: the snap-to-newest heuristic may land mid-frame when
+/// the ring wrapped in large strides; a torn header then ends the drain
+/// (reported by `read_frame`) rather than silently returning garbage. Callers
+/// that decode payloads best-effort should tolerate the resulting error.
+pub fn drain_frames(
+    backend: &dyn MappingBackend,
+    mut read_pos: u64,
+    capacity: u64,
+) -> Result<(Vec<Vec<u8>>, u64)> {
+    let mask = mask_for_capacity(capacity)?;
+    let next_tail = load_next_tail(backend)?;
+
+    // Never backpressure: if overtaken, jump to the newest window and skip
+    // whatever the writers already overwrote.
+    if next_tail > read_pos + capacity {
+        read_pos = next_tail - capacity;
+    }
+
+    let mut frames = Vec::new();
+    while read_pos < next_tail {
+        match read_frame(backend, read_pos, mask, capacity)? {
+            Some((header, payload)) => {
+                frames.push(payload);
+                read_pos = read_pos
+                    .checked_add(header.frame_size())
+                    .ok_or(Error::InvalidFrame("frame size overflow".to_string()))?;
+            }
+            None => break, // uncommitted tail; resume here next drain
+        }
+    }
+
+    Ok((frames, read_pos))
+}
+
 /// Atomically reserves `len` bytes at the tail via CAS on `next_tail`.
 ///
 /// Uses exponential backoff on contention. Checks backpressure against reader

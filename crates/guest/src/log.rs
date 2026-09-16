@@ -9,6 +9,7 @@ use std::{cell::Cell, sync::OnceLock};
 use selium_abi::{HostcallRequest, ResourceKind};
 use selium_memory::FrameHeader;
 use selium_service::FlatMsg;
+use selium_shm::RingBuf;
 use selium_shm::channels::{Channel, ChannelBackpressure};
 use thiserror::Error;
 use tracing::field::{Field, Visit};
@@ -135,6 +136,8 @@ impl Visit for EventVisitor {
 thread_local! {
     /// Re-entrancy guard: suppresses log events triggered while forwarding.
     static FORWARDING: Cell<bool> = const { Cell::new(false) };
+    /// Once-per-process guard for the panic hook's last-words record.
+    static PANIC_EMITTED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Returns the log channel handle if initialised.
@@ -181,12 +184,88 @@ pub fn init_with_capacity(capacity: u64) -> Result<(), InitError> {
     // Atomically install state. If another thread won the race, discard ours.
     drop(LOGGING_STATE.set(state));
 
+    // Emit a best-effort final log record before the guest aborts on panic
+    // (panic=abort becomes an `unreachable` trap the host records as
+    // `ProcessExited`); see `install_panic_hook`.
+    install_panic_hook();
+
     // Install the subscriber. try_init returns Err if a subscriber is
     // already installed (harmless — the existing one is equivalent).
     let subscriber = tracing_subscriber::registry().with(LogLayer);
     drop(subscriber.try_init());
 
     Ok(())
+}
+
+/// Installs a panic hook that emits a best-effort final log record before
+/// the guest aborts.
+///
+/// Guest panics become `unreachable` traps (panic=abort), which the host
+/// runtime drains and records as `ProcessExited`. The hook writes one
+/// `Error`-level record — including the panic message when available — into
+/// the log ring first, so the guest's last words survive in the drained
+/// logs. The previous hook is chained so native (non-WASM) panic output is
+/// preserved.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info: &std::panic::PanicHookInfo<'_>| {
+        emit_panic_record(info);
+        previous(info);
+    }));
+}
+
+/// Best-effort last-words record written by the panic hook.
+///
+/// Writes directly to the ring (bypassing the tracing layer) so it cannot
+/// re-enter the forwarding path that may itself be mid-panic, and guards
+/// against recursion with a once-per-process flag. A missing or full log
+/// channel is silently ignored: logging must never stand in the way of the
+/// abort that follows.
+fn emit_panic_record(info: &std::panic::PanicHookInfo<'_>) {
+    let already_emitted = PANIC_EMITTED.with(|emitted| {
+        let was = emitted.get();
+        emitted.set(true);
+        was
+    });
+    if already_emitted {
+        return;
+    }
+
+    let Some(state) = LOGGING_STATE.get() else {
+        return; // log transport never initialised
+    };
+
+    let message = match info.payload().downcast_ref::<&str>() {
+        Some(message) => (*message).to_string(),
+        None => match info.payload().downcast_ref::<String>() {
+            Some(message) => message.clone(),
+            None => "guest panicked (no message)".to_string(),
+        },
+    };
+
+    let record = LogRecord {
+        level: LogLevel::Error,
+        target: "selium_guest::panic".to_string(),
+        message,
+        fields: Vec::new(),
+        spans: Vec::new(),
+        timestamp_ms: timestamp_ms(),
+    };
+    publish(state.channel.ring(), &FlatMsg::encode(&record));
+}
+
+/// Publishes one encoded frame to the log ring, best-effort.
+///
+/// The log channel is drained by a weak reader (no reader slot), so a full
+/// ring never backpressures the guest: the oldest unread records are
+/// overwritten while the newest always survive. A reservation failure (a
+/// record larger than the ring) is dropped silently — logging must never
+/// stall guest execution.
+fn publish(ring: &RingBuf, encoded: &[u8]) {
+    let required = FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64;
+    if let Ok(pos) = ring.reserve(required) {
+        drop(ring.write_frame(pos, encoded, 0, 0));
+    }
 }
 
 /// Forwards a tracing event to the log channel as a framed FlatBuffer LogRecord.
@@ -221,13 +300,10 @@ fn forward_event(event: &tracing::Event<'_>) {
 
     let encoded = FlatMsg::encode(&record);
 
-    // Write a ready frame to the channel ring. The log channel uses Drop
-    // backpressure: if the ring is full the record is silently dropped
-    // rather than blocking the caller. Logging is best-effort.
-    let ring = state.channel.ring();
-    if let Ok(pos) = ring.reserve(FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64) {
-        drop(ring.write_frame(pos, &encoded, 0, 0));
-    }
+    // Write a ready frame to the channel ring. Best-effort: a full ring
+    // never blocks the caller (see `publish`); the host's weak reader means
+    // the newest records always survive.
+    publish(state.channel.ring(), &encoded);
 }
 
 /// Returns the current wall-clock time in milliseconds, using the host

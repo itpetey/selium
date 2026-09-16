@@ -288,18 +288,7 @@ impl Runtime {
                     // (`run_entrypoint_with_result` logs the failing future's
                     // error there); surface it in the activity log so a
                     // bootstrap failure is diagnosable without a debugger.
-                    let guest_logs = self
-                        .kernel
-                        .processes()
-                        .drain_log_channel(process.local_id)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|frame| {
-                            selium_service::FlatMsg::decode(frame)
-                                .ok()
-                                .map(|record: selium_service::log::LogRecord| record.message)
-                        })
-                        .collect::<Vec<_>>();
+                    let guest_logs = self.drain_guest_log_messages(process.local_id);
                     self.kernel.processes().record_activity(ActivityEvent {
                         kind: selium_abi::ActivityKind::ProcessExited,
                         process_id: Some(process.local_id),
@@ -314,10 +303,14 @@ impl Runtime {
                 loaded_guest
             }
             Err(error) => {
+                let guest_logs = self.drain_guest_log_messages(process.local_id);
                 self.kernel.processes().record_activity(ActivityEvent {
                     kind: selium_abi::ActivityKind::ProcessExited,
                     process_id: Some(process.local_id),
-                    message: format!("guest {} trapped: {error}", descriptor.name),
+                    message: format!(
+                        "guest {} trapped: {error}; recent guest logs: {guest_logs:?}",
+                        descriptor.name
+                    ),
                 });
                 self.cleanup_failed_process(process.local_id)?;
                 return Err(error);

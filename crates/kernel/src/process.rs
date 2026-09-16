@@ -221,9 +221,11 @@ impl ProcessTable {
     /// Returns raw frame payloads (without the 12-byte header). The caller
     /// is responsible for decoding the payloads (e.g., as FlatBuffer LogRecords).
     ///
-    /// Uses the shared ring frame reader with caller-managed position.
-    /// Handles `Overwritten` gracefully: if the read position has been overtaken
-    /// by the writer, advances to the current tail and returns available frames.
+    /// Uses the layout-level weak drain (`layout::drain_frames`), which holds
+    /// no reader slot and therefore never backpressures the guest writer.
+    /// Handles overwrite gracefully: if the read position has been overtaken
+    /// by the writer, the drain snaps forward to the newest window and skips
+    /// the records that were already overwritten.
     pub fn drain_log_channel(&self, process_id: ProcessId) -> Result<Vec<Vec<u8>>> {
         let mut processes = self.inner.processes.lock();
         let process = processes
@@ -236,7 +238,6 @@ impl ProcessTable {
         };
 
         let backend_ref: &dyn selium_memory::MappingBackend = &state.backend;
-        let mut read_pos = state.read_position;
 
         let data_capacity =
             layout::load_capacity(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
@@ -246,30 +247,9 @@ impl ProcessTable {
             )));
         }
 
-        let mask = data_capacity - 1;
-
-        let next_tail =
-            layout::load_next_tail(backend_ref).map_err(|e| Error::Wasm(e.to_string()))?;
-
-        if next_tail > read_pos + data_capacity {
-            read_pos = next_tail - data_capacity;
-        }
-
-        let mut frames = Vec::new();
-
-        while read_pos < next_tail {
-            match layout::read_frame(backend_ref, read_pos, mask, data_capacity) {
-                Ok(Some((header, payload))) => {
-                    let frame_size = header.frame_size();
-                    frames.push(payload);
-                    read_pos = read_pos
-                        .checked_add(frame_size)
-                        .ok_or_else(|| Error::Wasm("frame size overflow".to_string()))?;
-                }
-                Ok(None) => break,
-                Err(e) => return Err(Error::Wasm(e.to_string())),
-            }
-        }
+        let (frames, read_pos) =
+            layout::drain_frames(backend_ref, state.read_position, data_capacity)
+                .map_err(|e| Error::Wasm(e.to_string()))?;
 
         state.read_position = read_pos;
 

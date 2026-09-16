@@ -30,7 +30,7 @@
 use selium_memory::Region;
 use selium_wire::error::Error;
 
-pub use channels::{Channel, ChannelBackpressure};
+pub use channels::{Channel, ChannelBackpressure, WeakReader};
 pub use layout::{RingReader, RingWriter, round_capacity as layout_round_capacity};
 pub use region::{ChannelRegion, DATA_OFFSET, MIN_REGION_BYTES};
 pub use ring_buf::{RingBuf, round_capacity};

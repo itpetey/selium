@@ -454,6 +454,59 @@ impl AsyncRead for Reader {
     }
 }
 
+/// Weak (slotless) frame reader that always reads the newest available
+/// frames without ever backpressuring writers.
+///
+/// `WeakReader` is the formalised "weak reader": unlike [`BlockingReader`]
+/// it allocates no reader slot, so writers can always advance — a full ring
+/// overwrites the oldest unread frames rather than blocking. Each [`drain`]
+/// snaps forward to the newest window when the writer has overtaken it, then
+/// returns every committed frame up to the write tail, losing only the
+/// records that were overwritten.
+///
+/// This is the read handle for log drains and other fire-and-forget
+/// consumers where losing old records is acceptable but blocking a producer
+/// is not.
+///
+/// [`drain`]: WeakReader::drain
+pub struct WeakReader {
+    region: ChannelRegion,
+    pos: u64,
+}
+
+impl WeakReader {
+    /// Creates a weak reader at `start_pos`.
+    ///
+    /// `start_pos` is caller-chosen: `0` reads everything still present in
+    /// the ring from its beginning; the live write tail skips history.
+    pub(crate) fn new(region: ChannelRegion, start_pos: u64) -> Self {
+        Self {
+            region,
+            pos: start_pos,
+        }
+    }
+
+    /// Returns the current read position.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Returns a reference to the underlying channel region.
+    pub fn region(&self) -> &ChannelRegion {
+        &self.region
+    }
+
+    /// Drains committed frames available since the last drain, snapping past
+    /// any frames that were overwritten. Returns frame payloads (without
+    /// headers).
+    pub fn drain(&mut self) -> Result<Vec<Vec<u8>>> {
+        let (frames, pos) =
+            crate::layout::drain_frames(self.region.backend(), self.pos, self.region.capacity())?;
+        self.pos = pos;
+        Ok(frames)
+    }
+}
+
 pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) -> Result<Vec<u8>> {
     if len == 0 {
         return Ok(Vec::new());
@@ -489,4 +542,49 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
 fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
     let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
     FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Channel, ChannelBackpressure, ring_buf::RingBuf};
+    use selium_memory::FrameHeader;
+
+    fn write_frame(ring: &RingBuf, payload: &[u8]) {
+        let required = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
+        let pos = ring.reserve(required).expect("reserve");
+        ring.write_frame(pos, payload, 0, 0).expect("write");
+    }
+
+    #[test]
+    fn weak_reader_drains_all_committed_frames() {
+        let channel = Channel::create(128, ChannelBackpressure::Park).expect("create");
+        write_frame(channel.ring(), b"one");
+        write_frame(channel.ring(), b"two");
+
+        let mut reader = channel.weak_reader();
+        let drained = reader.drain().expect("drain");
+
+        assert_eq!(drained, vec![b"one".to_vec(), b"two".to_vec()]);
+        // No new frames: a second drain is empty and advances nothing.
+        assert!(reader.drain().expect("drain again").is_empty());
+    }
+
+    #[test]
+    fn weak_reader_never_backpressures_writers() {
+        // A ring far too small to hold every frame: the weak reader must not
+        // hold the write tail open — every write succeeds through overwrite.
+        let channel = Channel::create(128, ChannelBackpressure::Park).expect("create");
+        for i in 0u8..8 {
+            write_frame(channel.ring(), &[i; 64]);
+        }
+        // All eight frames were committed: the ring wrapped several times
+        // without a reader slot ever blocking a write.
+        assert_eq!(
+            channel.ring().read_next_tail().expect("tail"),
+            (FrameHeader::ENCODED_SIZE as u64 + 64) * 8
+        );
+        // Draining is best-effort and must not error, even after overwrite.
+        let mut reader = channel.weak_reader();
+        drop(reader.drain());
+    }
 }

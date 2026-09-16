@@ -150,7 +150,7 @@ impl ChannelRegion {
     }
 
     /// Convenience: returns the inner backend for layout-level operations.
-    fn backend(&self) -> &dyn selium_memory::MappingBackend {
+    pub(crate) fn backend(&self) -> &dyn selium_memory::MappingBackend {
         self.mapping.backend()
     }
 

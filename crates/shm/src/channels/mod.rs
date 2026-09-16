@@ -4,7 +4,7 @@ use selium_wire::error::Result;
 use crate::ring_buf::{RingBuf, round_capacity};
 
 pub use self::{
-    reader::{BlockingReader, HasGeneration, Reader},
+    reader::{BlockingReader, HasGeneration, Reader, WeakReader},
     writer::{BlockingWriter, Writer},
 };
 
@@ -163,6 +163,17 @@ impl Channel {
             start_pos,
             reader_id,
         ))
+    }
+
+    /// Creates a weak reader for this channel, starting at position `0`.
+    ///
+    /// Weak readers hold no reader slot, so they never backpressure writers:
+    /// a full ring overwrites the oldest unread data while the newest always
+    /// survives. Starting at `0`, the reader drains everything still present
+    /// in the ring, snapping past any records overwritten before the first
+    /// drain. Use for log drains and other fire-and-forget consumers.
+    pub fn weak_reader(&self) -> WeakReader {
+        WeakReader::new(self.ring.region().clone(), 0)
     }
 
     /// Returns the backpressure strategy for this channel.

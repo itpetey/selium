@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
 use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, LocalityScope, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ScopeContext, TaskId,
+    ActivityEvent, ActivityKind, Capability, CapabilityGrant, LocalityScope, ProcessId,
+    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, TaskId,
 };
-use selium_service::DiscoveryRequest;
+use selium_service::{DiscoveryRequest, FlatMsg};
 use tracing::debug;
-use wasmtiny::WasmValue;
+use wasmtiny::{WasmError, WasmValue};
 
 use crate::{
     Error, Result, config::ProcessAuthority, hostcall::HostOperationState, runtime::Runtime,
@@ -298,6 +298,10 @@ impl Runtime {
         // recovery path for individual cleanup steps. We discard each error and
         // continue with the remaining work to reclaim as much as possible.
         drop(self.kernel.processes().stop_process(process_id));
+        // A failed guest is never polled again: unload it. Idempotent —
+        // callers that already removed the `LoadedGuest` (e.g. the poll path)
+        // find nothing here.
+        self.loaded_guests.lock().remove(&process_id);
         self.operations
             .lock()
             .retain(|_, operation| operation.process_id != process_id);
@@ -923,6 +927,64 @@ impl Runtime {
         }
     }
 
+    /// Decodes recent guest log frames into human-readable messages for
+    /// surfacing in activity events (e.g. on trap). Best-effort: undecodable
+    /// frames are skipped.
+    pub(crate) fn drain_guest_log_messages(&self, process_id: ProcessId) -> Vec<String> {
+        self.kernel
+            .processes()
+            .drain_log_channel(process_id)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|frame| {
+                FlatMsg::decode(frame)
+                    .ok()
+                    .map(|record: selium_service::log::LogRecord| record.message)
+            })
+            .collect()
+    }
+
+    /// Records a failed reactor poll in the activity log and, for traps,
+    /// tears the guest down.
+    ///
+    /// A trap means the guest panicked and aborted (`std::process::abort` →
+    /// `unreachable`), so it can never make progress again: mirror the
+    /// entrypoint trap path by recording `ProcessExited` and reclaiming the
+    /// process. Non-trap failures (e.g. a missing `__selium_guest_poll`
+    /// export) are also permanent stalls, but are recorded without teardown:
+    /// they are module-shape bugs that are diagnosed from the log, not
+    /// killed mid-flight.
+    fn record_poll_failure(&self, process_id: ProcessId, error: &WasmError) {
+        let guest_logs = self.drain_guest_log_messages(process_id);
+        let trapped = match error {
+            WasmError::Trap(code) => {
+                self.kernel.processes().record_activity(ActivityEvent {
+                    kind: ActivityKind::ProcessExited,
+                    process_id: Some(process_id),
+                    message: format!(
+                        "guest {process_id} poll trapped ({code:?}); recent guest logs: {guest_logs:?}"
+                    ),
+                });
+                true
+            }
+            other => {
+                self.kernel.processes().record_activity(ActivityEvent {
+                    kind: ActivityKind::ProcessExited,
+                    process_id: Some(process_id),
+                    message: format!(
+                        "guest {process_id} poll failed ({other}); recent guest logs: {guest_logs:?}"
+                    ),
+                });
+                false
+            }
+        };
+        if trapped {
+            // Best-effort: the guest is already dead, so failures during
+            // cleanup are discarded (see `cleanup_failed_process`).
+            drop(self.cleanup_failed_process(process_id));
+        }
+    }
+
     /// Runs one reactor pass. Returns false when no progress is possible —
     /// the guest is not loaded, or `__selium_guest_poll` trapped — so the
     /// caller must not keep looping on pending mailbox state (the guest
@@ -935,18 +997,24 @@ impl Runtime {
             loaded_guest
                 .app
                 .call_function(loaded_guest.module_index, "__selium_guest_poll", &[]);
-        self.loaded_guests.lock().insert(process_id, loaded_guest);
         // Kick outbound network proxies on reactor stall — the guest may
         // have written outbound frames before parking.
         self.kick_network_waiters();
         match result {
-            Ok(_) => true,
+            Ok(_) => {
+                self.loaded_guests.lock().insert(process_id, loaded_guest);
+                true
+            }
             Err(error) => {
+                // A failed poll is permanent: do not re-insert the guest, or
+                // every future wake would re-drive `__selium_guest_poll`
+                // into the same failure. Record it (and tear down on trap).
                 debug!(
                     process_id,
                     error = %error,
                     "guest poll after mailbox wake failed"
                 );
+                self.record_poll_failure(process_id, &error);
                 false
             }
         }
@@ -1081,9 +1149,10 @@ mod tests {
     use super::*;
     use crate::mailbox::GuestMailbox;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
-    use selium_abi::{LocalityScope, MeteringObservation, ResourceSelector};
+    use selium_abi::{ActivityKind, LocalityScope, MeteringObservation, ResourceSelector};
     use std::sync::Arc;
-    use wasmtiny::runtime::{Limits, Memory as WasmMemory, MemoryType};
+    use wasmtiny::WasmError;
+    use wasmtiny::runtime::{Limits, Memory as WasmMemory, MemoryType, TrapCode};
 
     /// Registers a mailbox for `process_id` backed by scratch linear memory
     /// so wake-delivery mechanics can be exercised without a real guest.
@@ -1098,6 +1167,51 @@ mod tests {
         let mailbox = Arc::new(crate::mailbox::GuestMailbox::new(memory.clone(), 0));
         runtime.register_mailbox(process_id, mailbox.clone());
         mailbox
+    }
+
+    /// A trapped poll records a `ProcessExited` activity event and reclaims
+    /// the process record — a stalled guest must not linger as `running`
+    /// with no trace of why it stopped.
+    #[test]
+    fn trapped_poll_is_recorded_and_reaps_process() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "trapped".to_string(),
+                module_id: "trapped-module".to_string(),
+                module_bytes: module_with_entrypoint("main", ""),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest");
+        let pid = bootstrapped.process_id;
+
+        runtime.record_poll_failure(pid, &WasmError::Trap(TrapCode::Unreachable));
+
+        let activity = runtime.activity_log();
+        assert!(
+            activity.iter().any(|event| {
+                event.process_id == Some(pid)
+                    && event.kind == ActivityKind::ProcessExited
+                    && event.message.contains("poll trapped")
+            }),
+            "expected a ProcessExited trapped-poll record, got: {activity:?}"
+        );
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            0,
+            "trap must unload the guest"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_err(),
+            "trap must reap the process record"
+        );
     }
 
     /// Task 2.3: a wake delivered from another thread while the execution
