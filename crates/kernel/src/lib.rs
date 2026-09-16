@@ -9,8 +9,9 @@ pub use network::{
     NetworkState, TcpListenerState, TcpStreamState, UdpSocketState, decode_udp_frame,
     encode_udp_frame,
 };
-pub use poller::Poller;
+pub use poller::{BandwidthFn, Poller};
 pub use process::ProcessTable;
+pub use quota::QuotaTable;
 pub use storage::StorageRegistry;
 
 mod backend;
@@ -23,4 +24,5 @@ mod network_runtime;
 mod os_wait_word;
 mod poller;
 mod process;
+mod quota;
 mod storage;

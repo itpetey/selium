@@ -138,6 +138,11 @@ pub enum Capability {
     /// provisioned only: like `DelegateGrants`, it can never be conferred on a
     /// child process. Held solely by the identity system guest.
     MintCertificate,
+    /// Permission to author host-held quota counters via the `QuotaSet` and
+    /// `QuotaClear` hostcalls. Bootstrap-provisioned only: like
+    /// `DelegateGrants` and `MintCertificate`, it can never be conferred on a
+    /// child process. Held solely by the accounting system guest.
+    QuotaWrite,
 }
 
 /// Identity of a resource in either local-handle or shared-resource space.
@@ -252,6 +257,9 @@ pub enum AbiErrorCode {
     DetachedResource,
     /// The caller does not have the required capability.
     PermissionDenied,
+    /// The caller's tenant has exhausted its quota ceiling for the resource
+    /// class named in the error message.
+    QuotaExceeded,
     /// Payload bytes could not be decoded or framed correctly.
     MalformedPayload,
     /// Requested resource was not found.
@@ -594,6 +602,26 @@ pub enum HostcallRequest {
     MeteringRead {
         /// Process id to inspect.
         process_id: ProcessId,
+    },
+    /// Set a host-held quota counter for a tenant and resource class. Gated by
+    /// the `QuotaWrite` capability (bootstrap-provisioned and non-conferable);
+    /// the accounting guest is its sole author.
+    QuotaSet {
+        /// Tenant whose quota is authored.
+        tenant: String,
+        /// Resource class the quota caps.
+        class: ResourceClass,
+        /// Ceiling the quota enforces.
+        limit: u64,
+    },
+    /// Remove a host-held quota counter for a tenant and resource class,
+    /// restoring unrestricted allocation for that class. Gated by the
+    /// `QuotaWrite` capability.
+    QuotaClear {
+        /// Tenant whose quota is cleared.
+        tenant: String,
+        /// Resource class the quota capped.
+        class: ResourceClass,
     },
     /// Write a guest log entry.
     GuestLogWrite {
@@ -1297,6 +1325,21 @@ mod tests {
     }
 
     #[test]
+    fn quota_exceeded_error_code_round_trip() {
+        // A quota denial is a distinct code: guests must be able to tell
+        // "you lack the capability" apart from "your tenant hit its ceiling".
+        let error = AbiError::new(
+            AbiErrorCode::QuotaExceeded,
+            "quota exceeded for tenant acme on SharedRegion",
+        );
+        let encoded = encode_rkyv(&error).expect("encode error");
+        let decoded: AbiError = decode_rkyv(&encoded).expect("decode error");
+
+        assert_eq!(decoded.code, AbiErrorCode::QuotaExceeded);
+        assert!(decoded.message.contains("acme"));
+    }
+
+    #[test]
     fn frame_and_deframe_bytes_round_trip() {
         let framed = frame_bytes(b"hello").expect("frame bytes");
         let deframed = deframe_bytes(&framed).expect("deframe bytes");
@@ -1386,6 +1429,17 @@ mod tests {
         let encoded = encode_rkyv(&capability).expect("encode");
         let decoded: Capability = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, Capability::MintCertificate);
+    }
+
+    #[test]
+    fn capability_quota_write_round_trip() {
+        // `QuotaWrite` is rkyv-encodable like every other variant: the quota
+        // hostcalls it gates are gated by an ordinary capability grant that
+        // travels over the same ABI as the rest of the capability set.
+        let capability = Capability::QuotaWrite;
+        let encoded = encode_rkyv(&capability).expect("encode");
+        let decoded: Capability = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, Capability::QuotaWrite);
     }
 
     #[test]
@@ -1951,6 +2005,35 @@ mod tests {
                 generation: 7,
             },
             task_id: Some(3),
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn quota_set_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::QuotaSet {
+                tenant: "acme".to_string(),
+                class: ResourceClass::SharedRegion,
+                limit: 1_073_741_824,
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn quota_clear_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::QuotaClear {
+                tenant: "acme".to_string(),
+                class: ResourceClass::DurableLog,
+            },
+            task_id: Some(7),
         };
         let encoded = encode_rkyv(&envelope).expect("encode");
         let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");

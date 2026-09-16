@@ -20,6 +20,7 @@ use mio::{
     Events, Interest, Token,
     net::{TcpListener, TcpStream, UdpSocket},
 };
+
 use parking_lot::Mutex;
 use selium_shm::layout::RingWriter;
 
@@ -28,6 +29,10 @@ use selium_shm::layout::RingWriter;
 pub type AcceptFn = Box<dyn Fn(StdTcpStream) + Send + 'static>;
 /// Callback invoked when the host advances a ring generation.
 pub type GenerationAdvanceFn = Box<dyn Fn(u64, u64) + Send + Sync + 'static>;
+/// Callback invoked with the byte count of each socket read, so the runtime
+/// can attribute bandwidth consumption to the owning process's metering
+/// counter (see `Runtime::record_bandwidth_usage`).
+pub type BandwidthFn = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
 /// Poller entry for a registered socket.
 enum PollerEntry {
@@ -36,6 +41,7 @@ enum PollerEntry {
         inbound_writer: RingWriter,
         region_id: u64,
         running: Arc<AtomicBool>,
+        on_bandwidth: Option<BandwidthFn>,
     },
     TcpListener {
         /// Keeps the OS registration alive; dropping it deregisters.
@@ -103,6 +109,7 @@ impl Poller {
         inbound_writer: RingWriter,
         region_id: u64,
         running: Arc<AtomicBool>,
+        on_bandwidth: Option<BandwidthFn>,
     ) -> io::Result<()> {
         let mut mio_stream = TcpStream::from_std(stream);
         let token = self.alloc_token();
@@ -118,6 +125,7 @@ impl Poller {
                 inbound_writer,
                 region_id,
                 running,
+                on_bandwidth,
             },
         );
         Ok(())
@@ -239,6 +247,7 @@ impl Poller {
                 inbound_writer,
                 region_id,
                 running,
+                on_bandwidth,
             }) => {
                 if !running.load(Ordering::Relaxed) {
                     // Stopped externally (close_tcp_stream): clean up the
@@ -272,6 +281,9 @@ impl Poller {
                             break;
                         }
                         Ok(n) => {
+                            if let Some(record) = on_bandwidth.as_ref() {
+                                record(n as u64);
+                            }
                             let payload = buf.get(..n).unwrap_or(&[]);
                             if inbound_writer.write_frame(payload, 0, 0).is_err() {
                                 eprintln!(
@@ -305,6 +317,7 @@ impl Poller {
                             inbound_writer,
                             region_id,
                             running,
+                            on_bandwidth,
                         },
                     );
                 }

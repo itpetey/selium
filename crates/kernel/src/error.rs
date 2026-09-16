@@ -20,6 +20,14 @@ pub enum Error {
     #[error("process already stopped: {0}")]
     /// Process is already stopped.
     ProcessStopped(ProcessId),
+    #[error("quota exceeded for tenant {tenant} on {class:?}")]
+    /// Allocation would exceed the tenant's authored quota ceiling.
+    QuotaExceeded {
+        /// Tenant whose quota ceiling was exceeded.
+        tenant: String,
+        /// Resource class (dimension) whose ceiling was exceeded.
+        class: selium_abi::ResourceClass,
+    },
     #[error("wasmtiny runtime error: {0}")]
     /// Underlying Wasmtiny operation failed.
     Wasm(String),

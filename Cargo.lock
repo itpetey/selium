@@ -946,6 +946,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-accountant"
+version = "1.0.0-alpha.6"
+dependencies = [
+ "anyhow",
+ "rkyv",
+ "selium-abi",
+ "selium-guest",
+ "selium-service",
+ "selium-shm",
+ "selium-wire",
+]
+
+[[package]]
 name = "selium-bridge"
 version = "1.0.0-alpha.6"
 dependencies = [
@@ -1232,6 +1245,7 @@ dependencies = [
  "rcgen",
  "rustls-pki-types",
  "selium-abi",
+ "selium-accountant",
  "selium-client",
  "selium-identity",
  "selium-identity-onboard",

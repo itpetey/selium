@@ -2,6 +2,17 @@
 // Combined module tree for Selium Flatbuffers namespaces.
 pub mod selium {
   use super::*;
+  pub mod accountant {
+    use super::*;
+    mod accountant_control_generated;
+    pub use self::accountant_control_generated::*;
+    mod accountant_control_response_generated;
+    pub use self::accountant_control_response_generated::*;
+    mod metering_bucket_generated;
+    pub use self::metering_bucket_generated::*;
+    mod tenant_plan_generated;
+    pub use self::tenant_plan_generated::*;
+  }
   pub mod control {
     use super::*;
     mod resolved_target_generated;

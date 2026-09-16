@@ -44,6 +44,8 @@ const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
 const DEFAULT_SPAWN_BOUND_PER_IDENTITY: usize = 256;
 /// The identity guest's published grant table route.
 const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
+/// The accountant guest's published narrowing table route.
+const NARROWING_TABLE_ROUTE: &str = "sel:///accounting-narrowing";
 
 /// The identity-published grant table: a `fingerprint -> baseline grants` live
 /// table read at handoff conferral. Replaces the interim `IdentityGrantMap`
@@ -98,6 +100,74 @@ impl GrantTable {
         let bytes = table.get(&fingerprint.to_vec()).ok().flatten()?;
         selium_abi::decode_rkyv::<Vec<CapabilityGrant>>(&bytes).ok()
     }
+}
+
+/// The accountant-published narrowing table: `tenant -> rkyv-encoded
+/// Vec<Capability>` of capabilities the bridge subtracts from the
+/// identity-published baseline grants at conferral. Until the table is
+/// attached (`Some`), every tenant is un-narrowed (no-op), mirroring the
+/// grant table's fail-closed absence for unknown identities.
+pub struct NarrowingTable {
+    table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
+}
+
+impl NarrowingTable {
+    /// Builds an empty (unattached) narrowing table: every tenant un-narrowed.
+    pub fn empty() -> Self {
+        Self { table: None }
+    }
+
+    /// Attaches to the accountant's published narrowing table route.
+    pub async fn attach(ctx: &mut Context) -> anyhow::Result<Self> {
+        let target = ctx
+            .lookup(NARROWING_TABLE_ROUTE)
+            .await
+            .with_context(|| "bridge-server: narrowing table resolve failed")?
+            .ok_or_else(|| anyhow::anyhow!("narrowing table route not found"))?;
+        let channel = Channel::attach(target.resource_id)
+            .map_err(|e| anyhow::anyhow!("narrowing table region attach failed: {e}"))?;
+        let transport = ShmTransport::new_replay(&channel, &channel)
+            .map_err(|e| anyhow::anyhow!("narrowing table transport failed: {e}"))?;
+        let subscriber = Subscriber::new(FramedRead::new(transport), None);
+        let table = LiveTableView::new(subscriber)
+            .map_err(|e| anyhow::anyhow!("narrowing table view construction failed: {e}"))?;
+        Ok(Self { table: Some(table) })
+    }
+
+    /// Drains any pending mutations into the local view. Best-effort.
+    pub fn sync(&mut self) {
+        if let Some(table) = &self.table
+            && let Err(e) = table.sync()
+        {
+            warn!("bridge-server: narrowing table sync failed: {e}");
+        }
+    }
+
+    /// Returns the capabilities to subtract from a tenant's baseline grants.
+    pub fn narrowing_for(&self, tenant: &str) -> Vec<Capability> {
+        let Some(table) = self.table.as_ref() else {
+            return Vec::new();
+        };
+        let bytes = table
+            .get(&tenant.to_string())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        selium_abi::decode_rkyv::<Vec<Capability>>(&bytes).unwrap_or_default()
+    }
+}
+
+/// Folds the accountant's published narrowing into the baseline grants:
+/// every baseline grant whose capability appears in the narrowing set is
+/// removed. An empty narrowing set is a no-op.
+pub fn narrow_grants(
+    grants: Vec<CapabilityGrant>,
+    narrowing: &[Capability],
+) -> Vec<CapabilityGrant> {
+    grants
+        .into_iter()
+        .filter(|grant| !narrowing.contains(&grant.capability))
+        .collect()
 }
 
 impl SpawnBudget {
@@ -247,11 +317,19 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             GrantTable::empty()
         }
     };
+    let mut narrowing_table = match NarrowingTable::attach(&mut ctx).await {
+        Ok(table) => table,
+        Err(error) => {
+            warn!("bridge-server: narrowing table unavailable: {error}");
+            NarrowingTable::empty()
+        }
+    };
     let mut budget = SpawnBudget::default();
     mark_ready();
 
     loop {
         grant_table.sync();
+        narrowing_table.sync();
 
         let incoming = match listener.recv().await {
             Ok(incoming) => incoming,
@@ -289,6 +367,11 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             attach_then_close(incoming.shared_id);
             continue;
         };
+
+        // Fold the accountant's published narrowing into the baseline grants
+        // before conferral: a delinquent tenant's narrowing set empties the
+        // baseline; an absent narrowing set is a no-op.
+        let grants = narrow_grants(grants, &narrowing_table.narrowing_for(&own_tenant));
 
         if !budget.try_acquire(&identity.fingerprint, DEFAULT_SPAWN_BOUND_PER_IDENTITY) {
             warn!(
@@ -447,6 +530,35 @@ mod tests {
         // Releasing below zero is a no-op, not an underflow.
         budget.release(&fp);
         budget.release(&fp);
+    }
+
+    /// The narrowing fold removes every baseline grant whose capability is in
+    /// the accountant's published narrowing set.
+    #[test]
+    fn narrow_grants_subtracts_published_capabilities() {
+        let baseline = grants();
+        let narrowed = narrow_grants(baseline.clone(), &[Capability::Network]);
+        assert_eq!(narrowed.len(), baseline.len() - 1);
+        assert!(
+            narrowed
+                .iter()
+                .all(|grant| grant.capability != Capability::Network)
+        );
+    }
+
+    /// An empty narrowing set is a no-op: the baseline grants pass through.
+    #[test]
+    fn narrow_grants_with_empty_narrowing_is_a_noop() {
+        let baseline = grants();
+        assert_eq!(narrow_grants(baseline.clone(), &[]), baseline);
+    }
+
+    /// An unattached narrowing table narrows nothing: every tenant is a no-op.
+    #[test]
+    fn empty_narrowing_table_narrows_nothing() {
+        let table = NarrowingTable::empty();
+        assert!(table.narrowing_for("acme").is_empty());
+        assert!(table.narrowing_for("beta").is_empty());
     }
 
     /// 4.5 (test uplift): refusing an unknown identity attaches the

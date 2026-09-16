@@ -14,6 +14,7 @@ members = [
   "crates/service",
   "crates/shm",
   "crates/wire",
+  "guests/accountant",
   "guests/bridge",
   "guests/bridge-channel",
   "guests/connector-dns",

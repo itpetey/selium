@@ -189,15 +189,16 @@ fn app_guest_without_network_grants() {
         CompletionState::Failed(_)
     ));
 
-    // Cleanup.
+    // Cleanup. The handoff transferred ownership to the app, so the app
+    // frees the region (the connector no longer can).
     let (_, free_op) = runtime.begin_hostcall(
-        connector,
+        app,
         HostcallRequest::FreeRegion {
             region_id: alloc.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_op),
+        runtime.poll_hostcall(app, free_op),
         CompletionState::Ready(_)
     ));
 }
@@ -484,15 +485,16 @@ fn http_connector_golden_path() {
     memory.detach_shared_region(conn_mapping).expect("detach");
     memory.detach_shared_region(app_mapping).expect("detach");
 
-    // Cleanup.
+    // Cleanup. The handoff transferred ownership to the app, so the app
+    // frees the region (the connector no longer can).
     let (_, free_op) = runtime.begin_hostcall(
-        connector,
+        app,
         HostcallRequest::FreeRegion {
             region_id: alloc.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_op),
+        runtime.poll_hostcall(app, free_op),
         CompletionState::Ready(_)
     ));
 }
@@ -786,15 +788,16 @@ fn ungranted_region_attach_denied() {
         "the attach operation must fail, not defer or succeed"
     );
 
-    // Cleanup.
+    // Cleanup. The handoff transferred ownership to the app, so the app
+    // frees the region (the connector no longer can).
     let (_, free_op) = runtime.begin_hostcall(
-        connector,
+        app,
         HostcallRequest::FreeRegion {
             region_id: alloc.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_op),
+        runtime.poll_hostcall(app, free_op),
         CompletionState::Ready(_)
     ));
 }

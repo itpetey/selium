@@ -142,6 +142,58 @@ impl Runtime {
             .observe_metering(process_id, observation);
     }
 
+    /// Accumulates CPU usage for a process (host instrumentation hook). The
+    /// next [`Runtime::metering_tick`] projects it into the kernel as part of
+    /// the process's cumulative cpu counter.
+    pub fn record_cpu_usage(&self, process_id: selium_abi::ProcessId, micros: u64) {
+        self.metering.lock().record_cpu(process_id, micros);
+    }
+
+    /// Accumulates bandwidth usage for a process (host instrumentation hook).
+    pub fn record_bandwidth_usage(&self, process_id: selium_abi::ProcessId, bytes: u64) {
+        self.metering.lock().record_bandwidth(process_id, bytes);
+    }
+
+    /// Accumulates storage usage for a process (storage allocation hook).
+    pub(crate) fn note_storage_usage(&self, process_id: selium_abi::ProcessId, bytes: u64) {
+        self.metering.lock().record_storage(process_id, bytes);
+    }
+
+    /// Projects a fresh metering observation for every live process into the
+    /// kernel: cumulative cpu/bandwidth counters and current memory/storage
+    /// gauges. Memory is derived from live shared-region ownership; storage and
+    /// the cumulative counters come from the projector's accumulators.
+    pub fn metering_tick(&self) {
+        let live: Vec<ProcessId> = self.process_authorities.lock().keys().copied().collect();
+
+        // Current memory gauge per process: total bytes of owned shared
+        // regions, so freed regions stop counting on the next tick.
+        let mut memory_by_process: std::collections::HashMap<ProcessId, u64> = Default::default();
+        {
+            let owners = self.shared_resource_owners.lock();
+            for ((class, shared_id), pids) in owners.iter() {
+                if *class != ResourceClass::SharedRegion {
+                    continue;
+                }
+                let Ok(len) = self.kernel.memory().shared_region_len(*shared_id) else {
+                    continue;
+                };
+                for pid in pids {
+                    *memory_by_process.entry(*pid).or_insert(0) += u64::from(len);
+                }
+            }
+        }
+
+        let metering = self.metering.lock();
+        for process_id in live {
+            let memory_bytes = memory_by_process.get(&process_id).copied().unwrap_or(0);
+            let observation = metering.project(process_id, memory_bytes);
+            self.kernel
+                .processes()
+                .observe_metering(process_id, observation);
+        }
+    }
+
     /// Returns all activity log events currently held by the kernel.
     pub fn activity_log(&self) -> Vec<ActivityEvent> {
         self.kernel.processes().read_activity_from(0)
@@ -286,6 +338,8 @@ impl Runtime {
     ) -> Result<()> {
         // The process's fast-path capability vote is moot once it is gone.
         self.process_fastpath.lock().remove(&process_id);
+        // Its metering accumulators are moot too.
+        self.metering.lock().remove(process_id);
 
         // Its region attachments are moot too: drop it from every
         // attachment set so a later spawn of the same id cannot inherit
@@ -309,7 +363,9 @@ impl Runtime {
         // Revoke operations to the discovery feed under the serving tenant.
         // Staged: each `region_tenants` entry is removed only after its
         // revocation publishes successfully, so a failed teardown can be
-        // retried without losing bookkeeping.
+        // retried without losing bookkeeping. The (region, tenant) pairs are
+        // captured so the auto-free pass below can return destroyed regions'
+        // bytes to the quota of the tenant they were minted for.
         let region_keys: Vec<(ProcessId, u64)> = self
             .region_tenants
             .lock()
@@ -317,12 +373,14 @@ impl Runtime {
             .filter(|(pid, _)| *pid == process_id)
             .copied()
             .collect();
+        let mut region_quota_facts: Vec<(u64, String)> = Vec::new();
         for key in region_keys {
             let serving_tenant = self.region_tenants.lock().get(&key).cloned();
             if let Some(serving_tenant) = serving_tenant {
                 let uri = crate::discovery::region_registration_uri(&serving_tenant, key.1);
                 let request = DiscoveryRequest::Revoke { uri };
                 self.publish_discovery_event(request)?;
+                region_quota_facts.push((key.1, serving_tenant));
                 self.region_tenants.lock().remove(&key);
             }
         }
@@ -337,7 +395,10 @@ impl Runtime {
 
         // Revoke tier-1 registrations for host queues created by this
         // process, under the principal tenant each queue was minted for.
-        // Staged like the region revocations above.
+        // Staged like the region revocations above. The (queue, principal)
+        // pairs are captured so the handle-release pass below can return the
+        // still-queued items' pipe slots to the owner's quota — the
+        // `queue_tenants` entries are removed here, before that pass runs.
         let queue_keys: Vec<(ProcessId, u64)> = self
             .queue_tenants
             .lock()
@@ -345,6 +406,7 @@ impl Runtime {
             .filter(|(pid, _)| *pid == process_id)
             .copied()
             .collect();
+        let mut queue_quota_facts: Vec<(u64, String)> = Vec::new();
         for key in queue_keys {
             let principal = self.queue_tenants.lock().get(&key).cloned();
             if let Some(principal) = principal {
@@ -352,6 +414,7 @@ impl Runtime {
                     uri: crate::discovery::queue_registration_uri(&principal, key.1),
                 };
                 self.publish_discovery_event(request)?;
+                queue_quota_facts.push((key.1, principal));
                 self.queue_tenants.lock().remove(&key);
             }
         }
@@ -382,6 +445,26 @@ impl Runtime {
                 ResourceClass::SharedMapping => {
                     drop(self.kernel.memory().detach_shared_region(local_id));
                 }
+                ResourceClass::HostQueue => {
+                    // The queue's owner is gone and will never receive: the
+                    // pipe slots held by its still-queued items return to the
+                    // owner's quota (the kernel queue itself persists for
+                    // any later attacher, unmetered from here on).
+                    let shared_id = self.kernel.queues().host_queue_shared_id(local_id).ok();
+                    if let (Some(shared_id), Ok(pending)) =
+                        (shared_id, self.kernel.queues().host_queue_pending(local_id))
+                        && let Some((_, principal)) = queue_quota_facts
+                            .iter()
+                            .find(|(id, _)| *id == shared_id)
+                            .cloned()
+                    {
+                        self.kernel.quota().release(
+                            &principal,
+                            ResourceClass::HostQueue,
+                            pending as u64,
+                        );
+                    }
+                }
                 ResourceClass::TcpListener => {
                     drop(self.kernel.close_tcp_listener(local_id));
                 }
@@ -392,9 +475,13 @@ impl Runtime {
                     drop(self.kernel.close_udp_socket(local_id));
                 }
                 ResourceClass::DurableLog => {
+                    // Storage quotas are sticky across process death: durable
+                    // bytes persist (that is their point) and are released only
+                    // by an explicit user-side mechanism (TBA; see the spec).
                     drop(self.kernel.storage().close_log(local_id));
                 }
                 ResourceClass::BlobStore => {
+                    // Sticky storage quota, as above.
                     drop(self.kernel.storage().close_blob_store(local_id));
                 }
                 ResourceClass::Process => {}
@@ -417,12 +504,26 @@ impl Runtime {
             .collect::<Vec<_>>();
 
         for shared_id in owned_regions {
+            let mapping_count = self.kernel.memory().shared_region_mapping_count(shared_id);
             self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
-            if self.kernel.memory().shared_region_mapping_count(shared_id) == 0 {
-                // Best-effort: the region has no remaining mappings, but if
-                // destruction fails the region will be reclaimed by the kernel
-                // on process exit anyway.
+            if mapping_count == 0 {
+                // The region is destroyed: return its bytes to the quota of
+                // the tenant it was minted for. (Regions with surviving
+                // mappings keep their reservation — the resource is still
+                // live for its co-attachers.)
+                let region_len = self.kernel.memory().shared_region_len(shared_id).ok();
                 drop(self.kernel.memory().destroy_shared_region(shared_id));
+                if let (Some(len), Some((_, tenant))) = (
+                    region_len,
+                    region_quota_facts
+                        .iter()
+                        .find(|(id, _)| *id == shared_id)
+                        .cloned(),
+                ) {
+                    self.kernel
+                        .quota()
+                        .release(&tenant, ResourceClass::SharedRegion, u64::from(len));
+                }
             }
         }
 
@@ -1139,6 +1240,59 @@ mod tests {
                 .expect("metering")
                 .cpu_micros,
             11
+        );
+    }
+
+    #[test]
+    fn metering_tick_projects_counters_and_gauges() {
+        let runtime = Runtime::default();
+        let guest = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "metered".to_string(),
+                module_id: "metered-module".to_string(),
+                module_bytes: module_with_entrypoint("main", ""),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some("acme".to_string()),
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn metered guest");
+
+        // Cumulative counters accumulate across ticks; the observation updates
+        // on the tick.
+        runtime.record_cpu_usage(guest.process_id, 500);
+        runtime.record_bandwidth_usage(guest.process_id, 1024);
+        runtime.metering_tick();
+
+        let observation = runtime
+            .kernel()
+            .processes()
+            .metering_observation(guest.process_id)
+            .expect("metered observation after tick");
+        assert_eq!(observation.cpu_micros, 500);
+        assert_eq!(observation.bandwidth_bytes, 1024);
+        assert_eq!(observation.memory_bytes, 0);
+        assert_eq!(observation.storage_bytes, 0);
+
+        // A second accumulation updates the projected observation on the next
+        // tick (cumulative semantics).
+        runtime.record_cpu_usage(guest.process_id, 250);
+        runtime.metering_tick();
+        assert_eq!(
+            runtime
+                .kernel()
+                .processes()
+                .metering_observation(guest.process_id)
+                .expect("metered observation")
+                .cpu_micros,
+            750
         );
     }
 

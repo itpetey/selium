@@ -268,15 +268,16 @@ fn quic_channel_handoff_golden_path() {
     memory.detach_shared_region(conn_mapping).expect("detach");
     memory.detach_shared_region(app_mapping).expect("detach");
 
-    // Cleanup.
+    // Cleanup. The handoff transferred ownership to the app, so the app
+    // frees the region (the connector no longer can).
     let (_, free_op) = runtime.begin_hostcall(
-        connector,
+        app,
         HostcallRequest::FreeRegion {
             region_id: alloc.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_op),
+        runtime.poll_hostcall(app, free_op),
         CompletionState::Ready(_)
     ));
 }

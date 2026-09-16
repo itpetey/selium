@@ -158,8 +158,15 @@ impl Runtime {
             HostOperationState::HostQueueRecvWait { local_id, deadline } => {
                 match self.kernel.queues().try_host_queue_recv(local_id) {
                     Ok(Some((client_process_id, value, metadata))) => {
-                        // Queue handoff: share region ownership on recv.
-                        self.share_region_ownership_on_recv(
+                        // The item left the queue: release its pipe slot.
+                        self.release_queue_item(
+                            self.kernel
+                                .queues()
+                                .host_queue_shared_id(local_id)
+                                .unwrap_or_default(),
+                        );
+                        // Queue handoff: transfer region ownership on recv.
+                        self.transfer_region_ownership_on_recv(
                             operation.process_id,
                             client_process_id,
                             value,
@@ -302,6 +309,11 @@ impl Runtime {
                     AbiError::new(AbiErrorCode::MalformedPayload, "region size exceeds u32")
                 })?;
 
+                // Quota primitives cap extent independently of grants: reserve
+                // the byte size against the serving tenant's shared-memory
+                // ceiling before any region is allocated.
+                self.enforce_quota(&principal, ResourceClass::SharedRegion, size_bytes)?;
+
                 // Allocate region in the shared registry (standalone, no guest mapping yet).
                 let (shared_id, _len) = self
                     .kernel
@@ -361,6 +373,19 @@ impl Runtime {
                     region_id,
                 )?;
 
+                // Capture the region size and serving tenant before teardown so
+                // the quota reservation made at AllocRegion can be released.
+                let region_len = self
+                    .kernel
+                    .memory()
+                    .shared_region_len(region_id)
+                    .map_err(kernel_error)?;
+                let serving_tenant = self
+                    .region_tenants
+                    .lock()
+                    .get(&(process_id, region_id))
+                    .cloned();
+
                 // Detach the region from ALL loaded guests' wasm memory.
                 let wasm_region_id = self
                     .kernel
@@ -391,6 +416,16 @@ impl Runtime {
                 // fast-path eligibility vote for this region is stale.
                 self.clear_fast_path_attachments(region_id);
                 self.release_shared_resource(process_id, &ResourceClass::SharedRegion, region_id);
+
+                // Return the region's byte size to the serving tenant's
+                // shared-memory quota reservation.
+                if let Some(tenant) = serving_tenant {
+                    self.kernel.quota().release(
+                        &tenant,
+                        ResourceClass::SharedRegion,
+                        u64::from(region_len),
+                    );
+                }
 
                 // Tier-1 discovery revocation: publish a Revoke for the region URI.
                 if let Some(tenant) = self.region_tenants.lock().remove(&(process_id, region_id)) {
@@ -578,7 +613,7 @@ impl Runtime {
                     None,
                     uri,
                 )?;
-                let descriptor = crate::network::tcp_connect(self, address)
+                let descriptor = crate::network::tcp_connect(self, process_id, address)
                     .map_err(|e| AbiError::new(AbiErrorCode::Internal, e.to_string()))?;
                 self.claim_local_handle(process_id, ResourceClass::TcpStream, descriptor.shared_id);
                 self.claim_shared_resource(
@@ -671,11 +706,21 @@ impl Runtime {
                     ResourceClass::DurableLog,
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
+                // Storage allocations count against the writer's durable-log
+                // quota: the append's payload bytes are reserved before the
+                // record is written.
+                let payload_len = payload.len() as u64;
+                self.enforce_quota(
+                    &self.process_tenant(process_id).unwrap_or_default(),
+                    ResourceClass::DurableLog,
+                    payload_len,
+                )?;
                 let sequence = self
                     .kernel
                     .storage()
                     .append_log(local_id, timestamp_ms, headers, payload)
                     .map_err(kernel_error)?;
+                self.note_storage_usage(process_id, payload_len);
                 Ok(HostOperationState::Ready(HostcallOutput::Sequence(Some(
                     sequence,
                 ))))
@@ -774,11 +819,20 @@ impl Runtime {
                     ResourceClass::BlobStore,
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
+                // Storage allocations count against the writer's blob-store
+                // quota: the blob's byte length is reserved before it is stored.
+                let blob_len = bytes.len() as u64;
+                self.enforce_quota(
+                    &self.process_tenant(process_id).unwrap_or_default(),
+                    ResourceClass::BlobStore,
+                    blob_len,
+                )?;
                 let blob_id = self
                     .kernel
                     .storage()
                     .put_blob(local_id, bytes)
                     .map_err(kernel_error)?;
+                self.note_storage_usage(process_id, blob_len);
                 Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id)))
             }
             HostcallRequest::StorageBlobGet { local_id, blob_id } => {
@@ -933,6 +987,23 @@ impl Runtime {
                     None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
                 }
             }
+            HostcallRequest::QuotaSet {
+                tenant,
+                class,
+                limit,
+            } => {
+                // Quota authorship is bootstrap-provisioned: only the
+                // accounting guest holds `QuotaWrite`, and the admission matrix
+                // keeps it non-conferable.
+                self.require_capability(process_id, Capability::QuotaWrite)?;
+                self.kernel.quota().set(tenant, class, limit);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::QuotaClear { tenant, class } => {
+                self.require_capability(process_id, Capability::QuotaWrite)?;
+                self.kernel.quota().clear(&tenant, class);
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
             HostcallRequest::GuestLogWrite { entry } => {
                 // GuestLogWrite treats the writer's own pid as owned: a
                 // process can always write a log entry for itself.
@@ -972,6 +1043,10 @@ impl Runtime {
                 // with tenant-scoped delegation.
                 let principal =
                     self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
+                // Pipe quotas meter queued *items*, not queue count: a queue
+                // costs nothing to create and each pending entry reserves one
+                // slot against the queue owner's (serving) tenant — released
+                // when the entry is received. See `charge_queue_item`.
                 let queues = self.kernel.queues();
                 let memory = self.kernel.memory();
                 let descriptor = queues.create_host_queue(&memory);
@@ -1270,6 +1345,9 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     Some(ResourceIdentity::Shared(shared_id)),
                 )?;
+                // A queued item reserves one pipe slot against the queue
+                // owner's tenant; it is released when the item is received.
+                self.charge_queue_item(shared_id)?;
                 self.kernel
                     .queues()
                     .host_queue_send(local_id, process_id, value, metadata)
@@ -1302,11 +1380,19 @@ impl Runtime {
                     .map_err(kernel_error)?
                 {
                     Some((client_process_id, value, metadata)) => {
+                        // The item left the queue and entered the receiving
+                        // process's resource table: release its pipe slot.
+                        self.release_queue_item(shared_id);
                         // Queue handoff: if the value matches a shared region
-                        // owned by the sender, share ownership with the receiver
-                        // (documented rendezvous pattern — the only place
-                        // ownership is granted implicitly, kernel-side).
-                        self.share_region_ownership_on_recv(process_id, client_process_id, value);
+                        // owned by the sender, ownership TRANSFERS to the
+                        // receiver (documented rendezvous pattern — the only
+                        // place ownership moves implicitly, kernel-side),
+                        // with the region's quota reservation following it.
+                        self.transfer_region_ownership_on_recv(
+                            process_id,
+                            client_process_id,
+                            value,
+                        );
                         Ok(HostOperationState::Ready(HostcallOutput::ConnectionInfo {
                             client_process_id,
                             value,
@@ -1475,12 +1561,14 @@ impl Runtime {
                     if let Ok(Some((client_process_id, value, metadata))) =
                         self.kernel.queues().try_host_queue_recv(local_id)
                     {
-                        // Queue handoff: mirror the ownership sharing performed
+                        // The item left the queue: release its pipe slot.
+                        self.release_queue_item(shared_id);
+                        // Queue handoff: mirror the ownership transfer performed
                         // by the `poll_hostcall` completion path. Without this,
                         // a receiver woken via `HostQueueSend` gets the value
                         // but no authorisation basis to attach the handed-off
                         // region (documented rendezvous pattern).
-                        self.share_region_ownership_on_recv(
+                        self.transfer_region_ownership_on_recv(
                             operation.process_id,
                             client_process_id,
                             value,
@@ -1522,6 +1610,53 @@ impl Runtime {
             if *next_operation_id == first_candidate {
                 panic!("operation id space exhausted");
             }
+        }
+    }
+
+    /// Reserves `amount` of the tenant's quota ceiling for `class`, denying
+    /// the allocation (before any resource is granted) when it would exceed
+    /// the authored ceiling. The platform tenant (empty name) is unrestricted.
+    fn enforce_quota(
+        &self,
+        tenant: &str,
+        class: ResourceClass,
+        amount: u64,
+    ) -> std::result::Result<(), AbiError> {
+        self.kernel
+            .quota()
+            .try_consume(tenant, class, amount)
+            .map_err(|error| AbiError::new(AbiErrorCode::QuotaExceeded, error.to_string()))
+    }
+
+    /// Returns the tenant whose pipe quota meters a queue: the serving
+    /// principal the queue was minted for (its owner). Items pending in a
+    /// tenant's queues count against that tenant, whoever sent them.
+    fn queue_owner_tenant(&self, shared_id: u64) -> Option<String> {
+        self.queue_tenants
+            .lock()
+            .iter()
+            .find(|((_, queue_shared_id), _)| *queue_shared_id == shared_id)
+            .map(|(_, principal)| principal.clone())
+    }
+
+    /// Reserves one pipe slot against the queue owner's (serving) tenant for
+    /// an item enqueued onto `shared_id`, denying the enqueue when the
+    /// tenant's ceiling is exhausted.
+    pub(crate) fn charge_queue_item(&self, shared_id: u64) -> std::result::Result<(), AbiError> {
+        if let Some(tenant) = self.queue_owner_tenant(shared_id) {
+            self.enforce_quota(&tenant, ResourceClass::HostQueue, 1)?;
+        }
+        Ok(())
+    }
+
+    /// Releases the pipe slot reserved for a delivered (dequeued) item: the
+    /// item has left the queue and entered the receiving process's resource
+    /// table.
+    pub(crate) fn release_queue_item(&self, shared_id: u64) {
+        if let Some(tenant) = self.queue_owner_tenant(shared_id) {
+            self.kernel
+                .quota()
+                .release(&tenant, ResourceClass::HostQueue, 1);
         }
     }
 
@@ -1610,19 +1745,81 @@ impl Runtime {
     /// Queue handoff ownership sharing: if `value` matches a shared region
     /// owned by `sender_pid`, share ownership with `receiver_pid`. This is the
     /// one place ownership is granted implicitly (kernel-side, documented).
-    fn share_region_ownership_on_recv(
+    /// Transfers ownership of a handed-off region from sender to receiver.
+    ///
+    /// A delivered handoff leaves the sender's resource table and enters the
+    /// receiver's (Option A transfer semantics — the rendezvous pattern is
+    /// the only place ownership moves implicitly, kernel-side). The region's
+    /// quota reservation follows the resource: released from the sender's
+    /// (recorded serving) tenant and force-consumed against the receiver's.
+    ///
+    /// The receiver's consumption is **force-accepted**, not denied: a peer
+    /// can hand over a "poisoned" resource that pushes the receiving tenant
+    /// over its ceiling (subsequent allocations are denied; metering
+    /// surfaces the anomaly). Denying the receive instead would require
+    /// peek/requeue machinery in the host queue and would clog the victim's
+    /// queue slot permanently — a strictly worse denial than the documented
+    /// ceiling overflow. See the accountant spec's open-attack-vector note.
+    ///
+    /// Cross-tenant handoffs also move the discovery revocation bookkeeping
+    /// (`region_tenants`) to the receiver under the receiver's tenant; the
+    /// tier-1 registration URI remains minted under the original tenant, so
+    /// a cross-tenant revocation may miss (single-tenant handoffs — all
+    /// current flows — are unaffected).
+    fn transfer_region_ownership_on_recv(
         &self,
         receiver_pid: ProcessId,
         sender_pid: ProcessId,
         value: u64,
     ) {
-        if self
+        let region_id = value;
+        let sender_owns = self
             .shared_resource_owners
             .lock()
-            .get(&(ResourceClass::SharedRegion, value))
-            .is_some_and(|owners| owners.contains(&sender_pid))
+            .get(&(ResourceClass::SharedRegion, region_id))
+            .is_some_and(|owners| owners.contains(&sender_pid));
+        if !sender_owns {
+            return;
+        }
+
+        // Move the quota reservation: release from the recorded serving
+        // tenant, force-consume against the receiver's tenant (only when the
+        // tenants differ — an intra-tenant handoff keeps the reservation put).
+        let mut region_tenants = self.region_tenants.lock();
+        let key = (sender_pid, region_id);
+        if let Some(serving_tenant) = region_tenants.get(&key).cloned() {
+            let receiver_tenant = self.process_tenant(receiver_pid).unwrap_or_default();
+            if serving_tenant != receiver_tenant
+                && let Ok(len) = self.kernel.memory().shared_region_len(region_id)
+            {
+                self.kernel.quota().release(
+                    &serving_tenant,
+                    ResourceClass::SharedRegion,
+                    u64::from(len),
+                );
+                self.kernel.quota().force_consume(
+                    &receiver_tenant,
+                    ResourceClass::SharedRegion,
+                    u64::from(len),
+                );
+            }
+            // Re-key the revocation bookkeeping to the receiver under its
+            // tenant (single-tenant handoffs keep the same tenant value).
+            region_tenants.remove(&key);
+            region_tenants.insert(
+                (receiver_pid, region_id),
+                self.process_tenant(receiver_pid).unwrap_or_default(),
+            );
+        }
+        drop(region_tenants);
+
+        // Transfer ownership: the sender's entry leaves its resource table,
+        // the receiver's gains it.
+        let mut shared_resource_owners = self.shared_resource_owners.lock();
+        if let Some(owners) = shared_resource_owners.get_mut(&(ResourceClass::SharedRegion, region_id))
         {
-            self.claim_shared_resource(receiver_pid, ResourceClass::SharedRegion, value);
+            owners.remove(&sender_pid);
+            owners.insert(receiver_pid);
         }
     }
 
@@ -1700,6 +1897,20 @@ impl Runtime {
             return Err(AbiError::new(
                 AbiErrorCode::PermissionDenied,
                 "MintCertificate cannot be delegated to child processes",
+            ));
+        }
+
+        // `QuotaWrite` mirrors `MintCertificate` and `DelegateGrants`: it is
+        // bootstrap-provisioned only. A spawn that confers it on a child is
+        // denied even when the parent itself holds the capability, so quota
+        // authorship stays with the accounting guest.
+        if grants
+            .iter()
+            .any(|grant| grant.capability == Capability::QuotaWrite)
+        {
+            return Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                "QuotaWrite cannot be delegated to child processes",
             ));
         }
 
@@ -2775,6 +2986,508 @@ mod tests {
             runtime.poll_hostcall(parent.process_id, op),
             CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn quota_write_is_bootstrap_provisionable() {
+        let runtime = Runtime::default();
+
+        // Bootstrap provisioning admits the capability: a system guest holding
+        // `QuotaWrite` starts normally and carries the grant in its persisted
+        // authority.
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(Capability::QuotaWrite, Vec::new())],
+        );
+
+        assert!(
+            runtime
+                .restore_process_authority(bootstrapped.process_id)
+                .is_some_and(|authority| authority
+                    .grants
+                    .iter()
+                    .any(|grant| grant.capability == Capability::QuotaWrite))
+        );
+    }
+
+    #[test]
+    fn quota_write_cannot_be_conferred_on_children() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        // A parent holding `QuotaWrite` (bootstrap-provisioned) and
+        // `ProcessLifecycle` cannot confer quota authorship on a child: the
+        // spawn is denied with a capability error, mirroring `MintCertificate`.
+        let parent = spawn_with_grants(
+            &runtime,
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(Capability::QuotaWrite, Vec::new()),
+            ],
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(Capability::QuotaWrite, Vec::new())],
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "QuotaWrite must never be conferred on a child process"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn quota_hostcalls_deny_without_quota_write() {
+        let runtime = Runtime::default();
+        // A guest without `QuotaWrite` is denied the quota hostcalls: quota
+        // authorship is bootstrap-provisioned to the accounting guest alone.
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+
+        for request in [
+            HostcallRequest::QuotaSet {
+                tenant: "acme".to_string(),
+                class: ResourceClass::SharedRegion,
+                limit: 1024,
+            },
+            HostcallRequest::QuotaClear {
+                tenant: "acme".to_string(),
+                class: ResourceClass::SharedRegion,
+            },
+        ] {
+            let (status, op) = runtime.begin_hostcall(guest.process_id, request);
+            assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+            assert!(matches!(
+                runtime.poll_hostcall(guest.process_id, op),
+                CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+            ));
+        }
+    }
+
+    #[test]
+    fn over_ceiling_shared_memory_allocation_is_denied() {
+        let runtime = Runtime::default();
+        // Author a 64 KiB shared-memory ceiling for `acme` (the runtime gates
+        // `QuotaSet` behind `QuotaWrite`, covered by the test above; writing
+        // the table directly keeps this test focused on enforcement).
+        runtime
+            .kernel
+            .quota()
+            .set("acme", ResourceClass::SharedRegion, 65_536);
+
+        let tenant_guest = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-worker",
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+            Some("acme"),
+        );
+
+        // One page fits the ceiling exactly; a second page exceeds it.
+        let (first_status, _first_op) = runtime.begin_hostcall(
+            tenant_guest.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(first_status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let (second_status, second_op) = runtime.begin_hostcall(
+            tenant_guest.process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(second_status, selium_abi::HOSTCALL_STATUS_FAILED);
+        match runtime.poll_hostcall(tenant_guest.process_id, second_op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::QuotaExceeded);
+                assert!(
+                    error.message.contains("acme"),
+                    "error names the tenant: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("SharedRegion"),
+                    "error names the dimension: {}",
+                    error.message
+                );
+            }
+            other => panic!("expected quota denial, got {other:?}"),
+        }
+    }
+
+    /// Pipe quotas meter queued *items*, not queue count: creating a queue
+    /// costs nothing, each queued item reserves one slot against the queue
+    /// owner's tenant, an over-ceiling send is denied with `QuotaExceeded`,
+    /// and receiving releases the slot.
+    #[test]
+    fn pipe_quota_meters_queued_items_not_queue_count() {
+        let runtime = Runtime::default();
+
+        // The queue owner: tenant acme, holding the pipe capability.
+        let owner = spawn_with_grants_and_tenant(
+            &runtime,
+            "queue-owner",
+            vec![CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            )],
+            Some("acme"),
+        )
+        .process_id;
+
+        // Creating a queue consumes no slot.
+        let (create_status, create_op) = runtime.begin_hostcall(
+            owner,
+            HostcallRequest::HostQueueCreate {
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(create_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
+            runtime.poll_hostcall(owner, create_op)
+        else {
+            panic!("owner should create its queue");
+        };
+        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 0);
+
+        // Author a two-item pipe ceiling for acme.
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::HostQueue, 2);
+
+        // A sender with an explicit grant for the owner's queue: it attaches
+        // the queue to obtain its own local handle, then sends.
+        let sender = spawn_with_grants_and_tenant(
+            &runtime,
+            "queue-sender",
+            vec![CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ExplicitResource(ResourceIdentity::Shared(
+                    queue.shared_id,
+                ))],
+            )],
+            None,
+        )
+        .process_id;
+
+        let (attach_status, attach_op) =
+            runtime.begin_hostcall(sender, HostcallRequest::HostQueueAttach { shared_id: queue.shared_id });
+        assert_eq!(attach_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::HostQueue(sender_queue)) =
+            runtime.poll_hostcall(sender, attach_op)
+        else {
+            panic!("sender should attach the owner's queue");
+        };
+
+        let send = |value: u64| {
+            runtime.begin_hostcall(
+                sender,
+                HostcallRequest::HostQueueSend {
+                    local_id: sender_queue.local_id,
+                    value,
+                    metadata: Vec::new(),
+                },
+            )
+        };
+
+        // Two items fit the ceiling; the third is denied.
+        let (first, _) = send(1);
+        assert_eq!(first, selium_abi::HOSTCALL_STATUS_READY);
+        let (second, _) = send(2);
+        assert_eq!(second, selium_abi::HOSTCALL_STATUS_READY);
+        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 2);
+        let (third_status, third_op) = send(3);
+        assert_eq!(third_status, selium_abi::HOSTCALL_STATUS_FAILED);
+        assert!(matches!(
+            runtime.poll_hostcall(sender, third_op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::QuotaExceeded
+        ));
+
+        // The owner receives one item: its slot is released and a further
+        // send fits again.
+        let (recv_status, recv_op) =
+            runtime.begin_hostcall(owner, HostcallRequest::HostQueueRecv { local_id: queue.local_id });
+        assert_eq!(recv_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(owner, recv_op),
+            CompletionState::Ready(HostcallOutput::ConnectionInfo { value: 1, .. })
+        ));
+        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 1);
+        let (fourth, _) = send(4);
+        assert_eq!(fourth, selium_abi::HOSTCALL_STATUS_READY);
+    }
+
+    /// A dying process releases its live reservations: allocated regions'
+    /// bytes return to the tenant's quota, and pipe slots held by items
+    /// still queued in its queues are returned. Storage stays sticky.
+    #[test]
+    fn process_teardown_releases_region_and_pipe_quota() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-worker",
+            vec![
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                ),
+                CapabilityGrant::new(
+                    Capability::HostQueue,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+                ),
+            ],
+            Some("acme"),
+        )
+        .process_id;
+
+        // Allocate a one-page region and leave one item queued.
+        let (alloc_status, alloc_op) = runtime.begin_hostcall(
+            guest,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(alloc_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(guest, alloc_op),
+            CompletionState::Ready(HostcallOutput::RegionAlloc(_))
+        ));
+
+        let (queue_status, queue_op) = runtime.begin_hostcall(
+            guest,
+            HostcallRequest::HostQueueCreate {
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(queue_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
+            runtime.poll_hostcall(guest, queue_op)
+        else {
+            panic!("guest should create its queue");
+        };
+        let (send_status, _) = runtime.begin_hostcall(
+            guest,
+            HostcallRequest::HostQueueSend {
+                local_id: queue.local_id,
+                value: 1,
+                metadata: Vec::new(),
+            },
+        );
+        assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
+
+        assert_eq!(
+            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            65_536
+        );
+        assert_eq!(runtime.kernel().quota().used("acme", ResourceClass::HostQueue), 1);
+
+        // The worker dies: its region and queued item return to the quota.
+        runtime.stop_process(guest).expect("stop worker");
+        assert_eq!(
+            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            0,
+            "destroyed region's bytes must return to the tenant's quota"
+        );
+        assert_eq!(
+            runtime.kernel().quota().used("acme", ResourceClass::HostQueue),
+            0,
+            "queued items of a dead owner must release their pipe slots"
+        );
+    }
+
+    /// A handed-off region transfers: the sender's entry leaves its resource
+    /// table (it can no longer free the region) and the receiver's gains it,
+    /// with the quota reservation following the resource across tenants.
+    #[test]
+    fn handoff_transfers_region_ownership_and_quota() {
+        let runtime = Runtime::default();
+
+        // The receiving side: tenant beta, holding memory and pipe
+        // capabilities.
+        let receiver = spawn_with_grants_and_tenant(
+            &runtime,
+            "beta-receiver",
+            vec![
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                ),
+                CapabilityGrant::new(
+                    Capability::HostQueue,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+                ),
+            ],
+            Some("beta"),
+        )
+        .process_id;
+
+        // The receiver creates a queue under its own tenant first: the
+        // sender (a different tenant) then spawns with an explicit grant for
+        // that queue so it may attach and send into it.
+        let (queue_status, queue_op) = runtime.begin_hostcall(
+            receiver,
+            HostcallRequest::HostQueueCreate {
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(queue_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::HostQueue(queue)) =
+            runtime.poll_hostcall(receiver, queue_op)
+        else {
+            panic!("receiver should create its queue");
+        };
+
+        // The sending side: tenant acme, holding memory and an explicit
+        // grant for the receiver's queue.
+        let sender = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-sender",
+            vec![
+                CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                ),
+                CapabilityGrant::new(
+                    Capability::HostQueue,
+                    vec![ResourceSelector::ExplicitResource(ResourceIdentity::Shared(
+                        queue.shared_id,
+                    ))],
+                ),
+            ],
+            Some("acme"),
+        )
+        .process_id;
+
+        // The sender allocates a one-page region (charged to acme).
+        let (alloc_status, alloc_op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(alloc_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::RegionAlloc(region)) =
+            runtime.poll_hostcall(sender, alloc_op)
+        else {
+            panic!("sender should allocate its region");
+        };
+        assert_eq!(
+            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            65_536
+        );
+
+        let (attach_status, attach_op) =
+            runtime.begin_hostcall(sender, HostcallRequest::HostQueueAttach { shared_id: queue.shared_id });
+        assert_eq!(attach_status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::HostQueue(sender_queue)) =
+            runtime.poll_hostcall(sender, attach_op)
+        else {
+            panic!("sender should attach the receiver's queue");
+        };
+
+        let (send_status, _) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::HostQueueSend {
+                local_id: sender_queue.local_id,
+                value: region.region_id,
+                metadata: Vec::new(),
+            },
+        );
+        assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let (recv_status, recv_op) = runtime.begin_hostcall(
+            receiver,
+            HostcallRequest::HostQueueRecv {
+                local_id: queue.local_id,
+            },
+        );
+        assert_eq!(recv_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(receiver, recv_op),
+            CompletionState::Ready(HostcallOutput::ConnectionInfo { value, .. }) if value == region.region_id
+        ));
+
+        // The reservation followed the resource: acme's bytes moved to beta.
+        assert_eq!(
+            runtime.kernel().quota().used("acme", ResourceClass::SharedRegion),
+            0,
+            "the sender's reservation must move with the handed-off region"
+        );
+        assert_eq!(
+            runtime.kernel().quota().used("beta", ResourceClass::SharedRegion),
+            65_536,
+            "the receiver's tenant inherits the region's reservation"
+        );
+
+        // Ownership transferred: the receiver frees the region (releasing
+        // beta's reservation), and the sender can no longer free it.
+        let (free_status, free_op) = runtime.begin_hostcall(
+            receiver,
+            HostcallRequest::FreeRegion {
+                region_id: region.region_id,
+            },
+        );
+        assert_eq!(free_status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(receiver, free_op),
+            CompletionState::Ready(_)
+        ));
+        assert_eq!(
+            runtime.kernel().quota().used("beta", ResourceClass::SharedRegion),
+            0
+        );
+
+        let (sender_free_status, _sender_free_op) = runtime.begin_hostcall(
+            sender,
+            HostcallRequest::FreeRegion {
+                region_id: region.region_id,
+            },
+        );
+        assert_eq!(
+            sender_free_status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "the sender must no longer own the handed-off region"
+        );
     }
 
     #[test]

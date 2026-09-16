@@ -152,28 +152,47 @@ fn concurrent_connections_use_distinct_regions() {
     };
     assert_eq!(recv_b, region_b.region_id);
 
-    // Free both regions (simulates connection teardown / reclaim).
-    // Task 3.1: region-pair lifetime tied to connection teardown.
+    // Free both regions (simulates connection teardown / reclaim). The
+    // handoff transferred ownership to the server: the delivered regions
+    // entered the receiver's resource table, so the server frees them and
+    // the connector no longer can.
     let (_, free_a) = runtime.begin_hostcall(
-        connector,
+        server,
         HostcallRequest::FreeRegion {
             region_id: region_a.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_a),
+        runtime.poll_hostcall(server, free_a),
         CompletionState::Ready(_)
     ));
 
     let (_, free_b) = runtime.begin_hostcall(
-        connector,
+        server,
         HostcallRequest::FreeRegion {
             region_id: region_b.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_b),
+        runtime.poll_hostcall(server, free_b),
         CompletionState::Ready(_)
+    ));
+
+    // The sender's free rights ended at delivery: its FreeRegion is denied.
+    let (sender_free_status, sender_free_op) = runtime.begin_hostcall(
+        connector,
+        HostcallRequest::FreeRegion {
+            region_id: region_a.region_id,
+        },
+    );
+    assert_eq!(
+        sender_free_status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "the sender must no longer own a delivered handoff region"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(connector, sender_free_op),
+        CompletionState::Failed(_)
     ));
 }
 
@@ -841,8 +860,8 @@ fn zero_grant_guest_round_trip_via_host_queue() {
     assert_eq!(send_status, selium_abi::HOSTCALL_STATUS_READY);
 
     // Step 5: Server receives the region id. The HostQueueRecv path in
-    // dispatch_hostcall and poll_hostcall both call share_region_ownership_on_recv,
-    // which gives the server ownership of the session region.
+    // dispatch_hostcall and poll_hostcall both transfer region ownership on
+    // recv, which moves the session region into the server's resource table.
     let (recv_status, server_recv_op) = runtime.begin_hostcall(
         server,
         HostcallRequest::HostQueueRecv {
@@ -902,15 +921,16 @@ fn zero_grant_guest_round_trip_via_host_queue() {
         CompletionState::Failed(_)
     ));
 
-    // Cleanup: free the region.
+    // Cleanup: free the region. The handoff transferred ownership to the
+    // server, so the server frees it (the connector no longer can).
     let (_, free_op) = runtime.begin_hostcall(
-        connector,
+        server,
         HostcallRequest::FreeRegion {
             region_id: alloc.region_id,
         },
     );
     assert!(matches!(
-        runtime.poll_hostcall(connector, free_op),
+        runtime.poll_hostcall(server, free_op),
         CompletionState::Ready(_)
     ));
 }

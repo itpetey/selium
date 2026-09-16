@@ -132,6 +132,14 @@ pub struct Runtime {
     /// Initialised at startup (see [`Runtime::initialize_keyring`]); the
     /// signing hostcalls fail loudly while it is absent.
     pub(crate) keyring: Arc<Mutex<Option<crate::keyring::Keyring>>>,
+    /// Host-side metering projector: accumulates per-process cumulative
+    /// cpu/bandwidth counters and storage gauges, projected into the kernel on
+    /// each metering tick (see [`Runtime::metering_tick`]).
+    pub(crate) metering: Arc<Mutex<crate::metering::MeteringProjector>>,
+    /// Guards the one-shot metering ticker started at bootstrap: the host
+    /// projects fresh per-process observations on the sampling cadence so
+    /// the bookkeeper's `MeteringRead` polls observe live consumption.
+    pub(crate) metering_ticker_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Runtime {
@@ -175,6 +183,8 @@ impl Runtime {
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
             timer_handle: Arc::new(std::sync::OnceLock::new()),
             keyring: Arc::new(Mutex::new(None)),
+            metering: Arc::new(Mutex::new(crate::metering::MeteringProjector::default())),
+            metering_ticker_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Initialise the mio network poller if possible (best-effort).

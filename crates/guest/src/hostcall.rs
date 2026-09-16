@@ -196,6 +196,28 @@ pub fn revoke_ca(tenant: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Stores a host-held quota counter for a tenant and resource class. Requires
+/// the bootstrap-provisioned, non-conferable `QuotaWrite` capability, held
+/// solely by the accounting guest.
+pub fn quota_set(tenant: &str, class: selium_abi::ResourceClass, limit: u64) -> Result<()> {
+    hostcall_ready(HostcallRequest::QuotaSet {
+        tenant: tenant.to_string(),
+        class,
+        limit,
+    })
+    .map(|_| ())
+}
+
+/// Removes a host-held quota counter for a tenant and resource class,
+/// restoring unrestricted allocation. Requires the `QuotaWrite` capability.
+pub fn quota_clear(tenant: &str, class: selium_abi::ResourceClass) -> Result<()> {
+    hostcall_ready(HostcallRequest::QuotaClear {
+        tenant: tenant.to_string(),
+        class,
+    })
+    .map(|_| ())
+}
+
 /// The calling process's own identity: process id and tenant scope.
 ///
 /// System guests use this to verify handoff identities against their own

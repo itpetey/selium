@@ -581,6 +581,110 @@ pub enum IdentityResponse {
     },
 }
 
+/// A per-tenant metering bucket for one sampling interval, published by the
+/// bookkeeper entrypoint to a shared-memory topic and merged by the
+/// accountant entrypoint. Counter dimensions (`cpu_micros`, `bandwidth_bytes`)
+/// carry the interval's delta; gauge dimensions (`memory_bytes`,
+/// `storage_bytes`) carry the current reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/accountant.fbs",
+    ty = "selium.accountant.MeteringBucket",
+    binding = "selium_service::fbs::selium::accountant::MeteringBucket"
+)]
+pub struct MeteringBucket {
+    /// Tenant whose usage the bucket aggregates.
+    pub tenant: String,
+    /// CPU time delta in microseconds.
+    pub cpu_micros: u64,
+    /// Current memory usage in bytes.
+    pub memory_bytes: u64,
+    /// Current storage usage in bytes.
+    pub storage_bytes: u64,
+    /// Bandwidth delta in bytes.
+    pub bandwidth_bytes: u64,
+    /// Wall-clock publish time in unix seconds, stamped by the bookkeeper:
+    /// the accountant buckets the bucket into its billing window by this
+    /// stamp, not by its own receive-time clock.
+    pub published_unix_s: u64,
+}
+
+/// Per-dimension ceiling values for a tenant's paid plan or opt-in overage
+/// budget, authored by the operator through [`AccountantControl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/accountant.fbs",
+    ty = "selium.accountant.TenantPlan",
+    binding = "selium_service::fbs::selium::accountant::TenantPlan"
+)]
+pub struct TenantPlan {
+    /// CPU ceiling in microseconds (billable overage only).
+    pub cpu_micros: u64,
+    /// Memory ceiling in bytes.
+    pub memory_bytes: u64,
+    /// Storage ceiling in bytes.
+    pub storage_bytes: u64,
+    /// Bandwidth ceiling in bytes per minute.
+    pub bandwidth_bytes: u64,
+}
+
+/// Operator/billing control request served by the accountant: authoring the
+/// plan (soft ceiling) and overage budget (hard ceiling = plan + overage), and
+/// driving the rare billing-state transitions (delinquency/restoration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/accountant.fbs",
+    ty = "selium.accountant.AccountantControl",
+    binding = "selium_service::fbs::selium::accountant::AccountantControl"
+)]
+pub enum AccountantControl {
+    /// Author the tenant's paid plan ceilings.
+    SetPlan {
+        /// Tenant whose plan is authored.
+        tenant: String,
+        /// Per-dimension soft ceilings.
+        plan: TenantPlan,
+    },
+    /// Author the tenant's opt-in overage budget.
+    SetOverage {
+        /// Tenant whose overage budget is authored.
+        tenant: String,
+        /// Per-dimension hard-ceiling additions over the plan.
+        overage: TenantPlan,
+    },
+    /// Mark the tenant delinquent: narrow its grants to nothing and zero its
+    /// quotas.
+    MarkDelinquent {
+        /// Tenant to suspend.
+        tenant: String,
+    },
+    /// Restore a delinquent tenant to good standing.
+    MarkRestored {
+        /// Tenant to restore.
+        tenant: String,
+    },
+}
+
+/// Response from the accountant's operator/billing control surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/accountant.fbs",
+    ty = "selium.accountant.AccountantControlResponse",
+    binding = "selium_service::fbs::selium::accountant::AccountantControlResponse"
+)]
+pub enum AccountantControlResponse {
+    /// The control was applied and the tenant's enforcement state re-authored.
+    Updated {
+        /// Tenant whose enforcement state was updated.
+        tenant: String,
+    },
+    /// The control was refused or failed.
+    Error {
+        /// Failure context.
+        context: String,
+    },
+}
+
 /// Typed per-stream control frames shared between the external client and the
 /// bridge channel.
 ///
@@ -1262,6 +1366,84 @@ mod tests {
             let bytes = FlatMsg::encode(&response);
             let decoded: IdentityResponse = FlatMsg::decode(&bytes).expect("decode");
             assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn metering_bucket_round_trips() {
+        let bucket = MeteringBucket {
+            tenant: "acme".to_string(),
+            cpu_micros: 1_234_567,
+            memory_bytes: 65_536,
+            storage_bytes: 4096,
+            bandwidth_bytes: 10_000,
+            published_unix_s: 1_789_439_040,
+        };
+        let bytes = FlatMsg::encode(&bucket);
+        let decoded: MeteringBucket = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, bucket);
+    }
+
+    #[test]
+    fn accountant_control_response_round_trips() {
+        for response in [
+            AccountantControlResponse::Updated {
+                tenant: "acme".to_string(),
+            },
+            AccountantControlResponse::Error {
+                context: "unknown tenant".to_string(),
+            },
+        ] {
+            let bytes = FlatMsg::encode(&response);
+            let decoded: AccountantControlResponse = FlatMsg::decode(&bytes).expect("decode");
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
+    fn tenant_plan_round_trips() {
+        let plan = TenantPlan {
+            cpu_micros: 60_000_000,
+            memory_bytes: 1_073_741_824,
+            storage_bytes: 10_485_760,
+            bandwidth_bytes: 104_857_600,
+        };
+        let bytes = FlatMsg::encode(&plan);
+        let decoded: TenantPlan = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, plan);
+    }
+
+    #[test]
+    fn accountant_control_round_trips() {
+        for control in [
+            AccountantControl::SetPlan {
+                tenant: "acme".to_string(),
+                plan: TenantPlan {
+                    cpu_micros: 0,
+                    memory_bytes: 1024,
+                    storage_bytes: 512,
+                    bandwidth_bytes: 256,
+                },
+            },
+            AccountantControl::SetOverage {
+                tenant: "acme".to_string(),
+                overage: TenantPlan {
+                    cpu_micros: 0,
+                    memory_bytes: 256,
+                    storage_bytes: 128,
+                    bandwidth_bytes: 64,
+                },
+            },
+            AccountantControl::MarkDelinquent {
+                tenant: "acme".to_string(),
+            },
+            AccountantControl::MarkRestored {
+                tenant: "acme".to_string(),
+            },
+        ] {
+            let bytes = FlatMsg::encode(&control);
+            let decoded: AccountantControl = FlatMsg::decode(&bytes).expect("decode");
+            assert_eq!(decoded, control);
         }
     }
 

@@ -124,4 +124,27 @@ impl HostQueueRegistry {
             .ok_or(Error::NotFound(format!("host queue {shared_id}")))?;
         Ok(queue.entries.lock().pop_front())
     }
+
+    /// Returns the number of undelivered entries currently queued.
+    ///
+    /// The quota layer releases one pipe slot per delivered entry and the
+    /// remainder when the queue's owner goes away, so it needs the live
+    /// pending count.
+    pub fn host_queue_pending(&self, local_id: u64) -> Result<usize> {
+        let shared_id = self
+            .inner
+            .local_queues
+            .lock()
+            .get(&local_id)
+            .copied()
+            .ok_or(Error::NotFound(format!("host queue handle {local_id}")))?;
+        let queue = self
+            .inner
+            .queues_by_shared
+            .lock()
+            .get(&shared_id)
+            .cloned()
+            .ok_or(Error::NotFound(format!("host queue {shared_id}")))?;
+        Ok(queue.entries.lock().len())
+    }
 }

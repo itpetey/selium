@@ -53,8 +53,19 @@ impl EntrypointParam {
 /// optional leading `Context`, followed by integer parameters
 /// (`u8`/`u16`/`u32`/`u64`/`usize` and signed equivalents) and `(u64, u64)`
 /// pointer parameters, in sync and async variants.
+///
+/// One guest module may carry several entrypoints (each function emits its own
+/// unique export), but exactly one must be the **poll owner**: the module-global
+/// `__selium_guest_poll` reactor-drive export is emitted only by the entrypoint
+/// without the `no_poll` flag. Mark every additional entrypoint
+/// `#[entrypoint(no_poll)]`.
 #[proc_macro_attribute]
-pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn entrypoint(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let flags = parse_macro_input!(
+        attr with syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated
+    );
+    let no_poll = flags.iter().any(|ident| ident == "no_poll");
+
     let function = parse_macro_input!(item as ItemFn);
     if !function.sig.generics.params.is_empty() {
         return syn::Error::new_spanned(
@@ -99,24 +110,32 @@ pub fn entrypoint(_attr: TokenStream, item: TokenStream) -> TokenStream {
         &params,
     );
 
+    let poll_export = if no_poll {
+        quote! {}
+    } else {
+        quote! {
+            /// The host-driven reactor poll export. Only meaningful in the wasm
+            /// guest module (`cdylib`) build, where the runtime calls this
+            /// export by name to drive the reactor between entrypoint calls.
+            ///
+            /// Guest crates also compile as native `rlib`s (dev-dependencies
+            /// exposing constants and grant metadata to host-side tests), where
+            /// this export is dead weight: every `#[entrypoint]` crate emits the
+            /// same unmangled symbol, so linking two of them into one native
+            /// binary would collide. Gating on wasm keeps exactly one export per
+            /// guest module and none in native builds.
+            #[cfg(target_family = "wasm")]
+            #[unsafe(export_name = "__selium_guest_poll")]
+            pub extern "C" fn __selium_guest_poll() {
+                ::selium_guest::poll_safely();
+            }
+        }
+    };
+
     quote! {
         #generated
 
-        /// The host-driven reactor poll export. Only meaningful in the wasm
-        /// guest module (`cdylib`) build, where the runtime calls this
-        /// export by name to drive the reactor between entrypoint calls.
-        ///
-        /// Guest crates also compile as native `rlib`s (dev-dependencies
-        /// exposing constants and grant metadata to host-side tests), where
-        /// this export is dead weight: every `#[entrypoint]` crate emits the
-        /// same unmangled symbol, so linking two of them into one native
-        /// binary would collide. Gating on wasm keeps exactly one export per
-        /// guest module and none in native builds.
-        #[cfg(target_family = "wasm")]
-        #[unsafe(export_name = "__selium_guest_poll")]
-        pub extern "C" fn __selium_guest_poll() {
-            ::selium_guest::poll_safely();
-        }
+        #poll_export
 
         pub fn #metadata_fn() -> ::selium_guest::EntrypointMetadata {
             ::selium_guest::EntrypointMetadata::new(stringify!(#ident))

@@ -66,10 +66,28 @@ pub fn tcp_bind(
         let k = kernel.clone();
         let rt = runtime.clone();
         let queue_local_id = local_id;
+        // Bandwidth attribution: bytes on accepted connections belong to the
+        // listener's owner (the accepting process's tenant).
+        let owner_pid = process_id;
         poller
             .register_tcp_listener(
                 std_listener,
                 Box::new(move |stream: std::net::TcpStream| {
+                    // A queued connection reserves one pipe slot against the
+                    // listener owner's (serving) tenant. Over-ceiling arrivals
+                    // are dropped at the chokepoint — the external peer sees a
+                    // closed connection — and the denial is logged to aid
+                    // debugging.
+                    if let Ok(queue_shared_id) = k.queues().host_queue_shared_id(queue_local_id)
+                        && let Err(error) = rt.charge_queue_item(queue_shared_id)
+                    {
+                        tracing::debug!(
+                            queue = queue_shared_id,
+                            error = error.message,
+                            "accepted connection dropped: listener tenant's pipe quota exhausted"
+                        );
+                        return;
+                    }
                     drop(stream.set_nonblocking(true));
                     let (region, inbound_writer, outbound_reader, ring_offset, parent_local_id) =
                         match create_stream_region(&k) {
@@ -107,12 +125,19 @@ pub fn tcp_bind(
                     // inbound pump the guest would wait forever for data that is
                     // never delivered, so tear the connection down loudly rather
                     // than letting it hang.
+                    let bandwidth_rt = rt.clone();
+                    let bandwidth_cb: Option<selium_kernel::BandwidthFn> = Some(
+                        std::sync::Arc::new(move |bytes: u64| {
+                            bandwidth_rt.record_bandwidth_usage(owner_pid, bytes);
+                        }),
+                    );
                     let registration = match k.poller() {
                         Some(p) => p.register_tcp_stream(
                             stream,
                             inbound_writer,
                             shared_id,
                             stream_running.clone(),
+                            bandwidth_cb,
                         ),
                         None => Err(std::io::Error::other("network poller not initialised")),
                     };
@@ -136,10 +161,17 @@ pub fn tcp_bind(
                     // Spawn outbound drain on a dedicated thread.
                     let memory = k.memory();
                     let rt2 = rt.clone();
+                    let drain_rt = rt.clone();
+                    let drain_pid = owner_pid;
                     thread::spawn(move || {
-                        if let Err(_e) =
-                            proxy_outbound_tcp(outbound_stream, outbound_reader, stream_running)
-                        {
+                        if let Err(_e) = proxy_outbound_tcp(
+                            outbound_stream,
+                            outbound_reader,
+                            stream_running,
+                            Some(Box::new(move |bytes: u64| {
+                                drain_rt.record_bandwidth_usage(drain_pid, bytes);
+                            })),
+                        ) {
                         }
                         rt2.network_wait_keys
                             .lock()
@@ -167,7 +199,14 @@ pub fn tcp_bind(
 }
 
 /// Connect to a TCP endpoint and register the stream with the mio poller.
-pub fn tcp_connect(runtime: &Runtime, address: String) -> Result<SharedRegionDescriptor> {
+///
+/// `process_id` is the connecting process: its metering counter is credited
+/// with the stream's bandwidth in both directions.
+pub fn tcp_connect(
+    runtime: &Runtime,
+    process_id: u64,
+    address: String,
+) -> Result<SharedRegionDescriptor> {
     let kernel = &runtime.kernel;
     let std_stream = TcpStream::connect(&address)
         .map_err(|e| crate::Error::Host(format!("tcp connect failed: {e}")))?;
@@ -192,10 +231,16 @@ pub fn tcp_connect(runtime: &Runtime, address: String) -> Result<SharedRegionDes
         },
     );
 
-    // Register the stream for inbound reads with the mio poller.
+    // Register the stream for inbound reads with the mio poller. Inbound
+    // bytes are attributed to the connecting process's bandwidth counter.
     if let Some(poller) = kernel.poller() {
+        let bandwidth_rt = runtime.clone();
+        let bandwidth_pid = process_id;
+        let bandwidth_cb: Option<selium_kernel::BandwidthFn> = Some(std::sync::Arc::new(
+            move |bytes: u64| bandwidth_rt.record_bandwidth_usage(bandwidth_pid, bytes),
+        ));
         poller
-            .register_tcp_stream(std_stream, inbound_writer, shared_id, running.clone())
+            .register_tcp_stream(std_stream, inbound_writer, shared_id, running.clone(), bandwidth_cb)
             .map_err(|e| crate::Error::Host(format!("poller register stream: {e}")))?;
     }
 
@@ -206,11 +251,21 @@ pub fn tcp_connect(runtime: &Runtime, address: String) -> Result<SharedRegionDes
         .lock()
         .push((shared_id, gen_offset));
 
-    // Spawn the outbound drain on a dedicated thread.
+    // Spawn the outbound drain on a dedicated thread. Outbound bytes are
+    // attributed to the connecting process's bandwidth counter.
     let memory = kernel.memory();
     let rt = runtime.clone();
+    let drain_rt = runtime.clone();
+    let drain_pid = process_id;
     thread::spawn(move || {
-        if let Err(_e) = proxy_outbound_tcp(outbound_stream, outbound_reader, running) {}
+        if let Err(_e) = proxy_outbound_tcp(
+            outbound_stream,
+            outbound_reader,
+            running,
+            Some(Box::new(move |bytes: u64| {
+                drain_rt.record_bandwidth_usage(drain_pid, bytes);
+            })),
+        ) {}
         // Cleanup: remove wait key on exit.
         rt.network_wait_keys
             .lock()
@@ -365,6 +420,7 @@ fn proxy_outbound_tcp(
     mut stream: TcpStream,
     mut reader: RingReader,
     running: Arc<AtomicBool>,
+    on_bandwidth: Option<Box<dyn Fn(u64) + Send>>,
 ) -> Result<()> {
     let backend = reader.backend();
     // A fresh ring has zero writers because the peer has not attached yet.
@@ -390,6 +446,7 @@ fn proxy_outbound_tcp(
         loop {
             match reader.read_frame() {
                 Ok(Some((_header, payload))) => {
+                    let written = payload.len() as u64;
                     if let Err(_e) = stream.write_all(&payload) {
                         running.store(false, Ordering::Relaxed);
                         return Ok(());
@@ -397,6 +454,9 @@ fn proxy_outbound_tcp(
                     if let Err(_e) = stream.flush() {
                         running.store(false, Ordering::Relaxed);
                         return Ok(());
+                    }
+                    if let Some(record) = on_bandwidth.as_ref() {
+                        record(written);
                     }
                     saw_frame = true;
                 }
@@ -562,7 +622,7 @@ mod tests {
             drop(helper.accept());
         });
 
-        let descriptor = tcp_connect(&runtime, addr.to_string()).expect("tcp connect");
+        let descriptor = tcp_connect(&runtime, 0, addr.to_string()).expect("tcp connect");
         assert!(descriptor.shared_id > 0);
         assert!(descriptor.len > 0);
 
@@ -647,7 +707,7 @@ mod tests {
         });
 
         // Connect via the event-driven proxy.
-        let descriptor = tcp_connect(&runtime, server_addr.to_string()).expect("tcp connect");
+        let descriptor = tcp_connect(&runtime, 0, server_addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
         // Write to the outbound ring (simulating a guest write).
@@ -737,7 +797,7 @@ mod tests {
             }
         });
 
-        let descriptor = tcp_connect(&runtime, server_addr.to_string()).expect("tcp connect");
+        let descriptor = tcp_connect(&runtime, 0, server_addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
         let memory = runtime.kernel.memory();
@@ -812,7 +872,7 @@ mod tests {
             }
         });
 
-        let descriptor = tcp_connect(&runtime, server_addr.to_string()).expect("tcp connect");
+        let descriptor = tcp_connect(&runtime, 0, server_addr.to_string()).expect("tcp connect");
         let shared_id = descriptor.shared_id;
 
         // Wait for server to accept and close.

@@ -59,6 +59,10 @@ pub(crate) fn kernel_error(error: selium_kernel::Error) -> AbiError {
     let code = match error {
         selium_kernel::Error::NotFound(_) => AbiErrorCode::NotFound,
         selium_kernel::Error::Timeout => AbiErrorCode::Timeout,
+        // A quota denial is not a permission problem: the caller holds the
+        // capability, its tenant's authored ceiling is exhausted. The
+        // message names the tenant and resource class (dimension).
+        selium_kernel::Error::QuotaExceeded { .. } => AbiErrorCode::QuotaExceeded,
         selium_kernel::Error::AlreadyCompleted
         | selium_kernel::Error::ProcessStopped(_)
         | selium_kernel::Error::Wasm(_) => AbiErrorCode::Internal,

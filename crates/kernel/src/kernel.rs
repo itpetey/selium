@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use crate::{
     host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState, poller::Poller,
-    process::ProcessTable, storage::StorageRegistry,
+    process::ProcessTable, quota::QuotaTable, storage::StorageRegistry,
 };
 
 #[derive(Clone)]
@@ -22,6 +22,7 @@ pub(crate) struct KernelInner {
     pub(crate) storage: StorageRegistry,
     pub(crate) network: NetworkState,
     pub(crate) queues: HostQueueRegistry,
+    pub(crate) quota: QuotaTable,
     pub(crate) poller: Mutex<Option<Poller>>,
 }
 
@@ -34,6 +35,7 @@ impl Kernel {
                 storage: StorageRegistry::new(),
                 network: NetworkState::new(),
                 queues: HostQueueRegistry::new(),
+                quota: QuotaTable::new(),
                 poller: Mutex::new(None),
             }),
         }
@@ -71,6 +73,9 @@ impl Kernel {
     }
     pub fn queues(&self) -> HostQueueRegistry {
         self.inner.queues.clone()
+    }
+    pub fn quota(&self) -> QuotaTable {
+        self.inner.quota.clone()
     }
 }
 

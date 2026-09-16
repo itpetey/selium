@@ -10,9 +10,9 @@ pub use crate::{
     context::{Context, Serve},
     error::{GuestError, Result},
     hostcall::{
-        process_capability, process_tenant, random_bytes, record_registration,
-        record_resolved_queue_for, record_resolved_region_for, resolve_protocol_handler, revoke_ca,
-        self_info, sign_tenant_ca, sign_user_cert,
+        process_capability, process_tenant, quota_clear, quota_set, random_bytes,
+        record_registration, record_resolved_queue_for, record_resolved_region_for,
+        resolve_protocol_handler, revoke_ca, self_info, sign_tenant_ca, sign_user_cert,
     },
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::{mark_ready, process_id},

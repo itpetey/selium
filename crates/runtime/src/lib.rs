@@ -16,6 +16,7 @@ mod host_functions;
 mod hostcall;
 pub mod keyring;
 mod mailbox;
+mod metering;
 mod module_probe;
 mod network;
 mod process;
