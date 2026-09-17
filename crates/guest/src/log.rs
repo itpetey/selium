@@ -9,8 +9,10 @@ use std::{cell::Cell, sync::OnceLock};
 use selium_abi::{HostcallRequest, ResourceKind};
 use selium_memory::FrameHeader;
 use selium_service::FlatMsg;
-use selium_shm::RingBuf;
-use selium_shm::channels::{Channel, ChannelBackpressure};
+use selium_shm::{
+    RingBuf,
+    channels::{Channel, ChannelBackpressure},
+};
 use thiserror::Error;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{
@@ -197,23 +199,6 @@ pub fn init_with_capacity(capacity: u64) -> Result<(), InitError> {
     Ok(())
 }
 
-/// Installs a panic hook that emits a best-effort final log record before
-/// the guest aborts.
-///
-/// Guest panics become `unreachable` traps (panic=abort), which the host
-/// runtime drains and records as `ProcessExited`. The hook writes one
-/// `Error`-level record — including the panic message when available — into
-/// the log ring first, so the guest's last words survive in the drained
-/// logs. The previous hook is chained so native (non-WASM) panic output is
-/// preserved.
-fn install_panic_hook() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info: &std::panic::PanicHookInfo<'_>| {
-        emit_panic_record(info);
-        previous(info);
-    }));
-}
-
 /// Best-effort last-words record written by the panic hook.
 ///
 /// Writes directly to the ring (bypassing the tracing layer) so it cannot
@@ -254,20 +239,6 @@ fn emit_panic_record(info: &std::panic::PanicHookInfo<'_>) {
     publish(state.channel.ring(), &FlatMsg::encode(&record));
 }
 
-/// Publishes one encoded frame to the log ring, best-effort.
-///
-/// The log channel is drained by a weak reader (no reader slot), so a full
-/// ring never backpressures the guest: the oldest unread records are
-/// overwritten while the newest always survive. A reservation failure (a
-/// record larger than the ring) is dropped silently — logging must never
-/// stall guest execution.
-fn publish(ring: &RingBuf, encoded: &[u8]) {
-    let required = FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64;
-    if let Ok(pos) = ring.reserve(required) {
-        drop(ring.write_frame(pos, encoded, 0, 0));
-    }
-}
-
 /// Forwards a tracing event to the log channel as a framed FlatBuffer LogRecord.
 fn forward_event(event: &tracing::Event<'_>) {
     let _guard = match ForwardingGuard::enter() {
@@ -304,6 +275,37 @@ fn forward_event(event: &tracing::Event<'_>) {
     // never blocks the caller (see `publish`); the host's weak reader means
     // the newest records always survive.
     publish(state.channel.ring(), &encoded);
+}
+
+/// Installs a panic hook that emits a best-effort final log record before
+/// the guest aborts.
+///
+/// Guest panics become `unreachable` traps (panic=abort), which the host
+/// runtime drains and records as `ProcessExited`. The hook writes one
+/// `Error`-level record — including the panic message when available — into
+/// the log ring first, so the guest's last words survive in the drained
+/// logs. The previous hook is chained so native (non-WASM) panic output is
+/// preserved.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info: &std::panic::PanicHookInfo<'_>| {
+        emit_panic_record(info);
+        previous(info);
+    }));
+}
+
+/// Publishes one encoded frame to the log ring, best-effort.
+///
+/// The log channel is drained by a weak reader (no reader slot), so a full
+/// ring never backpressures the guest: the oldest unread records are
+/// overwritten while the newest always survive. A reservation failure (a
+/// record larger than the ring) is dropped silently — logging must never
+/// stall guest execution.
+fn publish(ring: &RingBuf, encoded: &[u8]) {
+    let required = FrameHeader::ENCODED_SIZE as u64 + encoded.len() as u64;
+    if let Ok(pos) = ring.reserve(required) {
+        drop(ring.write_frame(pos, encoded, 0, 0));
+    }
 }
 
 /// Returns the current wall-clock time in milliseconds, using the host

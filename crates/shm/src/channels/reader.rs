@@ -60,6 +60,26 @@ pub struct Reader {
     pending_offset: usize,
 }
 
+/// Weak (slotless) frame reader that always reads the newest available
+/// frames without ever backpressuring writers.
+///
+/// `WeakReader` is the formalised "weak reader": unlike [`BlockingReader`]
+/// it allocates no reader slot, so writers can always advance — a full ring
+/// overwrites the oldest unread frames rather than blocking. Each [`drain`]
+/// snaps forward to the newest window when the writer has overtaken it, then
+/// returns every committed frame up to the write tail, losing only the
+/// records that were overwritten.
+///
+/// This is the read handle for log drains and other fire-and-forget
+/// consumers where losing old records is acceptable but blocking a producer
+/// is not.
+///
+/// [`drain`]: WeakReader::drain
+pub struct WeakReader {
+    region: ChannelRegion,
+    pos: u64,
+}
+
 impl BlockingReader {
     /// Creates a new blocking reader at `start_pos` with the given `reader_id`.
     pub fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
@@ -452,26 +472,6 @@ impl AsyncRead for Reader {
 
         Poll::Ready(Ok(()))
     }
-}
-
-/// Weak (slotless) frame reader that always reads the newest available
-/// frames without ever backpressuring writers.
-///
-/// `WeakReader` is the formalised "weak reader": unlike [`BlockingReader`]
-/// it allocates no reader slot, so writers can always advance — a full ring
-/// overwrites the oldest unread frames rather than blocking. Each [`drain`]
-/// snaps forward to the newest window when the writer has overtaken it, then
-/// returns every committed frame up to the write tail, losing only the
-/// records that were overwritten.
-///
-/// This is the read handle for log drains and other fire-and-forget
-/// consumers where losing old records is acceptable but blocking a producer
-/// is not.
-///
-/// [`drain`]: WeakReader::drain
-pub struct WeakReader {
-    region: ChannelRegion,
-    pos: u64,
 }
 
 impl WeakReader {
