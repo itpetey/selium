@@ -242,6 +242,8 @@ pub enum MemoryError {
     IndexOutOfBounds,
     #[error("invalid layout")]
     InvalidLayout,
+    #[error("header checksum mismatch")]
+    CorruptedHeader,
     #[error("region provider is not configured")]
     ProviderNotSet,
     #[error("region not found: {0}")]

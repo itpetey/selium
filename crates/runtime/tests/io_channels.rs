@@ -147,7 +147,6 @@ fn frame_header_round_trip() {
         len: payload.len() as u32,
         tag: 1,
         flags: 0,
-        _reserved: [0; 3],
     };
     let header_bytes = header.encode();
 
@@ -156,17 +155,17 @@ fn frame_header_round_trip() {
         .write_shared_memory(mapping, 0, &header_bytes)
         .expect("write header");
     memory
-        .write_shared_memory(mapping, 12, payload)
+        .write_shared_memory(mapping, FrameHeader::ENCODED_SIZE as u64, payload)
         .expect("write payload");
 
     // Read back header.
     let read_header = memory
-        .read_shared_memory(mapping, 0, 12)
+        .read_shared_memory(mapping, 0, FrameHeader::ENCODED_SIZE)
         .expect("read header");
     let decoded = FrameHeader::decode(&read_header).expect("valid frame header");
     assert_eq!(decoded.len, 5);
     assert_eq!(decoded.tag, 1);
-    assert_eq!(decoded.frame_size(), 17);
+    assert_eq!(decoded.frame_size(), (FrameHeader::ENCODED_SIZE as u64) + 5);
 
     memory.detach_shared_region(mapping).expect("detach");
     free_region(&runtime, process_id, region_id);

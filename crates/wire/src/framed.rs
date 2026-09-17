@@ -101,7 +101,6 @@ impl Encoder<(Vec<u8>, u32, u8)> for FrameCodec {
             len: payload.len() as u32,
             tag,
             flags,
-            _reserved: [0; 3],
         };
         dst.reserve(FrameHeader::ENCODED_SIZE + payload.len());
         dst.extend_from_slice(&header.encode());

@@ -9,7 +9,15 @@ use crate::MemoryError;
 
 /// A frame header stored at the start of each message in a ring buffer.
 ///
-/// Layout: `[len: u32 little-endian] [tag: u32 little-endian] [flags: u8] [_reserved: [u8; 3]]` = 12 bytes
+/// Length-delimited frame header with a lightweight integrity checksum.
+///
+/// Layout: `[len: u32 LE] [tag: u32 LE] [flags: u8] [checksum: u32 LE] [pad: 3 bytes]` = 16 bytes
+///
+/// The checksum is FNV-1a over the first 9 bytes (len, tag, flags), computed at
+/// encode time and verified at decode time, so that misaligned reads are
+/// detectable. The trailing 3 bytes are zero padding that rounds the header to
+/// a clean 16-byte size for pointer maths; they carry no meaning and are
+/// ignored on decode.
 ///
 /// **Tag correlation**: In RPC contexts the `tag` field carries the correlation id
 /// assigned by the client. All frames belonging to one request (unary reply,
@@ -24,13 +32,11 @@ pub struct FrameHeader {
     pub tag: u32,
     /// Flags for frame metadata.
     pub flags: u8,
-    /// Reserved padding for alignment.
-    pub _reserved: [u8; 3],
 }
 
 impl FrameHeader {
     /// Total encoded header size in bytes.
-    pub const ENCODED_SIZE: usize = 12;
+    pub const ENCODED_SIZE: usize = 16;
     /// Frame flag set once the payload bytes are fully written.
     pub const FLAG_READY: u8 = 1;
     /// Frame flag set when a writer abandons a reserved span.
@@ -48,19 +54,47 @@ impl FrameHeader {
     pub const FLAG_STREAM_ERROR: u8 = 1 << 5;
 
     /// Encodes the header to a byte array.
-    pub fn encode(&self) -> [u8; 12] {
-        let mut bytes = [0u8; 12];
+    pub fn encode(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
         bytes[..4].copy_from_slice(&self.len.to_le_bytes());
         bytes[4..8].copy_from_slice(&self.tag.to_le_bytes());
         bytes[8] = self.flags;
-        bytes[9..12].copy_from_slice(&self._reserved);
+        let checksum = Self::checksum(&bytes[..9]);
+        bytes[9..13].copy_from_slice(&checksum.to_le_bytes());
+        // bytes[13..16] remain zero: trailing padding for a clean 16-byte size.
         bytes
     }
 
-    /// Decodes a header from a byte array.
+    /// FNV-1a 32-bit hash over the header's first 9 bytes.
+    ///
+    /// Chosen for being trivially portable to the guest while detecting any single-byte
+    /// change and most multi-byte corruption in the header.
+    fn checksum(bytes: &[u8]) -> u32 {
+        let mut hash = 0x811c_9dc5u32;
+        for &byte in bytes {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
+    /// Decodes a header from a byte array, verifying the FNV-1a checksum.
+    ///
+    /// Returns [`MemoryError::CorruptedHeader`] when the stored checksum does
+    /// not match the recomputed value — a misaligned read.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() < Self::ENCODED_SIZE {
             return Err(MemoryError::InvalidLayout);
+        }
+        let stored = u32::from_le_bytes(
+            bytes
+                .get(9..13)
+                .ok_or(MemoryError::InvalidLayout)?
+                .try_into()
+                .map_err(|_invalid_layout| MemoryError::InvalidLayout)?,
+        );
+        if stored != Self::checksum(bytes.get(..9).ok_or(MemoryError::InvalidLayout)?) {
+            return Err(MemoryError::CorruptedHeader);
         }
         let len = u32::from_le_bytes(
             bytes
@@ -77,17 +111,7 @@ impl FrameHeader {
                 .map_err(|_invalid_layout| MemoryError::InvalidLayout)?,
         );
         let flags = bytes.get(8).copied().ok_or(MemoryError::InvalidLayout)?;
-        let _reserved = bytes
-            .get(9..12)
-            .ok_or(MemoryError::InvalidLayout)?
-            .try_into()
-            .map_err(|_invalid_layout| MemoryError::InvalidLayout)?;
-        Ok(Self {
-            len,
-            tag,
-            flags,
-            _reserved,
-        })
+        Ok(Self { len, tag, flags })
     }
 
     /// Returns the total frame size including the header.
@@ -136,7 +160,6 @@ mod tests {
             len: 1024,
             tag: 42,
             flags: 1,
-            _reserved: [0; 3],
         };
         let encoded = header.encode();
         let decoded = FrameHeader::decode(&encoded).unwrap();
@@ -148,9 +171,47 @@ mod tests {
         clippy::assertions_on_result_states,
         reason = "unwrap_used lint conflicts with clippy's suggested fix"
     )]
-    fn header_requires_twelve_bytes() {
-        assert!(FrameHeader::decode(&[0; 11]).is_err());
-        assert!(FrameHeader::decode(&[0; 12]).is_ok());
+    fn header_requires_full_encoded_size() {
+        let header = FrameHeader {
+            len: 0,
+            tag: 0,
+            flags: 0,
+        };
+        let encoded = header.encode();
+        // A short buffer never decodes, regardless of checksum content.
+        assert!(FrameHeader::decode(&encoded[..15]).is_err());
+        // The all-zeros placeholder without a valid checksum is rejected too:
+        // an uncommitted header must be a checksum-valid not-ready frame, not
+        // raw zeros, so torn reads stay distinguishable from empty slots.
+        assert!(matches!(
+            FrameHeader::decode(&[0u8; 16]),
+            Err(MemoryError::CorruptedHeader)
+        ));
+        // A checksum-valid header round-trips.
+        assert!(FrameHeader::decode(&encoded).is_ok());
+    }
+
+    #[test]
+    fn misaligned_header_fails_checksum_verification() {
+        let header = FrameHeader {
+            len: 1024,
+            tag: 42,
+            flags: FrameHeader::FLAG_READY,
+        };
+        let mut encoded = header.encode();
+        // Flip one bit in the `len` field: decode must reject it as corrupted.
+        encoded[0] ^= 0b0000_0001;
+        assert!(matches!(
+            FrameHeader::decode(&encoded),
+            Err(MemoryError::CorruptedHeader)
+        ));
+
+        // A mid-payload read is garbage bytes with a (almost surely) wrong
+        // checksum: decode must never accept it as a valid header.
+        assert!(matches!(
+            FrameHeader::decode(&[0x5a; 16]),
+            Err(MemoryError::CorruptedHeader)
+        ));
     }
 
     #[test]
@@ -159,9 +220,8 @@ mod tests {
             len: 100,
             tag: 0,
             flags: 0,
-            _reserved: [0; 3],
         };
-        assert_eq!(header.frame_size(), 112);
+        assert_eq!(header.frame_size(), 116);
     }
 
     #[test]
@@ -170,7 +230,6 @@ mod tests {
             len: 0,
             tag: 0,
             flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_ABORTED,
-            _reserved: [0; 3],
         };
 
         assert!(header.is_ready());
@@ -183,7 +242,6 @@ mod tests {
             len: 0,
             tag: 0,
             flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_ITEM,
-            _reserved: [0; 3],
         };
         assert!(item_header.is_ready());
         assert!(item_header.is_stream_item());
@@ -194,7 +252,6 @@ mod tests {
             len: 0,
             tag: 0,
             flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_END,
-            _reserved: [0; 3],
         };
         assert!(end_header.is_ready());
         assert!(end_header.is_stream_end());
@@ -204,7 +261,6 @@ mod tests {
             len: 0,
             tag: 0,
             flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_CANCEL,
-            _reserved: [0; 3],
         };
         assert!(cancel_header.is_ready());
         assert!(cancel_header.is_stream_cancel());
@@ -215,7 +271,6 @@ mod tests {
             len: 0,
             tag: 0,
             flags: FrameHeader::FLAG_READY | FrameHeader::FLAG_STREAM_ERROR,
-            _reserved: [0; 3],
         };
         assert!(error_header.is_stream_error());
         assert!(!error_header.is_stream_item());
@@ -229,7 +284,6 @@ mod tests {
             flags: FrameHeader::FLAG_READY
                 | FrameHeader::FLAG_STREAM_ITEM
                 | FrameHeader::FLAG_STREAM_END,
-            _reserved: [0; 3],
         };
         assert!(header.is_stream_item());
         assert!(header.is_stream_end());

@@ -132,7 +132,6 @@ impl UdpSocket {
             len: payload_len,
             tag: 0,
             flags: 0,
-            _reserved: [0; 3],
         };
         let header_bytes = header.encode();
 

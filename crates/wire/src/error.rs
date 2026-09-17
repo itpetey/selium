@@ -16,6 +16,11 @@ pub enum Error {
     ReaderBehind,
     #[error("invalid frame header: {0}")]
     InvalidFrame(String),
+    #[error("torn frame header at position {position}: checksum mismatch")]
+    TornFrame {
+        /// Logical byte position where the header failed integrity verification.
+        position: u64,
+    },
     #[error("capacity exceeded")]
     CapacityExceeded,
     #[error("compare-and-set failed: expected {expected}, got {actual:?}")]
@@ -67,6 +72,9 @@ impl From<selium_memory::MemoryError> for Error {
             selium_memory::MemoryError::CapacityExceeded => Self::CapacityExceeded,
             selium_memory::MemoryError::IndexOutOfBounds => Self::IndexOutOfBounds,
             selium_memory::MemoryError::InvalidLayout => Self::InvalidLayout,
+            selium_memory::MemoryError::CorruptedHeader => {
+                Self::InvalidFrame("header checksum mismatch".to_string())
+            }
             selium_memory::MemoryError::ProviderNotSet => Self::InvalidRegion,
             selium_memory::MemoryError::RegionNotFound(_) => Self::InvalidRegion,
             selium_memory::MemoryError::Other(msg) => Self::Guest(msg),
@@ -90,6 +98,10 @@ mod tests {
         assert_eq!(
             Error::InvalidFrame("bad header".to_string()).to_string(),
             "invalid frame header: bad header"
+        );
+        assert_eq!(
+            Error::TornFrame { position: 42 }.to_string(),
+            "torn frame header at position 42: checksum mismatch"
         );
         assert_eq!(Error::CapacityExceeded.to_string(), "capacity exceeded");
         assert_eq!(Error::ChannelClosed.to_string(), "channel closed");

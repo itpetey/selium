@@ -541,7 +541,10 @@ pub(crate) fn read_raw(region: &ChannelRegion, pos: u64, len: u64, mask: u64) ->
 
 fn read_header(region: &ChannelRegion, pos: u64, mask: u64) -> Result<FrameHeader> {
     let header_bytes = read_raw(region, pos, FrameHeader::ENCODED_SIZE as u64, mask)?;
-    FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
+    FrameHeader::decode(&header_bytes).map_err(|e| match e {
+        selium_memory::MemoryError::CorruptedHeader => Error::TornFrame { position: pos },
+        other => Error::InvalidFrame(other.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -586,5 +589,29 @@ mod tests {
         // Draining is best-effort and must not error, even after overwrite.
         let mut reader = channel.weak_reader();
         drop(reader.drain());
+    }
+
+    #[test]
+    fn weak_reader_resyncs_after_torn_snap() {
+        // Four 80-byte frames (16-byte header + 64-byte payload) in a 128-byte
+        // ring wrap twice. A fresh weak reader snaps to `next_tail - capacity`
+        // = 192, which lands inside frame C's payload (spans 176..240). The
+        // checksum detects the torn read and the drain resyncs to frame D's
+        // boundary instead of misdelivering garbage or erroring.
+        let channel = Channel::create(128, ChannelBackpressure::Park).expect("create");
+        for i in 0u8..4 {
+            write_frame(channel.ring(), &[i; 64]);
+        }
+
+        let mut reader = channel.weak_reader();
+        let drained = reader.drain().expect("drain");
+
+        // Only the newest fully-intact frame survives the overwrite; exactly
+        // that frame is delivered, from a true boundary.
+        assert_eq!(drained, vec![vec![3u8; 64]]);
+        assert_eq!(
+            reader.position(),
+            (FrameHeader::ENCODED_SIZE as u64 + 64) * 4
+        );
     }
 }

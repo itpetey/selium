@@ -19,7 +19,7 @@ use std::sync::{
     atomic::{Ordering, fence},
 };
 
-use selium_memory::{MappingBackend, RING_HEADER_SIZE};
+use selium_memory::{MappingBackend, MemoryError, RING_HEADER_SIZE};
 use selium_wire::error::{Error, Result};
 
 // Re-export FrameHeader so the layout module is the canonical import path.
@@ -571,8 +571,10 @@ pub fn read_frame(
         mask,
         capacity,
     )?;
-    let header =
-        FrameHeader::decode(&header_bytes).map_err(|e| Error::InvalidFrame(e.to_string()))?;
+    let header = FrameHeader::decode(&header_bytes).map_err(|e| match e {
+        MemoryError::CorruptedHeader => Error::TornFrame { position: pos },
+        other => Error::InvalidFrame(other.to_string()),
+    })?;
 
     if !header.is_ready() {
         return Ok(None);
@@ -608,7 +610,10 @@ pub fn read_frame_header(
         mask,
         capacity,
     )?;
-    FrameHeader::decode(&bytes).map_err(|e| Error::InvalidFrame(e.to_string()))
+    FrameHeader::decode(&bytes).map_err(|e| match e {
+        MemoryError::CorruptedHeader => Error::TornFrame { position: pos },
+        other => Error::InvalidFrame(other.to_string()),
+    })
 }
 
 /// Releases a reader slot (sets it to 0).
@@ -638,10 +643,18 @@ pub fn release_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<()
 /// consumers where losing old records is acceptable but blocking a producer
 /// is not.
 ///
-/// Known limitation: the snap-to-newest heuristic may land mid-frame when
-/// the ring wrapped in large strides; a torn header then ends the drain
-/// (reported by `read_frame`) rather than silently returning garbage. Callers
-/// that decode payloads best-effort should tolerate the resulting error.
+/// **Torn reads are detected, not absorbed.** Every frame header carries an
+/// FNV-1a checksum (see [`FrameHeader`]); when the snap-to-newest heuristic
+/// lands mid-frame (possible after ring overwrite with large strides), the
+/// bytes there fail verification and `read_frame` reports
+/// [`Error::TornFrame`]. The drain then scans forward to the next
+/// checksum-valid header boundary and resumes there, so delivery after the
+/// torn point is exact. If no valid boundary exists ahead (a reserved but
+/// not-yet-committed frame), the drain stops gracefully and returns the
+/// position to resume from — the caller retries and observes the committed
+/// frames on a later call. Callers that decode payloads best-effort should
+/// still tolerate payload-level errors; header-level corruption never
+/// surfaces as data.
 pub fn drain_frames(
     backend: &dyn MappingBackend,
     mut read_pos: u64,
@@ -658,18 +671,62 @@ pub fn drain_frames(
 
     let mut frames = Vec::new();
     while read_pos < next_tail {
-        match read_frame(backend, read_pos, mask, capacity)? {
-            Some((header, payload)) => {
+        match read_frame(backend, read_pos, mask, capacity) {
+            Ok(Some((header, payload))) => {
                 frames.push(payload);
                 read_pos = read_pos
                     .checked_add(header.frame_size())
                     .ok_or(Error::InvalidFrame("frame size overflow".to_string()))?;
             }
-            None => break, // uncommitted tail; resume here next drain
+            Ok(None) => break, // not-ready frame; resume here next drain
+            Err(Error::TornFrame { .. }) => {
+                // Snap landed mid-frame. Recover to the next checksum-valid
+                // header boundary; without one ahead, this is the uncommitted
+                // tail — stop and resume here on the next drain.
+                match resync_frame_boundary(backend, read_pos, next_tail, mask, capacity)? {
+                    Some(boundary) if boundary > read_pos => read_pos = boundary,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 
     Ok((frames, read_pos))
+}
+
+/// Scans forward from `start` (exclusive) for the next position holding a
+/// checksum-valid frame header, bounded by `end` (the write tail).
+///
+/// Used by [`drain_frames`] to recover from a torn read after the weak-drain
+/// snapped into a partially overwritten region. Every byte up to the next
+/// real frame boundary carries a checksum, so the scan stops exactly there;
+/// the false-positive rate is a single `2⁻³²` checksum collision per probed
+/// position.
+fn resync_frame_boundary(
+    backend: &dyn MappingBackend,
+    start: u64,
+    end: u64,
+    mask: u64,
+    capacity: u64,
+) -> Result<Option<u64>> {
+    let mut pos = start.wrapping_add(1);
+    while pos < end {
+        let bytes = read_at(
+            backend,
+            pos,
+            FrameHeader::ENCODED_SIZE as u64,
+            mask,
+            capacity,
+        )?;
+        if let Ok(header) = FrameHeader::decode(&bytes)
+            && header.frame_size() <= capacity
+        {
+            return Ok(Some(pos));
+        }
+        pos = pos.wrapping_add(1);
+    }
+    Ok(None)
 }
 
 /// Atomically reserves `len` bytes at the tail via CAS on `next_tail`.
@@ -852,10 +909,11 @@ pub fn write_at(
 /// Writes a framed message using single-phase write with release fencing.
 ///
 /// 1. Reserve `frame_size` bytes at the tail.
-/// 2. Write payload at `pos + ENCODED_SIZE`.
-/// 3. Release fence.
-/// 4. Write header with READY flag at `pos`.
-/// 5. Bump generation counter.
+/// 2. Write a placeholder header (checksum-valid, not READY) at `pos`.
+/// 3. Write payload at `pos + ENCODED_SIZE`.
+/// 4. Release fence.
+/// 5. Write header with READY flag at `pos`.
+/// 6. Bump generation counter.
 #[expect(
     clippy::too_many_arguments,
     reason = "ring-protocol write primitive; arguments are inherent to the protocol"
@@ -889,6 +947,17 @@ pub fn write_frame(
         protect_writers,
     )?;
 
+    // Placeholder header (checksum-valid, not READY) marks the reservation as
+    // an in-flight frame. Readers gate on `is_ready()`; without this, a strict
+    // checksum-verifying reader would read stale bytes at the frame start and
+    // mistake an in-progress write for a torn header.
+    let placeholder = FrameHeader {
+        len: payload.len() as u32,
+        tag,
+        flags: flags & !FrameHeader::FLAG_READY,
+    };
+    write_at(backend, pos, &placeholder.encode(), mask, capacity)?;
+
     let payload_pos = pos
         .checked_add(FrameHeader::ENCODED_SIZE as u64)
         .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
@@ -901,7 +970,6 @@ pub fn write_frame(
         len: payload.len() as u32,
         tag,
         flags: flags | FrameHeader::FLAG_READY,
-        _reserved: [0; 3],
     };
     write_at(backend, pos, &ready_header.encode(), mask, capacity)?;
 

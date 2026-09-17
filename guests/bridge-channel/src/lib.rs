@@ -1372,7 +1372,6 @@ mod tests {
             len: payload.len() as u32,
             tag,
             flags,
-            _reserved: [0; 3],
         };
         let mut framed = Vec::with_capacity(FrameHeader::ENCODED_SIZE + payload.len());
         framed.extend_from_slice(&header.encode());

@@ -88,7 +88,6 @@ fn frame_header_round_trip() {
         len: 5,
         tag: 99,
         flags: FrameHeader::FLAG_READY,
-        _reserved: [0; 3],
     };
     let encoded = header.encode();
     let decoded = FrameHeader::decode(&encoded).unwrap();

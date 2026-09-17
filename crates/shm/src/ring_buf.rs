@@ -138,17 +138,29 @@ impl RingBuf {
 
     /// Writes a framed message using single-phase write with release fencing.
     ///
-    /// 1. Write payload at `pos + ENCODED_SIZE`
-    /// 2. Release fence
-    /// 3. Write header with READY flag at `pos`
-    /// 4. Bump generation counter and notify waiters
+    /// 1. Write placeholder header (checksum-valid, not READY) at `pos`.
+    /// 2. Write payload at `pos + ENCODED_SIZE`
+    /// 3. Release fence
+    /// 4. Write header with READY flag at `pos`
+    /// 5. Bump generation counter and notify waiters
     pub fn write_frame(&self, pos: u64, payload: &[u8], tag: u32, flags: u8) -> Result<()> {
         let frame_size = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
         if frame_size > self.capacity {
             return Err(Error::CapacityExceeded);
         }
 
-        // Step 1: Write payload first.
+        // Placeholder header (checksum-valid, not READY): marks this
+        // reservation as in-flight so a checksum-verifying reader sees a
+        // decodable, not-ready frame instead of stale bytes it would mistake
+        // for a torn header.
+        let placeholder = FrameHeader {
+            len: payload.len() as u32,
+            tag,
+            flags: flags & !FrameHeader::FLAG_READY,
+        };
+        self.write_at(pos, &placeholder.encode())?;
+
+        // Step 2: Write payload first.
         let payload_pos = pos
             .checked_add(FrameHeader::ENCODED_SIZE as u64)
             .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
@@ -162,7 +174,6 @@ impl RingBuf {
             len: payload.len() as u32,
             tag,
             flags: flags | FrameHeader::FLAG_READY,
-            _reserved: [0; 3],
         };
         self.write_at(pos, &ready_header.encode())?;
 

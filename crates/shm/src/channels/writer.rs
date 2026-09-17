@@ -303,34 +303,45 @@ impl Drop for BlockingWriter {
 
 /// Two-phase write of an already-encoded frame (header + payload) to the ring buffer.
 ///
-/// Writes payload first (bytes after the 12-byte header), then a release
-/// fence, then the header. This ensures readers never observe a READY
-/// header before the completed payload. Finally bumps the generation
-/// counter to notify waiters.
+/// Writes a placeholder header (checksum-valid, not READY) at `pos` first, so
+/// a strict checksum-verifying reader never mistakes an in-flight reservation's
+/// stale bytes for a torn header. Then writes the payload, then a release
+/// fence, then the READY header. This ensures readers never observe a READY
+/// header before the completed payload. Finally bumps the generation counter
+/// to notify waiters.
 fn write_frame_bytes(region: &ChannelRegion, pos: u64, buf: &[u8]) -> Result<()> {
     let mask = region.capacity() - 1;
 
     let header_size = FrameHeader::ENCODED_SIZE as u64;
     let payload = buf.get(FrameHeader::ENCODED_SIZE..).unwrap_or_default();
 
-    // Step 1: Write payload at pos + ENCODED_SIZE.
+    // The pre-encoded header carried by `buf`; decode validates its checksum.
+    let frame_header =
+        FrameHeader::decode(buf.get(..FrameHeader::ENCODED_SIZE).unwrap_or_default())
+            .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+
+    // Step 1: Placeholder header (checksum-valid, not READY).
+    let mut not_ready = frame_header;
+    not_ready.flags &= !FrameHeader::FLAG_READY;
+    write_raw(region, pos, &not_ready.encode(), mask)?;
+
+    // Step 2: Write payload at pos + ENCODED_SIZE.
     let payload_pos = pos
         .checked_add(header_size)
         .ok_or_else(|| Error::InvalidFrame("payload position overflow".to_string()))?;
     write_raw(region, payload_pos, payload, mask)?;
 
-    // Step 2: Release fence ensures payload is visible before the header.
+    // Step 3: Release fence ensures payload is visible before the header.
     fence(Ordering::Release);
 
-    // Step 3: Write header at pos with FLAG_READY set. Readers gate on
+    // Step 4: Write header at pos with FLAG_READY set. Readers gate on
     // `is_ready()`; committing without it makes the frame permanently
     // invisible to them (matches the canonical layout::write_frame).
-    let mut header = FrameHeader::decode(buf.get(..FrameHeader::ENCODED_SIZE).unwrap_or_default())
-        .map_err(|e| Error::InvalidFrame(e.to_string()))?;
-    header.flags |= FrameHeader::FLAG_READY;
-    write_raw(region, pos, &header.encode(), mask)?;
+    let mut ready_header = frame_header;
+    ready_header.flags |= FrameHeader::FLAG_READY;
+    write_raw(region, pos, &ready_header.encode(), mask)?;
 
-    // Step 4: Bump generation counter and notify waiters.
+    // Step 5: Bump generation counter and notify waiters.
     region.bump_generation()?;
 
     Ok(())
@@ -378,7 +389,6 @@ mod tests {
             len: 5,
             tag: 1,
             flags: FrameHeader::FLAG_READY,
-            _reserved: [0; 3],
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&header.encode());
