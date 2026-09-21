@@ -310,17 +310,6 @@ pub enum DesiredStateRecord {
     },
 }
 
-impl DesiredStateRecord {
-    /// Returns the tenant this record belongs to.
-    pub fn tenant(&self) -> &str {
-        match self {
-            Self::Deployment { tenant, .. }
-            | Self::PipelineBinding { tenant, .. }
-            | Self::Stop { tenant, .. } => tenant,
-        }
-    }
-}
-
 /// A target returned by a control-plane resolve. The resolve projection of a
 /// discovered resource: enough to attach (resource id, host) without the full
 /// `ResourceTarget` taxonomy (class, tenant, interface, labels), which stays in
@@ -749,6 +738,17 @@ impl From<selium_abi::AbiError> for EncodingError {
 impl From<flatbuffers::InvalidFlatbuffer> for EncodingError {
     fn from(error: flatbuffers::InvalidFlatbuffer) -> Self {
         Self::Decode(error)
+    }
+}
+
+impl DesiredStateRecord {
+    /// Returns the tenant this record belongs to.
+    pub fn tenant(&self) -> &str {
+        match self {
+            Self::Deployment { tenant, .. }
+            | Self::PipelineBinding { tenant, .. }
+            | Self::Stop { tenant, .. } => tenant,
+        }
     }
 }
 

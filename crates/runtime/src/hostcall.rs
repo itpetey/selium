@@ -30,6 +30,24 @@ pub(crate) struct HostOperation {
     pub(crate) state: HostOperationState,
 }
 
+/// The delegation scope implied by an authority's `DelegateGrants` grants:
+/// root-wide (a `Namespace::Root` selector), or tenant-scoped (the named
+/// tenants from `Tenant`/`Namespace::Tenant` selectors).
+enum DelegationScope {
+    Root,
+    Tenants(HashSet<String>),
+}
+
+impl DelegationScope {
+    /// Returns whether this scope admits a child spawn in `tenant`.
+    fn admits_tenant(&self, tenant: &str) -> bool {
+        match self {
+            Self::Root => true,
+            Self::Tenants(tenants) => tenants.contains(tenant),
+        }
+    }
+}
+
 impl Runtime {
     /// Begins a hostcall for a process and returns its initial status and operation id.
     pub fn begin_hostcall(
@@ -2020,24 +2038,6 @@ impl Runtime {
     }
 }
 
-/// The delegation scope implied by an authority's `DelegateGrants` grants:
-/// root-wide (a `Namespace::Root` selector), or tenant-scoped (the named
-/// tenants from `Tenant`/`Namespace::Tenant` selectors).
-enum DelegationScope {
-    Root,
-    Tenants(HashSet<String>),
-}
-
-impl DelegationScope {
-    /// Returns whether this scope admits a child spawn in `tenant`.
-    fn admits_tenant(&self, tenant: &str) -> bool {
-        match self {
-            Self::Root => true,
-            Self::Tenants(tenants) => tenants.contains(tenant),
-        }
-    }
-}
-
 /// Extracts the delegation scope from an authority's grants: `Root` when any
 /// `DelegateGrants` grant carries a `Namespace::Root` selector, the tenant set
 /// from `Tenant`/`Namespace::Tenant` selectors, and `None` when no
@@ -2070,6 +2070,16 @@ fn delegation_scope(grants: &[CapabilityGrant]) -> Option<DelegationScope> {
         None
     } else {
         Some(DelegationScope::Tenants(tenants))
+    }
+}
+
+/// Returns whether a parent `Namespace` selector covers (is at least as broad
+/// as) a child namespace: root is greater than any tenant, and a tenant
+/// covers only itself.
+fn namespace_covers(parent: &Namespace, child: &Namespace) -> bool {
+    match parent {
+        Namespace::Root => true,
+        Namespace::Tenant(parent_tenant) => child == &Namespace::Tenant(parent_tenant.clone()),
     }
 }
 
@@ -2111,16 +2121,6 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
             matches!(selector, ResourceSelector::Children)
         }),
     })
-}
-
-/// Returns whether a parent `Namespace` selector covers (is at least as broad
-/// as) a child namespace: root is greater than any tenant, and a tenant
-/// covers only itself.
-fn namespace_covers(parent: &Namespace, child: &Namespace) -> bool {
-    match parent {
-        Namespace::Root => true,
-        Namespace::Tenant(parent_tenant) => child == &Namespace::Tenant(parent_tenant.clone()),
-    }
 }
 
 /// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.

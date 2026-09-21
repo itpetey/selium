@@ -233,17 +233,6 @@ pub enum Namespace {
     Tenant(String),
 }
 
-impl Namespace {
-    /// Returns whether this namespace admits a scope context whose tenant is
-    /// `tenant`: `Root` admits `None` only; `Tenant(t)` admits `Some(t)` exactly.
-    pub fn matches_tenant(&self, tenant: Option<&str>) -> bool {
-        match self {
-            Self::Root => tenant.is_none(),
-            Self::Tenant(expected) => tenant == Some(expected.as_str()),
-        }
-    }
-}
-
 /// Selector that narrows where a capability grant applies.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
@@ -1056,6 +1045,17 @@ impl Default for ScopeContext {
             locality: LocalityScope::Any,
             resource_class: None,
             resource_id: None,
+        }
+    }
+}
+
+impl Namespace {
+    /// Returns whether this namespace admits a scope context whose tenant is
+    /// `tenant`: `Root` admits `None` only; `Tenant(t)` admits `Some(t)` exactly.
+    pub fn matches_tenant(&self, tenant: Option<&str>) -> bool {
+        match self {
+            Self::Root => tenant.is_none(),
+            Self::Tenant(expected) => tenant == Some(expected.as_str()),
         }
     }
 }

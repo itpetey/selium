@@ -21,154 +21,6 @@ use selium_abi::{
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-#[test]
-fn bridge_server_delegates_and_child_attaches_stream_region() {
-    // Bootstrap the connector (registered Tier-1 handler for `sel-quic`) and
-    // the bridge-server, pinning the server's listener to the connector. The
-    // runtime no longer provisions the bridge-server's listener; the server
-    // creates its own queue and self-registers its route via `serve` (the
-    // substrate test drives the hostcalls directly rather than the wasm
-    // entrypoint, so the registration is exercised at the queue-minting
-    // level).
-    let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
-
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_entrypoint("bridge_channel"),
-        )
-        .expect("register bridge-channel module");
-
-    // 1. The bridge-server creates its own listener queue (self-registration
-    //    replaces the runtime's well-known-URI queue minting). The queue is
-    //    minted under the server's own (root) principal and Tier-1 registered;
-    //    the connector resolves the bridge route via discovery and attaches
-    //    the listener (gaining its own local handle, and with it an
-    //    authorisation basis for the attach).
-    let (server_listener_local_id, connector_queue_local_id) =
-        bridge_listener_and_connector_queue(&runtime, connector, bridge_server);
-
-    // 2. The connector allocates the stream region in the client's tenant
-    //    scope and delivers the handoff with the authenticated identity.
-    let stream_region = deliver_handoff(
-        &runtime,
-        connector,
-        connector_queue_local_id,
-        "acme",
-        [0x7A; 32],
-    );
-
-    // 3. The bridge-server receives it on its own listener and decodes the
-    //    identity.
-    let (value, identity) = recv_handoff(&runtime, bridge_server, server_listener_local_id);
-    assert_eq!(value, stream_region.region_id);
-    assert_eq!(identity.tenant, "acme");
-
-    // 4. The bridge-server spawns the bridge-channel with the client's grants
-    //    plus a tenant-scoped ExplicitResource grant for the handed-off
-    //    region, under the DelegateGrants path (the server does not itself
-    //    hold these grants). The root-scoped delegation admits the grants
-    //    because every child grant carries a tenant selector, and the root
-    //    namespace is greater than any tenant.
-    let child_pid = spawn_bridge_channel(&runtime, bridge_server, "acme", stream_region.region_id);
-
-    // 5. The bridge-channel runs under the identity's tenant, not the root
-    //    bridge-server's: the tenant-scoped spawn scopes the child to the
-    //    handed-off identity, so its tenant-scoped grants are enforceable.
-    assert_eq!(
-        runtime.process_tenant(child_pid).as_deref(),
-        Some("acme"),
-        "bridge-channel must run under the handoff identity's tenant"
-    );
-
-    // 6. The child attaches the delivered region via its ExplicitResource
-    //    grant, matching the Tenant and ExplicitResource selectors (its
-    //    process tenant now matches the grant's tenant scope).
-    try_attach_region(&runtime, child_pid, stream_region.region_id)
-        .expect("bridge-channel attaches its own handed-off region");
-}
-
-/// 4.2: the single per-platform bridge-server serves every tenant, and the
-/// tenants stay isolated end to end at the substrate level. Two handoffs —
-/// an `acme` identity and a `beta` identity — are delivered to the one root
-/// bridge-server; each spawns a bridge-channel scoped to its own identity's
-/// tenant; each child attaches only its own handed-off region, and a
-/// cross-tenant attach is denied by the runtime's tenant fence.
-#[test]
-fn single_instance_bridge_serves_two_tenants_without_leak() {
-    let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
-
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_entrypoint("bridge_channel"),
-        )
-        .expect("register bridge-channel module");
-
-    let (server_listener_local_id, connector_queue_local_id) =
-        bridge_listener_and_connector_queue(&runtime, connector, bridge_server);
-
-    // Two handoffs, each carrying a different tenant's authenticated
-    // identity, and each stream region minted in that tenant's scope.
-    let acme_region = deliver_handoff(
-        &runtime,
-        connector,
-        connector_queue_local_id,
-        "acme",
-        [0x7A; 32],
-    );
-    let beta_region = deliver_handoff(
-        &runtime,
-        connector,
-        connector_queue_local_id,
-        "beta",
-        [0x7B; 32],
-    );
-
-    // The single bridge-server receives both and decodes each identity — it
-    // refuses neither on cross-tenant grounds, because it is bound to no
-    // one tenant.
-    let (acme_value, acme_identity) =
-        recv_handoff(&runtime, bridge_server, server_listener_local_id);
-    assert_eq!(acme_value, acme_region.region_id);
-    assert_eq!(acme_identity.tenant, "acme");
-    let (beta_value, beta_identity) =
-        recv_handoff(&runtime, bridge_server, server_listener_local_id);
-    assert_eq!(beta_value, beta_region.region_id);
-    assert_eq!(beta_identity.tenant, "beta");
-
-    // Each handoff spawns a bridge-channel scoped to its own identity's
-    // tenant under the root `DelegateGrants`.
-    let acme_child = spawn_bridge_channel(&runtime, bridge_server, "acme", acme_region.region_id);
-    let beta_child = spawn_bridge_channel(&runtime, bridge_server, "beta", beta_region.region_id);
-    assert_eq!(
-        runtime.process_tenant(acme_child).as_deref(),
-        Some("acme"),
-        "the acme handoff's child runs under acme"
-    );
-    assert_eq!(
-        runtime.process_tenant(beta_child).as_deref(),
-        Some("beta"),
-        "the beta handoff's child runs under beta"
-    );
-
-    // Each child attaches its own handed-off region...
-    try_attach_region(&runtime, acme_child, acme_region.region_id)
-        .expect("the acme child attaches its own region");
-    try_attach_region(&runtime, beta_child, beta_region.region_id)
-        .expect("the beta child attaches its own region");
-
-    // ...and neither reaches the other tenant's region: the acme child holds
-    // no grant admitting beta's region, and the runtime's region tenant
-    // fence denies a cross-tenant attach outright.
-    let cross = try_attach_region(&runtime, acme_child, beta_region.region_id)
-        .expect_err("the acme child must not attach beta's region");
-    assert_eq!(cross.code, selium_abi::AbiErrorCode::PermissionDenied);
-    let cross = try_attach_region(&runtime, beta_child, acme_region.region_id)
-        .expect_err("the beta child must not attach acme's region");
-    assert_eq!(cross.code, selium_abi::AbiErrorCode::PermissionDenied);
-}
-
 /// Bootstraps the connector (the registered Tier-1 handler for `sel-quic`)
 /// and the single per-platform bridge-server (a root guest holding a
 /// `Namespace::Root` `DelegateGrants`), pins the server's listener to the
@@ -305,6 +157,73 @@ fn bridge_listener_and_connector_queue(
     (server_listener.local_id, connector_queue.local_id)
 }
 
+#[test]
+fn bridge_server_delegates_and_child_attaches_stream_region() {
+    // Bootstrap the connector (registered Tier-1 handler for `sel-quic`) and
+    // the bridge-server, pinning the server's listener to the connector. The
+    // runtime no longer provisions the bridge-server's listener; the server
+    // creates its own queue and self-registers its route via `serve` (the
+    // substrate test drives the hostcalls directly rather than the wasm
+    // entrypoint, so the registration is exercised at the queue-minting
+    // level).
+    let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
+
+    runtime
+        .register_module_bytes(
+            "bridge-channel-module".to_string(),
+            module_with_entrypoint("bridge_channel"),
+        )
+        .expect("register bridge-channel module");
+
+    // 1. The bridge-server creates its own listener queue (self-registration
+    //    replaces the runtime's well-known-URI queue minting). The queue is
+    //    minted under the server's own (root) principal and Tier-1 registered;
+    //    the connector resolves the bridge route via discovery and attaches
+    //    the listener (gaining its own local handle, and with it an
+    //    authorisation basis for the attach).
+    let (server_listener_local_id, connector_queue_local_id) =
+        bridge_listener_and_connector_queue(&runtime, connector, bridge_server);
+
+    // 2. The connector allocates the stream region in the client's tenant
+    //    scope and delivers the handoff with the authenticated identity.
+    let stream_region = deliver_handoff(
+        &runtime,
+        connector,
+        connector_queue_local_id,
+        "acme",
+        [0x7A; 32],
+    );
+
+    // 3. The bridge-server receives it on its own listener and decodes the
+    //    identity.
+    let (value, identity) = recv_handoff(&runtime, bridge_server, server_listener_local_id);
+    assert_eq!(value, stream_region.region_id);
+    assert_eq!(identity.tenant, "acme");
+
+    // 4. The bridge-server spawns the bridge-channel with the client's grants
+    //    plus a tenant-scoped ExplicitResource grant for the handed-off
+    //    region, under the DelegateGrants path (the server does not itself
+    //    hold these grants). The root-scoped delegation admits the grants
+    //    because every child grant carries a tenant selector, and the root
+    //    namespace is greater than any tenant.
+    let child_pid = spawn_bridge_channel(&runtime, bridge_server, "acme", stream_region.region_id);
+
+    // 5. The bridge-channel runs under the identity's tenant, not the root
+    //    bridge-server's: the tenant-scoped spawn scopes the child to the
+    //    handed-off identity, so its tenant-scoped grants are enforceable.
+    assert_eq!(
+        runtime.process_tenant(child_pid).as_deref(),
+        Some("acme"),
+        "bridge-channel must run under the handoff identity's tenant"
+    );
+
+    // 6. The child attaches the delivered region via its ExplicitResource
+    //    grant, matching the Tenant and ExplicitResource selectors (its
+    //    process tenant now matches the grant's tenant scope).
+    try_attach_region(&runtime, child_pid, stream_region.region_id)
+        .expect("bridge-channel attaches its own handed-off region");
+}
+
 /// Allocates a stream region in `tenant`'s scope (a root principal may mint
 /// for any tenant) and delivers it to the bridge queue as a handoff carrying
 /// the tenant's authenticated identity. Returns the allocated region.
@@ -348,6 +267,35 @@ fn deliver_handoff(
     stream_region
 }
 
+fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u64) {
+    let discovery = spawn_guest(runtime, "discovery", Vec::new(), None);
+    let (status, _op) = runtime.begin_hostcall(
+        discovery,
+        HostcallRequest::RecordResolvedQueueFor {
+            client_process_id: client,
+            shared_id,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    module_with_entrypoint_args(entrypoint, 0)
+}
+
+fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
+    let params: String = "i64 ".repeat(args).trim_end().to_string();
+    let params = if params.is_empty() {
+        String::new()
+    } else {
+        format!("(param {params})")
+    };
+    wat::parse_str(format!(
+        "(module (memory 1) (func (export \"{entrypoint}\") {params}))"
+    ))
+    .expect("compile wat")
+}
+
 /// Receives one delivered handoff on the bridge-server's listener and
 /// returns the handed-off value and the decoded client identity.
 #[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
@@ -370,6 +318,87 @@ fn recv_handoff(
     };
     let identity = ClientIdentity::decode(&metadata).expect("decode handoff identity");
     (value, identity)
+}
+
+/// 4.2: the single per-platform bridge-server serves every tenant, and the
+/// tenants stay isolated end to end at the substrate level. Two handoffs —
+/// an `acme` identity and a `beta` identity — are delivered to the one root
+/// bridge-server; each spawns a bridge-channel scoped to its own identity's
+/// tenant; each child attaches only its own handed-off region, and a
+/// cross-tenant attach is denied by the runtime's tenant fence.
+#[test]
+fn single_instance_bridge_serves_two_tenants_without_leak() {
+    let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
+
+    runtime
+        .register_module_bytes(
+            "bridge-channel-module".to_string(),
+            module_with_entrypoint("bridge_channel"),
+        )
+        .expect("register bridge-channel module");
+
+    let (server_listener_local_id, connector_queue_local_id) =
+        bridge_listener_and_connector_queue(&runtime, connector, bridge_server);
+
+    // Two handoffs, each carrying a different tenant's authenticated
+    // identity, and each stream region minted in that tenant's scope.
+    let acme_region = deliver_handoff(
+        &runtime,
+        connector,
+        connector_queue_local_id,
+        "acme",
+        [0x7A; 32],
+    );
+    let beta_region = deliver_handoff(
+        &runtime,
+        connector,
+        connector_queue_local_id,
+        "beta",
+        [0x7B; 32],
+    );
+
+    // The single bridge-server receives both and decodes each identity — it
+    // refuses neither on cross-tenant grounds, because it is bound to no
+    // one tenant.
+    let (acme_value, acme_identity) =
+        recv_handoff(&runtime, bridge_server, server_listener_local_id);
+    assert_eq!(acme_value, acme_region.region_id);
+    assert_eq!(acme_identity.tenant, "acme");
+    let (beta_value, beta_identity) =
+        recv_handoff(&runtime, bridge_server, server_listener_local_id);
+    assert_eq!(beta_value, beta_region.region_id);
+    assert_eq!(beta_identity.tenant, "beta");
+
+    // Each handoff spawns a bridge-channel scoped to its own identity's
+    // tenant under the root `DelegateGrants`.
+    let acme_child = spawn_bridge_channel(&runtime, bridge_server, "acme", acme_region.region_id);
+    let beta_child = spawn_bridge_channel(&runtime, bridge_server, "beta", beta_region.region_id);
+    assert_eq!(
+        runtime.process_tenant(acme_child).as_deref(),
+        Some("acme"),
+        "the acme handoff's child runs under acme"
+    );
+    assert_eq!(
+        runtime.process_tenant(beta_child).as_deref(),
+        Some("beta"),
+        "the beta handoff's child runs under beta"
+    );
+
+    // Each child attaches its own handed-off region...
+    try_attach_region(&runtime, acme_child, acme_region.region_id)
+        .expect("the acme child attaches its own region");
+    try_attach_region(&runtime, beta_child, beta_region.region_id)
+        .expect("the beta child attaches its own region");
+
+    // ...and neither reaches the other tenant's region: the acme child holds
+    // no grant admitting beta's region, and the runtime's region tenant
+    // fence denies a cross-tenant attach outright.
+    let cross = try_attach_region(&runtime, acme_child, beta_region.region_id)
+        .expect_err("the acme child must not attach beta's region");
+    assert_eq!(cross.code, selium_abi::AbiErrorCode::PermissionDenied);
+    let cross = try_attach_region(&runtime, beta_child, acme_region.region_id)
+        .expect_err("the beta child must not attach acme's region");
+    assert_eq!(cross.code, selium_abi::AbiErrorCode::PermissionDenied);
 }
 
 /// Spawns a bridge-channel under `tenant` with the identity's tenant-scoped
@@ -420,62 +449,6 @@ fn spawn_bridge_channel(
     }
 }
 
-/// Attempts to attach `region_id`, returning the attach offset on success or
-/// the hostcall error on failure.
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "test helper surfaces unexpected hostcall output as a panic"
-)]
-#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
-fn try_attach_region(
-    runtime: &Runtime,
-    process_id: ProcessId,
-    region_id: u64,
-) -> Result<selium_abi::RegionAttachment, selium_abi::AbiError> {
-    let (_, attach_op) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::AttachRegion {
-            region_id,
-            reader_slot: None,
-            prot: RegionProt::ReadWrite,
-        },
-    );
-    match runtime.poll_hostcall(process_id, attach_op) {
-        CompletionState::Ready(HostcallOutput::RegionAttach(attachment)) => Ok(attachment),
-        CompletionState::Failed(error) => Err(error),
-        other => panic!("expected attach outcome, got {other:?}"),
-    }
-}
-
-fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new(), None);
-    let (status, _op) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-}
-
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    module_with_entrypoint_args(entrypoint, 0)
-}
-
-fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
-    let params: String = "i64 ".repeat(args).trim_end().to_string();
-    let params = if params.is_empty() {
-        String::new()
-    } else {
-        format!("(param {params})")
-    };
-    wat::parse_str(format!(
-        "(module (memory 1) (func (export \"{entrypoint}\") {params}))"
-    ))
-    .expect("compile wat")
-}
-
 fn spawn_guest(
     runtime: &Runtime,
     name: &str,
@@ -506,4 +479,31 @@ fn spawn_guest(
         .first()
         .expect("bootstrap report contains the requested guest")
         .process_id
+}
+
+/// Attempts to attach `region_id`, returning the attach offset on success or
+/// the hostcall error on failure.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "test helper surfaces unexpected hostcall output as a panic"
+)]
+#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
+fn try_attach_region(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    region_id: u64,
+) -> Result<selium_abi::RegionAttachment, selium_abi::AbiError> {
+    let (_, attach_op) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::AttachRegion {
+            region_id,
+            reader_slot: None,
+            prot: RegionProt::ReadWrite,
+        },
+    );
+    match runtime.poll_hostcall(process_id, attach_op) {
+        CompletionState::Ready(HostcallOutput::RegionAttach(attachment)) => Ok(attachment),
+        CompletionState::Failed(error) => Err(error),
+        other => panic!("expected attach outcome, got {other:?}"),
+    }
 }

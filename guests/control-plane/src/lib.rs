@@ -189,26 +189,6 @@ pub fn control_plane_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
-/// The tenant label recorded on a desired-state record or manifest prefix for
-/// a requestor namespace: a named tenant records its name; the root namespace
-/// records an empty label (no tenant name exists).
-fn tenant_label(namespace: &Namespace) -> String {
-    match namespace {
-        Namespace::Tenant(tenant) => tenant.clone(),
-        Namespace::Root => String::new(),
-    }
-}
-
-/// The tenant-prefixed module manifest key for a requestor namespace:
-/// `<tenant>:<manifest>` for a named tenant, the bare manifest for root (no
-/// tenant name exists).
-fn tenant_prefixed_manifest(namespace: &Namespace, manifest: &str) -> String {
-    match namespace {
-        Namespace::Tenant(tenant) => format!("{tenant}:{manifest}"),
-        Namespace::Root => manifest.to_string(),
-    }
-}
-
 /// Maps a discovery lookup outcome to a typed resolve response.
 pub fn resolve_response(target: Option<ResourceTarget>) -> ControlResponse {
     match target {
@@ -339,20 +319,6 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
             blobs.clone(),
             namespace,
         ));
-    }
-}
-
-/// Refuses a delivered session by attaching then closing the delivered region,
-/// so the sender observes EOF instead of parking on a region nobody attaches.
-fn refuse_session(shared_id: u64) {
-    match selium_guest::net::ByteStream::attach_blocking(shared_id) {
-        Ok(stream) => drop(stream),
-        Err(error) => {
-            warn!(
-                shared_id,
-                "control-plane: session refusal could not attach region: {error}"
-            )
-        }
     }
 }
 
@@ -556,6 +522,40 @@ fn record(
     log.append(timestamp_ms, Vec::new(), payload)?;
     state.borrow_mut().apply_record(record);
     Ok(())
+}
+
+/// Refuses a delivered session by attaching then closing the delivered region,
+/// so the sender observes EOF instead of parking on a region nobody attaches.
+fn refuse_session(shared_id: u64) {
+    match selium_guest::net::ByteStream::attach_blocking(shared_id) {
+        Ok(stream) => drop(stream),
+        Err(error) => {
+            warn!(
+                shared_id,
+                "control-plane: session refusal could not attach region: {error}"
+            )
+        }
+    }
+}
+
+/// The tenant label recorded on a desired-state record or manifest prefix for
+/// a requestor namespace: a named tenant records its name; the root namespace
+/// records an empty label (no tenant name exists).
+fn tenant_label(namespace: &Namespace) -> String {
+    match namespace {
+        Namespace::Tenant(tenant) => tenant.clone(),
+        Namespace::Root => String::new(),
+    }
+}
+
+/// The tenant-prefixed module manifest key for a requestor namespace:
+/// `<tenant>:<manifest>` for a named tenant, the bare manifest for root (no
+/// tenant name exists).
+fn tenant_prefixed_manifest(namespace: &Namespace, manifest: &str) -> String {
+    match namespace {
+        Namespace::Tenant(tenant) => format!("{tenant}:{manifest}"),
+        Namespace::Root => manifest.to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -76,6 +76,15 @@ impl Drop for HostcallFuture {
     }
 }
 
+/// Maps a process tenant to its namespace: `None` (or empty) → `Root`, a
+/// named tenant → `Tenant(t)`.
+pub fn namespace_from_tenant(tenant: Option<&str>) -> selium_abi::Namespace {
+    match tenant {
+        Some(tenant) if !tenant.is_empty() => selium_abi::Namespace::Tenant(tenant.to_string()),
+        _ => selium_abi::Namespace::Root,
+    }
+}
+
 /// Returns whether `process_id` holds `capability`.
 ///
 /// Restricted to the discovery system guest: the runtime accepts this
@@ -97,6 +106,17 @@ pub fn process_capability(
     }
 }
 
+/// Derives a caller's requestor namespace from its process owner.
+///
+/// The tenant is read from the runtime's persisted process authority — the
+/// only non-forgeable tenant source — never from a tenant the caller asserts
+/// for itself (e.g. sender-controlled handoff metadata). A named process
+/// tenant yields `Tenant(t)`; an unset (root) tenant yields `Root`. Returns an
+/// error only when the runtime tenant lookup itself fails.
+pub fn process_namespace(process_id: selium_abi::ProcessId) -> Result<selium_abi::Namespace> {
+    process_tenant(process_id).map(|tenant| namespace_from_tenant(tenant.as_deref()))
+}
+
 /// The tenant identity assigned to another process, if any.
 ///
 /// The discovery service uses this to scope resolution to the calling
@@ -108,26 +128,6 @@ pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String
             "unexpected hostcall output for ProcessTenant: {other:?}"
         ))),
     }
-}
-
-/// Maps a process tenant to its namespace: `None` (or empty) → `Root`, a
-/// named tenant → `Tenant(t)`.
-pub fn namespace_from_tenant(tenant: Option<&str>) -> selium_abi::Namespace {
-    match tenant {
-        Some(tenant) if !tenant.is_empty() => selium_abi::Namespace::Tenant(tenant.to_string()),
-        _ => selium_abi::Namespace::Root,
-    }
-}
-
-/// Derives a caller's requestor namespace from its process owner.
-///
-/// The tenant is read from the runtime's persisted process authority — the
-/// only non-forgeable tenant source — never from a tenant the caller asserts
-/// for itself (e.g. sender-controlled handoff metadata). A named process
-/// tenant yields `Tenant(t)`; an unset (root) tenant yields `Root`. Returns an
-/// error only when the runtime tenant lookup itself fails.
-pub fn process_namespace(process_id: selium_abi::ProcessId) -> Result<selium_abi::Namespace> {
-    process_tenant(process_id).map(|tenant| namespace_from_tenant(tenant.as_deref()))
 }
 
 /// Removes a host-held quota counter for a tenant and resource class,
