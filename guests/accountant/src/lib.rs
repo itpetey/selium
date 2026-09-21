@@ -51,6 +51,9 @@ pub const BOOKKEEPER_ENTRYPOINT: &str = "bookkeeper";
 pub const BUCKET_TOPIC_PATH: &str = "accounting-buckets";
 /// Serving route path for the accountant's control surface (`sel:///accountant`).
 pub const CONTROL_PATH: &str = "accountant";
+/// Default per-tenant process-count ceiling, authored unless an operator
+/// raised it via the `SetProcessQuota` control.
+const DEFAULT_PROCESS_QUOTA: u64 = 100;
 /// Durable log name for the usage ledger (per-minute windows + policy records).
 pub const LEDGER_LOG: &str = "selium.accountant.ledger";
 /// Serving route path for the accountant's narrowing live table (`sel:///accounting-narrowing`).
@@ -59,9 +62,6 @@ pub const NARROWING_TABLE_PATH: &str = "accounting-narrowing";
 const TOPIC_CAPACITY: u64 = 64 * 1024;
 /// Seconds in one billing window.
 const WINDOW_SECS: u64 = 60;
-/// Default per-tenant process-count ceiling, authored unless an operator
-/// raised it via the `SetProcessQuota` control.
-const DEFAULT_PROCESS_QUOTA: u64 = 100;
 
 /// Per-dimension usage in one sampling interval or billing window.
 ///
@@ -155,18 +155,6 @@ pub struct Account {
     delinquent: bool,
     /// The last rolled window's usage.
     last_usage: Usage,
-}
-
-impl Default for Account {
-    fn default() -> Self {
-        Self {
-            plan: Usage::default(),
-            overage: Usage::default(),
-            process_quota: DEFAULT_PROCESS_QUOTA,
-            delinquent: false,
-            last_usage: Usage::default(),
-        }
-    }
 }
 
 /// Enforcement state authored from an account: quota values and the narrowing
@@ -331,6 +319,18 @@ impl Account {
             LedgerRecord::SetProcessQuota { processes, .. } => self.process_quota = *processes,
             LedgerRecord::Delinquent { .. } => self.delinquent = true,
             LedgerRecord::Restored { .. } => self.delinquent = false,
+        }
+    }
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            plan: Usage::default(),
+            overage: Usage::default(),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            delinquent: false,
+            last_usage: Usage::default(),
         }
     }
 }

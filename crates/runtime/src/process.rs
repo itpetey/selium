@@ -1171,6 +1171,13 @@ impl Runtime {
     }
 }
 
+/// Whether a guest reactor poll reports that the poll-owner entrypoint has
+/// completed: the `__selium_guest_poll` export returns `1` when the entrypoint
+/// future finished (a still-running, parked entrypoint returns `0`).
+fn entrypoint_completed(results: &[WasmValue]) -> bool {
+    results.first() == Some(&WasmValue::I32(1))
+}
+
 /// True when the per-attachment eligibility map marks every attacher of
 /// `shared_id` as fast-path capable (and at least one attacher exists). See
 /// [`Runtime::fast_path_region_active`].
@@ -1181,13 +1188,6 @@ fn region_fast_path_active(
     attachments
         .get(&shared_id)
         .is_some_and(|voters| !voters.is_empty() && voters.values().all(|capable| *capable))
-}
-
-/// Whether a guest reactor poll reports that the poll-owner entrypoint has
-/// completed: the `__selium_guest_poll` export returns `1` when the entrypoint
-/// future finished (a still-running, parked entrypoint returns `0`).
-fn entrypoint_completed(results: &[WasmValue]) -> bool {
-    results.first() == Some(&WasmValue::I32(1))
 }
 
 #[cfg(test)]

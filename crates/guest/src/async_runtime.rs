@@ -153,12 +153,6 @@ pub fn poll_reactor() -> i32 {
     poll_owner_done()
 }
 
-/// Returns whether the poll-owner entrypoint task has completed: `0` while it
-/// is running (parked), `1` once it completed.
-fn poll_owner_done() -> i32 {
-    POLL_OWNER_DONE.with(|done| i32::from(*done.borrow()))
-}
-
 /// Polls the guest reactor and aborts the process if polling panics.
 ///
 /// Returns the poll-owner entrypoint completion code (see [`poll_reactor`]).
@@ -245,50 +239,6 @@ where
     JoinHandle { state }
 }
 
-/// Spawns the poll-owner entrypoint future: the single task whose completion
-/// signals the process's normal exit through the poll export.
-///
-/// Like [`spawn`], but records the task as the poll owner and sets the
-/// reactor's completion signal (`POLL_OWNER_DONE`) when the future completes —
-/// whether it returns `Ok` or `Err` — so a later [`poll_reactor`] reports the
-/// entrypoint as done instead of leaving the process resident on an idle,
-/// silent reactor.
-fn spawn_poll_owner<F>(future: F) -> JoinHandle<F::Output>
-where
-    F: Future + 'static,
-{
-    let state = Rc::new(RefCell::new(JoinState::new()));
-    let state_for_task = Rc::clone(&state);
-    let id = next_task_id();
-    POLL_OWNER_TASK.with(|owner| *owner.borrow_mut() = Some(id));
-    POLL_OWNER_DONE.with(|done| *done.borrow_mut() = false);
-    let task = BackgroundTask {
-        id,
-        future: Box::pin(async move {
-            let output = future.await;
-            POLL_OWNER_DONE.with(|done| *done.borrow_mut() = true);
-            state_for_task.borrow_mut().complete(output);
-        }),
-        runnable: true,
-    };
-
-    enqueue_task(task);
-
-    JoinHandle { state }
-}
-
-/// Queues a spawned task, falling back to the spawn queue when the reactor is
-/// mid-poll (the background list is borrowed).
-fn enqueue_task(task: BackgroundTask) {
-    BACKGROUND.with(|tasks| {
-        if let Ok(mut tasks) = tasks.try_borrow_mut() {
-            tasks.push(task);
-        } else {
-            SPAWN_QUEUE.with(|queue| queue.borrow_mut().push(task));
-        }
-    });
-}
-
 /// Yields execution back to the guest task runner once.
 pub async fn yield_now() {
     YieldNow { yielded: false }.await;
@@ -360,6 +310,18 @@ fn apply_yield_queue() {
             if let Some(task) = tasks.iter_mut().find(|task| task.id == *task_id) {
                 task.runnable = true;
             }
+        }
+    });
+}
+
+/// Queues a spawned task, falling back to the spawn queue when the reactor is
+/// mid-poll (the background list is borrowed).
+fn enqueue_task(task: BackgroundTask) {
+    BACKGROUND.with(|tasks| {
+        if let Ok(mut tasks) = tasks.try_borrow_mut() {
+            tasks.push(task);
+        } else {
+            SPAWN_QUEUE.with(|queue| queue.borrow_mut().push(task));
         }
     });
 }
@@ -445,6 +407,12 @@ fn poll_backgrounds() -> bool {
     progressed
 }
 
+/// Returns whether the poll-owner entrypoint task has completed: `0` while it
+/// is running (parked), `1` once it completed.
+fn poll_owner_done() -> i32 {
+    POLL_OWNER_DONE.with(|done| i32::from(*done.borrow()))
+}
+
 fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
     // Register with the guest's own gen-wait map (for guest-writable rings).
     GEN_WAIT_MAP.with(|cell| {
@@ -470,6 +438,38 @@ fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
             task_id,
         ));
     }
+}
+
+/// Spawns the poll-owner entrypoint future: the single task whose completion
+/// signals the process's normal exit through the poll export.
+///
+/// Like [`spawn`], but records the task as the poll owner and sets the
+/// reactor's completion signal (`POLL_OWNER_DONE`) when the future completes —
+/// whether it returns `Ok` or `Err` — so a later [`poll_reactor`] reports the
+/// entrypoint as done instead of leaving the process resident on an idle,
+/// silent reactor.
+fn spawn_poll_owner<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+{
+    let state = Rc::new(RefCell::new(JoinState::new()));
+    let state_for_task = Rc::clone(&state);
+    let id = next_task_id();
+    POLL_OWNER_TASK.with(|owner| *owner.borrow_mut() = Some(id));
+    POLL_OWNER_DONE.with(|done| *done.borrow_mut() = false);
+    let task = BackgroundTask {
+        id,
+        future: Box::pin(async move {
+            let output = future.await;
+            POLL_OWNER_DONE.with(|done| *done.borrow_mut() = true);
+            state_for_task.borrow_mut().complete(output);
+        }),
+        runnable: true,
+    };
+
+    enqueue_task(task);
+
+    JoinHandle { state }
 }
 
 fn wake_gen_waiters(region_id: u64, new_generation: u64) {

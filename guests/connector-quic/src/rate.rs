@@ -14,19 +14,25 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use selium_guest::time::Instant;
 use tokio::sync::Mutex;
 
+/// A tenant's bucket is evicted after this long without a stream admission.
+pub const ADMISSION_IDLE_EVICT_AFTER: Duration = Duration::from_secs(60);
+/// Default admission burst (streams) per tenant.
+pub const DEFAULT_ADMISSION_BURST: u64 = 32;
 /// Default admission rate (streams/sec) per tenant. Operator configuration;
 /// this is the deployable default.
 pub const DEFAULT_ADMISSION_TOKENS_PER_SEC: u64 = 16;
-/// Default admission burst (streams) per tenant.
-pub const DEFAULT_ADMISSION_BURST: u64 = 32;
-/// A tenant's bucket is evicted after this long without a stream admission.
-pub const ADMISSION_IDLE_EVICT_AFTER: Duration = Duration::from_secs(60);
 
 /// Shared per-tenant stream-admission rate limiter, cloned into each
 /// connection task.
 #[derive(Clone)]
 pub struct AdmissionLimiter {
     inner: Arc<Mutex<Inner>>,
+}
+
+struct Bucket {
+    tokens: f64,
+    last_refill: Instant,
+    last_touch: Instant,
 }
 
 struct Inner {
@@ -38,12 +44,6 @@ struct Inner {
     buckets: HashMap<String, Bucket>,
     /// Duration after which an untouched bucket is evicted.
     evict_after: Duration,
-}
-
-struct Bucket {
-    tokens: f64,
-    last_refill: Instant,
-    last_touch: Instant,
 }
 
 impl AdmissionLimiter {

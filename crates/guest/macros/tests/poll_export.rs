@@ -16,13 +16,6 @@ use thiserror::Error;
 #[error("{0}")]
 struct TestError(String);
 
-/// A poll-owner entrypoint: its expansion emits the `__selium_guest_poll`
-/// export with an `extern "C" fn() -> i32` signature on wasm.
-#[entrypoint]
-async fn poll_probe() -> Result<(), TestError> {
-    Ok(())
-}
-
 #[test]
 fn poll_export_reports_completion_code() {
     // With no poll owner installed yet, the reactor reports "running".
@@ -36,4 +29,11 @@ fn poll_export_reports_completion_code() {
     // The (just-completed) poll-owner entrypoint is now reported as done on
     // the next poll — the host's reap signal for a returned guest entrypoint.
     assert_eq!(poll_safely(), 1);
+}
+
+/// A poll-owner entrypoint: its expansion emits the `__selium_guest_poll`
+/// export with an `extern "C" fn() -> i32` signature on wasm.
+#[entrypoint]
+async fn poll_probe() -> Result<(), TestError> {
+    Ok(())
 }

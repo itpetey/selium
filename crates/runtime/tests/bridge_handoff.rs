@@ -224,6 +224,64 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
         .expect("bridge-channel attaches its own handed-off region");
 }
 
+/// Task 7.1: a completed bridge-channel pipe exits and its process is reaped
+/// — no zombie reactor. The child's poll export reports entrypoint completion;
+/// the runtime records `ProcessExited` and tears the process down (also
+/// returning its process-quota slot to the tenant).
+#[test]
+fn completed_bridge_channel_is_reaped_without_zombie() {
+    let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
+    runtime
+        .register_module_bytes(
+            "bridge-channel-module".to_string(),
+            module_with_completing_poll(),
+        )
+        .expect("register bridge-channel module");
+    // An authored ceiling makes the process-slot usage observable.
+    runtime
+        .kernel()
+        .quota()
+        .set("acme", ResourceClass::Process, 5);
+
+    let before = runtime.loaded_guest_count();
+    let child = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
+    assert_eq!(runtime.loaded_guest_count(), before + 1);
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::Process),
+        1
+    );
+
+    // The bridge-channel's pipe tears down so its entrypoint returns: the
+    // reactor poll reports completion and the runtime reaps the process.
+    runtime.poll_guest(child);
+    assert!(
+        runtime.kernel().processes().inspect_process(child).is_err(),
+        "the completed bridge-channel process must be reaped"
+    );
+    assert_eq!(
+        runtime.loaded_guest_count(),
+        before,
+        "the completed child must not linger as a zombie reactor"
+    );
+    assert!(
+        runtime.activity_log().iter().any(|event| {
+            event.process_id == Some(child) && event.kind == ActivityKind::ProcessExited
+        }),
+        "the reap must record ProcessExited"
+    );
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::Process),
+        0,
+        "the reaped child must return its process slot"
+    );
+}
+
 /// Allocates a stream region in `tenant`'s scope (a root principal may mint
 /// for any tenant) and delivers it to the bridge queue as a handoff carrying
 /// the tenant's authenticated identity. Returns the allocated region.
@@ -279,10 +337,6 @@ fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u6
     assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
 }
 
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    module_with_entrypoint_args(entrypoint, 0)
-}
-
 /// A bridge-channel stub whose `__selium_guest_poll` export reports entrypoint
 /// completion (`1`): its poll-owner entrypoint has returned, so the runtime
 /// reaps it as a normal exit.
@@ -296,6 +350,10 @@ fn module_with_completing_poll() -> Vec<u8> {
     .expect("compile wat")
 }
 
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    module_with_entrypoint_args(entrypoint, 0)
+}
+
 fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
     let params: String = "i64 ".repeat(args).trim_end().to_string();
     let params = if params.is_empty() {
@@ -307,6 +365,58 @@ fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
         "(module (memory 1) (func (export \"{entrypoint}\") {params}))"
     ))
     .expect("compile wat")
+}
+
+/// Task 7.2: exceeding a tenant's process ceiling is denied by the quota and
+/// surfaced to the client as a clean stream close — the bridge keeps no spawn
+/// counter, so the bound is the accountant-authored quota, released on exit.
+#[test]
+fn process_ceiling_denies_bridge_channel_spawn() {
+    let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
+    runtime
+        .register_module_bytes(
+            "bridge-channel-module".to_string(),
+            module_with_completing_poll(),
+        )
+        .expect("register bridge-channel module");
+    // Author a ceiling of one bridge-channel process for the tenant.
+    runtime
+        .kernel()
+        .quota()
+        .set("acme", ResourceClass::Process, 1);
+
+    // One spawn consumes the only slot.
+    let first = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
+
+    // The second spawn is denied before a second child is created.
+    let denied = spawn_bridge_channel_result(&runtime, bridge_server, "acme", 43)
+        .expect_err("a spawn over the ceiling must be denied");
+    assert_eq!(denied.code, AbiErrorCode::QuotaExceeded);
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::Process),
+        1,
+        "the denied spawn must not create a second child"
+    );
+
+    // The denial aborts only the stream: the bridge attach-then-closes it (the
+    // client observes EOF — exercised in the bridge crate's denial-path test),
+    // while the process table gains no second child (usage stays at one).
+
+    // The bridge keeps no spawn counter: once the first child exits (the poll
+    // completion reaps it), its slot returns and a spawn succeeds again.
+    runtime.poll_guest(first);
+    let _second = spawn_bridge_channel(&runtime, bridge_server, "acme", 44);
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::Process),
+        1,
+        "the reaped child's slot lets the tenant spawn again up to the ceiling"
+    );
 }
 
 /// Receives one delivered handoff on the bridge-server's listener and
@@ -536,114 +646,4 @@ fn try_attach_region(
         CompletionState::Failed(error) => Err(error),
         other => panic!("expected attach outcome, got {other:?}"),
     }
-}
-
-/// Task 7.1: a completed bridge-channel pipe exits and its process is reaped
-/// — no zombie reactor. The child's poll export reports entrypoint completion;
-/// the runtime records `ProcessExited` and tears the process down (also
-/// returning its process-quota slot to the tenant).
-#[test]
-fn completed_bridge_channel_is_reaped_without_zombie() {
-    let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_completing_poll(),
-        )
-        .expect("register bridge-channel module");
-    // An authored ceiling makes the process-slot usage observable.
-    runtime
-        .kernel()
-        .quota()
-        .set("acme", ResourceClass::Process, 5);
-
-    let before = runtime.loaded_guest_count();
-    let child = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
-    assert_eq!(runtime.loaded_guest_count(), before + 1);
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::Process),
-        1
-    );
-
-    // The bridge-channel's pipe tears down so its entrypoint returns: the
-    // reactor poll reports completion and the runtime reaps the process.
-    runtime.poll_guest(child);
-    assert!(
-        runtime.kernel().processes().inspect_process(child).is_err(),
-        "the completed bridge-channel process must be reaped"
-    );
-    assert_eq!(
-        runtime.loaded_guest_count(),
-        before,
-        "the completed child must not linger as a zombie reactor"
-    );
-    assert!(
-        runtime.activity_log().iter().any(|event| {
-            event.process_id == Some(child) && event.kind == ActivityKind::ProcessExited
-        }),
-        "the reap must record ProcessExited"
-    );
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::Process),
-        0,
-        "the reaped child must return its process slot"
-    );
-}
-
-/// Task 7.2: exceeding a tenant's process ceiling is denied by the quota and
-/// surfaced to the client as a clean stream close — the bridge keeps no spawn
-/// counter, so the bound is the accountant-authored quota, released on exit.
-#[test]
-fn process_ceiling_denies_bridge_channel_spawn() {
-    let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_completing_poll(),
-        )
-        .expect("register bridge-channel module");
-    // Author a ceiling of one bridge-channel process for the tenant.
-    runtime
-        .kernel()
-        .quota()
-        .set("acme", ResourceClass::Process, 1);
-
-    // One spawn consumes the only slot.
-    let first = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
-
-    // The second spawn is denied before a second child is created.
-    let denied = spawn_bridge_channel_result(&runtime, bridge_server, "acme", 43)
-        .expect_err("a spawn over the ceiling must be denied");
-    assert_eq!(denied.code, AbiErrorCode::QuotaExceeded);
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::Process),
-        1,
-        "the denied spawn must not create a second child"
-    );
-
-    // The denial aborts only the stream: the bridge attach-then-closes it (the
-    // client observes EOF — exercised in the bridge crate's denial-path test),
-    // while the process table gains no second child (usage stays at one).
-
-    // The bridge keeps no spawn counter: once the first child exits (the poll
-    // completion reaps it), its slot returns and a spawn succeeds again.
-    runtime.poll_guest(first);
-    let _second = spawn_bridge_channel(&runtime, bridge_server, "acme", 44);
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::Process),
-        1,
-        "the reaped child's slot lets the tenant spawn again up to the ceiling"
-    );
 }

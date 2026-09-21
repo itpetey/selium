@@ -69,10 +69,19 @@ pub mod runtime;
 pub mod stream;
 pub mod udp_adapter;
 
+/// QUIC error code used to reset an admitted-refused stream: distinct from the
+/// handshake refusal code so a peer can tell "stream refused" from "connection
+/// refused" while the connection itself stays up.
+pub const ADMISSION_REFUSED_ERROR_CODE: u32 = 0x1_0100;
 /// Anchor-table key prefix: keys are `client-ca-<tenant>`.
 const ANCHOR_KEY_PREFIX: &str = "client-ca-";
 /// The identity guest's published anchor live-table route.
 const ANCHOR_TABLE_ROUTE: &str = "sel:///identity-anchors";
+/// Maximum concurrent bidirectional streams a single connection may open.
+/// quinn enforces this natively via the advertised MAX_STREAMS, so streams
+/// beyond the cap are refused before any per-stream region is allocated. The
+/// exact value is operator configuration; this is the deployable default.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
 /// Default listener address for the QUIC connector.
 ///
 /// Deferred policy: recorded in the connector's config, not spec behaviour
@@ -86,15 +95,6 @@ const TLS_CERT_MANIFEST: &str = "cert-pem";
 const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
-/// Maximum concurrent bidirectional streams a single connection may open.
-/// quinn enforces this natively via the advertised MAX_STREAMS, so streams
-/// beyond the cap are refused before any per-stream region is allocated. The
-/// exact value is operator configuration; this is the deployable default.
-pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
-/// QUIC error code used to reset an admitted-refused stream: distinct from the
-/// handshake refusal code so a peer can tell "stream refused" from "connection
-/// refused" while the connection itself stays up.
-pub const ADMISSION_REFUSED_ERROR_CODE: u32 = 0x1_0100;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
