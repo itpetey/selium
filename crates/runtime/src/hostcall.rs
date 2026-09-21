@@ -925,14 +925,25 @@ impl Runtime {
                 let module_bytes = self
                     .module_bytes(&module_id)
                     .map_err(|error| AbiError::new(AbiErrorCode::NotFound, error.to_string()))?;
+                let arguments =
+                    crate::wasm::decode_integer_arguments(&arguments).map_err(|error| {
+                        AbiError::new(AbiErrorCode::MalformedPayload, error.to_string())
+                    })?;
+                // Enforce the tenant-scoped process quota after spawn-tenant
+                // resolution and before instantiation: a spawn whose target
+                // tenant is at its authored ceiling is denied with
+                // `QuotaExceeded`. Tenant-less (root) processes are not
+                // metered.
+                let quota_tenant = tenant.clone();
+                if let Some(tenant) = quota_tenant.as_deref() {
+                    self.enforce_quota(tenant, ResourceClass::Process, 1)?;
+                }
                 let descriptor = SystemGuestDescriptor {
                     name: module_id.clone(),
                     module_id: module_id.clone(),
                     module_bytes,
                     entrypoint,
-                    arguments: crate::wasm::decode_integer_arguments(&arguments).map_err(
-                        |error| AbiError::new(AbiErrorCode::MalformedPayload, error.to_string()),
-                    )?,
+                    arguments,
                     grants,
                     dependencies: Vec::new(),
                     readiness: ReadinessCondition::Immediate,
@@ -940,9 +951,25 @@ impl Runtime {
                     serving_role: None,
                     handlers: Vec::new(),
                 };
-                let child = self
-                    .spawn_system_guest(descriptor)
-                    .map_err(|error| AbiError::new(AbiErrorCode::Internal, error.to_string()))?;
+                let child = match self.spawn_system_guest(descriptor) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        // The reserved slot was never claimed by a live child;
+                        // return it so a failed spawn does not leak quota.
+                        if let Some(tenant) = quota_tenant.as_deref() {
+                            self.kernel
+                                .quota()
+                                .release(tenant, ResourceClass::Process, 1);
+                        }
+                        return Err(AbiError::new(AbiErrorCode::Internal, error.to_string()));
+                    }
+                };
+                // Record the charged tenant so teardown releases the slot once.
+                if let Some(tenant) = quota_tenant.as_deref() {
+                    self.process_quota_tenants
+                        .lock()
+                        .insert(child.process_id, tenant.to_string());
+                }
                 // Record the parent relationship for the Children selector.
                 self.process_authorities
                     .lock()
@@ -4298,6 +4325,188 @@ mod tests {
             runtime.process_tenant(child_pid).as_deref(),
             Some("acme"),
             "a spawned bridge-channel must inherit the bridge-server's tenant"
+        );
+    }
+
+    /// Task 3.1: a spawn for a tenant at its process ceiling is denied with
+    /// `QuotaExceeded` before the child is created, while a tenant-less (root)
+    /// spawn is not metered.
+    #[test]
+    fn process_start_enforces_tenant_process_quota_and_skips_root() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::Process, 1);
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "root-spawner",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Namespace(Namespace::Root)],
+                ),
+            ],
+            None,
+        );
+
+        // A tenant-less (root) spawn is not metered: it succeeds without
+        // touching the ceiling.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: None,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let root_child = match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Ready(HostcallOutput::Process(process)) => process.local_id,
+            other => panic!("expected root child descriptor, got {other:?}"),
+        };
+
+        // The first tenant-scoped spawn is within the ceiling.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let tenant_child = match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Ready(HostcallOutput::Process(process)) => process.local_id,
+            other => panic!("expected tenant child descriptor, got {other:?}"),
+        };
+
+        // The second tenant-scoped spawn is over the ceiling: denied before
+        // any child is created.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "an over-ceiling tenant spawn must be denied"
+        );
+        assert!(
+            matches!(
+                runtime.poll_hostcall(parent.process_id, op),
+                CompletionState::Failed(error) if error.code == AbiErrorCode::QuotaExceeded
+            ),
+            "the over-ceiling spawn must fail with QuotaExceeded"
+        );
+
+        let _ = (root_child, tenant_child);
+    }
+
+    /// Task 3.2: the process-quota slot returns to the tenant when the child
+    /// exits (is torn down), letting the tenant spawn again up to its ceiling.
+    #[test]
+    fn process_quota_slot_returns_to_tenant_on_exit() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::Process, 1);
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "root-spawner",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Namespace(Namespace::Root)],
+                ),
+            ],
+            None,
+        );
+
+        // The only slot is consumed by the first child.
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let child = match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Ready(HostcallOutput::Process(process)) => process.local_id,
+            other => panic!("expected child descriptor, got {other:?}"),
+        };
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::Process),
+            1,
+            "the spawned child must hold the process slot"
+        );
+
+        // Stop the child (the existing teardown path): the slot returns.
+        runtime.stop_process(child).expect("stop child");
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::Process),
+            0,
+            "a torn-down child must return its process slot"
+        );
+
+        // The tenant can spawn again up to the ceiling.
+        let (status, _op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_READY,
+            "the released slot lets the tenant spawn again"
         );
     }
 

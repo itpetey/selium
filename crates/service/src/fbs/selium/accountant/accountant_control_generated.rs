@@ -23,6 +23,7 @@ impl<'a> AccountantControl<'a> {
   pub const VT_TENANT: ::flatbuffers::VOffsetT = 6;
   pub const VT_PLAN: ::flatbuffers::VOffsetT = 8;
   pub const VT_OVERAGE: ::flatbuffers::VOffsetT = 10;
+  pub const VT_PROCESSES: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -34,6 +35,7 @@ impl<'a> AccountantControl<'a> {
     args: &'args AccountantControlArgs<'args>
   ) -> ::flatbuffers::WIPOffset<AccountantControl<'bldr>> {
     let mut builder = AccountantControlBuilder::new(_fbb);
+    builder.add_processes(args.processes);
     if let Some(x) = args.overage { builder.add_overage(x); }
     if let Some(x) = args.plan { builder.add_plan(x); }
     if let Some(x) = args.tenant { builder.add_tenant(x); }
@@ -70,6 +72,13 @@ impl<'a> AccountantControl<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<TenantPlan>>(AccountantControl::VT_OVERAGE, None)}
   }
+  #[inline]
+  pub fn processes(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(AccountantControl::VT_PROCESSES, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for AccountantControl<'_> {
@@ -82,6 +91,7 @@ impl ::flatbuffers::Verifiable for AccountantControl<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<TenantPlan>>("plan", Self::VT_PLAN, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<TenantPlan>>("overage", Self::VT_OVERAGE, false)?
+     .visit_field::<u64>("processes", Self::VT_PROCESSES, false)?
      .finish();
     Ok(())
   }
@@ -91,6 +101,7 @@ pub struct AccountantControlArgs<'a> {
     pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub plan: Option<::flatbuffers::WIPOffset<TenantPlan<'a>>>,
     pub overage: Option<::flatbuffers::WIPOffset<TenantPlan<'a>>>,
+    pub processes: u64,
 }
 impl<'a> Default for AccountantControlArgs<'a> {
   #[inline]
@@ -100,6 +111,7 @@ impl<'a> Default for AccountantControlArgs<'a> {
       tenant: None,
       plan: None,
       overage: None,
+      processes: 0,
     }
   }
 }
@@ -126,6 +138,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> AccountantControlBuilder<'a, 
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<TenantPlan>>(AccountantControl::VT_OVERAGE, overage);
   }
   #[inline]
+  pub fn add_processes(&mut self, processes: u64) {
+    self.fbb_.push_slot::<u64>(AccountantControl::VT_PROCESSES, processes, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> AccountantControlBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     AccountantControlBuilder {
@@ -147,6 +163,7 @@ impl ::core::fmt::Debug for AccountantControl<'_> {
       ds.field("tenant", &self.tenant());
       ds.field("plan", &self.plan());
       ds.field("overage", &self.overage());
+      ds.field("processes", &self.processes());
       ds.finish()
   }
 }

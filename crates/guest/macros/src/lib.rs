@@ -124,10 +124,15 @@ pub fn entrypoint(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// same unmangled symbol, so linking two of them into one native
             /// binary would collide. Gating on wasm keeps exactly one export per
             /// guest module and none in native builds.
+            ///
+            /// Returns the reactor's completion code: `0` while the poll-owner
+            /// entrypoint future is still running (parked), `1` once it has
+            /// completed — the host's signal to tear the process down as a
+            /// normal exit.
             #[cfg(target_family = "wasm")]
             #[unsafe(export_name = "__selium_guest_poll")]
-            pub extern "C" fn __selium_guest_poll() {
-                ::selium_guest::poll_safely();
+            pub extern "C" fn __selium_guest_poll() -> i32 {
+                ::selium_guest::poll_safely()
             }
         }
     };

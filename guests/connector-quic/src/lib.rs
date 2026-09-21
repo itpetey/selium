@@ -38,7 +38,7 @@ use quinn::ServerConfig;
 use rustls_pemfile as pemfile;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use selium_guest::{
-    Context, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
+    Context, Instant, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
 };
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
@@ -53,6 +53,9 @@ use ring as _;
 use crate::{
     identity::{ClientAnchorSet, build_server_config},
     pipeline::relay_stream,
+    rate::{
+        AdmissionLimiter, DEFAULT_ADMISSION_BURST, DEFAULT_ADMISSION_TOKENS_PER_SEC, refuse_stream,
+    },
     resolve::{ResolveError, ResolverHandle, RouteResolver},
     runtime::ConnectorRuntime,
     udp_adapter::QuicUdpSocket,
@@ -60,6 +63,7 @@ use crate::{
 
 pub mod identity;
 pub mod pipeline;
+pub mod rate;
 pub mod resolve;
 pub mod runtime;
 pub mod stream;
@@ -82,6 +86,15 @@ const TLS_CERT_MANIFEST: &str = "cert-pem";
 const TLS_KEY_MANIFEST: &str = "key-pem";
 /// Storage blob store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
+/// Maximum concurrent bidirectional streams a single connection may open.
+/// quinn enforces this natively via the advertised MAX_STREAMS, so streams
+/// beyond the cap are refused before any per-stream region is allocated. The
+/// exact value is operator configuration; this is the deployable default.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
+/// QUIC error code used to reset an admitted-refused stream: distinct from the
+/// handshake refusal code so a peer can tell "stream refused" from "connection
+/// refused" while the connection itself stays up.
+pub const ADMISSION_REFUSED_ERROR_CODE: u32 = 0x1_0100;
 
 #[derive(Debug, Error)]
 pub enum TlsError {
@@ -143,6 +156,10 @@ pub fn build_endpoint(
 /// anchors and attaches the derived identity to each handoff; `None` serves
 /// without client authentication and attaches empty metadata.
 ///
+/// `limiter` rate-limits new stream admissions per tenant before a per-stream
+/// channel is allocated; a stream over the rate is reset with a distinct error
+/// code while the connection itself stays up.
+///
 /// Exposed for the connector's integration tests: the refusal path (unknown
 /// or absent SNI, or missing/unverifiable client identity under mTLS)
 /// closes the connection before any guest contact.
@@ -150,6 +167,7 @@ pub async fn handle_connection(
     connection: quinn::Connection,
     resolver: ResolverHandle,
     anchors: Option<ClientAnchorSet>,
+    limiter: AdmissionLimiter,
 ) {
     // Route from the handshake SNI. Unknown/absent SNI refuses the connection
     // without ever contacting an app guest.
@@ -172,7 +190,7 @@ pub async fn handle_connection(
     // guest can attribute authority (the bridge-server maps it to grants).
     // Without configured anchors, mTLS is off and handoffs carry empty
     // metadata.
-    let (identity_metadata, serving_tenant) = match &anchors {
+    let (identity_metadata, client_tenant) = match &anchors {
         Some(anchors) => match anchors.identity_for(&connection) {
             Some(identity) => (identity.encode(), Some(identity.tenant)),
             None => {
@@ -193,6 +211,14 @@ pub async fn handle_connection(
         }
     };
 
+    // Admission key: the authenticated client's tenant, falling back to the
+    // resolved serving tenant when client authentication is disabled. A
+    // root/tenant-less route admits under the platform (empty) key.
+    let rate_key = client_tenant
+        .clone()
+        .or_else(|| target.tenant.clone())
+        .unwrap_or_default();
+
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
@@ -202,8 +228,28 @@ pub async fn handle_connection(
             }
         };
 
+        // Refuse streams over the per-tenant admission rate before allocating
+        // a per-stream region: reset the stream with a distinct error code,
+        // keeping the connection up for conforming streams.
+        let now = match Instant::now() {
+            Ok(now) => now,
+            Err(error) => {
+                warn!("quic-connector: clock unavailable for admission: {error}");
+                refuse_stream(send, recv);
+                continue;
+            }
+        };
+        if !limiter.allow(&rate_key, now).await {
+            warn!(
+                tenant = %rate_key,
+                "quic-connector: stream admission rate limit exceeded"
+            );
+            refuse_stream(send, recv);
+            continue;
+        }
+
         let channel =
-            match crate::stream::QuicChannel::allocate_for_tenant(serving_tenant.as_deref()) {
+            match crate::stream::QuicChannel::allocate_for_tenant(client_tenant.as_deref()) {
                 Ok(channel) => channel,
                 Err(e) => {
                     warn!("quic-connector: stream channel allocation failed: {e}");
@@ -470,6 +516,12 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
     let anchors = Arc::new(anchors);
     spawn(anchor_refresher(anchor_table, anchors.clone()));
 
+    // Per-tenant stream-admission rate limiter shared across every connection
+    // task: keyed by the authenticated client's tenant (falling back to the
+    // resolved serving tenant), refusing streams over the rate before a
+    // per-stream region is allocated.
+    let limiter = AdmissionLimiter::new(DEFAULT_ADMISSION_TOKENS_PER_SEC, DEFAULT_ADMISSION_BURST);
+
     loop {
         let Some(incoming) = endpoint.accept().await else {
             break;
@@ -486,8 +538,9 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
         info!("quic-connector: QUIC handshake complete");
         let resolver = resolver.clone();
         let anchor_set = (*anchors).clone();
+        let limiter = limiter.clone();
         spawn(async move {
-            handle_connection(connection, resolver, anchor_set).await;
+            handle_connection(connection, resolver, anchor_set, limiter).await;
         });
     }
 

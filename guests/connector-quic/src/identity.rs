@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use quinn::{
-    ServerConfig,
+    ServerConfig, TransportConfig,
     crypto::rustls::QuicServerConfig,
     rustls::{
         DigitallySignedStruct, DistinguishedName, Error as RustlsError, RootCertStore,
@@ -358,7 +358,17 @@ pub fn build_server_config(
         tracing::error!("quic-connector: QUIC crypto config rejected: {e}");
         TlsError::ConfigError
     })?;
-    Ok(ServerConfig::with_crypto(Arc::new(quic_crypto)))
+    let mut config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+
+    // Cap concurrent bidirectional streams per connection: quinn advertises
+    // the limit as the connection's MAX_STREAMS, so a client cannot open
+    // streams beyond the cap — no per-stream region is ever allocated for
+    // them (see `MAX_CONCURRENT_BIDI_STREAMS`).
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_bidi_streams(crate::MAX_CONCURRENT_BIDI_STREAMS.into());
+    config.transport_config(Arc::new(transport));
+
+    Ok(config)
 }
 
 /// Builds a per-tenant client verifier from a single trust anchor.

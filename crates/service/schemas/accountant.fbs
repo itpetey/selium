@@ -54,6 +54,7 @@ table TenantPlan {
 //   1 = SetOverage { tenant, overage }
 //   2 = MarkDelinquent { tenant }
 //   3 = MarkRestored { tenant }
+//   4 = SetProcessQuota { tenant, processes }
 table AccountantControl {
     variant: ubyte;
     // Tenant the control targets (all data variants).
@@ -62,6 +63,8 @@ table AccountantControl {
     plan: selium.accountant.TenantPlan;
     // Opt-in overage budget ceilings (SetOverage).
     overage: selium.accountant.TenantPlan;
+    // Per-tenant process-count ceiling (SetProcessQuota).
+    processes: ulong;
 }
 
 // Operator/billing control response from the accountant.

@@ -68,6 +68,10 @@ pub struct Runtime {
     /// teardown can revoke the queue's URI under the tenant it was minted
     /// for (which may differ from the creating process's own tenant).
     pub(crate) queue_tenants: Arc<Mutex<QueueTenants>>,
+    /// Tenant whose `ResourceClass::Process` quota a spawned child consumed,
+    /// keyed by the child's process id. Recorded by `ProcessStart`; teardown
+    /// releases the slot exactly once by removing (and reading) the entry.
+    pub(crate) process_quota_tenants: Arc<Mutex<HashMap<ProcessId, String>>>,
     /// Wait registry: guest tasks parked on host-writable rings.
     pub(crate) wait_registry: Arc<Mutex<WaitRegistry>>,
     /// Region attachments: every process that mapped a shared region,
@@ -171,6 +175,7 @@ impl Runtime {
             discovery_process: Arc::new(Mutex::new(None)),
             region_tenants: Arc::new(Mutex::new(HashMap::new())),
             queue_tenants: Arc::new(Mutex::new(HashMap::new())),
+            process_quota_tenants: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             region_attachments: Arc::new(Mutex::new(HashMap::new())),
             network_wait_keys: Arc::new(Mutex::new(Vec::new())),

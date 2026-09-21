@@ -220,6 +220,13 @@ impl Runtime {
         self.loaded_guests.lock().len()
     }
 
+    /// Drives a process's guest reactor until it stalls, reaping the process
+    /// if its poll-owner entrypoint completed. Test/integration hook.
+    #[doc(hidden)]
+    pub fn poll_guest(&self, process_id: ProcessId) {
+        self.poll_guest_until_stalled(process_id);
+    }
+
     /// Registers module bytes under an id, rejecting conflicting bytes.
     pub fn register_module_bytes(&self, module_id: String, module_bytes: Vec<u8>) -> Result<()> {
         let mut registry = self.module_registry.lock();
@@ -348,6 +355,16 @@ impl Runtime {
         self.process_fastpath.lock().remove(&process_id);
         // Its metering accumulators are moot too.
         self.metering.lock().remove(process_id);
+
+        // Release the tenant-scoped process-quota slot reserved at spawn,
+        // exactly once (the entry is removed here). Tenant-less processes and
+        // never-ProcessStart-spawned system guests reserved no slot, so they
+        // find no entry and release nothing.
+        if let Some(tenant) = self.process_quota_tenants.lock().remove(&process_id) {
+            self.kernel
+                .quota()
+                .release(&tenant, ResourceClass::Process, 1);
+        }
 
         // Its region attachments are moot too: drop it from every
         // attachment set so a later spawn of the same id cannot inherit
@@ -990,9 +1007,9 @@ impl Runtime {
     }
 
     /// Runs one reactor pass. Returns false when no progress is possible —
-    /// the guest is not loaded, or `__selium_guest_poll` trapped — so the
-    /// caller must not keep looping on pending mailbox state (the guest
-    /// cannot clear it).
+    /// the guest is not loaded, its entrypoint completed, or
+    /// `__selium_guest_poll` trapped — so the caller must not keep looping on
+    /// pending mailbox state (the guest cannot clear it).
     fn poll_guest_once(&self, process_id: ProcessId) -> bool {
         let Some(mut loaded_guest) = self.loaded_guests.lock().remove(&process_id) else {
             return false;
@@ -1005,6 +1022,24 @@ impl Runtime {
         // have written outbound frames before parking.
         self.kick_network_waiters();
         match result {
+            Ok(results) if entrypoint_completed(&results) => {
+                // The poll-owner entrypoint future completed: the process's
+                // normal exit. Record `ProcessExited` and funnel the reap
+                // through the existing teardown path (discovery URI
+                // revocation, region/pipe reclaim), rather than re-inserting
+                // the guest as an idle resident reactor.
+                let guest_logs = self.drain_guest_log_messages(process_id);
+                self.kernel.processes().record_activity(ActivityEvent {
+                    kind: ActivityKind::ProcessExited,
+                    process_id: Some(process_id),
+                    message: format!(
+                        "guest {process_id} entrypoint completed; reaping process; recent guest logs: {guest_logs:?}"
+                    ),
+                });
+                debug!(process_id, "guest entrypoint completed; reaping process");
+                drop(self.cleanup_failed_process(process_id));
+                false
+            }
             Ok(_) => {
                 self.loaded_guests.lock().insert(process_id, loaded_guest);
                 true
@@ -1148,6 +1183,13 @@ fn region_fast_path_active(
         .is_some_and(|voters| !voters.is_empty() && voters.values().all(|capable| *capable))
 }
 
+/// Whether a guest reactor poll reports that the poll-owner entrypoint has
+/// completed: the `__selium_guest_poll` export returns `1` when the entrypoint
+/// future finished (a still-running, parked entrypoint returns `0`).
+fn entrypoint_completed(results: &[WasmValue]) -> bool {
+    results.first() == Some(&WasmValue::I32(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,6 +1259,95 @@ mod tests {
         assert!(
             runtime.kernel().processes().inspect_process(pid).is_err(),
             "trap must reap the process record"
+        );
+    }
+
+    /// Task 2.1: a spawned guest whose poll export reports entrypoint
+    /// completion is removed from the process table with a `ProcessExited`
+    /// event, while one reporting still-running stays resident.
+    #[test]
+    fn completed_entrypoint_poll_reaps_process() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "completing".to_string(),
+                module_id: "completing-module".to_string(),
+                module_bytes: wat::parse_str(
+                    "(module
+                        (func (export \"main\") (result i32) i32.const 0)
+                        (func (export \"__selium_guest_poll\") (result i32) i32.const 1))",
+                )
+                .expect("compile wat"),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest");
+        let pid = bootstrapped.process_id;
+        assert_eq!(runtime.loaded_guest_count(), 1);
+
+        runtime.poll_guest_until_stalled(pid);
+
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            0,
+            "completion must unload the guest"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_err(),
+            "completion must reap the process record"
+        );
+        let activity = runtime.activity_log();
+        assert!(
+            activity.iter().any(|event| {
+                event.process_id == Some(pid) && event.kind == ActivityKind::ProcessExited
+            }),
+            "expected a ProcessExited completion record, got: {activity:?}"
+        );
+    }
+
+    /// Task 2.1 (counterpart): a parked entrypoint — the poll export reports
+    /// still-running — keeps its process resident and must not be reaped.
+    #[test]
+    fn parked_entrypoint_poll_keeps_process_resident() {
+        let runtime = Runtime::default();
+        let bootstrapped = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "running".to_string(),
+                module_id: "running-module".to_string(),
+                module_bytes: wat::parse_str(
+                    "(module
+                        (func (export \"main\") (result i32) i32.const 0)
+                        (func (export \"__selium_guest_poll\") (result i32) i32.const 0))",
+                )
+                .expect("compile wat"),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest");
+        let pid = bootstrapped.process_id;
+
+        runtime.poll_guest_until_stalled(pid);
+
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            1,
+            "a running entrypoint must stay loaded"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_ok(),
+            "a running entrypoint must keep its process record"
         );
     }
 

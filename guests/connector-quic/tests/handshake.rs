@@ -29,13 +29,15 @@ use quinn::{
     udp::{RecvMeta, Transmit},
 };
 use selium_connector_quic::{
-    build_endpoint, handle_connection,
+    MAX_CONCURRENT_BIDI_STREAMS, build_endpoint, handle_connection,
     identity::{ClientAnchorSet, build_server_config},
+    rate::{AdmissionLimiter, refuse_stream},
     resolve::RouteResolver,
     runtime::{ConnectorRuntime, ConnectorTimer},
     sni_of,
     udp_adapter::QuicUdpSocket,
 };
+use selium_guest::time::Instant;
 
 const CERT_DER: &[u8] = include_bytes!("fixtures/cert.der");
 const CLIENT_CERT_DER: &[u8] = include_bytes!("fixtures/client_cert.der");
@@ -682,12 +684,198 @@ async fn unknown_sni_is_refused_without_guest_contact() {
     let resolver: selium_connector_quic::resolve::ResolverHandle =
         Arc::new(tokio::sync::Mutex::new(RouteResolver::empty()));
     let anchors = test_anchor_set();
-    handle_connection(server_conn.clone(), resolver, Some(anchors)).await;
+    let limiter = selium_connector_quic::rate::AdmissionLimiter::new(100, 100);
+    handle_connection(server_conn.clone(), resolver, Some(anchors), limiter).await;
 
     let closed = tokio::time::timeout(std::time::Duration::from_secs(5), server_conn.closed())
         .await
         .is_ok();
     assert!(closed, "unknown SNI must be refused and closed");
+
+    drop(client_conn);
+    drop(endpoint);
+    drop(client_endpoint);
+}
+
+/// Task 6.1: the server transport config caps concurrent bidirectional
+/// streams per connection. A client opening exactly the cap succeeds; the
+/// next stream is refused (blocked on stream credit the connector never
+/// grants), so no per-stream channel would be allocated for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_bidi_streams_beyond_the_cap_are_refused() {
+    let cert = quinn::rustls::pki_types::CertificateDer::from(CERT_DER.to_vec());
+    let key = quinn::rustls::pki_types::PrivateKeyDer::Pkcs8(
+        quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(KEY_DER.to_vec()),
+    );
+    let server_config = build_server_config(vec![cert], key, None).expect("server config");
+
+    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind server socket");
+    let server_addr = server_socket.local_addr().expect("server addr");
+    let server_socket = TokioUdpSocket {
+        inner: Arc::new(server_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let endpoint = build_endpoint(
+        Arc::new(server_socket),
+        Arc::new(TokioRuntime),
+        Some(server_config),
+    )
+    .expect("build server endpoint");
+
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let client_socket = TokioUdpSocket {
+        inner: Arc::new(client_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
+        .expect("build client endpoint");
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots
+        .add(quinn::rustls::pki_types::CertificateDer::from(
+            CERT_DER.to_vec(),
+        ))
+        .expect("trust server cert");
+    client_endpoint.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
+    );
+
+    let client_task = {
+        let ep = client_endpoint.clone();
+        tokio::spawn(async move {
+            ep.connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("client connection")
+        })
+    };
+    let _server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let incoming = endpoint.accept().await.expect("server incoming");
+        incoming.await.expect("server handshake")
+    })
+    .await
+    .expect("handshake completes");
+    let client_conn = client_task.await.expect("client task");
+
+    // Open exactly the advertised cap: each succeeds immediately.
+    let cap = MAX_CONCURRENT_BIDI_STREAMS as usize;
+    let mut opened = Vec::with_capacity(cap);
+    for _ in 0..cap {
+        opened.push(client_conn.open_bi().await.expect("within cap"));
+    }
+
+    // The next stream must be refused (blocked on stream credit) rather than
+    // admitted: it never completes within a short window.
+    let overflow =
+        tokio::time::timeout(std::time::Duration::from_secs(2), client_conn.open_bi()).await;
+    assert!(
+        overflow.is_err(),
+        "the {cap}+1th concurrent stream must be refused before allocation"
+    );
+
+    drop(opened);
+    drop(client_conn);
+    drop(endpoint);
+    drop(client_endpoint);
+}
+
+/// Task 6.2: a burst above the admission rate is refused with a distinct
+/// stream reset while the connection itself stays up for further streams.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_stream_resets_but_connection_stays_up() {
+    let (server_config, cert) = server_config();
+
+    let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind server socket");
+    let server_addr = server_socket.local_addr().expect("server addr");
+    let server_socket = TokioUdpSocket {
+        inner: Arc::new(server_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let endpoint = build_endpoint(
+        Arc::new(server_socket),
+        Arc::new(TokioRuntime),
+        Some(server_config),
+    )
+    .expect("build server endpoint");
+
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind client socket");
+    let client_socket = TokioUdpSocket {
+        inner: Arc::new(client_socket),
+        buf: Mutex::new(vec![0u8; 65536]),
+    };
+    let mut client_endpoint = build_endpoint(Arc::new(client_socket), Arc::new(TokioRuntime), None)
+        .expect("build client endpoint");
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert).expect("trust server cert");
+    client_endpoint.set_default_client_config(
+        ClientConfig::with_root_certificates(Arc::new(roots)).expect("client config"),
+    );
+
+    let client_task = {
+        let ep = client_endpoint.clone();
+        tokio::spawn(async move {
+            ep.connect(server_addr, "localhost")
+                .expect("connect")
+                .await
+                .expect("client connection")
+        })
+    };
+    let server_conn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let incoming = endpoint.accept().await.expect("server incoming");
+        incoming.await.expect("server handshake")
+    })
+    .await
+    .expect("handshake completes");
+    let client_conn = client_task.await.expect("client task");
+
+    // A burst-1 limiter admits one stream and deprives the rest (no refill).
+    let limiter = AdmissionLimiter::new(0, 1);
+    let now = Instant::from_nanos(0);
+    assert!(limiter.allow("acme", now).await, "first stream admitted");
+
+    // The client opens a stream and writes, so the server accepts it.
+    let client_stream_task = {
+        let client_conn = client_conn.clone();
+        tokio::spawn(async move {
+            let (mut send, mut recv) = client_conn.open_bi().await.expect("open_bi");
+            send.write_all(b"x").await.expect("client write");
+            send.finish().expect("client finish");
+            // The refused stream surfaces as a peer reset (distinct code).
+            let mut buf = [0u8; 1];
+            match recv.read(&mut buf).await {
+                Err(quinn::ReadError::Reset(code)) => {
+                    assert_eq!(
+                        code.into_inner() as u32,
+                        selium_connector_quic::ADMISSION_REFUSED_ERROR_CODE
+                    );
+                }
+                other => panic!("expected a peer reset with the admission code, got {other:?}"),
+            }
+        })
+    };
+
+    let (send, recv) = server_conn
+        .accept_bi()
+        .await
+        .expect("server accepts bidirectional stream");
+    // The second admission is deprived: refuse before allocation.
+    assert!(
+        !limiter.allow("acme", now).await,
+        "burst above the rate refused"
+    );
+    refuse_stream(send, recv);
+
+    client_stream_task.await.expect("client stream task");
+
+    // The connection stays up: a fresh stream can still be opened.
+    let _probe = client_conn.open_bi().await.expect("connection stays up");
 
     drop(client_conn);
     drop(endpoint);

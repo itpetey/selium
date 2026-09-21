@@ -114,6 +114,13 @@ thread_local! {
     static YIELD_QUEUE: RefCell<Vec<TaskId>> = const { RefCell::new(Vec::new()) };
     static CURRENT_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
     static NEXT_TASK_ID: RefCell<TaskId> = const { RefCell::new(1) };
+    /// The poll-owner entrypoint task: the one task whose completion signals
+    /// the process's normal exit through the poll export.
+    static POLL_OWNER_TASK: RefCell<Option<TaskId>> = const { RefCell::new(None) };
+    /// Whether the poll-owner entrypoint task has completed. Once set, every
+    /// subsequent reactor poll reports completion (`1`) until a new entrypoint
+    /// runner installs itself.
+    static POLL_OWNER_DONE: RefCell<bool> = const { RefCell::new(false) };
     /// (region_id, observed_generation) → list of wakers for tasks waiting
     /// for the generation to advance past `observed_generation`.
     /// Initialised lazily because HashMap::new is not const-stable.
@@ -127,7 +134,12 @@ pub fn install_generation_wait_callbacks() {
 }
 
 /// Polls mailbox wakeups and runnable background tasks until no work remains.
-pub fn poll_reactor() {
+///
+/// Returns the poll-owner entrypoint completion code: `0` while the entrypoint
+/// task is still running (parked), `1` once it has completed. The host reads
+/// this code through the `__selium_guest_poll` export to distinguish a
+/// still-resident service from a process whose entrypoint future finished.
+pub fn poll_reactor() -> i32 {
     register_mailbox();
     install_generation_wait_callbacks();
 
@@ -138,13 +150,22 @@ pub fn poll_reactor() {
         }
         break;
     }
+    poll_owner_done()
+}
+
+/// Returns whether the poll-owner entrypoint task has completed: `0` while it
+/// is running (parked), `1` once it completed.
+fn poll_owner_done() -> i32 {
+    POLL_OWNER_DONE.with(|done| i32::from(*done.borrow()))
 }
 
 /// Polls the guest reactor and aborts the process if polling panics.
-pub fn poll_safely() {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_reactor));
-    if result.is_err() {
-        std::process::abort();
+///
+/// Returns the poll-owner entrypoint completion code (see [`poll_reactor`]).
+pub fn poll_safely() -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll_reactor)) {
+        Ok(code) => code,
+        Err(_) => std::process::abort(),
     }
 }
 
@@ -154,7 +175,7 @@ where
     F: Future<Output = ()> + 'static,
 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        spawn(future);
+        spawn_poll_owner(future);
         poll_safely();
     }));
     if result.is_err() {
@@ -176,12 +197,17 @@ where
 /// Errors are logged inside the task when it completes — before or after
 /// the reactor first stalls — because a late `Err` can no longer reach the
 /// already-returned exit code; the log is the only surfacing channel.
+///
+/// The entrypoint task is installed as the poll owner: its completion (an
+/// `Ok` or `Err` reaching the task body) sets the reactor's completion
+/// signal, so a later host poll observes the process as done rather than as
+/// an idle resident reactor (see [`poll_reactor`]).
 pub fn run_entrypoint_with_result<F, E>(future: F) -> Result<(), E>
 where
     F: Future<Output = Result<(), E>> + 'static,
     E: core::fmt::Display,
 {
-    let join = spawn(async move {
+    let join = spawn_poll_owner(async move {
         match future.await {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -214,6 +240,46 @@ where
         runnable: true,
     };
 
+    enqueue_task(task);
+
+    JoinHandle { state }
+}
+
+/// Spawns the poll-owner entrypoint future: the single task whose completion
+/// signals the process's normal exit through the poll export.
+///
+/// Like [`spawn`], but records the task as the poll owner and sets the
+/// reactor's completion signal (`POLL_OWNER_DONE`) when the future completes —
+/// whether it returns `Ok` or `Err` — so a later [`poll_reactor`] reports the
+/// entrypoint as done instead of leaving the process resident on an idle,
+/// silent reactor.
+fn spawn_poll_owner<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+{
+    let state = Rc::new(RefCell::new(JoinState::new()));
+    let state_for_task = Rc::clone(&state);
+    let id = next_task_id();
+    POLL_OWNER_TASK.with(|owner| *owner.borrow_mut() = Some(id));
+    POLL_OWNER_DONE.with(|done| *done.borrow_mut() = false);
+    let task = BackgroundTask {
+        id,
+        future: Box::pin(async move {
+            let output = future.await;
+            POLL_OWNER_DONE.with(|done| *done.borrow_mut() = true);
+            state_for_task.borrow_mut().complete(output);
+        }),
+        runnable: true,
+    };
+
+    enqueue_task(task);
+
+    JoinHandle { state }
+}
+
+/// Queues a spawned task, falling back to the spawn queue when the reactor is
+/// mid-poll (the background list is borrowed).
+fn enqueue_task(task: BackgroundTask) {
     BACKGROUND.with(|tasks| {
         if let Ok(mut tasks) = tasks.try_borrow_mut() {
             tasks.push(task);
@@ -221,8 +287,6 @@ where
             SPAWN_QUEUE.with(|queue| queue.borrow_mut().push(task));
         }
     });
-
-    JoinHandle { state }
 }
 
 /// Yields execution back to the guest task runner once.
@@ -558,5 +622,92 @@ mod tests {
         let result: Result<(), EntrypointError> =
             run_entrypoint_with_result(async { Err(EntrypointError("boom")) });
         assert!(matches!(result, Err(error) if error.0 == "boom"));
+    }
+
+    /// Task 1.1: a poll-owner future that completes causes the reactor to
+    /// report completion, while one that parks (never resolving) reports
+    /// still-running.
+    #[test]
+    fn reactor_reports_poll_owner_completion() {
+        // A future that completes synchronously reports done immediately.
+        let result = run_entrypoint_with_result(async { Ok::<(), EntrypointError>(()) });
+        assert!(matches!(result, Ok(())));
+        assert_eq!(
+            poll_reactor(),
+            1,
+            "a completed entrypoint must report completion"
+        );
+
+        // A future that parks indefinitely reports running.
+        let result = run_entrypoint_with_result(async {
+            core::future::pending::<Result<(), EntrypointError>>().await
+        });
+        assert!(matches!(result, Ok(())));
+        assert_eq!(poll_reactor(), 0, "a parked entrypoint must report running");
+    }
+
+    /// Task 1.3: a previously parked entrypoint that completes during a later
+    /// reactor poll (a wake, not a bare re-poll) flips the reactor to the
+    /// completion signal — for both `Ok` and `Err` completions — rather than
+    /// leaving the process resident on an idle reactor.
+    #[test]
+    fn reactor_reports_late_poll_owner_completion() {
+        /// Parks on its first poll (capturing the task id) and completes on a
+        /// later poll, mirroring a service that waits on an external wake.
+        struct CompleteOnWake {
+            polls: u32,
+            task_id: Rc<RefCell<Option<TaskId>>>,
+            fail: bool,
+        }
+
+        impl Future for CompleteOnWake {
+            type Output = Result<(), EntrypointError>;
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                this.polls += 1;
+                if this.polls == 1 {
+                    *this.task_id.borrow_mut() = current_task_id();
+                    Poll::Pending
+                } else if this.fail {
+                    Poll::Ready(Err(EntrypointError("late boom")))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        // Late `Ok` completion: parked, then woken.
+        let task_id: Rc<RefCell<Option<TaskId>>> = Rc::new(RefCell::new(None));
+        let result = run_entrypoint_with_result(CompleteOnWake {
+            polls: 0,
+            task_id: Rc::clone(&task_id),
+            fail: false,
+        });
+        assert!(matches!(result, Ok(())));
+        assert_eq!(poll_reactor(), 0, "parked entrypoint reports running");
+        wake_task(task_id.borrow().expect("task id captured"));
+        assert_eq!(
+            poll_reactor(),
+            1,
+            "a late-completing entrypoint must report completion"
+        );
+
+        // Late `Err` completion: parked, then woken — the error path is a
+        // completion signal too.
+        let task_id: Rc<RefCell<Option<TaskId>>> = Rc::new(RefCell::new(None));
+        let result = run_entrypoint_with_result(CompleteOnWake {
+            polls: 0,
+            task_id: Rc::clone(&task_id),
+            fail: true,
+        });
+        assert!(matches!(result, Ok(())));
+        assert_eq!(poll_reactor(), 0, "parked entrypoint reports running");
+        wake_task(task_id.borrow().expect("task id captured"));
+        assert_eq!(
+            poll_reactor(),
+            1,
+            "a late error completion must report completion"
+        );
     }
 }

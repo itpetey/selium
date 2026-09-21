@@ -110,11 +110,15 @@ Closing either end of a pipe SHALL tear down the whole pipe and terminate the br
 - **THEN** the bridge-channel SHALL finish or reset the client's stream and terminate
 
 ### Requirement: Bounded Spawn
-The bridge-server SHALL enforce a bound on bridge-channel spawns (for example per-identity or per-tenant concurrency) so an external client cannot exhaust the scheduler by opening many streams.
+The bridge-server SHALL bound bridge-channel spawns through the host-enforced per-tenant process quota: a tenant's effective spawn bound SHALL be its accountant-authored process-quota ceiling. When the runtime denies a spawn because the client tenant's process quota is exhausted, the bridge-server SHALL refuse the handoff and close the delivered stream so the client observes the refusal, and SHALL NOT maintain its own spawn counter.
 
 #### Scenario: Spawn bound exceeded
-- **WHEN** a client attempts to open more streams than the configured bound permits
-- **THEN** the bridge-server SHALL refuse the additional streams
+- **WHEN** a client attempts to open more streams than the client tenant's process quota permits
+- **THEN** the bridge-server SHALL refuse the additional streams and close each delivered stream so the client observes EOF
+
+#### Scenario: Denied spawn needs no guest-local bookkeeping
+- **WHEN** the runtime denies a bridge-channel spawn with `QuotaExceeded`
+- **THEN** the bridge-server SHALL attach-then-close the stream and SHALL require no guest-local spawn counter to handle the refusal
 
 ### Requirement: Host-Queue RPC Rendezvous
 For a handshake URI that resolves to a host-queue target, the bridge-channel SHALL establish an RPC session on the external client's behalf, mirroring the internal `rpc::connect` path: allocate a two-ring shared-memory session region, splice the client's stream into it (request frames stream → request ring; reply ring → stream), and enqueue the session's shared id into the served queue. The handoff metadata SHALL carry the resolved client identity once guest-spawned processes can receive pointer arguments (today guest `Process::start` carries integer arguments only); until then the metadata is empty and authorization rests on the runtime's capability enforcement at queue attach. The session region SHALL be freed on pipe teardown so the serving guest observes session end, mirroring an internal client's drop.

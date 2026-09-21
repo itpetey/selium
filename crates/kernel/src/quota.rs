@@ -259,4 +259,27 @@ mod tests {
             Err(Error::QuotaExceeded { .. })
         ));
     }
+
+    #[test]
+    fn process_class_round_trips_without_new_abi_variants() {
+        let table = QuotaTable::new();
+        // The Process dimension reuses the same generic counter as every
+        // other class: author, reserve, release, and look it up.
+        table.set("acme", ResourceClass::Process, 100);
+        assert_eq!(table.lookup("acme", ResourceClass::Process), Some(100));
+        table
+            .try_consume("acme", ResourceClass::Process, 60)
+            .expect("within ceiling");
+        assert_eq!(table.used("acme", ResourceClass::Process), 60);
+        // Over-ceiling reservation is denied.
+        assert!(matches!(
+            table.try_consume("acme", ResourceClass::Process, 41),
+            Err(Error::QuotaExceeded { .. })
+        ));
+        // Release returns the slot; the counter clears.
+        table.release("acme", ResourceClass::Process, 60);
+        assert_eq!(table.used("acme", ResourceClass::Process), 0);
+        table.clear("acme", ResourceClass::Process);
+        assert_eq!(table.lookup("acme", ResourceClass::Process), None);
+    }
 }

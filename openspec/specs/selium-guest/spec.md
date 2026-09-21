@@ -207,7 +207,10 @@ until the reactor stalls, and returns the task's output if it completed or
 return an exit code immediately, so a parked entrypoint (a long-running
 service, or a guest waiting on host-delivered events) reports "no error
 observed" and stays on the reactor, driven by later guest polls; the
-function SHALL NOT panic when the entrypoint parks.
+function SHALL NOT panic when the entrypoint parks. When the poll-owner
+entrypoint task later completes, the reactor SHALL report completion
+through the poll export so the host terminates the process as a normal
+exit — the completed task SHALL NOT remain on the reactor as an idle no-op.
 
 #### Scenario: Successful future returns its output
 - **WHEN** `run_entrypoint_with_result` is called with a future that resolves to `Ok(())`
@@ -222,7 +225,11 @@ function SHALL NOT panic when the entrypoint parks.
 - **WHEN** the entrypoint future parks (a long-running service loop or a wait on host-delivered events) and the reactor stalls before the task completes
 - **THEN** `run_entrypoint_with_result` SHALL return `Ok(())` (exit code 0)
 - **AND** the task SHALL remain on the reactor, driven by later polls
-- **AND** a later `Err` completion SHALL be logged through the guest log transport, since the already-returned exit code can no longer carry it
+
+#### Scenario: Late completion ends the process
+- **WHEN** a previously parked entrypoint task completes during a later reactor poll
+- **THEN** the reactor SHALL report completion through the poll export and the host SHALL terminate the process
+- **AND** a later `Err` completion SHALL be logged through the guest log transport before the process terminates
 
 #### Scenario: Panic in future aborts the guest
 - **WHEN** `run_entrypoint_with_result` is called and a spawned task panics during reactor polling

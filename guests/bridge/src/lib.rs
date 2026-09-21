@@ -20,12 +20,13 @@
 //!   capability held at `Namespace::Root`;
 //! - refuses unknown identities by attaching then closing the delivered region
 //!   so the connector observes EOF and FINs the client stream;
-//! - enforces a per-identity spawn bound to blunt stream-mint amplification.
+//! - delegates the spawn bound to the host-enforced per-tenant process quota:
+//!   a `Process::start_for_tenant` failure (e.g. the tenant's quota is
+//!   exhausted) is surfaced by attach-then-close, with no guest-local spawn
+//!   counter.
 //!
 //! The bridge server terminates no QUIC and relays no stream bytes; it is a
 //! control-plane guest only.
-
-use std::collections::HashMap;
 
 use anyhow::Context as _;
 use selium_abi::{
@@ -43,8 +44,6 @@ use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 /// The `bridge-channel` module id and entrypoint this server spawns.
 const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
-/// Per-identity spawn bound (open question: exact concurrency/rate policy).
-const DEFAULT_SPAWN_BOUND_PER_IDENTITY: usize = 256;
 /// The identity guest's published grant table route.
 const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
 /// The accountant guest's published narrowing table route.
@@ -56,12 +55,6 @@ const NARROWING_TABLE_ROUTE: &str = "sel:///accounting-narrowing";
 /// the bridge refuses the handoff — fail-closed, never conferring on absence.
 pub struct GrantTable {
     table: Option<LiveTableView<Vec<u8>, Vec<u8>, ShmTransport>>,
-}
-
-/// Tracks per-identity spawn totals to bound stream-mint amplification.
-#[derive(Default)]
-pub struct SpawnBudget {
-    per_identity: HashMap<[u8; 32], usize>,
 }
 
 /// The accountant-published narrowing table: `tenant -> rkyv-encoded
@@ -111,31 +104,6 @@ impl GrantTable {
         let table = self.table.as_ref()?;
         let bytes = table.get(&fingerprint.to_vec()).ok().flatten()?;
         selium_abi::decode_rkyv::<Vec<CapabilityGrant>>(&bytes).ok()
-    }
-}
-
-impl SpawnBudget {
-    /// Attempts to acquire a spawn slot for `fingerprint`, bounded by `limit`.
-    /// The budget is a lifetime per-identity cap: the bridge server has no
-    /// child-exit signal, so true concurrency tracking is deferred to the
-    /// supervisor (see design open questions). Slots acquired for spawns
-    /// that fail are returned via [`Self::release`], so a failed spawn does
-    /// not permanently consume a client's budget.
-    pub fn try_acquire(&mut self, fingerprint: &[u8; 32], limit: usize) -> bool {
-        let count = self.per_identity.entry(*fingerprint).or_insert(0);
-        if *count >= limit {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Returns a spawn slot previously acquired by
-    /// [`Self::try_acquire`] (e.g. the spawn failed and never consumed it).
-    pub fn release(&mut self, fingerprint: &[u8; 32]) {
-        if let Some(count) = self.per_identity.get_mut(fingerprint) {
-            *count = count.saturating_sub(1);
-        }
     }
 }
 
@@ -320,7 +288,6 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             NarrowingTable::empty()
         }
     };
-    let mut budget = SpawnBudget::default();
     mark_ready();
 
     loop {
@@ -359,15 +326,6 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
         // tenant, so each handoff narrows for its own tenant.
         let grants = narrow_grants(grants, &narrowing_table.narrowing_for(&identity.tenant));
 
-        if !budget.try_acquire(&identity.fingerprint, DEFAULT_SPAWN_BOUND_PER_IDENTITY) {
-            warn!(
-                tenant = %identity.tenant,
-                "bridge-server: refusing handoff over spawn bound"
-            );
-            attach_then_close(incoming.shared_id);
-            continue;
-        }
-
         let child_grants = bridge_channel_grants(
             grants,
             &identity.tenant,
@@ -388,10 +346,10 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
                 "bridge-server: spawned bridge-channel"
             ),
             Err(e) => {
+                // The host-enforced per-tenant process quota denied the spawn
+                // (or the spawn failed for another reason): the client observes
+                // the refusal as a stream close, with no guest-local counter.
                 error!("bridge-server: bridge-channel spawn failed: {e}");
-                // The slot was never consumed by a live child; return it so
-                // failed spawns do not permanently eat the client's budget.
-                budget.release(&identity.fingerprint);
                 attach_then_close(incoming.shared_id);
             }
         }
@@ -554,31 +512,6 @@ mod tests {
             !explicit_scoped(&beta, "acme", Capability::SharedMemory, STREAM_REGION),
             "a beta handoff must not confer an acme-scoped grant"
         );
-    }
-
-    #[test]
-    fn spawn_budget_refuses_over_limit() {
-        let mut budget = SpawnBudget::default();
-        let fp = [9u8; 32];
-        assert!(budget.try_acquire(&fp, 2));
-        assert!(budget.try_acquire(&fp, 2));
-        assert!(!budget.try_acquire(&fp, 2), "third spawn must be refused");
-    }
-
-    #[test]
-    fn spawn_budget_release_frees_failed_spawns() {
-        let mut budget = SpawnBudget::default();
-        let fp = [11u8; 32];
-        assert!(budget.try_acquire(&fp, 1));
-        assert!(!budget.try_acquire(&fp, 1), "bound consumed");
-        budget.release(&fp);
-        assert!(
-            budget.try_acquire(&fp, 1),
-            "a failed spawn must not permanently consume the budget"
-        );
-        // Releasing below zero is a no-op, not an underflow.
-        budget.release(&fp);
-        budget.release(&fp);
     }
 
     /// The narrowing fold removes every baseline grant whose capability is in

@@ -59,6 +59,9 @@ pub const NARROWING_TABLE_PATH: &str = "accounting-narrowing";
 const TOPIC_CAPACITY: u64 = 64 * 1024;
 /// Seconds in one billing window.
 const WINDOW_SECS: u64 = 60;
+/// Default per-tenant process-count ceiling, authored unless an operator
+/// raised it via the `SetProcessQuota` control.
+const DEFAULT_PROCESS_QUOTA: u64 = 100;
 
 /// Per-dimension usage in one sampling interval or billing window.
 ///
@@ -117,6 +120,13 @@ pub enum LedgerRecord {
         /// Restored tenant.
         tenant: String,
     },
+    /// The operator authored the tenant's per-tenant process-count ceiling.
+    SetProcessQuota {
+        /// Tenant whose process ceiling is authored.
+        tenant: String,
+        /// Process-count ceiling.
+        processes: u64,
+    },
 }
 
 /// The account states mapped by the revenue control loop.
@@ -133,16 +143,30 @@ pub enum AccountState {
 }
 
 /// One tenant's live account state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Account {
     /// Paid plan (soft ceilings).
     plan: Usage,
     /// Opt-in overage budget (hard ceiling = plan + overage).
     overage: Usage,
+    /// The operator-authored process-count ceiling (default 100).
+    process_quota: u64,
     /// Billing suspension flag.
     delinquent: bool,
     /// The last rolled window's usage.
     last_usage: Usage,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            plan: Usage::default(),
+            overage: Usage::default(),
+            process_quota: DEFAULT_PROCESS_QUOTA,
+            delinquent: false,
+            last_usage: Usage::default(),
+        }
+    }
 }
 
 /// Enforcement state authored from an account: quota values and the narrowing
@@ -153,6 +177,8 @@ pub struct Enforcement {
     pub memory_quota: u64,
     /// Storage ceiling (authored for both durable-log and blob-store classes).
     pub storage_quota: u64,
+    /// Per-tenant process-count ceiling.
+    pub process_quota: u64,
     /// Capabilities to subtract from a tenant's baseline grants at conferral.
     pub narrowing: Vec<Capability>,
 }
@@ -302,6 +328,7 @@ impl Account {
             }
             LedgerRecord::SetPlan { plan, .. } => self.plan = *plan,
             LedgerRecord::SetOverage { overage, .. } => self.overage = *overage,
+            LedgerRecord::SetProcessQuota { processes, .. } => self.process_quota = *processes,
             LedgerRecord::Delinquent { .. } => self.delinquent = true,
             LedgerRecord::Restored { .. } => self.delinquent = false,
         }
@@ -369,6 +396,7 @@ impl AccountBook {
             }
             LedgerRecord::SetPlan { tenant, .. }
             | LedgerRecord::SetOverage { tenant, .. }
+            | LedgerRecord::SetProcessQuota { tenant, .. }
             | LedgerRecord::Delinquent { tenant }
             | LedgerRecord::Restored { tenant } => {
                 self.accounts
@@ -462,7 +490,12 @@ impl Shared {
             .get(tenant)
             .cloned()
             .unwrap_or_default();
-        let enforcement = enforcement_for(account.plan, account.overage, account.delinquent);
+        let enforcement = enforcement_for(
+            account.plan,
+            account.overage,
+            account.process_quota,
+            account.delinquent,
+        );
 
         for class in [ResourceClass::SharedRegion] {
             if let Err(error) = quota_set(tenant, class.clone(), enforcement.memory_quota) {
@@ -473,6 +506,9 @@ impl Shared {
             if let Err(error) = quota_set(tenant, class.clone(), enforcement.storage_quota) {
                 warn!(tenant, class = ?class, "accountant: quota set failed: {error}");
             }
+        }
+        if let Err(error) = quota_set(tenant, ResourceClass::Process, enforcement.process_quota) {
+            warn!(tenant, "accountant: process quota set failed: {error}");
         }
 
         match selium_abi::encode_rkyv(&enforcement.narrowing) {
@@ -554,8 +590,14 @@ pub fn bookkeeper_grants() -> Vec<CapabilityGrant> {
 
 /// Computes the enforcement state for an account: non-delinquent tenants are
 /// capped at the hard ceiling (the opt-in overage budget, zero means the plan
-/// is the hard cap); a delinquent tenant is zeroed and narrowed to nothing.
-pub fn enforcement_for(plan: Usage, overage: Usage, delinquent: bool) -> Enforcement {
+/// is the hard cap) and at the operator-authored (or default) process count; a
+/// delinquent tenant is zeroed and narrowed to nothing.
+pub fn enforcement_for(
+    plan: Usage,
+    overage: Usage,
+    process_quota: u64,
+    delinquent: bool,
+) -> Enforcement {
     let hard = Usage {
         cpu_micros: plan.cpu_micros.saturating_add(overage.cpu_micros),
         memory_bytes: plan.memory_bytes.saturating_add(overage.memory_bytes),
@@ -566,12 +608,14 @@ pub fn enforcement_for(plan: Usage, overage: Usage, delinquent: bool) -> Enforce
         Enforcement {
             memory_quota: 0,
             storage_quota: 0,
+            process_quota: 0,
             narrowing: all_capabilities(),
         }
     } else {
         Enforcement {
             memory_quota: hard.memory_bytes,
             storage_quota: hard.storage_bytes,
+            process_quota,
             narrowing: Vec::new(),
         }
     }
@@ -767,6 +811,10 @@ fn apply_control(
         AccountantControl::MarkRestored { tenant } => {
             (tenant.clone(), LedgerRecord::Restored { tenant })
         }
+        AccountantControl::SetProcessQuota { tenant, processes } => (
+            tenant.clone(),
+            LedgerRecord::SetProcessQuota { tenant, processes },
+        ),
     };
 
     {
@@ -1065,22 +1113,44 @@ mod tests {
     #[test]
     fn enforcements_map_across_the_state_machine() {
         // Paid/active tenants are capped at the hard ceiling and not narrowed.
-        let active = enforcement_for(plan(), overage(), false);
+        let active = enforcement_for(plan(), overage(), DEFAULT_PROCESS_QUOTA, false);
         assert_eq!(active.memory_quota, 15_000);
         assert_eq!(active.storage_quota, 7_500);
+        assert_eq!(active.process_quota, 100);
         assert!(active.narrowing.is_empty());
 
         // No opt-in overage means the plan is the hard cap.
-        let no_overage = enforcement_for(plan(), Usage::default(), false);
+        let no_overage = enforcement_for(plan(), Usage::default(), DEFAULT_PROCESS_QUOTA, false);
         assert_eq!(no_overage.memory_quota, 10_000);
         assert_eq!(no_overage.storage_quota, 5_000);
 
-        // Delinquency zeroes quotas and narrows to nothing.
-        let delinquent = enforcement_for(plan(), overage(), true);
+        // An operator-raised process ceiling threads through unchanged.
+        let raised = enforcement_for(plan(), overage(), 250, false);
+        assert_eq!(raised.process_quota, 250);
+
+        // Delinquency zeroes quotas (including the process ceiling) and
+        // narrows to nothing.
+        let delinquent = enforcement_for(plan(), overage(), 500, true);
         assert_eq!(delinquent.memory_quota, 0);
         assert_eq!(delinquent.storage_quota, 0);
+        assert_eq!(delinquent.process_quota, 0);
         assert_eq!(delinquent.narrowing, all_capabilities());
         assert!(delinquent.narrowing.len() >= 10);
+    }
+
+    #[test]
+    fn account_defaults_to_the_process_quota_ceiling() {
+        // No operator control: the account defaults to a 100-process ceiling.
+        let account = Account::default();
+        assert_eq!(account.process_quota, DEFAULT_PROCESS_QUOTA);
+
+        // An operator control raises the ceiling, replayed through the ledger.
+        let mut account = Account::default();
+        account.apply_record(&LedgerRecord::SetProcessQuota {
+            tenant: "acme".to_string(),
+            processes: 250,
+        });
+        assert_eq!(account.process_quota, 250);
     }
 
     #[test]
@@ -1094,6 +1164,14 @@ mod tests {
         let encoded = selium_abi::encode_rkyv(&record).expect("encode");
         let decoded: LedgerRecord = selium_abi::decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, record);
+
+        let process_quota = LedgerRecord::SetProcessQuota {
+            tenant: "acme".to_string(),
+            processes: 250,
+        };
+        let encoded = selium_abi::encode_rkyv(&process_quota).expect("encode");
+        let decoded: LedgerRecord = selium_abi::decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, process_quota);
     }
 
     #[test]
@@ -1137,6 +1215,7 @@ mod tests {
             overage: overage(),
             delinquent: false,
             last_usage: Usage::default(),
+            ..Account::default()
         };
         assert_eq!(account.state(), AccountState::Paid);
 

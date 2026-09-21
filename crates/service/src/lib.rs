@@ -676,6 +676,14 @@ pub enum AccountantControl {
         /// Tenant to restore.
         tenant: String,
     },
+    /// Author the tenant's per-tenant process-count ceiling (default 100;
+    /// operators raise it per tenant on request).
+    SetProcessQuota {
+        /// Tenant whose process ceiling is authored.
+        tenant: String,
+        /// Process-count ceiling.
+        processes: u64,
+    },
 }
 
 /// Response from the accountant's operator/billing control surface.
@@ -1463,6 +1471,10 @@ mod tests {
             },
             AccountantControl::MarkRestored {
                 tenant: "acme".to_string(),
+            },
+            AccountantControl::SetProcessQuota {
+                tenant: "acme".to_string(),
+                processes: 250,
             },
         ] {
             let bytes = FlatMsg::encode(&control);
