@@ -21,17 +21,35 @@ pub struct Metering;
 
 impl Process {
     /// Starts a process from a module, entrypoint, arguments, and grants.
+    /// The child inherits the parent's tenant.
     pub fn start(
         module_id: impl Into<String>,
         entrypoint: impl Into<String>,
         arguments: Vec<Vec<u8>>,
         grants: Vec<CapabilityGrant>,
     ) -> Result<Self> {
+        Self::start_for_tenant(module_id, entrypoint, arguments, grants, None)
+    }
+
+    /// Starts a process under an explicit `tenant`.
+    ///
+    /// `None` inherits the parent's tenant; a tenant differing from the
+    /// parent's own requires an in-scope `DelegateGrants` grant — including
+    /// for a root parent, so cross-tenant authority is always a grant, not
+    /// the parent's bootstrap tenant (the runtime denies the spawn otherwise).
+    pub fn start_for_tenant(
+        module_id: impl Into<String>,
+        entrypoint: impl Into<String>,
+        arguments: Vec<Vec<u8>>,
+        grants: Vec<CapabilityGrant>,
+        tenant: Option<&str>,
+    ) -> Result<Self> {
         match hostcall_ready(HostcallRequest::ProcessStart {
             module_id: module_id.into(),
             entrypoint: entrypoint.into(),
             arguments,
             grants,
+            tenant: tenant.map(str::to_string),
         })? {
             HostcallOutput::Process(descriptor) => Ok(Self { descriptor }),
             _ => Err(GuestError::UnexpectedHostcallOutput),

@@ -401,6 +401,34 @@ mod tests {
         assert_eq!(resolve_wire_name("", &domains), None);
     }
 
+    /// Root-namespace (platform-tenant) wire names project to the bare
+    /// reversed path with no tenant domain suffix: `bridge` → `sel:///bridge`,
+    /// `control` → `sel:///control`.
+    #[test]
+    fn resolve_wire_name_projects_bare_root_names() {
+        let domains = DomainTable::new();
+        assert_eq!(
+            resolve_wire_name("bridge", &domains),
+            Some((String::new(), vec!["bridge".to_string()]))
+        );
+        assert_eq!(
+            resolve_wire_name("control", &domains),
+            Some((String::new(), vec!["control".to_string()]))
+        );
+        // A registered domain table does not change the bare-name projection.
+        let mut with_domains = DomainTable::new();
+        with_domains.seed("example.com", "acme");
+        assert_eq!(
+            resolve_wire_name("bridge", &with_domains),
+            Some((String::new(), vec!["bridge".to_string()]))
+        );
+        // The tenant-scoped shape still projects alongside the bare case.
+        assert_eq!(
+            resolve_wire_name("bridge.acme", &with_domains),
+            Some(("acme".to_string(), vec!["bridge".to_string()]))
+        );
+    }
+
     #[test]
     fn resolve_wire_name_strips_registered_domains() {
         let mut domains = DomainTable::new();

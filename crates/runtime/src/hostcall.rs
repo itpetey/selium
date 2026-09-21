@@ -7,8 +7,8 @@ use std::{
 
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, GuestLogEntry,
-    HostcallOutput, HostcallRequest, OperationId, ProcessId, ResourceClass, ResourceIdentity,
-    ResourceSelector, ScopeContext, TaskId,
+    HostcallOutput, HostcallRequest, Namespace, OperationId, ProcessId, ResourceClass,
+    ResourceIdentity, ResourceSelector, ScopeContext, TaskId,
 };
 use selium_service::{DiscoveryRequest, FlatMsg, ResourceTarget, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
@@ -894,6 +894,7 @@ impl Runtime {
                 entrypoint,
                 arguments,
                 grants,
+                tenant,
             } => {
                 self.require(
                     process_id,
@@ -901,8 +902,8 @@ impl Runtime {
                     ResourceClass::Process,
                     None,
                 )?;
+                let tenant = self.resolve_spawn_tenant(process_id, tenant.as_deref())?;
                 self.validate_child_grants(process_id, &grants)?;
-                let tenant = self.process_tenant(process_id);
                 let module_bytes = self
                     .module_bytes(&module_id)
                     .map_err(|error| AbiError::new(AbiErrorCode::NotFound, error.to_string()))?;
@@ -1916,32 +1917,33 @@ impl Runtime {
         }
 
         // Tenant-scoped grant delegation: a parent holding a
-        // `DelegateGrants` grant with a tenant selector may confer child
-        // grants it does not itself hold, provided **every** child grant is
-        // itself tenant-scoped within the parent's delegation scope. A
-        // grant without an in-scope `Tenant` selector is unrestricted within
-        // its capability and must therefore fall through to the subset
-        // check: admitting it under delegation would escape the tenant
-        // fence. This is the deliberate, tenant-fenced exception to
-        // authority monotonicity (see the `rebuild-guest-bridge` design, D7).
-        let delegate_scopes: HashSet<&str> = authority
-            .grants
-            .iter()
-            .filter(|grant| grant.capability == Capability::DelegateGrants)
-            .filter_map(|grant| {
-                grant.selectors.iter().find_map(|selector| match selector {
-                    ResourceSelector::Tenant(tenant) => Some(tenant.as_str()),
-                    _ => None,
+        // `DelegateGrants` grant with a tenant or root namespace selector may
+        // confer child grants it does not itself hold, provided **every**
+        // child grant is itself tenant-scoped within the parent's delegation
+        // scope. A grant without an in-scope `Tenant` selector is unrestricted
+        // within its capability and must therefore fall through to the subset
+        // check: admitting it under delegation would escape the tenant fence.
+        // This is the deliberate, tenant-fenced exception to authority
+        // monotonicity (see the `rebuild-guest-bridge` design, D7).
+        let delegating = match delegation_scope(&authority.grants) {
+            Some(DelegationScope::Root) => grants.iter().all(|grant| {
+                grant.selectors.iter().any(|selector| {
+                    matches!(
+                        selector,
+                        ResourceSelector::Tenant(_)
+                            | ResourceSelector::Namespace(Namespace::Tenant(_))
+                    )
                 })
-            })
-            .collect();
-        let delegating = !delegate_scopes.is_empty()
-            && grants.iter().all(|grant| {
+            }),
+            Some(DelegationScope::Tenants(tenants)) => grants.iter().all(|grant| {
                 grant.selectors.iter().any(|selector| match selector {
-                    ResourceSelector::Tenant(tenant) => delegate_scopes.contains(tenant.as_str()),
+                    ResourceSelector::Tenant(t) => tenants.contains(t),
+                    ResourceSelector::Namespace(Namespace::Tenant(t)) => tenants.contains(t),
                     _ => false,
                 })
-            });
+            }),
+            None => false,
+        };
 
         if delegating {
             return Ok(());
@@ -1981,6 +1983,94 @@ impl Runtime {
         }
         Ok(())
     }
+
+    /// Resolves the tenant a spawned child runs under.
+    ///
+    /// `None` (or a value equal to the parent's own tenant) inherits the
+    /// parent's tenant with no extra authority. Spawning a child under any
+    /// other tenant — for a root parent as much as a tenant-scoped one —
+    /// requires a `DelegateGrants` grant whose scope (root or tenant-scoped)
+    /// admits the requested tenant: cross-tenant authority is a grant, not an
+    /// accident of the parent's bootstrap tenant.
+    fn resolve_spawn_tenant(
+        &self,
+        process_id: ProcessId,
+        requested: Option<&str>,
+    ) -> std::result::Result<Option<String>, AbiError> {
+        let own_tenant = self.process_tenant(process_id);
+        let Some(requested) = requested else {
+            return Ok(own_tenant);
+        };
+        if own_tenant.as_deref() == Some(requested) {
+            return Ok(Some(requested.to_string()));
+        }
+        let authority = self.restore_process_authority(process_id).ok_or_else(|| {
+            AbiError::new(
+                AbiErrorCode::InvalidHandle,
+                format!("unknown process authority {process_id}"),
+            )
+        })?;
+        if delegation_scope(&authority.grants).is_some_and(|scope| scope.admits_tenant(requested)) {
+            return Ok(Some(requested.to_string()));
+        }
+        Err(AbiError::new(
+            AbiErrorCode::PermissionDenied,
+            format!("spawn tenant {requested:?} requires an in-scope DelegateGrants grant"),
+        ))
+    }
+}
+
+/// The delegation scope implied by an authority's `DelegateGrants` grants:
+/// root-wide (a `Namespace::Root` selector), or tenant-scoped (the named
+/// tenants from `Tenant`/`Namespace::Tenant` selectors).
+enum DelegationScope {
+    Root,
+    Tenants(HashSet<String>),
+}
+
+impl DelegationScope {
+    /// Returns whether this scope admits a child spawn in `tenant`.
+    fn admits_tenant(&self, tenant: &str) -> bool {
+        match self {
+            Self::Root => true,
+            Self::Tenants(tenants) => tenants.contains(tenant),
+        }
+    }
+}
+
+/// Extracts the delegation scope from an authority's grants: `Root` when any
+/// `DelegateGrants` grant carries a `Namespace::Root` selector, the tenant set
+/// from `Tenant`/`Namespace::Tenant` selectors, and `None` when no
+/// `DelegateGrants` grant carries a tenant-scoping selector.
+fn delegation_scope(grants: &[CapabilityGrant]) -> Option<DelegationScope> {
+    let mut tenants = HashSet::new();
+    let mut root = false;
+    for grant in grants
+        .iter()
+        .filter(|grant| grant.capability == Capability::DelegateGrants)
+    {
+        for selector in &grant.selectors {
+            match selector {
+                ResourceSelector::Tenant(tenant) => {
+                    tenants.insert(tenant.clone());
+                }
+                ResourceSelector::Namespace(Namespace::Tenant(tenant)) => {
+                    tenants.insert(tenant.clone());
+                }
+                ResourceSelector::Namespace(Namespace::Root) => {
+                    root = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if root {
+        Some(DelegationScope::Root)
+    } else if tenants.is_empty() {
+        None
+    } else {
+        Some(DelegationScope::Tenants(tenants))
+    }
 }
 
 fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) -> bool {
@@ -1992,6 +2082,17 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
         ResourceSelector::Tenant(parent_tenant) => child.selectors.iter().any(|selector| {
             matches!(selector, ResourceSelector::Tenant(child_tenant) if child_tenant == parent_tenant)
         }),
+        ResourceSelector::Namespace(parent_scope) => {
+            child.selectors.iter().any(|selector| match selector {
+                ResourceSelector::Namespace(child_scope) => {
+                    namespace_covers(parent_scope, child_scope)
+                }
+                ResourceSelector::Tenant(child_tenant) => {
+                    namespace_covers(parent_scope, &Namespace::Tenant(child_tenant.clone()))
+                }
+                _ => false,
+            })
+        }
         ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
             matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
         }),
@@ -2010,6 +2111,16 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
             matches!(selector, ResourceSelector::Children)
         }),
     })
+}
+
+/// Returns whether a parent `Namespace` selector covers (is at least as broad
+/// as) a child namespace: root is greater than any tenant, and a tenant
+/// covers only itself.
+fn namespace_covers(parent: &Namespace, child: &Namespace) -> bool {
+    match parent {
+        Namespace::Root => true,
+        Namespace::Tenant(parent_tenant) => child == &Namespace::Tenant(parent_tenant.clone()),
+    }
 }
 
 /// Converts a selium-abi `RegionProt` to wasmtiny's `RegionProt`.
@@ -2351,6 +2462,7 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: child_grants,
+                tenant: None,
             },
         );
         let HostcallOutput::Process(child) = ready(&runtime, bootstrapped.process_id, start_op)
@@ -2637,6 +2749,7 @@ mod tests {
                     Capability::SharedMemory,
                     vec![ResourceSelector::UriPrefix("sel://acme/".to_string())],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
@@ -2695,6 +2808,7 @@ mod tests {
                         ResourceSelector::ResourceClass(ResourceClass::TcpStream),
                     ],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -2741,6 +2855,7 @@ mod tests {
                         ResourceSelector::ResourceClass(ResourceClass::TcpStream),
                     ],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -2793,6 +2908,7 @@ mod tests {
                         ResourceSelector::ResourceClass(ResourceClass::TcpStream),
                     ],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -2852,12 +2968,233 @@ mod tests {
                     ),
                     CapabilityGrant::new(Capability::Storage, Vec::new()),
                 ],
+                tenant: None,
             },
         );
         assert_eq!(
             status,
             selium_abi::HOSTCALL_STATUS_FAILED,
             "an unscoped child grant must not ride the delegation path"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    /// A `Namespace::Root`-scoped delegator spawns a tenant-scoped child
+    /// whose grants the root delegator does not itself hold: the root
+    /// namespace is greater than any tenant, so any tenant-scoped child grant
+    /// is admitted.
+    #[test]
+    fn root_delegator_spawns_tenant_scoped_child() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "root-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Namespace(Namespace::Root)],
+                ),
+            ],
+            None,
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::Network,
+                    vec![
+                        ResourceSelector::Tenant("acme".to_string()),
+                        ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                    ],
+                )],
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_READY,
+            "a root delegator must admit any tenant-scoped child grant"
+        );
+        let child = match runtime.poll_hostcall(parent.process_id, op) {
+            CompletionState::Ready(HostcallOutput::Process(child)) => child,
+            other => panic!("expected child process descriptor, got {other:?}"),
+        };
+        assert_eq!(
+            runtime.process_tenant(child.local_id).as_deref(),
+            Some("acme"),
+            "the root delegator spawns the child under the requested tenant"
+        );
+    }
+
+    /// A root principal without a `DelegateGrants` grant cannot spawn a child
+    /// under a tenant: cross-tenant spawn authority is a grant, not an
+    /// accident of the parent's bootstrap tenant (the rejected
+    /// "root guest implicitly delegates" shortcut).
+    #[test]
+    fn root_principal_without_delegate_grants_cannot_spawn_tenant_child() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "root-spawner",
+            vec![CapabilityGrant::new(
+                Capability::ProcessLifecycle,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+            )],
+            None,
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: Some("acme".to_string()),
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "a root parent without DelegateGrants must not tenant-scope a spawn"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    /// A `Namespace::Root`-scoped delegator must still refuse an unscoped
+    /// (selector-less) child grant: such a grant is unrestricted within its
+    /// capability and not conferable under delegation — it falls through to
+    /// the subset check and is denied.
+    #[test]
+    fn root_delegator_denies_unscoped_child_grant() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "root-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Namespace(Namespace::Root)],
+                ),
+            ],
+            None,
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(Capability::Storage, Vec::new())],
+                tenant: None,
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "an unscoped child grant must not ride the root delegation path"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    /// A tenant-scoped delegator cannot spawn a child under a foreign tenant,
+    /// even with grants scoped to that foreign tenant: the requested child
+    /// tenant is outside its `DelegateGrants` scope (`resolve_spawn_tenant`).
+    #[test]
+    fn tenant_delegator_cannot_spawn_child_in_foreign_tenant() {
+        let runtime = Runtime::default();
+        runtime
+            .register_module_bytes(
+                "child-module".to_string(),
+                module_with_entrypoint("main", ""),
+            )
+            .expect("register child module");
+
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-bridge",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::DelegateGrants,
+                    vec![ResourceSelector::Tenant("acme".to_string())],
+                ),
+            ],
+            Some("acme"),
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                module_id: "child-module".to_string(),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![
+                    CapabilityGrant::new(
+                        Capability::Network,
+                        vec![
+                            ResourceSelector::Tenant("beta".to_string()),
+                            ResourceSelector::ResourceClass(ResourceClass::TcpStream),
+                        ],
+                    ),
+                    CapabilityGrant::new(
+                        Capability::HostQueue,
+                        vec![ResourceSelector::Tenant("beta".to_string())],
+                    ),
+                ],
+                tenant: Some("beta".to_string()),
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "a tenant-scoped delegator must not spawn a child in a foreign tenant"
         );
         assert!(matches!(
             runtime.poll_hostcall(parent.process_id, op),
@@ -2904,6 +3241,7 @@ mod tests {
                     Capability::DelegateGrants,
                     vec![ResourceSelector::Tenant("acme".to_string())],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -2976,6 +3314,7 @@ mod tests {
                     Capability::MintCertificate,
                     Vec::new(),
                 )],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -3042,6 +3381,7 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(Capability::QuotaWrite, Vec::new())],
+                tenant: None,
             },
         );
         assert_eq!(
@@ -3944,6 +4284,7 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: child_grants,
+                tenant: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -4167,6 +4508,7 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: vec![],
+                tenant: None,
             },
         );
         let HostcallOutput::Process(child) = ready(&runtime, parent.process_id, start_op) else {
@@ -4317,6 +4659,7 @@ mod tests {
                         ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
                     ],
                 )],
+                tenant: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);

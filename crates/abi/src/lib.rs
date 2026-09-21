@@ -13,6 +13,7 @@
 //! | `Locality` | **Enforced** | `locality` |
 //! | `ExplicitResource` | **Enforced** | `resource_id` |
 //! | `Tenant` | **Enforced** | `tenant` (from process authority) |
+//! | `Namespace` | **Enforced** | `tenant` (from process authority) |
 //! | `Children` | **Enforced** | requires process-tree access (runtime) |
 //! | `UriPrefix` | **Enforced*** | `uri` (network endpoints only) |
 //!
@@ -217,12 +218,43 @@ pub struct ScopeContext {
     pub resource_id: Option<ResourceIdentity>,
 }
 
+/// A requestor namespace: either the platform root (no tenant) or a tenant.
+///
+/// This is the requestor-tenant vocabulary shared by capability selectors
+/// (`ResourceSelector::Namespace`), delegation scopes, and the control-plane /
+/// bridge-server requestor-derivation path. `Root` is the platform namespace
+/// (`None` process tenant); `Tenant(t)` is a named tenant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum Namespace {
+    /// The platform root namespace: a scope context with no tenant.
+    Root,
+    /// A named tenant namespace.
+    Tenant(String),
+}
+
+impl Namespace {
+    /// Returns whether this namespace admits a scope context whose tenant is
+    /// `tenant`: `Root` admits `None` only; `Tenant(t)` admits `Some(t)` exactly.
+    pub fn matches_tenant(&self, tenant: Option<&str>) -> bool {
+        match self {
+            Self::Root => tenant.is_none(),
+            Self::Tenant(expected) => tenant == Some(expected.as_str()),
+        }
+    }
+}
+
 /// Selector that narrows where a capability grant applies.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum ResourceSelector {
     /// Match a tenant name exactly.
     Tenant(String),
+    /// Match a requestor namespace hierarchically: `Namespace::Root` admits a
+    /// root scope context, `Namespace::Tenant(t)` admits tenant `t` exactly.
+    /// Unlike `Tenant`, this variant also carries the `Root` value, which is
+    /// required for `DelegateGrants` to express root-wide delegation.
+    Namespace(Namespace),
     /// Match resources whose URI starts with the prefix.
     UriPrefix(String),
     /// Match an operation locality.
@@ -587,6 +619,12 @@ pub enum HostcallRequest {
         arguments: Vec<Vec<u8>>,
         /// Capability grants for the new process.
         grants: Vec<CapabilityGrant>,
+        /// Tenant the child is spawned under. `None` inherits the parent's
+        /// tenant; a tenant differing from the parent's own is admitted only
+        /// for a parent holding a `DelegateGrants` grant whose scope admits
+        /// the requested tenant — including a root parent, so cross-tenant
+        /// authority is always a grant, never the parent's bootstrap tenant.
+        tenant: Option<String>,
     },
     /// Stop a process.
     ProcessStop {
@@ -1026,7 +1064,8 @@ impl ResourceSelector {
     /// Returns whether the runtime can evaluate this selector against a `ScopeContext`.
     ///
     /// The enforcement matrix is:
-    /// - `Tenant`, `Locality`, `ResourceClass`, `ExplicitResource`, `Children`: evaluatable.
+    /// - `Tenant`, `Namespace`, `Locality`, `ResourceClass`, `ExplicitResource`,
+    ///   `Children`: evaluatable.
     /// - `UriPrefix`: evaluatable only when the same grant also carries a network
     ///   `ResourceClass` selector (`TcpListener`, `TcpStream`, or `UdpSocket`).
     pub fn is_evaluatable(&self, grant_selectors: &[ResourceSelector]) -> bool {
@@ -1040,6 +1079,7 @@ impl ResourceSelector {
                 )
             }),
             Self::Tenant(_)
+            | Self::Namespace(_)
             | Self::Locality(_)
             | Self::ResourceClass(_)
             | Self::ExplicitResource(_)
@@ -1059,6 +1099,7 @@ impl ResourceSelector {
     pub fn matches(&self, context: &ScopeContext) -> bool {
         match self {
             Self::Tenant(expected) => context.tenant.as_ref() == Some(expected),
+            Self::Namespace(namespace) => namespace.matches_tenant(context.tenant.as_deref()),
             Self::UriPrefix(prefix) => {
                 let context_uri = context.uri.as_ref();
                 match context_uri {
@@ -1272,6 +1313,55 @@ pub fn unpack_hostcall_status(encoded: u64) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Namespace` round-trips through the rkyv codec in both variants; the
+    /// selector vocabulary that uses it (and the delegation fence) shares the
+    /// same ABI codec.
+    #[test]
+    fn namespace_round_trips_through_rkyv() {
+        for namespace in [Namespace::Root, Namespace::Tenant("acme".to_string())] {
+            let encoded = encode_rkyv(&namespace).expect("encode namespace");
+            let decoded: Namespace = decode_rkyv(&encoded).expect("decode namespace");
+            assert_eq!(decoded, namespace);
+        }
+    }
+
+    /// `ResourceSelector::Namespace` matches hierarchically: a tenant selector
+    /// admits only its own tenant, and the root selector admits only a root
+    /// (tenant-less) scope context.
+    #[test]
+    fn namespace_selector_matches_exactly_and_root() {
+        let acme = ResourceSelector::Namespace(Namespace::Tenant("acme".to_string()));
+        let root = ResourceSelector::Namespace(Namespace::Root);
+
+        let acme_context = ScopeContext {
+            tenant: Some("acme".to_string()),
+            ..ScopeContext::default()
+        };
+        let root_context = ScopeContext {
+            tenant: None,
+            ..ScopeContext::default()
+        };
+        let beta_context = ScopeContext {
+            tenant: Some("beta".to_string()),
+            ..ScopeContext::default()
+        };
+
+        // Exact-tenant admission.
+        assert!(acme.matches(&acme_context));
+        assert!(!acme.matches(&beta_context));
+        assert!(
+            !acme.matches(&root_context),
+            "tenant selector must not admit root"
+        );
+
+        // Root admission.
+        assert!(root.matches(&root_context));
+        assert!(
+            !root.matches(&acme_context),
+            "root selector must not admit a tenant"
+        );
+    }
 
     #[test]
     fn scope_grants_use_intersection_semantics() {

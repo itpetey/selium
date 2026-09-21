@@ -275,7 +275,8 @@ pub struct PipelineBinding {
 ///
 /// The control plane's durable log is the store of record for accepted
 /// intent; the deployment and pipeline projections are rebuilt from it on
-/// replay.
+/// replay. Every record carries the tenant it belongs to, so replay
+/// partitions the projection by tenant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[schema(
     path = "schemas/control.fbs",
@@ -284,17 +285,40 @@ pub struct PipelineBinding {
 )]
 pub enum DesiredStateRecord {
     /// A deployment desired-state write.
-    #[field("deployment")]
-    Deployment(Deployment),
+    Deployment {
+        /// Deployment desired state.
+        #[field("deployment")]
+        deployment: Deployment,
+        /// Tenant the record belongs to.
+        tenant: String,
+    },
     /// A pipeline-binding desired-state write.
-    #[field("pipeline")]
-    PipelineBinding(PipelineBinding),
+    PipelineBinding {
+        /// Pipeline binding.
+        #[field("pipeline")]
+        pipeline: PipelineBinding,
+        /// Tenant the record belongs to.
+        tenant: String,
+    },
     /// A workload stop: a tombstone removing the deployment from the
     /// projection, so replay does not resurrect a stopped workload.
     Stop {
         /// Workload identifier.
         workload_id: String,
+        /// Tenant the record belongs to.
+        tenant: String,
     },
+}
+
+impl DesiredStateRecord {
+    /// Returns the tenant this record belongs to.
+    pub fn tenant(&self) -> &str {
+        match self {
+            Self::Deployment { tenant, .. }
+            | Self::PipelineBinding { tenant, .. }
+            | Self::Stop { tenant, .. } => tenant,
+        }
+    }
 }
 
 /// A target returned by a control-plane resolve. The resolve projection of a
@@ -1571,11 +1595,14 @@ mod tests {
 
     #[test]
     fn desired_state_record_deployment_round_trips() {
-        let record = DesiredStateRecord::Deployment(Deployment {
-            workload_id: "api".to_string(),
-            replicas: 3,
-            module: "api/v1".to_string(),
-        });
+        let record = DesiredStateRecord::Deployment {
+            deployment: Deployment {
+                workload_id: "api".to_string(),
+                replicas: 3,
+                module: "api/v1".to_string(),
+            },
+            tenant: "acme".to_string(),
+        };
         let bytes = FlatMsg::encode(&record);
         let decoded: DesiredStateRecord = FlatMsg::decode(&bytes).expect("decode");
         assert_eq!(decoded, record);
@@ -1583,11 +1610,14 @@ mod tests {
 
     #[test]
     fn desired_state_record_pipeline_binding_round_trips() {
-        let record = DesiredStateRecord::PipelineBinding(PipelineBinding {
-            name: "api-to-db".to_string(),
-            from: "api".to_string(),
-            to: "db".to_string(),
-        });
+        let record = DesiredStateRecord::PipelineBinding {
+            pipeline: PipelineBinding {
+                name: "api-to-db".to_string(),
+                from: "api".to_string(),
+                to: "db".to_string(),
+            },
+            tenant: "acme".to_string(),
+        };
         let bytes = FlatMsg::encode(&record);
         let decoded: DesiredStateRecord = FlatMsg::decode(&bytes).expect("decode");
         assert_eq!(decoded, record);
@@ -1597,6 +1627,7 @@ mod tests {
     fn desired_state_record_stop_round_trips() {
         let record = DesiredStateRecord::Stop {
             workload_id: "api".to_string(),
+            tenant: "acme".to_string(),
         };
         let bytes = FlatMsg::encode(&record);
         let decoded: DesiredStateRecord = FlatMsg::decode(&bytes).expect("decode");
@@ -1624,6 +1655,7 @@ mod tests {
             deployment: None,
             pipeline: None,
             workload_id: None,
+            tenant: None,
         };
         let root = crate::fbs::selium::control::DesiredStateRecord::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1642,6 +1674,7 @@ mod tests {
             deployment: None,
             pipeline: None,
             workload_id: None,
+            tenant: None,
         };
         let root = crate::fbs::selium::control::DesiredStateRecord::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1759,6 +1792,7 @@ mod tests {
             deployment: None,
             pipeline: None,
             workload_id: None,
+            tenant: None,
         };
         let root = crate::fbs::selium::control::DesiredStateRecord::create(&mut builder, &args);
         builder.finish(root, None);

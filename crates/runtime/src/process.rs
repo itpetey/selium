@@ -263,21 +263,25 @@ impl Runtime {
     /// Validates grants against the enforcement admission matrix.
     ///
     /// Admitted selectors: `ResourceClass`, `Locality`, `ExplicitResource`,
-    /// `Tenant`, `Children`.
+    /// `Tenant`, `Namespace`, `Children`.
     /// Admitted with constraints: `UriPrefix` (requires a network
     /// `ResourceClass` selector in the same grant).
     /// Empty selector list = unrestricted within the capability — except
     /// `DelegateGrants`: an empty selector list would vacuously match every
     /// tenant (including root) and grant global cross-tenant delegation
     /// authority, so a `DelegateGrants` grant MUST carry at least one
-    /// `Tenant` selector.
+    /// tenant-scoping selector: a `Tenant`, a `Namespace::Tenant`, or an
+    /// explicit `Namespace::Root` (root-wide delegation stays explicit and
+    /// grantable rather than vacuous).
     pub(crate) fn validate_grants(&self, grants: &[CapabilityGrant]) -> Result<()> {
         for grant in grants {
             if grant.capability == Capability::DelegateGrants
-                && !grant
-                    .selectors
-                    .iter()
-                    .any(|selector| matches!(selector, ResourceSelector::Tenant(_)))
+                && !grant.selectors.iter().any(|selector| {
+                    matches!(
+                        selector,
+                        ResourceSelector::Tenant(_) | ResourceSelector::Namespace(_)
+                    )
+                })
             {
                 return Err(Error::InvalidGrant(grant.capability.clone()));
             }
@@ -1149,7 +1153,9 @@ mod tests {
     use super::*;
     use crate::mailbox::GuestMailbox;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
-    use selium_abi::{ActivityKind, LocalityScope, MeteringObservation, ResourceSelector};
+    use selium_abi::{
+        ActivityKind, LocalityScope, MeteringObservation, Namespace, ResourceSelector,
+    };
     use std::sync::Arc;
     use wasmtiny::WasmError;
     use wasmtiny::runtime::{Limits, Memory as WasmMemory, MemoryType, TrapCode};
@@ -1707,5 +1713,59 @@ mod tests {
             handlers: Vec::new(),
         });
         assert!(admitted.is_ok(), "tenant-scoped DelegateGrants is admitted");
+    }
+
+    /// A `Namespace::Root`-carrying `DelegateGrants` is admitted: root-wide
+    /// delegation is explicit (a named selector), not the vacuous empty-
+    /// selector list validation rejects.
+    #[test]
+    fn delegate_grants_admits_namespace_root() {
+        let runtime = Runtime::default();
+
+        let admitted = runtime.spawn_system_guest(SystemGuestDescriptor {
+            name: "root-delegator".to_string(),
+            module_id: "root-delegator-module".to_string(),
+            module_bytes: wat::parse_str("(module (func (export \"boot\")))").expect("wat"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::DelegateGrants,
+                vec![ResourceSelector::Namespace(Namespace::Root)],
+            )],
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            serving_role: None,
+            handlers: Vec::new(),
+        });
+        assert!(
+            admitted.is_ok(),
+            "Namespace::Root DelegateGrants is admitted"
+        );
+
+        // A `Namespace::Tenant`-carrying `DelegateGrants` is also a named
+        // tenant scope and therefore admitted.
+        let admitted_tenant = runtime.spawn_system_guest(SystemGuestDescriptor {
+            name: "tenant-ns-delegator".to_string(),
+            module_id: "tenant-ns-delegator-module".to_string(),
+            module_bytes: wat::parse_str("(module (func (export \"boot\")))").expect("wat"),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::DelegateGrants,
+                vec![ResourceSelector::Namespace(Namespace::Tenant(
+                    "acme".to_string(),
+                ))],
+            )],
+            dependencies: Vec::new(),
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            serving_role: None,
+            handlers: Vec::new(),
+        });
+        assert!(
+            admitted_tenant.is_ok(),
+            "Namespace::Tenant DelegateGrants is admitted"
+        );
     }
 }

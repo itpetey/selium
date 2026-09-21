@@ -19,28 +19,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
+use selium_abi::{Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector};
 use selium_client::{ClientIdentity, ConnectOptions, FlatMsg as _};
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
 
-/// The bridge route's server certificate (SAN `bridge.acme`), provisioned
-/// into the `tls-certs` blob store before the connector guest boots.
+/// The single-instance bridge route's server certificate (SAN `bridge`),
+/// provisioned into the `tls-certs` blob store before the connector guest
+/// boots.
 pub(crate) const BRIDGE_CERT_PEM: &[u8] =
     include_bytes!("../../../../guests/connector-quic/tests/fixtures/bridge_cert.pem");
 pub(crate) const BRIDGE_KEY_PEM: &[u8] =
     include_bytes!("../../../../guests/connector-quic/tests/fixtures/bridge_key.pem");
 /// The connector's fixed listener (its `QUIC_LISTEN_ADDR` const).
 pub(crate) const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
-/// The control plane's served route, named in the bridge handshake.
-pub(crate) const CONTROL_URI: &str = "sel://acme/control";
+/// The single-instance control plane's root served route, named in the bridge
+/// handshake.
+pub(crate) const CONTROL_URI: &str = "sel:///control";
 pub(crate) const LEAF_MANIFEST: &str = "acme-leaf";
 /// Blob store + manifest the onboarding guest writes the issued leaf to.
 pub(crate) const ONBOARD_STORE: &str = "selium.identity-onboard.out";
 /// The day-1 scheduler seam's typed deferred context.
 pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
-/// SNI / TLS server name: the synthetic tenant wire name for the acme
-/// bridge route (resolved by the connector to `sel://acme/bridge`).
-pub(crate) const SERVER_NAME: &str = "bridge.acme";
+/// SNI / TLS server name: the bare root wire name for the single-instance
+/// bridge route (resolved by the connector to `sel:///bridge`).
+pub(crate) const SERVER_NAME: &str = "bridge";
 /// The tenant the onboarding guest mints and the client connects as.
 pub(crate) const TENANT: &str = "acme";
 
@@ -72,7 +74,9 @@ impl Drop for SpinePortGuard {
     }
 }
 
-/// The per-tenant bridge server, conferring from the identity grant table.
+/// The single per-platform bridge server, conferring from the identity grant
+/// table. Boots as a root guest (`tenant: None`) holding a `Namespace::Root`
+/// `DelegateGrants` grant and `SystemRegistration` for its root route.
 pub(crate) fn bridge_server_descriptor(
     module_bytes: Vec<u8>,
     dependencies: Vec<String>,
@@ -90,8 +94,9 @@ pub(crate) fn bridge_server_descriptor(
             ),
             CapabilityGrant::new(
                 Capability::DelegateGrants,
-                vec![ResourceSelector::Tenant(TENANT.to_string())],
+                vec![ResourceSelector::Namespace(Namespace::Root)],
             ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
             CapabilityGrant::new(
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
@@ -103,7 +108,7 @@ pub(crate) fn bridge_server_descriptor(
         ],
         dependencies,
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some(TENANT.to_string()),
+        tenant: None,
         serving_role: None,
         handlers: Vec::new(),
     }
@@ -174,7 +179,8 @@ pub(crate) fn connector_descriptor(
     }
 }
 
-/// The acme control plane, serving the typed `deploy`/`status` surface.
+/// The single-instance control plane, serving the typed `deploy`/`status`
+/// surface for every tenant from the root `sel:///control` route.
 pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "control-plane".to_string(),
@@ -185,36 +191,25 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
         grants: vec![
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant(TENANT.to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::DurableLog),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
             ),
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant(TENANT.to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::BlobStore),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
             ),
             CapabilityGrant::new(
                 Capability::SharedMemory,
-                vec![
-                    ResourceSelector::Tenant(TENANT.to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
             CapabilityGrant::new(
                 Capability::HostQueue,
-                vec![
-                    ResourceSelector::Tenant(TENANT.to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some(TENANT.to_string()),
+        tenant: None,
         serving_role: None,
         handlers: Vec::new(),
     }

@@ -1,34 +1,39 @@
-//! Control-plane system guest.
+//! Control-plane system guest (single per-platform instance).
 //!
-//! Serves a typed, capability-gated control RPC surface to externally
-//! authenticated clients. The guest creates its own listener (a host-mediated
-//! connection queue), registers it as a named service (`sel://<tenant>/control`,
-//! external wire name `control.<tenant>`) through discovery, and runs the
-//! existing shared-memory RPC path over it: each client session is a two-ring
-//! shared-memory (request/reply) region the client allocates with
-//! `rpc::connect` and rendezvous to the control plane's queue, which the
-//! control plane `rpc::accept`s — the same path the discovery guest serves.
-//! Data flows over shared memory; only control flows over hostcalls.
+//! Serves a typed, capability-gated control RPC surface. The guest creates its
+//! own listener (a host-mediated connection queue), registers it as a
+//! root-namespace service (`sel:///control`, wire name `control`) through
+//! discovery, and runs the existing shared-memory RPC path over it: each
+//! session is a two-ring shared-memory (request/reply) region the caller
+//! allocates with `rpc::connect` and rendezvous to the control plane's queue,
+//! which the control plane `rpc::accept`s — the same internal shared-memory
+//! path the discovery guest serves. Data flows over shared memory; only
+//! control flows over hostcalls.
 //!
-//! The control plane owns **user-facing desired state** (deployments and
-//! pipeline bindings) in a durable log, projects it into an in-memory read
-//! model rebuilt from replay, and delegates platform policy:
+//! The control plane derives each session's requestor namespace from the
+//! delivering process's tenant (its **process owner**) — the
+//! runtime-persisted process authority, never handoff metadata or a tenant the
+//! caller asserts for itself. An external client reaches the control plane as
+//! a bridge-channel spawned under its authenticated tenant, so the
+//! bridge-channel's process owner *is* that tenant. The control plane owns
+//! **user-facing desired state** (deployments and pipeline bindings) in a
+//! single platform-scoped durable log, tags every record with its tenant, and
+//! projects it into an in-memory read model partitioned by namespace:
 //!
 //! - **placement/scale/stop** → the scheduler (typed `SchedulerRequest`),
 //! - **resolve** → discovery (`Context::lookup`),
 //! - **module upload** → storage hostcalls (`StorageBlobPut` +
-//!   `StorageBlobSetManifest`).
-//!
-//! Access is enforced by the capability system at attach time; the guest does
-//! not re-derive client identity (see `admit_control_client`).
+//!   `StorageBlobSetManifest`, tenant-prefixed manifest names).
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use anyhow::{Context as _, bail};
-use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector, ScopeContext};
+use anyhow::Context as _;
+use selium_abi::{
+    Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector, ScopeContext,
+};
 use selium_guest::{
     BlobStore, Context, DurableLog, ResourceListener, Serve, debug, entrypoint, info, mark_ready,
-    spawn, warn,
+    namespace_from_tenant, spawn, warn,
 };
 use selium_service::{
     ControlRequest, ControlResponse, DelegationStatus, Deployment, DesiredStateRecord, FlatMsg,
@@ -44,12 +49,20 @@ pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
 pub const CONTROL_PATH: &str = "control";
 
 /// The desired-state read model: deployments and pipeline bindings projected
-/// from the control plane's durable log.
+/// from the control plane's durable log, partitioned by requestor namespace.
 ///
 /// The durable log is the store of record; this structure is rebuilt from
-/// replay on boot and updated in lock-step with each append.
+/// replay on boot and updated in lock-step with each append. Records carry
+/// their tenant, so each append lands in exactly one partition; a session reads
+/// only its own partition.
 #[derive(Debug, Clone, Default)]
 pub struct ControlPlaneState {
+    partitions: BTreeMap<Namespace, DesiredStateView>,
+}
+
+/// One tenant's slice of the desired-state projection.
+#[derive(Debug, Clone, Default)]
+struct DesiredStateView {
     deployments: BTreeMap<String, Deployment>,
     pipelines: BTreeMap<String, PipelineBinding>,
 }
@@ -66,30 +79,39 @@ pub struct ControlPlaneState {
 pub struct SchedulerClient;
 
 impl ControlPlaneState {
-    /// Applies one desired-state record (a log entry, in replay order).
+    /// Applies one desired-state record (a log entry, in replay order) into
+    /// the partition named by the record's tenant.
     pub fn apply_record(&mut self, record: DesiredStateRecord) {
+        let namespace = namespace_from_tenant(Some(record.tenant()));
+        let view = self.partitions.entry(namespace).or_default();
         match record {
-            DesiredStateRecord::Deployment(deployment) => {
-                self.deployments
+            DesiredStateRecord::Deployment { deployment, .. } => {
+                view.deployments
                     .insert(deployment.workload_id.clone(), deployment);
             }
-            DesiredStateRecord::PipelineBinding(binding) => {
-                self.pipelines.insert(binding.name.clone(), binding);
+            DesiredStateRecord::PipelineBinding { pipeline, .. } => {
+                view.pipelines.insert(pipeline.name.clone(), pipeline);
             }
-            DesiredStateRecord::Stop { workload_id } => {
-                self.deployments.remove(&workload_id);
+            DesiredStateRecord::Stop { workload_id, .. } => {
+                view.deployments.remove(&workload_id);
             }
         }
     }
 
-    /// Returns the last accepted desired state for a workload.
-    pub fn deployment(&self, workload_id: &str) -> Option<&Deployment> {
-        self.deployments.get(workload_id)
+    /// Returns the last accepted desired state for a workload in the given
+    /// requestor namespace.
+    pub fn deployment(&self, namespace: &Namespace, workload_id: &str) -> Option<&Deployment> {
+        self.partitions
+            .get(namespace)
+            .and_then(|view| view.deployments.get(workload_id))
     }
 
-    /// Returns the last accepted binding for a named pipeline.
-    pub fn pipeline(&self, name: &str) -> Option<&PipelineBinding> {
-        self.pipelines.get(name)
+    /// Returns the last accepted binding for a named pipeline in the given
+    /// requestor namespace.
+    pub fn pipeline(&self, namespace: &Namespace, name: &str) -> Option<&PipelineBinding> {
+        self.partitions
+            .get(namespace)
+            .and_then(|view| view.pipelines.get(name))
     }
 
     /// Materialises the projection from previously appended log records.
@@ -121,12 +143,12 @@ impl SchedulerClient {
 }
 
 /// Returns whether a client's grant set admits an attach to the control
-/// surface: a tenant-scoped host-queue admission (the serving listener's
-/// resource class).
+/// surface in the given tenant scope: a host-queue admission (the serving
+/// listener's resource class).
 ///
-/// This mirrors the grant matrix the runtime enforces at attach time. It is a
-/// grant-matrix evaluation, not an ad-hoc identity check — the control plane
-/// never parses client identity to admit a session.
+/// This mirrors the grant matrix the runtime enforces at attach/send time. It
+/// is a grant-matrix evaluation, not an ad-hoc identity check — the control
+/// plane never parses client identity to admit a session.
 pub fn admit_control_client(grants: &[CapabilityGrant], tenant: &str) -> bool {
     let scope = ScopeContext {
         tenant: Some(tenant.to_string()),
@@ -138,41 +160,53 @@ pub fn admit_control_client(grants: &[CapabilityGrant], tenant: &str) -> bool {
         .any(|grant| grant.capability == Capability::HostQueue && grant.allows(&scope))
 }
 
-/// The grant set assigned to the control-plane guest: storage (durable log and
-/// module blob store), shared memory (the RPC session rings), and host queue
-/// (the serving listener plus the pre-connected discovery RPC client). All
-/// scoped to the guest's own tenant.
-pub fn control_plane_grants(tenant: &str) -> Vec<CapabilityGrant> {
+/// The grant set assigned to the single-instance control-plane guest: storage
+/// (durable log and module blob store), shared memory (the RPC session rings),
+/// host queue (the serving listener plus the pre-connected discovery RPC
+/// client), and system registration (the root-namespace serving route). All
+/// scoped at class scope — the control plane serves every tenant and derives
+/// each session's tenant from the authenticated identity, never from a tenant
+/// selector on its own grants.
+pub fn control_plane_grants() -> Vec<CapabilityGrant> {
     vec![
         CapabilityGrant::new(
             Capability::Storage,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::DurableLog),
-            ],
+            vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
         ),
         CapabilityGrant::new(
             Capability::Storage,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::BlobStore),
-            ],
+            vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
         ),
         CapabilityGrant::new(
             Capability::SharedMemory,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-            ],
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
         ),
         CapabilityGrant::new(
             Capability::HostQueue,
-            vec![
-                ResourceSelector::Tenant(tenant.to_string()),
-                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-            ],
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
         ),
+        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
     ]
+}
+
+/// The tenant label recorded on a desired-state record or manifest prefix for
+/// a requestor namespace: a named tenant records its name; the root namespace
+/// records an empty label (no tenant name exists).
+fn tenant_label(namespace: &Namespace) -> String {
+    match namespace {
+        Namespace::Tenant(tenant) => tenant.clone(),
+        Namespace::Root => String::new(),
+    }
+}
+
+/// The tenant-prefixed module manifest key for a requestor namespace:
+/// `<tenant>:<manifest>` for a named tenant, the bare manifest for root (no
+/// tenant name exists).
+fn tenant_prefixed_manifest(namespace: &Namespace, manifest: &str) -> String {
+    match namespace {
+        Namespace::Tenant(tenant) => format!("{tenant}:{manifest}"),
+        Namespace::Root => manifest.to_string(),
+    }
 }
 
 /// Maps a discovery lookup outcome to a typed resolve response.
@@ -216,22 +250,14 @@ fn accept_delegated(
 
 /// Control-plane entrypoint.
 ///
-/// Creates its own listener, registers the `control` serving route with
-/// discovery, and reports readiness only after the route is registered —
-/// mirroring `bridge-server`'s self-registration — then accepts typed
-/// shared-memory RPC sessions (mirroring `discovery`).
+/// Creates its own listener, registers the root `control` serving route with
+/// discovery, and reports readiness only after the route is registered — then
+/// accepts typed shared-memory RPC sessions, each scoped to the requestor
+/// namespace derived from the delivering process's tenant (its process owner).
 #[entrypoint]
 async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("control-plane: started");
-
-    // The served surface is `control.<tenant>`; without a tenant scope there
-    // is no wire name to serve under, so refuse to serve.
-    let (_, own_tenant) =
-        selium_guest::self_info().with_context(|| "control-plane: self info failed")?;
-    let Some(own_tenant) = own_tenant else {
-        bail!("control-plane: no tenant scope provisioned; refusing to serve");
-    };
 
     let log = DurableLog::open(CONTROL_LOG).with_context(|| "control-plane: log open failed")?;
     let blobs = BlobStore::open(CONTROL_BLOB_STORE)
@@ -243,18 +269,21 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
     let state = Rc::new(RefCell::new(desired));
 
     // The server creates its own listener: self-registration replaces the
-    // runtime's well-known-URI queue minting.
+    // runtime's well-known-URI queue minting. Sessions are internal
+    // shared-memory RPC rendezvous, like `discovery` — no connector pinning,
+    // and the tenant is the process owner, not handoff metadata.
     let listener =
         ResourceListener::create().with_context(|| "control-plane: create listener failed")?;
 
-    // Register the serving route (`sel://<tenant>/control`, wire name
-    // `control.<tenant>`) from one declaration.
+    // Register the root serving route (`sel:///control`, wire name `control`)
+    // from one declaration. The single-instance control plane serves every
+    // tenant, so it holds no own tenant to register under.
     let target = ResourceTarget {
         uri: String::new(), // pinned by `serve` to the derived internal path
         host_id: String::new(),
         resource_id: listener.descriptor().shared_id,
         interface: None,
-        tenant: Some(own_tenant.clone()),
+        tenant: None,
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
     };
@@ -279,6 +308,22 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        // Derive the session's requestor namespace from the delivering
+        // process's tenant — the runtime-persisted process authority, the only
+        // non-forgeable tenant source. An external client arrives as a
+        // bridge-channel spawned under its authenticated tenant, so the
+        // bridge-channel's process owner *is* that tenant. Refuse the session
+        // only when the process-tenant lookup itself fails.
+        let namespace = match selium_guest::process_namespace(incoming.client_process_id) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                warn!("control-plane: refusing session with unresolvable tenant: {error}");
+                refuse_session(incoming.shared_id);
+                continue;
+            }
+        };
+
         let connection = match rpc::accept::<ControlRequest, ControlResponse>(incoming.into()) {
             Ok(connection) => connection,
             Err(error) => {
@@ -292,7 +337,22 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
             state.clone(),
             log.clone(),
             blobs.clone(),
+            namespace,
         ));
+    }
+}
+
+/// Refuses a delivered session by attaching then closing the delivered region,
+/// so the sender observes EOF instead of parking on a region nobody attaches.
+fn refuse_session(shared_id: u64) {
+    match selium_guest::net::ByteStream::attach_blocking(shared_id) {
+        Ok(stream) => drop(stream),
+        Err(error) => {
+            warn!(
+                shared_id,
+                "control-plane: session refusal could not attach region: {error}"
+            )
+        }
     }
 }
 
@@ -319,14 +379,15 @@ fn delegation_status(response: SchedulerResponse) -> DelegationStatus {
 
 /// Serves one accepted RPC session: each request is decoded (`request.payload`
 /// is the typed decode; a failure becomes a typed serialization error rather
-/// than any text-grammar interpretation), handled, and replied to over the
-/// session's reply ring.
+/// than any text-grammar interpretation), handled scoped to the session's
+/// requestor namespace, and replied to over the session's reply ring.
 async fn handle_connection(
     mut connection: rpc::RpcConnection<ControlRequest, ControlResponse>,
     discovery_handle: u64,
     state: Rc<RefCell<ControlPlaneState>>,
     log: DurableLog,
     blobs: BlobStore,
+    namespace: Namespace,
 ) {
     // Each connection builds its own discovery client for `Resolve`; the
     // bootstrap context cannot be shared across concurrent handlers.
@@ -342,7 +403,9 @@ async fn handle_connection(
         match connection.recv().await {
             Ok(request) => {
                 let response = match request.payload() {
-                    Ok(payload) => handle_request(&mut ctx, &log, &blobs, &state, payload).await,
+                    Ok(payload) => {
+                        handle_request(&mut ctx, &log, &blobs, &state, &namespace, payload).await
+                    }
                     Err(error) => {
                         warn!("control-plane: request decode failed: {error}");
                         ControlResponse::Error {
@@ -365,15 +428,18 @@ async fn handle_connection(
     }
 }
 
-/// Handles one decoded control request: `Resolve` routes through the async
-/// discovery client, every other verb records desired state and/or delegates.
+/// Handles one decoded control request, scoped to the session's requestor
+/// namespace: `Resolve` routes through the async discovery client, every other
+/// verb records tenant-tagged desired state and/or delegates.
 async fn handle_request(
     ctx: &mut Context,
     log: &DurableLog,
     blobs: &BlobStore,
     state: &RefCell<ControlPlaneState>,
+    namespace: &Namespace,
     request: ControlRequest,
 ) -> ControlResponse {
+    let tenant = tenant_label(namespace);
     match request {
         ControlRequest::Resolve { uri } => match ctx.lookup(&uri).await {
             Ok(target) => resolve_response(target),
@@ -383,11 +449,14 @@ async fn handle_request(
             },
         },
         ControlRequest::Upload { manifest, bytes } => {
+            // Tenant-prefix the manifest so the single platform blob store
+            // cannot leak one tenant's uploads into another's manifest key.
+            let key = tenant_prefixed_manifest(namespace, &manifest);
             match blobs
                 .put(bytes)
-                .and_then(|blob_id| blobs.set_manifest(&manifest, blob_id))
+                .and_then(|blob_id| blobs.set_manifest(&key, blob_id))
             {
-                Ok(()) => ControlResponse::Uploaded { manifest },
+                Ok(()) => ControlResponse::Uploaded { manifest: key },
                 Err(error) => ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -404,7 +473,11 @@ async fn handle_request(
                 replicas,
                 module: module.clone(),
             };
-            if let Err(error) = record(log, state, DesiredStateRecord::Deployment(deployment)) {
+            let desired = DesiredStateRecord::Deployment {
+                deployment,
+                tenant: tenant.clone(),
+            };
+            if let Err(error) = record(log, state, desired) {
                 return ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -422,7 +495,7 @@ async fn handle_request(
         } => {
             let module = state
                 .borrow()
-                .deployment(&workload_id)
+                .deployment(namespace, &workload_id)
                 .map(|deployment| deployment.module.clone())
                 .unwrap_or_default();
             let deployment = Deployment {
@@ -430,7 +503,11 @@ async fn handle_request(
                 replicas,
                 module: module.clone(),
             };
-            if let Err(error) = record(log, state, DesiredStateRecord::Deployment(deployment)) {
+            let desired = DesiredStateRecord::Deployment {
+                deployment,
+                tenant: tenant.clone(),
+            };
+            if let Err(error) = record(log, state, desired) {
                 return ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -448,6 +525,7 @@ async fn handle_request(
                 state,
                 DesiredStateRecord::Stop {
                     workload_id: workload_id.clone(),
+                    tenant: tenant.clone(),
                 },
             ) {
                 return ControlResponse::Error {
@@ -461,7 +539,7 @@ async fn handle_request(
             accept_delegated(&workload_id, 0, String::new(), request)
         }
         ControlRequest::Status { workload_id } => ControlResponse::Status {
-            deployment: state.borrow().deployment(&workload_id).cloned(),
+            deployment: state.borrow().deployment(namespace, &workload_id).cloned(),
         },
     }
 }
@@ -501,34 +579,60 @@ mod tests {
         }
     }
 
+    fn ns(tenant: &str) -> Namespace {
+        Namespace::Tenant(tenant.to_string())
+    }
+
+    fn deployment_record(tenant: &str, deployment: Deployment) -> DesiredStateRecord {
+        DesiredStateRecord::Deployment {
+            deployment,
+            tenant: tenant.to_string(),
+        }
+    }
+
+    fn pipeline_record(tenant: &str, pipeline: PipelineBinding) -> DesiredStateRecord {
+        DesiredStateRecord::PipelineBinding {
+            pipeline,
+            tenant: tenant.to_string(),
+        }
+    }
+
+    fn stop_record(tenant: &str, workload_id: &str) -> DesiredStateRecord {
+        DesiredStateRecord::Stop {
+            workload_id: workload_id.to_string(),
+            tenant: tenant.to_string(),
+        }
+    }
+
     /// 4.2: the projection reconstructs from replay of appended records.
     #[test]
     fn projection_reconstructs_from_replayed_records() {
         let mut state = ControlPlaneState::default();
         let records = vec![
-            DesiredStateRecord::Deployment(deployment("api", 2, "api/v1")),
-            DesiredStateRecord::Deployment(deployment("api", 4, "api/v2")),
-            DesiredStateRecord::PipelineBinding(binding("api-to-db", "api", "db")),
-            DesiredStateRecord::Stop {
-                workload_id: "gone".to_string(),
-            },
-            DesiredStateRecord::Deployment(deployment("gone", 1, "gone/v1")),
-            DesiredStateRecord::Stop {
-                workload_id: "gone".to_string(),
-            },
+            deployment_record("acme", deployment("api", 2, "api/v1")),
+            deployment_record("acme", deployment("api", 4, "api/v2")),
+            pipeline_record("acme", binding("api-to-db", "api", "db")),
+            stop_record("acme", "gone"),
+            deployment_record("acme", deployment("gone", 1, "gone/v1")),
+            stop_record("acme", "gone"),
         ];
         for record in records {
             state.apply_record(record);
         }
 
+        let acme = ns("acme");
         assert_eq!(
-            state.deployment("api"),
+            state.deployment(&acme, "api"),
             Some(&deployment("api", 4, "api/v2")),
             "last accepted desired state wins"
         );
-        assert_eq!(state.deployment("gone"), None, "stop tombstones remove");
         assert_eq!(
-            state.pipeline("api-to-db"),
+            state.deployment(&acme, "gone"),
+            None,
+            "stop tombstones remove"
+        );
+        assert_eq!(
+            state.pipeline(&acme, "api-to-db"),
             Some(&binding("api-to-db", "api", "db"))
         );
     }
@@ -537,7 +641,7 @@ mod tests {
     /// encoding and is recorded in the projection.
     #[test]
     fn deployment_intent_is_recorded_in_projection() {
-        let record = DesiredStateRecord::Deployment(deployment("api", 3, "api/v1"));
+        let record = deployment_record("acme", deployment("api", 3, "api/v1"));
         let payload = FlatMsg::encode(&record);
         let decoded: DesiredStateRecord = FlatMsg::decode(&payload).expect("decode record");
 
@@ -545,7 +649,7 @@ mod tests {
         state.apply_record(decoded);
 
         assert_eq!(
-            state.deployment("api"),
+            state.deployment(&ns("acme"), "api"),
             Some(&deployment("api", 3, "api/v1"))
         );
     }
@@ -554,18 +658,55 @@ mod tests {
     #[test]
     fn status_reads_return_last_accepted_desired_state() {
         let mut state = ControlPlaneState::default();
-        state.apply_record(DesiredStateRecord::Deployment(deployment(
-            "api", 2, "api/v1",
-        )));
-        state.apply_record(DesiredStateRecord::Deployment(deployment(
-            "api", 5, "api/v2",
-        )));
+        state.apply_record(deployment_record("acme", deployment("api", 2, "api/v1")));
+        state.apply_record(deployment_record("acme", deployment("api", 5, "api/v2")));
 
+        let acme = ns("acme");
         assert_eq!(
-            state.deployment("api"),
+            state.deployment(&acme, "api"),
             Some(&deployment("api", 5, "api/v2"))
         );
-        assert_eq!(state.deployment("missing"), None);
+        assert_eq!(state.deployment(&acme, "missing"), None);
+    }
+
+    /// 3.4: two tenants' deployments never leak across partitions — an `acme`
+    /// session reads no `beta` desired state and vice versa.
+    #[test]
+    fn desired_state_partitions_by_tenant() {
+        let mut state = ControlPlaneState::default();
+        state.apply_record(deployment_record("acme", deployment("api", 2, "acme/v1")));
+        state.apply_record(deployment_record("beta", deployment("api", 9, "beta/v1")));
+
+        let acme = ns("acme");
+        let beta = ns("beta");
+        assert_eq!(
+            state.deployment(&acme, "api"),
+            Some(&deployment("api", 2, "acme/v1")),
+            "acme observes its own partition"
+        );
+        assert_eq!(
+            state.deployment(&beta, "api"),
+            Some(&deployment("api", 9, "beta/v1")),
+            "beta observes its own partition"
+        );
+        assert_eq!(
+            state.deployment(&acme, "beta-only-workload"),
+            None,
+            "acme reads no beta desired state"
+        );
+
+        // A beta stop does not tombstone acme's deployment.
+        state.apply_record(stop_record("beta", "api"));
+        assert_eq!(
+            state.deployment(&acme, "api"),
+            Some(&deployment("api", 2, "acme/v1")),
+            "a beta stop must not remove an acme deployment"
+        );
+        assert_eq!(
+            state.deployment(&beta, "api"),
+            None,
+            "the beta stop applies"
+        );
     }
 
     /// 5.1: a discovery lookup maps to a typed resolve response.
@@ -619,22 +760,23 @@ mod tests {
     /// recorded desired state.
     #[test]
     fn deployment_records_module_reference() {
-        let record = DesiredStateRecord::Deployment(deployment("api", 3, "api/v1"));
+        let record = deployment_record("acme", deployment("api", 3, "api/v1"));
         let mut state = ControlPlaneState::default();
         state.apply_record(record);
         assert_eq!(
             state
-                .deployment("api")
+                .deployment(&ns("acme"), "api")
                 .map(|deployment| deployment.module.as_str()),
             Some("api/v1")
         );
     }
 
-    /// 7.3: the grant set covers storage, shared memory, and host queue, each
-    /// scoped to the guest's tenant.
+    /// 7.3: the single-instance grant set covers storage, shared memory, host
+    /// queue, and system registration at class scope — no tenant selectors,
+    /// since the control plane serves every tenant.
     #[test]
-    fn grant_set_is_tenant_scoped() {
-        let grants = control_plane_grants("acme");
+    fn grant_set_is_class_scoped() {
+        let grants = control_plane_grants();
         let capabilities: Vec<Capability> = grants
             .iter()
             .map(|grant| grant.capability.clone())
@@ -642,18 +784,22 @@ mod tests {
         assert!(capabilities.contains(&Capability::Storage));
         assert!(capabilities.contains(&Capability::SharedMemory));
         assert!(capabilities.contains(&Capability::HostQueue));
+        assert!(capabilities.contains(&Capability::SystemRegistration));
 
-        // Every grant carries a tenant selector scoping it to "acme".
+        // No grant carries a tenant selector: the single instance serves all
+        // tenants and derives each session's tenant from the identity.
         assert!(grants.iter().all(|grant| {
-            grant
+            !grant
                 .selectors
                 .iter()
-                .any(|selector| matches!(selector, ResourceSelector::Tenant(t) if t == "acme"))
+                .any(|selector| matches!(selector, ResourceSelector::Tenant(_)))
         }));
     }
 
-    /// 7.3: a client without a control-plane grant is refused; a client with
-    /// the tenant-scoped host-queue admission is admitted.
+    /// 7.3: a client without a control-plane grant is refused; the
+    /// class-scoped control-plane set admits any tenant (the per-session
+    /// tenant comes from the authenticated identity, not from a tenant
+    /// selector on the grant).
     #[test]
     fn authority_boundary_refuses_unprivileged_clients() {
         // A data-plane-only client: host queue in another tenant.
@@ -663,10 +809,45 @@ mod tests {
         )];
         assert!(!admit_control_client(&data_plane, "acme"));
 
-        // A control-plane client: host queue scoped to the control tenant.
-        let control_plane = control_plane_grants("acme");
+        // The single-instance control-plane set is class-scoped and therefore
+        // admits any tenant scope.
+        let control_plane = control_plane_grants();
         assert!(admit_control_client(&control_plane, "acme"));
-        assert!(!admit_control_client(&control_plane, "other"));
+        assert!(admit_control_client(&control_plane, "other"));
+    }
+
+    /// 3.5: module-blob manifests are tenant-prefixed within the single
+    /// platform blob store; a root session leaves the manifest bare.
+    #[test]
+    fn manifest_keys_are_tenant_prefixed() {
+        assert_eq!(
+            tenant_prefixed_manifest(&ns("acme"), "api/v1"),
+            "acme:api/v1"
+        );
+        assert_eq!(
+            tenant_prefixed_manifest(&ns("beta"), "api/v1"),
+            "beta:api/v1"
+        );
+        assert_eq!(
+            tenant_prefixed_manifest(&Namespace::Root, "platform/v1"),
+            "platform/v1"
+        );
+    }
+
+    /// 3.3: each session is scoped by the delivering process owner's tenant —
+    /// a named process tenant maps to its namespace, an unset one to root.
+    #[test]
+    fn session_scope_comes_from_process_owner() {
+        assert_eq!(
+            namespace_from_tenant(Some("acme")),
+            Namespace::Tenant("acme".to_string()),
+            "a named process tenant scopes the session to that tenant"
+        );
+        assert_eq!(
+            namespace_from_tenant(None),
+            Namespace::Root,
+            "an unset process tenant scopes the session to the root namespace"
+        );
     }
 
     /// 3.2: a client half sends a typed request and receives a correlated

@@ -95,6 +95,9 @@ table PipelineBinding {
 //   0 = Deployment(deployment)
 //   1 = PipelineBinding(binding)
 //   2 = Stop { workload_id }
+//
+// Every record carries the tenant it belongs to, so replay can rebuild a
+// tenant-partitioned read model from the single platform-scoped log.
 table DesiredStateRecord {
     variant: ubyte;
     // Deployment desired state (Deployment variant).
@@ -103,6 +106,8 @@ table DesiredStateRecord {
     pipeline: PipelineBinding;
     // Workload identifier (Stop variant).
     workload_id: string;
+    // Tenant the record belongs to (all variants).
+    tenant: string;
 }
 
 root_type ControlRequest;

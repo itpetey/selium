@@ -22,6 +22,7 @@ impl<'a> DesiredStateRecord<'a> {
   pub const VT_DEPLOYMENT: ::flatbuffers::VOffsetT = 6;
   pub const VT_PIPELINE: ::flatbuffers::VOffsetT = 8;
   pub const VT_WORKLOAD_ID: ::flatbuffers::VOffsetT = 10;
+  pub const VT_TENANT: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -33,6 +34,7 @@ impl<'a> DesiredStateRecord<'a> {
     args: &'args DesiredStateRecordArgs<'args>
   ) -> ::flatbuffers::WIPOffset<DesiredStateRecord<'bldr>> {
     let mut builder = DesiredStateRecordBuilder::new(_fbb);
+    if let Some(x) = args.tenant { builder.add_tenant(x); }
     if let Some(x) = args.workload_id { builder.add_workload_id(x); }
     if let Some(x) = args.pipeline { builder.add_pipeline(x); }
     if let Some(x) = args.deployment { builder.add_deployment(x); }
@@ -69,6 +71,13 @@ impl<'a> DesiredStateRecord<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DesiredStateRecord::VT_WORKLOAD_ID, None)}
   }
+  #[inline]
+  pub fn tenant(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DesiredStateRecord::VT_TENANT, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DesiredStateRecord<'_> {
@@ -81,6 +90,7 @@ impl ::flatbuffers::Verifiable for DesiredStateRecord<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<Deployment>>("deployment", Self::VT_DEPLOYMENT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<PipelineBinding>>("pipeline", Self::VT_PIPELINE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("workload_id", Self::VT_WORKLOAD_ID, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
      .finish();
     Ok(())
   }
@@ -90,6 +100,7 @@ pub struct DesiredStateRecordArgs<'a> {
     pub deployment: Option<::flatbuffers::WIPOffset<Deployment<'a>>>,
     pub pipeline: Option<::flatbuffers::WIPOffset<PipelineBinding<'a>>>,
     pub workload_id: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for DesiredStateRecordArgs<'a> {
   #[inline]
@@ -99,6 +110,7 @@ impl<'a> Default for DesiredStateRecordArgs<'a> {
       deployment: None,
       pipeline: None,
       workload_id: None,
+      tenant: None,
     }
   }
 }
@@ -125,6 +137,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DesiredStateRecordBuilder<'a,
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DesiredStateRecord::VT_WORKLOAD_ID, workload_id);
   }
   #[inline]
+  pub fn add_tenant(&mut self, tenant: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DesiredStateRecord::VT_TENANT, tenant);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DesiredStateRecordBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DesiredStateRecordBuilder {
@@ -146,6 +162,7 @@ impl ::core::fmt::Debug for DesiredStateRecord<'_> {
       ds.field("deployment", &self.deployment());
       ds.field("pipeline", &self.pipeline());
       ds.field("workload_id", &self.workload_id());
+      ds.field("tenant", &self.tenant());
       ds.finish()
   }
 }

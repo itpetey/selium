@@ -75,10 +75,6 @@ pub enum Command {
     about = "Drive the Selium control plane from the command line"
 )]
 pub struct Cli {
-    /// Tenant whose bridge and control route the CLI targets.
-    #[arg(long)]
-    pub tenant: String,
-
     /// QUIC connector address (`host:port`).
     #[arg(long)]
     pub connector: String,
@@ -101,13 +97,17 @@ pub struct Cli {
 
 impl Cli {
     /// The bridge-route server name (TLS SNI + certificate verification
-    /// name) derived from the tenant.
+    /// name): the bare root wire name of the single per-platform
+    /// bridge-server. The requestor's tenant is established by the presented
+    /// client certificate, not by the name dialled.
     pub fn server_name(&self) -> String {
-        format!("bridge.{}", self.tenant)
+        "bridge".to_string()
     }
 
-    /// The control route named in the bridge channel handshake.
+    /// The control route named in the bridge channel handshake: the single
+    /// per-platform control plane's root route. The session's tenant is the
+    /// bridge-channel's process tenant, derived from the presented leaf.
     pub fn control_route(&self) -> String {
-        format!("sel://{}/control", self.tenant)
+        "sel:///control".to_string()
     }
 }

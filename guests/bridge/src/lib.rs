@@ -1,20 +1,23 @@
-//! Per-tenant bridge server system guest.
+//! Single-instance (per-platform) bridge server system guest.
 //!
 //! The QUIC connector terminates QUIC and delivers each accepted stream to the
-//! tenant's bridge server as a per-stream handoff whose [`IncomingConnection`]
+//! single bridge server as a per-stream handoff whose [`IncomingConnection`]
 //! metadata carries the authenticated client identity (`tenant` +
 //! fingerprint). The bridge server:
 //!
-//! - creates its own listener and registers its serving route
-//!   (`sel://<tenant>/bridge`) with discovery via `Context::serve`, deriving
-//!   both the internal path and the wire names (`bridge.<tenant>`,
-//!   `bridge.<owned-domain>`) from that one declaration;
+//! - creates its own listener and registers its root serving route
+//!   (`sel:///bridge`, wire name `bridge`) with discovery via `Context::serve`,
+//!   deriving the route from that one declaration;
+//! - derives each handoff's tenant from the decoded identity — the single
+//!   bridge-server is bound to no one tenant, so it never refuses an identity
+//!   on cross-tenant grounds;
 //! - resolves the handoff's identity to a grant set from the identity guest's
 //!   published grant table (a `fingerprint -> baseline grants` live table read
 //!   via [`GrantTable`]), replacing the interim `IdentityGrantMap` stub;
 //! - spawns one `bridge-channel <shared_id, grants>` per stream, conferring the
-//!   client's grants plus an `ExplicitResource` for the handed-off region via
-//!   the `DelegateGrants` capability;
+//!   client's grants (narrowed for that identity's tenant) plus an
+//!   `ExplicitResource` for the handed-off region via the `DelegateGrants`
+//!   capability held at `Namespace::Root`;
 //! - refuses unknown identities by attaching then closing the delivered region
 //!   so the connector observes EOF and FINs the client stream;
 //! - enforces a per-identity spawn bound to blunt stream-mint amplification.
@@ -24,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use selium_abi::{
     Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
     client_identity::ClientIdentity,
@@ -263,16 +266,6 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("bridge-server: started");
 
-    // The server's own tenant scope: handoffs carrying identities resolved
-    // for any other tenant are refused (the connector derives the identity's
-    // tenant from the verifying trust anchor, but a client verified by
-    // another tenant's anchor must not reach this tenant's bridge).
-    let (_, own_tenant) =
-        selium_guest::self_info().with_context(|| "bridge-server: self info failed")?;
-    let Some(own_tenant) = own_tenant else {
-        bail!("bridge-server: no tenant scope provisioned; refusing to serve");
-    };
-
     // The server creates its own listener: self-registration replaces the
     // runtime's well-known-URI queue minting.
     let mut listener =
@@ -292,13 +285,16 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
         })?;
     listener.expect_sender(connector);
 
-    // Register the serving route (`sel://<tenant>/bridge`) from one declaration.
+    // Register the root serving route (`sel:///bridge`) from one declaration.
+    // The bridge-server is a single per-platform instance (tenant `None`): its
+    // own tenant is not part of the serving identity, and the tenant it acts
+    // for comes from each handoff's authenticated identity.
     let target = ResourceTarget {
         uri: String::new(), // pinned by `serve` to the derived internal path
         host_id: String::new(),
         resource_id: listener.descriptor().shared_id,
         interface: None,
-        tenant: Some(own_tenant.clone()),
+        tenant: None,
         class: ResourceClass::HostQueue,
         labels: Vec::new(),
     };
@@ -347,18 +343,6 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             continue;
         };
 
-        // Refuse identities resolved for a foreign tenant: the identity
-        // source is scoped to this server's tenant only.
-        if identity.tenant != own_tenant {
-            warn!(
-                own = %own_tenant,
-                identity_tenant = %identity.tenant,
-                "bridge-server: refusing cross-tenant identity"
-            );
-            attach_then_close(incoming.shared_id);
-            continue;
-        }
-
         let Some(grants) = grant_table.grants_for(&identity.fingerprint) else {
             warn!(
                 tenant = %identity.tenant,
@@ -370,8 +354,10 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
 
         // Fold the accountant's published narrowing into the baseline grants
         // before conferral: a delinquent tenant's narrowing set empties the
-        // baseline; an absent narrowing set is a no-op.
-        let grants = narrow_grants(grants, &narrowing_table.narrowing_for(&own_tenant));
+        // baseline; an absent narrowing set is a no-op. The tenant is taken
+        // from the identity — the single bridge-server is bound to no one
+        // tenant, so each handoff narrows for its own tenant.
+        let grants = narrow_grants(grants, &narrowing_table.narrowing_for(&identity.tenant));
 
         if !budget.try_acquire(&identity.fingerprint, DEFAULT_SPAWN_BOUND_PER_IDENTITY) {
             warn!(
@@ -382,14 +368,19 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             continue;
         }
 
-        let child_grants =
-            bridge_channel_grants(grants, &own_tenant, ctx.raw_handle(), incoming.shared_id);
+        let child_grants = bridge_channel_grants(
+            grants,
+            &identity.tenant,
+            ctx.raw_handle(),
+            incoming.shared_id,
+        );
 
-        match Process::start(
+        match Process::start_for_tenant(
             BRIDGE_CHANNEL_MODULE,
             BRIDGE_CHANNEL_ENTRYPOINT,
             vec![arg_u64(ctx.raw_handle()), arg_u64(incoming.shared_id)],
             child_grants,
+            Some(&identity.tenant),
         ) {
             Ok(_child) => info!(
                 tenant = %identity.tenant,
@@ -504,6 +495,64 @@ mod tests {
         assert!(
             explicit(Capability::HostQueue, DISCOVERY_LISTENER),
             "child may attach the discovery listener queue: {child:?}"
+        );
+    }
+
+    /// Two handoffs carrying different tenants confer child grants scoped to
+    /// their own tenant: the single bridge-server binds to no tenant, so the
+    /// handed-off identity's tenant — not the server's — drives the conferred
+    /// grant scopes.
+    #[test]
+    fn child_grants_scoped_to_each_handoff_tenant() {
+        const DISCOVERY_LISTENER: u64 = 100;
+        const STREAM_REGION: u64 = 200;
+
+        let acme = bridge_channel_grants(grants(), "acme", DISCOVERY_LISTENER, STREAM_REGION);
+        let beta = bridge_channel_grants(grants(), "beta", DISCOVERY_LISTENER, STREAM_REGION);
+
+        let explicit_scoped = |grants: &[CapabilityGrant], tenant: &str, capability, id| {
+            grants.iter().any(|grant| {
+                grant.capability == capability
+                    && grant.selectors.iter().any(|selector| {
+                        matches!(
+                            selector,
+                            ResourceSelector::Tenant(t) if t == tenant
+                        )
+                    })
+                    && grant.selectors.iter().any(|selector| {
+                        *selector
+                            == ResourceSelector::ExplicitResource(ResourceIdentity::Shared(id))
+                    })
+            })
+        };
+
+        assert!(explicit_scoped(
+            &acme,
+            "acme",
+            Capability::SharedMemory,
+            STREAM_REGION
+        ));
+        assert!(explicit_scoped(
+            &acme,
+            "acme",
+            Capability::HostQueue,
+            DISCOVERY_LISTENER
+        ));
+        assert!(explicit_scoped(
+            &beta,
+            "beta",
+            Capability::SharedMemory,
+            STREAM_REGION
+        ));
+        assert!(explicit_scoped(
+            &beta,
+            "beta",
+            Capability::HostQueue,
+            DISCOVERY_LISTENER
+        ));
+        assert!(
+            !explicit_scoped(&beta, "acme", Capability::SharedMemory, STREAM_REGION),
+            "a beta handoff must not confer an acme-scoped grant"
         );
     }
 

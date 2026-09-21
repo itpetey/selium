@@ -110,6 +110,26 @@ pub fn process_tenant(process_id: selium_abi::ProcessId) -> Result<Option<String
     }
 }
 
+/// Maps a process tenant to its namespace: `None` (or empty) → `Root`, a
+/// named tenant → `Tenant(t)`.
+pub fn namespace_from_tenant(tenant: Option<&str>) -> selium_abi::Namespace {
+    match tenant {
+        Some(tenant) if !tenant.is_empty() => selium_abi::Namespace::Tenant(tenant.to_string()),
+        _ => selium_abi::Namespace::Root,
+    }
+}
+
+/// Derives a caller's requestor namespace from its process owner.
+///
+/// The tenant is read from the runtime's persisted process authority — the
+/// only non-forgeable tenant source — never from a tenant the caller asserts
+/// for itself (e.g. sender-controlled handoff metadata). A named process
+/// tenant yields `Tenant(t)`; an unset (root) tenant yields `Root`. Returns an
+/// error only when the runtime tenant lookup itself fails.
+pub fn process_namespace(process_id: selium_abi::ProcessId) -> Result<selium_abi::Namespace> {
+    process_tenant(process_id).map(|tenant| namespace_from_tenant(tenant.as_deref()))
+}
+
 /// Removes a host-held quota counter for a tenant and resource class,
 /// restoring unrestricted allocation. Requires the `QuotaWrite` capability.
 pub fn quota_clear(tenant: &str, class: selium_abi::ResourceClass) -> Result<()> {
@@ -363,5 +383,27 @@ pub(crate) fn poll_operation(operation_id: OperationId) -> Result<Option<Hostcal
             CompletionState::Pending { .. } => Ok(None),
             CompletionState::Failed(error) => Err(abi_error_to_guest_error(error)),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use selium_abi::Namespace;
+
+    /// A root (unset) process tenant maps to the root namespace.
+    #[test]
+    fn root_process_tenant_maps_to_root_namespace() {
+        assert_eq!(namespace_from_tenant(None), Namespace::Root);
+        assert_eq!(namespace_from_tenant(Some("")), Namespace::Root);
+    }
+
+    /// A named process tenant maps to its tenant namespace.
+    #[test]
+    fn named_process_tenant_maps_to_tenant_namespace() {
+        assert_eq!(
+            namespace_from_tenant(Some("acme")),
+            Namespace::Tenant("acme".to_string())
+        );
     }
 }

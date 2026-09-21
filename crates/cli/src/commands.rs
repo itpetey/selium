@@ -14,8 +14,10 @@ use selium_client::{
 
 use crate::cli::{Cli, Command};
 
-/// Builds [`ConnectOptions`] from the connection flags: the tenant-derived
-/// server name, the trusted server root, and the optional client identity.
+/// Builds [`ConnectOptions`] from the connection flags: the bare bridge
+/// server name (the single per-platform bridge-server's root wire name), the
+/// trusted server root, and the client identity. The requestor's tenant is
+/// established by the presented client certificate, not by the name dialled.
 pub fn build_connect_options(cli: &Cli) -> Result<ConnectOptions> {
     let ca_pem = std::fs::read(&cli.ca).with_context(|| {
         format!(
@@ -428,7 +430,6 @@ mod tests {
             "/../../guests/connector-quic/tests/fixtures"
         );
         let cli = Cli {
-            tenant: "acme".to_string(),
             connector: "127.0.0.1:4433".to_string(),
             ca: PathBuf::from(format!("{dir}/bridge_cert.pem")),
             client_cert: PathBuf::from(format!("{dir}/client_cert.pem")),
@@ -440,7 +441,11 @@ mod tests {
 
         let options = build_connect_options(&cli).unwrap();
 
-        assert_eq!(options.server_name, "bridge.acme");
+        // The dialled name is the bare root wire name: the tenant comes from
+        // the presented leaf, not the name dialled.
+        assert_eq!(options.server_name, "bridge");
+        // The control route is the single control plane's root route.
+        assert_eq!(cli.control_route(), "sel:///control");
         assert!(!options.server_root.is_empty());
         assert!(
             options

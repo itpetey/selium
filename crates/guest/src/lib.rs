@@ -10,9 +10,10 @@ pub use crate::{
     context::{Context, Serve},
     error::{GuestError, Result},
     hostcall::{
-        process_capability, process_tenant, quota_clear, quota_set, random_bytes,
-        record_registration, record_resolved_queue_for, record_resolved_region_for,
-        resolve_protocol_handler, revoke_ca, self_info, sign_tenant_ca, sign_user_cert,
+        namespace_from_tenant, process_capability, process_namespace, process_tenant, quota_clear,
+        quota_set, random_bytes, record_registration, record_resolved_queue_for,
+        record_resolved_region_for, resolve_protocol_handler, revoke_ca, self_info, sign_tenant_ca,
+        sign_user_cert,
     },
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::{mark_ready, process_id},
@@ -22,8 +23,8 @@ pub use crate::{
     time::{Instant, Timer, now},
 };
 pub use selium_abi::{
-    Capability, CapabilityGrant, EntrypointMetadata, LocalityScope, RegionProt, ResourceClass,
-    ResourceIdentity, ResourceSelector, ScopeContext,
+    Capability, CapabilityGrant, EntrypointMetadata, LocalityScope, Namespace, RegionProt,
+    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext,
 };
 // Re-export service message types and encoding types.
 pub use selium_guest_macros::{entrypoint, pattern_interface, schema};

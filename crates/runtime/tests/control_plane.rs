@@ -2,7 +2,7 @@
 //!
 //! Deploys the real `selium-discovery` and `selium-control-plane` WASM guests
 //! on a single host and asserts the control-plane slice end-to-end: bootstrap
-//! with discovery wiring, self-registration of the `control.<tenant>` serving
+//! with discovery wiring, self-registration of the root `control` serving
 //! route, and readiness signalling (which fires only after the route is
 //! registered).
 //!
@@ -50,7 +50,7 @@ fn control_plane_bootstrap_slice_end_to_end() {
         .find(|guest| guest.name == "control-plane")
         .expect("control-plane guest in report");
 
-    // Both guests reached readiness.
+    // Both serving guests reached readiness.
     let activity = runtime.activity_log();
     assert!(
         activity
@@ -68,10 +68,10 @@ fn control_plane_bootstrap_slice_end_to_end() {
     );
 
     // The control route registered: readiness is signalled only after
-    // `Context::serve` registers `sel://acme/control` in discovery, and
+    // `Context::serve` registers `sel:///control` in discovery, and
     // discovery records the registration with the runtime before replying.
     assert!(
-        runtime.has_registration(control_guest.process_id, "sel://acme/control"),
+        runtime.has_registration(control_guest.process_id, "sel:///control"),
         "expected the control route to be registered and observable"
     );
 
@@ -94,36 +94,25 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         grants: vec![
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::DurableLog),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
             ),
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::BlobStore),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
             ),
             CapabilityGrant::new(
                 Capability::SharedMemory,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
             CapabilityGrant::new(
                 Capability::HostQueue,
-                vec![
-                    ResourceSelector::Tenant("acme".to_string()),
-                    ResourceSelector::ResourceClass(ResourceClass::HostQueue),
-                ],
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
         dependencies: vec!["discovery".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: Some("acme".to_string()),
+        tenant: None,
         serving_role: None,
         handlers: Vec::new(),
     }
