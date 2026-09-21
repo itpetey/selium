@@ -122,12 +122,12 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result
         Arc::new(inflight.clone()),
         resolver_addr,
     ));
-    spawn(accept_loop(
-        listener,
-        Arc::new(inflight),
-        socket,
-        resolver_addr,
-    ));
+
+    // Keep the poll-owner entrypoint future parked on the accept loop. Under
+    // the runtime's process-lifecycle semantics an entrypoint that returns
+    // marks its process for teardown, so the connector accepts inline rather
+    // than returning after spawning the loops.
+    accept_loop(listener, Arc::new(inflight), socket, resolver_addr).await;
 
     Ok(())
 }
