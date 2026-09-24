@@ -26,6 +26,7 @@ members = [
   "guests/dns-demo",
   "guests/identity",
   "guests/identity-onboard",
+  "guests/mt-demo",
   "guests/net-demo",
   "guests/quic-demo",
   "guests/spine-demo",
@@ -85,7 +86,8 @@ tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", default-features = false }
-wasmtiny = { version = "0.1", default-features = false }
+wasmtiny = { version = "0.1", default-features = false, features = ["aot"] }
+wasmtiny-aotc = { path = "../../wasmtiny/crates/aotc", default-features = false }
 wat = { version = "1.259", default-features = false }
 web-time = "1.1"
 x509-parser = { version = "0.18", default-features = false }
@@ -133,5 +135,5 @@ unwrap_used = "warn"
 getrandom = { git = "https://github.com/seliumlabs/getrandom", rev = "1cd6d1f288be4a8dfe2f72aac02add4b8c3e0ac5" }
 # Drop this entry once ring releases a 0.17.x built on getrandom 0.4.
 ring = { git = "https://github.com/briansmith/ring", rev = "840167e18e4fa837eb48de46500454a616a15a6e" }
-wasmtiny = { path = "../../wasmtiny" }
+wasmtiny = { path = "../../wasmtiny/crates/core" }
 web-time = { path = "vendor/web-time" }

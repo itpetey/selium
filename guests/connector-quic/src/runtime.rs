@@ -47,36 +47,9 @@ impl Runtime for ConnectorRuntime {
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        // Bridge quinn's `Send`-bound driver future onto the guest's
-        // cooperative single-threaded executor, which accepts non-`Send`
-        // futures. The guest reactor runs entirely on one thread, so the
-        // removed auto-trait bound is never relied upon.
-        let future: Pin<Box<dyn Future<Output = ()>>> = {
-            // SAFETY: `Box<dyn Future + Send>` and `Box<dyn Future>` share the
-            // same representation (data pointer + vtable pointer). The future
-            // is moved into the reactor and only polled on this single guest
-            // thread, so dropping `Send` is sound.
-            let raw = unsafe {
-                // SAFETY: `Pin::into_inner_unchecked` is the inverse of
-                // `Pin::new_unchecked` above — we just unwrapped the pin
-                // projection to reach the inner `Box` for transmutation.
-                Box::into_raw(Pin::into_inner_unchecked(future))
-            };
-            let boxed: Box<dyn Future<Output = ()>> = unsafe {
-                // SAFETY: `Box<dyn Future + Send>` and `Box<dyn Future>` share
-                // the same layout. The future is moved into the reactor and
-                // only polled on this single guest thread, so dropping `Send`
-                // is sound.
-                Box::from_raw(raw as *mut dyn Future<Output = ()>)
-            };
-            unsafe {
-                // SAFETY: The `Box` contains a valid pinned future obtained
-                // from `Pin::into_inner_unchecked` above. Re-pinning it is
-                // sound because it will only be polled in this single-threaded
-                // reactor.
-                Pin::new_unchecked(boxed)
-            }
-        };
+        // quinn's driver futures are `Send`; the guest executor's `spawn`
+        // accepts them directly — task capsules migrate between workers, so
+        // no `Send` bound is dropped here.
         selium_guest::spawn(future);
     }
 

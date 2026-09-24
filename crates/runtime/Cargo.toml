@@ -27,6 +27,7 @@ time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 wasmtiny.workspace = true
+wasmtiny-aotc.workspace = true
 
 [dev-dependencies]
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-ring"] }

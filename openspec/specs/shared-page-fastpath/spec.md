@@ -6,7 +6,7 @@ per-region wait registry (portable), Stage 2 via optional per-OS
 wait-word primitives — with detection and fallback honesty and no
 platform becoming dependent on either stage.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Guest Notify Emission on Ring Writes
 When built with the atomics feature, the guest ring write path SHALL

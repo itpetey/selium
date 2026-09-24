@@ -139,7 +139,7 @@ pub(crate) fn write_guest_memory(
 
 /// Encodes a single `WasmValue` into the tagged byte form expected by
 /// [`decode_wasm_arguments`].
-fn encode_wasm_value(value: WasmValue) -> Vec<u8> {
+pub(crate) fn encode_wasm_value(value: WasmValue) -> Vec<u8> {
     let mut bytes = Vec::new();
     value.to_bytes(&mut bytes);
     bytes

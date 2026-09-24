@@ -26,9 +26,20 @@ use crate::{
 const DEFAULT_READINESS_POLL_MS: u64 = 10;
 const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 
+pub(crate) enum GuestExecution {
+    /// The cooperative single-worker reactor (interpreter path): the host
+    /// drives `__selium_guest_poll` to stall on each wake.
+    Cooperative {
+        app: WasmApplication,
+        module_index: u32,
+    },
+    /// The multithreaded worker pool (AOT path): dedicated OS worker threads
+    /// enter `__selium_guest_worker` concurrently over the shared instance.
+    Multithreaded(crate::multithreaded::MultithreadedGuest),
+}
+
 pub(crate) struct LoadedGuest {
-    pub(crate) app: WasmApplication,
-    pub(crate) module_index: u32,
+    pub(crate) execution: GuestExecution,
     pub(crate) entrypoint_results: Vec<WasmValue>,
 }
 
@@ -267,20 +278,32 @@ impl Runtime {
             None,
         );
 
-        let loaded_guest = match self.load_guest_module(&descriptor.module_bytes, process.local_id)
-        {
-            Ok(loaded_guest) => loaded_guest,
-            Err(error) => {
-                self.cleanup_failed_process(process.local_id)?;
-                return Err(error);
-            }
-        };
         // Shared-page fast-path detection: probe the guest's module bytes
         // once at spawn (shared memory declaration + atomic notify
         // opcodes). Region attach consumes the result; no user-facing
         // configuration exists (see the shared-page-fastpath spec).
         let fastpath = crate::module_probe::probe(&descriptor.module_bytes);
         self.record_process_fastpath(process.local_id, fastpath.fast_path_capable());
+        // Multithreaded execution is opt-in per guest via the module: a guest
+        // exporting the worker entry runs on a dedicated worker pool (AOT);
+        // every other guest keeps the cooperative single-worker reactor.
+        let loaded_guest = if fastpath.multithreaded() {
+            match self.load_multithreaded_guest(&descriptor.module_bytes, process.local_id) {
+                Ok(loaded_guest) => loaded_guest,
+                Err(error) => {
+                    self.cleanup_failed_process(process.local_id)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            match self.load_guest_module(&descriptor.module_bytes, process.local_id) {
+                Ok(loaded_guest) => loaded_guest,
+                Err(error) => {
+                    self.cleanup_failed_process(process.local_id)?;
+                    return Err(error);
+                }
+            }
+        };
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
             Ok(loaded_guest) => {
                 if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {
@@ -319,6 +342,29 @@ impl Runtime {
         self.loaded_guests
             .lock()
             .insert(process.local_id, loaded_guest);
+        // Start a multithreaded guest's worker pool now that the guest is
+        // registered, so the pool monitor's reap can always find it. The
+        // pool size is the configured per-guest count (default: available
+        // CPU cores, never exceeding them unless explicitly configured). The
+        // `loaded_guests` guard is released before the failure path's
+        // `cleanup_failed_process` (which re-locks `loaded_guests`).
+        let start_result = {
+            let mut guests = self.loaded_guests.lock();
+            match guests.get_mut(&process.local_id) {
+                Some(guest) => match &mut guest.execution {
+                    GuestExecution::Multithreaded(mt) => {
+                        let worker_count = self.worker_count_for(&descriptor.name);
+                        Some(mt.start_workers(self.clone(), process.local_id, worker_count))
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        if let Some(Err(error)) = start_result {
+            self.cleanup_failed_process(process.local_id)?;
+            return Err(error);
+        }
         self.claim_local_handle(
             process.local_id,
             selium_abi::ResourceClass::Process,
@@ -412,8 +458,21 @@ impl Runtime {
         app.instantiate(module_index).map_err(map_wasm_error)?;
         app.execute_start(module_index).map_err(map_wasm_error)?;
         Ok(LoadedGuest {
-            app,
-            module_index,
+            execution: GuestExecution::Cooperative { app, module_index },
+            entrypoint_results: Vec::new(),
+        })
+    }
+
+    /// AOT-compiles a multithreaded guest's module and instantiates the
+    /// shared instance its worker pool will enter concurrently.
+    pub(crate) fn load_multithreaded_guest(
+        &self,
+        module_bytes: &[u8],
+        process_id: selium_abi::ProcessId,
+    ) -> Result<LoadedGuest> {
+        let mt = crate::multithreaded::MultithreadedGuest::load(self, process_id, module_bytes)?;
+        Ok(LoadedGuest {
+            execution: GuestExecution::Multithreaded(mt),
             entrypoint_results: Vec::new(),
         })
     }
@@ -423,19 +482,20 @@ impl Runtime {
         mut loaded_guest: LoadedGuest,
         descriptor: &SystemGuestDescriptor,
     ) -> Result<LoadedGuest> {
-        let arguments = crate::wasm::resolve_entrypoint_arguments(
-            &mut loaded_guest.app,
-            loaded_guest.module_index,
-            &descriptor.arguments,
-        )?;
-        let results = loaded_guest
-            .app
-            .call_function(
-                loaded_guest.module_index,
-                descriptor.entrypoint.as_str(),
-                &arguments,
-            )
-            .map_err(map_wasm_error)?;
+        let results = match &mut loaded_guest.execution {
+            GuestExecution::Cooperative { app, module_index } => {
+                let arguments = crate::wasm::resolve_entrypoint_arguments(
+                    app,
+                    *module_index,
+                    &descriptor.arguments,
+                )?;
+                app.call_function(*module_index, descriptor.entrypoint.as_str(), &arguments)
+                    .map_err(map_wasm_error)?
+            }
+            GuestExecution::Multithreaded(mt) => {
+                mt.run_entrypoint(&descriptor.entrypoint, &descriptor.arguments)?
+            }
+        };
         loaded_guest.entrypoint_results = results;
         Ok(loaded_guest)
     }

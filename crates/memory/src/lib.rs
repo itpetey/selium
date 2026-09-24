@@ -63,7 +63,7 @@ mod waiters {
 
     /// Returns (or creates) the waiter entry for `key`.
     pub(crate) fn get_waiter(key: usize) -> Arc<Waiter> {
-        let mut map = registry().lock().expect("waiters registry lock poisoned");
+        let mut map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key)
             .or_insert_with(|| {
                 Arc::new(Waiter {
@@ -85,7 +85,7 @@ mod waiters {
         let mut flag = waiter
             .notified
             .lock()
-            .expect("waiter notified lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !*flag {
             *flag = true;
             waiter.condvar.notify_one();

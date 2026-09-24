@@ -22,7 +22,7 @@
 //! may only act on its own tenant (issue user certificates, manage its own
 //! principals).
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, sync::{Arc, Mutex}};
 
 use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -116,12 +116,12 @@ pub enum Tier {
 
 /// Shared identity state handed to each request handler.
 struct IdentityState {
-    tenants: Rc<RefCell<TenantRegistry>>,
-    principals: Rc<RefCell<PrincipalRegistry>>,
+    tenants: Arc<Mutex<TenantRegistry>>,
+    principals: Arc<Mutex<PrincipalRegistry>>,
     tenant_log: DurableLog,
     principal_log: DurableLog,
-    anchors: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
-    grants: Rc<LiveTable<Vec<u8>, Vec<u8>, ShmTransport>>,
+    anchors: Arc<LiveTable<String, Vec<u8>, ShmTransport>>,
+    grants: Arc<LiveTable<Vec<u8>, Vec<u8>, ShmTransport>>,
 }
 
 impl TenantRegistry {
@@ -308,7 +308,7 @@ where
 /// enforcing it on every request.
 async fn handle_connection(
     mut connection: selium_shm::rpc::RpcConnection<IdentityRequest, IdentityResponse>,
-    state: Rc<IdentityState>,
+    state: Arc<IdentityState>,
 ) {
     let tier = match selium_guest::process_tenant(connection.client_process_id()) {
         Ok(tenant) => Tier::from_tenant(tenant),
@@ -440,14 +440,16 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
     let principal_log =
         DurableLog::open(PRINCIPAL_LOG).with_context(|| "identity: principal log open failed")?;
 
-    let tenants = Rc::new(RefCell::new(TenantRegistry::default()));
+    let tenants = Arc::new(Mutex::new(TenantRegistry::default()));
     tenants
-        .borrow_mut()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .rebuild(&tenant_log)
         .with_context(|| "identity: tenant registry replay failed")?;
-    let principals = Rc::new(RefCell::new(PrincipalRegistry::default()));
+    let principals = Arc::new(Mutex::new(PrincipalRegistry::default()));
     principals
-        .borrow_mut()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .rebuild(&principal_log)
         .with_context(|| "identity: principal registry replay failed")?;
 
@@ -457,10 +459,10 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("identity: grant table create failed: {e}"))?;
 
     // Re-publish replayed state into the fresh tables.
-    let anchors = Rc::new(anchors);
-    let grants = Rc::new(grants);
+    let anchors = Arc::new(anchors);
+    let grants = Arc::new(grants);
     {
-        let tenants = tenants.borrow();
+        let tenants = tenants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (tenant, cert) in tenants.entries() {
             if let Err(e) = anchors.set(anchor_key(tenant), cert.clone()) {
                 warn!("identity: anchor re-publish failed for {tenant}: {e}");
@@ -468,7 +470,7 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
         }
     }
     {
-        let principals = principals.borrow();
+        let principals = principals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (fingerprint, grant_bytes) in principals.entries() {
             if let Err(e) = publish_grants(&grants, fingerprint, grant_bytes) {
                 warn!("identity: grant re-publish failed: {e}");
@@ -531,7 +533,7 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
     .await
     .with_context(|| "identity: serve grant table failed")?;
 
-    let state = Rc::new(IdentityState {
+    let state = Arc::new(IdentityState {
         tenants,
         principals,
         tenant_log,
@@ -577,7 +579,7 @@ fn issue_user_cert(
     // already held by this principal across an issuance (a leaf rotation).
     let grants = state
         .principals
-        .borrow()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .grants(&fingerprint)
         .cloned()
         .unwrap_or_default();
@@ -606,7 +608,7 @@ fn mint_tenant_ca(tenant: &str, state: &IdentityState) -> Result<(), String> {
 
     state
         .tenants
-        .borrow_mut()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(TenantRecord::Onboard {
             tenant: tenant.to_string(),
             ca_cert_der: ca_cert_der.clone(),
@@ -653,7 +655,7 @@ fn record_principal(tenant: &str, fingerprint: &[u8], grants: &[u8], state: &Ide
         }
         Err(error) => warn!("identity: principal record encode failed: {error}"),
     }
-    state.principals.borrow_mut().apply_record(record);
+    state.principals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_record(record);
 }
 
 /// Removes a principal's baseline grants.
@@ -677,7 +679,7 @@ fn remove_principal(tenant: &str, fingerprint: &[u8], state: &IdentityState) {
     }
     state
         .principals
-        .borrow_mut()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(PrincipalRecord::Remove {
             tenant: tenant.to_string(),
             fingerprint: fingerprint.to_vec(),
@@ -713,7 +715,7 @@ fn revoke_tenant(tenant: &str, state: &IdentityState) -> Result<(), String> {
 
     state
         .tenants
-        .borrow_mut()
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(TenantRecord::Revoke {
             tenant: tenant.to_string(),
         });

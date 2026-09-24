@@ -30,6 +30,12 @@
 
 const CODE_SECTION: u8 = 10;
 const MEMORY_SECTION: u8 = 5;
+const EXPORT_SECTION: u8 = 7;
+
+/// The worker entry export name a multithreaded guest module must carry.
+/// Presence selects multithreaded execution (dedicated worker pool); absence
+/// falls back to the single-worker cooperative reactor.
+pub const WORKER_ENTRY_EXPORT: &str = "__selium_guest_worker";
 
 /// Probe result: does this module participate in the shared-page fast path?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +45,9 @@ pub struct ModuleProbe {
     /// The module's code section contains the `memory.atomic.notify` opcode
     /// sequence (`0xFE 0x00`).
     pub atomic_notify: bool,
+    /// The module exports the multithreaded worker entry
+    /// (`__selium_guest_worker`).
+    pub worker_entry: bool,
 }
 
 /// Iterates the sections of a wasm module. Returns `None` when the magic
@@ -54,6 +63,13 @@ impl ModuleProbe {
     /// code contains atomic notify opcodes (the write path emits them).
     pub fn fast_path_capable(&self) -> bool {
         self.shared_memory && self.atomic_notify
+    }
+
+    /// True when the module declares the multithreaded worker entry export,
+    /// so the runtime provisions a dedicated worker pool for it. Absence
+    /// selects the cooperative single-worker reactor.
+    pub fn multithreaded(&self) -> bool {
+        self.worker_entry
     }
 }
 
@@ -108,6 +124,7 @@ pub fn probe(module: &[u8]) -> ModuleProbe {
     let mut probe = ModuleProbe {
         shared_memory: false,
         atomic_notify: false,
+        worker_entry: false,
     };
 
     let Some(mut cursor) = SectionCursor::new(module) else {
@@ -118,10 +135,46 @@ pub fn probe(module: &[u8]) -> ModuleProbe {
         match id {
             MEMORY_SECTION => probe.shared_memory |= scan_memory_section(payload),
             CODE_SECTION => probe.atomic_notify |= scan_code_section(payload),
+            EXPORT_SECTION => probe.worker_entry |= scan_export_section(payload),
             _ => {}
         }
     }
     probe
+}
+
+/// True when an export section payload declares the multithreaded worker
+/// entry export. Returns false on malformed input (the safe cooperative
+/// fallback).
+fn scan_export_section(payload: &[u8]) -> bool {
+    let mut cursor = SectionCursor {
+        bytes: payload,
+        pos: 0,
+    };
+    let Some(count) = cursor.read_leb_u32() else {
+        return false;
+    };
+    for _ in 0..count {
+        // Export name: LEB length + bytes.
+        let Some(name_len) = cursor.read_leb_u32() else {
+            return false;
+        };
+        let Some(name_start) = cursor.pos.checked_add(name_len as usize) else {
+            return false;
+        };
+        let Some(name) = cursor.bytes.get(cursor.pos..name_start) else {
+            return false;
+        };
+        if name == WORKER_ENTRY_EXPORT.as_bytes() {
+            return true;
+        }
+        cursor.pos = name_start;
+        // Export kind (1 byte) + index (LEB128).
+        cursor.pos += 1;
+        if cursor.read_leb_u32().is_none() {
+            return false;
+        }
+    }
+    false
 }
 
 /// True when the code section payload contains the `memory.atomic.notify`
@@ -232,5 +285,48 @@ mod tests {
         let module = module(MEMORY_SECTION, &[0xFF, 0xFF]);
         let probe = probe(&module);
         assert!(!probe.shared_memory);
+    }
+
+    /// Builds an export-section payload declaring one export with `name`.
+    fn export_payload(name: &str) -> Vec<u8> {
+        let mut payload = vec![0x01]; // one export
+        payload.push(name.len() as u8);
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0x00); // kind: func
+        payload.push(0x00); // index 0
+        payload
+    }
+
+    #[test]
+    fn worker_entry_export_is_detected() {
+        let module = module(EXPORT_SECTION, &export_payload(WORKER_ENTRY_EXPORT));
+        let probe = probe(&module);
+        assert!(probe.worker_entry);
+        assert!(probe.multithreaded());
+    }
+
+    #[test]
+    fn guest_without_worker_entry_falls_back_to_cooperative() {
+        let module = module(EXPORT_SECTION, &export_payload("__selium_guest_poll"));
+        let probe = probe(&module);
+        assert!(!probe.worker_entry);
+        assert!(!probe.multithreaded());
+    }
+
+    #[test]
+    fn worker_entry_detection_is_exact() {
+        // A similar-but-different name must not match.
+        let module = module(EXPORT_SECTION, &export_payload("__selium_guest_worker_extra"));
+        let probe = probe(&module);
+        assert!(!probe.worker_entry);
+    }
+
+    #[test]
+    fn malformed_export_section_falls_back_to_cooperative() {
+        // Count claims one export but the payload ends immediately.
+        let module = module(EXPORT_SECTION, &[0x01]);
+        let probe = probe(&module);
+        assert!(!probe.worker_entry);
+        assert!(!probe.multithreaded());
     }
 }

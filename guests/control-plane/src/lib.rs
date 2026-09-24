@@ -25,7 +25,7 @@
 //! - **module upload** → storage hostcalls (`StorageBlobPut` +
 //!   `StorageBlobSetManifest`, tenant-prefixed manifest names).
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, sync::{Arc, Mutex}};
 
 use anyhow::Context as _;
 use selium_abi::{
@@ -246,7 +246,7 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
     desired
         .rebuild(&log)
         .with_context(|| "control-plane: projection rebuild failed")?;
-    let state = Rc::new(RefCell::new(desired));
+    let state = Arc::new(Mutex::new(desired));
 
     // The server creates its own listener: self-registration replaces the
     // runtime's well-known-URI queue minting. Sessions are internal
@@ -350,7 +350,7 @@ fn delegation_status(response: SchedulerResponse) -> DelegationStatus {
 async fn handle_connection(
     mut connection: rpc::RpcConnection<ControlRequest, ControlResponse>,
     discovery_handle: u64,
-    state: Rc<RefCell<ControlPlaneState>>,
+    state: Arc<Mutex<ControlPlaneState>>,
     log: DurableLog,
     blobs: BlobStore,
     namespace: Namespace,
@@ -401,7 +401,7 @@ async fn handle_request(
     ctx: &mut Context,
     log: &DurableLog,
     blobs: &BlobStore,
-    state: &RefCell<ControlPlaneState>,
+    state: &Mutex<ControlPlaneState>,
     namespace: &Namespace,
     request: ControlRequest,
 ) -> ControlResponse {
@@ -460,7 +460,7 @@ async fn handle_request(
             replicas,
         } => {
             let module = state
-                .borrow()
+                .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                 .deployment(namespace, &workload_id)
                 .map(|deployment| deployment.module.clone())
                 .unwrap_or_default();
@@ -505,7 +505,7 @@ async fn handle_request(
             accept_delegated(&workload_id, 0, String::new(), request)
         }
         ControlRequest::Status { workload_id } => ControlResponse::Status {
-            deployment: state.borrow().deployment(namespace, &workload_id).cloned(),
+            deployment: state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).deployment(namespace, &workload_id).cloned(),
         },
     }
 }
@@ -514,13 +514,13 @@ async fn handle_request(
 /// projection, keeping the store of record and the read model in step.
 fn record(
     log: &DurableLog,
-    state: &RefCell<ControlPlaneState>,
+    state: &Mutex<ControlPlaneState>,
     record: DesiredStateRecord,
 ) -> selium_guest::Result<()> {
     let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
     let payload = FlatMsg::encode(&record);
     log.append(timestamp_ms, Vec::new(), payload)?;
-    state.borrow_mut().apply_record(record);
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_record(record);
     Ok(())
 }
 

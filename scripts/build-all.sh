@@ -173,11 +173,49 @@ build_atomics_guest() {
   cargo build --target "$target" -p selium-net-demo
 }
 
+# ---------------------------------------------------------------------------
+# Multithreaded (mt-demo) guest build
+# ---------------------------------------------------------------------------
+# The ignored `sdk_mt_demo_guest_runs_two_cpu_bound_tasks_in_parallel` test
+# needs the `selium-mt-demo` guest built with the same atomics target as the
+# net-demo atomics flavour, PLUS `--export=__stack_pointer`. That export is the
+# wasm-threads shadow-stack convention: the runtime's engine resolves the
+# module's stack-pointer global from it and gives each concurrent invocation
+# its own shadow stack, so two workers entering one shared instance do not
+# overlap frames. Without the export the engine cannot identify the stack
+# global and leaves the module on the shared stack (unsafe to enter
+# concurrently). The atomics module is kept at a distinct
+# `selium_mt_demo_atomics.wasm` so it does not collide with a plain build.
+build_mt_demo_guest() {
+  local target="wasm32-unknown-unknown"
+  local target_root="${CARGO_TARGET_DIR:-$ROOT/target}"
+
+  if ! rustc +nightly --version >/dev/null 2>&1; then
+    echo "error: the mt-demo atomics build needs a nightly toolchain" >&2
+    echo "  rustup toolchain install nightly --component rust-src --target $target" >&2
+    exit 1
+  fi
+
+  echo "Building atomics mt-demo guest"
+  rm -f "$target_root/$target/debug/selium_mt_demo.wasm"
+
+  RUSTFLAGS="$ATOMICS_RUSTFLAGS -C link-arg=--export=__stack_pointer" \
+    cargo +nightly build -Zbuild-std=std,panic_abort \
+      --target "$target" \
+      -p selium-mt-demo \
+      --features selium-guest/nightly-wasm-atomics
+
+  cp "$target_root/$target/debug/selium_mt_demo.wasm" \
+    "$target_root/$target/debug/selium_mt_demo_atomics.wasm"
+}
+
 if [ "$ATOMICS_ONLY" = "1" ]; then
   build_atomics_guest
+  build_mt_demo_guest
   exit 0
 fi
 
 build_dir crates
 build_dir guests --target wasm32-unknown-unknown
 build_atomics_guest
+build_mt_demo_guest

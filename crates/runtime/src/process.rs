@@ -30,7 +30,23 @@ impl Runtime {
                 return Err(error.into());
             }
         }
-        self.loaded_guests.lock().remove(&process_id);
+        // A multithreaded guest's worker pool must be stopped and joined
+        // before its resources are reclaimed. Cooperative guests are simply
+        // unloaded (they are never polled again). The `loaded_guests` guard is
+        // released before `stop_and_join` so a wedged pool's stop spin (up to
+        // `STOP_BUDGET`) never holds the map lock — which wake delivery and
+        // spawn also take.
+        let multithreaded = self
+            .loaded_guests
+            .lock()
+            .remove(&process_id)
+            .and_then(|guest| match guest.execution {
+                crate::bootstrap::GuestExecution::Multithreaded(mt) => Some(mt),
+                _ => None,
+            });
+        if let Some(mt) = multithreaded {
+            mt.stop_and_join(self, process_id);
+        }
         // Capture the authority before it is dropped so cleanup can revoke
         // the process's typed URIs, and re-insert it if teardown fails so a
         // retry re-enters the cleanup path.
@@ -204,7 +220,15 @@ impl Runtime {
         self.loaded_guests
             .lock()
             .get(&process_id)
-            .map(|guest| guest.module_index)
+            .and_then(|guest| match &guest.execution {
+                crate::bootstrap::GuestExecution::Cooperative { module_index, .. } => {
+                    Some(*module_index)
+                }
+                // A multithreaded guest runs over a shared AOT instance with no
+                // single entrypoint module index; report absence rather than a
+                // fabricated index.
+                crate::bootstrap::GuestExecution::Multithreaded(_) => None,
+            })
     }
 
     /// Returns entrypoint execution results for a loaded guest, if available.
@@ -220,11 +244,31 @@ impl Runtime {
         self.loaded_guests.lock().len()
     }
 
+    /// Returns the provisioned worker-pool size of a multithreaded guest, if
+    /// the process runs on the multithreaded execution path.
+    pub fn multithreaded_worker_count(&self, process_id: ProcessId) -> Option<usize> {
+        self.loaded_guests.lock().get(&process_id).and_then(|guest| {
+            match &guest.execution {
+                crate::bootstrap::GuestExecution::Multithreaded(mt) => Some(mt.worker_count),
+                crate::bootstrap::GuestExecution::Cooperative { .. } => None,
+            }
+        })
+    }
+
     /// Drives a process's guest reactor until it stalls, reaping the process
     /// if its poll-owner entrypoint completed. Test/integration hook.
     #[doc(hidden)]
     pub fn poll_guest(&self, process_id: ProcessId) {
         self.poll_guest_until_stalled(process_id);
+    }
+
+    /// Delivers a wake to a guest task through the process's wake path
+    /// (mailbox + inline reactor poll for cooperative guests; parking-word
+    /// notify for multithreaded guests). Test/integration hook mirroring the
+    /// kernel poller's `note_generation_advance` wake delivery.
+    #[doc(hidden)]
+    pub fn wake_guest_task(&self, process_id: ProcessId, task_id: selium_abi::TaskId) {
+        self.wake_process_task(process_id, task_id);
     }
 
     /// Registers module bytes under an id, rejecting conflicting bytes.
@@ -311,8 +355,20 @@ impl Runtime {
         drop(self.kernel.processes().stop_process(process_id));
         // A failed guest is never polled again: unload it. Idempotent —
         // callers that already removed the `LoadedGuest` (e.g. the poll path)
-        // find nothing here.
-        self.loaded_guests.lock().remove(&process_id);
+        // find nothing here. As in `stop_process`, the `loaded_guests` guard
+        // is released before `stop_and_join` so the wedged-pool stop spin does
+        // not hold the map lock.
+        let multithreaded = self
+            .loaded_guests
+            .lock()
+            .remove(&process_id)
+            .and_then(|guest| match guest.execution {
+                crate::bootstrap::GuestExecution::Multithreaded(mt) => Some(mt),
+                _ => None,
+            });
+        if let Some(mt) = multithreaded {
+            mt.stop_and_join(self, process_id);
+        }
         self.operations
             .lock()
             .retain(|_, operation| operation.process_id != process_id);
@@ -773,7 +829,39 @@ impl Runtime {
             );
             return;
         }
-        self.poll_guest_until_stalled(process_id);
+        if self.guest_is_multithreaded(process_id) {
+            // Wake delivery by notify: bump the task's parking word and kick a
+            // parked worker so it resumes in place — the waking thread never
+            // drives the guest's reactor as a unit (see the
+            // channel-wake-wait and guest-worker-pool specs).
+            if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned() {
+                let _ = mailbox.bump_task_parking_word(task_id);
+                // Bump the shared wake word before notifying, mirroring
+                // `set_stop`'s futex discipline: a notify that fires between a
+                // worker's re-check and its `wait32` registration would be
+                // consumed by nobody, so the word bump makes the worker's
+                // subsequent wait return on the value mismatch instead of
+                // sleeping to the timeout.
+                let _ = mailbox.bump_wake_word();
+                let _ = mailbox.notify_wake_word(1);
+            }
+        } else {
+            self.poll_guest_until_stalled(process_id);
+        }
+    }
+
+    /// True when the process runs on the multithreaded worker pool (its
+    /// module exports the worker entry) rather than the cooperative reactor.
+    fn guest_is_multithreaded(&self, process_id: ProcessId) -> bool {
+        self.loaded_guests
+            .lock()
+            .get(&process_id)
+            .is_some_and(|guest| {
+                matches!(
+                    guest.execution,
+                    crate::bootstrap::GuestExecution::Multithreaded(_)
+                )
+            })
     }
 
     /// Records a guest task's interest in a generation advance on a region.
@@ -1014,10 +1102,17 @@ impl Runtime {
         let Some(mut loaded_guest) = self.loaded_guests.lock().remove(&process_id) else {
             return false;
         };
-        let result =
-            loaded_guest
-                .app
-                .call_function(loaded_guest.module_index, "__selium_guest_poll", &[]);
+        let result = match &mut loaded_guest.execution {
+            crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
+                app.call_function(*module_index, "__selium_guest_poll", &[])
+            }
+            crate::bootstrap::GuestExecution::Multithreaded(_) => {
+                // A multithreaded guest is never poll-driven: re-insert and
+                // report no progress so the caller does not loop.
+                self.loaded_guests.lock().insert(process_id, loaded_guest);
+                return false;
+            }
+        };
         // Kick outbound network proxies on reactor stall — the guest may
         // have written outbound frames before parking.
         self.kick_network_waiters();
@@ -1402,8 +1497,10 @@ mod tests {
     }
 
     /// Task 4.2: many threads deliver wakes to one guest concurrently.
-    /// Every wake must be enqueued exactly once (tail counts monotonically)
-    /// and the runtime must stay consistent — no lost or corrupted wakes.
+    /// The ring is bounded (`CAPACITY` slots), so with no consumer draining it
+    /// the first `CAPACITY` wakes fill it and the rest are skipped rather than
+    /// overwriting unread wakes; the concurrent enqueues must never tear the
+    /// tail counter (it advances to exactly `CAPACITY`).
     #[test]
     fn concurrent_wake_delivery_never_loses_wakes() {
         let runtime = Arc::new(Runtime::default());
@@ -1426,8 +1523,10 @@ mod tests {
             handle.join().expect("waker thread");
         }
 
-        // Total delivered wakes == THREADS * WAKES_PER_THREAD, observable
-        // as the mailbox tail counter.
+        // With no consumer, the ring fills to exactly `CAPACITY`: the tail
+        // advances by one per successful enqueue and then stops (further wakes
+        // are skipped, not overwritten — the multithreaded notify path still
+        // delivers them). Concurrent enqueues must not tear or over-advance it.
         let mailboxes = runtime.mailboxes.lock();
         let mb = mailboxes.get(&pid).expect("mailbox registered");
         let tail = mb
@@ -1438,8 +1537,8 @@ mod tests {
             .expect("read tail");
         assert_eq!(
             tail as usize,
-            THREADS * WAKES_PER_THREAD,
-            "every concurrent wake must be enqueued exactly once"
+            selium_abi::mailbox::CAPACITY,
+            "a full ring must stop enqueuing rather than overwrite unread wakes"
         );
     }
 

@@ -18,6 +18,7 @@ pub mod keyring;
 mod mailbox;
 mod metering;
 mod module_probe;
+mod multithreaded;
 mod network;
 mod process;
 mod region_provider;

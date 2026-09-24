@@ -144,6 +144,10 @@ pub struct Runtime {
     /// projects fresh per-process observations on the sampling cadence so
     /// the bookkeeper's `MeteringRead` polls observe live consumption.
     pub(crate) metering_ticker_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-guest worker-count overrides for multithreaded execution, keyed by
+    /// system guest name. Absent entries default to the number of available
+    /// CPU cores (the pool never exceeds it unless explicitly configured).
+    pub(crate) worker_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Runtime {
@@ -190,6 +194,7 @@ impl Runtime {
             keyring: Arc::new(Mutex::new(None)),
             metering: Arc::new(Mutex::new(crate::metering::MeteringProjector::default())),
             metering_ticker_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker_counts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Initialise the mio network poller if possible (best-effort).
@@ -280,6 +285,39 @@ impl Runtime {
         } else {
             Ok(())
         }
+    }
+
+    /// Returns the registered mailbox of `process_id`, if the guest has
+    /// registered one (the guest calls `mailbox_register` during init).
+    pub(crate) fn mailbox(&self, process_id: ProcessId) -> Option<Arc<GuestMailbox>> {
+        self.mailboxes.lock().get(&process_id).cloned()
+    }
+
+    /// Configures the worker-pool size for a multithreaded system guest by
+    /// name. Unconfigured guests default to the number of available CPU
+    /// cores (never exceeding it unless this override is set).
+    ///
+    /// The count is clamped to at least one worker: a zero-worker pool would
+    /// have no thread to run the guest, and the monitor would reap the
+    /// process the instant it spawned.
+    pub fn set_worker_count(&self, guest_name: &str, count: usize) {
+        self.worker_counts
+            .lock()
+            .insert(guest_name.to_string(), count.max(1));
+    }
+
+    /// Resolves the worker-pool size for a multithreaded guest: the explicit
+    /// per-guest override, or the available-core default.
+    pub fn worker_count_for(&self, guest_name: &str) -> usize {
+        self.worker_counts
+            .lock()
+            .get(guest_name)
+            .copied()
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(1)
+            })
     }
 }
 

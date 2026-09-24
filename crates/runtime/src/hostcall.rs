@@ -414,11 +414,20 @@ impl Runtime {
                 let to_detach: Vec<ProcessId> = guests.keys().copied().collect();
                 for pid in to_detach {
                     if let Some(guest) = guests.get_mut(&pid) {
-                        drop(
-                            guest
-                                .app
-                                .detach_shared_region(guest.module_index, wasm_region_id),
-                        );
+                        match &mut guest.execution {
+                            crate::bootstrap::GuestExecution::Cooperative {
+                                app,
+                                module_index,
+                            } => {
+                                drop(app.detach_shared_region(*module_index, wasm_region_id));
+                            }
+                            // The AOT instance detaches from the shared
+                            // linear memory; its mapping list tracks the
+                            // attachment the same way the interpreter's does.
+                            crate::bootstrap::GuestExecution::Multithreaded(mt) => {
+                                drop(mt.detach_shared_region(wasm_region_id));
+                            }
+                        }
                     }
                 }
                 drop(guests);
@@ -513,20 +522,35 @@ impl Runtime {
                             "process not found for AttachRegion",
                         )
                     })?;
-                    let page_offset = guest
-                        .app
-                        .attach_shared_region(
-                            guest.module_index,
-                            wasm_region_id,
-                            to_wasm_prot(prot),
-                            reader_slot,
-                        )
-                        .map_err(|e| {
-                            AbiError::new(
-                                AbiErrorCode::Internal,
-                                format!("attach shared region failed: {e}"),
+                    let page_offset = match &mut guest.execution {
+                        crate::bootstrap::GuestExecution::Cooperative {
+                            app,
+                            module_index,
+                        } => app
+                            .attach_shared_region(
+                                *module_index,
+                                wasm_region_id,
+                                to_wasm_prot(prot),
+                                reader_slot,
                             )
-                        })?;
+                            .map_err(|e| {
+                                AbiError::new(
+                                    AbiErrorCode::Internal,
+                                    format!("attach shared region failed: {e}"),
+                                )
+                            })?,
+                        // The AOT instance maps the region into the guest's
+                        // shared linear memory; safe while the worker pool
+                        // executes (see MultithreadedGuest::attach_shared_region).
+                        crate::bootstrap::GuestExecution::Multithreaded(mt) => mt
+                            .attach_shared_region(wasm_region_id, to_wasm_prot(prot), reader_slot)
+                            .map_err(|e| {
+                                AbiError::new(
+                                    AbiErrorCode::Internal,
+                                    format!("attach shared region failed: {e}"),
+                                )
+                            })?,
+                    };
                     drop(guests);
                     page_offset
                 };

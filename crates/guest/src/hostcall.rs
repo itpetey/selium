@@ -7,7 +7,7 @@ use selium_abi::{
 
 use crate::{
     GuestError, Result,
-    async_runtime::current_task_id,
+    async_runtime::task_id_from_waker,
     error::abi_error_to_guest_error,
     platform::{selium_hostcall_create, selium_hostcall_drop, selium_hostcall_poll},
 };
@@ -20,9 +20,9 @@ pub(crate) struct HostcallFuture {
 impl Future for HostcallFuture {
     type Output = Result<HostcallOutput>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         if self.operation_id.is_none() {
-            let Some(task_id) = current_task_id() else {
+            let Some(task_id) = task_id_from_waker(cx.waker()) else {
                 return Poll::Ready(Err(GuestError::Host(
                     "async hostcall polled outside Selium guest reactor".to_string(),
                 )));

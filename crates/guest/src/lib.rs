@@ -1,5 +1,16 @@
 //! Selium guest SDK.
 
+// The `nightly-wasm-atomics` feature enables the genuine
+// `memory.atomic.wait32` / `memory.atomic.notify` WASM intrinsics the
+// multithreaded executor uses to park workers and deliver wake-by-notify.
+// Those intrinsics live behind the `stdarch_wasm_atomic_wait` feature gate on
+// nightly; gate the attribute so stable builds (without the cargo feature)
+// stay on the stable compiler.
+#![cfg_attr(
+    all(target_arch = "wasm32", feature = "nightly-wasm-atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 use crate::hostcall_region_provider::HostcallRegionProvider;
 
 pub use crate::{
@@ -65,4 +76,31 @@ pub fn init() -> Result<()> {
     }
     crate::platform::register_mailbox();
     Ok(())
+}
+
+/// The multithreaded worker entry export: the runtime calls this on each
+/// dedicated OS worker thread of a multithreaded guest, passing the worker's
+/// id, and the worker runs the shared executor over the guest's linear memory
+/// until the process exits. Emitted alongside the `__selium_guest_poll`
+/// entrypoint-exit-code export; `module_probe` uses its presence to select
+/// multithreaded execution.
+///
+/// The export is emitted **only for guests opting into multithreaded
+/// execution** (`multithreaded` feature) **and built with the atomics target**
+/// (`+atomics` + `--shared-memory`, the `nightly-wasm-atomics` feature): the
+/// executor's parking words and worker handoff require real atomics over
+/// shared linear memory, so a guest without both never carries the worker
+/// entry and the runtime falls back to the cooperative single-worker reactor.
+///
+/// Returns the poll-owner exit code (0 running / 1 completed) so a worker
+/// observing process completion reports it the same way the poll export does.
+#[cfg(all(
+    target_family = "wasm",
+    feature = "multithreaded",
+    target_feature = "atomics"
+))]
+#[unsafe(export_name = "__selium_guest_worker")]
+pub extern "C" fn __selium_guest_worker(worker_id: i32) -> i32 {
+    let worker_id = u32::try_from(worker_id).unwrap_or(0);
+    crate::async_runtime::worker_enter(worker_id, true)
 }

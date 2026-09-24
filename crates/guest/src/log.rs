@@ -4,7 +4,10 @@
 //! tracing subscriber integration. Log records are encoded as FlatBuffers
 //! and published to a Drop-backpressure channel as ready frames.
 
-use std::{cell::Cell, sync::OnceLock};
+use std::{
+    sync::OnceLock,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use selium_abi::{HostcallRequest, ResourceKind};
 use selium_memory::FrameHeader;
@@ -55,13 +58,16 @@ pub enum InitError {
 
 impl ForwardingGuard {
     /// Returns `Some(guard)` if not already forwarding, `None` if re-entrant.
+    ///
+    /// Process-wide, not per-thread: on `wasm32-unknown-unknown` a
+    /// `thread_local!` lowers to shared linear memory, so a per-thread flag is
+    /// shared across a multithreaded guest's workers anyway — and a plain
+    /// `Cell` raced between workers is a data race. One process-wide atomic
+    /// makes the guard correct and also serialises the log ring's single-
+    /// producer write path across workers (a concurrent forwarder is
+    /// suppressed, the same effective behaviour as before).
     fn enter() -> Option<Self> {
-        let was_forwarding = FORWARDING.with(|f| {
-            let prev = f.get();
-            f.set(true);
-            prev
-        });
-        if was_forwarding {
+        if FORWARDING.swap(true, Ordering::AcqRel) {
             None
         } else {
             Some(ForwardingGuard)
@@ -71,7 +77,7 @@ impl ForwardingGuard {
 
 impl Drop for ForwardingGuard {
     fn drop(&mut self) {
-        FORWARDING.with(|f| f.set(false));
+        FORWARDING.store(false, Ordering::Release);
     }
 }
 
@@ -135,12 +141,13 @@ impl Visit for EventVisitor {
     }
 }
 
-thread_local! {
-    /// Re-entrancy guard: suppresses log events triggered while forwarding.
-    static FORWARDING: Cell<bool> = const { Cell::new(false) };
-    /// Once-per-process guard for the panic hook's last-words record.
-    static PANIC_EMITTED: Cell<bool> = const { Cell::new(false) };
-}
+/// Process-wide re-entrancy guard: suppresses log events triggered while
+/// forwarding. Process-wide (an atomic, not `thread_local!`) so it also
+/// serialises the single-producer log-ring write across a multithreaded
+/// guest's workers — see [`ForwardingGuard::enter`].
+static FORWARDING: AtomicBool = AtomicBool::new(false);
+/// Once-per-process guard for the panic hook's last-words record.
+static PANIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Returns the log channel handle if initialised.
 pub fn channel() -> Option<&'static Channel> {
@@ -207,11 +214,7 @@ pub fn init_with_capacity(capacity: u64) -> Result<(), InitError> {
 /// channel is silently ignored: logging must never stand in the way of the
 /// abort that follows.
 fn emit_panic_record(info: &std::panic::PanicHookInfo<'_>) {
-    let already_emitted = PANIC_EMITTED.with(|emitted| {
-        let was = emitted.get();
-        emitted.set(true);
-        was
-    });
+    let already_emitted = PANIC_EMITTED.swap(true, Ordering::AcqRel);
     if already_emitted {
         return;
     }

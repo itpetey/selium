@@ -19,7 +19,7 @@
 //! root-namespace RPC listener: `SetPlan`/`SetOverage` author the ceilings and
 //! `MarkDelinquent`/`MarkRestored` drive the rare billing-state transitions.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -216,7 +216,7 @@ struct Shared {
     accounts: AccountBook,
     ledger: DurableLog,
     buckets: Subscriber<MeteringBucket, ShmTransport>,
-    narrowing: Rc<LiveTable<String, Vec<u8>, ShmTransport>>,
+    narrowing: Arc<LiveTable<String, Vec<u8>, ShmTransport>>,
     window: Option<RollingWindow>,
 }
 
@@ -700,9 +700,9 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     // The narrowing live table consumed by the bridge-server.
     let (narrowing_region, narrowing) = create_live_table(TOPIC_CAPACITY)
         .map_err(|e| anyhow::anyhow!("accountant: narrowing table create failed: {e}"))?;
-    let narrowing = Rc::new(narrowing);
+    let narrowing = Arc::new(narrowing);
 
-    let shared = Rc::new(RefCell::new(Shared {
+    let shared = Arc::new(Mutex::new(Shared {
         accounts,
         ledger,
         buckets,
@@ -713,7 +713,7 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     // Re-author enforcement for every replayed tenant (covers a restart where
     // a tenant's policy records predate this boot).
     {
-        let mut shared = shared.borrow_mut();
+        let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tenants: Vec<String> = shared.accounts.accounts.keys().cloned().collect();
         for tenant in tenants {
             shared.author_enforcement(&tenant);
@@ -787,7 +787,7 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
 
 /// Applies one operator/billing control to the shared state.
 fn apply_control(
-    shared: &Rc<RefCell<Shared>>,
+    shared: &Arc<Mutex<Shared>>,
     control: AccountantControl,
 ) -> AccountantControlResponse {
     let (tenant, record) = match control {
@@ -818,7 +818,7 @@ fn apply_control(
     };
 
     {
-        let mut shared = shared.borrow_mut();
+        let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         shared.apply_policy(&tenant, record);
     }
 
@@ -958,7 +958,7 @@ fn create_live_table(capacity: u64) -> selium_wire::Result<(u64, NarrowingLiveTa
 /// plans, budgets, and billing-state transitions.
 async fn handle_control(
     mut connection: selium_shm::rpc::RpcConnection<AccountantControl, AccountantControlResponse>,
-    shared: Rc<RefCell<Shared>>,
+    shared: Arc<Mutex<Shared>>,
 ) {
     let operator = match process_tenant(connection.client_process_id()) {
         Ok(None) => true,
@@ -1012,7 +1012,7 @@ fn roll_due(shared: &mut Shared) -> Vec<LedgerRecord> {
 
 /// The rolling loop: drains bookkeeper buckets into the current minute window
 /// and rolls a completed window into the ledger, re-evaluating enforcement.
-async fn roll_loop(shared: Rc<RefCell<Shared>>) {
+async fn roll_loop(shared: Arc<Mutex<Shared>>) {
     loop {
         // Drain available buckets into the current window, rolling when the
         // minute has elapsed. The read is scoped so its `RefMut` drops before
@@ -1020,10 +1020,10 @@ async fn roll_loop(shared: Rc<RefCell<Shared>>) {
         // whole statement, so reading inline would double-borrow the `RefCell`
         // and panic the guest (a wasm trap kills the reactor permanently).
         loop {
-            let read = shared.borrow_mut().buckets.read_with_tag();
+            let read = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).buckets.read_with_tag();
             match read {
                 Ok((bucket, _tag)) => {
-                    let mut shared = shared.borrow_mut();
+                    let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     // Roll the elapsed window BEFORE merging: the merge
                     // starts the next minute's window, and rolling first
                     // guarantees the completed window reaches the ledger
@@ -1045,7 +1045,7 @@ async fn roll_loop(shared: Rc<RefCell<Shared>>) {
 
         // A minute ticks even without traffic: roll an elapsed window.
         {
-            let mut shared = shared.borrow_mut();
+            let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let records = roll_due(&mut shared);
             for record in records {
                 if let LedgerRecord::Window { tenant, .. } = &record {

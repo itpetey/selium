@@ -9,7 +9,8 @@
 //! tenant-scoped; the empty tenant is the reserved root namespace.
 
 use std::{
-    cell::RefCell, collections::BTreeMap, collections::BTreeSet, collections::HashMap, rc::Rc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::Context as _;
@@ -549,7 +550,7 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
     );
     selium_guest::mark_ready();
 
-    let store = Rc::new(RefCell::new(DiscoveryStore::default()));
+    let store = Arc::new(Mutex::new(DiscoveryStore::default()));
 
     // Spawn the feed processing loop.
     selium_guest::spawn(feed_loop(store.clone(), feed_subscriber));
@@ -579,12 +580,12 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
 }
 
 async fn feed_loop(
-    store: Rc<RefCell<DiscoveryStore>>,
+    store: Arc<Mutex<DiscoveryStore>>,
     mut subscriber: Subscriber<DiscoveryRequest, ShmTransport>,
 ) {
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => store.borrow_mut().apply_tier1_event(request),
+            Ok((request, _tag)) => store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_tier1_event(request),
             Err(selium_wire::error::Error::BufferEmpty) => {
                 selium_guest::yield_now().await;
             }
@@ -597,7 +598,7 @@ async fn feed_loop(
 }
 
 async fn handler(
-    store: Rc<RefCell<DiscoveryStore>>,
+    store: Arc<Mutex<DiscoveryStore>>,
     mut conn: selium_shm::rpc::RpcConnection<DiscoveryRequest, DiscoveryResponse>,
 ) {
     let client_process_id = conn.client_process_id();
@@ -617,7 +618,7 @@ async fn handler(
         match conn.recv().await {
             Ok(request) => {
                 let response = {
-                    let mut store = store.borrow_mut();
+                    let mut store = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match request.payload() {
                         Ok(payload) if !scope_verified => denied_response(&payload),
                         Ok(payload) => match payload {
