@@ -1,14 +1,18 @@
 use crate::async_runtime::wake_task;
 
+static mut MAILBOX: [u32; MAILBOX_WORDS] = [0; MAILBOX_WORDS];
+const MAILBOX_WORDS: usize = selium_abi::mailbox::BYTE_LEN / 4;
+/// Set once the mailbox area has been zeroed for this process (see
+/// [`register_mailbox`]). The zeroing is a one-time initialisation: a repeat
+/// of it on every reactor entry would wipe host-enqueued wakes (the ring,
+/// flag, head, and tail) that arrived between polls.
+static MAILBOX_ZEROED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Liveness bound for a worker parked on the shared wake word, in
 /// nanoseconds (250 ms): a worker that misses a notify — e.g. a stop or
 /// exit signal delivered while it was between its exit-check and its waiter
 /// registration — re-checks and re-parks at most this often, so no signal
 /// can be slept through indefinitely.
 const PARK_TIMEOUT_NANOS: u64 = 250_000_000;
-
-static mut MAILBOX: [u32; MAILBOX_WORDS] = [0; MAILBOX_WORDS];
-const MAILBOX_WORDS: usize = selium_abi::mailbox::BYTE_LEN / 4;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "selium")]
@@ -41,6 +45,27 @@ pub fn mark_ready() {
 pub fn process_id() -> u64 {
     // SAFETY: `selium_process_id` is a host import with no safety invariants.
     unsafe { selium_process_id() }
+}
+
+/// Bumps the host-visible parking word of `task_id` — the mirror of the
+/// task's internal wake counter in the shared ABI layout. Returns the
+/// previous value, or `None` when the task id is beyond the parking-word
+/// table (those tasks fall back to the ring mailbox wake path).
+pub(crate) fn bump_task_parking_word(task_id: selium_abi::TaskId) -> Option<u32> {
+    let offset = selium_abi::mailbox::parking_word_offset(task_id)?;
+    // SAFETY: `offset` is a bounds-checked mailbox constant within the
+    // parking-word table.
+    Some(unsafe { (*mailbox_cell(offset)).fetch_add(1, std::sync::atomic::Ordering::Release) })
+}
+
+/// Bumps the shared wake word, signalling parked workers to re-check the run
+/// queue. Returns the previous value.
+pub(crate) fn bump_wake_word() -> u32 {
+    // SAFETY: the wake word is a valid AtomicU32 within the mailbox.
+    unsafe {
+        (*mailbox_cell(selium_abi::mailbox::WAKE_WORD_OFFSET))
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+    }
 }
 
 pub(crate) fn drain_mailbox() {
@@ -90,59 +115,6 @@ pub(crate) fn drain_mailbox() {
     unsafe { (*flag_ptr).store(0, std::sync::atomic::Ordering::Release) };
 }
 
-/// Set once the mailbox area has been zeroed for this process (see
-/// [`register_mailbox`]). The zeroing is a one-time initialisation: a repeat
-/// of it on every reactor entry would wipe host-enqueued wakes (the ring,
-/// flag, head, and tail) that arrived between polls.
-static MAILBOX_ZEROED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn register_mailbox() {
-    // Zero the whole shared area (ring + wake word + parking-word table) once,
-    // at first executor entry, so a fresh process — or a fresh native test —
-    // starts from a clean slate. Wasm linear memory is zero-initialised, so
-    // this only matters for native test binaries, but it is cheap and exact.
-    // SAFETY: the zeroing is guarded by the one-time `MAILBOX_ZEROED` swap,
-    // so concurrent first entries cannot race it — exactly one caller zeroes
-    // and the others observe the swap's happens-before edge.
-    if !MAILBOX_ZEROED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        unsafe {
-            let base = mailbox_base().cast::<u32>();
-            for index in 0..MAILBOX_WORDS {
-                base.add(index).write(0);
-            }
-        }
-    }
-    // SAFETY: The mailbox is a static mutable array; the capacity store and
-    // the host registration below are mediated by the host import and are
-    // idempotent, so repeat entries (cooperative polls re-register) are
-    // safe.
-    let capacity_ptr = unsafe { mailbox_cell(selium_abi::mailbox::CAPACITY_OFFSET) };
-    // SAFETY: `capacity_ptr` points to a valid AtomicU32 within the mailbox.
-    unsafe {
-        (*capacity_ptr).store(
-            selium_abi::mailbox::CAPACITY as u32,
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-    // SAFETY: `selium_mailbox_register` is a host import that registers the
-    // mailbox with the runtime. It is safe to call once during initialisation.
-    unsafe {
-        selium_mailbox_register(mailbox_base(), selium_abi::mailbox::BYTE_LEN);
-    }
-}
-
-/// Returns whether the host has requested the guest process to stop (the ABI
-/// stop word is set). Multithreaded workers check this when woken and return
-/// from the worker entry, so the host can tear a process down without
-/// driving the reactor.
-pub(crate) fn stop_requested() -> bool {
-    // SAFETY: the stop word is a valid AtomicU32 within the mailbox.
-    unsafe {
-        (*mailbox_cell(selium_abi::mailbox::STOP_OFFSET)).load(std::sync::atomic::Ordering::Acquire)
-            != 0
-    }
-}
-
 /// Returns whether the host has queued mailbox wakes (the ring holds unread
 /// entries: `head != tail`).
 ///
@@ -159,39 +131,6 @@ pub(crate) fn mailbox_has_pending() -> bool {
             .load(std::sync::atomic::Ordering::Acquire);
         head != tail
     }
-}
-
-/// Returns the current value of the shared wake word (the word parked workers
-/// wait on). The worker compares this against the value observed before
-/// parking; a divergence means a wake arrived and the park must be skipped.
-pub(crate) fn wake_word_value() -> u32 {
-    // SAFETY: the wake word is a valid AtomicU32 within the mailbox.
-    unsafe { (*mailbox_cell(selium_abi::mailbox::WAKE_WORD_OFFSET)).load(std::sync::atomic::Ordering::Acquire) }
-}
-
-/// Bumps the shared wake word, signalling parked workers to re-check the run
-/// queue. Returns the previous value.
-pub(crate) fn bump_wake_word() -> u32 {
-    // SAFETY: the wake word is a valid AtomicU32 within the mailbox.
-    unsafe {
-        (*mailbox_cell(selium_abi::mailbox::WAKE_WORD_OFFSET))
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-    }
-}
-
-/// Bumps the host-visible parking word of `task_id` — the mirror of the
-/// task's internal wake counter in the shared ABI layout. Returns the
-/// previous value, or `None` when the task id is beyond the parking-word
-/// table (those tasks fall back to the ring mailbox wake path).
-pub(crate) fn bump_task_parking_word(task_id: selium_abi::TaskId) -> Option<u32> {
-    let offset = selium_abi::mailbox::parking_word_offset(task_id)?;
-    // SAFETY: `offset` is a bounds-checked mailbox constant within the
-    // parking-word table.
-    Some(
-        unsafe {
-            (*mailbox_cell(offset)).fetch_add(1, std::sync::atomic::Ordering::Release)
-        },
-    )
 }
 
 /// Notifies one worker parked on the shared wake word.
@@ -269,14 +208,39 @@ pub(crate) fn park_on_wake_word(expected: u32) {
     }
 }
 
-/// Address of the shared wake word: the native futex key and the wasm wait
-/// address for parked workers.
-///
-/// Stable WASM (cooperative mode) never parks, so the address is only needed
-/// on native and `nightly-wasm-atomics` builds.
-#[cfg(any(not(target_arch = "wasm32"), feature = "nightly-wasm-atomics"))]
-pub(crate) fn wake_word_address() -> usize {
-    mailbox_base().wrapping_add(selium_abi::mailbox::WAKE_WORD_OFFSET) as usize
+pub(crate) fn register_mailbox() {
+    // Zero the whole shared area (ring + wake word + parking-word table) once,
+    // at first executor entry, so a fresh process — or a fresh native test —
+    // starts from a clean slate. Wasm linear memory is zero-initialised, so
+    // this only matters for native test binaries, but it is cheap and exact.
+    // SAFETY: the zeroing is guarded by the one-time `MAILBOX_ZEROED` swap,
+    // so concurrent first entries cannot race it — exactly one caller zeroes
+    // and the others observe the swap's happens-before edge.
+    if !MAILBOX_ZEROED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        unsafe {
+            let base = mailbox_base().cast::<u32>();
+            for index in 0..MAILBOX_WORDS {
+                base.add(index).write(0);
+            }
+        }
+    }
+    // SAFETY: The mailbox is a static mutable array; the capacity store and
+    // the host registration below are mediated by the host import and are
+    // idempotent, so repeat entries (cooperative polls re-register) are
+    // safe.
+    let capacity_ptr = unsafe { mailbox_cell(selium_abi::mailbox::CAPACITY_OFFSET) };
+    // SAFETY: `capacity_ptr` points to a valid AtomicU32 within the mailbox.
+    unsafe {
+        (*capacity_ptr).store(
+            selium_abi::mailbox::CAPACITY as u32,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    // SAFETY: `selium_mailbox_register` is a host import that registers the
+    // mailbox with the runtime. It is safe to call once during initialisation.
+    unsafe {
+        selium_mailbox_register(mailbox_base(), selium_abi::mailbox::BYTE_LEN);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -292,6 +256,39 @@ pub(crate) unsafe fn selium_hostcall_drop(_: u64) -> u32 {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) unsafe fn selium_hostcall_poll(_: u64, _: *mut u8, _: usize) -> u64 {
     0
+}
+
+/// Returns whether the host has requested the guest process to stop (the ABI
+/// stop word is set). Multithreaded workers check this when woken and return
+/// from the worker entry, so the host can tear a process down without
+/// driving the reactor.
+pub(crate) fn stop_requested() -> bool {
+    // SAFETY: the stop word is a valid AtomicU32 within the mailbox.
+    unsafe {
+        (*mailbox_cell(selium_abi::mailbox::STOP_OFFSET)).load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+}
+
+/// Address of the shared wake word: the native futex key and the wasm wait
+/// address for parked workers.
+///
+/// Stable WASM (cooperative mode) never parks, so the address is only needed
+/// on native and `nightly-wasm-atomics` builds.
+#[cfg(any(not(target_arch = "wasm32"), feature = "nightly-wasm-atomics"))]
+pub(crate) fn wake_word_address() -> usize {
+    mailbox_base().wrapping_add(selium_abi::mailbox::WAKE_WORD_OFFSET) as usize
+}
+
+/// Returns the current value of the shared wake word (the word parked workers
+/// wait on). The worker compares this against the value observed before
+/// parking; a divergence means a wake arrived and the park must be skipped.
+pub(crate) fn wake_word_value() -> u32 {
+    // SAFETY: the wake word is a valid AtomicU32 within the mailbox.
+    unsafe {
+        (*mailbox_cell(selium_abi::mailbox::WAKE_WORD_OFFSET))
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 fn mailbox_base() -> *mut u8 {

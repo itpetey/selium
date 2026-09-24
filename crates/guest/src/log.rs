@@ -29,7 +29,14 @@ pub use selium_service::log::{LogField, LogLevel, LogRecord, LogSpan};
 
 /// Default log channel capacity in bytes (512 KB, matching prior art).
 const DEFAULT_LOG_CAPACITY: u64 = 512 * 1024;
+/// Process-wide re-entrancy guard: suppresses log events triggered while
+/// forwarding. Process-wide (an atomic, not `thread_local!`) so it also
+/// serialises the single-producer log-ring write across a multithreaded
+/// guest's workers — see [`ForwardingGuard::enter`].
+static FORWARDING: AtomicBool = AtomicBool::new(false);
 static LOGGING_STATE: OnceLock<LoggingState> = OnceLock::new();
+/// Once-per-process guard for the panic hook's last-words record.
+static PANIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Global logging state, initialised once via `init()`.
 struct LoggingState {
@@ -140,14 +147,6 @@ impl Visit for EventVisitor {
         });
     }
 }
-
-/// Process-wide re-entrancy guard: suppresses log events triggered while
-/// forwarding. Process-wide (an atomic, not `thread_local!`) so it also
-/// serialises the single-producer log-ring write across a multithreaded
-/// guest's workers — see [`ForwardingGuard::enter`].
-static FORWARDING: AtomicBool = AtomicBool::new(false);
-/// Once-per-process guard for the panic hook's last-words record.
-static PANIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Returns the log channel handle if initialised.
 pub fn channel() -> Option<&'static Channel> {

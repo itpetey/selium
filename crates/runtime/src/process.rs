@@ -247,12 +247,13 @@ impl Runtime {
     /// Returns the provisioned worker-pool size of a multithreaded guest, if
     /// the process runs on the multithreaded execution path.
     pub fn multithreaded_worker_count(&self, process_id: ProcessId) -> Option<usize> {
-        self.loaded_guests.lock().get(&process_id).and_then(|guest| {
-            match &guest.execution {
+        self.loaded_guests
+            .lock()
+            .get(&process_id)
+            .and_then(|guest| match &guest.execution {
                 crate::bootstrap::GuestExecution::Multithreaded(mt) => Some(mt.worker_count),
                 crate::bootstrap::GuestExecution::Cooperative { .. } => None,
-            }
-        })
+            })
     }
 
     /// Drives a process's guest reactor until it stalls, reaping the process

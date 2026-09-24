@@ -92,7 +92,10 @@ where
 
     /// Inserts or updates a value, publishing the change to the topic.
     pub fn set(&self, key: K, value: V) -> Result<()> {
-        let mut publisher = self.publisher.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut publisher = self
+            .publisher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
@@ -109,7 +112,12 @@ where
     /// Inserts or updates a value only when the current version matches `expected_version`.
     pub fn compare_and_set(&self, key: K, expected_version: u64, value: V) -> Result<u64> {
         self.sync()?;
-        let actual = self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).map(|record| record.version);
+        let actual = self
+            .local
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|record| record.version);
         if actual.unwrap_or(0) != expected_version {
             return Err(Error::CasConflict {
                 expected: expected_version,
@@ -117,7 +125,10 @@ where
             });
         }
 
-        let mut publisher = self.publisher.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut publisher = self
+            .publisher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
@@ -139,7 +150,10 @@ where
 
     /// Deletes a value, publishing the deletion to the topic.
     pub fn delete(&self, key: K) -> Result<()> {
-        let mut publisher = self.publisher.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut publisher = self
+            .publisher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mutation_id = publisher.allocate_mutation_id();
         let msg = LiveTableMessage {
             mutation_id,
@@ -160,7 +174,8 @@ where
     {
         Ok(self
             .local
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .and_then(|record| record.value.clone()))
     }
@@ -170,7 +185,12 @@ where
     where
         K: Eq + Hash,
     {
-        Ok(self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned())
+        Ok(self
+            .local
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned())
     }
 
     /// Returns the current version for a key, including tombstones from deletes.
@@ -178,7 +198,12 @@ where
     where
         K: Eq + Hash,
     {
-        Ok(self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).map(|entry| entry.version))
+        Ok(self
+            .local
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .map(|entry| entry.version))
     }
 
     /// Returns up to `limit` records from the local materialised view.
@@ -186,13 +211,25 @@ where
     where
         K: Clone + Eq + Hash,
     {
-        Ok(scan_entries(&self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner), limit))
+        Ok(scan_entries(
+            &self
+                .local
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            limit,
+        ))
     }
 
     /// Drains the subscriber to pick up remote writes.
     pub fn sync(&self) -> Result<()> {
-        let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut local = self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subscriber = self
+            .subscriber
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut local = self
+            .local
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match subscriber.read_with_tag() {
                 Ok((msg, _writer_id)) => {
@@ -218,11 +255,20 @@ where
     ///
     /// Synchronous poll so the `RwLock` guards never cross an `await` point.
     fn poll_next_message(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
-        let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subscriber = self
+            .subscriber
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match subscriber.read_with_tag() {
             Ok((msg, _writer_id)) => {
                 drop(subscriber);
-                apply_message_to(&mut self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner), msg);
+                apply_message_to(
+                    &mut self
+                        .local
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    msg,
+                );
                 std::task::Poll::Ready(Ok(()))
             }
             Err(Error::BufferEmpty) => match subscriber.reader_mut().poll_frame(cx) {
@@ -236,7 +282,13 @@ where
                             )));
                         }
                     };
-                    apply_message_to(&mut self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner), msg);
+                    apply_message_to(
+                        &mut self
+                            .local
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        msg,
+                    );
                     std::task::Poll::Ready(Ok(()))
                 }
                 std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
@@ -270,7 +322,10 @@ where
         expected_version: Option<u64>,
     ) -> Result<ApplyOutcome> {
         let mutation_id = {
-            let mut publisher = self.publisher.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut publisher = self
+                .publisher
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mutation_id = publisher.allocate_mutation_id();
             let msg = LiveTableMessage {
                 mutation_id,
@@ -281,7 +336,11 @@ where
             publisher.publish(&msg)?;
             mutation_id
         };
-        let own_writer_id = self.publisher.read().unwrap_or_else(std::sync::PoisonError::into_inner).writer_id();
+        let own_writer_id = self
+            .publisher
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .writer_id();
         std::future::poll_fn(|cx| self.poll_own_mutation(mutation_id, own_writer_id, cx)).await
     }
 
@@ -296,7 +355,10 @@ where
     ) -> std::task::Poll<Result<ApplyOutcome>> {
         loop {
             let (msg, writer_id) = {
-                let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut subscriber = self
+                    .subscriber
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match subscriber.reader_mut().poll_frame(cx) {
                     std::task::Poll::Ready(Ok((payload, tag, _flags))) => {
                         drop(subscriber);
@@ -316,7 +378,13 @@ where
             };
 
             let is_own_mutation = writer_id == own_writer_id && msg.mutation_id == mutation_id;
-            let outcome = apply_message_to(&mut self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner), msg);
+            let outcome = apply_message_to(
+                &mut self
+                    .local
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                msg,
+            );
             if is_own_mutation {
                 return std::task::Poll::Ready(Ok(outcome));
             }
@@ -324,9 +392,19 @@ where
     }
 
     fn sync_until_own_mutation(&self, mutation_id: u64) -> Result<ApplyOutcome> {
-        let own_writer_id = self.publisher.read().unwrap_or_else(std::sync::PoisonError::into_inner).writer_id();
-        let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut local = self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own_writer_id = self
+            .publisher
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .writer_id();
+        let mut subscriber = self
+            .subscriber
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut local = self
+            .local
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match subscriber.read_with_tag() {
                 Ok((msg, writer_id)) => {
@@ -368,7 +446,8 @@ where
     {
         Ok(self
             .local
-            .read().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .and_then(|record| record.value.clone()))
     }
@@ -378,7 +457,12 @@ where
     where
         K: Eq + Hash,
     {
-        Ok(self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned())
+        Ok(self
+            .local
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned())
     }
 
     /// Returns up to `limit` records from the local materialised view.
@@ -386,13 +470,25 @@ where
     where
         K: Clone + Eq + Hash,
     {
-        Ok(scan_entries(&self.local.read().unwrap_or_else(std::sync::PoisonError::into_inner), limit))
+        Ok(scan_entries(
+            &self
+                .local
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            limit,
+        ))
     }
 
     /// Drains the subscriber to pick up remote writes.
     pub fn sync(&self) -> Result<()> {
-        let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut local = self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subscriber = self
+            .subscriber
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut local = self
+            .local
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match subscriber.read_with_tag() {
                 Ok((msg, _writer_id)) => {
@@ -412,11 +508,20 @@ where
 
     /// Applies the next remote mutation, parking on the caller's waker.
     fn poll_next_message(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
-        let mut subscriber = self.subscriber.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut subscriber = self
+            .subscriber
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match subscriber.read_with_tag() {
             Ok((msg, _writer_id)) => {
                 drop(subscriber);
-                apply_message_to(&mut self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner), msg);
+                apply_message_to(
+                    &mut self
+                        .local
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    msg,
+                );
                 std::task::Poll::Ready(Ok(()))
             }
             Err(Error::BufferEmpty) => match subscriber.reader_mut().poll_frame(cx) {
@@ -430,7 +535,13 @@ where
                             )));
                         }
                     };
-                    apply_message_to(&mut self.local.write().unwrap_or_else(std::sync::PoisonError::into_inner), msg);
+                    apply_message_to(
+                        &mut self
+                            .local
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        msg,
+                    );
                     std::task::Poll::Ready(Ok(()))
                 }
                 std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),

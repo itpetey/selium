@@ -29,9 +29,8 @@
 //! `shared-page-fastpath` capability spec.
 
 const CODE_SECTION: u8 = 10;
-const MEMORY_SECTION: u8 = 5;
 const EXPORT_SECTION: u8 = 7;
-
+const MEMORY_SECTION: u8 = 5;
 /// The worker entry export name a multithreaded guest module must carry.
 /// Presence selects multithreaded execution (dedicated worker pool); absence
 /// falls back to the single-worker cooperative reactor.
@@ -142,6 +141,13 @@ pub fn probe(module: &[u8]) -> ModuleProbe {
     probe
 }
 
+/// True when the code section payload contains the `memory.atomic.notify`
+/// opcode sequence (`0xFE 0x00`). See the module docs for the false-positive
+/// analysis; there are no false negatives.
+fn scan_code_section(payload: &[u8]) -> bool {
+    payload.windows(2).any(|pair| pair == [0xFE, 0x00])
+}
+
 /// True when an export section payload declares the multithreaded worker
 /// entry export. Returns false on malformed input (the safe cooperative
 /// fallback).
@@ -175,13 +181,6 @@ fn scan_export_section(payload: &[u8]) -> bool {
         }
     }
     false
-}
-
-/// True when the code section payload contains the `memory.atomic.notify`
-/// opcode sequence (`0xFE 0x00`). See the module docs for the false-positive
-/// analysis; there are no false negatives.
-fn scan_code_section(payload: &[u8]) -> bool {
-    payload.windows(2).any(|pair| pair == [0xFE, 0x00])
 }
 
 /// True when any memory entry in a memory section payload sets the shared
@@ -316,7 +315,10 @@ mod tests {
     #[test]
     fn worker_entry_detection_is_exact() {
         // A similar-but-different name must not match.
-        let module = module(EXPORT_SECTION, &export_payload("__selium_guest_worker_extra"));
+        let module = module(
+            EXPORT_SECTION,
+            &export_payload("__selium_guest_worker_extra"),
+        );
         let probe = probe(&module);
         assert!(!probe.worker_entry);
     }

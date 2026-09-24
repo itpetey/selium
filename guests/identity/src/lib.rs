@@ -22,7 +22,10 @@
 //! may only act on its own tenant (issue user certificates, manage its own
 //! principals).
 
-use std::{collections::BTreeMap, sync::{Arc, Mutex}};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -462,7 +465,9 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
     let anchors = Arc::new(anchors);
     let grants = Arc::new(grants);
     {
-        let tenants = tenants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tenants = tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (tenant, cert) in tenants.entries() {
             if let Err(e) = anchors.set(anchor_key(tenant), cert.clone()) {
                 warn!("identity: anchor re-publish failed for {tenant}: {e}");
@@ -470,7 +475,9 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
         }
     }
     {
-        let principals = principals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let principals = principals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (fingerprint, grant_bytes) in principals.entries() {
             if let Err(e) = publish_grants(&grants, fingerprint, grant_bytes) {
                 warn!("identity: grant re-publish failed: {e}");
@@ -579,7 +586,8 @@ fn issue_user_cert(
     // already held by this principal across an issuance (a leaf rotation).
     let grants = state
         .principals
-        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .grants(&fingerprint)
         .cloned()
         .unwrap_or_default();
@@ -608,7 +616,8 @@ fn mint_tenant_ca(tenant: &str, state: &IdentityState) -> Result<(), String> {
 
     state
         .tenants
-        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(TenantRecord::Onboard {
             tenant: tenant.to_string(),
             ca_cert_der: ca_cert_der.clone(),
@@ -655,7 +664,11 @@ fn record_principal(tenant: &str, fingerprint: &[u8], grants: &[u8], state: &Ide
         }
         Err(error) => warn!("identity: principal record encode failed: {error}"),
     }
-    state.principals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_record(record);
+    state
+        .principals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_record(record);
 }
 
 /// Removes a principal's baseline grants.
@@ -679,7 +692,8 @@ fn remove_principal(tenant: &str, fingerprint: &[u8], state: &IdentityState) {
     }
     state
         .principals
-        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(PrincipalRecord::Remove {
             tenant: tenant.to_string(),
             fingerprint: fingerprint.to_vec(),
@@ -715,7 +729,8 @@ fn revoke_tenant(tenant: &str, state: &IdentityState) -> Result<(), String> {
 
     state
         .tenants
-        .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(TenantRecord::Revoke {
             tenant: tenant.to_string(),
         });

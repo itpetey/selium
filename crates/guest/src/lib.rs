@@ -63,21 +63,6 @@ mod resource;
 mod storage;
 pub mod time;
 
-/// Installs the hostcall-backed region provider and registers the mailbox
-/// reactor so the guest can allocate and share memory regions.
-///
-/// This should be called once per guest process, typically from an
-/// entrypoint before any I/O patterns are used. It is safe to call multiple
-/// times; subsequent calls are no-ops.
-pub fn init() -> Result<()> {
-    if selium_memory::region_provider().is_err() {
-        selium_memory::set_region_provider(Box::new(HostcallRegionProvider::new()))
-            .map_err(|error| GuestError::Host(error.to_string()))?;
-    }
-    crate::platform::register_mailbox();
-    Ok(())
-}
-
 /// The multithreaded worker entry export: the runtime calls this on each
 /// dedicated OS worker thread of a multithreaded guest, passing the worker's
 /// id, and the worker runs the shared executor over the guest's linear memory
@@ -103,4 +88,19 @@ pub fn init() -> Result<()> {
 pub extern "C" fn __selium_guest_worker(worker_id: i32) -> i32 {
     let worker_id = u32::try_from(worker_id).unwrap_or(0);
     crate::async_runtime::worker_enter(worker_id, true)
+}
+
+/// Installs the hostcall-backed region provider and registers the mailbox
+/// reactor so the guest can allocate and share memory regions.
+///
+/// This should be called once per guest process, typically from an
+/// entrypoint before any I/O patterns are used. It is safe to call multiple
+/// times; subsequent calls are no-ops.
+pub fn init() -> Result<()> {
+    if selium_memory::region_provider().is_err() {
+        selium_memory::set_region_provider(Box::new(HostcallRegionProvider::new()))
+            .map_err(|error| GuestError::Host(error.to_string()))?;
+    }
+    crate::platform::register_mailbox();
+    Ok(())
 }

@@ -63,7 +63,9 @@ mod waiters {
 
     /// Returns (or creates) the waiter entry for `key`.
     pub(crate) fn get_waiter(key: usize) -> Arc<Waiter> {
-        let mut map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key)
             .or_insert_with(|| {
                 Arc::new(Waiter {

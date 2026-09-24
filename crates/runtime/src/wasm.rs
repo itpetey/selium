@@ -47,6 +47,14 @@ pub(crate) fn decode_wasm_arguments(arguments: &[Vec<u8>]) -> Result<Vec<WasmVal
         .collect()
 }
 
+/// Encodes a single `WasmValue` into the tagged byte form expected by
+/// [`decode_wasm_arguments`].
+pub(crate) fn encode_wasm_value(value: WasmValue) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    value.to_bytes(&mut bytes);
+    bytes
+}
+
 pub(crate) fn guest_memory(caller: &HostCaller<'_>) -> wasmtiny::runtime::Result<SharedMemory> {
     caller
         .memory(0)
@@ -135,14 +143,6 @@ pub(crate) fn write_guest_memory(
         .lock()
         .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))?
         .write(ptr, bytes)
-}
-
-/// Encodes a single `WasmValue` into the tagged byte form expected by
-/// [`decode_wasm_arguments`].
-pub(crate) fn encode_wasm_value(value: WasmValue) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    value.to_bytes(&mut bytes);
-    bytes
 }
 
 /// Grows the guest's linear memory, copies `bytes` into it, and returns the

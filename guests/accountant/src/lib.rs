@@ -19,7 +19,11 @@
 //! root-namespace RPC listener: `SetPlan`/`SetOverage` author the ceilings and
 //! `MarkDelinquent`/`MarkRestored` drive the rare billing-state transitions.
 
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -713,7 +717,9 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     // Re-author enforcement for every replayed tenant (covers a restart where
     // a tenant's policy records predate this boot).
     {
-        let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shared = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tenants: Vec<String> = shared.accounts.accounts.keys().cloned().collect();
         for tenant in tenants {
             shared.author_enforcement(&tenant);
@@ -818,7 +824,9 @@ fn apply_control(
     };
 
     {
-        let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shared = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         shared.apply_policy(&tenant, record);
     }
 
@@ -1020,10 +1028,16 @@ async fn roll_loop(shared: Arc<Mutex<Shared>>) {
         // whole statement, so reading inline would double-borrow the `RefCell`
         // and panic the guest (a wasm trap kills the reactor permanently).
         loop {
-            let read = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).buckets.read_with_tag();
+            let read = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .buckets
+                .read_with_tag();
             match read {
                 Ok((bucket, _tag)) => {
-                    let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut shared = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     // Roll the elapsed window BEFORE merging: the merge
                     // starts the next minute's window, and rolling first
                     // guarantees the completed window reaches the ledger
@@ -1045,7 +1059,9 @@ async fn roll_loop(shared: Arc<Mutex<Shared>>) {
 
         // A minute ticks even without traffic: roll an elapsed window.
         {
-            let mut shared = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut shared = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let records = roll_due(&mut shared);
             for record in records {
                 if let LedgerRecord::Window { tenant, .. } = &record {

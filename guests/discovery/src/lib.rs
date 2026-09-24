@@ -585,7 +585,10 @@ async fn feed_loop(
 ) {
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_tier1_event(request),
+            Ok((request, _tag)) => store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .apply_tier1_event(request),
             Err(selium_wire::error::Error::BufferEmpty) => {
                 selium_guest::yield_now().await;
             }
@@ -618,7 +621,9 @@ async fn handler(
         match conn.recv().await {
             Ok(request) => {
                 let response = {
-                    let mut store = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut store = store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match request.payload() {
                         Ok(payload) if !scope_verified => denied_response(&payload),
                         Ok(payload) => match payload {

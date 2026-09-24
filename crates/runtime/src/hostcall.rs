@@ -415,10 +415,7 @@ impl Runtime {
                 for pid in to_detach {
                     if let Some(guest) = guests.get_mut(&pid) {
                         match &mut guest.execution {
-                            crate::bootstrap::GuestExecution::Cooperative {
-                                app,
-                                module_index,
-                            } => {
+                            crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
                                 drop(app.detach_shared_region(*module_index, wasm_region_id));
                             }
                             // The AOT instance detaches from the shared
@@ -523,10 +520,7 @@ impl Runtime {
                         )
                     })?;
                     let page_offset = match &mut guest.execution {
-                        crate::bootstrap::GuestExecution::Cooperative {
-                            app,
-                            module_index,
-                        } => app
+                        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => app
                             .attach_shared_region(
                                 *module_index,
                                 wasm_region_id,

@@ -37,7 +37,8 @@ use crate::{
 const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A multithreaded guest: one AOT instance shared by a pool of worker threads.
-pub(crate) struct MultithreadedGuest {    /// The shared AOT instance all workers enter concurrently.
+pub(crate) struct MultithreadedGuest {
+    /// The shared AOT instance all workers enter concurrently.
     instance: Arc<AotInstance>,
     /// Function index of the `__selium_guest_worker` export.
     worker_func: u32,
@@ -66,12 +67,11 @@ impl MultithreadedGuest {
     ) -> Result<Self> {
         let artifact = compile_artifact(module_bytes, &CompilerConfig::host())
             .map_err(|error| Error::Host(format!("AOT compilation failed: {error}")))?;
-        let module = AotLoader::new()
-            .load(&artifact)
-            .map_err(map_wasm_error)?;
+        let module = AotLoader::new().load(&artifact).map_err(map_wasm_error)?;
         let store = AotStore::shared();
         let imports = runtime.runtime_aot_imports(process_id);
-        let instance = AotInstance::instantiate(&store, &module, &imports).map_err(map_wasm_error)?;
+        let instance =
+            AotInstance::instantiate(&store, &module, &imports).map_err(map_wasm_error)?;
         let worker_func = instance
             .export_func_index(WORKER_ENTRY_EXPORT)
             .ok_or_else(|| {
@@ -125,7 +125,8 @@ impl MultithreadedGuest {
         prot: RegionProt,
         reader_slot: Option<u32>,
     ) -> wasmtiny::runtime::Result<u32> {
-        self.instance.attach_shared_region(region_id, prot, reader_slot)
+        self.instance
+            .attach_shared_region(region_id, prot, reader_slot)
     }
 
     /// Detaches a shared region from the guest's shared linear memory.
@@ -155,44 +156,40 @@ impl MultithreadedGuest {
             let spawned = std::thread::Builder::new()
                 .name(format!("selium-guest-worker-{process_id}-{worker_id}"))
                 .spawn(move || {
-                        let result = instance.invoke_shared(
-                            worker_func,
-                            &[WasmValue::I32(worker_id as i32)],
-                        );
-                        if let Err(error) = result {
-                            // A faulted worker: stop the remaining workers via
-                            // the ABI stop word + notify, and record the fault
-                            // for the monitor's reap. Each notify wakes exactly
-                            // one parked worker, so deliver one per worker (the
-                            // `set_stop` bump makes a worker that has not parked
-                            // yet return from its wait immediately, so no
-                            // delivery is lost).
-                            if let Some(mailbox) = worker_runtime.mailbox(process_id) {
-                                for _ in 0..count {
-                                    let _ = mailbox.set_stop();
-                                    let _ = mailbox.notify_wake_word(1);
-                                    std::thread::sleep(std::time::Duration::from_millis(1));
-                                }
-                            }
-                            // Record where the trap fired: the engine maps the
-                            // faulting PC to its wasm function index and code
-                            // offset, which is the only in-guest location
-                            // information available once the worker has faulted.
-                            let detail = match instance.last_trap_site() {
-                                Some((func, offset, _code)) => {
-                                    format!("{error} at wasm function {func}+{offset}")
-                                }
-                                None => error.to_string(),
-                            };
-                            let mut slot = fault.lock();
-                            if slot.is_none() {
-                                *slot = Some(detail);
+                    let result =
+                        instance.invoke_shared(worker_func, &[WasmValue::I32(worker_id as i32)]);
+                    if let Err(error) = result {
+                        // A faulted worker: stop the remaining workers via
+                        // the ABI stop word + notify, and record the fault
+                        // for the monitor's reap. Each notify wakes exactly
+                        // one parked worker, so deliver one per worker (the
+                        // `set_stop` bump makes a worker that has not parked
+                        // yet return from its wait immediately, so no
+                        // delivery is lost).
+                        if let Some(mailbox) = worker_runtime.mailbox(process_id) {
+                            for _ in 0..count {
+                                let _ = mailbox.set_stop();
+                                let _ = mailbox.notify_wake_word(1);
+                                std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }
-                    })
-                    .map_err(|error| {
-                        Error::Host(format!("worker thread spawn failed: {error}"))
-                    });
+                        // Record where the trap fired: the engine maps the
+                        // faulting PC to its wasm function index and code
+                        // offset, which is the only in-guest location
+                        // information available once the worker has faulted.
+                        let detail = match instance.last_trap_site() {
+                            Some((func, offset, _code)) => {
+                                format!("{error} at wasm function {func}+{offset}")
+                            }
+                            None => error.to_string(),
+                        };
+                        let mut slot = fault.lock();
+                        if slot.is_none() {
+                            *slot = Some(detail);
+                        }
+                    }
+                })
+                .map_err(|error| Error::Host(format!("worker thread spawn failed: {error}")));
             match spawned {
                 Ok(handle) => workers.push(handle),
                 Err(error) => {
@@ -304,20 +301,6 @@ impl MultithreadedGuest {
     }
 }
 
-/// Signals a guest's worker pool to return (ABI stop word + wake-word bump)
-/// without joining. Used when a pool cannot be fully provisioned: the workers
-/// already started observe the stop and exit instead of parking forever on an
-/// instance whose monitor will never join them.
-fn signal_stop(runtime: &Runtime, process_id: selium_abi::ProcessId) {
-    if let Some(mailbox) = runtime.mailbox(process_id) {
-        // `set_stop` also bumps the shared wake word, so a parked worker's
-        // `wait32` returns on the value mismatch and it re-checks the stop
-        // word; the notify covers a worker parked at the moment of the bump.
-        let _ = mailbox.set_stop();
-        let _ = mailbox.notify_wake_word(1);
-    }
-}
-
 /// The monitor's reap: classify whether the pool finished by fault or normal
 /// exit and tear the process down (idempotent with the runtime's stop path).
 fn monitor_finished(
@@ -340,11 +323,14 @@ fn monitor_finished(
             "multithreaded guest {process_id} workers exited; recent guest logs: {guest_logs:?}"
         ),
     };
-    runtime.kernel.processes().record_activity(selium_abi::ActivityEvent {
-        kind: selium_abi::ActivityKind::ProcessExited,
-        process_id: Some(process_id),
-        message,
-    });
+    runtime
+        .kernel
+        .processes()
+        .record_activity(selium_abi::ActivityEvent {
+            kind: selium_abi::ActivityKind::ProcessExited,
+            process_id: Some(process_id),
+            message,
+        });
     drop(runtime.cleanup_failed_process(process_id));
 }
 
@@ -369,6 +355,20 @@ fn resolve_aot_entrypoint_arguments(
         }
     }
     decode_wasm_arguments(&encoded)
+}
+
+/// Signals a guest's worker pool to return (ABI stop word + wake-word bump)
+/// without joining. Used when a pool cannot be fully provisioned: the workers
+/// already started observe the stop and exit instead of parking forever on an
+/// instance whose monitor will never join them.
+fn signal_stop(runtime: &Runtime, process_id: selium_abi::ProcessId) {
+    if let Some(mailbox) = runtime.mailbox(process_id) {
+        // `set_stop` also bumps the shared wake word, so a parked worker's
+        // `wait32` returns on the value mismatch and it re-checks the stop
+        // word; the notify covers a worker parked at the moment of the bump.
+        let _ = mailbox.set_stop();
+        let _ = mailbox.notify_wake_word(1);
+    }
 }
 
 /// Grows the guest's linear memory and copies `bytes` into it, returning the

@@ -25,7 +25,10 @@
 //! - **module upload** → storage hostcalls (`StorageBlobPut` +
 //!   `StorageBlobSetManifest`, tenant-prefixed manifest names).
 
-use std::{collections::BTreeMap, sync::{Arc, Mutex}};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context as _;
 use selium_abi::{
@@ -460,7 +463,8 @@ async fn handle_request(
             replicas,
         } => {
             let module = state
-                .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .deployment(namespace, &workload_id)
                 .map(|deployment| deployment.module.clone())
                 .unwrap_or_default();
@@ -505,7 +509,11 @@ async fn handle_request(
             accept_delegated(&workload_id, 0, String::new(), request)
         }
         ControlRequest::Status { workload_id } => ControlResponse::Status {
-            deployment: state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).deployment(namespace, &workload_id).cloned(),
+            deployment: state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .deployment(namespace, &workload_id)
+                .cloned(),
         },
     }
 }
@@ -520,7 +528,10 @@ fn record(
     let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
     let payload = FlatMsg::encode(&record);
     log.append(timestamp_ms, Vec::new(), payload)?;
-    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).apply_record(record);
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_record(record);
     Ok(())
 }
 

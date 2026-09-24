@@ -26,20 +26,6 @@ use selium_guest::{entrypoint, spawn};
 /// keep the test fast.
 const ITERATIONS: u64 = 1 << 26;
 
-#[entrypoint]
-async fn mt_demo(mode: u64) -> anyhow::Result<()> {
-    let first = spawn(cpu_bound(ITERATIONS));
-    let second = spawn(cpu_bound(ITERATIONS));
-    first.await;
-    second.await;
-    if mode == 1 {
-        // Resident mode: park forever so the guest's workers stay parked;
-        // the test delivers wakes and then stops the process.
-        core::future::pending::<()>().await;
-    }
-    Ok(())
-}
-
 /// A CPU-bound task: `iterations` updates of a task-local accumulator. The
 /// loop-carried dependency (a multiply-add chain) cannot be folded into a
 /// closed form, and the inputs are `black_box`ed so the optimizer cannot treat
@@ -54,4 +40,18 @@ async fn cpu_bound(iterations: u64) {
         remaining -= 1;
     }
     std::hint::black_box(acc);
+}
+
+#[entrypoint]
+async fn mt_demo(mode: u64) -> anyhow::Result<()> {
+    let first = spawn(cpu_bound(ITERATIONS));
+    let second = spawn(cpu_bound(ITERATIONS));
+    first.await;
+    second.await;
+    if mode == 1 {
+        // Resident mode: park forever so the guest's workers stay parked;
+        // the test delivers wakes and then stops the process.
+        core::future::pending::<()>().await;
+    }
+    Ok(())
 }

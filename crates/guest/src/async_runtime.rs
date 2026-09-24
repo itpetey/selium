@@ -59,12 +59,15 @@ use crate::{
     },
 };
 
+static EXECUTOR: OnceLock<Executor> = OnceLock::new();
 /// Task is parked: not runnable, not being polled.
 const TASK_PARKED: u32 = 0;
-/// Task is runnable: enqueued (or about to be) on the shared run queue.
-const TASK_QUEUED: u32 = 1;
 /// Task is claimed by one worker: its future is being polled.
 const TASK_POLLING: u32 = 2;
+/// Task is runnable: enqueued (or about to be) on the shared run queue.
+const TASK_QUEUED: u32 = 1;
+static TASK_WAKE_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker);
 
 /// A live guest task: a pinned, `Send` future plus its lifecycle state.
 struct TaskSlot {
@@ -112,22 +115,6 @@ struct Executor {
     active_workers: AtomicU32,
 }
 
-static EXECUTOR: OnceLock<Executor> = OnceLock::new();
-
-fn executor() -> &'static Executor {
-    EXECUTOR.get_or_init(|| Executor {
-        tasks: Mutex::new(HashMap::new()),
-        run_queue: Mutex::new(VecDeque::new()),
-        yield_queue: Mutex::new(VecDeque::new()),
-        next_task_id: AtomicU32::new(1),
-        poll_owner_task: AtomicU32::new(0),
-        poll_owner_done: AtomicBool::new(false),
-        gen_wait_map: Mutex::new(HashMap::new()),
-        mailbox_lock: Mutex::new(()),
-        active_workers: AtomicU32::new(0),
-    })
-}
-
 /// The executor's waker payload: identifies the task so a wake targets the
 /// right task and SDK futures can recover their task id from the poll context
 /// without ambient thread-local state (see [`task_id_from_waker`]). The
@@ -142,82 +129,111 @@ struct TaskWake {
     task_id: TaskId,
 }
 
-/// Creates a waker for `task_id` as seen from `worker_id`.
-fn create_waker(worker_id: u32, task_id: TaskId) -> Waker {
-    let arc = Arc::new(TaskWake { worker_id, task_id });
-    let ptr = Arc::into_raw(arc);
-    // SAFETY: `TASK_WAKE_VTABLE` manages the strong count via the clone/drop
-    // entries, and the data pointer always points at a live `Arc<TaskWake>`
-    // for as long as any waker derived from it exists.
-    unsafe { Waker::from_raw(RawWaker::new(ptr.cast(), &TASK_WAKE_VTABLE)) }
+/// Handle returned by a spawned guest task.
+pub struct JoinHandle<T> {
+    state: Arc<JoinState<T>>,
 }
 
-/// Returns the task id encoded in `waker`, if the waker was created by this
-/// executor. `None` for foreign wakers (e.g. tokio's, in native tests).
-pub(crate) fn task_id_from_waker(waker: &Waker) -> Option<TaskId> {
-    if std::ptr::eq(waker.vtable(), &TASK_WAKE_VTABLE) {
-        // SAFETY: the vtable match guarantees the data pointer was produced
-        // by `create_waker` and points at a live `Arc<TaskWake>`.
-        let wake = unsafe { &*waker.data().cast::<TaskWake>() };
-        Some(wake.task_id)
-    } else {
-        None
+/// Shared completion state of a spawned task: the output slot plus an atomic
+/// completion flag. `Arc`-shared so the handle (`Send` when `T: Send`) can be
+/// awaited from any worker.
+struct JoinState<T> {
+    /// The task's output once complete; `None` while running.
+    result: Mutex<Option<T>>,
+    /// Whether the task completed — an atomic flag observable without locking.
+    done: AtomicBool,
+    /// Waker of the task awaiting the join, registered on a `Pending` poll.
+    waker: Mutex<Option<Waker>>,
+}
+
+/// A one-shot cooperative yield: parks the current task and re-queues it via
+/// the yield queue (see [`yield_now`]).
+struct YieldNow {
+    yielded: bool,
+}
+
+impl<T> JoinHandle<T> {
+    pub(crate) fn take_result(&self) -> Option<T> {
+        self.state
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
-unsafe fn clone_waker(data: *const ()) -> RawWaker {
-    // SAFETY: `data` points at a live `Arc<TaskWake>` with a strong count
-    // owned by the raw waker being cloned.
-    let arc = unsafe { Arc::from_raw(data.cast::<TaskWake>()) };
-    let cloned = Arc::clone(&arc);
-    // Re-arm the original pointer: `from_raw` consumed one strong count, but
-    // the source waker still owns it.
-    let _ = Arc::into_raw(arc);
-    RawWaker::new(Arc::into_raw(cloned).cast(), &TASK_WAKE_VTABLE)
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.state.done.load(Ordering::Acquire) {
+            let result = self
+                .state
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            Poll::Ready(result.expect("a done join always holds its result"))
+        } else {
+            *self
+                .state
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
 }
 
-unsafe fn wake_waker(data: *const ()) {
-    // SAFETY: `data` is a live `Arc<TaskWake>` (see `clone_waker`); waking
-    // by ref and dropping are both safe on such a pointer.
-    unsafe { wake_waker_by_ref(data) };
-    unsafe { drop_waker(data) };
+impl<T> JoinState<T> {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            done: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    fn complete(&self, value: T) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
+        self.done.store(true, Ordering::Release);
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            waker.wake();
+        }
+    }
 }
 
-unsafe fn wake_waker_by_ref(data: *const ()) {
-    // SAFETY: `data` points at a live `Arc<TaskWake>`.
-    let wake = unsafe { &*data.cast::<TaskWake>() };
-    wake_task(wake.task_id);
-}
+impl Future for YieldNow {
+    type Output = ();
 
-unsafe fn drop_waker(data: *const ()) {
-    // SAFETY: `data` points at a live `Arc<TaskWake>`; dropping the raw
-    // pointer decrements the strong count and frees the allocation at zero.
-    drop(unsafe { Arc::from_raw(data.cast::<TaskWake>()) });
-}
-
-static TASK_WAKE_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(clone_waker, wake_waker, wake_waker_by_ref, drop_waker);
-
-/// Install the generation-wait callbacks so that channel types in
-/// `selium-shm` can park tasks on the reactor.
-pub fn install_generation_wait_callbacks() {
-    selium_memory::install_generation_callbacks(register_gen_wait, wake_gen_waiters);
-}
-
-/// Runs the shared executor as `worker_id`.
-///
-/// With `park_when_empty` false (cooperative mode) the loop returns the
-/// poll-owner completion code as soon as no forward-progress work remains;
-/// the host drives subsequent entries through the `__selium_guest_poll`
-/// export. With `park_when_empty` true (multithreaded mode) the worker parks
-/// on the shared wake word when idle and only returns once the poll-owner
-/// entrypoint completes (the process-exit signal).
-pub(crate) fn worker_enter(worker_id: u32, park_when_empty: bool) -> i32 {
-    let executor = executor();
-    executor.active_workers.fetch_add(1, Ordering::Relaxed);
-    let code = worker_loop(executor, worker_id, park_when_empty);
-    executor.active_workers.fetch_sub(1, Ordering::Relaxed);
-    code
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            match task_id_from_waker(cx.waker()) {
+                // Inside the executor: queue a yield wake. Yields are applied
+                // without counting as forward progress in cooperative mode
+                // (see `apply_yield_queue`), so a spinning `yield_now` loop
+                // cannot keep the reactor alive and peg the host thread; the
+                // yielding task is polled on the next reactor entry (or, in
+                // multithreaded mode, by a worker on the next pass).
+                Some(task_id) => yield_task(task_id),
+                // Outside the executor there is no queue to park on: fall
+                // back to self-waking through the caller's waker.
+                None => cx.waker().wake_by_ref(),
+            }
+            Poll::Pending
+        }
+    }
 }
 
 /// Runs a single reactor pass limited to the poll-owner entrypoint task.
@@ -234,7 +250,10 @@ pub(crate) fn worker_enter(worker_id: u32, park_when_empty: bool) -> i32 {
 pub fn bootstrap_reactor() -> i32 {
     let executor = executor();
     {
-        let _guard = executor.mailbox_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = executor
+            .mailbox_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         drain_mailbox();
     }
     let owner = executor.poll_owner_task.load(Ordering::Acquire);
@@ -248,60 +267,10 @@ pub fn bootstrap_reactor() -> i32 {
     poll_owner_done(executor)
 }
 
-fn worker_loop(executor: &Executor, worker_id: u32, park_when_empty: bool) -> i32 {
-    loop {
-        // The host tears a multithreaded process down by setting the ABI stop
-        // word and notifying the wake word; a woken worker returns instead of
-        // re-parking. Cooperative mode reports the code at stall instead,
-        // preserving the existing host-driven semantics.
-        if park_when_empty && (stop_requested() || poll_owner_completed(executor)) {
-            return poll_owner_done(executor);
-        }
-        {
-            // The mailbox ring is single-consumer: at most one worker drains.
-            let _guard = executor.mailbox_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            drain_mailbox();
-        }
-        // Run runnable tasks (forward progress). Tasks woken or spawned while
-        // another task is being polled enqueue directly into the shared queue,
-        // so this loop keeps going until the queue is genuinely empty.
-        while let Some((task_id, observed_wakes)) = pop_runnable(executor) {
-            poll_task(executor, task_id, worker_id, observed_wakes);
-        }
-        if run_queue_non_empty(executor) || mailbox_has_pending() {
-            continue;
-        }
-        // Queue empty: apply cooperative yields queued during the pass.
-        let yielded = apply_yield_queue(executor);
-        if yielded {
-            if park_when_empty {
-                // Multithreaded: no host re-drive exists, so the worker keeps
-                // servicing runnable (yielded) tasks.
-                continue;
-            }
-            // Cooperative: yields do not count as forward progress — the host
-            // drives the next poll entry, so a spinning `yield_now` cannot peg
-            // the host thread.
-            return poll_owner_done(executor);
-        }
-        if !park_when_empty {
-            return poll_owner_done(executor);
-        }
-        // Multithreaded mode: re-check the exit conditions before parking —
-        // the process may have completed while the last task was being
-        // polled (the loop-top check has not run again).
-        if stop_requested() || poll_owner_completed(executor) {
-            return poll_owner_done(executor);
-        }
-        // Park with the standard futex discipline: observe the wake word,
-        // re-check for work, then wait. A wake landing between the check and
-        // the wait wakes us immediately.
-        let observed = wake_word_value();
-        if run_queue_non_empty(executor) || mailbox_has_pending() {
-            continue;
-        }
-        park_on_wake_word(observed);
-    }
+/// Install the generation-wait callbacks so that channel types in
+/// `selium-shm` can park tasks on the reactor.
+pub fn install_generation_wait_callbacks() {
+    selium_memory::install_generation_callbacks(register_gen_wait, wake_gen_waiters);
 }
 
 /// Polls mailbox wakeups and runnable background tasks until no work remains.
@@ -380,31 +349,6 @@ where
     join.take_result().unwrap_or(Ok(()))
 }
 
-/// Drives the entrypoint to its first park.
-///
-/// Cooperative builds run the reactor to stall (the host re-drives later
-/// polls). Multithreaded builds run a single bootstrap pass: the entrypoint
-/// parks with its spawned tasks left queued for the worker pool, so CPU work
-/// never runs serially on the bootstrap thread.
-fn drive_entrypoint() -> i32 {
-    #[cfg(all(
-        target_arch = "wasm32",
-        feature = "multithreaded",
-        target_feature = "atomics"
-    ))]
-    {
-        bootstrap_reactor()
-    }
-    #[cfg(not(all(
-        target_arch = "wasm32",
-        feature = "multithreaded",
-        target_feature = "atomics"
-    )))]
-    {
-        poll_safely()
-    }
-}
-
 /// Spawns a future onto the shared guest executor.
 ///
 /// The future must be `Send + 'static` so its task capsule can migrate
@@ -439,6 +383,19 @@ pub async fn yield_now() {
     YieldNow { yielded: false }.await;
 }
 
+/// Returns the task id encoded in `waker`, if the waker was created by this
+/// executor. `None` for foreign wakers (e.g. tokio's, in native tests).
+pub(crate) fn task_id_from_waker(waker: &Waker) -> Option<TaskId> {
+    if std::ptr::eq(waker.vtable(), &TASK_WAKE_VTABLE) {
+        // SAFETY: the vtable match guarantees the data pointer was produced
+        // by `create_waker` and points at a live `Arc<TaskWake>`.
+        let wake = unsafe { &*waker.data().cast::<TaskWake>() };
+        Some(wake.task_id)
+    } else {
+        None
+    }
+}
+
 /// Wakes `task_id`: makes it runnable from any state and, if it was parked,
 /// enqueues it and notifies a parked worker. A wake racing an in-flight poll
 /// is never lost: the parking word bump is observed by the poller's
@@ -449,7 +406,10 @@ pub(crate) fn wake_task(task_id: TaskId) {
     }
     let executor = executor();
     loop {
-        let tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tasks = executor
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(slot) = tasks.get(&task_id) else {
             return; // task already completed and removed
         };
@@ -457,7 +417,12 @@ pub(crate) fn wake_task(task_id: TaskId) {
             TASK_PARKED => {
                 if slot
                     .state
-                    .compare_exchange(TASK_PARKED, TASK_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        TASK_PARKED,
+                        TASK_QUEUED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     slot.park_word.fetch_add(1, Ordering::Release);
@@ -494,6 +459,22 @@ pub(crate) fn wake_task(task_id: TaskId) {
     }
 }
 
+/// Runs the shared executor as `worker_id`.
+///
+/// With `park_when_empty` false (cooperative mode) the loop returns the
+/// poll-owner completion code as soon as no forward-progress work remains;
+/// the host drives subsequent entries through the `__selium_guest_poll`
+/// export. With `park_when_empty` true (multithreaded mode) the worker parks
+/// on the shared wake word when idle and only returns once the poll-owner
+/// entrypoint completes (the process-exit signal).
+pub(crate) fn worker_enter(worker_id: u32, park_when_empty: bool) -> i32 {
+    let executor = executor();
+    executor.active_workers.fetch_add(1, Ordering::Relaxed);
+    let code = worker_loop(executor, worker_id, park_when_empty);
+    executor.active_workers.fetch_sub(1, Ordering::Relaxed);
+    code
+}
+
 /// Queues a cooperative yield for `task_id` (see [`YieldNow`]).
 pub(crate) fn yield_task(task_id: TaskId) {
     if task_id != 0 {
@@ -503,6 +484,137 @@ pub(crate) fn yield_task(task_id: TaskId) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id);
     }
+}
+
+/// Applies cooperative yields queued during the pass: transitions each
+/// yielded task parked → queued and enqueues it. Returns whether any yield
+/// was applied. Yields do NOT count as forward progress in cooperative mode
+/// (see [`worker_loop`]).
+fn apply_yield_queue(executor: &Executor) -> bool {
+    let yields: Vec<TaskId> = executor
+        .yield_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+        .collect();
+    if yields.is_empty() {
+        return false;
+    }
+    for task_id in yields {
+        let tasks = executor
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(slot) = tasks.get(&task_id) else {
+            continue;
+        };
+        if slot
+            .state
+            .compare_exchange(
+                TASK_PARKED,
+                TASK_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = bump_task_parking_word(task_id);
+            drop(tasks);
+            enqueue_and_notify(task_id);
+        }
+        // Else: already queued or being polled by another worker — leave it.
+    }
+    true
+}
+
+unsafe fn clone_waker(data: *const ()) -> RawWaker {
+    // SAFETY: `data` points at a live `Arc<TaskWake>` with a strong count
+    // owned by the raw waker being cloned.
+    let arc = unsafe { Arc::from_raw(data.cast::<TaskWake>()) };
+    let cloned = Arc::clone(&arc);
+    // Re-arm the original pointer: `from_raw` consumed one strong count, but
+    // the source waker still owns it.
+    let _ = Arc::into_raw(arc);
+    RawWaker::new(Arc::into_raw(cloned).cast(), &TASK_WAKE_VTABLE)
+}
+
+/// Creates a waker for `task_id` as seen from `worker_id`.
+fn create_waker(worker_id: u32, task_id: TaskId) -> Waker {
+    let arc = Arc::new(TaskWake { worker_id, task_id });
+    let ptr = Arc::into_raw(arc);
+    // SAFETY: `TASK_WAKE_VTABLE` manages the strong count via the clone/drop
+    // entries, and the data pointer always points at a live `Arc<TaskWake>`
+    // for as long as any waker derived from it exists.
+    unsafe { Waker::from_raw(RawWaker::new(ptr.cast(), &TASK_WAKE_VTABLE)) }
+}
+
+/// Drives the entrypoint to its first park.
+///
+/// Cooperative builds run the reactor to stall (the host re-drives later
+/// polls). Multithreaded builds run a single bootstrap pass: the entrypoint
+/// parks with its spawned tasks left queued for the worker pool, so CPU work
+/// never runs serially on the bootstrap thread.
+fn drive_entrypoint() -> i32 {
+    #[cfg(all(
+        target_arch = "wasm32",
+        feature = "multithreaded",
+        target_feature = "atomics"
+    ))]
+    {
+        bootstrap_reactor()
+    }
+    #[cfg(not(all(
+        target_arch = "wasm32",
+        feature = "multithreaded",
+        target_feature = "atomics"
+    )))]
+    {
+        poll_safely()
+    }
+}
+
+unsafe fn drop_waker(data: *const ()) {
+    // SAFETY: `data` points at a live `Arc<TaskWake>`; dropping the raw
+    // pointer decrements the strong count and frees the allocation at zero.
+    drop(unsafe { Arc::from_raw(data.cast::<TaskWake>()) });
+}
+
+/// Pushes `task_id` onto the shared run queue, bumps the shared wake word,
+/// and notifies one parked worker.
+fn enqueue_and_notify(task_id: TaskId) {
+    executor()
+        .run_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(task_id);
+    bump_wake_word();
+    notify_wake_word();
+}
+
+/// Registers a new task in the table and enqueues it runnable.
+fn enqueue_new_task(task: TaskSlot) {
+    let id = task.id;
+    let mut tasks = executor()
+        .tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tasks.insert(id, task);
+    drop(tasks);
+    enqueue_and_notify(id);
+}
+
+fn executor() -> &'static Executor {
+    EXECUTOR.get_or_init(|| Executor {
+        tasks: Mutex::new(HashMap::new()),
+        run_queue: Mutex::new(VecDeque::new()),
+        yield_queue: Mutex::new(VecDeque::new()),
+        next_task_id: AtomicU32::new(1),
+        poll_owner_task: AtomicU32::new(0),
+        poll_owner_done: AtomicBool::new(false),
+        gen_wait_map: Mutex::new(HashMap::new()),
+        mailbox_lock: Mutex::new(()),
+        active_workers: AtomicU32::new(0),
+    })
 }
 
 /// Allocates a fresh task id (never 0; wraps to 1 on overflow).
@@ -521,92 +633,15 @@ fn next_task_id() -> TaskId {
     }
 }
 
-/// Registers a new task in the table and enqueues it runnable.
-fn enqueue_new_task(task: TaskSlot) {
-    let id = task.id;
-    let mut tasks = executor().tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    tasks.insert(id, task);
-    drop(tasks);
-    enqueue_and_notify(id);
+/// Returns whether the poll-owner entrypoint task has completed.
+fn poll_owner_completed(executor: &Executor) -> bool {
+    executor.poll_owner_done.load(Ordering::Acquire)
 }
 
-/// Pushes `task_id` onto the shared run queue, bumps the shared wake word,
-/// and notifies one parked worker.
-fn enqueue_and_notify(task_id: TaskId) {
-    executor()
-        .run_queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push_back(task_id);
-    bump_wake_word();
-    notify_wake_word();
-}
-
-/// Returns whether the run queue holds any runnable task (without claiming).
-fn run_queue_non_empty(executor: &Executor) -> bool {
-    !executor
-        .run_queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_empty()
-}
-
-/// Claims one runnable task: pops an id from the run queue and
-/// CAS-transitions its state queued → polling, guaranteeing single-flight
-/// (at most one worker polls a task's future at a time). Also captures the
-/// task's parking-word baseline **in the same task-table critical section as
-/// the claim**: a concurrent wake either lands before the claim (absorbed by
-/// the upcoming poll) or bumps the word after the baseline read (caught by
-/// the poller's post-poll re-check) — no wake can slip between the claim and
-/// the baseline. Returns `None` when the queue is empty or every entry is
-/// stale (already claimed or completed).
-fn pop_runnable(executor: &Executor) -> Option<(TaskId, u32)> {
-    loop {
-        let task_id = executor
-            .run_queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()?;
-        let tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(slot) = tasks.get(&task_id) else {
-            continue; // completed and removed; stale queue entry
-        };
-        if slot
-            .state
-            .compare_exchange(TASK_QUEUED, TASK_POLLING, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let observed_wakes = slot.park_word.load(Ordering::Acquire);
-            return Some((task_id, observed_wakes));
-        }
-        // Stale or concurrently claimed entry; try the next.
-    }
-}
-
-/// Claims a specific task id from the run queue (queued → polling) if it is
-/// runnable, without touching any other queued task, capturing the
-/// parking-word baseline in the same critical section (see [`pop_runnable`]).
-/// Used by the bootstrap pass to poll exactly the entrypoint task. A stale
-/// queue entry is left for `pop_runnable` to skip.
-#[cfg(all(
-    target_arch = "wasm32",
-    feature = "multithreaded",
-    target_feature = "atomics"
-))]
-fn pop_specific(executor: &Executor, task_id: TaskId) -> Option<u32> {
-    let tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(slot) = tasks.get(&task_id) else {
-        return None;
-    };
-    if slot
-        .state
-        .compare_exchange(TASK_QUEUED, TASK_POLLING, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        Some(slot.park_word.load(Ordering::Acquire))
-    } else {
-        None
-    }
+/// Returns the poll-owner completion code: `0` while it is running (parked),
+/// `1` once it completed.
+fn poll_owner_done(executor: &Executor) -> i32 {
+    i32::from(executor.poll_owner_done.load(Ordering::Acquire))
 }
 
 /// Polls one claimed task's future, applying the lost-wakeup re-check.
@@ -618,7 +653,10 @@ fn pop_specific(executor: &Executor, task_id: TaskId) -> Option<u32> {
 /// Returns `true` when the task completed.
 fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wakes: u32) -> bool {
     let mut future = {
-        let mut tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tasks = executor
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(slot) = tasks.get_mut(&task_id) else {
             return false;
         };
@@ -631,7 +669,10 @@ fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wake
     let mut context = Context::from_waker(&waker);
     let poll = future.as_mut().poll(&mut context);
 
-    let mut tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tasks = executor
+        .tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(slot) = tasks.get_mut(&task_id) else {
         // The task was removed while it was being polled (only possible if
         // something re-entered the executor during the poll); drop the future.
@@ -657,7 +698,12 @@ fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wake
             if slot.park_word.load(Ordering::SeqCst) != observed_wakes {
                 if slot
                     .state
-                    .compare_exchange(TASK_PARKED, TASK_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        TASK_PARKED,
+                        TASK_QUEUED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     drop(tasks);
@@ -669,48 +715,78 @@ fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wake
     }
 }
 
-/// Applies cooperative yields queued during the pass: transitions each
-/// yielded task parked → queued and enqueues it. Returns whether any yield
-/// was applied. Yields do NOT count as forward progress in cooperative mode
-/// (see [`worker_loop`]).
-fn apply_yield_queue(executor: &Executor) -> bool {
-    let yields: Vec<TaskId> = executor
-        .yield_queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .drain(..)
-        .collect();
-    if yields.is_empty() {
-        return false;
-    }
-    for task_id in yields {
-        let tasks = executor.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+/// Claims one runnable task: pops an id from the run queue and
+/// CAS-transitions its state queued → polling, guaranteeing single-flight
+/// (at most one worker polls a task's future at a time). Also captures the
+/// task's parking-word baseline **in the same task-table critical section as
+/// the claim**: a concurrent wake either lands before the claim (absorbed by
+/// the upcoming poll) or bumps the word after the baseline read (caught by
+/// the poller's post-poll re-check) — no wake can slip between the claim and
+/// the baseline. Returns `None` when the queue is empty or every entry is
+/// stale (already claimed or completed).
+fn pop_runnable(executor: &Executor) -> Option<(TaskId, u32)> {
+    loop {
+        let task_id = executor
+            .run_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()?;
+        let tasks = executor
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(slot) = tasks.get(&task_id) else {
-            continue;
+            continue; // completed and removed; stale queue entry
         };
         if slot
             .state
-            .compare_exchange(TASK_PARKED, TASK_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                TASK_QUEUED,
+                TASK_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
-            let _ = bump_task_parking_word(task_id);
-            drop(tasks);
-            enqueue_and_notify(task_id);
+            let observed_wakes = slot.park_word.load(Ordering::Acquire);
+            return Some((task_id, observed_wakes));
         }
-        // Else: already queued or being polled by another worker — leave it.
+        // Stale or concurrently claimed entry; try the next.
     }
-    true
 }
 
-/// Returns whether the poll-owner entrypoint task has completed.
-fn poll_owner_completed(executor: &Executor) -> bool {
-    executor.poll_owner_done.load(Ordering::Acquire)
-}
-
-/// Returns the poll-owner completion code: `0` while it is running (parked),
-/// `1` once it completed.
-fn poll_owner_done(executor: &Executor) -> i32 {
-    i32::from(executor.poll_owner_done.load(Ordering::Acquire))
+/// Claims a specific task id from the run queue (queued → polling) if it is
+/// runnable, without touching any other queued task, capturing the
+/// parking-word baseline in the same critical section (see [`pop_runnable`]).
+/// Used by the bootstrap pass to poll exactly the entrypoint task. A stale
+/// queue entry is left for `pop_runnable` to skip.
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "multithreaded",
+    target_feature = "atomics"
+))]
+fn pop_specific(executor: &Executor, task_id: TaskId) -> Option<u32> {
+    let tasks = executor
+        .tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(slot) = tasks.get(&task_id) else {
+        return None;
+    };
+    if slot
+        .state
+        .compare_exchange(
+            TASK_QUEUED,
+            TASK_POLLING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        Some(slot.park_word.load(Ordering::Acquire))
+    } else {
+        None
+    }
 }
 
 fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
@@ -739,6 +815,15 @@ fn register_gen_wait(region_id: u64, observed_generation: u64, waker: &Waker) {
             task_id,
         ));
     }
+}
+
+/// Returns whether the run queue holds any runnable task (without claiming).
+fn run_queue_non_empty(executor: &Executor) -> bool {
+    !executor
+        .run_queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty()
 }
 
 /// Spawns the poll-owner entrypoint future: the single task whose completion
@@ -792,7 +877,10 @@ where
 
 fn wake_gen_waiters(region_id: u64, new_generation: u64) {
     let executor = executor();
-    let mut map = executor.gen_wait_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = executor
+        .gen_wait_map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Collect keys where region matches and generation < new_generation.
     let to_wake: Vec<(u64, u64)> = map
         .keys()
@@ -825,110 +913,75 @@ fn wake_gen_waiters(region_id: u64, new_generation: u64) {
     }
 }
 
-/// Handle returned by a spawned guest task.
-pub struct JoinHandle<T> {
-    state: Arc<JoinState<T>>,
+unsafe fn wake_waker(data: *const ()) {
+    // SAFETY: `data` is a live `Arc<TaskWake>` (see `clone_waker`); waking
+    // by ref and dropping are both safe on such a pointer.
+    unsafe { wake_waker_by_ref(data) };
+    unsafe { drop_waker(data) };
 }
 
-/// Shared completion state of a spawned task: the output slot plus an atomic
-/// completion flag. `Arc`-shared so the handle (`Send` when `T: Send`) can be
-/// awaited from any worker.
-struct JoinState<T> {
-    /// The task's output once complete; `None` while running.
-    result: Mutex<Option<T>>,
-    /// Whether the task completed — an atomic flag observable without locking.
-    done: AtomicBool,
-    /// Waker of the task awaiting the join, registered on a `Pending` poll.
-    waker: Mutex<Option<Waker>>,
+unsafe fn wake_waker_by_ref(data: *const ()) {
+    // SAFETY: `data` points at a live `Arc<TaskWake>`.
+    let wake = unsafe { &*data.cast::<TaskWake>() };
+    wake_task(wake.task_id);
 }
 
-impl<T> JoinHandle<T> {
-    pub(crate) fn take_result(&self) -> Option<T> {
-        self.state
-            .result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-}
-
-impl<T> Future for JoinHandle<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.state.done.load(Ordering::Acquire) {
-            let result = self
-                .state
-                .result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            Poll::Ready(result.expect("a done join always holds its result"))
-        } else {
-            *self
-                .state
-                .waker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
-            Poll::Pending
+fn worker_loop(executor: &Executor, worker_id: u32, park_when_empty: bool) -> i32 {
+    loop {
+        // The host tears a multithreaded process down by setting the ABI stop
+        // word and notifying the wake word; a woken worker returns instead of
+        // re-parking. Cooperative mode reports the code at stall instead,
+        // preserving the existing host-driven semantics.
+        if park_when_empty && (stop_requested() || poll_owner_completed(executor)) {
+            return poll_owner_done(executor);
         }
-    }
-}
-
-impl<T> JoinState<T> {
-    fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            done: AtomicBool::new(false),
-            waker: Mutex::new(None),
-        }
-    }
-
-    fn complete(&self, value: T) {
-        *self
-            .result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
-        self.done.store(true, Ordering::Release);
-        if let Some(waker) = self
-            .waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
         {
-            waker.wake();
+            // The mailbox ring is single-consumer: at most one worker drains.
+            let _guard = executor
+                .mailbox_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drain_mailbox();
         }
-    }
-}
-
-/// A one-shot cooperative yield: parks the current task and re-queues it via
-/// the yield queue (see [`yield_now`]).
-struct YieldNow {
-    yielded: bool,
-}
-
-impl Future for YieldNow {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.yielded {
-            Poll::Ready(())
-        } else {
-            self.yielded = true;
-            match task_id_from_waker(cx.waker()) {
-                // Inside the executor: queue a yield wake. Yields are applied
-                // without counting as forward progress in cooperative mode
-                // (see `apply_yield_queue`), so a spinning `yield_now` loop
-                // cannot keep the reactor alive and peg the host thread; the
-                // yielding task is polled on the next reactor entry (or, in
-                // multithreaded mode, by a worker on the next pass).
-                Some(task_id) => yield_task(task_id),
-                // Outside the executor there is no queue to park on: fall
-                // back to self-waking through the caller's waker.
-                None => cx.waker().wake_by_ref(),
+        // Run runnable tasks (forward progress). Tasks woken or spawned while
+        // another task is being polled enqueue directly into the shared queue,
+        // so this loop keeps going until the queue is genuinely empty.
+        while let Some((task_id, observed_wakes)) = pop_runnable(executor) {
+            poll_task(executor, task_id, worker_id, observed_wakes);
+        }
+        if run_queue_non_empty(executor) || mailbox_has_pending() {
+            continue;
+        }
+        // Queue empty: apply cooperative yields queued during the pass.
+        let yielded = apply_yield_queue(executor);
+        if yielded {
+            if park_when_empty {
+                // Multithreaded: no host re-drive exists, so the worker keeps
+                // servicing runnable (yielded) tasks.
+                continue;
             }
-            Poll::Pending
+            // Cooperative: yields do not count as forward progress — the host
+            // drives the next poll entry, so a spinning `yield_now` cannot peg
+            // the host thread.
+            return poll_owner_done(executor);
         }
+        if !park_when_empty {
+            return poll_owner_done(executor);
+        }
+        // Multithreaded mode: re-check the exit conditions before parking —
+        // the process may have completed while the last task was being
+        // polled (the loop-top check has not run again).
+        if stop_requested() || poll_owner_completed(executor) {
+            return poll_owner_done(executor);
+        }
+        // Park with the standard futex discipline: observe the wake word,
+        // re-check for work, then wait. A wake landing between the check and
+        // the wait wakes us immediately.
+        let observed = wake_word_value();
+        if run_queue_non_empty(executor) || mailbox_has_pending() {
+            continue;
+        }
+        park_on_wake_word(observed);
     }
 }
 
@@ -1015,40 +1068,62 @@ mod tests {
     #[test]
     fn join_handle_is_send_when_output_is_send() {
         assert_send::<JoinHandle<u32>>();
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
     }
 
     #[test]
     fn cooperative_yield_allows_spawned_task_progress() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         let value = Arc::new(Mutex::new(0));
         let value_for_task = Arc::clone(&value);
 
         let join = spawn(async move {
             yield_now().await;
-            *value_for_task.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 7;
+            *value_for_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = 7;
         });
         // First pass: task runs, hits yield_now (Pending + self-wake), parks.
         // The self-wake marks the task runnable for the next pass.
         poll_reactor();
-        assert_eq!(*value.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 0);
+        assert_eq!(
+            *value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0
+        );
 
         // Second pass: task is runnable, yield_now completes (Ready), task sets
         // value and finishes.
         poll_reactor();
 
-        assert_eq!(*value.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 7);
         assert_eq!(
-            *join.state.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            7
+        );
+        assert_eq!(
+            *join
+                .state
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(())
         );
     }
 
     #[test]
     fn reactor_parks_pending_tasks_until_woken() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         struct ParkUntilWoken {
             polls: Arc<Mutex<u32>>,
@@ -1060,10 +1135,16 @@ mod tests {
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let task = self.get_mut();
-                let mut polls = task.polls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut polls = task
+                    .polls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *polls += 1;
                 if *polls == 1 {
-                    *task.task_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    *task
+                        .task_id
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         task_id_from_waker(cx.waker());
                     Poll::Pending
                 } else {
@@ -1080,14 +1161,28 @@ mod tests {
         });
 
         poll_reactor();
-        assert_eq!(*polls.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
         assert_eq!(
-            *join.state.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *polls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
+        assert_eq!(
+            *join
+                .state
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             None
         );
 
         poll_reactor();
-        assert_eq!(*polls.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+        assert_eq!(
+            *polls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
 
         wake_task(
             task_id
@@ -1097,9 +1192,18 @@ mod tests {
         );
         poll_reactor();
 
-        assert_eq!(*polls.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 2);
         assert_eq!(
-            *join.state.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *polls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            2
+        );
+        assert_eq!(
+            *join
+                .state
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(())
         );
     }
@@ -1116,7 +1220,9 @@ mod tests {
 
     #[test]
     fn result_entrypoint_that_parks_returns_ok_before_completion() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
@@ -1147,7 +1253,9 @@ mod tests {
 
     #[test]
     fn result_entrypoint_that_fails_returns_err() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         let result: Result<(), EntrypointError> =
             run_entrypoint_with_result(async { Err(EntrypointError("boom")) });
@@ -1159,7 +1267,9 @@ mod tests {
     /// still-running.
     #[test]
     fn reactor_reports_poll_owner_completion() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         // A future that completes synchronously reports done immediately.
         let result = run_entrypoint_with_result(async { Ok::<(), EntrypointError>(()) });
@@ -1185,7 +1295,9 @@ mod tests {
     /// leaving the process resident on an idle reactor.
     #[test]
     fn reactor_reports_late_poll_owner_completion() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
         /// Parks on its first poll (capturing the task id) and completes on a
         /// later poll, mirroring a service that waits on an external wake.
@@ -1202,7 +1314,10 @@ mod tests {
                 let this = self.get_mut();
                 this.polls += 1;
                 if this.polls == 1 {
-                    *this.task_id.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    *this
+                        .task_id
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         task_id_from_waker(cx.waker());
                     Poll::Pending
                 } else if this.fail {
@@ -1277,7 +1392,10 @@ mod tests {
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             if let Some(worker_id) = worker_id_from_waker(cx.waker()) {
-                self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(worker_id);
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(worker_id);
             }
             Poll::Ready(())
         }
@@ -1288,7 +1406,9 @@ mod tests {
     /// id (via the executor waker) and both tasks overlap in time.
     #[test]
     fn independent_tasks_run_concurrently_on_distinct_workers() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
 
         let workers_seen = Arc::new(Mutex::new(Vec::new()));
@@ -1309,8 +1429,7 @@ mod tests {
                 // overlap; with one worker the first task spins to a deadline
                 // and flags failure instead of hanging the test.
                 entered.fetch_add(1, Ordering::Release);
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while entered.load(Ordering::Acquire) < 2 {
                     if std::time::Instant::now() >= deadline {
                         overlap_failed.store(true, Ordering::Release);
@@ -1336,7 +1455,9 @@ mod tests {
             stop_workers();
         });
 
-        let seen = workers_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seen = workers_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             seen.iter().any(|&w| w == 0) && seen.iter().any(|&w| w == 1),
             "both tasks must run on distinct workers, saw {seen:?}"
@@ -1363,7 +1484,10 @@ mod tests {
             let Some(task_id) = task_id_from_waker(cx.waker()) else {
                 return Poll::Ready(());
             };
-            let mut map = this.wake_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = this
+                .wake_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if map.insert(task_id, cx.waker().clone()).is_none() {
                 // First poll: registered and parked.
                 Poll::Pending
@@ -1382,7 +1506,9 @@ mod tests {
     /// the run.
     #[test]
     fn lost_wakeup_stress_never_loses_a_wake() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         const RUNS: usize = 10;
         const CONSUMERS: usize = 32;
@@ -1429,7 +1555,11 @@ mod tests {
                 // before stopping the workers.
                 wait_until(
                     || {
-                        wake_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() == CONSUMERS
+                        wake_map
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .len()
+                            == CONSUMERS
                     },
                     "all consumers to register",
                 );
@@ -1466,7 +1596,9 @@ mod tests {
     /// id).
     #[test]
     fn concurrent_hostcall_staging_never_corrupts_request_slot() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
 
         const WORKERS: u32 = 4;
@@ -1489,8 +1621,8 @@ mod tests {
                             request: HostcallRequest::SelfInfo,
                             task_id: Some(task_id),
                         };
-                        let encoded = selium_abi::encode_rkyv(&envelope)
-                            .expect("envelope must encode");
+                        let encoded =
+                            selium_abi::encode_rkyv(&envelope).expect("envelope must encode");
                         let decoded: selium_abi::HostcallEnvelope =
                             selium_abi::decode_rkyv(&encoded).expect("envelope must decode");
                         if decoded.task_id != Some(task_id) {
@@ -1515,7 +1647,9 @@ mod tests {
     /// no poller-driven reactor pass.
     #[test]
     fn wake_by_notify_resumes_a_parked_task_in_place() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_executor();
 
         let registered = Arc::new(Mutex::new(None::<TaskId>));
@@ -1534,7 +1668,10 @@ mod tests {
                 if this.polls == 1 {
                     let task_id = task_id_from_waker(cx.waker())
                         .expect("parked task runs under an executor waker");
-                    *this.registered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task_id);
+                    *this
+                        .registered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task_id);
                     Poll::Pending
                 } else {
                     this.resumed.store(true, Ordering::Release);
@@ -1560,7 +1697,12 @@ mod tests {
             // and notifies the shared wake word). The poller never drives the
             // reactor.
             wait_until(
-                || registered.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some(),
+                || {
+                    registered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+                },
                 "the task to park",
             );
             let task_id = registered

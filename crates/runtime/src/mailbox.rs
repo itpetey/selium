@@ -32,7 +32,10 @@ impl GuestMailbox {
             .checked_add(slot)
             .ok_or_else(|| WasmError::Runtime("mailbox slot offset overflow".to_string()))?;
         store(self.cell(&memory, slot_offset)?, task_id);
-        store(self.cell(&memory, selium_abi::mailbox::TAIL_OFFSET)?, tail.wrapping_add(1));
+        store(
+            self.cell(&memory, selium_abi::mailbox::TAIL_OFFSET)?,
+            tail.wrapping_add(1),
+        );
         store(self.cell(&memory, selium_abi::mailbox::FLAG_OFFSET)?, 1);
         Ok(())
     }
@@ -42,10 +45,7 @@ impl GuestMailbox {
     /// channel-wake-wait spec: the host notifies the parked task's parking
     /// word). Best-effort: task ids beyond the parking-word table fall back
     /// to the ring wake path alone.
-    pub(crate) fn bump_task_parking_word(
-        &self,
-        task_id: TaskId,
-    ) -> wasmtiny::runtime::Result<()> {
+    pub(crate) fn bump_task_parking_word(&self, task_id: TaskId) -> wasmtiny::runtime::Result<()> {
         let Some(offset) = selium_abi::mailbox::parking_word_offset(task_id) else {
             return Ok(());
         };
@@ -97,9 +97,7 @@ impl GuestMailbox {
         Ok(())
     }
 
-    fn lock(
-        &self,
-    ) -> wasmtiny::runtime::Result<std::sync::MutexGuard<'_, Memory>> {
+    fn lock(&self) -> wasmtiny::runtime::Result<std::sync::MutexGuard<'_, Memory>> {
         self.memory
             .lock()
             .map_err(|_lock_err| WasmError::Runtime("guest memory lock poisoned".to_string()))
@@ -114,11 +112,7 @@ impl GuestMailbox {
     /// lose an update. `Memory::as_ptr` is stable across `memory.grow`
     /// (growth mprotects the reservation; it never reallocates), so the
     /// pointer stays valid while the memory lock is held.
-    fn cell(
-        &self,
-        memory: &Memory,
-        offset: usize,
-    ) -> wasmtiny::runtime::Result<*const AtomicU32> {
+    fn cell(&self, memory: &Memory, offset: usize) -> wasmtiny::runtime::Result<*const AtomicU32> {
         let addr = self.offset(offset)? as usize;
         let end = addr
             .checked_add(std::mem::size_of::<u32>())
@@ -141,6 +135,14 @@ impl GuestMailbox {
     }
 }
 
+/// Atomic fetch-add on a mailbox cell, returning the previous value. This is
+/// the atomic read-modify-write the ABI documents for the wake/parking words
+/// (the guest bumps the same words with a real `fetch_add`).
+fn fetch_add(cell: *const AtomicU32) -> u32 {
+    // SAFETY: `cell` points to a valid AtomicU32 within the guest's memory.
+    unsafe { (*cell).fetch_add(1, Ordering::AcqRel) }
+}
+
 /// Atomic load of a mailbox cell (acquire), synchronising with the guest's
 /// own atomic accesses.
 fn load(cell: *const AtomicU32) -> u32 {
@@ -152,12 +154,4 @@ fn load(cell: *const AtomicU32) -> u32 {
 fn store(cell: *const AtomicU32, value: u32) {
     // SAFETY: `cell` points to a valid AtomicU32 within the guest's memory.
     unsafe { (*cell).store(value, Ordering::Release) };
-}
-
-/// Atomic fetch-add on a mailbox cell, returning the previous value. This is
-/// the atomic read-modify-write the ABI documents for the wake/parking words
-/// (the guest bumps the same words with a real `fetch_add`).
-fn fetch_add(cell: *const AtomicU32) -> u32 {
-    // SAFETY: `cell` points to a valid AtomicU32 within the guest's memory.
-    unsafe { (*cell).fetch_add(1, Ordering::AcqRel) }
 }
