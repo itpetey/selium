@@ -529,13 +529,10 @@ fn apply_yield_queue(executor: &Executor) -> bool {
 
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     // SAFETY: `data` points at a live `Arc<TaskWake>` with a strong count
-    // owned by the raw waker being cloned.
-    let arc = unsafe { Arc::from_raw(data.cast::<TaskWake>()) };
-    let cloned = Arc::clone(&arc);
-    // Re-arm the original pointer: `from_raw` consumed one strong count, but
-    // the source waker still owns it.
-    let _ = Arc::into_raw(arc);
-    RawWaker::new(Arc::into_raw(cloned).cast(), &TASK_WAKE_VTABLE)
+    // owned by the raw waker being cloned; the increment becomes the cloned
+    // waker's own reference, so the source waker's pointer stays valid.
+    unsafe { Arc::increment_strong_count(data.cast::<TaskWake>()) };
+    RawWaker::new(data, &TASK_WAKE_VTABLE)
 }
 
 /// Creates a waker for `task_id` as seen from `worker_id`.
@@ -695,8 +692,8 @@ fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wake
             slot.state.store(TASK_PARKED, Ordering::SeqCst);
             // Lost-wakeup re-check: a wake that raced the poll (the parking
             // word advanced) must be delivered when the task re-parks.
-            if slot.park_word.load(Ordering::SeqCst) != observed_wakes {
-                if slot
+            if slot.park_word.load(Ordering::SeqCst) != observed_wakes
+                && slot
                     .state
                     .compare_exchange(
                         TASK_PARKED,
@@ -705,10 +702,9 @@ fn poll_task(executor: &Executor, task_id: TaskId, worker_id: u32, observed_wake
                         Ordering::Acquire,
                     )
                     .is_ok()
-                {
-                    drop(tasks);
-                    enqueue_and_notify(task_id);
-                }
+            {
+                drop(tasks);
+                enqueue_and_notify(task_id);
             }
             false
         }
@@ -915,8 +911,10 @@ fn wake_gen_waiters(region_id: u64, new_generation: u64) {
 
 unsafe fn wake_waker(data: *const ()) {
     // SAFETY: `data` is a live `Arc<TaskWake>` (see `clone_waker`); waking
-    // by ref and dropping are both safe on such a pointer.
+    // by ref is safe on such a pointer.
     unsafe { wake_waker_by_ref(data) };
+    // SAFETY: `data` is still a live `Arc<TaskWake>` after the wake; drop
+    // consumes the reference owned by this waker exactly once.
     unsafe { drop_waker(data) };
 }
 
@@ -1459,7 +1457,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            seen.iter().any(|&w| w == 0) && seen.iter().any(|&w| w == 1),
+            seen.contains(&0) && seen.contains(&1),
             "both tasks must run on distinct workers, saw {seen:?}"
         );
         assert_eq!(all_done.load(Ordering::Acquire), 2);

@@ -836,15 +836,31 @@ impl Runtime {
             // drives the guest's reactor as a unit (see the
             // channel-wake-wait and guest-worker-pool specs).
             if let Some(mailbox) = self.mailboxes.lock().get(&process_id).cloned() {
-                let _ = mailbox.bump_task_parking_word(task_id);
+                if let Err(error) = mailbox.bump_task_parking_word(task_id) {
+                    debug!(
+                        process_id,
+                        task_id,
+                        error = %error,
+                        "failed to bump guest task parking word"
+                    );
+                }
                 // Bump the shared wake word before notifying, mirroring
                 // `set_stop`'s futex discipline: a notify that fires between a
                 // worker's re-check and its `wait32` registration would be
                 // consumed by nobody, so the word bump makes the worker's
                 // subsequent wait return on the value mismatch instead of
                 // sleeping to the timeout.
-                let _ = mailbox.bump_wake_word();
-                let _ = mailbox.notify_wake_word(1);
+                if let Err(error) = mailbox.bump_wake_word() {
+                    debug!(process_id, error = %error, "failed to bump guest wake word");
+                }
+                if let Err(error) = mailbox.notify_wake_word(1) {
+                    debug!(
+                        process_id,
+                        task_id,
+                        error = %error,
+                        "failed to notify guest task wake"
+                    );
+                }
             }
         } else {
             self.poll_guest_until_stalled(process_id);

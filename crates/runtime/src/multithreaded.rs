@@ -16,6 +16,7 @@ use std::sync::{
 };
 
 use parking_lot::Mutex;
+use tracing::debug;
 use wasmtiny::{
     RegionProt, SharedRegionId, WasmValue,
     aot::{AotInstance, AotLoader, AotStore},
@@ -26,6 +27,7 @@ use crate::{
     Error, Result,
     config::SystemGuestArg,
     error::map_wasm_error,
+    mailbox::GuestMailbox,
     module_probe::WORKER_ENTRY_EXPORT,
     runtime::Runtime,
     wasm::{decode_wasm_arguments, encode_wasm_value},
@@ -168,8 +170,7 @@ impl MultithreadedGuest {
                         // delivery is lost).
                         if let Some(mailbox) = worker_runtime.mailbox(process_id) {
                             for _ in 0..count {
-                                let _ = mailbox.set_stop();
-                                let _ = mailbox.notify_wake_word(1);
+                                signal_stop_once(&mailbox, process_id);
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }
@@ -211,7 +212,21 @@ impl MultithreadedGuest {
             .name(format!("selium-guest-monitor-{process_id}"))
             .spawn(move || {
                 for worker in workers {
-                    let _ = worker.join();
+                    if let Err(panic) = worker.join() {
+                        // A worker's closure folds every trap into `fault`; a
+                        // `join` error means the thread itself panicked before
+                        // doing so, so record it to keep the reap classified as
+                        // a fault rather than a clean exit.
+                        let detail = panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "worker thread panicked".to_string());
+                        let mut slot = fault.lock();
+                        if slot.is_none() {
+                            *slot = Some(detail);
+                        }
+                    }
                 }
                 // Announce completion BEFORE the reap so the monitor's own
                 // cleanup never joins the monitor thread from itself.
@@ -257,9 +272,7 @@ impl MultithreadedGuest {
     pub(crate) fn stop_and_join(&self, runtime: &Runtime, process_id: selium_abi::ProcessId) {
         if !self.stopped.swap(true, Ordering::SeqCst) {
             // Claimed teardown: signal the workers, then reap below.
-            if let Some(mailbox) = runtime.mailbox(process_id) {
-                let _ = mailbox.set_stop();
-            }
+            signal_stop(runtime, process_id);
         }
         if let Some(monitor) = self.monitor.lock().take() {
             if !self.monitor_done.load(Ordering::SeqCst) {
@@ -269,10 +282,7 @@ impl MultithreadedGuest {
                 while !self.monitor_done.load(Ordering::SeqCst)
                     && std::time::Instant::now() < deadline
                 {
-                    if let Some(mailbox) = runtime.mailbox(process_id) {
-                        let _ = mailbox.set_stop();
-                        let _ = mailbox.notify_wake_word(1);
-                    }
+                    signal_stop(runtime, process_id);
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 if !self.monitor_done.load(Ordering::SeqCst) {
@@ -363,11 +373,23 @@ fn resolve_aot_entrypoint_arguments(
 /// instance whose monitor will never join them.
 fn signal_stop(runtime: &Runtime, process_id: selium_abi::ProcessId) {
     if let Some(mailbox) = runtime.mailbox(process_id) {
-        // `set_stop` also bumps the shared wake word, so a parked worker's
-        // `wait32` returns on the value mismatch and it re-checks the stop
-        // word; the notify covers a worker parked at the moment of the bump.
-        let _ = mailbox.set_stop();
-        let _ = mailbox.notify_wake_word(1);
+        signal_stop_once(&mailbox, process_id);
+    }
+}
+
+/// Delivers one stop signal to `mailbox`: sets the ABI stop word and notifies
+/// a parked worker. Mailbox errors are logged rather than discarded — wake
+/// delivery is best-effort, but a failure during isolation or teardown must
+/// not pass unnoticed.
+fn signal_stop_once(mailbox: &GuestMailbox, process_id: selium_abi::ProcessId) {
+    // `set_stop` also bumps the shared wake word, so a parked worker's
+    // `wait32` returns on the value mismatch and it re-checks the stop word;
+    // the notify covers a worker parked at the moment of the bump.
+    if let Err(error) = mailbox.set_stop() {
+        debug!(process_id, error = %error, "failed to set guest stop word");
+    }
+    if let Err(error) = mailbox.notify_wake_word(1) {
+        debug!(process_id, error = %error, "failed to notify guest wake word");
     }
 }
 
