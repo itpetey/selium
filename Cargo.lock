@@ -1145,7 +1145,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "selium-abi"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "rkyv",
  "thiserror",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "selium-accountant"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "rkyv",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "selium-bridge"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "selium-bridge-channel"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "selium-cli"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "selium-client"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "futures",
  "quinn",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "selium-connector-dns"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "selium-connector-http"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "futures",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "selium-connector-quic"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "getrandom",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "selium-control-plane"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "selium-discovery"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "selium-discovery-probe"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "selium-dns-demo"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "selium-guest"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "selium-abi",
  "selium-guest-macros",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "selium-guest-macros"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "blake3",
  "proc-macro2",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "selium-identity"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "rkyv",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "selium-identity-onboard"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "selium-kernel"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "libc",
  "mio",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "selium-memory"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "selium-abi",
  "thiserror",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "selium-mt-demo"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "selium-net-demo"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "selium-proto-dns"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "flatbuffers",
  "selium-guest-macros",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "selium-proto-http"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "flatbuffers",
  "selium-guest-macros",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "selium-quic-demo"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "selium-runtime"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "selium-service"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "flatbuffers",
  "selium-abi",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "selium-shm"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "flatbuffers",
  "futures",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "selium-spine-demo"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "selium-wire"
-version = "1.0.0-alpha.6"
+version = "1.0.0-alpha.7"
 dependencies = [
  "bytes",
  "flatbuffers",
