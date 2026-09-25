@@ -35,7 +35,7 @@ rcgen.workspace = true
 selium-accountant = { path = "../../guests/accountant" }
 selium-client.workspace = true
 selium-identity = { path = "../../guests/identity" }
-selium-identity-onboard = { path = "../../guests/identity-onboard" }
+selium-identity-onboard = { path = "../../integration/identity-onboard" }
 selium-proto-dns.workspace = true
 selium-service.workspace = true
 wat.workspace = true

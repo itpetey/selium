@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build every crate in ./crates/ with the default (host) target, then every
-# crate in ./guests/ with the wasm32-unknown-unknown target. Finally, rebuild
-# the net-demo guest with genuine wasm atomics (nightly + shared memory),
-# which the ignored `fastpath_wake` test requires. The atomics artifact is
+# crate in ./guests/ and ./integration/ with the wasm32-unknown-unknown target.
+# Finally, rebuild the net-demo guest with genuine wasm atomics (nightly +
+# shared memory), which the ignored `fastpath_wake` test requires. The atomics
+# artifact is
 # written to a distinct `selium_net_demo_atomics.wasm` (cargo can only emit
 # `selium_net_demo.wasm` for a crate named selium-net-demo, so the atomics
 # module is copied aside), and the plain `selium_net_demo.wasm` is restored
@@ -217,5 +218,6 @@ fi
 
 build_dir crates
 build_dir guests --target wasm32-unknown-unknown
+build_dir integration --target wasm32-unknown-unknown
 build_atomics_guest
 build_mt_demo_guest

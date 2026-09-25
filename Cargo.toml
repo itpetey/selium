@@ -22,14 +22,14 @@ members = [
   "guests/connector-quic",
   "guests/control-plane",
   "guests/discovery",
-  "guests/discovery-probe",
-  "guests/dns-demo",
   "guests/identity",
-  "guests/identity-onboard",
-  "guests/mt-demo",
-  "guests/net-demo",
-  "guests/quic-demo",
-  "guests/spine-demo",
+  "integration/discovery-probe",
+  "integration/dns-demo",
+  "integration/identity-onboard",
+  "integration/mt-demo",
+  "integration/net-demo",
+  "integration/quic-demo",
+  "integration/spine-demo",
 ]
 exclude = ["vendor"]
 # Frozen during the spine rebuild (kept in-tree for later increments):
