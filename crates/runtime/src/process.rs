@@ -15,79 +15,6 @@ use crate::{
     runtime::{CpuBudgetWindow, Runtime},
 };
 
-/// The wall-clock minute index (`unix_seconds / 60`) that process CPU budget
-/// windows are aligned to — the same UTC-minute boundaries the accountant's
-/// per-minute billing windows use, so a process's budget window matches its
-/// billing window. A pre-epoch system clock falls back to a process-monotonic
-/// minute so windows still roll rather than pinning at zero.
-fn wall_clock_window_index() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(elapsed) => elapsed.as_secs() / 60,
-        Err(_) => {
-            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            EPOCH
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_secs()
-                / 60
-        }
-    }
-}
-
-/// The start-of-window instruction count for a process: the previously anchored
-/// start when the process is still in the same wall-clock window, otherwise the
-/// current count (a fresh window anchors afresh).
-fn anchor_window_start(
-    previous: Option<CpuBudgetWindow>,
-    window_index: u64,
-    current_instructions: u64,
-) -> u64 {
-    match previous {
-        Some(window) if window.window_index == window_index => window.window_start_instructions,
-        _ => current_instructions,
-    }
-}
-
-/// A process's engine execution budget for a window: the window's anchored
-/// start count plus the tenant's ceiling (`None` = unbounded).
-fn window_budget(window_start_instructions: u64, ceiling: Option<u64>) -> Option<u64> {
-    ceiling.map(|ceiling| window_start_instructions.saturating_add(ceiling))
-}
-
-/// Reads a guest execution's cumulative executed-instruction count, or `None`
-/// when its instance is unavailable.
-fn instructions_of(execution: &crate::bootstrap::GuestExecution) -> Option<u64> {
-    match execution {
-        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => app
-            .runtime
-            .get_module(*module_index)
-            .and_then(|module| module.stats().ok())
-            .map(|stats| stats.executed_instructions),
-        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
-            mt.stats().ok().map(|stats| stats.executed_instructions)
-        }
-    }
-}
-
-/// Applies an engine execution budget to a guest execution (`None` clears any
-/// budget). Both engine paths carry an instruction meter (the interpreter
-/// charges every executed instruction; the AOT path charges size-weighted fuel
-/// at entries and loop back-edges), so the budget applies to a cooperative
-/// process's instance or a multithreaded process's shared worker-pool instance
-/// alike.
-fn set_execution_budget(execution: &crate::bootstrap::GuestExecution, budget: Option<u64>) {
-    match execution {
-        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
-            if let Some(module) = app.runtime.get_module(*module_index) {
-                drop(module.set_execution_budget(budget));
-            }
-        }
-        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
-            drop(mt.set_execution_budget(budget));
-        }
-    }
-}
-
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
     ///
@@ -1489,11 +1416,40 @@ impl Runtime {
     }
 }
 
+/// The start-of-window instruction count for a process: the previously anchored
+/// start when the process is still in the same wall-clock window, otherwise the
+/// current count (a fresh window anchors afresh).
+fn anchor_window_start(
+    previous: Option<CpuBudgetWindow>,
+    window_index: u64,
+    current_instructions: u64,
+) -> u64 {
+    match previous {
+        Some(window) if window.window_index == window_index => window.window_start_instructions,
+        _ => current_instructions,
+    }
+}
+
 /// Whether a guest reactor poll reports that the poll-owner entrypoint has
 /// completed: the `__selium_guest_poll` export returns `1` when the entrypoint
 /// future finished (a still-running, parked entrypoint returns `0`).
 fn entrypoint_completed(results: &[WasmValue]) -> bool {
     results.first() == Some(&WasmValue::I32(1))
+}
+
+/// Reads a guest execution's cumulative executed-instruction count, or `None`
+/// when its instance is unavailable.
+fn instructions_of(execution: &crate::bootstrap::GuestExecution) -> Option<u64> {
+    match execution {
+        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => app
+            .runtime
+            .get_module(*module_index)
+            .and_then(|module| module.stats().ok())
+            .map(|stats| stats.executed_instructions),
+        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
+            mt.stats().ok().map(|stats| stats.executed_instructions)
+        }
+    }
 }
 
 /// True when the per-attachment eligibility map marks every attacher of
@@ -1506,6 +1462,50 @@ fn region_fast_path_active(
     attachments
         .get(&shared_id)
         .is_some_and(|voters| !voters.is_empty() && voters.values().all(|capable| *capable))
+}
+
+/// Applies an engine execution budget to a guest execution (`None` clears any
+/// budget). Both engine paths carry an instruction meter (the interpreter
+/// charges every executed instruction; the AOT path charges size-weighted fuel
+/// at entries and loop back-edges), so the budget applies to a cooperative
+/// process's instance or a multithreaded process's shared worker-pool instance
+/// alike.
+fn set_execution_budget(execution: &crate::bootstrap::GuestExecution, budget: Option<u64>) {
+    match execution {
+        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
+            if let Some(module) = app.runtime.get_module(*module_index) {
+                drop(module.set_execution_budget(budget));
+            }
+        }
+        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
+            drop(mt.set_execution_budget(budget));
+        }
+    }
+}
+
+/// The wall-clock minute index (`unix_seconds / 60`) that process CPU budget
+/// windows are aligned to — the same UTC-minute boundaries the accountant's
+/// per-minute billing windows use, so a process's budget window matches its
+/// billing window. A pre-epoch system clock falls back to a process-monotonic
+/// minute so windows still roll rather than pinning at zero.
+fn wall_clock_window_index() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs() / 60,
+        Err(_) => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 60
+        }
+    }
+}
+
+/// A process's engine execution budget for a window: the window's anchored
+/// start count plus the tenant's ceiling (`None` = unbounded).
+fn window_budget(window_start_instructions: u64, ceiling: Option<u64>) -> Option<u64> {
+    ceiling.map(|ceiling| window_start_instructions.saturating_add(ceiling))
 }
 
 #[cfg(test)]

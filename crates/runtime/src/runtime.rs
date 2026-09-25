@@ -42,25 +42,6 @@ pub(crate) struct WaitEntry {
     pub(crate) generation: u64,
 }
 
-/// Per-process CPU budget window: the wall-clock minute the process's engine
-/// execution budget is currently anchored for, and its cumulative
-/// instruction count at that window's start.
-///
-/// The runtime recomputes a process's budget as
-/// `window_start_instructions + ceiling` on every refresh, so consumption in
-/// one window never reduces the next window's ceiling while a ceiling authored
-/// mid-window still takes effect against the current window's remaining
-/// allowance. A change of `window_index` (a new wall-clock minute) re-anchors
-/// `window_start_instructions` from the live count.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CpuBudgetWindow {
-    /// Wall-clock minute index (`unix_seconds / 60`).
-    pub(crate) window_index: u64,
-    /// The process's cumulative executed-instruction count at this window's
-    /// start.
-    pub(crate) window_start_instructions: u64,
-}
-
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
 pub struct Runtime {
@@ -172,6 +153,25 @@ pub struct Runtime {
     /// the spawn-time anchor and the per-second `refresh_cpu_budgets`, removed
     /// at process teardown.
     pub(crate) cpu_budget_windows: Arc<Mutex<HashMap<ProcessId, CpuBudgetWindow>>>,
+}
+
+/// Per-process CPU budget window: the wall-clock minute the process's engine
+/// execution budget is currently anchored for, and its cumulative
+/// instruction count at that window's start.
+///
+/// The runtime recomputes a process's budget as
+/// `window_start_instructions + ceiling` on every refresh, so consumption in
+/// one window never reduces the next window's ceiling while a ceiling authored
+/// mid-window still takes effect against the current window's remaining
+/// allowance. A change of `window_index` (a new wall-clock minute) re-anchors
+/// `window_start_instructions` from the live count.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CpuBudgetWindow {
+    /// Wall-clock minute index (`unix_seconds / 60`).
+    pub(crate) window_index: u64,
+    /// The process's cumulative executed-instruction count at this window's
+    /// start.
+    pub(crate) window_start_instructions: u64,
 }
 
 impl Runtime {

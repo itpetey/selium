@@ -38,6 +38,57 @@ const TRAPPING_WORKER: &str = r#"(module
     (func (export "__selium_guest_worker") (param i32) (result i32)
       unreachable))"#;
 
+/// Spawns a `WORKERS`-strong multithreaded guest whose workers each commit one
+/// page, run `iterations` of a busy loop, and park; polls metering until the
+/// whole pool has finished its work, and returns the single projected
+/// per-process observation.
+fn aggregate_observation(
+    name: &str,
+    workers: usize,
+    iterations: u32,
+) -> selium_abi::MeteringObservation {
+    let runtime = Runtime::default();
+    runtime.set_worker_count(name, workers);
+    let bootstrapped = runtime
+        .spawn_system_guest(pool_descriptor(
+            name,
+            &format!("{name}-module"),
+            &working_parked_worker_module(iterations),
+        ))
+        .expect("spawn aggregating guest");
+    let process_id = bootstrapped.process_id;
+
+    // Poll metering until every worker has committed its contribution: each
+    // worker grows one page, runs its loop, then crosses a host-call boundary
+    // that commits the shared meter before parking. Waiting for the committed
+    // page count to reach one page per worker *and* the instruction counter to
+    // stop advancing (two equal samples) proves the whole pool has finished —
+    // without a fixed sleep, which races on a loaded CI.
+    let expected_pages = (1 + workers) as u64; // declared page + one per worker.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut previous_cpu = None;
+    let observation = loop {
+        runtime.metering_tick();
+        let observation = runtime
+            .kernel()
+            .processes()
+            .metering_observation(process_id)
+            .expect("one aggregated per-process observation");
+        let pages_committed = observation.memory_bytes == expected_pages * 65_536;
+        let cpu_settled =
+            previous_cpu == Some(observation.cpu_instructions) && observation.cpu_instructions > 0;
+        if (pages_committed && cpu_settled) || Instant::now() >= deadline {
+            break observation;
+        }
+        previous_cpu = Some(observation.cpu_instructions);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    runtime.stop_process(process_id).expect("stop process");
+    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    observation
+}
+
 /// Builds a CPU-bound worker module whose worker entry performs `iterations`
 /// atomic increments on the worker's own linear-memory word (address = worker
 /// id × 4, so distinct workers never contend on the same cache line), then
@@ -87,6 +138,63 @@ fn execution_guard_is_bypassed_for_multithreaded_guests() {
 
     runtime.stop_process(process_id).expect("stop process");
     wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+}
+
+/// Loads the atomics mt-demo module, failing with an actionable message when
+/// it is absent (it is built by `scripts/build-all.sh`, not on the fly).
+#[expect(clippy::panic, reason = "test helper")]
+fn mt_demo_wasm() -> Vec<u8> {
+    let target_dir =
+        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
+    let path =
+        PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_mt_demo_atomics.wasm");
+    std::fs::read(&path).unwrap_or_else(|_error| {
+        panic!(
+            "atomics mt-demo guest not found at {}.\n\
+             Build it first with `scripts/build-all.sh` (needs a nightly \
+             toolchain with the rust-src component for -Zbuild-std)",
+            path.display()
+        )
+    })
+}
+
+/// 3.4: a multithreaded guest's metering aggregates across every worker thread
+/// into a single per-process observation. Each worker commits one extra page on
+/// the shared instance, runs a CPU-bound loop, then parks; the projected
+/// observation must report the summed committed-page count and the summed
+/// executed-unit count for the process — not one observation per worker. Three
+/// workers must report strictly more CPU than one over the same fixture.
+#[test]
+fn multithreaded_guest_aggregates_workers_into_one_observation() {
+    const ITERATIONS: u32 = 4_000_000;
+    let single = aggregate_observation("single", 1, ITERATIONS);
+    let triple = aggregate_observation("triple", 3, ITERATIONS);
+
+    // One observation per process, whose linear-memory gauge sums every
+    // worker's growth (one declared page plus one per worker).
+    assert_eq!(
+        single.memory_bytes,
+        2 * 65_536,
+        "one worker commits one extra page"
+    );
+    assert_eq!(
+        triple.memory_bytes,
+        4 * 65_536,
+        "the process reports one observation summing every worker's pages"
+    );
+
+    // CPU is summed across the workers: each shares the instance's meter, so
+    // three workers charge strictly more than one.
+    assert!(
+        single.cpu_instructions > 0,
+        "the pool's workers must have a metered CPU count: {single:?}"
+    );
+    assert!(
+        triple.cpu_instructions > single.cpu_instructions,
+        "three workers must sum more CPU than one ({} -> {})",
+        single.cpu_instructions,
+        triple.cpu_instructions
+    );
 }
 
 /// 4.x (multithreaded path): the runtime's per-minute CPU budget refresh
@@ -157,114 +265,6 @@ fn multithreaded_guest_is_halted_when_it_exhausts_its_cpu_budget() {
     );
 }
 
-/// 3.4: a multithreaded guest's metering aggregates across every worker thread
-/// into a single per-process observation. Each worker commits one extra page on
-/// the shared instance, runs a CPU-bound loop, then parks; the projected
-/// observation must report the summed committed-page count and the summed
-/// executed-unit count for the process — not one observation per worker. Three
-/// workers must report strictly more CPU than one over the same fixture.
-#[test]
-fn multithreaded_guest_aggregates_workers_into_one_observation() {
-    const ITERATIONS: u32 = 4_000_000;
-    let single = aggregate_observation("single", 1, ITERATIONS);
-    let triple = aggregate_observation("triple", 3, ITERATIONS);
-
-    // One observation per process, whose linear-memory gauge sums every
-    // worker's growth (one declared page plus one per worker).
-    assert_eq!(
-        single.memory_bytes,
-        2 * 65_536,
-        "one worker commits one extra page"
-    );
-    assert_eq!(
-        triple.memory_bytes,
-        4 * 65_536,
-        "the process reports one observation summing every worker's pages"
-    );
-
-    // CPU is summed across the workers: each shares the instance's meter, so
-    // three workers charge strictly more than one.
-    assert!(
-        single.cpu_instructions > 0,
-        "the pool's workers must have a metered CPU count: {single:?}"
-    );
-    assert!(
-        triple.cpu_instructions > single.cpu_instructions,
-        "three workers must sum more CPU than one ({} -> {})",
-        single.cpu_instructions,
-        triple.cpu_instructions
-    );
-}
-
-/// Spawns a `WORKERS`-strong multithreaded guest whose workers each commit one
-/// page, run `iterations` of a busy loop, and park; polls metering until the
-/// whole pool has finished its work, and returns the single projected
-/// per-process observation.
-fn aggregate_observation(
-    name: &str,
-    workers: usize,
-    iterations: u32,
-) -> selium_abi::MeteringObservation {
-    let runtime = Runtime::default();
-    runtime.set_worker_count(name, workers);
-    let bootstrapped = runtime
-        .spawn_system_guest(pool_descriptor(
-            name,
-            &format!("{name}-module"),
-            &working_parked_worker_module(iterations),
-        ))
-        .expect("spawn aggregating guest");
-    let process_id = bootstrapped.process_id;
-
-    // Poll metering until every worker has committed its contribution: each
-    // worker grows one page, runs its loop, then crosses a host-call boundary
-    // that commits the shared meter before parking. Waiting for the committed
-    // page count to reach one page per worker *and* the instruction counter to
-    // stop advancing (two equal samples) proves the whole pool has finished —
-    // without a fixed sleep, which races on a loaded CI.
-    let expected_pages = (1 + workers) as u64; // declared page + one per worker.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut previous_cpu = None;
-    let observation = loop {
-        runtime.metering_tick();
-        let observation = runtime
-            .kernel()
-            .processes()
-            .metering_observation(process_id)
-            .expect("one aggregated per-process observation");
-        let pages_committed = observation.memory_bytes == expected_pages * 65_536;
-        let cpu_settled =
-            previous_cpu == Some(observation.cpu_instructions) && observation.cpu_instructions > 0;
-        if (pages_committed && cpu_settled) || Instant::now() >= deadline {
-            break observation;
-        }
-        previous_cpu = Some(observation.cpu_instructions);
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    runtime.stop_process(process_id).expect("stop process");
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
-    observation
-}
-
-/// Loads the atomics mt-demo module, failing with an actionable message when
-/// it is absent (it is built by `scripts/build-all.sh`, not on the fly).
-#[expect(clippy::panic, reason = "test helper")]
-fn mt_demo_wasm() -> Vec<u8> {
-    let target_dir =
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_e| "../../target".to_string());
-    let path =
-        PathBuf::from(target_dir).join("wasm32-unknown-unknown/debug/selium_mt_demo_atomics.wasm");
-    std::fs::read(&path).unwrap_or_else(|_error| {
-        panic!(
-            "atomics mt-demo guest not found at {}.\n\
-             Build it first with `scripts/build-all.sh` (needs a nightly \
-             toolchain with the rust-src component for -Zbuild-std)",
-            path.display()
-        )
-    })
-}
-
 /// Worker-entry body that registers a mailbox at [`MAILBOX_BASE`] (via the
 /// `selium.mailbox_register` host import) and then parks on the shared wake
 /// word until a host notify wakes it. The mailbox length and the wake-word
@@ -284,49 +284,6 @@ fn parking_worker_module() -> String {
       (i32.const {wake_word}) (i32.const 0) (i32.store)
       i32.const 0)
     (func (export "__selium_guest_worker") (param i32) (result i32)
-      (memory.atomic.wait32
-        (i32.const {wake_word}) (i32.const 0) (i64.const -1))
-      drop
-      i32.const 0))"#
-    )
-}
-
-/// Worker-entry body that runs `iterations` of a busy arithmetic loop, crosses
-/// a host-call boundary (committing the invocation's fuel to the shared meter),
-/// then commits one extra linear-memory page on the shared instance (via
-/// `memory.grow`) before parking on the shared wake word — so the process stays
-/// resident with every worker's CPU and page contribution on the shared
-/// instance.
-///
-/// The page is grown **after** the fuel-committing host call (not before): the
-/// meter only settles at host-call boundaries, so a page count observed by the
-/// host is a sound signal that the worker's loop fuel has already been
-/// committed — the host can wait on the committed page count rather than a
-/// fixed sleep.
-fn working_parked_worker_module(iterations: u32) -> String {
-    let mailbox_len = mailbox::BYTE_LEN;
-    let wake_word = MAILBOX_BASE + mailbox::WAKE_WORD_OFFSET as u32;
-    format!(
-        r#"(module
-    (import "selium" "mailbox_register" (func $mb (param i32 i32)))
-    (memory 1)
-    (func (export "boot") (result i32)
-      (i32.const {MAILBOX_BASE}) (i32.const {mailbox_len}) (call $mb)
-      (i32.const {wake_word}) (i32.const 0) (i32.store)
-      i32.const 0)
-    (func (export "__selium_guest_worker") (param $id i32) (result i32)
-      (local $i i32)
-      (block $done
-        (loop $l
-          (local.get $i) (i32.const {iterations}) (i32.ge_u) (br_if $done)
-          (local.get $i) (i32.const 1) (i32.add) (local.set $i)
-          (br $l)))
-      ;; Cross a host-call boundary so the invocation's accumulated fuel is
-      ;; committed to the shared meter before the worker parks.
-      (i32.const {MAILBOX_BASE}) (i32.const {mailbox_len}) (call $mb)
-      ;; Commit the page only after the fuel, so an observed page proves the
-      ;; fuel has landed.
-      (i32.const 1) (memory.grow) (drop)
       (memory.atomic.wait32
         (i32.const {wake_word}) (i32.const 0) (i64.const -1))
       drop
@@ -594,4 +551,47 @@ fn worker_pool_provisioned_at_spawn_with_configured_count_and_joins_on_teardown(
 
     // Teardown of an already-reaped process is tolerated (idempotent).
     drop(runtime.stop_process(process_id));
+}
+
+/// Worker-entry body that runs `iterations` of a busy arithmetic loop, crosses
+/// a host-call boundary (committing the invocation's fuel to the shared meter),
+/// then commits one extra linear-memory page on the shared instance (via
+/// `memory.grow`) before parking on the shared wake word — so the process stays
+/// resident with every worker's CPU and page contribution on the shared
+/// instance.
+///
+/// The page is grown **after** the fuel-committing host call (not before): the
+/// meter only settles at host-call boundaries, so a page count observed by the
+/// host is a sound signal that the worker's loop fuel has already been
+/// committed — the host can wait on the committed page count rather than a
+/// fixed sleep.
+fn working_parked_worker_module(iterations: u32) -> String {
+    let mailbox_len = mailbox::BYTE_LEN;
+    let wake_word = MAILBOX_BASE + mailbox::WAKE_WORD_OFFSET as u32;
+    format!(
+        r#"(module
+    (import "selium" "mailbox_register" (func $mb (param i32 i32)))
+    (memory 1)
+    (func (export "boot") (result i32)
+      (i32.const {MAILBOX_BASE}) (i32.const {mailbox_len}) (call $mb)
+      (i32.const {wake_word}) (i32.const 0) (i32.store)
+      i32.const 0)
+    (func (export "__selium_guest_worker") (param $id i32) (result i32)
+      (local $i i32)
+      (block $done
+        (loop $l
+          (local.get $i) (i32.const {iterations}) (i32.ge_u) (br_if $done)
+          (local.get $i) (i32.const 1) (i32.add) (local.set $i)
+          (br $l)))
+      ;; Cross a host-call boundary so the invocation's accumulated fuel is
+      ;; committed to the shared meter before the worker parks.
+      (i32.const {MAILBOX_BASE}) (i32.const {mailbox_len}) (call $mb)
+      ;; Commit the page only after the fuel, so an observed page proves the
+      ;; fuel has landed.
+      (i32.const 1) (memory.grow) (drop)
+      (memory.atomic.wait32
+        (i32.const {wake_word}) (i32.const 0) (i64.const -1))
+      drop
+      i32.const 0))"#
+    )
 }
