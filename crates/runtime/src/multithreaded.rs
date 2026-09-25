@@ -18,8 +18,9 @@ use std::sync::{
 use parking_lot::Mutex;
 use tracing::debug;
 use wasmtiny::{
-    RegionProt, SharedRegionId, WasmValue,
+    RegionProt, SharedRegionId, WasmError, WasmValue,
     aot::{AotInstance, AotLoader, AotStore},
+    runtime::TrapCode,
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 
@@ -139,6 +140,24 @@ impl MultithreadedGuest {
         self.instance.detach_shared_region(region_id)
     }
 
+    /// Returns the shared instance's engine metering snapshot: the executed
+    /// instruction count and committed owned-memory pages. Because every worker
+    /// enters the same instance, a single snapshot aggregates the whole pool
+    /// into one per-process reading.
+    pub(crate) fn stats(&self) -> wasmtiny::runtime::Result<wasmtiny::runtime::InstanceStats> {
+        self.instance.stats()
+    }
+
+    /// Sets or resets the shared instance's execution budget (maximum metering
+    /// units); `None` means unbounded. Because every worker charges the shared
+    /// instance's meter, the budget caps the whole pool's per-window execution.
+    pub(crate) fn set_execution_budget(
+        &self,
+        budget: Option<u64>,
+    ) -> wasmtiny::runtime::Result<()> {
+        self.instance.set_execution_budget(budget)
+    }
+
     /// Provisions `count` dedicated OS worker threads, each entering the
     /// worker export over the shared instance, plus a monitor that reaps the
     /// process when the pool finishes.
@@ -178,11 +197,19 @@ impl MultithreadedGuest {
                         // faulting PC to its wasm function index and code
                         // offset, which is the only in-guest location
                         // information available once the worker has faulted.
-                        let detail = match instance.last_trap_site() {
-                            Some((func, offset, _code)) => {
-                                format!("{error} at wasm function {func}+{offset}")
+                        // Budget exhaustion is a distinct first-class outcome:
+                        // the engine reports it and the runtime owns the reap,
+                        // so surface it rather than a raw trap site.
+                        let detail = match &error {
+                            WasmError::Trap(TrapCode::ExecutionBudgetExceeded) => {
+                                "exhausted its CPU instruction budget".to_string()
                             }
-                            None => error.to_string(),
+                            _ => match instance.last_trap_site() {
+                                Some((func, offset, _code)) => {
+                                    format!("{error} at wasm function {func}+{offset}")
+                                }
+                                None => error.to_string(),
+                            },
                         };
                         let mut slot = fault.lock();
                         if slot.is_none() {

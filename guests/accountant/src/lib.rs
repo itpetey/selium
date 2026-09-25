@@ -69,14 +69,14 @@ const WINDOW_SECS: u64 = 60;
 
 /// Per-dimension usage in one sampling interval or billing window.
 ///
-/// Counter dimensions (`cpu_micros`, `bandwidth_bytes`) accumulate; gauge
+/// Counter dimensions (`cpu_instructions`, `bandwidth_bytes`) accumulate; gauge
 /// dimensions (`memory_bytes`, `storage_bytes`) carry a point-in-time reading
 /// (windowed reduction takes the peak).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct Usage {
-    /// CPU time in microseconds.
-    pub cpu_micros: u64,
+    /// CPU executed instructions.
+    pub cpu_instructions: u64,
     /// Memory bytes.
     pub memory_bytes: u64,
     /// Storage bytes.
@@ -162,9 +162,12 @@ pub struct Account {
 }
 
 /// Enforcement state authored from an account: quota values and the narrowing
-/// set the bridge-server subtracts from baseline conferrals.
+/// set the bridge-server subtracts from baseline conferral.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enforcement {
+    /// Per-minute CPU instruction ceiling (the runtime translates it into a
+    /// per-process engine execution budget).
+    pub cpu_ceiling: u64,
     /// Shared-memory ceiling.
     pub memory_quota: u64,
     /// Storage ceiling (authored for both durable-log and blob-store classes).
@@ -179,8 +182,8 @@ pub struct Enforcement {
 /// difference incremental consumption between ticks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CumulativeCounters {
-    /// Last observed cumulative cpu microseconds.
-    pub cpu_micros: u64,
+    /// Last observed cumulative CPU instructions.
+    pub cpu_instructions: u64,
     /// Last observed cumulative bandwidth bytes.
     pub bandwidth_bytes: u64,
 }
@@ -227,7 +230,7 @@ struct Shared {
 impl Usage {
     /// Adds counter dimensions (`cpu`, `bandwidth`).
     fn add_counters(&mut self, other: Usage) {
-        self.cpu_micros = self.cpu_micros.saturating_add(other.cpu_micros);
+        self.cpu_instructions = self.cpu_instructions.saturating_add(other.cpu_instructions);
         self.bandwidth_bytes = self.bandwidth_bytes.saturating_add(other.bandwidth_bytes);
     }
 
@@ -240,7 +243,9 @@ impl Usage {
     /// Returns the per-dimension excess of `self` over `ceiling`.
     pub fn over(&self, ceiling: Usage) -> Usage {
         Usage {
-            cpu_micros: self.cpu_micros.saturating_sub(ceiling.cpu_micros),
+            cpu_instructions: self
+                .cpu_instructions
+                .saturating_sub(ceiling.cpu_instructions),
             memory_bytes: self.memory_bytes.saturating_sub(ceiling.memory_bytes),
             storage_bytes: self.storage_bytes.saturating_sub(ceiling.storage_bytes),
             bandwidth_bytes: self.bandwidth_bytes.saturating_sub(ceiling.bandwidth_bytes),
@@ -249,7 +254,7 @@ impl Usage {
 
     /// Returns whether any dimension exceeds `ceiling`.
     pub fn exceeds(&self, ceiling: Usage) -> bool {
-        self.cpu_micros > ceiling.cpu_micros
+        self.cpu_instructions > ceiling.cpu_instructions
             || self.memory_bytes > ceiling.memory_bytes
             || self.storage_bytes > ceiling.storage_bytes
             || self.bandwidth_bytes > ceiling.bandwidth_bytes
@@ -259,7 +264,7 @@ impl Usage {
 impl From<&MeteringBucket> for Usage {
     fn from(bucket: &MeteringBucket) -> Self {
         Self {
-            cpu_micros: bucket.cpu_micros,
+            cpu_instructions: bucket.cpu_instructions,
             memory_bytes: bucket.memory_bytes,
             storage_bytes: bucket.storage_bytes,
             bandwidth_bytes: bucket.bandwidth_bytes,
@@ -270,7 +275,7 @@ impl From<&MeteringBucket> for Usage {
 impl From<&TenantPlan> for Usage {
     fn from(plan: &TenantPlan) -> Self {
         Self {
-            cpu_micros: plan.cpu_micros,
+            cpu_instructions: plan.cpu_instructions,
             memory_bytes: plan.memory_bytes,
             storage_bytes: plan.storage_bytes,
             bandwidth_bytes: plan.bandwidth_bytes,
@@ -295,7 +300,10 @@ impl Account {
     /// The hard ceiling: plan plus the opt-in overage budget.
     pub fn hard_ceiling(&self) -> Usage {
         Usage {
-            cpu_micros: self.plan.cpu_micros.saturating_add(self.overage.cpu_micros),
+            cpu_instructions: self
+                .plan
+                .cpu_instructions
+                .saturating_add(self.overage.cpu_instructions),
             memory_bytes: self
                 .plan
                 .memory_bytes
@@ -345,13 +353,13 @@ impl RollingWindow {
     pub fn merge(&mut self, bucket: &MeteringBucket) {
         let entry = self.usage.entry(bucket.tenant.clone()).or_default();
         entry.add_counters(Usage {
-            cpu_micros: bucket.cpu_micros,
+            cpu_instructions: bucket.cpu_instructions,
             memory_bytes: 0,
             storage_bytes: 0,
             bandwidth_bytes: bucket.bandwidth_bytes,
         });
         entry.merge_gauges(Usage {
-            cpu_micros: 0,
+            cpu_instructions: 0,
             memory_bytes: bucket.memory_bytes,
             storage_bytes: bucket.storage_bytes,
             bandwidth_bytes: 0,
@@ -514,6 +522,13 @@ impl Shared {
         if let Err(error) = quota_set(tenant, ResourceClass::Process, enforcement.process_quota) {
             warn!(tenant, "accountant: process quota set failed: {error}");
         }
+        // The CPU ceiling is a quota dimension (not an allocation gate): the
+        // runtime translates it into per-process engine execution budgets on
+        // its minute refresh. Zeroed for a delinquent tenant alongside its
+        // other quotas.
+        if let Err(error) = quota_set(tenant, ResourceClass::Cpu, enforcement.cpu_ceiling) {
+            warn!(tenant, "accountant: cpu ceiling set failed: {error}");
+        }
 
         match selium_abi::encode_rkyv(&enforcement.narrowing) {
             Ok(bytes) => {
@@ -596,6 +611,12 @@ pub fn bookkeeper_grants() -> Vec<CapabilityGrant> {
 /// capped at the hard ceiling (the opt-in overage budget, zero means the plan
 /// is the hard cap) and at the operator-authored (or default) process count; a
 /// delinquent tenant is zeroed and narrowed to nothing.
+///
+/// The CPU ceiling is authored as `plan + overage` instructions: the plan and
+/// overage carry instruction ceilings, so the operator-facing (human-unit)
+/// conversion happens once at the pricing-boundary rate card, upstream of the
+/// accountant — the metering/enforcement pipeline never carries a pseudo-time
+/// quantity.
 pub fn enforcement_for(
     plan: Usage,
     overage: Usage,
@@ -603,13 +624,16 @@ pub fn enforcement_for(
     delinquent: bool,
 ) -> Enforcement {
     let hard = Usage {
-        cpu_micros: plan.cpu_micros.saturating_add(overage.cpu_micros),
+        cpu_instructions: plan
+            .cpu_instructions
+            .saturating_add(overage.cpu_instructions),
         memory_bytes: plan.memory_bytes.saturating_add(overage.memory_bytes),
         storage_bytes: plan.storage_bytes.saturating_add(overage.storage_bytes),
         bandwidth_bytes: plan.bandwidth_bytes.saturating_add(overage.bandwidth_bytes),
     };
     if delinquent {
         Enforcement {
+            cpu_ceiling: 0,
             memory_quota: 0,
             storage_quota: 0,
             process_quota: 0,
@@ -617,6 +641,7 @@ pub fn enforcement_for(
         }
     } else {
         Enforcement {
+            cpu_ceiling: hard.cpu_instructions,
             memory_quota: hard.memory_bytes,
             storage_quota: hard.storage_bytes,
             process_quota,
@@ -644,8 +669,8 @@ pub fn reduce_samples(
             .unwrap_or_default();
         let cpu_delta = sample
             .observation
-            .cpu_micros
-            .saturating_sub(last.cpu_micros);
+            .cpu_instructions
+            .saturating_sub(last.cpu_instructions);
         let bandwidth_delta = sample
             .observation
             .bandwidth_bytes
@@ -653,20 +678,20 @@ pub fn reduce_samples(
         last_counters.insert(
             sample.process_id,
             CumulativeCounters {
-                cpu_micros: sample.observation.cpu_micros,
+                cpu_instructions: sample.observation.cpu_instructions,
                 bandwidth_bytes: sample.observation.bandwidth_bytes,
             },
         );
 
         let bucket = buckets.entry(tenant.clone()).or_default();
         bucket.add_counters(Usage {
-            cpu_micros: cpu_delta,
+            cpu_instructions: cpu_delta,
             memory_bytes: 0,
             storage_bytes: 0,
             bandwidth_bytes: bandwidth_delta,
         });
         bucket.merge_gauges(Usage {
-            cpu_micros: 0,
+            cpu_instructions: 0,
             memory_bytes: sample.observation.memory_bytes,
             storage_bytes: sample.observation.storage_bytes,
             bandwidth_bytes: 0,
@@ -918,7 +943,7 @@ async fn bookkeeper(mut ctx: Context) -> anyhow::Result<()> {
         for (tenant, usage) in &buckets {
             let bucket = MeteringBucket {
                 tenant: tenant.clone(),
-                cpu_micros: usage.cpu_micros,
+                cpu_instructions: usage.cpu_instructions,
                 memory_bytes: usage.memory_bytes,
                 storage_bytes: usage.storage_bytes,
                 bandwidth_bytes: usage.bandwidth_bytes,
@@ -1111,7 +1136,7 @@ mod tests {
 
     fn usage(cpu: u64, memory: u64, storage: u64, bandwidth: u64) -> Usage {
         Usage {
-            cpu_micros: cpu,
+            cpu_instructions: cpu,
             memory_bytes: memory,
             storage_bytes: storage,
             bandwidth_bytes: bandwidth,
@@ -1129,7 +1154,9 @@ mod tests {
     #[test]
     fn enforcements_map_across_the_state_machine() {
         // Paid/active tenants are capped at the hard ceiling and not narrowed.
+        // The CPU ceiling is the plan plus the opt-in overage, in instructions.
         let active = enforcement_for(plan(), overage(), DEFAULT_PROCESS_QUOTA, false);
+        assert_eq!(active.cpu_ceiling, 1_500);
         assert_eq!(active.memory_quota, 15_000);
         assert_eq!(active.storage_quota, 7_500);
         assert_eq!(active.process_quota, 100);
@@ -1137,6 +1164,7 @@ mod tests {
 
         // No opt-in overage means the plan is the hard cap.
         let no_overage = enforcement_for(plan(), Usage::default(), DEFAULT_PROCESS_QUOTA, false);
+        assert_eq!(no_overage.cpu_ceiling, 1_000);
         assert_eq!(no_overage.memory_quota, 10_000);
         assert_eq!(no_overage.storage_quota, 5_000);
 
@@ -1144,14 +1172,28 @@ mod tests {
         let raised = enforcement_for(plan(), overage(), 250, false);
         assert_eq!(raised.process_quota, 250);
 
-        // Delinquency zeroes quotas (including the process ceiling) and
-        // narrows to nothing.
+        // Delinquency zeroes quotas (including the CPU ceiling and the process
+        // ceiling) and narrows to nothing.
         let delinquent = enforcement_for(plan(), overage(), 500, true);
+        assert_eq!(delinquent.cpu_ceiling, 0);
         assert_eq!(delinquent.memory_quota, 0);
         assert_eq!(delinquent.storage_quota, 0);
         assert_eq!(delinquent.process_quota, 0);
         assert_eq!(delinquent.narrowing, all_capabilities());
         assert!(delinquent.narrowing.len() >= 10);
+    }
+
+    #[test]
+    fn authored_cpu_ceiling_is_plan_plus_overage() {
+        // Task 5.1: the authored per-minute CPU instruction ceiling equals the
+        // tenant's plan plus its opt-in overage budget.
+        let plan = usage(7_000, 0, 0, 0);
+        let overage = usage(3_000, 0, 0, 0);
+        let enforcement = enforcement_for(plan, overage, DEFAULT_PROCESS_QUOTA, false);
+        assert_eq!(
+            enforcement.cpu_ceiling,
+            plan.cpu_instructions + overage.cpu_instructions
+        );
     }
 
     #[test]
@@ -1253,7 +1295,7 @@ mod tests {
                 process_id: 1,
                 tenant: Some("acme".to_string()),
                 observation: MeteringObservation {
-                    cpu_micros: 100,
+                    cpu_instructions: 100,
                     memory_bytes: 1_000,
                     storage_bytes: 500,
                     bandwidth_bytes: 50,
@@ -1263,7 +1305,7 @@ mod tests {
                 process_id: 2,
                 tenant: Some("acme".to_string()),
                 observation: MeteringObservation {
-                    cpu_micros: 300,
+                    cpu_instructions: 300,
                     memory_bytes: 2_000,
                     storage_bytes: 700,
                     bandwidth_bytes: 10,
@@ -1274,7 +1316,7 @@ mod tests {
                 process_id: 3,
                 tenant: None,
                 observation: MeteringObservation {
-                    cpu_micros: 9_000,
+                    cpu_instructions: 9_000,
                     memory_bytes: 9_000,
                     storage_bytes: 9_000,
                     bandwidth_bytes: 9_000,
@@ -1291,7 +1333,7 @@ mod tests {
             process_id: 1,
             tenant: Some("acme".to_string()),
             observation: MeteringObservation {
-                cpu_micros: 150,
+                cpu_instructions: 150,
                 memory_bytes: 900,
                 storage_bytes: 600,
                 bandwidth_bytes: 75,
@@ -1309,7 +1351,7 @@ mod tests {
         };
         window.merge(&MeteringBucket {
             tenant: "acme".to_string(),
-            cpu_micros: 100,
+            cpu_instructions: 100,
             memory_bytes: 1_000,
             storage_bytes: 500,
             bandwidth_bytes: 50,
@@ -1317,7 +1359,7 @@ mod tests {
         });
         window.merge(&MeteringBucket {
             tenant: "acme".to_string(),
-            cpu_micros: 50,
+            cpu_instructions: 50,
             memory_bytes: 800,
             storage_bytes: 900,
             bandwidth_bytes: 25,
@@ -1360,7 +1402,7 @@ mod tests {
         };
         window.merge(&MeteringBucket {
             tenant: "acme".to_string(),
-            cpu_micros: 1_200,
+            cpu_instructions: 1_200,
             memory_bytes: 12_000,
             storage_bytes: 6_000,
             bandwidth_bytes: 3_000,
@@ -1368,7 +1410,7 @@ mod tests {
         });
         window.merge(&MeteringBucket {
             tenant: "beta".to_string(),
-            cpu_micros: 10,
+            cpu_instructions: 10,
             memory_bytes: 20,
             storage_bytes: 30,
             bandwidth_bytes: 40,

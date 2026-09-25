@@ -61,9 +61,16 @@ impl Runtime {
             std::thread::Builder::new()
                 .name("selium-metering-ticker".to_string())
                 .spawn(move || {
+                    // The CPU budget refresh runs on the same ticker: each live
+                    // process's engine execution budget is re-applied every
+                    // second, so a ceiling authored or withdrawn between
+                    // windows lands within one sampling interval. The budget
+                    // *window* itself re-anchors only when the wall-clock
+                    // minute rolls (see `refresh_cpu_budgets`).
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         runtime.metering_tick();
+                        runtime.refresh_cpu_budgets();
                     }
                 })
                 .map_err(|error| Error::Host(format!("metering ticker spawn failed: {error}")))?;
@@ -304,6 +311,15 @@ impl Runtime {
                 }
             }
         };
+        // Bound the fresh process from its first instructions: anchor its
+        // engine execution budget to the tenant's authored CPU ceiling now,
+        // before the entrypoint runs, so a process spawned mid-window is not
+        // unbounded until the next wall-clock minute.
+        self.anchor_spawn_cpu_budget(
+            process.local_id,
+            descriptor.tenant.as_deref(),
+            &loaded_guest.execution,
+        );
         let loaded_guest = match self.execute_entrypoint(loaded_guest, &descriptor) {
             Ok(loaded_guest) => {
                 if loaded_guest.entrypoint_results == [WasmValue::I32(1)] {

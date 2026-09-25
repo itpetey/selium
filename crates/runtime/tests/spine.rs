@@ -96,6 +96,20 @@ fn wasm_guest_runs_golden_path() {
         "expected 'spine: pubsub ok' in guest log, got: {messages:?}"
     );
 
+    // Metering flows end-to-end from the engine: the host projects the guest's
+    // executed-instruction count read from the Wasmtiny instance meter (no
+    // host-side placeholder hook).
+    runtime.metering_tick();
+    let observation = runtime
+        .kernel()
+        .processes()
+        .metering_observation(process_id)
+        .expect("metered observation");
+    assert!(
+        observation.cpu_instructions > 0,
+        "the guest's executed instructions must be projected: {observation:?}"
+    );
+
     // Teardown: stop releases runtime state and kernel resources.
     runtime.stop_process(process_id).expect("stop process");
     assert_eq!(runtime.loaded_guest_count(), 0);

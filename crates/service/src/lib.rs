@@ -596,7 +596,7 @@ pub enum IdentityResponse {
 
 /// A per-tenant metering bucket for one sampling interval, published by the
 /// bookkeeper entrypoint to a shared-memory topic and merged by the
-/// accountant entrypoint. Counter dimensions (`cpu_micros`, `bandwidth_bytes`)
+/// accountant entrypoint. Counter dimensions (`cpu_instructions`, `bandwidth_bytes`)
 /// carry the interval's delta; gauge dimensions (`memory_bytes`,
 /// `storage_bytes`) carry the current reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,8 +608,9 @@ pub enum IdentityResponse {
 pub struct MeteringBucket {
     /// Tenant whose usage the bucket aggregates.
     pub tenant: String,
-    /// CPU time delta in microseconds.
-    pub cpu_micros: u64,
+    /// CPU instruction delta for the interval (executed WebAssembly
+    /// instructions).
+    pub cpu_instructions: u64,
     /// Current memory usage in bytes.
     pub memory_bytes: u64,
     /// Current storage usage in bytes.
@@ -631,8 +632,8 @@ pub struct MeteringBucket {
     binding = "selium_service::fbs::selium::accountant::TenantPlan"
 )]
 pub struct TenantPlan {
-    /// CPU ceiling in microseconds (billable overage only).
-    pub cpu_micros: u64,
+    /// CPU ceiling in instructions per minute.
+    pub cpu_instructions: u64,
     /// Memory ceiling in bytes.
     pub memory_bytes: u64,
     /// Storage ceiling in bytes.
@@ -1405,7 +1406,7 @@ mod tests {
     fn metering_bucket_round_trips() {
         let bucket = MeteringBucket {
             tenant: "acme".to_string(),
-            cpu_micros: 1_234_567,
+            cpu_instructions: 1_234_567,
             memory_bytes: 65_536,
             storage_bytes: 4096,
             bandwidth_bytes: 10_000,
@@ -1435,7 +1436,7 @@ mod tests {
     #[test]
     fn tenant_plan_round_trips() {
         let plan = TenantPlan {
-            cpu_micros: 60_000_000,
+            cpu_instructions: 60_000_000,
             memory_bytes: 1_073_741_824,
             storage_bytes: 10_485_760,
             bandwidth_bytes: 104_857_600,
@@ -1451,7 +1452,7 @@ mod tests {
             AccountantControl::SetPlan {
                 tenant: "acme".to_string(),
                 plan: TenantPlan {
-                    cpu_micros: 0,
+                    cpu_instructions: 0,
                     memory_bytes: 1024,
                     storage_bytes: 512,
                     bandwidth_bytes: 256,
@@ -1460,7 +1461,7 @@ mod tests {
             AccountantControl::SetOverage {
                 tenant: "acme".to_string(),
                 overage: TenantPlan {
-                    cpu_micros: 0,
+                    cpu_instructions: 0,
                     memory_bytes: 256,
                     storage_bytes: 128,
                     bandwidth_bytes: 64,

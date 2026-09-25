@@ -103,10 +103,9 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
     };
     let workload = find("workload");
 
-    // A workload runs: accumulate cpu/bandwidth and allocate shared memory,
-    // then project the per-process observation into the kernel for the
-    // bookkeeper to sample.
-    runtime.record_cpu_usage(workload, 5_000_000);
+    // A workload runs: its engine-fed instruction counter accrues, bandwidth
+    // is instrumented, and it allocates shared memory; the host projects the
+    // per-process observation into the kernel for the bookkeeper to sample.
     runtime.record_bandwidth_usage(workload, 1024);
     let (status, op) = runtime.begin_hostcall(
         workload,
@@ -130,8 +129,8 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
     match window {
         LedgerRecord::Window { usage, .. } => {
             assert!(
-                usage.cpu_micros >= 5_000_000,
-                "cpu usage in ledger: {usage:?}"
+                usage.cpu_instructions > 0,
+                "engine-fed cpu usage in ledger: {usage:?}"
             );
             assert!(
                 usage.memory_bytes >= 65_536,

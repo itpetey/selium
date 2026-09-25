@@ -2517,7 +2517,7 @@ mod tests {
         runtime.project_metering(
             child.local_id,
             MeteringObservation {
-                cpu_micros: 1,
+                cpu_instructions: 1,
                 memory_bytes: 2,
                 storage_bytes: 3,
                 bandwidth_bytes: 4,
@@ -4744,7 +4744,7 @@ mod tests {
         runtime.project_metering(
             child.local_id,
             MeteringObservation {
-                cpu_micros: 42,
+                cpu_instructions: 42,
                 memory_bytes: 0,
                 storage_bytes: 0,
                 bandwidth_bytes: 0,
@@ -4793,7 +4793,7 @@ mod tests {
         runtime.project_metering(
             unrelated.process_id,
             MeteringObservation {
-                cpu_micros: 7,
+                cpu_instructions: 7,
                 memory_bytes: 0,
                 storage_bytes: 0,
                 bandwidth_bytes: 0,

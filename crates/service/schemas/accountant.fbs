@@ -12,17 +12,17 @@
 //   `SetOverage` authors the opt-in overage budget (hard ceiling = plan +
 //   overage); `MarkDelinquent`/`MarkRestored` drive the rare billing-state
 //   transitions.
-// - `TenantPlan`: per-dimension ceilings (`cpu_micros` participates in
-//   billable-overage recording; `memory_bytes`, `storage_bytes`, and
-//   `bandwidth_bytes` are the enforceable dimensions).
+// - `TenantPlan`: per-dimension ceilings (`cpu_instructions` is the
+//   enforceable per-minute CPU ceiling; `memory_bytes`, `storage_bytes`, and
+//   `bandwidth_bytes` are the other enforceable dimensions).
 namespace selium.accountant;
 
 // A per-tenant metering bucket for one sampling interval.
 table MeteringBucket {
     // Tenant whose usage the bucket aggregates.
     tenant: string;
-    // CPU time delta in microseconds.
-    cpu_micros: ulong;
+    // CPU instruction delta (executed WebAssembly instructions) for the interval.
+    cpu_instructions: ulong;
     // Current memory usage in bytes.
     memory_bytes: ulong;
     // Current storage usage in bytes.
@@ -37,8 +37,8 @@ table MeteringBucket {
 
 // Per-dimension ceiling values for a tenant's plan or overage budget.
 table TenantPlan {
-    // CPU ceiling in microseconds (billable overage only).
-    cpu_micros: ulong;
+    // CPU ceiling in instructions per minute.
+    cpu_instructions: ulong;
     // Memory ceiling in bytes.
     memory_bytes: ulong;
     // Storage ceiling in bytes.

@@ -250,6 +250,11 @@ pub enum ResourceClass {
     GuestLog,
     /// Host-mediated connection queue resource.
     HostQueue,
+    /// Per-tenant CPU instruction ceiling (a quota dimension, not an
+    /// allocatable resource): the accountant authors a tenant's per-minute
+    /// executed-instruction ceiling under this class and the runtime translates
+    /// it into per-process engine execution budgets.
+    Cpu,
 }
 
 /// Context used to evaluate a capability grant.
@@ -907,8 +912,8 @@ pub struct HostcallEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub struct MeteringObservation {
-    /// CPU time consumed in microseconds.
-    pub cpu_micros: u64,
+    /// Cumulative WebAssembly instructions executed by the process.
+    pub cpu_instructions: u64,
     /// Memory usage in bytes.
     pub memory_bytes: u64,
     /// Storage usage in bytes.
@@ -1061,6 +1066,7 @@ impl ResourceClass {
             Self::MeteringStream => "metering",
             Self::GuestLog => "guest-log",
             Self::HostQueue => "queue",
+            Self::Cpu => "cpu",
         }
     }
 
@@ -1082,6 +1088,7 @@ impl ResourceClass {
             "metering" => Some(Self::MeteringStream),
             "guest-log" => Some(Self::GuestLog),
             "queue" => Some(Self::HostQueue),
+            "cpu" => Some(Self::Cpu),
             _ => None,
         }
     }
@@ -1618,6 +1625,30 @@ mod tests {
     }
 
     #[test]
+    fn metering_observation_round_trip() {
+        // The observation carries the cumulative instruction count and the
+        // memory/storage/bandwidth gauges. The former microsecond CPU field
+        // is intentionally absent from the type, so there is nothing to read.
+        let output = HostcallOutput::Metering(MeteringObservation {
+            cpu_instructions: 123_456,
+            memory_bytes: 4_096,
+            storage_bytes: 512,
+            bandwidth_bytes: 8_192,
+        });
+        let encoded = encode_rkyv(&output).expect("encode");
+        let decoded: HostcallOutput = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, output);
+
+        let HostcallOutput::Metering(observation) = decoded else {
+            panic!("expected metering observation");
+        };
+        assert_eq!(observation.cpu_instructions, 123_456);
+        assert_eq!(observation.memory_bytes, 4_096);
+        assert_eq!(observation.storage_bytes, 512);
+        assert_eq!(observation.bandwidth_bytes, 8_192);
+    }
+
+    #[test]
     fn self_info_round_trip() {
         let envelope = HostcallEnvelope {
             request: HostcallRequest::SelfInfo,
@@ -1765,6 +1796,7 @@ mod tests {
             (ResourceClass::MeteringStream, "metering"),
             (ResourceClass::GuestLog, "guest-log"),
             (ResourceClass::HostQueue, "queue"),
+            (ResourceClass::Cpu, "cpu"),
         ];
         for (class, expected) in every {
             assert_eq!(class.uri_segment(), expected, "segment for {class:?}");

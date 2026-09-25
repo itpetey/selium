@@ -217,7 +217,7 @@ fn seed_policy(runtime: &Runtime) {
         &LedgerRecord::SetPlan {
             tenant: DELINQUENT.to_string(),
             plan: Usage {
-                cpu_micros: 1_000_000,
+                cpu_instructions: 1_000_000,
                 memory_bytes: 64 * 65_536,
                 storage_bytes: 32 * 65_536,
                 bandwidth_bytes: 1024,
@@ -229,7 +229,7 @@ fn seed_policy(runtime: &Runtime) {
         &LedgerRecord::SetOverage {
             tenant: DELINQUENT.to_string(),
             overage: Usage {
-                cpu_micros: 0,
+                cpu_instructions: 0,
                 memory_bytes: 16 * 65_536,
                 storage_bytes: 8 * 65_536,
                 bandwidth_bytes: 0,
@@ -247,7 +247,7 @@ fn seed_policy(runtime: &Runtime) {
         &LedgerRecord::SetPlan {
             tenant: ACTIVE.to_string(),
             plan: Usage {
-                cpu_micros: 500_000,
+                cpu_instructions: 500_000,
                 memory_bytes: 32 * 65_536,
                 storage_bytes: 16 * 65_536,
                 bandwidth_bytes: 512,
@@ -259,7 +259,7 @@ fn seed_policy(runtime: &Runtime) {
         &LedgerRecord::SetOverage {
             tenant: ACTIVE.to_string(),
             overage: Usage {
-                cpu_micros: 0,
+                cpu_instructions: 0,
                 memory_bytes: 8 * 65_536,
                 storage_bytes: 4 * 65_536,
                 bandwidth_bytes: 0,

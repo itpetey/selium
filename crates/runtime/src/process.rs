@@ -6,11 +6,87 @@ use selium_abi::{
 };
 use selium_service::{DiscoveryRequest, FlatMsg};
 use tracing::debug;
-use wasmtiny::{WasmError, WasmValue};
+use wasmtiny::{WasmError, WasmValue, runtime::TrapCode};
 
 use crate::{
-    Error, Result, config::ProcessAuthority, hostcall::HostOperationState, runtime::Runtime,
+    Error, Result,
+    config::ProcessAuthority,
+    hostcall::HostOperationState,
+    runtime::{CpuBudgetWindow, Runtime},
 };
+
+/// The wall-clock minute index (`unix_seconds / 60`) that process CPU budget
+/// windows are aligned to — the same UTC-minute boundaries the accountant's
+/// per-minute billing windows use, so a process's budget window matches its
+/// billing window. A pre-epoch system clock falls back to a process-monotonic
+/// minute so windows still roll rather than pinning at zero.
+fn wall_clock_window_index() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs() / 60,
+        Err(_) => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                / 60
+        }
+    }
+}
+
+/// The start-of-window instruction count for a process: the previously anchored
+/// start when the process is still in the same wall-clock window, otherwise the
+/// current count (a fresh window anchors afresh).
+fn anchor_window_start(
+    previous: Option<CpuBudgetWindow>,
+    window_index: u64,
+    current_instructions: u64,
+) -> u64 {
+    match previous {
+        Some(window) if window.window_index == window_index => window.window_start_instructions,
+        _ => current_instructions,
+    }
+}
+
+/// A process's engine execution budget for a window: the window's anchored
+/// start count plus the tenant's ceiling (`None` = unbounded).
+fn window_budget(window_start_instructions: u64, ceiling: Option<u64>) -> Option<u64> {
+    ceiling.map(|ceiling| window_start_instructions.saturating_add(ceiling))
+}
+
+/// Reads a guest execution's cumulative executed-instruction count, or `None`
+/// when its instance is unavailable.
+fn instructions_of(execution: &crate::bootstrap::GuestExecution) -> Option<u64> {
+    match execution {
+        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => app
+            .runtime
+            .get_module(*module_index)
+            .and_then(|module| module.stats().ok())
+            .map(|stats| stats.executed_instructions),
+        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
+            mt.stats().ok().map(|stats| stats.executed_instructions)
+        }
+    }
+}
+
+/// Applies an engine execution budget to a guest execution (`None` clears any
+/// budget). Both engine paths carry an instruction meter (the interpreter
+/// charges every executed instruction; the AOT path charges size-weighted fuel
+/// at entries and loop back-edges), so the budget applies to a cooperative
+/// process's instance or a multithreaded process's shared worker-pool instance
+/// alike.
+fn set_execution_budget(execution: &crate::bootstrap::GuestExecution, budget: Option<u64>) {
+    match execution {
+        crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
+            if let Some(module) = app.runtime.get_module(*module_index) {
+                drop(module.set_execution_budget(budget));
+            }
+        }
+        crate::bootstrap::GuestExecution::Multithreaded(mt) => {
+            drop(mt.set_execution_budget(budget));
+        }
+    }
+}
 
 impl Runtime {
     /// Stops a process and releases runtime-owned state for it.
@@ -158,13 +234,6 @@ impl Runtime {
             .observe_metering(process_id, observation);
     }
 
-    /// Accumulates CPU usage for a process (host instrumentation hook). The
-    /// next [`Runtime::metering_tick`] projects it into the kernel as part of
-    /// the process's cumulative cpu counter.
-    pub fn record_cpu_usage(&self, process_id: selium_abi::ProcessId, micros: u64) {
-        self.metering.lock().record_cpu(process_id, micros);
-    }
-
     /// Accumulates bandwidth usage for a process (host instrumentation hook).
     pub fn record_bandwidth_usage(&self, process_id: selium_abi::ProcessId, bytes: u64) {
         self.metering.lock().record_bandwidth(process_id, bytes);
@@ -176,38 +245,143 @@ impl Runtime {
     }
 
     /// Projects a fresh metering observation for every live process into the
-    /// kernel: cumulative cpu/bandwidth counters and current memory/storage
-    /// gauges. Memory is derived from live shared-region ownership; storage and
-    /// the cumulative counters come from the projector's accumulators.
+    /// kernel: cumulative instruction/bandwidth counters and current
+    /// memory/storage gauges. Instruction counts and the memory gauge are read
+    /// from the engine's per-instance meter (committed linear-memory pages);
+    /// storage and the bandwidth counter come from the projector's
+    /// accumulators.
     pub fn metering_tick(&self) {
         let live: Vec<ProcessId> = self.process_authorities.lock().keys().copied().collect();
 
-        // Current memory gauge per process: total bytes of owned shared
-        // regions, so freed regions stop counting on the next tick.
-        let mut memory_by_process: std::collections::HashMap<ProcessId, u64> = Default::default();
-        {
-            let owners = self.shared_resource_owners.lock();
-            for ((class, shared_id), pids) in owners.iter() {
-                if *class != ResourceClass::SharedRegion {
-                    continue;
-                }
-                let Ok(len) = self.kernel.memory().shared_region_len(*shared_id) else {
-                    continue;
-                };
-                for pid in pids {
-                    *memory_by_process.entry(*pid).or_insert(0) += u64::from(len);
-                }
-            }
+        // Refresh each live process's engine-fed readings before projecting:
+        // instructions for cpu and committed linear pages for memory.
+        for process_id in &live {
+            self.observe_engine_metering(*process_id);
         }
 
         let metering = self.metering.lock();
         for process_id in live {
-            let memory_bytes = memory_by_process.get(&process_id).copied().unwrap_or(0);
-            let observation = metering.project(process_id, memory_bytes);
+            let observation = metering.project(process_id);
             self.kernel
                 .processes()
                 .observe_metering(process_id, observation);
         }
+    }
+
+    /// Reads a live process's engine metering snapshot (executed instructions
+    /// and committed linear-memory bytes) and folds it into the projector.
+    /// Returns false when the process has no loaded guest to read from.
+    fn observe_engine_metering(&self, process_id: ProcessId) -> bool {
+        let stats = {
+            let guests = self.loaded_guests.lock();
+            match guests.get(&process_id).map(|guest| &guest.execution) {
+                Some(crate::bootstrap::GuestExecution::Cooperative { app, module_index }) => app
+                    .runtime
+                    .get_module(*module_index)
+                    .and_then(|module| module.stats().ok()),
+                Some(crate::bootstrap::GuestExecution::Multithreaded(mt)) => mt.stats().ok(),
+                None => None,
+            }
+        };
+        let Some(stats) = stats else {
+            return false;
+        };
+        self.metering.lock().observe_engine(
+            process_id,
+            stats.executed_instructions,
+            stats.memory_bytes,
+        );
+        true
+    }
+
+    /// Re-applies each live process's tenant CPU instruction ceiling to its
+    /// engine execution budget.
+    ///
+    /// Run on every host sampling tick so a ceiling authored or withdrawn
+    /// between windows takes effect within one second; the budget *window*
+    /// itself is re-anchored only when the wall-clock minute rolls (see
+    /// [`Runtime::anchor_cpu_budget`]).
+    pub fn refresh_cpu_budgets(&self) {
+        let window_index = wall_clock_window_index();
+        let live: Vec<(ProcessId, Option<String>)> = {
+            let authorities = self.process_authorities.lock();
+            authorities
+                .iter()
+                .map(|(process_id, authority)| (*process_id, authority.tenant.clone()))
+                .collect()
+        };
+        let guests = self.loaded_guests.lock();
+        for (process_id, tenant) in live {
+            let Some(guest) = guests.get(&process_id) else {
+                continue;
+            };
+            self.anchor_cpu_budget(
+                process_id,
+                tenant.as_deref(),
+                &guest.execution,
+                window_index,
+            );
+        }
+    }
+
+    /// Anchors a freshly loaded process's engine execution budget to its
+    /// tenant's current-window CPU ceiling, before its entrypoint runs, so a
+    /// process spawned mid-window is bounded from its first instructions rather
+    /// than only from the next wall-clock minute.
+    pub(crate) fn anchor_spawn_cpu_budget(
+        &self,
+        process_id: ProcessId,
+        tenant: Option<&str>,
+        execution: &crate::bootstrap::GuestExecution,
+    ) {
+        self.anchor_cpu_budget(process_id, tenant, execution, wall_clock_window_index());
+    }
+
+    /// Anchors a process's engine execution budget to its tenant's
+    /// current-window CPU instruction ceiling and applies it to the process's
+    /// live instance.
+    ///
+    /// The budget is `window_start + ceiling`, where `window_start` is the
+    /// process's instruction count at the current window's start: a fresh
+    /// window re-anchors from the live count (so consumption in one window
+    /// never reduces the next), while a ceiling authored mid-window takes
+    /// effect against the current window's remaining allowance. A tenant with
+    /// no authored ceiling (or no tenant) is unbounded.
+    ///
+    /// The read of the live instruction count and the subsequent
+    /// `set_execution_budget` are not atomic with respect to the instance's own
+    /// execution, so a process already running on another thread — a poll, or a
+    /// multithreaded worker — can execute a bounded step between the two; the
+    /// overshoot is at most one execution step and is still metered honestly.
+    fn anchor_cpu_budget(
+        &self,
+        process_id: ProcessId,
+        tenant: Option<&str>,
+        execution: &crate::bootstrap::GuestExecution,
+        window_index: u64,
+    ) {
+        let Some(current_instructions) = instructions_of(execution) else {
+            return;
+        };
+        let window_start_instructions = {
+            let mut windows = self.cpu_budget_windows.lock();
+            let window_start_instructions = anchor_window_start(
+                windows.get(&process_id).copied(),
+                window_index,
+                current_instructions,
+            );
+            windows.insert(
+                process_id,
+                CpuBudgetWindow {
+                    window_index,
+                    window_start_instructions,
+                },
+            );
+            window_start_instructions
+        };
+        let ceiling =
+            tenant.and_then(|tenant| self.kernel.quota().lookup(tenant, ResourceClass::Cpu));
+        set_execution_budget(execution, window_budget(window_start_instructions, ceiling));
     }
 
     /// Returns all activity log events currently held by the kernel.
@@ -412,6 +586,9 @@ impl Runtime {
         self.process_fastpath.lock().remove(&process_id);
         // Its metering accumulators are moot too.
         self.metering.lock().remove(process_id);
+        // And so is its CPU budget window, so a later spawn reusing the id
+        // cannot inherit an anchor from a dead process.
+        self.cpu_budget_windows.lock().remove(&process_id);
 
         // Release the tenant-scoped process-quota slot reserved at spawn,
         // exactly once (the entry is removed here). Tenant-less processes and
@@ -1076,13 +1253,26 @@ impl Runtime {
     /// A trap means the guest panicked and aborted (`std::process::abort` →
     /// `unreachable`), so it can never make progress again: mirror the
     /// entrypoint trap path by recording `ProcessExited` and reclaiming the
-    /// process. Non-trap failures (e.g. a missing `__selium_guest_poll`
-    /// export) are also permanent stalls, but are recorded without teardown:
-    /// they are module-shape bugs that are diagnosed from the log, not
-    /// killed mid-flight.
+    /// process. Exhausting the tenant's CPU instruction budget is a distinct
+    /// first-class outcome (the engine surfaces `ExecutionBudgetExceeded`; the
+    /// runtime owns the reap decision), recorded and reaped through the same
+    /// standard teardown path. Non-trap failures (e.g. a missing
+    /// `__selium_guest_poll` export) are also permanent stalls, but are recorded
+    /// without teardown: they are module-shape bugs that are diagnosed from the
+    /// log, not killed mid-flight.
     fn record_poll_failure(&self, process_id: ProcessId, error: &WasmError) {
         let guest_logs = self.drain_guest_log_messages(process_id);
         let trapped = match error {
+            WasmError::Trap(TrapCode::ExecutionBudgetExceeded) => {
+                self.kernel.processes().record_activity(ActivityEvent {
+                    kind: ActivityKind::ProcessExited,
+                    process_id: Some(process_id),
+                    message: format!(
+                        "guest {process_id} exhausted its CPU instruction budget; reaping process; recent guest logs: {guest_logs:?}"
+                    ),
+                });
+                true
+            }
             WasmError::Trap(code) => {
                 self.kernel.processes().record_activity(ActivityEvent {
                     kind: ActivityKind::ProcessExited,
@@ -1121,7 +1311,23 @@ impl Runtime {
         };
         let result = match &mut loaded_guest.execution {
             crate::bootstrap::GuestExecution::Cooperative { app, module_index } => {
-                app.call_function(*module_index, "__selium_guest_poll", &[])
+                let result = app.call_function(*module_index, "__selium_guest_poll", &[]);
+                // Engine-fed metering: after every reactor poll, snapshot the
+                // instance's cumulative executed-instruction count and committed
+                // linear-memory pages so the projection always reflects the
+                // engine's observations, never a host-side placeholder.
+                if let Some(stats) = app
+                    .runtime
+                    .get_module(*module_index)
+                    .and_then(|module| module.stats().ok())
+                {
+                    self.metering.lock().observe_engine(
+                        process_id,
+                        stats.executed_instructions,
+                        stats.memory_bytes,
+                    );
+                }
+                result
             }
             crate::bootstrap::GuestExecution::Multithreaded(_) => {
                 // A multithreaded guest is never poll-driven: re-insert and
@@ -1308,7 +1514,8 @@ mod tests {
     use crate::mailbox::GuestMailbox;
     use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
     use selium_abi::{
-        ActivityKind, LocalityScope, MeteringObservation, Namespace, ResourceSelector,
+        ActivityKind, CompletionState, HostcallOutput, HostcallRequest, LocalityScope,
+        MeteringObservation, Namespace, RegionProt, ResourceKind, ResourceSelector,
     };
     use std::sync::Arc;
     use wasmtiny::WasmError;
@@ -1588,7 +1795,7 @@ mod tests {
         runtime.project_metering(
             bootstrapped.process_id,
             MeteringObservation {
-                cpu_micros: 11,
+                cpu_instructions: 11,
                 memory_bytes: 22,
                 storage_bytes: 33,
                 bandwidth_bytes: 44,
@@ -1607,19 +1814,20 @@ mod tests {
                 .processes()
                 .metering_observation(bootstrapped.process_id)
                 .expect("metering")
-                .cpu_micros,
+                .cpu_instructions,
             11
         );
     }
 
     #[test]
-    fn metering_tick_projects_counters_and_gauges() {
+    fn metering_tick_projects_engine_instructions_and_linear_pages() {
         let runtime = Runtime::default();
         let guest = runtime
             .spawn_system_guest(SystemGuestDescriptor {
                 name: "metered".to_string(),
                 module_id: "metered-module".to_string(),
-                module_bytes: module_with_entrypoint("main", ""),
+                module_bytes: wat::parse_str("(module (memory 3) (func (export \"main\")))")
+                    .expect("compile metered module"),
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: vec![CapabilityGrant::new(
@@ -1634,9 +1842,15 @@ mod tests {
             })
             .expect("spawn metered guest");
 
-        // Cumulative counters accumulate across ticks; the observation updates
-        // on the tick.
-        runtime.record_cpu_usage(guest.process_id, 500);
+        // Own a shared region: its bytes must NOT land in the linear-memory
+        // gauge (regions are a separate quota dimension).
+        let (shared_id, _len) = runtime
+            .kernel()
+            .memory()
+            .allocate_shared_region(65_536)
+            .expect("allocate region");
+        runtime.claim_shared_resource(guest.process_id, ResourceClass::SharedRegion, shared_id);
+
         runtime.record_bandwidth_usage(guest.process_id, 1024);
         runtime.metering_tick();
 
@@ -1645,23 +1859,325 @@ mod tests {
             .processes()
             .metering_observation(guest.process_id)
             .expect("metered observation after tick");
-        assert_eq!(observation.cpu_micros, 500);
+        // CPU is fed from the engine's per-instance instruction meter, not a
+        // host instrumentation hook.
+        assert!(
+            observation.cpu_instructions > 0,
+            "engine must feed the instruction counter: {observation:?}"
+        );
+        // Memory is the guest's committed linear pages (3 * 64 KiB), not the
+        // owned shared region's bytes.
+        assert_eq!(
+            observation.memory_bytes,
+            3 * 65_536,
+            "memory gauge is committed linear pages, not region bytes"
+        );
         assert_eq!(observation.bandwidth_bytes, 1024);
-        assert_eq!(observation.memory_bytes, 0);
         assert_eq!(observation.storage_bytes, 0);
 
-        // A second accumulation updates the projected observation on the next
-        // tick (cumulative semantics).
-        runtime.record_cpu_usage(guest.process_id, 250);
+        // The engine's instruction counter is monotonic across ticks.
+        let first = observation.cpu_instructions;
         runtime.metering_tick();
+        let second = runtime
+            .kernel()
+            .processes()
+            .metering_observation(guest.process_id)
+            .expect("metered observation after second tick")
+            .cpu_instructions;
+        assert!(
+            second >= first,
+            "instruction counter must not decrease ({first} -> {second})"
+        );
+    }
+
+    #[test]
+    fn poll_feeds_engine_instruction_meter() {
+        let runtime = Runtime::default();
+        let guest = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "polled".to_string(),
+                module_id: "polled-module".to_string(),
+                module_bytes: wat::parse_str(
+                    "(module
+                        (memory 1)
+                        (func (export \"main\"))
+                        (func (export \"__selium_guest_poll\") (result i32)
+                            i32.const 1
+                            i32.const 2
+                            i32.add
+                            drop
+                            i32.const 0))",
+                )
+                .expect("compile polled module"),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: None,
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn polled guest");
+
+        runtime.metering_tick();
+        let before = runtime
+            .kernel()
+            .processes()
+            .metering_observation(guest.process_id)
+            .expect("metered observation before poll")
+            .cpu_instructions;
+
+        // Drive a reactor poll: the engine charges the poll's instructions and
+        // the projector reads the instance's cumulative count.
+        runtime.poll_guest(guest.process_id);
+
+        runtime.metering_tick();
+        let after = runtime
+            .kernel()
+            .processes()
+            .metering_observation(guest.process_id)
+            .expect("metered observation after poll")
+            .cpu_instructions;
+        assert!(
+            after > before,
+            "a poll must increase the engine-fed instruction counter ({before} -> {after})"
+        );
+    }
+
+    /// A cooperative guest whose poll runs a busy arithmetic loop before
+    /// parking (returns 0), so a poll can be driven across a CPU budget.
+    fn busy_poll_module(iterations: u32) -> Vec<u8> {
+        wat::parse_str(format!(
+            "(module
+                (memory 1)
+                (func (export \"main\"))
+                (func (export \"__selium_guest_poll\") (result i32)
+                    (local $i i32)
+                    (block $done
+                        (loop $l
+                            (local.get $i) (i32.const {iterations}) (i32.ge_u) (br_if $done)
+                            (local.get $i) (i32.const 1) (i32.add) (local.set $i)
+                            (br $l)))
+                    i32.const 0))"
+        ))
+        .expect("compile busy poll module")
+    }
+
+    /// Spawns a resident tenant-scoped guest whose poll runs `iterations` of a
+    /// busy loop, granting shared-memory so it can hold a reservation to be
+    /// released on reap.
+    fn spawn_busy_guest(runtime: &Runtime, iterations: u32) -> ProcessId {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "budgeted".to_string(),
+                module_id: format!("budgeted-module-{iterations}"),
+                module_bytes: busy_poll_module(iterations),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                dependencies: Vec::new(),
+                readiness: ReadinessCondition::Immediate,
+                tenant: Some("acme".to_string()),
+                serving_role: None,
+                handlers: Vec::new(),
+            })
+            .expect("spawn budgeted guest")
+            .process_id
+    }
+
+    /// Task 4.1: a tenant's per-minute CPU instruction ceiling becomes a
+    /// per-process engine execution budget, refreshed on every sampling tick so
+    /// a ceiling change lands within one second. Raising the ceiling lets the
+    /// guest run; lowering it below the remaining window work halts the guest
+    /// on the next refresh.
+    #[test]
+    fn tenant_cpu_ceiling_becomes_a_per_process_engine_budget() {
+        let runtime = Runtime::default();
+        let pid = spawn_busy_guest(&runtime, 50_000);
+
+        // A generous ceiling: the poll runs to completion without trapping.
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::Cpu, 100_000_000);
+        runtime.refresh_cpu_budgets();
+        runtime.poll_guest(pid);
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            1,
+            "a generous ceiling must not halt the guest"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_ok(),
+            "a generous ceiling must not reap the process"
+        );
+
+        // Lowering the ceiling re-anchors the engine budget to the new ceiling
+        // on the next refresh: the poll's remaining work now exceeds it and the
+        // engine halts execution.
+        runtime.kernel().quota().set("acme", ResourceClass::Cpu, 10);
+        runtime.refresh_cpu_budgets();
+        runtime.poll_guest(pid);
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            0,
+            "the lowered ceiling must halt the guest"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_err(),
+            "the halted guest must be reaped"
+        );
+    }
+
+    /// The spawn-time anchor: a process spawned mid-window under a tenant with
+    /// an already-authored CPU ceiling is bounded from its first instructions —
+    /// no budget refresh is needed for the ceiling to apply.
+    #[test]
+    fn spawn_anchors_the_tenant_cpu_ceiling_without_a_refresh() {
+        let runtime = Runtime::default();
+        // Author the ceiling BEFORE the process exists, then spawn into it.
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::Cpu, 50_000);
+        let pid = spawn_busy_guest(&runtime, 1_000_000);
+
+        // No `refresh_cpu_budgets` call: the spawn-time anchor alone must halt
+        // the runaway loop on the first poll.
+        runtime.poll_guest(pid);
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            0,
+            "the spawn-anchored budget must halt the guest"
+        );
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_err(),
+            "the over-budget guest must be reaped"
+        );
+    }
+
+    /// The window anchor keeps a window's start count across refreshes within
+    /// the same wall-clock minute, and re-anchors afresh on a new minute.
+    #[test]
+    fn cpu_budget_window_re_anchors_only_on_a_new_minute() {
+        // First anchor for a window: the window starts at the live count.
+        assert_eq!(anchor_window_start(None, 100, 5_000), 5_000);
+        // Same minute: the anchored start is kept, so consumption is not reset.
+        assert_eq!(
+            anchor_window_start(
+                Some(CpuBudgetWindow {
+                    window_index: 100,
+                    window_start_instructions: 5_000,
+                }),
+                100,
+                9_000,
+            ),
+            5_000
+        );
+        // New minute: the window re-anchors from the live count.
+        assert_eq!(
+            anchor_window_start(
+                Some(CpuBudgetWindow {
+                    window_index: 100,
+                    window_start_instructions: 5_000,
+                }),
+                101,
+                9_000,
+            ),
+            9_000
+        );
+        // The budget is the window start plus the ceiling; no ceiling is
+        // unbounded.
+        assert_eq!(window_budget(5_000, Some(2_000)), Some(7_000));
+        assert_eq!(window_budget(5_000, None), None);
+        // A ceiling that would overflow saturates rather than wrapping.
+        assert_eq!(window_budget(u64::MAX, Some(1)), Some(u64::MAX));
+    }
+
+    /// The budget window is aligned to wall-clock minutes, matching the
+    /// accountant's billing windows.
+    #[test]
+    fn cpu_budget_window_is_wall_clock_minute_aligned() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        assert_eq!(wall_clock_window_index(), now / 60);
+    }
+
+    /// Task 4.2: exhausting the tenant's CPU budget halts a runaway-loop guest
+    /// and reaps it through the standard teardown path, releasing its
+    /// reservations (here, a shared-region quota reservation). Task 4.3: the
+    /// exhaustion outcome is a distinct first-class signal recorded by the
+    /// runtime (the engine only reports it).
+    #[test]
+    fn over_budget_process_is_reaped_and_releases_reservations() {
+        let runtime = Runtime::default();
+        let pid = spawn_busy_guest(&runtime, 1_000_000);
+
+        // The guest holds a shared-region reservation against the tenant.
+        let (status, op) = runtime.begin_hostcall(
+            pid,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: RegionProt::ReadWrite,
+                purpose: ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        assert!(matches!(
+            runtime.poll_hostcall(pid, op),
+            CompletionState::Ready(HostcallOutput::RegionAlloc(_))
+        ));
         assert_eq!(
             runtime
                 .kernel()
-                .processes()
-                .metering_observation(guest.process_id)
-                .expect("metered observation")
-                .cpu_micros,
-            750
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
+            65_536,
+            "the region reservation is tracked against the tenant"
+        );
+
+        // A tiny per-minute ceiling: the runaway loop exhausts it on the next
+        // poll.
+        runtime
+            .kernel()
+            .quota()
+            .set("acme", ResourceClass::Cpu, 1_000);
+        runtime.refresh_cpu_budgets();
+        runtime.poll_guest(pid);
+
+        // Reaped through the standard teardown path, with the exhaustion
+        // recorded as a distinct outcome.
+        assert_eq!(runtime.loaded_guest_count(), 0);
+        assert!(
+            runtime.kernel().processes().inspect_process(pid).is_err(),
+            "the over-budget process must be reaped"
+        );
+        assert!(
+            runtime.activity_log().iter().any(|event| {
+                event.process_id == Some(pid)
+                    && event.kind == ActivityKind::ProcessExited
+                    && event
+                        .message
+                        .contains("exhausted its CPU instruction budget")
+            }),
+            "expected a budget-exhaustion ProcessExited record, got: {:?}",
+            runtime.activity_log()
+        );
+        // The region reservation returned to the tenant.
+        assert_eq!(
+            runtime
+                .kernel()
+                .quota()
+                .used("acme", ResourceClass::SharedRegion),
+            0,
+            "the reaped process's region reservation is released"
         );
     }
 

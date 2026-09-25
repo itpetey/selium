@@ -2037,6 +2037,7 @@ name = "wasmtiny"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "log",
  "parking_lot",
  "sha2",
  "thiserror",

@@ -42,6 +42,25 @@ pub(crate) struct WaitEntry {
     pub(crate) generation: u64,
 }
 
+/// Per-process CPU budget window: the wall-clock minute the process's engine
+/// execution budget is currently anchored for, and its cumulative
+/// instruction count at that window's start.
+///
+/// The runtime recomputes a process's budget as
+/// `window_start_instructions + ceiling` on every refresh, so consumption in
+/// one window never reduces the next window's ceiling while a ceiling authored
+/// mid-window still takes effect against the current window's remaining
+/// allowance. A change of `window_index` (a new wall-clock minute) re-anchors
+/// `window_start_instructions` from the live count.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CpuBudgetWindow {
+    /// Wall-clock minute index (`unix_seconds / 60`).
+    pub(crate) window_index: u64,
+    /// The process's cumulative executed-instruction count at this window's
+    /// start.
+    pub(crate) window_start_instructions: u64,
+}
+
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
 pub struct Runtime {
@@ -148,6 +167,11 @@ pub struct Runtime {
     /// system guest name. Absent entries default to the number of available
     /// CPU cores (the pool never exceeds it unless explicitly configured).
     pub(crate) worker_counts: Arc<Mutex<HashMap<String, usize>>>,
+    /// Per-process CPU budget windows (see [`CpuBudgetWindow`]): the wall-clock
+    /// minute a process's engine execution budget is anchored for. Written by
+    /// the spawn-time anchor and the per-second `refresh_cpu_budgets`, removed
+    /// at process teardown.
+    pub(crate) cpu_budget_windows: Arc<Mutex<HashMap<ProcessId, CpuBudgetWindow>>>,
 }
 
 impl Runtime {
@@ -195,6 +219,7 @@ impl Runtime {
             metering: Arc::new(Mutex::new(crate::metering::MeteringProjector::default())),
             metering_ticker_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker_counts: Arc::new(Mutex::new(HashMap::new())),
+            cpu_budget_windows: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Initialise the mio network poller if possible (best-effort).
