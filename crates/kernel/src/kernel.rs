@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use crate::{
     host_queue::HostQueueRegistry, memory::MemoryRegistry, network::NetworkState, poller::Poller,
-    process::ProcessTable, quota::QuotaTable, storage::StorageRegistry,
+    process::ProcessTable, quota::QuotaTable, volume::VolumeRegistry,
 };
 
 #[derive(Clone)]
@@ -19,7 +19,7 @@ pub struct Kernel {
 pub(crate) struct KernelInner {
     pub(crate) memory: MemoryRegistry,
     pub(crate) processes: ProcessTable,
-    pub(crate) storage: StorageRegistry,
+    pub(crate) volumes: VolumeRegistry,
     pub(crate) network: NetworkState,
     pub(crate) queues: HostQueueRegistry,
     pub(crate) quota: QuotaTable,
@@ -27,12 +27,32 @@ pub(crate) struct KernelInner {
 }
 
 impl Kernel {
+    /// Creates a kernel whose durable volume layer is rooted at `root`.
+    pub fn with_state_dir(seed: u64, root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(KernelInner {
+                memory: MemoryRegistry::new(seed),
+                processes: ProcessTable::new(seed),
+                volumes: VolumeRegistry::new(root),
+                network: NetworkState::new(),
+                queues: HostQueueRegistry::new(),
+                quota: QuotaTable::new(),
+                poller: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Creates a kernel with a throwaway state directory.
+    ///
+    /// The durable volume layer still lives on the filesystem (the host has no
+    /// in-memory storage mode), but the directory is removed when the last
+    /// kernel handle drops. Boot with [`Kernel::with_state_dir`] to persist.
     pub fn with_seed(seed: u64) -> Self {
         Self {
             inner: Arc::new(KernelInner {
                 memory: MemoryRegistry::new(seed),
                 processes: ProcessTable::new(seed),
-                storage: StorageRegistry::new(),
+                volumes: VolumeRegistry::ephemeral(),
                 network: NetworkState::new(),
                 queues: HostQueueRegistry::new(),
                 quota: QuotaTable::new(),
@@ -65,8 +85,8 @@ impl Kernel {
     pub fn processes(&self) -> ProcessTable {
         self.inner.processes.clone()
     }
-    pub fn storage(&self) -> StorageRegistry {
-        self.inner.storage.clone()
+    pub fn volumes(&self) -> VolumeRegistry {
+        self.inner.volumes.clone()
     }
     pub fn network(&self) -> NetworkState {
         self.inner.network.clone()

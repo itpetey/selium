@@ -419,6 +419,7 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap guest");
     report

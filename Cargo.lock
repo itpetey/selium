@@ -44,7 +44,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror",
+ "thiserror 2.0.21",
  "time",
 ]
 
@@ -228,6 +228,15 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "constant_time_eq"
@@ -458,6 +467,24 @@ checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags",
  "rustc_version",
+]
+
+[[package]]
+name = "flatbuffers-build"
+version = "0.2.4+flatc-25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2859e0a9c8f4ea7ba413bb92c799559b78215976bb74dad2f5f618fad8fce50"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "flatc-fork"
+version = "0.6.0+25.12.19-2026-02-06-03fffb2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f995c44278ee64981366ec17e6847f0756184a92ad0d3a1b6f7170f91e1eb129"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]
@@ -882,7 +909,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -904,7 +931,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -1139,7 +1166,7 @@ name = "selium-abi"
 version = "1.0.0-alpha.7"
 dependencies = [
  "rkyv",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1202,7 +1229,7 @@ dependencies = [
  "rustls-pki-types",
  "selium-service",
  "selium-wire",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -1233,7 +1260,7 @@ dependencies = [
  "selium-proto-http",
  "selium-service",
  "selium-shm",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1258,7 +1285,7 @@ dependencies = [
  "selium-shm",
  "selium-wire",
  "sha2",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -1319,7 +1346,7 @@ dependencies = [
  "selium-service",
  "selium-shm",
  "selium-wire",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1335,7 +1362,7 @@ dependencies = [
  "selium-guest",
  "selium-runtime",
  "syn 3.0.6",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "trybuild",
@@ -1378,8 +1405,7 @@ dependencies = [
  "selium-abi",
  "selium-memory",
  "selium-shm",
- "sha2",
- "thiserror",
+ "thiserror 2.0.21",
  "wasmtiny",
 ]
 
@@ -1388,7 +1414,7 @@ name = "selium-memory"
 version = "1.0.0-alpha.7"
 dependencies = [
  "selium-abi",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1415,7 +1441,7 @@ dependencies = [
  "flatbuffers",
  "selium-guest-macros",
  "selium-service",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1449,6 +1475,7 @@ dependencies = [
  "selium-abi",
  "selium-accountant",
  "selium-client",
+ "selium-control-plane",
  "selium-identity",
  "selium-identity-onboard",
  "selium-kernel",
@@ -1456,8 +1483,9 @@ dependencies = [
  "selium-proto-dns",
  "selium-service",
  "selium-shm",
+ "selium-store",
  "selium-wire",
- "thiserror",
+ "thiserror 2.0.21",
  "time",
  "tokio",
  "tracing",
@@ -1472,9 +1500,11 @@ name = "selium-service"
 version = "1.0.0-alpha.7"
 dependencies = [
  "flatbuffers",
+ "flatbuffers-build",
+ "flatc-fork",
  "selium-abi",
  "selium-guest-macros",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -1502,6 +1532,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-store"
+version = "1.0.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "selium-abi",
+ "selium-guest",
+ "selium-service",
+ "selium-shm",
+ "sha2",
+]
+
+[[package]]
 name = "selium-wire"
 version = "1.0.0-alpha.7"
 dependencies = [
@@ -1512,7 +1554,7 @@ dependencies = [
  "selium-guest-macros",
  "selium-memory",
  "selium-service",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
 ]
@@ -1707,11 +1749,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.21",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2039,7 +2101,7 @@ dependencies = [
  "log",
  "parking_lot",
  "sha2",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2052,7 +2114,7 @@ dependencies = [
  "cranelift-frontend",
  "sha2",
  "target-lexicon",
- "thiserror",
+ "thiserror 2.0.21",
  "wasmparser 0.259.0",
 ]
 
@@ -2126,7 +2188,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror",
+ "thiserror 2.0.21",
  "time",
 ]
 

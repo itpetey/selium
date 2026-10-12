@@ -20,6 +20,7 @@ fn entrypoint_with_u64_param_receives_argument() {
         start_discovery: false,
         system_guests: vec![descriptor],
         domain_table: Vec::new(),
+        state_dir: None,
     };
 
     let report = runtime

@@ -181,6 +181,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap");
 

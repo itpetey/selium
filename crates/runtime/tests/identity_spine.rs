@@ -47,13 +47,13 @@ use std::{sync::Arc, time::Duration};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
 use selium_client::FlatMsg as _;
 use selium_identity_onboard::{MODE_ONBOARD, MODE_REVOKE};
-use selium_runtime::{Runtime, RuntimeConfig};
+use selium_runtime::RuntimeConfig;
 use selium_service::{ControlRequest, ControlResponse, DelegationStatus, Deployment};
 use spine_common::{
-    CONNECTOR_ADDR, CONTROL_URI, SCHEDULER_DEFERRED, SpinePortGuard, bridge_server_descriptor,
-    client_options, connector_descriptor, control_plane_descriptor, discovery_descriptor,
-    drain_logs, identity_descriptor, operator_descriptor, read_issued_leaf, read_wasm,
-    seed_tls_blob_store, wait_for_logs,
+    CONNECTOR_ADDR, CONTROL_URI, SCHEDULER_DEFERRED, SpinePortGuard, StateRoot,
+    bridge_server_descriptor, client_options, connector_descriptor, control_plane_descriptor,
+    discovery_descriptor, drain_logs, identity_descriptor, operator_descriptor, read_issued_leaf,
+    read_wasm, runtime_in_state_root, seed_tls_blob_store, store_descriptor, wait_for_logs,
 };
 
 mod common;
@@ -66,7 +66,8 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
     // whole test so the no-mTLS test cannot race it.
     let _port = SpinePortGuard::acquire();
 
-    let runtime = Runtime::default();
+    let state = StateRoot::new("identity");
+    let runtime = runtime_in_state_root(&state);
     runtime.generate_keyring().expect("generate host keyring");
     seed_tls_blob_store(&runtime);
 
@@ -82,16 +83,25 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
             domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
+                store_descriptor(vec!["discovery".to_string()]),
                 identity_descriptor(read_wasm("selium-identity", "selium_identity.wasm")),
                 operator_descriptor(
                     read_wasm("selium-identity-onboard", "selium_identity_onboard.wasm"),
                     client_spki.clone(),
                     MODE_ONBOARD,
-                    vec!["discovery".to_string(), "identity".to_string()],
+                    vec![
+                        "discovery".to_string(),
+                        "store".to_string(),
+                        "identity".to_string(),
+                    ],
                 ),
                 connector_descriptor(
                     read_wasm("selium-connector-quic", "selium_connector_quic.wasm"),
-                    vec!["discovery".to_string(), "identity".to_string()],
+                    vec![
+                        "discovery".to_string(),
+                        "store".to_string(),
+                        "identity".to_string(),
+                    ],
                 ),
                 bridge_server_descriptor(
                     read_wasm("selium-bridge", "selium_bridge.wasm"),
@@ -106,6 +116,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
                     "selium_control_plane.wasm",
                 )),
             ],
+            state_dir: state.config_dir(),
         })
         .unwrap_or_else(|error| {
             let mut logs = vec![format!("activity: {:?}", error.to_string())];
@@ -292,6 +303,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
                 // already-running discovery/identity are not listed.
                 Vec::new(),
             )],
+            state_dir: state.config_dir(),
         })
         .map(|report| {
             report

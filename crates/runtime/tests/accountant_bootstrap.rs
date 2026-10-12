@@ -110,6 +110,7 @@ fn bookkeeper_boots_before_accountant_from_the_same_module_bytes() {
             start_discovery: false,
             domain_table: Vec::new(),
             system_guests: vec![account, bookkeeper, discovery],
+            state_dir: None,
         })
         .expect("bootstrap accounting spine");
 

@@ -214,6 +214,7 @@ fn runtime_with_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTransport>) 
             start_discovery: true,
             system_guests: vec![],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap discovery");
     assert!(report.guests.is_empty());

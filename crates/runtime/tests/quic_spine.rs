@@ -54,6 +54,7 @@ use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDesc
 use selium_service::FlatMsg;
 
 mod common;
+mod spine_common;
 
 /// Connector TLS material, provisioned into the `tls-certs` blob store
 /// before the connector guest boots (the same PEM fixtures the
@@ -128,10 +129,10 @@ fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             ),
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
         ],
-        dependencies: vec!["discovery".to_string()],
+        dependencies: vec!["discovery".to_string(), "store".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         serving_role: None,
@@ -166,7 +167,10 @@ fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             ),
             CapabilityGrant::new(Capability::SystemRegistration, vec![]),
         ],
-        dependencies: vec!["discovery".to_string()],
+        // The demo serves a `sel-quic` route, which requires the connector's
+        // handler registration to be observable in discovery — a real
+        // dependency, not an ordering accident.
+        dependencies: vec!["discovery".to_string(), "quic-connector".to_string()],
         readiness: ReadinessCondition::Immediate,
         tenant: None,
         serving_role: None,
@@ -211,12 +215,14 @@ fn discovery_wasm() -> Vec<u8> {
 }
 
 /// Drains a guest's log channel and decodes each frame as a `LogRecord`.
+///
+/// A dead process has no channel (its teardown reclaimed it): report nothing
+/// rather than panicking, so this stays usable from the failure diagnostics.
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        return Vec::new();
+    };
+    frames
         .iter()
         .map(|frame| {
             selium_service::log::LogRecord::decode(frame)
@@ -266,7 +272,8 @@ async fn echo_round_trip(connection: &quinn::Connection, payload: Vec<u8>) -> Ve
     reason = "the warm-up and payload round-trips intentionally run inline for deterministic join semantics"
 )]
 async fn external_quinn_client_echoes_through_wasm_connector_guest() {
-    let runtime = Runtime::default();
+    let state = spine_common::StateRoot::new("quic-spine");
+    let runtime = spine_common::runtime_in_state_root(&state);
     seed_tls_blob_store(&runtime);
 
     let report = runtime
@@ -274,10 +281,12 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
             start_discovery: true,
             system_guests: vec![
                 discovery_descriptor(discovery_wasm()),
+                spine_common::store_descriptor(vec!["discovery".to_string()]),
                 connector_descriptor(connector_wasm()),
                 demo_descriptor(demo_wasm()),
             ],
             domain_table: Vec::new(),
+            state_dir: state.config_dir(),
         })
         .expect("bootstrap discovery, connector and demo guests");
 
@@ -482,25 +491,13 @@ fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
 
 /// Provisions the connector's TLS material into the `tls-certs` blob store
 /// the connector opens via its `Storage` grant (`cert-pem` / `key-pem`
-/// manifests). Seeded from the host before the connector boots, exactly as
-/// provisioning would.
+/// manifests). Seeded into the store's own volume layout before the connector
+/// boots, exactly as provisioning would.
 fn seed_tls_blob_store(runtime: &Runtime) {
-    let storage = runtime.kernel().storage();
-    let store = storage.open_blob_store(&runtime.kernel().memory(), "tls-certs");
-
-    let cert_id = storage
-        .put_blob(store.local_id, CERT_PEM.to_vec())
-        .expect("put cert blob");
-    let key_id = storage
-        .put_blob(store.local_id, KEY_PEM.to_vec())
-        .expect("put key blob");
-
-    storage
-        .set_manifest(store.local_id, "cert-pem", cert_id)
-        .expect("cert manifest");
-    storage
-        .set_manifest(store.local_id, "key-pem", key_id)
-        .expect("key manifest");
+    let cert_id = spine_common::seed_blob(runtime, "tls-certs", CERT_PEM);
+    let key_id = spine_common::seed_blob(runtime, "tls-certs", KEY_PEM);
+    spine_common::seed_manifest(runtime, "tls-certs", "cert-pem", &cert_id);
+    spine_common::seed_manifest(runtime, "tls-certs", "key-pem", &key_id);
 }
 
 /// Polls a guest's log channel until every `(needle, count)` pair is
@@ -528,5 +525,14 @@ fn wait_for_logs(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
+    panic!(
+        "timed out waiting for {needles:?} in guest log; got {seen:?}; activity: {:#?}",
+        runtime
+            .kernel()
+            .processes()
+            .read_activity_from(0)
+            .iter()
+            .map(|event| (event.process_id, event.message.clone()))
+            .collect::<Vec<_>>()
+    );
 }

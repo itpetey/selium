@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
 
@@ -70,6 +71,11 @@ pub struct RuntimeConfig {
     /// Out-of-band domain→tenant mapping, seeded into the discovery service
     /// at startup (advisory: routes and scopes names, never authenticates).
     pub domain_table: Vec<(String, String)>,
+    /// State directory rooting durable state: the kernel's volume layer, the
+    /// host PKI hierarchy, and the per-tenant volume usage reconstructed at
+    /// boot. `None` keeps the kernel's throwaway volume root and leaves the
+    /// host keyring to the embedder.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Guest successfully started during bootstrap.

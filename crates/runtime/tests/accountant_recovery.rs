@@ -29,7 +29,9 @@ use selium_accountant::{
     accountant_grants, bookkeeper_grants,
 };
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
-use spine_common::{discovery_descriptor, read_wasm};
+use spine_common::{
+    StateRoot, discovery_descriptor, read_wasm, runtime_in_state_root, store_descriptor,
+};
 
 mod common;
 mod spine_common;
@@ -42,7 +44,8 @@ const DELINQUENT: &str = "acme";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the discovery and accountant guests built for wasm32-unknown-unknown"]
 async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
-    let runtime = Runtime::default();
+    let state = StateRoot::new("accountant-recovery");
+    let runtime = runtime_in_state_root(&state);
 
     // Seed the durable ledger before the accountant has ever booted.
     seed_policy(&runtime);
@@ -55,6 +58,7 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
             domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
+                store_descriptor(vec!["discovery".to_string()]),
                 accounting_descriptor(
                     BOOKKEEPER_ENTRYPOINT,
                     BOOKKEEPER_ENTRYPOINT,
@@ -65,9 +69,14 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
                     ACCOUNTANT_ENTRYPOINT,
                     ACCOUNTANT_ENTRYPOINT,
                     accountant_grants(),
-                    vec!["discovery".to_string(), BOOKKEEPER_ENTRYPOINT.to_string()],
+                    vec![
+                        "discovery".to_string(),
+                        "store".to_string(),
+                        BOOKKEEPER_ENTRYPOINT.to_string(),
+                    ],
                 ),
             ],
+            state_dir: state.config_dir(),
         })
         .expect("bootstrap accounting spine");
 
@@ -97,10 +106,12 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
                 ACCOUNTANT_ENTRYPOINT,
                 accountant_grants(),
                 // Dependencies resolve against this config's guest set;
-                // discovery is already running, so the respawn declares none
-                // (the bootstrap loop still wires the discovery handle in).
+                // discovery and the store are already running, so the respawn
+                // declares none (the bootstrap loop still wires the discovery
+                // handle in).
                 Vec::new(),
             )],
+            state_dir: state.config_dir(),
         })
         .expect("respawn accountant");
     let respawn = respawn_report.guests.first().expect("respawned accountant");
@@ -161,16 +172,12 @@ fn accounting_descriptor(
 
 /// Asserts the accountant re-authored enforcement from the replayed ledger:
 /// the delinquent tenant's quotas are zeroed; the active tenant is capped at
-/// its hard ceiling (plan + overage) for both storage classes.
+/// its hard ceiling (plan + overage) for memory and its resident bytes.
 fn assert_enforcement_reauthored(runtime: &Runtime) {
     let quota = runtime.kernel().quota();
 
     // Delinquent: narrowing-to-nothing and zeroed quotas.
-    for class in [
-        ResourceClass::SharedRegion,
-        ResourceClass::DurableLog,
-        ResourceClass::BlobStore,
-    ] {
+    for class in [ResourceClass::SharedRegion, ResourceClass::Volume] {
         assert_eq!(
             quota.lookup(DELINQUENT, class.clone()),
             Some(0),
@@ -184,29 +191,42 @@ fn assert_enforcement_reauthored(runtime: &Runtime) {
         Some(40 * 65_536),
         "active tenant's memory quota must be its hard ceiling"
     );
-    for class in [ResourceClass::DurableLog, ResourceClass::BlobStore] {
-        assert_eq!(
-            quota.lookup(ACTIVE, class.clone()),
-            Some(20 * 65_536),
-            "active tenant's {class:?} quota must be its hard ceiling"
-        );
-    }
+    assert_eq!(
+        quota.lookup(ACTIVE, ResourceClass::Volume),
+        Some(20 * 65_536),
+        "active tenant's volume quota must be its hard ceiling"
+    );
 }
 
 /// Seeds one encoded ledger record into the durable usage log, host-side, in
-/// the exact wire format the accountant appends.
+/// the store's own record format: the volume layer is written directly, so the
+/// store's recovery path reads it exactly as it reads its own appends.
 fn seed_ledger_record(runtime: &Runtime, record: &LedgerRecord) {
-    let storage = runtime.kernel().storage();
-    let memory = runtime.kernel().memory();
-    let ledger = storage.open_log(&memory, LEDGER_LOG);
     let payload = selium_abi::encode_rkyv(record).expect("encode ledger record");
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    storage
-        .append_log(ledger.local_id, timestamp_ms, Vec::new(), payload)
+
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::log_volume(LEDGER_LOG, 0);
+    let volume = volumes.open(None, &name).expect("open ledger volume");
+    let existing = volumes
+        .read_at(volume.local_id, 0, u32::MAX as usize)
+        .expect("read ledger volume");
+    let (frames, _end) = selium_store::format::scan_frames(&existing);
+    let sequence = frames.len() as u64 + 1;
+    let record = selium_store::format::Record {
+        sequence,
+        timestamp_ms,
+        headers: Vec::new(),
+        payload,
+    };
+    let framed = selium_store::format::frame(&selium_store::format::encode_record(&record));
+    volumes
+        .append(volume.local_id, &framed)
         .expect("append ledger record");
+    volumes.sync(volume.local_id).expect("sync ledger volume");
 }
 
 fn seed_policy(runtime: &Runtime) {

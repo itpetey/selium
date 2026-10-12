@@ -240,6 +240,7 @@ fn foundation_crates_work_together_through_hostcalls() {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap runtime");
     assert_eq!(report.guests.len(), 1);
@@ -286,6 +287,7 @@ fn hostcalls_enforce_session_grants() {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap runtime");
 
@@ -741,6 +743,7 @@ fn spawn_guest(
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap guest");
     report.guests[0].process_id

@@ -33,11 +33,13 @@ wasmtiny-aotc.workspace = true
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-ring"] }
 rcgen.workspace = true
 selium-accountant = { path = "../../guests/accountant" }
+selium-control-plane = { path = "../../guests/control-plane" }
 selium-client.workspace = true
 selium-identity = { path = "../../guests/identity" }
 selium-identity-onboard = { path = "../../integration/identity-onboard" }
 selium-proto-dns.workspace = true
 selium-service.workspace = true
+selium-store = { path = "../../guests/store" }
 wat.workspace = true
 x509-parser.workspace = true
 

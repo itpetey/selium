@@ -42,6 +42,13 @@ struct Cli {
     /// Defaults: entrypoint="main", module-id=<name>, readiness="immediate".
     #[arg(long, value_parser = parse_app)]
     app: Vec<AppDef>,
+
+    /// State directory rooting durable state: the kernel's volume layer, the
+    /// host PKI hierarchy, and per-tenant volume usage reconstructed at boot.
+    /// Falls back to `SELIUM_STATE_DIR`; without either the runtime boots with
+    /// a throwaway volume root and no persisted keys.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -74,6 +81,11 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<_>>()?;
 
+    let state_dir = cli
+        .state_dir
+        .clone()
+        .or_else(|| std::env::var_os("SELIUM_STATE_DIR").map(PathBuf::from));
+
     let kernel = Kernel::default();
     let runtime = Runtime::new(kernel);
 
@@ -85,6 +97,7 @@ async fn main() -> Result<()> {
         start_discovery: cli.start_discovery,
         system_guests: guests,
         domain_table: Vec::new(),
+        state_dir,
     };
     let report = runtime.bootstrap_system_guests(config)?;
 
@@ -268,6 +281,7 @@ async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
             start_discovery: false,
             system_guests: vec![net_demo_descriptor(module_bytes)],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .map_err(|error| anyhow::anyhow!("bootstrap: {error}"))?;
     #[expect(

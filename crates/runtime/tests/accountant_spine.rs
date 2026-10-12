@@ -36,7 +36,9 @@ use selium_accountant::{
     bookkeeper_grants,
 };
 use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
-use spine_common::{discovery_descriptor, read_wasm};
+use spine_common::{
+    StateRoot, discovery_descriptor, read_wasm, runtime_in_state_root, store_descriptor,
+};
 
 mod common;
 mod spine_common;
@@ -68,7 +70,8 @@ fn accounting_descriptor(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the discovery and accountant guests built for wasm32-unknown-unknown"]
 async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
-    let runtime = Runtime::default();
+    let state = StateRoot::new("accountant-spine");
+    let runtime = runtime_in_state_root(&state);
 
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
@@ -76,20 +79,26 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
             domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
+                store_descriptor(vec!["discovery".to_string()]),
                 accounting_descriptor(
                     BOOKKEEPER_ENTRYPOINT,
                     BOOKKEEPER_ENTRYPOINT,
                     bookkeeper_grants(),
-                    vec!["discovery".to_string()],
+                    vec!["discovery".to_string(), "store".to_string()],
                 ),
                 accounting_descriptor(
                     ACCOUNTANT_ENTRYPOINT,
                     ACCOUNTANT_ENTRYPOINT,
                     accountant_grants(),
-                    vec!["discovery".to_string(), BOOKKEEPER_ENTRYPOINT.to_string()],
+                    vec![
+                        "discovery".to_string(),
+                        "store".to_string(),
+                        BOOKKEEPER_ENTRYPOINT.to_string(),
+                    ],
                 ),
                 workload_descriptor(),
             ],
+            state_dir: state.config_dir(),
         })
         .unwrap_or_else(|error| panic!("bootstrap accounting spine: {error}"));
 
@@ -191,14 +200,9 @@ fn wait_for_ledger_window(
     timeout: Duration,
     guest_pids: &[u64],
 ) -> LedgerRecord {
-    let storage = runtime.kernel().storage();
-    let memory = runtime.kernel().memory();
-    let ledger = storage.open_log(&memory, LEDGER_LOG);
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        let records = storage
-            .replay_log(ledger.local_id, None, u32::MAX as usize)
-            .expect("replay usage ledger");
+        let records = spine_common::read_log_records(runtime, LEDGER_LOG);
         for record in records {
             if let Ok(decoded) = selium_abi::decode_rkyv::<LedgerRecord>(&record.payload)
                 && matches!(&decoded, LedgerRecord::Window { tenant: t, .. } if t == tenant)

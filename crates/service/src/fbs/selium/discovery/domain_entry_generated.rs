@@ -37,18 +37,6 @@ impl<'a> DomainEntry<'a> {
     builder.finish()
   }
 
-  pub fn unpack(&self) -> DomainEntryT {
-    let domain = self.domain().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    let tenant = self.tenant().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    DomainEntryT {
-      domain,
-      tenant,
-    }
-  }
 
   /// Domain (e.g. `example.com`).
   #[inline]
@@ -128,36 +116,5 @@ impl ::core::fmt::Debug for DomainEntry<'_> {
       ds.field("domain", &self.domain());
       ds.field("tenant", &self.tenant());
       ds.finish()
-  }
-}
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct DomainEntryT {
-  pub domain: Option<alloc::string::String>,
-  pub tenant: Option<alloc::string::String>,
-}
-impl Default for DomainEntryT {
-  fn default() -> Self {
-    Self {
-      domain: None,
-      tenant: None,
-    }
-  }
-}
-impl DomainEntryT {
-  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
-    &self,
-    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
-  ) -> ::flatbuffers::WIPOffset<DomainEntry<'b>> {
-    let domain = self.domain.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    let tenant = self.tenant.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    DomainEntry::create(_fbb, &DomainEntryArgs{
-      domain,
-      tenant,
-    })
   }
 }

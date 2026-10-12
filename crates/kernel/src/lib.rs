@@ -12,7 +12,7 @@ pub use network::{
 pub use poller::{BandwidthFn, Poller};
 pub use process::ProcessTable;
 pub use quota::QuotaTable;
-pub use storage::StorageRegistry;
+pub use volume::{VolumeDescriptor, VolumeRegistry};
 
 mod backend;
 mod error;
@@ -25,4 +25,4 @@ mod os_wait_word;
 mod poller;
 mod process;
 mod quota;
-mod storage;
+mod volume;

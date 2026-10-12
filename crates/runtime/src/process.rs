@@ -166,17 +166,12 @@ impl Runtime {
         self.metering.lock().record_bandwidth(process_id, bytes);
     }
 
-    /// Accumulates storage usage for a process (storage allocation hook).
-    pub(crate) fn note_storage_usage(&self, process_id: selium_abi::ProcessId, bytes: u64) {
-        self.metering.lock().record_storage(process_id, bytes);
-    }
-
     /// Projects a fresh metering observation for every live process into the
-    /// kernel: cumulative instruction/bandwidth counters and current
-    /// memory/storage gauges. Instruction counts and the memory gauge are read
-    /// from the engine's per-instance meter (committed linear-memory pages);
-    /// storage and the bandwidth counter come from the projector's
-    /// accumulators.
+    /// kernel: cumulative instruction/bandwidth counters and the current
+    /// memory gauge. Instruction counts and the memory gauge are read from the
+    /// engine's per-instance meter (committed linear-memory pages); the
+    /// bandwidth counter comes from the projector's accumulator. Tenant storage
+    /// is not projected per process.
     pub fn metering_tick(&self) {
         let live: Vec<ProcessId> = self.process_authorities.lock().keys().copied().collect();
 
@@ -660,15 +655,11 @@ impl Runtime {
                 ResourceClass::UdpSocket => {
                     drop(self.kernel.close_udp_socket(local_id));
                 }
-                ResourceClass::DurableLog => {
-                    // Storage quotas are sticky across process death: durable
-                    // bytes persist (that is their point) and are released only
-                    // by an explicit user-side mechanism (TBA; see the spec).
-                    drop(self.kernel.storage().close_log(local_id));
-                }
-                ResourceClass::BlobStore => {
-                    // Sticky storage quota, as above.
-                    drop(self.kernel.storage().close_blob_store(local_id));
+                ResourceClass::Volume => {
+                    // Closing the handle does not remove the volume: durable
+                    // bytes belong to the tenant, not the process, and are
+                    // released only when the volume is removed.
+                    drop(self.kernel.volumes().close(local_id));
                 }
                 ResourceClass::Process => {}
                 _ => {}
@@ -1797,7 +1788,6 @@ mod tests {
             MeteringObservation {
                 cpu_instructions: 11,
                 memory_bytes: 22,
-                storage_bytes: 33,
                 bandwidth_bytes: 44,
             },
         );
@@ -1873,7 +1863,6 @@ mod tests {
             "memory gauge is committed linear pages, not region bytes"
         );
         assert_eq!(observation.bandwidth_bytes, 1024);
-        assert_eq!(observation.storage_bytes, 0);
 
         // The engine's instruction counter is monotonic across ticks.
         let first = observation.cpu_instructions;
@@ -2347,6 +2336,7 @@ mod tests {
                 start_discovery: true,
                 system_guests: Vec::new(),
                 domain_table: Vec::new(),
+                state_dir: None,
             })
             .expect("bootstrap discovery");
         let pid = spawn_tenant_guest(&runtime, "retry-guest", "acme");
@@ -2396,6 +2386,7 @@ mod tests {
                 start_discovery: true,
                 system_guests: Vec::new(),
                 domain_table: Vec::new(),
+                state_dir: None,
             })
             .expect("bootstrap discovery");
         let pid = spawn_tenant_guest(&runtime, "failed-guest", "acme");

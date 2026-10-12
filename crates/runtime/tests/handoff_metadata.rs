@@ -196,6 +196,7 @@ fn spawn_guest(
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap guest");
     report

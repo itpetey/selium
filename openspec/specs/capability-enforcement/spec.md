@@ -130,7 +130,7 @@ include `ResourceClass::TcpListener`, `ResourceClass::TcpStream`, or
 
 #### Scenario: UriPrefix on non-network class rejected
 - **WHEN** a grant is registered with selectors
-  `[ResourceClass(DurableLog), UriPrefix("tcp://10.0.0.5:443")]`
+  `[ResourceClass(SharedRegion), UriPrefix("tcp://10.0.0.5:443")]`
 - **THEN** registration SHALL fail with an error explaining that
   `UriPrefix` is not evaluatable for that class
 
@@ -231,3 +231,22 @@ monotonicity cannot chain through spawned processes.
 
 - **WHEN** a process holding `QuotaWrite` spawns a child whose grants include `QuotaWrite`
 - **THEN** the spawn SHALL be denied with a capability error
+
+### Requirement: Volume Hostcall Authorisation
+
+Volume hostcalls SHALL require the storage capability and SHALL be authorised against the volume's serving tenant exactly as allocation provenance requires: a root principal MAY serve any tenant, and a tenant-scoped caller SHALL need scoped delegation to serve another tenant. Local volume handles SHALL be ownership-checked, and process teardown SHALL release them.
+
+#### Scenario: Capability required
+
+- **WHEN** a process without the storage capability opens a volume
+- **THEN** the hostcall SHALL be denied with a permission error
+
+#### Scenario: Cross-tenant open denied
+
+- **WHEN** a tenant-scoped process without delegation opens a volume for another tenant
+- **THEN** the hostcall SHALL be denied with `PermissionDenied`
+
+#### Scenario: Root serves a tenant
+
+- **WHEN** a root system guest opens a volume under tenant `acme`
+- **THEN** the volume SHALL be recorded under `acme`, not under the root namespace

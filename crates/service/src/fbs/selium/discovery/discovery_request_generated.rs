@@ -9,13 +9,13 @@ pub enum DiscoveryRequestOffset {}
 ///
 /// Variant tag values:
 ///   0 = Resolve(uri)
-///   1 = Register { uri, target, root_service, owner }
-///   2 = Revoke { uri }
-///   3 = ResolvePrefix(uri)
-///   4 = ResolveLabels { key, value }
-///   5 = ListDomains
-///   6 = RevokeByOwner { process_id }
-///   7 = SeedDomain { domain, tenant }
+///   1 = ResolvePrefix(uri)
+///   2 = ResolveLabels { key, value }
+///   3 = Register { uri, target, owner, root_service }
+///   4 = Revoke { uri }
+///   5 = RevokeByOwner { process_id }
+///   6 = SeedDomain { domain, tenant }
+///   7 = ListDomains
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -63,42 +63,6 @@ impl<'a> DiscoveryRequest<'a> {
     builder.finish()
   }
 
-  pub fn unpack(&self) -> DiscoveryRequestT {
-    let variant = self.variant();
-    let uri = self.uri().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    let key = self.key().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    let value = self.value().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    let target = self.target().map(|x| {
-      alloc::boxed::Box::new(x.unpack())
-    });
-    let root_service = self.root_service();
-    let owner = self.owner();
-    let process_id = self.process_id();
-    let domain = self.domain().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    let tenant = self.tenant().map(|x| {
-      alloc::string::ToString::to_string(x)
-    });
-    DiscoveryRequestT {
-      variant,
-      uri,
-      key,
-      value,
-      target,
-      root_service,
-      owner,
-      process_id,
-      domain,
-      tenant,
-    }
-  }
 
   /// Variant discriminator.
   #[inline]
@@ -306,76 +270,5 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
       ds.field("domain", &self.domain());
       ds.field("tenant", &self.tenant());
       ds.finish()
-  }
-}
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiscoveryRequestT {
-  pub variant: u8,
-  pub uri: Option<alloc::string::String>,
-  pub key: Option<alloc::string::String>,
-  pub value: Option<alloc::string::String>,
-  pub target: Option<alloc::boxed::Box<ResourceTargetT>>,
-  pub root_service: bool,
-  pub owner: u64,
-  pub process_id: u64,
-  pub domain: Option<alloc::string::String>,
-  pub tenant: Option<alloc::string::String>,
-}
-impl Default for DiscoveryRequestT {
-  fn default() -> Self {
-    Self {
-      variant: 0,
-      uri: None,
-      key: None,
-      value: None,
-      target: None,
-      root_service: false,
-      owner: 0,
-      process_id: 0,
-      domain: None,
-      tenant: None,
-    }
-  }
-}
-impl DiscoveryRequestT {
-  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
-    &self,
-    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
-  ) -> ::flatbuffers::WIPOffset<DiscoveryRequest<'b>> {
-    let variant = self.variant;
-    let uri = self.uri.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    let key = self.key.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    let value = self.value.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    let target = self.target.as_ref().map(|x|{
-      x.pack(_fbb)
-    });
-    let root_service = self.root_service;
-    let owner = self.owner;
-    let process_id = self.process_id;
-    let domain = self.domain.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    let tenant = self.tenant.as_ref().map(|x|{
-      _fbb.create_string(x)
-    });
-    DiscoveryRequest::create(_fbb, &DiscoveryRequestArgs{
-      variant,
-      uri,
-      key,
-      value,
-      target,
-      root_service,
-      owner,
-      process_id,
-      domain,
-      tenant,
-    })
   }
 }

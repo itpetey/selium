@@ -166,6 +166,7 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
                 connector_descriptor(connector_wasm(), format!("udp://{resolver_addr}")),
                 demo_descriptor(demo_wasm(), tcp_addr.to_string()),
             ],
+            state_dir: None,
         })
         .expect("bootstrap discovery, connector and demo guests");
 

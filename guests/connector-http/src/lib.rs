@@ -44,7 +44,7 @@ pub mod wire_out;
 const TLS_CERT_MANIFEST: &str = "cert-pem";
 /// Manifest name for the private key PEM.
 const TLS_KEY_MANIFEST: &str = "key-pem";
-/// Storage blob store name for TLS material.
+/// Blob-store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
 #[derive(Debug, Error)]
@@ -105,9 +105,9 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 /// Receives a discovery `Context` handle for route resolution. The runtime
 /// wires this at bootstrap via the entrypoint args mechanism.
 ///
-/// TLS certificates are loaded from blob storage at startup. The connector
-/// fails loudly if certificate material is missing or invalid, and never
-/// serves plaintext HTTP on the TLS listener.
+/// TLS certificates are loaded from the store's blob storage at startup. The
+/// connector fails loudly if certificate material is missing or invalid, and
+/// never serves plaintext HTTP on the TLS listener.
 /// Each accepted connection is handled by its own task: TLS handshake, then
 /// the windowed forwarding pipeline. Connections are served concurrently;
 /// one slow (or parked-on-backpressure) connection never blocks the others.
@@ -137,7 +137,7 @@ async fn connector_http(mut ctx: Context) -> anyhow::Result<()> {
 
     // Load TLS configuration. This fails loudly on missing/invalid material
     // per spec: "loud failure on missing/invalid cert material".
-    let tls_config = load_tls_config().with_context(
+    let tls_config = load_tls_config(&mut ctx).await.with_context(
         || "http-connector: TLS setup failed; refusing to serve plaintext on TLS listener",
     )?;
     info!("http-connector: TLS configured");
@@ -191,12 +191,11 @@ async fn connector_http(mut ctx: Context) -> anyhow::Result<()> {
     }
 }
 
-/// Load TLS certificate and key material from storage via the connector's
-/// `Storage` grant. Fails loudly on missing or invalid material.
-fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    use selium_guest::BlobStore;
-
-    let store = BlobStore::open(TLS_STORE_NAME).map_err(|e| {
+/// Load TLS certificate and key material from the store service's blob storage
+/// via the connector's storage grant. Fails loudly on missing or invalid
+/// material.
+async fn load_tls_config(ctx: &mut Context) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let store = ctx.open_blob_store(TLS_STORE_NAME).await.map_err(|e| {
         error!("http-connector: failed to open blob store '{TLS_STORE_NAME}': {e}");
         TlsError::StorageUnavailable
     })?;
@@ -204,6 +203,7 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
     // Load certificate chain.
     let cert_blob_id = store
         .manifest(TLS_CERT_MANIFEST)
+        .await
         .map_err(|e| {
             error!("http-connector: cert manifest '{TLS_CERT_MANIFEST}' not found: {e}");
             TlsError::MissingCertificate
@@ -214,6 +214,7 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
         })?;
     let cert_pem = store
         .get(&cert_blob_id)
+        .await
         .map_err(|e| {
             error!("http-connector: failed to read cert blob: {e}");
             TlsError::MissingCertificate
@@ -226,6 +227,7 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
     // Load private key.
     let key_blob_id = store
         .manifest(TLS_KEY_MANIFEST)
+        .await
         .map_err(|e| {
             error!("http-connector: key manifest '{TLS_KEY_MANIFEST}' not found: {e}");
             TlsError::MissingKey
@@ -236,6 +238,7 @@ fn load_tls_config() -> Result<Arc<rustls::ServerConfig>, TlsError> {
         })?;
     let key_pem = store
         .get(&key_blob_id)
+        .await
         .map_err(|e| {
             error!("http-connector: failed to read key blob: {e}");
             TlsError::MissingKey

@@ -160,7 +160,7 @@ pub enum Capability {
     Signal,
     /// Permission to use network listeners, sessions, streams, and requests.
     Network,
-    /// Permission to use durable logs and blob stores.
+    /// Permission to use durable volumes.
     Storage,
     /// Permission to manage session lifetime.
     SessionLifecycle,
@@ -236,10 +236,8 @@ pub enum ResourceClass {
     TcpStream,
     /// UDP socket resource.
     UdpSocket,
-    /// Durable log resource.
-    DurableLog,
-    /// Blob store resource.
-    BlobStore,
+    /// Durable volume resource: an opaque byte container.
+    Volume,
     /// Process resource.
     Process,
     /// Activity log resource.
@@ -429,28 +427,14 @@ pub struct HostQueueDescriptor {
     pub shared_id: SharedResourceId,
 }
 
-/// Descriptor for a durable log handle.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+/// Descriptor for an opened durable volume handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
-pub struct DurableLogDescriptor {
-    /// Local log handle id.
+pub struct VolumeDescriptor {
+    /// Local volume handle id.
     pub local_id: LocalResourceId,
-    /// Shared log id.
-    pub shared_id: SharedResourceId,
-    /// Durable log name.
-    pub name: String,
-}
-
-/// Descriptor for a blob store handle.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct BlobStoreDescriptor {
-    /// Local blob store handle id.
-    pub local_id: LocalResourceId,
-    /// Shared blob store id.
-    pub shared_id: SharedResourceId,
-    /// Blob store name.
-    pub name: String,
+    /// Current length of the volume in bytes.
+    pub len: u64,
 }
 
 /// Descriptor for a guest process.
@@ -463,20 +447,6 @@ pub struct ProcessDescriptor {
     pub module_id: String,
     /// Entrypoint export used to start the process.
     pub entrypoint: String,
-}
-
-/// Record stored in a durable log.
-#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
-#[rkyv(bytecheck())]
-pub struct StorageRecord {
-    /// Monotonic log sequence number.
-    pub sequence: u64,
-    /// Record timestamp in milliseconds.
-    pub timestamp_ms: u64,
-    /// User-supplied header key-value pairs.
-    pub headers: Vec<(String, String)>,
-    /// Record payload bytes.
-    pub payload: Vec<u8>,
 }
 
 /// Kind of event recorded in the activity log.
@@ -540,10 +510,6 @@ pub enum ResourceKind {
     PubSubTopic,
     /// Shared memory region for network socket buffers.
     NetworkBuffer,
-    /// Shared memory region for durable log storage.
-    DurableLog,
-    /// Shared memory region for blob store.
-    BlobStore,
     /// Generic/unknown shared memory region.
     SharedMemory,
 }
@@ -567,91 +533,63 @@ pub enum HostcallRequest {
         /// Address to bind to.
         address: String,
     },
-    /// Open a durable log.
-    StorageOpenLog {
-        /// Durable log name.
+    /// Open or create a durable volume under a serving tenant.
+    VolumeOpen {
+        /// Volume name.
         name: String,
+        /// Tenant the volume is minted under. `None` mints under the calling
+        /// process's own tenant; a different tenant requires cross-tenant
+        /// allocation authority (root principal or tenant-scoped delegation).
+        serving_tenant: Option<String>,
     },
-    /// Close a durable log handle.
-    StorageLogClose {
-        /// Local log handle id to close.
+    /// Append bytes to an open durable volume.
+    VolumeAppend {
+        /// Local volume handle id.
         local_id: LocalResourceId,
-    },
-    /// Append a record to a durable log.
-    StorageLogAppend {
-        /// Local log handle id.
-        local_id: LocalResourceId,
-        /// Record timestamp in milliseconds.
-        timestamp_ms: u64,
-        /// Record headers.
-        headers: Vec<(String, String)>,
-        /// Record payload bytes.
-        payload: Vec<u8>,
-    },
-    /// Replay records from a durable log.
-    StorageLogReplay {
-        /// Local log handle id.
-        local_id: LocalResourceId,
-        /// Optional first sequence number to include.
-        from_sequence: Option<u64>,
-        /// Maximum number of records to return.
-        limit: u32,
-    },
-    /// Store a named durable log checkpoint.
-    StorageLogCheckpoint {
-        /// Local log handle id.
-        local_id: LocalResourceId,
-        /// Checkpoint name.
-        name: String,
-        /// Sequence number to record.
-        sequence: u64,
-    },
-    /// Read a named durable log checkpoint.
-    StorageLogCheckpointRead {
-        /// Local log handle id.
-        local_id: LocalResourceId,
-        /// Checkpoint name.
-        name: String,
-    },
-    /// Open a blob store.
-    StorageOpenBlobStore {
-        /// Blob store name.
-        name: String,
-    },
-    /// Close a blob store handle.
-    StorageBlobStoreClose {
-        /// Local blob store handle id to close.
-        local_id: LocalResourceId,
-    },
-    /// Put bytes into a blob store.
-    StorageBlobPut {
-        /// Local blob store handle id.
-        local_id: LocalResourceId,
-        /// Blob bytes to store.
+        /// Bytes to append.
         bytes: Vec<u8>,
     },
-    /// Get bytes from a blob store.
-    StorageBlobGet {
-        /// Local blob store handle id.
+    /// Read bytes at an offset from an open durable volume.
+    VolumeReadAt {
+        /// Local volume handle id.
         local_id: LocalResourceId,
-        /// Blob id to read.
-        blob_id: String,
+        /// Byte offset to read from.
+        offset: u64,
+        /// Maximum number of bytes to return.
+        len: u32,
     },
-    /// Set a named manifest to a blob id.
-    StorageBlobSetManifest {
-        /// Local blob store handle id.
+    /// Return the current length of an open durable volume.
+    VolumeLen {
+        /// Local volume handle id.
         local_id: LocalResourceId,
-        /// Manifest name.
-        name: String,
-        /// Blob id to associate with the manifest.
-        blob_id: String,
     },
-    /// Read a named manifest from a blob store.
-    StorageBlobGetManifest {
-        /// Local blob store handle id.
-        local_id: LocalResourceId,
-        /// Manifest name.
+    /// List the volume names recorded under a serving tenant.
+    VolumeList {
+        /// Tenant whose volumes are listed (`None` is the calling process's own).
+        serving_tenant: Option<String>,
+    },
+    /// Remove a durable volume under a serving tenant.
+    VolumeRemove {
+        /// Volume name to remove.
         name: String,
+        /// Tenant the volume belongs to (`None` is the calling process's own).
+        serving_tenant: Option<String>,
+    },
+    /// Flush an open durable volume's bytes to stable storage.
+    VolumeSync {
+        /// Local volume handle id.
+        local_id: LocalResourceId,
+    },
+    /// Close a local durable volume handle.
+    VolumeClose {
+        /// Local volume handle id.
+        local_id: LocalResourceId,
+    },
+    /// Return a tenant's resident durable-storage bytes. Gated by the
+    /// `QuotaWrite` authority; the accounting guest is its sole caller.
+    VolumeUsage {
+        /// Tenant whose resident volume bytes are read.
+        tenant: String,
     },
     /// Start a process.
     ProcessStart {
@@ -916,8 +854,6 @@ pub struct MeteringObservation {
     pub cpu_instructions: u64,
     /// Memory usage in bytes.
     pub memory_bytes: u64,
-    /// Storage usage in bytes.
-    pub storage_bytes: u64,
     /// Network bandwidth usage in bytes.
     pub bandwidth_bytes: u64,
 }
@@ -935,22 +871,16 @@ pub enum HostcallOutput {
 
     /// A host-mediated connection queue descriptor.
     HostQueue(HostQueueDescriptor),
-    /// A durable log descriptor.
-    DurableLog(DurableLogDescriptor),
-    /// A blob store descriptor.
-    BlobStore(BlobStoreDescriptor),
+    /// A durable volume descriptor.
+    Volume(VolumeDescriptor),
     /// A process descriptor.
     Process(ProcessDescriptor),
     /// Raw bytes.
     Bytes(Vec<u8>),
-    /// Blob id string.
-    BlobId(String),
-    /// Optional sequence number.
-    Sequence(Option<u64>),
+    /// Volume names.
+    VolumeNames(Vec<String>),
     /// Shared resource id.
     SharedId(SharedResourceId),
-    /// Durable log records.
-    StorageRecords(Vec<StorageRecord>),
     /// Activity log events.
     ActivityEvents(Vec<ActivityEvent>),
     /// Guest log entries.
@@ -1059,8 +989,7 @@ impl ResourceClass {
             Self::TcpListener => "listener",
             Self::TcpStream => "stream",
             Self::UdpSocket => "socket",
-            Self::DurableLog => "log",
-            Self::BlobStore => "blob",
+            Self::Volume => "volume",
             Self::Process => "proc",
             Self::ActivityLog => "activity",
             Self::MeteringStream => "metering",
@@ -1081,8 +1010,7 @@ impl ResourceClass {
             "listener" => Some(Self::TcpListener),
             "stream" => Some(Self::TcpStream),
             "socket" => Some(Self::UdpSocket),
-            "log" => Some(Self::DurableLog),
-            "blob" => Some(Self::BlobStore),
+            "volume" => Some(Self::Volume),
             "proc" => Some(Self::Process),
             "activity" => Some(Self::ActivityLog),
             "metering" => Some(Self::MeteringStream),
@@ -1625,14 +1553,78 @@ mod tests {
     }
 
     #[test]
+    fn volume_hostcalls_round_trip() {
+        let requests = vec![
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: Some("acme".to_string()),
+            },
+            HostcallRequest::VolumeAppend {
+                local_id: 1,
+                bytes: vec![1, 2, 3],
+            },
+            HostcallRequest::VolumeReadAt {
+                local_id: 1,
+                offset: 4,
+                len: 8,
+            },
+            HostcallRequest::VolumeLen { local_id: 1 },
+            HostcallRequest::VolumeList {
+                serving_tenant: None,
+            },
+            HostcallRequest::VolumeRemove {
+                name: "orders".to_string(),
+                serving_tenant: Some("acme".to_string()),
+            },
+            HostcallRequest::VolumeSync { local_id: 1 },
+            HostcallRequest::VolumeClose { local_id: 1 },
+            HostcallRequest::VolumeUsage {
+                tenant: "acme".to_string(),
+            },
+        ];
+        for request in requests {
+            let envelope = HostcallEnvelope {
+                request,
+                task_id: Some(9),
+            };
+            let encoded = encode_rkyv(&envelope).expect("encode");
+            let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+            assert_eq!(decoded, envelope);
+        }
+
+        for output in [
+            HostcallOutput::Volume(VolumeDescriptor {
+                local_id: 3,
+                len: 64,
+            }),
+            HostcallOutput::VolumeNames(vec!["a".to_string(), "b".to_string()]),
+        ] {
+            let encoded = encode_rkyv(&output).expect("encode");
+            let decoded: HostcallOutput = decode_rkyv(&encoded).expect("decode");
+            assert_eq!(decoded, output);
+        }
+    }
+
+    #[test]
+    fn storage_classes_leave_the_abi() {
+        assert_eq!(ResourceClass::Volume.uri_segment(), "volume");
+        assert_eq!(
+            ResourceClass::from_uri_segment("volume"),
+            Some(ResourceClass::Volume)
+        );
+        assert_eq!(ResourceClass::from_uri_segment("log"), None);
+        assert_eq!(ResourceClass::from_uri_segment("blob"), None);
+    }
+
+    #[test]
     fn metering_observation_round_trip() {
         // The observation carries the cumulative instruction count and the
-        // memory/storage/bandwidth gauges. The former microsecond CPU field
-        // is intentionally absent from the type, so there is nothing to read.
+        // memory/bandwidth gauges. Neither the former microsecond CPU field
+        // nor a per-process storage field exists on the type: tenant storage
+        // is read through the volume-usage hostcall.
         let output = HostcallOutput::Metering(MeteringObservation {
             cpu_instructions: 123_456,
             memory_bytes: 4_096,
-            storage_bytes: 512,
             bandwidth_bytes: 8_192,
         });
         let encoded = encode_rkyv(&output).expect("encode");
@@ -1644,7 +1636,6 @@ mod tests {
         };
         assert_eq!(observation.cpu_instructions, 123_456);
         assert_eq!(observation.memory_bytes, 4_096);
-        assert_eq!(observation.storage_bytes, 512);
         assert_eq!(observation.bandwidth_bytes, 8_192);
     }
 
@@ -1789,8 +1780,7 @@ mod tests {
             (ResourceClass::TcpListener, "listener"),
             (ResourceClass::TcpStream, "stream"),
             (ResourceClass::UdpSocket, "socket"),
-            (ResourceClass::DurableLog, "log"),
-            (ResourceClass::BlobStore, "blob"),
+            (ResourceClass::Volume, "volume"),
             (ResourceClass::Process, "proc"),
             (ResourceClass::ActivityLog, "activity"),
             (ResourceClass::MeteringStream, "metering"),
@@ -1835,8 +1825,6 @@ mod tests {
             ResourceKind::RpcRing,
             ResourceKind::PubSubTopic,
             ResourceKind::NetworkBuffer,
-            ResourceKind::DurableLog,
-            ResourceKind::BlobStore,
             ResourceKind::SharedMemory,
         ] {
             let encoded = encode_rkyv(&kind).expect("encode");
@@ -2143,7 +2131,7 @@ mod tests {
     #[test]
     fn uri_prefix_not_evaluatable_without_network_class() {
         let selectors = vec![
-            ResourceSelector::ResourceClass(ResourceClass::DurableLog),
+            ResourceSelector::ResourceClass(ResourceClass::Volume),
             ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string()),
         ];
         assert!(!selectors[1].is_evaluatable(&selectors));
@@ -2203,7 +2191,7 @@ mod tests {
         let envelope = HostcallEnvelope {
             request: HostcallRequest::QuotaClear {
                 tenant: "acme".to_string(),
-                class: ResourceClass::DurableLog,
+                class: ResourceClass::Volume,
             },
             task_id: Some(7),
         };

@@ -280,6 +280,7 @@ fn runtime_with_discovery_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTr
             start_discovery: true,
             system_guests: vec![],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap discovery");
     assert!(report.guests.is_empty());

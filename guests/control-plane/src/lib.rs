@@ -22,8 +22,8 @@
 //!
 //! - **placement/scale/stop** → the scheduler (typed `SchedulerRequest`),
 //! - **resolve** → discovery (`Context::lookup`),
-//! - **module upload** → storage hostcalls (`StorageBlobPut` +
-//!   `StorageBlobSetManifest`, tenant-prefixed manifest names).
+//! - **module upload** → the store service (blob put + manifest set,
+//!   tenant-prefixed manifest names).
 
 use std::{
     collections::BTreeMap,
@@ -118,8 +118,8 @@ impl ControlPlaneState {
     }
 
     /// Materialises the projection from previously appended log records.
-    fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
-        let records = log.replay(None, u32::MAX)?;
+    async fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
+        let records = log.replay(None, u32::MAX).await?;
         for record in records {
             match FlatMsg::decode(&record.payload) {
                 Ok(desired) => self.apply_record(desired),
@@ -164,21 +164,17 @@ pub fn admit_control_client(grants: &[CapabilityGrant], tenant: &str) -> bool {
 }
 
 /// The grant set assigned to the single-instance control-plane guest: storage
-/// (durable log and module blob store), shared memory (the RPC session rings),
-/// host queue (the serving listener plus the pre-connected discovery RPC
-/// client), and system registration (the root-namespace serving route). All
-/// scoped at class scope — the control plane serves every tenant and derives
-/// each session's tenant from the authenticated identity, never from a tenant
-/// selector on its own grants.
+/// (the desired-state log and module blob store, served over store volumes),
+/// shared memory (the RPC session rings), host queue (the serving listener
+/// plus the pre-connected discovery RPC client), and system registration (the
+/// root-namespace serving route). All scoped at class scope — the control
+/// plane serves every tenant and derives each session's tenant from the
+/// authenticated identity, never from a tenant selector on its own grants.
 pub fn control_plane_grants() -> Vec<CapabilityGrant> {
     vec![
         CapabilityGrant::new(
             Capability::Storage,
-            vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
-        ),
-        CapabilityGrant::new(
-            Capability::Storage,
-            vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+            vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
         ),
         CapabilityGrant::new(
             Capability::SharedMemory,
@@ -242,12 +238,18 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("control-plane: started");
 
-    let log = DurableLog::open(CONTROL_LOG).with_context(|| "control-plane: log open failed")?;
-    let blobs = BlobStore::open(CONTROL_BLOB_STORE)
+    let log = ctx
+        .open_log(CONTROL_LOG)
+        .await
+        .with_context(|| "control-plane: log open failed")?;
+    let blobs = ctx
+        .open_blob_store(CONTROL_BLOB_STORE)
+        .await
         .with_context(|| "control-plane: blob store open failed")?;
     let mut desired = ControlPlaneState::default();
     desired
         .rebuild(&log)
+        .await
         .with_context(|| "control-plane: projection rebuild failed")?;
     let state = Arc::new(Mutex::new(desired));
 
@@ -421,10 +423,12 @@ async fn handle_request(
             // Tenant-prefix the manifest so the single platform blob store
             // cannot leak one tenant's uploads into another's manifest key.
             let key = tenant_prefixed_manifest(namespace, &manifest);
-            match blobs
-                .put(bytes)
-                .and_then(|blob_id| blobs.set_manifest(&key, blob_id))
-            {
+            let stored = async {
+                let blob_id = blobs.put(bytes).await?;
+                blobs.set_manifest(&key, blob_id).await
+            }
+            .await;
+            match stored {
                 Ok(()) => ControlResponse::Uploaded { manifest: key },
                 Err(error) => ControlResponse::Error {
                     step: "storage".to_string(),
@@ -446,7 +450,7 @@ async fn handle_request(
                 deployment,
                 tenant: tenant.clone(),
             };
-            if let Err(error) = record(log, state, desired) {
+            if let Err(error) = record(log, state, desired).await {
                 return ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -477,7 +481,7 @@ async fn handle_request(
                 deployment,
                 tenant: tenant.clone(),
             };
-            if let Err(error) = record(log, state, desired) {
+            if let Err(error) = record(log, state, desired).await {
                 return ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -497,7 +501,9 @@ async fn handle_request(
                     workload_id: workload_id.clone(),
                     tenant: tenant.clone(),
                 },
-            ) {
+            )
+            .await
+            {
                 return ControlResponse::Error {
                     step: "storage".to_string(),
                     context: format!("{error}"),
@@ -520,14 +526,14 @@ async fn handle_request(
 
 /// Appends a desired-state record to the durable log and applies it to the
 /// projection, keeping the store of record and the read model in step.
-fn record(
+async fn record(
     log: &DurableLog,
     state: &Mutex<ControlPlaneState>,
     record: DesiredStateRecord,
 ) -> selium_guest::Result<()> {
     let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
     let payload = FlatMsg::encode(&record);
-    log.append(timestamp_ms, Vec::new(), payload)?;
+    log.append(timestamp_ms, Vec::new(), payload).await?;
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

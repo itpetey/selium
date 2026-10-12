@@ -241,6 +241,7 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         })
         .expect("bootstrap");
     report.guests[0].process_id

@@ -1,0 +1,26 @@
+[package]
+name = "selium-store"
+version.workspace = true
+edition.workspace = true
+description = "Selium durable store system guest (durable logs and blob stores over host volumes)"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+selium-abi.workspace = true
+selium-guest.workspace = true
+selium-service.workspace = true
+selium-shm.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

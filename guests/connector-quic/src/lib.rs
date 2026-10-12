@@ -12,8 +12,9 @@
 //!   datagram I/O onto the shm send/recv rings; the
 //!   [`ConnectorRuntime`](runtime::ConnectorRuntime) gives quinn its executor
 //!   and timers.
-//! - TLS server material (certificate + key) is loaded from blob storage via
-//!   the connector's `Storage` grant, failing loudly when missing or invalid.
+//! - TLS server material (certificate + key) is loaded from the store service's
+//!   blob storage via the connector's storage grant, failing loudly when missing
+//!   or invalid.
 //! - **Client authentication (mTLS) is opt-in and endpoint-global.** With no
 //!   per-tenant trust anchors configured in the TLS blob store, the connector
 //!   serves without client authentication. When anchors are configured, a
@@ -92,7 +93,7 @@ const REFUSE_ERROR_CODE: u32 = 0x100;
 const TLS_CERT_MANIFEST: &str = "cert-pem";
 /// Manifest name for the private key PEM.
 const TLS_KEY_MANIFEST: &str = "key-pem";
-/// Storage blob store name for TLS material.
+/// Blob-store name for TLS material.
 const TLS_STORE_NAME: &str = "tls-certs";
 
 #[derive(Debug, Error)]
@@ -429,7 +430,7 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("quic-connector: started");
 
-    let (certs, key) = load_server_identity().with_context(
+    let (certs, key) = load_server_identity(&mut ctx).await.with_context(
         || "quic-connector: TLS setup failed; refusing to serve QUIC without TLS material",
     )?;
 
@@ -546,20 +547,21 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Loads the QUIC server's own identity (certificate chain + private key)
-/// from blob storage via the connector's `Storage` grant. Client trust anchors
-/// are not loaded here: they are sourced from the identity anchor live table.
-fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError>
-{
-    use selium_guest::BlobStore;
-
-    let store = BlobStore::open(TLS_STORE_NAME).map_err(|e| {
+/// Loads the QUIC server's own identity (certificate chain + private key) from
+/// the store service's blob storage via the connector's storage grant. Client
+/// trust anchors are not loaded here: they are sourced from the identity anchor
+/// live table.
+async fn load_server_identity(
+    ctx: &mut Context,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
+    let store = ctx.open_blob_store(TLS_STORE_NAME).await.map_err(|e| {
         error!("quic-connector: failed to open blob store '{TLS_STORE_NAME}': {e}");
         TlsError::StorageUnavailable
     })?;
 
     let cert_blob_id = store
         .manifest(TLS_CERT_MANIFEST)
+        .await
         .map_err(|e| {
             error!("quic-connector: cert manifest '{TLS_CERT_MANIFEST}' not found: {e}");
             TlsError::MissingCertificate
@@ -570,6 +572,7 @@ fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer
         })?;
     let cert_pem = store
         .get(&cert_blob_id)
+        .await
         .map_err(|e| {
             error!("quic-connector: failed to read cert blob: {e}");
             TlsError::MissingCertificate
@@ -581,6 +584,7 @@ fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer
 
     let key_blob_id = store
         .manifest(TLS_KEY_MANIFEST)
+        .await
         .map_err(|e| {
             error!("quic-connector: key manifest '{TLS_KEY_MANIFEST}' not found: {e}");
             TlsError::MissingKey
@@ -591,6 +595,7 @@ fn load_server_identity() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer
         })?;
     let key_pem = store
         .get(&key_blob_id)
+        .await
         .map_err(|e| {
             error!("quic-connector: failed to read key blob: {e}");
             TlsError::MissingKey

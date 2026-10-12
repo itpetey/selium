@@ -181,13 +181,13 @@ mod tests {
     #[test]
     fn consume_succeeds_within_ceiling_and_fails_beyond_it() {
         let table = QuotaTable::new();
-        table.set("acme", ResourceClass::DurableLog, 100);
+        table.set("acme", ResourceClass::Volume, 100);
         table
-            .try_consume("acme", ResourceClass::DurableLog, 60)
+            .try_consume("acme", ResourceClass::Volume, 60)
             .expect("within ceiling");
-        assert_eq!(table.used("acme", ResourceClass::DurableLog), 60);
+        assert_eq!(table.used("acme", ResourceClass::Volume), 60);
         assert!(matches!(
-            table.try_consume("acme", ResourceClass::DurableLog, 41),
+            table.try_consume("acme", ResourceClass::Volume, 41),
             Err(Error::QuotaExceeded { .. })
         ));
     }
@@ -247,15 +247,15 @@ mod tests {
     #[test]
     fn restamp_updates_ceiling_and_preserves_usage() {
         let table = QuotaTable::new();
-        table.set("acme", ResourceClass::BlobStore, 100);
+        table.set("acme", ResourceClass::Volume, 100);
         table
-            .try_consume("acme", ResourceClass::BlobStore, 90)
+            .try_consume("acme", ResourceClass::Volume, 90)
             .expect("within ceiling");
         // Re-authoring changes the ceiling but does not reset live usage.
-        table.set("acme", ResourceClass::BlobStore, 80);
-        assert_eq!(table.used("acme", ResourceClass::BlobStore), 90);
+        table.set("acme", ResourceClass::Volume, 80);
+        assert_eq!(table.used("acme", ResourceClass::Volume), 90);
         assert!(matches!(
-            table.try_consume("acme", ResourceClass::BlobStore, 1),
+            table.try_consume("acme", ResourceClass::Volume, 1),
             Err(Error::QuotaExceeded { .. })
         ));
     }

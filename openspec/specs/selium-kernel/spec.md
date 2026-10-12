@@ -41,12 +41,19 @@ kernel.
 - **THEN** it reads frames with the shared frame reader and ring geometry
   from the channel header, with no local frame parsing
 
-### Requirement: Durable Storage Primitives
-`selium-kernel` SHALL expose a `StorageRegistry` sub-struct with durable log and blob primitives: append, replay, checkpoint, put, and get operations.
+### Requirement: Durable Volume Primitives
 
-#### Scenario: Guest replays a durable log
-- **WHEN** a guest replays a durable log from a valid checkpoint or sequence
-- **THEN** the kernel SHALL return the retained records and bounds according to the storage contract
+`selium-kernel` SHALL expose a `VolumeRegistry` sub-struct of opaque named byte containers rooted at a configured state directory, offering open, append, read-at-offset, length, list, remove and sync. The kernel SHALL NOT interpret container contents: record framing, sequence numbers, content addressing, manifests and checkpoints SHALL NOT exist in the kernel.
+
+#### Scenario: Bytes survive a kernel restart
+
+- **WHEN** bytes are appended to a volume and a kernel is created against the same state directory
+- **THEN** opening that volume SHALL observe the appended bytes and length
+
+#### Scenario: Contents are opaque
+
+- **WHEN** a volume written by one component is read through the registry
+- **THEN** the kernel SHALL return the stored bytes unchanged without interpreting their format
 
 ### Requirement: Primitive Process Lifecycle
 `selium-kernel` SHALL expose a `ProcessTable` sub-struct for starting, stopping, and inspecting guest processes without embedding placement or orchestration policy.
@@ -78,7 +85,7 @@ kernel.
 
 - `MemoryRegistry` — shared memory regions, mappings, Store
 - `ProcessTable` — process lifecycle, activity log, guest logs, metering
-- `StorageRegistry` — durable logs and blob stores
+- `VolumeRegistry` — durable volume containers
 - `NetworkState` — network resource metadata (no I/O)
 - `HostQueueRegistry` — host-mediated connection queues
 
@@ -88,7 +95,7 @@ kernel.
 
 #### Scenario: No cross-subsystem field access
 - **WHEN** `MemoryRegistry` methods execute
-- **THEN** they SHALL NOT lock or access fields owned by `ProcessTable`, `StorageRegistry`, `NetworkState`, or `HostQueueRegistry`
+- **THEN** they SHALL NOT lock or access fields owned by `ProcessTable`, `VolumeRegistry`, `NetworkState`, or `HostQueueRegistry`
 
 ### Requirement: No Tokio Dependency
 `selium-kernel` SHALL NOT depend on tokio. The `HostQueueState` notification mechanism SHALL use `parking_lot` primitives only.

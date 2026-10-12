@@ -275,11 +275,8 @@ impl ProcessTable {
             kind: ActivityKind::MeteringObserved,
             process_id: Some(process_id),
             message: format!(
-                "metering updated cpu={} memory={} storage={} bandwidth={}",
-                observation.cpu_instructions,
-                observation.memory_bytes,
-                observation.storage_bytes,
-                observation.bandwidth_bytes
+                "metering updated cpu={} memory={} bandwidth={}",
+                observation.cpu_instructions, observation.memory_bytes, observation.bandwidth_bytes
             ),
         });
     }
@@ -312,7 +309,6 @@ mod tests {
             MeteringObservation {
                 cpu_instructions: 10,
                 memory_bytes: 20,
-                storage_bytes: 30,
                 bandwidth_bytes: 40,
             },
         );

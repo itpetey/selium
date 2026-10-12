@@ -19,12 +19,12 @@
 
 use std::time::Duration;
 
-use selium_runtime::{Runtime, RuntimeConfig};
+use selium_runtime::RuntimeConfig;
 use selium_service::{ControlRequest, ControlResponse};
 use spine_common::{
-    CONNECTOR_ADDR, CONTROL_URI, SpinePortGuard, bridge_server_descriptor,
+    CONNECTOR_ADDR, CONTROL_URI, SpinePortGuard, StateRoot, bridge_server_descriptor,
     client_options_no_identity, connector_descriptor, discovery_descriptor, drain_logs, read_wasm,
-    seed_tls_blob_store, wait_for_logs,
+    runtime_in_state_root, seed_tls_blob_store, store_descriptor, wait_for_logs,
 };
 
 mod common;
@@ -42,7 +42,8 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
     // whole test so the golden-path test cannot race it.
     let _port = SpinePortGuard::acquire();
 
-    let runtime = Runtime::default();
+    let state = StateRoot::new("no-mtls-spine");
+    let runtime = runtime_in_state_root(&state);
     seed_tls_blob_store(&runtime);
 
     let report = runtime
@@ -52,15 +53,17 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
             // No identity guest: mTLS is off (opt-in via identity deployment).
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
+                store_descriptor(vec!["discovery".to_string()]),
                 connector_descriptor(
                     read_wasm("selium-connector-quic", "selium_connector_quic.wasm"),
-                    vec!["discovery".to_string()],
+                    vec!["discovery".to_string(), "store".to_string()],
                 ),
                 bridge_server_descriptor(
                     read_wasm("selium-bridge", "selium_bridge.wasm"),
                     vec!["discovery".to_string(), "quic-connector".to_string()],
                 ),
             ],
+            state_dir: state.config_dir(),
         })
         .unwrap_or_else(|error| {
             // The improved bootstrap diagnostics carry the failed guest's

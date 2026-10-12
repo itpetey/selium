@@ -15,35 +15,35 @@ pub mod selium {
   }
   pub mod control {
     use super::*;
-    mod resolved_target_generated;
-    pub use self::resolved_target_generated::*;
-    mod deployment_generated;
-    pub use self::deployment_generated::*;
-    mod delegation_status_generated;
-    pub use self::delegation_status_generated::*;
     mod control_request_generated;
     pub use self::control_request_generated::*;
     mod control_response_generated;
     pub use self::control_response_generated::*;
-    mod pipeline_binding_generated;
-    pub use self::pipeline_binding_generated::*;
+    mod delegation_status_generated;
+    pub use self::delegation_status_generated::*;
+    mod deployment_generated;
+    pub use self::deployment_generated::*;
     mod desired_state_record_generated;
     pub use self::desired_state_record_generated::*;
+    mod pipeline_binding_generated;
+    pub use self::pipeline_binding_generated::*;
+    mod resolved_target_generated;
+    pub use self::resolved_target_generated::*;
   }
   pub mod discovery {
     use super::*;
+    mod discovery_request_generated;
+    pub use self::discovery_request_generated::*;
+    mod discovery_response_generated;
+    pub use self::discovery_response_generated::*;
+    mod domain_entry_generated;
+    pub use self::domain_entry_generated::*;
     mod interface_metadata_generated;
     pub use self::interface_metadata_generated::*;
     mod label_generated;
     pub use self::label_generated::*;
     mod resource_target_generated;
     pub use self::resource_target_generated::*;
-    mod domain_entry_generated;
-    pub use self::domain_entry_generated::*;
-    mod discovery_request_generated;
-    pub use self::discovery_request_generated::*;
-    mod discovery_response_generated;
-    pub use self::discovery_response_generated::*;
   }
   pub mod identity {
     use super::*;
@@ -75,7 +75,20 @@ pub mod selium {
   }
   pub mod scheduler {
     use super::*;
-    mod scheduler_generated;
-    pub use self::scheduler_generated::*;
+    mod scheduler_request_generated;
+    pub use self::scheduler_request_generated::*;
+    mod scheduler_response_generated;
+    pub use self::scheduler_response_generated::*;
+  }
+  pub mod store {
+    use super::*;
+    mod header_generated;
+    pub use self::header_generated::*;
+    mod log_record_generated;
+    pub use self::log_record_generated::*;
+    mod store_request_generated;
+    pub use self::store_request_generated::*;
+    mod store_response_generated;
+    pub use self::store_response_generated::*;
   }
 }

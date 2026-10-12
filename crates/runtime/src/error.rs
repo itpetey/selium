@@ -63,6 +63,9 @@ pub(crate) fn kernel_error(error: selium_kernel::Error) -> AbiError {
         // capability, its tenant's authored ceiling is exhausted. The
         // message names the tenant and resource class (dimension).
         selium_kernel::Error::QuotaExceeded { .. } => AbiErrorCode::QuotaExceeded,
+        // A malformed volume name or a filesystem failure is the host's own
+        // internal failure, not the caller's mistake.
+        selium_kernel::Error::Invalid(_) | selium_kernel::Error::Io(_) => AbiErrorCode::Internal,
         selium_kernel::Error::AlreadyCompleted
         | selium_kernel::Error::ProcessStopped(_)
         | selium_kernel::Error::Wasm(_) => AbiErrorCode::Internal,

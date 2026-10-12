@@ -17,5 +17,9 @@ selium-guest-macros = { path = "../guest/macros" }
 thiserror.workspace = true
 tracing.workspace = true
 
+[build-dependencies]
+flatbuffers-build.workspace = true
+flatc-fork.workspace = true
+
 [lints]
 workspace = true

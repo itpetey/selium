@@ -2,7 +2,6 @@
 // @generated
 extern crate alloc;
 use super::*;
-
 pub enum IdentityResponseOffset {}
 #[derive(Copy, Clone, PartialEq)]
 

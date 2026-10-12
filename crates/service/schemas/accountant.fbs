@@ -6,7 +6,9 @@
 // - `MeteringBucket`: the bookkeeper's per-second, per-tenant reduced metering
 //   bucket, published to a shared-memory topic and merged by the accountant.
 //   Counter dimensions (cpu, bandwidth) carry the sampling interval's delta;
-//   gauge dimensions (memory, storage) carry the current reading.
+//   the memory gauge carries the current reading. Durable storage is absent by
+//   design: it is a tenant fact, not a per-process measurement, so the
+//   accountant reads a tenant's resident volume bytes from the volume layer.
 // - `AccountantControl`: the operator/billing control surface, served over the
 //   accountant's RPC listener. `SetPlan` authors the paid plan (soft ceiling);
 //   `SetOverage` authors the opt-in overage budget (hard ceiling = plan +
@@ -25,8 +27,6 @@ table MeteringBucket {
     cpu_instructions: ulong;
     // Current memory usage in bytes.
     memory_bytes: ulong;
-    // Current storage usage in bytes.
-    storage_bytes: ulong;
     // Bandwidth delta in bytes.
     bandwidth_bytes: ulong;
     // Wall-clock publish time in unix seconds, stamped by the bookkeeper:

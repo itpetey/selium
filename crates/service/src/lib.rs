@@ -597,8 +597,9 @@ pub enum IdentityResponse {
 /// A per-tenant metering bucket for one sampling interval, published by the
 /// bookkeeper entrypoint to a shared-memory topic and merged by the
 /// accountant entrypoint. Counter dimensions (`cpu_instructions`, `bandwidth_bytes`)
-/// carry the interval's delta; gauge dimensions (`memory_bytes`,
-/// `storage_bytes`) carry the current reading.
+/// carry the interval's delta; the memory gauge carries the current reading.
+/// Durable storage is deliberately absent: it is a tenant fact read from the
+/// volume layer, not a per-process measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[schema(
     path = "schemas/accountant.fbs",
@@ -613,8 +614,6 @@ pub struct MeteringBucket {
     pub cpu_instructions: u64,
     /// Current memory usage in bytes.
     pub memory_bytes: u64,
-    /// Current storage usage in bytes.
-    pub storage_bytes: u64,
     /// Bandwidth delta in bytes.
     pub bandwidth_bytes: u64,
     /// Wall-clock publish time in unix seconds, stamped by the bookkeeper:
@@ -704,6 +703,170 @@ pub enum AccountantControlResponse {
     Error {
         /// Failure context.
         context: String,
+    },
+}
+
+/// A durable-log record header key/value pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/store.fbs",
+    ty = "selium.store.Header",
+    binding = "selium_service::fbs::selium::store::Header"
+)]
+pub struct StoreRecordHeader {
+    /// Header key.
+    pub key: String,
+    /// Header value.
+    pub value: String,
+}
+
+/// A durable-log record as replayed to a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/store.fbs",
+    ty = "selium.store.LogRecord",
+    binding = "selium_service::fbs::selium::store::LogRecord"
+)]
+pub struct StoreRecord {
+    /// Monotonic log sequence number.
+    pub sequence: u64,
+    /// Record timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// User-supplied header key/value pairs.
+    pub headers: Vec<StoreRecordHeader>,
+    /// Record payload bytes.
+    pub payload: Vec<u8>,
+}
+
+/// Request sent to the durable store service.
+///
+/// Every request is scoped to the delivering process's tenant by the store
+/// itself; no variant carries a caller-asserted tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/store.fbs",
+    ty = "selium.store.StoreRequest",
+    binding = "selium_service::fbs::selium::store::StoreRequest"
+)]
+pub enum StoreRequest {
+    /// Open or create a durable log by name.
+    OpenLog {
+        /// Durable log name.
+        log: String,
+    },
+    /// Append a record to a durable log.
+    Append {
+        /// Durable log name.
+        log: String,
+        /// Record timestamp in milliseconds.
+        timestamp_ms: u64,
+        /// Record headers.
+        headers: Vec<StoreRecordHeader>,
+        /// Record payload bytes.
+        payload: Vec<u8>,
+    },
+    /// Replay records from a durable log.
+    Replay {
+        /// Durable log name.
+        log: String,
+        /// First sequence to include; 0 means from the start.
+        from_sequence: u64,
+        /// Maximum number of records to return.
+        limit: u32,
+    },
+    /// Record a named checkpoint referencing an existing sequence.
+    WriteCheckpoint {
+        /// Durable log name.
+        log: String,
+        /// Checkpoint name.
+        checkpoint: String,
+        /// Sequence the checkpoint references.
+        sequence: u64,
+    },
+    /// Read a named checkpoint.
+    ReadCheckpoint {
+        /// Durable log name.
+        log: String,
+        /// Checkpoint name.
+        checkpoint: String,
+    },
+    /// Store blob bytes and return their content-derived id.
+    PutBlob {
+        /// Blob-store name.
+        store: String,
+        /// Blob bytes.
+        payload: Vec<u8>,
+    },
+    /// Read blob bytes by content id.
+    GetBlob {
+        /// Blob-store name.
+        store: String,
+        /// Blob id to read.
+        blob_id: String,
+    },
+    /// Set a named manifest referencing an existing blob id.
+    SetManifest {
+        /// Blob-store name.
+        store: String,
+        /// Manifest name.
+        manifest: String,
+        /// Blob id the manifest references.
+        blob_id: String,
+    },
+    /// Read the blob id a named manifest references.
+    GetManifest {
+        /// Blob-store name.
+        store: String,
+        /// Manifest name.
+        manifest: String,
+    },
+}
+
+/// Response from the durable store service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/store.fbs",
+    ty = "selium.store.StoreResponse",
+    binding = "selium_service::fbs::selium::store::StoreResponse"
+)]
+pub enum StoreResponse {
+    /// The request completed with no value.
+    Ok,
+    /// A record was appended at this sequence.
+    Appended {
+        /// Sequence assigned to the appended record.
+        sequence: u64,
+    },
+    /// Records replayed from a durable log.
+    Replay {
+        /// Records in sequence order.
+        records: Vec<StoreRecord>,
+    },
+    /// A named checkpoint's sequence.
+    Checkpoint {
+        /// Sequence the checkpoint references.
+        sequence: u64,
+    },
+    /// The named checkpoint does not exist.
+    CheckpointMissing,
+    /// The content-derived id of a stored blob.
+    BlobId {
+        /// Content-derived blob id.
+        blob_id: String,
+    },
+    /// Blob bytes.
+    Bytes {
+        /// Blob bytes.
+        payload: Vec<u8>,
+    },
+    /// The requested log, blob or manifest does not exist.
+    NotFound,
+    /// The request failed with a typed error.
+    Error {
+        /// Stable machine-readable error code.
+        code: String,
+        /// Human-readable error detail.
+        message: String,
     },
 }
 
@@ -1408,7 +1571,6 @@ mod tests {
             tenant: "acme".to_string(),
             cpu_instructions: 1_234_567,
             memory_bytes: 65_536,
-            storage_bytes: 4096,
             bandwidth_bytes: 10_000,
             published_unix_s: 1_789_439_040,
         };

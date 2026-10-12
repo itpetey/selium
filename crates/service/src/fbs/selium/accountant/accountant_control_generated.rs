@@ -2,7 +2,6 @@
 // @generated
 extern crate alloc;
 use super::*;
-
 pub enum AccountantControlOffset {}
 #[derive(Copy, Clone, PartialEq)]
 

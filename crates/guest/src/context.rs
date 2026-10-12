@@ -2,7 +2,11 @@ use selium_abi::uri::{self, DomainTable};
 use selium_service::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
 use selium_shm::rpc::{self, OwnedRpcClient};
 
-use crate::{GuestError, resource::ResourceSender};
+use crate::{
+    GuestError,
+    resource::ResourceSender,
+    store::{self, BlobStore, DurableLog, STORE_ROUTE, StoreClient},
+};
 
 /// RPC ring capacity for discovery replies.
 const RPC_REP_CAPACITY: u64 = 4096;
@@ -34,6 +38,8 @@ pub struct Context {
     /// constructing a [`Context`] through the entrypoint macro.
     handle: u64,
     client: OwnedRpcClient<DiscoveryRequest, DiscoveryResponse>,
+    /// Client of the durable store service, connected lazily on first use.
+    store_client: Option<StoreClient>,
 }
 
 impl Context {
@@ -61,7 +67,42 @@ impl Context {
         Ok(Self {
             handle: discovery_handle,
             client,
+            store_client: None,
         })
+    }
+
+    /// Returns a client of the durable store service, connecting on first use.
+    ///
+    /// The store route is resolved for the caller, so a guest never has to
+    /// know it. When the store is not registered the request fails with a
+    /// typed error rather than hanging.
+    pub async fn store(&mut self) -> Result<StoreClient, GuestError> {
+        if let Some(client) = self.store_client.clone() {
+            return Ok(client);
+        }
+        let target = self
+            .lookup(STORE_ROUTE)
+            .await?
+            .ok_or_else(|| GuestError::Host(format!("store service unreachable: {STORE_ROUTE}")))?;
+        let sender = ResourceSender::attach(target.resource_id)?;
+        let client = store::connect(sender).await?;
+        self.store_client = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Opens or creates a durable log through the store service.
+    pub async fn open_log(&mut self, name: impl Into<String>) -> Result<DurableLog, GuestError> {
+        let client = self.store().await?;
+        DurableLog::open(client, name).await
+    }
+
+    /// Opens or creates a blob store through the store service.
+    pub async fn open_blob_store(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<BlobStore, GuestError> {
+        let client = self.store().await?;
+        BlobStore::open(client, name).await
     }
 
     /// Returns the raw discovery host-queue handle this context was built

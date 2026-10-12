@@ -2,7 +2,6 @@
 // @generated
 extern crate alloc;
 use super::*;
-
 pub enum MeteringBucketOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -22,9 +21,8 @@ impl<'a> MeteringBucket<'a> {
   pub const VT_TENANT: ::flatbuffers::VOffsetT = 4;
   pub const VT_CPU_INSTRUCTIONS: ::flatbuffers::VOffsetT = 6;
   pub const VT_MEMORY_BYTES: ::flatbuffers::VOffsetT = 8;
-  pub const VT_STORAGE_BYTES: ::flatbuffers::VOffsetT = 10;
-  pub const VT_BANDWIDTH_BYTES: ::flatbuffers::VOffsetT = 12;
-  pub const VT_PUBLISHED_UNIX_S: ::flatbuffers::VOffsetT = 14;
+  pub const VT_BANDWIDTH_BYTES: ::flatbuffers::VOffsetT = 10;
+  pub const VT_PUBLISHED_UNIX_S: ::flatbuffers::VOffsetT = 12;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -38,7 +36,6 @@ impl<'a> MeteringBucket<'a> {
     let mut builder = MeteringBucketBuilder::new(_fbb);
     builder.add_published_unix_s(args.published_unix_s);
     builder.add_bandwidth_bytes(args.bandwidth_bytes);
-    builder.add_storage_bytes(args.storage_bytes);
     builder.add_memory_bytes(args.memory_bytes);
     builder.add_cpu_instructions(args.cpu_instructions);
     if let Some(x) = args.tenant { builder.add_tenant(x); }
@@ -68,13 +65,6 @@ impl<'a> MeteringBucket<'a> {
     unsafe { self._tab.get::<u64>(MeteringBucket::VT_MEMORY_BYTES, Some(0)).unwrap()}
   }
   #[inline]
-  pub fn storage_bytes(&self) -> u64 {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<u64>(MeteringBucket::VT_STORAGE_BYTES, Some(0)).unwrap()}
-  }
-  #[inline]
   pub fn bandwidth_bytes(&self) -> u64 {
     // Safety:
     // Created from valid Table for this object
@@ -99,7 +89,6 @@ impl ::flatbuffers::Verifiable for MeteringBucket<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
      .visit_field::<u64>("cpu_instructions", Self::VT_CPU_INSTRUCTIONS, false)?
      .visit_field::<u64>("memory_bytes", Self::VT_MEMORY_BYTES, false)?
-     .visit_field::<u64>("storage_bytes", Self::VT_STORAGE_BYTES, false)?
      .visit_field::<u64>("bandwidth_bytes", Self::VT_BANDWIDTH_BYTES, false)?
      .visit_field::<u64>("published_unix_s", Self::VT_PUBLISHED_UNIX_S, false)?
      .finish();
@@ -110,7 +99,6 @@ pub struct MeteringBucketArgs<'a> {
     pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub cpu_instructions: u64,
     pub memory_bytes: u64,
-    pub storage_bytes: u64,
     pub bandwidth_bytes: u64,
     pub published_unix_s: u64,
 }
@@ -121,7 +109,6 @@ impl<'a> Default for MeteringBucketArgs<'a> {
       tenant: None,
       cpu_instructions: 0,
       memory_bytes: 0,
-      storage_bytes: 0,
       bandwidth_bytes: 0,
       published_unix_s: 0,
     }
@@ -144,10 +131,6 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> MeteringBucketBuilder<'a, 'b,
   #[inline]
   pub fn add_memory_bytes(&mut self, memory_bytes: u64) {
     self.fbb_.push_slot::<u64>(MeteringBucket::VT_MEMORY_BYTES, memory_bytes, 0);
-  }
-  #[inline]
-  pub fn add_storage_bytes(&mut self, storage_bytes: u64) {
-    self.fbb_.push_slot::<u64>(MeteringBucket::VT_STORAGE_BYTES, storage_bytes, 0);
   }
   #[inline]
   pub fn add_bandwidth_bytes(&mut self, bandwidth_bytes: u64) {
@@ -178,13 +161,11 @@ impl ::core::fmt::Debug for MeteringBucket<'_> {
       ds.field("tenant", &self.tenant());
       ds.field("cpu_instructions", &self.cpu_instructions());
       ds.field("memory_bytes", &self.memory_bytes());
-      ds.field("storage_bytes", &self.storage_bytes());
       ds.field("bandwidth_bytes", &self.bandwidth_bytes());
       ds.field("published_unix_s", &self.published_unix_s());
       ds.finish()
   }
 }
-
 #[inline]
 /// Verifies that a buffer of bytes contains a `MeteringBucket`
 /// and returns it.

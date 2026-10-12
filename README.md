@@ -17,8 +17,8 @@ tested:
 
 - Real WASM guests (`wasm32-unknown-unknown`, no WASI) executing on wasmtiny
 - The hostcall ABI (`selium-abi`, rkyv-encoded): capability-gated shared
-  memory alloc/attach, host queues, storage, process lifecycle, activity and
-  guest logs
+  memory alloc/attach, host queues, durable volumes, process lifecycle,
+  activity and guest logs
 - Shared-memory channels (`selium-shm`): lock-free ring buffers with typed
   pub/sub, RPC, and live-table overlays (`selium-wire`)
 - Structured guest logging over a shared-memory channel, drained by the host
@@ -27,11 +27,23 @@ tested:
 - Capability enforcement: real scope contexts (tenant, resource class,
   identity), grant-time selector admission, and an enforcement matrix — see
   `selium-abi` docs for the capability × selector table
+- **Durable storage**: the host exposes opaque named volumes (open, append,
+  read-at, length, list, remove, sync) rooted at a state directory, and the
+  `store` system guest owns all storage semantics over them — record framing,
+  sequences, checkpoints, content-addressed blob ids, manifests, per-tenant
+  layout and crash-consistent recovery — served as typed RPC on
+  `sel:///store`. The host never interprets a byte it stores
+- **A stateful boot**: the runtime takes a state directory (`--state-dir` /
+  `SELIUM_STATE_DIR`), boots the store before its dependants, persists the
+  host PKI hierarchy (offline root, online intermediate, per-tenant CAs), and
+  reconstructs per-tenant storage usage from the resident volumes before any
+  guest runs. A power cycle preserves tenants, principals, deployments,
+  uploaded modules and certificate chains
 - System guests built on that foundation: discovery (Tier-1 runtime feed
   registration, Tier-2 guest-driven URI resolution over shm RPC, and
-  revocation on process exit), identity, accounting, control plane, the
-  per-tenant bridge and per-stream bridge-channel, and the DNS/HTTP/QUIC edge
-  connectors
+  revocation on process exit), the store, identity, accounting, control plane,
+  the per-tenant bridge and per-stream bridge-channel, and the DNS/HTTP/QUIC
+  edge connectors
 
 The proof is the integration test suite:
 
@@ -70,7 +82,12 @@ cargo test -p selium-runtime --test net_wake -- --ignored
 ## Deferred (explicitly not working yet)
 
 - Multi-host clustering (the system guests are single-host)
-- Durable storage (current log and blob stores are in-memory)
+- Storage retention: log truncation, blob deletion and compaction. Durable
+  bytes accumulate; quotas cap a tenant's resident bytes but nothing reclaims
+  them yet
+- A bulk storage path: today a write travels ring → store guest → volume
+  hostcall → disk, and reads are chunked. Zero-copy payloads (slice-source
+  appends) and file-backed mapped reads are the two documented follow-ups
 
 The `guests/cluster`, `guests/scheduler`, and `guests/supervisor` guests are
 retained in-tree, frozen for later increments: they are not members of the
@@ -85,7 +102,7 @@ workspace and do not build.
 | `crates/memory` | `RegionMapping`/`RegionProvider` shared-memory abstraction |
 | `crates/shm` | Shared-memory ring channels (`Channel`, `RingBuf`, blocking/non-blocking readers/writers) |
 | `crates/wire` | Transport-agnostic framing + pub/sub, RPC, live-table patterns |
-| `crates/kernel` | Primitive host resources: shared memory, network, storage, processes, activity, metering |
+| `crates/kernel` | Primitive host resources: shared memory, network, durable volumes, processes, activity, metering |
 | `crates/runtime` | Wasmtiny-backed execution, capability enforcement, system-guest bootstrap, hostcall dispatch |
 | `crates/guest` | The guest SDK: hostcalls, async reactor, typed handles, tracing integration |
 | `crates/guest/macros` | `#[entrypoint]`, `#[pattern_interface]`, `#[schema]` proc macros |
@@ -94,6 +111,7 @@ workspace and do not build.
 | `crates/proto-dns` | DNS protocol wire types and DNS wire-format codec |
 | `crates/proto-http` | HTTP protocol wire types (FlatBuffers) |
 | `guests/discovery` | Discovery system guest (URI registration/resolution store + wiring) |
+| `guests/store` | Durable store system guest: the platform's only owner of durable-log and blob-store semantics (framing, sequences, checkpoints, content ids, manifests, crash-consistent recovery) over host volumes |
 | `guests/identity` | Identity system guest (tenant CA and user-certificate lifecycle, registries, anchor and grant publication) |
 | `guests/accountant` | Accounting system guest (metering reduction, billing, quota, narrowing, and rate-limit authoring) |
 | `guests/control-plane` | Control-plane system guest (typed RPC control surface and desired-state ownership) |

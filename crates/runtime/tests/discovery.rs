@@ -72,6 +72,7 @@ fn discovery_bootstrap_slice_end_to_end() {
                 discovery_descriptor(discovery_wasm),
                 discovery_probe_descriptor(probe_wasm),
             ],
+            state_dir: None,
         })
         .expect("bootstrap system guests");
 

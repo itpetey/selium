@@ -15,9 +15,10 @@
 //! ```
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{ReadinessCondition, RuntimeConfig, SystemGuestDescriptor};
 
 mod common;
+mod spine_common;
 
 #[test]
 #[ignore = "requires the control-plane and discovery guests built for wasm32-unknown-unknown"]
@@ -25,20 +26,24 @@ fn control_plane_bootstrap_slice_end_to_end() {
     let discovery_wasm = discovery_wasm();
     let control_plane_wasm = control_plane_wasm();
 
-    let runtime = Runtime::default();
+    let state = spine_common::StateRoot::new("control-plane");
+    let runtime = spine_common::runtime_in_state_root(&state);
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
             domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(discovery_wasm),
+                spine_common::store_descriptor(vec!["discovery".to_string()]),
                 control_plane_descriptor(control_plane_wasm),
             ],
+            state_dir: state.config_dir(),
         })
         .expect("bootstrap system guests");
 
-    // Discovery must be ready before the control plane (declared dependency).
-    assert_eq!(report.guests.len(), 2);
+    // Discovery and the store must be ready before the control plane
+    // (declared dependencies).
+    assert_eq!(report.guests.len(), 3);
     let discovery_guest = report
         .guests
         .iter()
@@ -49,6 +54,10 @@ fn control_plane_bootstrap_slice_end_to_end() {
         .iter()
         .find(|guest| guest.name == "control-plane")
         .expect("control-plane guest in report");
+    assert!(
+        report.guests.iter().any(|guest| guest.name == "store"),
+        "the store guest is bootstrapped"
+    );
 
     // Both serving guests reached readiness.
     let activity = runtime.activity_log();
@@ -94,11 +103,7 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         grants: vec![
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
             CapabilityGrant::new(
                 Capability::SharedMemory,
@@ -110,7 +115,7 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             ),
             CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
-        dependencies: vec!["discovery".to_string()],
+        dependencies: vec!["discovery".to_string(), "store".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
         serving_role: None,

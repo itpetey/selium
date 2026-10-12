@@ -50,6 +50,7 @@ fn connector_and_bridge_boot_after_identity() {
             // Identity is listed last: dependency order must still boot it
             // before the guests that depend on it.
             system_guests: vec![connector, bridge, identity],
+            state_dir: None,
         })
         .expect("bootstrap identity spine");
 

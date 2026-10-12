@@ -30,7 +30,7 @@ pub use crate::{
     platform::{mark_ready, process_id},
     process::{ActivityLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
-    storage::{BlobStore, DurableLog},
+    store::{BlobStore, DurableLog, STORE_ROUTE, StoreClient},
     time::{Instant, Timer, now},
 };
 pub use selium_abi::{
@@ -60,8 +60,9 @@ pub mod net;
 mod platform;
 mod process;
 mod resource;
-mod storage;
+mod store;
 pub mod time;
+pub mod volume;
 
 /// The multithreaded worker entry export: the runtime calls this on each
 /// dedicated OS worker thread of a multithreaded guest, passing the worker's

@@ -9,11 +9,11 @@ pub enum DiscoveryResponseOffset {}
 ///
 /// Variant tag values:
 ///   0 = Found(target)
-///   1 = NotFound
-///   2 = Registered
-///   3 = Revoked
-///   4 = Forbidden
-///   5 = Resolved(targets)
+///   1 = Resolved(targets)
+///   2 = NotFound
+///   3 = Registered
+///   4 = Revoked
+///   5 = Forbidden
 ///   6 = Domains(domains)
 pub struct DiscoveryResponse<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
@@ -50,24 +50,6 @@ impl<'a> DiscoveryResponse<'a> {
     builder.finish()
   }
 
-  pub fn unpack(&self) -> DiscoveryResponseT {
-    let variant = self.variant();
-    let target = self.target().map(|x| {
-      alloc::boxed::Box::new(x.unpack())
-    });
-    let targets = self.targets().map(|x| {
-      x.iter().map(|t| t.unpack()).collect()
-    });
-    let domains = self.domains().map(|x| {
-      x.iter().map(|t| t.unpack()).collect()
-    });
-    DiscoveryResponseT {
-      variant,
-      target,
-      targets,
-      domains,
-    }
-  }
 
   /// Variant discriminator.
   #[inline]
@@ -179,47 +161,6 @@ impl ::core::fmt::Debug for DiscoveryResponse<'_> {
       ds.field("targets", &self.targets());
       ds.field("domains", &self.domains());
       ds.finish()
-  }
-}
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiscoveryResponseT {
-  pub variant: u8,
-  pub target: Option<alloc::boxed::Box<ResourceTargetT>>,
-  pub targets: Option<alloc::vec::Vec<ResourceTargetT>>,
-  pub domains: Option<alloc::vec::Vec<DomainEntryT>>,
-}
-impl Default for DiscoveryResponseT {
-  fn default() -> Self {
-    Self {
-      variant: 0,
-      target: None,
-      targets: None,
-      domains: None,
-    }
-  }
-}
-impl DiscoveryResponseT {
-  pub fn pack<'b, A: ::flatbuffers::Allocator + 'b>(
-    &self,
-    _fbb: &mut ::flatbuffers::FlatBufferBuilder<'b, A>
-  ) -> ::flatbuffers::WIPOffset<DiscoveryResponse<'b>> {
-    let variant = self.variant;
-    let target = self.target.as_ref().map(|x|{
-      x.pack(_fbb)
-    });
-    let targets = self.targets.as_ref().map(|x|{
-      let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
-    });
-    let domains = self.domains.as_ref().map(|x|{
-      let w: alloc::vec::Vec<_> = x.iter().map(|t| t.pack(_fbb)).collect();_fbb.create_vector(&w)
-    });
-    DiscoveryResponse::create(_fbb, &DiscoveryResponseArgs{
-      variant,
-      target,
-      targets,
-      domains,
-    })
   }
 }
 #[inline]

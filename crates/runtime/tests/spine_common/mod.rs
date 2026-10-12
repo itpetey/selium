@@ -14,13 +14,14 @@
 
 use std::{
     fs::OpenOptions,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use selium_abi::{Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector};
 use selium_client::{ClientIdentity, ConnectOptions, FlatMsg as _};
+use selium_kernel::Kernel;
 use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
 
 /// The single-instance bridge route's server certificate (SAN `bridge`),
@@ -45,6 +46,75 @@ pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
 pub(crate) const SERVER_NAME: &str = "bridge";
 /// The tenant the onboarding guest mints and the client connects as.
 pub(crate) const TENANT: &str = "acme";
+
+/// A temporary state root for one test, removed on drop.
+///
+/// Spine tests boot against a throwaway root so durable state starts clean and
+/// never leaks between runs; the same root can be reused across two boots to
+/// assert that state survives a restart.
+pub(crate) struct StateRoot {
+    path: PathBuf,
+}
+
+impl StateRoot {
+    /// Creates a unique temporary state root.
+    pub(crate) fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "selium-spine-{tag}-{}-{nanos}-{unique}",
+                std::process::id()
+            )),
+        }
+    }
+
+    /// The state directory path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Takes ownership of an existing state directory, removing it on drop.
+    ///
+    /// Used by the second lifetime of a power-cycle test, which runs in a fresh
+    /// process and must assert against the directory the first one left behind.
+    pub(crate) fn adopt(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The state directory as a [`RuntimeConfig`](selium_runtime::RuntimeConfig)
+    /// field.
+    pub(crate) fn config_dir(&self) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+}
+
+impl Drop for StateRoot {
+    fn drop(&mut self) {
+        // Best-effort: a test that fails mid-way still cleans up here.
+        drop(std::fs::remove_dir_all(&self.path));
+    }
+}
+
+/// Creates a runtime whose volume layer is already rooted at `root`.
+///
+/// A test that seeds durable state (TLS material, a ledger) *before* bootstrap
+/// needs the root in place first: the state root may only be set before first
+/// use, so seeding into a throwaway root and re-rooting afterwards is refused
+/// by design. Passing `root.config_dir()` to the bootstrap is then a no-op.
+pub(crate) fn runtime_in_state_root(root: &StateRoot) -> Runtime {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seed = u64::from(std::process::id())
+        ^ COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .rotate_left(23);
+    Runtime::new(Kernel::with_state_dir(seed, root.path()))
+}
 
 /// Cross-process guard for the connector's fixed listener port: the spine
 /// test binaries (one runtime per process) must not bind `0.0.0.0:4433`
@@ -168,7 +238,7 @@ pub(crate) fn connector_descriptor(
             ),
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
         ],
         dependencies,
@@ -191,11 +261,7 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
         grants: vec![
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
-            ),
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
             CapabilityGrant::new(
                 Capability::SharedMemory,
@@ -207,10 +273,44 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
             ),
             CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
-        dependencies: vec!["discovery".to_string()],
+        dependencies: vec!["discovery".to_string(), "store".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
         serving_role: None,
+        handlers: Vec::new(),
+    }
+}
+
+/// The durable store system guest: the platform's only owner of durable-log
+/// and blob-store semantics, serving the root-namespace `sel:///store` route
+/// over the host's opaque volumes. Every guest that opens a log or blob store
+/// declares it as a dependency, so the store is ready first.
+pub(crate) fn store_descriptor(dependencies: Vec<String>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "store".to_string(),
+        module_id: "store-module".to_string(),
+        module_bytes: read_wasm("selium-store", "selium_store.wasm"),
+        entrypoint: "store_main".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        ],
+        dependencies,
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: Some("sel:///store".to_string()),
         handlers: Vec::new(),
     }
 }
@@ -266,7 +366,7 @@ pub(crate) fn identity_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescripto
         entrypoint: "identity_main".to_string(),
         arguments: Vec::new(),
         grants: selium_identity::identity_grants(),
-        dependencies: vec!["discovery".to_string()],
+        dependencies: vec!["discovery".to_string(), "store".to_string()],
         readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
         serving_role: None,
@@ -293,9 +393,23 @@ pub(crate) fn operator_descriptor(
     mode: u64,
     dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
+    operator_descriptor_named("identity-onboard", module_bytes, spki, mode, dependencies)
+}
+
+/// The same operator guest under an explicit name.
+///
+/// A test that drives two legs concurrently boots the guest twice, and two
+/// descriptors cannot share a name.
+pub(crate) fn operator_descriptor_named(
+    name: &str,
+    module_bytes: Vec<u8>,
+    spki: Vec<u8>,
+    mode: u64,
+    dependencies: Vec<String>,
+) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
-        name: "identity-onboard".to_string(),
-        module_id: "identity-onboard-module".to_string(),
+        name: name.to_string(),
+        module_id: format!("{name}-module"),
         module_bytes,
         entrypoint: "onboard".to_string(),
         arguments: vec![SystemGuestArg::Pointer(spki), SystemGuestArg::Integer(mode)],
@@ -310,7 +424,7 @@ pub(crate) fn operator_descriptor(
             ),
             CapabilityGrant::new(
                 Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
         ],
         dependencies,
@@ -323,16 +437,106 @@ pub(crate) fn operator_descriptor(
 
 /// Reads the issued leaf the onboarding guest wrote to the blob store.
 pub(crate) fn read_issued_leaf(runtime: &Runtime) -> Vec<u8> {
-    let storage = runtime.kernel().storage();
-    let store = storage.open_blob_store(&runtime.kernel().memory(), ONBOARD_STORE);
-    let leaf_id = storage
-        .get_manifest(store.local_id, LEAF_MANIFEST)
-        .expect("leaf manifest lookup")
-        .expect("issued leaf manifest present");
-    storage
-        .get_blob(store.local_id, &leaf_id)
-        .expect("leaf blob lookup")
-        .expect("issued leaf blob present")
+    let leaf_id =
+        read_manifest(runtime, ONBOARD_STORE, LEAF_MANIFEST).expect("issued leaf manifest present");
+    read_blob(runtime, ONBOARD_STORE, &leaf_id).expect("issued leaf blob present")
+}
+
+/// Writes a blob's content into the store's own layout under the platform
+/// tenant, exactly as the store's `put` does, and returns the content id.
+pub(crate) fn seed_blob(runtime: &Runtime, store: &str, bytes: &[u8]) -> String {
+    let id = selium_store::format::blob_id(bytes);
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::blob_volume(store, &id);
+    let volume = volumes.open(None, &name).expect("open blob volume");
+    volumes.append(volume.local_id, bytes).expect("append blob");
+    volumes.sync(volume.local_id).expect("sync blob volume");
+    drop(volumes.close(volume.local_id));
+    id
+}
+
+/// Points a manifest at a blob id in the store's own manifest layout.
+pub(crate) fn seed_manifest(runtime: &Runtime, store: &str, manifest: &str, blob_id: &str) {
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::manifest_volume(store);
+    let volume = volumes.open(None, &name).expect("open manifest volume");
+    let framed =
+        selium_store::format::frame(&selium_store::format::encode_manifest(manifest, blob_id));
+    volumes
+        .append(volume.local_id, &framed)
+        .expect("append manifest");
+    volumes.sync(volume.local_id).expect("sync manifest volume");
+    drop(volumes.close(volume.local_id));
+}
+
+/// Reads a manifest's blob id out of the store's own layout.
+pub(crate) fn read_manifest(runtime: &Runtime, store: &str, manifest: &str) -> Option<String> {
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::manifest_volume(store);
+    if !volumes.list(None).expect("list volumes").contains(&name) {
+        return None;
+    }
+    let volume = volumes.open(None, &name).expect("open manifest volume");
+    let bytes = volumes
+        .read_at(volume.local_id, 0, u32::MAX as usize)
+        .expect("read manifest volume");
+    drop(volumes.close(volume.local_id));
+    let (frames, _end) = selium_store::format::scan_frames(&bytes);
+    let mut found = None;
+    for frame in frames {
+        if let Ok((name, blob_id)) = selium_store::format::decode_manifest(frame)
+            && name == manifest
+        {
+            found = Some(blob_id);
+        }
+    }
+    found
+}
+
+/// Reads a blob's content out of the store's own layout.
+pub(crate) fn read_blob(runtime: &Runtime, store: &str, blob_id: &str) -> Option<Vec<u8>> {
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::blob_volume(store, blob_id);
+    if !volumes.list(None).expect("list volumes").contains(&name) {
+        return None;
+    }
+    let volume = volumes.open(None, &name).expect("open blob volume");
+    let bytes = volumes
+        .read_at(volume.local_id, 0, u32::MAX as usize)
+        .expect("read blob volume");
+    drop(volumes.close(volume.local_id));
+    Some(bytes)
+}
+
+/// Reads every complete record a log's volumes hold, in sequence order.
+pub(crate) fn read_log_records(runtime: &Runtime, log: &str) -> Vec<selium_store::format::Record> {
+    let volumes = runtime.kernel().volumes();
+    let names = volumes.list(None).expect("list volumes");
+    let mut segments: Vec<u64> = names
+        .iter()
+        .filter_map(|name| selium_store::format::parse_log_volume(name))
+        .filter_map(|parsed| parsed.ok())
+        .filter(|(parsed_log, _segment)| parsed_log == log)
+        .map(|(_log, segment)| segment)
+        .collect();
+    segments.sort_unstable();
+
+    let mut records = Vec::new();
+    for segment in segments {
+        let name = selium_store::format::log_volume(log, segment);
+        let volume = volumes.open(None, &name).expect("open log volume");
+        let bytes = volumes
+            .read_at(volume.local_id, 0, u32::MAX as usize)
+            .expect("read log volume");
+        drop(volumes.close(volume.local_id));
+        let (frames, _end) = selium_store::format::scan_frames(&bytes);
+        for frame in frames {
+            if let Ok(record) = selium_store::format::decode_record(frame) {
+                records.push(record);
+            }
+        }
+    }
+    records
 }
 
 pub(crate) fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
@@ -343,20 +547,10 @@ pub(crate) fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
 /// into the `tls-certs` blob store. Client trust anchors are NOT seeded here —
 /// they come exclusively from the identity guest's anchor live table.
 pub(crate) fn seed_tls_blob_store(runtime: &Runtime) {
-    let storage = runtime.kernel().storage();
-    let store = storage.open_blob_store(&runtime.kernel().memory(), "tls-certs");
-    let cert_id = storage
-        .put_blob(store.local_id, BRIDGE_CERT_PEM.to_vec())
-        .expect("put bridge cert blob");
-    let key_id = storage
-        .put_blob(store.local_id, BRIDGE_KEY_PEM.to_vec())
-        .expect("put bridge key blob");
-    storage
-        .set_manifest(store.local_id, "cert-pem", cert_id)
-        .expect("cert manifest");
-    storage
-        .set_manifest(store.local_id, "key-pem", key_id)
-        .expect("key manifest");
+    let cert_id = seed_blob(runtime, "tls-certs", BRIDGE_CERT_PEM);
+    let key_id = seed_blob(runtime, "tls-certs", BRIDGE_KEY_PEM);
+    seed_manifest(runtime, "tls-certs", "cert-pem", &cert_id);
+    seed_manifest(runtime, "tls-certs", "key-pem", &key_id);
 }
 
 #[expect(clippy::panic, reason = "test helper")]

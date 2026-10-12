@@ -8,7 +8,7 @@ use std::{
 use selium_abi::{
     AbiError, AbiErrorCode, Capability, CapabilityGrant, CompletionState, GuestLogEntry,
     HostcallOutput, HostcallRequest, Namespace, OperationId, ProcessId, ResourceClass,
-    ResourceIdentity, ResourceSelector, ScopeContext, TaskId,
+    ResourceIdentity, ResourceSelector, ScopeContext, TaskId, VolumeDescriptor,
 };
 use selium_service::{DiscoveryRequest, FlatMsg, ResourceTarget, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
@@ -702,228 +702,149 @@ impl Runtime {
                     descriptor,
                 )))
             }
-            HostcallRequest::StorageOpenLog { name } => {
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    None,
-                )?;
-                let descriptor = self.kernel.storage().open_log(&self.kernel.memory(), name);
-                self.claim_local_handle(process_id, ResourceClass::DurableLog, descriptor.local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::DurableLog(
-                    descriptor,
-                )))
-            }
-            HostcallRequest::StorageLogClose { local_id } => {
-                self.ensure_local_handle_owner(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    local_id,
-                )?;
-                self.kernel
-                    .storage()
-                    .close_log(local_id)
-                    .map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::DurableLog, local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::StorageLogAppend {
-                local_id,
-                timestamp_ms,
-                headers,
-                payload,
-            } => {
-                let shared_id = self.log_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                // Storage allocations count against the writer's durable-log
-                // quota: the append's payload bytes are reserved before the
-                // record is written.
-                let payload_len = payload.len() as u64;
-                self.enforce_quota(
-                    &self.process_tenant(process_id).unwrap_or_default(),
-                    ResourceClass::DurableLog,
-                    payload_len,
-                )?;
-                let sequence = self
-                    .kernel
-                    .storage()
-                    .append_log(local_id, timestamp_ms, headers, payload)
-                    .map_err(kernel_error)?;
-                self.note_storage_usage(process_id, payload_len);
-                Ok(HostOperationState::Ready(HostcallOutput::Sequence(Some(
-                    sequence,
-                ))))
-            }
-            HostcallRequest::StorageLogReplay {
-                local_id,
-                from_sequence,
-                limit,
-            } => {
-                let shared_id = self.log_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let records = self
-                    .kernel
-                    .storage()
-                    .replay_log(local_id, from_sequence, limit as usize)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::StorageRecords(
-                    records,
-                )))
-            }
-            HostcallRequest::StorageLogCheckpoint {
-                local_id,
+            HostcallRequest::VolumeOpen {
                 name,
-                sequence,
+                serving_tenant,
             } => {
-                let shared_id = self.log_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                self.kernel
-                    .storage()
-                    .checkpoint_log(local_id, name, sequence)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::StorageLogCheckpointRead { local_id, name } => {
-                let shared_id = self.log_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::DurableLog,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                let sequence = self
-                    .kernel
-                    .storage()
-                    .checkpoint_sequence(local_id, &name)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Sequence(
-                    sequence,
-                )))
-            }
-            HostcallRequest::StorageOpenBlobStore { name } => {
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::BlobStore,
-                    None,
-                )?;
+                self.require(process_id, Capability::Storage, ResourceClass::Volume, None)?;
+                // Principal provenance: the volume is minted under the serving
+                // tenant, which may differ from the opening process's own
+                // tenant only for a root principal or with tenant-scoped
+                // delegation.
+                let principal =
+                    self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
                 let descriptor = self
                     .kernel
-                    .storage()
-                    .open_blob_store(&self.kernel.memory(), name);
-                self.claim_local_handle(process_id, ResourceClass::BlobStore, descriptor.local_id);
-                Ok(HostOperationState::Ready(HostcallOutput::BlobStore(
-                    descriptor,
+                    .volumes()
+                    .open((!principal.is_empty()).then_some(principal.as_str()), &name)
+                    .map_err(kernel_error)?;
+                self.claim_local_handle(process_id, ResourceClass::Volume, descriptor.local_id);
+                self.volume_tenants
+                    .lock()
+                    .insert((process_id, descriptor.local_id), principal);
+                Ok(HostOperationState::Ready(HostcallOutput::Volume(
+                    VolumeDescriptor {
+                        local_id: descriptor.local_id,
+                        len: descriptor.len,
+                    },
                 )))
             }
-            HostcallRequest::StorageBlobStoreClose { local_id } => {
+            HostcallRequest::VolumeAppend { local_id, bytes } => {
                 self.ensure_local_handle_owner(
                     process_id,
                     Capability::Storage,
-                    ResourceClass::BlobStore,
+                    ResourceClass::Volume,
+                    local_id,
+                )?;
+                // Durable bytes belong to the tenant the volume was minted
+                // under: reserve the append's bytes against that tenant before
+                // the host writes anything. A denial writes no bytes.
+                let tenant = self.volume_serving_tenant(process_id, local_id);
+                let appended = bytes.len() as u64;
+                self.enforce_quota(&tenant, ResourceClass::Volume, appended)?;
+                let offset = self
+                    .kernel
+                    .volumes()
+                    .append(local_id, &bytes)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(offset)))
+            }
+            HostcallRequest::VolumeReadAt {
+                local_id,
+                offset,
+                len,
+            } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::Volume,
+                    local_id,
+                )?;
+                let bytes = self
+                    .kernel
+                    .volumes()
+                    .read_at(local_id, offset, len as usize)
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes)))
+            }
+            HostcallRequest::VolumeLen { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::Volume,
+                    local_id,
+                )?;
+                let len = self.kernel.volumes().len(local_id).map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::U64(len)))
+            }
+            HostcallRequest::VolumeList { serving_tenant } => {
+                self.require(process_id, Capability::Storage, ResourceClass::Volume, None)?;
+                let principal =
+                    self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
+                let names = self
+                    .kernel
+                    .volumes()
+                    .list((!principal.is_empty()).then_some(principal.as_str()))
+                    .map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::VolumeNames(
+                    names,
+                )))
+            }
+            HostcallRequest::VolumeRemove {
+                name,
+                serving_tenant,
+            } => {
+                self.require(process_id, Capability::Storage, ResourceClass::Volume, None)?;
+                let principal =
+                    self.authorize_serving_tenant(process_id, serving_tenant.as_deref())?;
+                let freed = self
+                    .kernel
+                    .volumes()
+                    .remove((!principal.is_empty()).then_some(principal.as_str()), &name)
+                    .map_err(kernel_error)?;
+                // Removal releases the tenant's resident bytes: the volume no
+                // longer exists, so its bytes leave the tenant's usage.
+                self.kernel
+                    .quota()
+                    .release(&principal, ResourceClass::Volume, freed);
+                Ok(HostOperationState::Ready(HostcallOutput::U64(freed)))
+            }
+            HostcallRequest::VolumeSync { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::Volume,
+                    local_id,
+                )?;
+                self.kernel.volumes().sync(local_id).map_err(kernel_error)?;
+                Ok(HostOperationState::Ready(HostcallOutput::Empty))
+            }
+            HostcallRequest::VolumeClose { local_id } => {
+                self.ensure_local_handle_owner(
+                    process_id,
+                    Capability::Storage,
+                    ResourceClass::Volume,
                     local_id,
                 )?;
                 self.kernel
-                    .storage()
-                    .close_blob_store(local_id)
+                    .volumes()
+                    .close(local_id)
                     .map_err(kernel_error)?;
-                self.release_local_handle(process_id, &ResourceClass::BlobStore, local_id);
+                self.release_local_handle(process_id, &ResourceClass::Volume, local_id);
+                self.volume_tenants.lock().remove(&(process_id, local_id));
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
-            HostcallRequest::StorageBlobPut { local_id, bytes } => {
-                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::BlobStore,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                // Storage allocations count against the writer's blob-store
-                // quota: the blob's byte length is reserved before it is stored.
-                let blob_len = bytes.len() as u64;
-                self.enforce_quota(
-                    &self.process_tenant(process_id).unwrap_or_default(),
-                    ResourceClass::BlobStore,
-                    blob_len,
-                )?;
-                let blob_id = self
+            HostcallRequest::VolumeUsage { tenant } => {
+                // The accounting guest is the sole reader: the reading is gated
+                // by the same bootstrap-provisioned authority that authors
+                // ceilings.
+                self.require_capability(process_id, Capability::QuotaWrite)?;
+                let usage = self
                     .kernel
-                    .storage()
-                    .put_blob(local_id, bytes)
+                    .volumes()
+                    .tenant_usage((!tenant.is_empty()).then_some(tenant.as_str()))
                     .map_err(kernel_error)?;
-                self.note_storage_usage(process_id, blob_len);
-                Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id)))
-            }
-            HostcallRequest::StorageBlobGet { local_id, blob_id } => {
-                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::BlobStore,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                match self
-                    .kernel
-                    .storage()
-                    .get_blob(local_id, &blob_id)
-                    .map_err(kernel_error)?
-                {
-                    Some(bytes) => Ok(HostOperationState::Ready(HostcallOutput::Bytes(bytes))),
-                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
-                }
-            }
-            HostcallRequest::StorageBlobSetManifest {
-                local_id,
-                name,
-                blob_id,
-            } => {
-                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::BlobStore,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                self.kernel
-                    .storage()
-                    .set_manifest(local_id, name, blob_id)
-                    .map_err(kernel_error)?;
-                Ok(HostOperationState::Ready(HostcallOutput::Empty))
-            }
-            HostcallRequest::StorageBlobGetManifest { local_id, name } => {
-                let shared_id = self.blob_store_shared_id(process_id, local_id)?;
-                self.require(
-                    process_id,
-                    Capability::Storage,
-                    ResourceClass::BlobStore,
-                    Some(ResourceIdentity::Shared(shared_id)),
-                )?;
-                match self
-                    .kernel
-                    .storage()
-                    .get_manifest(local_id, &name)
-                    .map_err(kernel_error)?
-                {
-                    Some(blob_id) => Ok(HostOperationState::Ready(HostcallOutput::BlobId(blob_id))),
-                    None => Ok(HostOperationState::Ready(HostcallOutput::Empty)),
-                }
+                Ok(HostOperationState::Ready(HostcallOutput::U64(usage)))
             }
             HostcallRequest::ProcessStart {
                 module_id,
@@ -1888,38 +1809,16 @@ impl Runtime {
         }
     }
 
-    fn log_shared_id(
-        &self,
-        process_id: ProcessId,
-        local_id: u64,
-    ) -> std::result::Result<u64, AbiError> {
-        self.ensure_local_handle_owner(
-            process_id,
-            Capability::Storage,
-            ResourceClass::DurableLog,
-            local_id,
-        )?;
-        self.kernel
-            .storage()
-            .log_shared_id_public(local_id)
-            .map_err(kernel_error)
-    }
-
-    fn blob_store_shared_id(
-        &self,
-        process_id: ProcessId,
-        local_id: u64,
-    ) -> std::result::Result<u64, AbiError> {
-        self.ensure_local_handle_owner(
-            process_id,
-            Capability::Storage,
-            ResourceClass::BlobStore,
-            local_id,
-        )?;
-        self.kernel
-            .storage()
-            .blob_store_shared_id_public(local_id)
-            .map_err(kernel_error)
+    /// Returns the serving tenant a local volume handle was minted under, so
+    /// an append is reserved against that tenant rather than the writer's.
+    /// Falls back to the calling process's own tenant for an unrecorded handle.
+    fn volume_serving_tenant(&self, process_id: ProcessId, local_id: u64) -> String {
+        self.volume_tenants
+            .lock()
+            .get(&(process_id, local_id))
+            .cloned()
+            .or_else(|| self.process_tenant(process_id))
+            .unwrap_or_default()
     }
 
     fn validate_child_grants(
@@ -2299,159 +2198,339 @@ mod tests {
     }
 
     #[test]
-    fn storage_hostcalls_cover_logs_and_blobs() {
+    fn volume_hostcalls_cover_the_byte_container_lifecycle() {
         let runtime = Runtime::default();
         let bootstrapped = spawn_with_grants(
             &runtime,
-            vec![
-                CapabilityGrant::new(
-                    Capability::Storage,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
-                ),
-                CapabilityGrant::new(
-                    Capability::Storage,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::BlobStore)],
-                ),
-            ],
+            vec![CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            )],
         );
 
-        let (_, open_log_op) = runtime.begin_hostcall(
+        let (_, open_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageOpenLog {
-                name: "audit".to_string(),
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: None,
             },
         );
-        let HostcallOutput::DurableLog(log) = ready(&runtime, bootstrapped.process_id, open_log_op)
+        let HostcallOutput::Volume(volume) = ready(&runtime, bootstrapped.process_id, open_op)
         else {
-            panic!("expected durable log");
+            panic!("expected volume descriptor");
+        };
+        assert_eq!(volume.len, 0);
+
+        let (_, append_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeAppend {
+                local_id: volume.local_id,
+                bytes: b"hello".to_vec(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, append_op),
+            HostcallOutput::U64(0)
+        );
+        let (_, second_append_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeAppend {
+                local_id: volume.local_id,
+                bytes: b" world".to_vec(),
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, second_append_op),
+            HostcallOutput::U64(5)
+        );
+
+        let (_, read_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeReadAt {
+                local_id: volume.local_id,
+                offset: 6,
+                len: 64,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, read_op),
+            HostcallOutput::Bytes(b"world".to_vec())
+        );
+
+        let (_, len_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeLen {
+                local_id: volume.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, len_op),
+            HostcallOutput::U64(11)
+        );
+
+        let (_, list_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeList {
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, list_op),
+            HostcallOutput::VolumeNames(vec!["orders".to_string()])
+        );
+
+        let (_, sync_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeSync {
+                local_id: volume.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, sync_op),
+            HostcallOutput::Empty
+        );
+
+        let (_, close_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeClose {
+                local_id: volume.local_id,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, close_op),
+            HostcallOutput::Empty
+        );
+
+        let (_, remove_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeRemove {
+                name: "orders".to_string(),
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(
+            ready(&runtime, bootstrapped.process_id, remove_op),
+            HostcallOutput::U64(11)
+        );
+    }
+
+    #[test]
+    fn volume_open_requires_the_storage_capability() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(&runtime, Vec::new());
+        let (status, op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        let CompletionState::Failed(error) = runtime.poll_hostcall(bootstrapped.process_id, op)
+        else {
+            panic!("expected permission denial");
+        };
+        assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn volume_open_for_a_foreign_tenant_requires_delegation() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-worker",
+            vec![CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            )],
+            Some("acme"),
+        );
+        let (status, op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: Some("beta".to_string()),
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        let CompletionState::Failed(error) = runtime.poll_hostcall(bootstrapped.process_id, op)
+        else {
+            panic!("expected cross-tenant denial");
+        };
+        assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn root_principal_opens_a_volume_under_a_named_tenant() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            )],
+        );
+        let (_, open_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: Some("acme".to_string()),
+            },
+        );
+        let HostcallOutput::Volume(volume) = ready(&runtime, bootstrapped.process_id, open_op)
+        else {
+            panic!("expected volume descriptor");
         };
         let (_, append_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageLogAppend {
-                local_id: log.local_id,
-                timestamp_ms: 42,
-                headers: Vec::new(),
-                payload: b"entry".to_vec(),
-            },
-        );
-        let HostcallOutput::Sequence(Some(sequence)) =
-            ready(&runtime, bootstrapped.process_id, append_op)
-        else {
-            panic!("expected appended sequence");
-        };
-        let (_, checkpoint_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::StorageLogCheckpoint {
-                local_id: log.local_id,
-                name: "boot".to_string(),
-                sequence,
+            HostcallRequest::VolumeAppend {
+                local_id: volume.local_id,
+                bytes: b"acme-bytes".to_vec(),
             },
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, checkpoint_op),
-            HostcallOutput::Empty
+            ready(&runtime, bootstrapped.process_id, append_op),
+            HostcallOutput::U64(0)
         );
-        let (_, checkpoint_read_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::StorageLogCheckpointRead {
-                local_id: log.local_id,
-                name: "boot".to_string(),
-            },
+        // The bytes are recorded under `acme`, not the root namespace.
+        assert_eq!(
+            runtime
+                .kernel
+                .volumes()
+                .tenant_usage(Some("acme"))
+                .expect("acme usage"),
+            10
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, checkpoint_read_op),
-            HostcallOutput::Sequence(Some(sequence))
+            runtime
+                .kernel
+                .volumes()
+                .tenant_usage(None)
+                .expect("root usage"),
+            0
         );
-        let (_, replay_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::StorageLogReplay {
-                local_id: log.local_id,
-                from_sequence: Some(sequence),
-                limit: 1,
-            },
-        );
-        let HostcallOutput::StorageRecords(records) =
-            ready(&runtime, bootstrapped.process_id, replay_op)
-        else {
-            panic!("expected log records");
-        };
-        assert_eq!(records[0].payload, b"entry".to_vec());
+    }
 
-        let (_, open_blob_op) = runtime.begin_hostcall(
+    #[test]
+    fn append_beyond_the_volume_ceiling_writes_no_bytes() {
+        let runtime = Runtime::default();
+        runtime.kernel.quota().set("acme", ResourceClass::Volume, 4);
+
+        let bootstrapped = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-store",
+            vec![CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            )],
+            Some("acme"),
+        );
+        let (_, open_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageOpenBlobStore {
-                name: "assets".to_string(),
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: None,
             },
         );
-        let HostcallOutput::BlobStore(store) =
-            ready(&runtime, bootstrapped.process_id, open_blob_op)
+        let HostcallOutput::Volume(volume) = ready(&runtime, bootstrapped.process_id, open_op)
         else {
-            panic!("expected blob store");
+            panic!("expected volume descriptor");
         };
-        let (_, put_op) = runtime.begin_hostcall(
+
+        let (status, op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageBlobPut {
-                local_id: store.local_id,
-                bytes: b"blob".to_vec(),
+            HostcallRequest::VolumeAppend {
+                local_id: volume.local_id,
+                bytes: b"oversized".to_vec(),
             },
         );
-        let HostcallOutput::BlobId(blob_id) = ready(&runtime, bootstrapped.process_id, put_op)
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        let CompletionState::Failed(error) = runtime.poll_hostcall(bootstrapped.process_id, op)
         else {
-            panic!("expected blob id");
+            panic!("expected quota denial");
         };
-        let (_, manifest_op) = runtime.begin_hostcall(
+        assert_eq!(error.code, AbiErrorCode::QuotaExceeded);
+        assert!(
+            error.message.contains("acme"),
+            "names the tenant: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Volume"),
+            "names the dimension: {}",
+            error.message
+        );
+
+        // No bytes were written: the volume stays empty and no usage is booked.
+        let (_, len_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageBlobSetManifest {
-                local_id: store.local_id,
-                name: "latest".to_string(),
-                blob_id: blob_id.clone(),
+            HostcallRequest::VolumeLen {
+                local_id: volume.local_id,
             },
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, manifest_op),
-            HostcallOutput::Empty
+            ready(&runtime, bootstrapped.process_id, len_op),
+            HostcallOutput::U64(0)
         );
-        let (_, get_op) = runtime.begin_hostcall(
+        assert_eq!(
+            runtime.kernel.quota().used("acme", ResourceClass::Volume),
+            0
+        );
+    }
+
+    #[test]
+    fn removing_a_volume_releases_its_usage() {
+        let runtime = Runtime::default();
+        let bootstrapped = spawn_with_grants_and_tenant(
+            &runtime,
+            "acme-store",
+            vec![CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            )],
+            Some("acme"),
+        );
+        let (_, open_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageBlobGet {
-                local_id: store.local_id,
-                blob_id,
+            HostcallRequest::VolumeOpen {
+                name: "orders".to_string(),
+                serving_tenant: None,
+            },
+        );
+        let HostcallOutput::Volume(volume) = ready(&runtime, bootstrapped.process_id, open_op)
+        else {
+            panic!("expected volume descriptor");
+        };
+        let (_, append_op) = runtime.begin_hostcall(
+            bootstrapped.process_id,
+            HostcallRequest::VolumeAppend {
+                local_id: volume.local_id,
+                bytes: b"bytes".to_vec(),
             },
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, get_op),
-            HostcallOutput::Bytes(b"blob".to_vec())
+            ready(&runtime, bootstrapped.process_id, append_op),
+            HostcallOutput::U64(0)
         );
-        let (_, manifest_read_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::StorageBlobGetManifest {
-                local_id: store.local_id,
-                name: "latest".to_string(),
-            },
+        assert_eq!(
+            runtime.kernel.quota().used("acme", ResourceClass::Volume),
+            5
         );
-        assert!(matches!(
-            ready(&runtime, bootstrapped.process_id, manifest_read_op),
-            HostcallOutput::BlobId(_)
-        ));
-        let (_, close_log_op) = runtime.begin_hostcall(
+
+        let (_, remove_op) = runtime.begin_hostcall(
             bootstrapped.process_id,
-            HostcallRequest::StorageLogClose {
-                local_id: log.local_id,
+            HostcallRequest::VolumeRemove {
+                name: "orders".to_string(),
+                serving_tenant: None,
             },
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, close_log_op),
-            HostcallOutput::Empty
-        );
-        let (_, close_blob_op) = runtime.begin_hostcall(
-            bootstrapped.process_id,
-            HostcallRequest::StorageBlobStoreClose {
-                local_id: store.local_id,
-            },
+            ready(&runtime, bootstrapped.process_id, remove_op),
+            HostcallOutput::U64(5)
         );
         assert_eq!(
-            ready(&runtime, bootstrapped.process_id, close_blob_op),
-            HostcallOutput::Empty
+            runtime.kernel.quota().used("acme", ResourceClass::Volume),
+            0
         );
     }
 
@@ -2519,7 +2598,6 @@ mod tests {
             MeteringObservation {
                 cpu_instructions: 1,
                 memory_bytes: 2,
-                storage_bytes: 3,
                 bandwidth_bytes: 4,
             },
         );
@@ -4189,6 +4267,7 @@ mod tests {
                     handlers: vec!["sel-quic".to_string()],
                 }],
                 domain_table: Vec::new(),
+                state_dir: None,
             })
             .expect("bootstrap connector");
         let connector = report.guests.first().expect("connector").process_id;
@@ -4746,7 +4825,6 @@ mod tests {
             MeteringObservation {
                 cpu_instructions: 42,
                 memory_bytes: 0,
-                storage_bytes: 0,
                 bandwidth_bytes: 0,
             },
         );
@@ -4795,7 +4873,6 @@ mod tests {
             MeteringObservation {
                 cpu_instructions: 7,
                 memory_bytes: 0,
-                storage_bytes: 0,
                 bandwidth_bytes: 0,
             },
         );

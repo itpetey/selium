@@ -28,6 +28,12 @@ pub enum Error {
         /// Resource class (dimension) whose ceiling was exceeded.
         class: selium_abi::ResourceClass,
     },
+    #[error("invalid argument: {0}")]
+    /// An argument was rejected by validation (e.g. an unsafe volume name).
+    Invalid(String),
+    #[error("io error: {0}")]
+    /// Filesystem operation failed.
+    Io(#[from] std::io::Error),
     #[error("wasmtiny runtime error: {0}")]
     /// Underlying Wasmtiny operation failed.
     Wasm(String),

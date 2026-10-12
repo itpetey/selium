@@ -18,6 +18,7 @@
 //! without changing the hostcall surface.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
@@ -38,7 +39,7 @@ pub trait CaStore: Send + Sync {
     /// Stores a tenant CA key.
     fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError>;
     /// Returns a tenant CA key, if present.
-    fn get(&self, tenant: &str) -> Option<&TenantCa>;
+    fn get(&self, tenant: &str) -> Option<TenantCa>;
     /// Removes and returns a tenant CA key, if present.
     fn remove(&mut self, tenant: &str) -> Option<TenantCa>;
 }
@@ -55,6 +56,8 @@ pub enum KeyringError {
     TenantCaNotFound { tenant: String },
     #[error("unsupported subject key algorithm")]
     UnsupportedSubjectKey,
+    #[error("keyring state error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Host-side PKI key material: a DER certificate plus its PKCS#8 private key.
@@ -104,12 +107,56 @@ impl CaStore for InMemoryCaStore {
         Ok(())
     }
 
-    fn get(&self, tenant: &str) -> Option<&TenantCa> {
-        self.by_tenant.get(tenant)
+    fn get(&self, tenant: &str) -> Option<TenantCa> {
+        self.by_tenant.get(tenant).cloned()
     }
 
     fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
         self.by_tenant.remove(tenant)
+    }
+}
+
+/// File-backed tenant CA store: one certificate/key pair per tenant.
+pub struct FileCaStore {
+    dir: PathBuf,
+}
+
+impl FileCaStore {
+    /// Creates a store whose material lives under `dir`.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn cert_path(&self, tenant: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.cert.der", encode_component(tenant)))
+    }
+
+    fn key_path(&self, tenant: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.key.der", encode_component(tenant)))
+    }
+}
+
+impl CaStore for FileCaStore {
+    fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError> {
+        std::fs::create_dir_all(&self.dir)?;
+        write_private(&self.cert_path(tenant), &ca.cert_der)?;
+        write_private(&self.key_path(tenant), &ca.key_der)?;
+        Ok(())
+    }
+
+    fn get(&self, tenant: &str) -> Option<TenantCa> {
+        let cert_der = std::fs::read(self.cert_path(tenant)).ok()?;
+        let key_der = std::fs::read(self.key_path(tenant)).ok()?;
+        Some(TenantCa { cert_der, key_der })
+    }
+
+    fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
+        let ca = self.get(tenant)?;
+        drop(std::fs::remove_file(self.cert_path(tenant)));
+        drop(std::fs::remove_file(self.key_path(tenant)));
+        Some(ca)
     }
 }
 
@@ -176,6 +223,19 @@ impl Keyring {
         self.root
             .as_ref()
             .map(|material| material.cert_der.as_slice())
+    }
+
+    /// Returns the host-private material a later boot needs to reconstruct this
+    /// hierarchy.
+    ///
+    /// Host-only, and the counterpart of [`KeyringBootstrap`]: the private keys
+    /// it carries are written to the host's state directory and never cross to
+    /// a guest.
+    pub fn bootstrap_material(&self) -> KeyringBootstrap {
+        KeyringBootstrap {
+            root: self.root.clone(),
+            intermediate: Some(self.intermediate.clone()),
+        }
     }
 
     /// Mints a tenant CA: generates a host-held tenant key pair, signs it via
@@ -284,6 +344,127 @@ fn material_from(cert: &Certificate, key: &KeyPair) -> KeyMaterial {
         cert_der: cert.der().to_vec(),
         key_der: key.serialize_der(),
     }
+}
+
+/// The host keyring persisted under a state directory.
+///
+/// Covers the whole hierarchy — the offline root, the online intermediate and
+/// the per-tenant CAs — so a restart reuses the material it already had rather
+/// than silently replacing it: certificates issued before a restart keep
+/// validating against the tenant CA they chain to. An empty state directory
+/// generates and persists a fresh hierarchy on first boot.
+///
+/// Layout: `<state>/keys/{root,intermediate}.{cert,key}.der` and
+/// `<state>/keys/tenants/<enc tenant>.{cert,key}.der`.
+pub struct KeyringStore {
+    dir: PathBuf,
+}
+
+impl KeyringStore {
+    /// Creates a store rooted under `state_dir`.
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: state_dir.into().join("keys"),
+        }
+    }
+
+    /// Loads the persisted hierarchy, or generates and persists a fresh one
+    /// when the state directory holds none.
+    pub fn load_or_generate(&self) -> Result<Keyring, KeyringError> {
+        if let Some(bootstrap) = self.load()? {
+            return Keyring::initialize(Box::new(FileCaStore::new(self.tenants_dir())), bootstrap);
+        }
+        let keyring = Keyring::generate()?;
+        self.persist(&keyring)?;
+        Ok(keyring.with_tenant_store(Box::new(FileCaStore::new(self.tenants_dir()))))
+    }
+
+    fn tenants_dir(&self) -> PathBuf {
+        self.dir.join("tenants")
+    }
+
+    fn material_paths(&self, name: &str) -> (PathBuf, PathBuf) {
+        (
+            self.dir.join(format!("{name}.cert.der")),
+            self.dir.join(format!("{name}.key.der")),
+        )
+    }
+
+    /// Reads the persisted hierarchy, returning `None` when it is absent.
+    fn load(&self) -> Result<Option<KeyringBootstrap>, KeyringError> {
+        let (intermediate_cert, intermediate_key) = self.material_paths("intermediate");
+        let Some(intermediate) = read_material(&intermediate_cert, &intermediate_key)? else {
+            return Ok(None);
+        };
+        let (root_cert, root_key) = self.material_paths("root");
+        let root = read_material(&root_cert, &root_key)?;
+        Ok(Some(KeyringBootstrap {
+            root,
+            intermediate: Some(intermediate),
+        }))
+    }
+
+    /// Writes the whole hierarchy to the state directory.
+    fn persist(&self, keyring: &Keyring) -> Result<(), KeyringError> {
+        std::fs::create_dir_all(&self.dir)?;
+        let material = keyring.bootstrap_material();
+        let root = material.root.ok_or(KeyringError::IntermediateMissing)?;
+        let (root_cert, root_key) = self.material_paths("root");
+        write_private(&root_cert, &root.cert_der)?;
+        write_private(&root_key, &root.key_der)?;
+
+        let intermediate = material
+            .intermediate
+            .ok_or(KeyringError::IntermediateMissing)?;
+        let (intermediate_cert, intermediate_key) = self.material_paths("intermediate");
+        write_private(&intermediate_cert, &intermediate.cert_der)?;
+        write_private(&intermediate_key, &intermediate.key_der)?;
+
+        std::fs::create_dir_all(self.tenants_dir())?;
+        Ok(())
+    }
+}
+
+/// Reads a certificate/key pair, returning `None` when either half is absent.
+fn read_material(cert: &Path, key: &Path) -> Result<Option<KeyMaterial>, KeyringError> {
+    match (std::fs::read(cert), std::fs::read(key)) {
+        (Ok(cert_der), Ok(key_der)) => Ok(Some(KeyMaterial { cert_der, key_der })),
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error.into()),
+    }
+}
+
+/// Writes host-private material, restricting permissions where the platform
+/// supports it.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), KeyringError> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Encodes a tenant name into a single filesystem-safe component.
+fn encode_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            if let Some(high) = char::from_digit(u32::from(byte >> 4), 16) {
+                out.push(high);
+            }
+            if let Some(low) = char::from_digit(u32::from(byte & 0x0f), 16) {
+                out.push(low);
+            }
+        }
+    }
+    out
 }
 
 /// Validates that stored material round-trips through a signing handle.
@@ -420,5 +601,92 @@ mod tests {
     fn test_spki() -> Vec<u8> {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("keygen");
         key.subject_public_key_info()
+    }
+
+    /// A unique temporary state directory for a test.
+    fn temp_state_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "selium-{tag}-{}-{nanos}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn first_boot_generates_and_persists_the_whole_hierarchy() {
+        let dir = temp_state_dir("keyring-fresh");
+        let keyring = KeyringStore::new(&dir)
+            .load_or_generate()
+            .expect("generate");
+        let intermediate = keyring.intermediate_cert().to_vec();
+        assert!(!intermediate.is_empty());
+        for name in ["root", "intermediate"] {
+            assert!(
+                dir.join("keys").join(format!("{name}.cert.der")).exists(),
+                "{name} certificate is persisted"
+            );
+            assert!(
+                dir.join("keys").join(format!("{name}.key.der")).exists(),
+                "{name} private key is persisted"
+            );
+        }
+
+        // The next boot reuses the same material rather than replacing it.
+        let reopened = KeyringStore::new(&dir).load_or_generate().expect("reload");
+        assert_eq!(reopened.intermediate_cert(), intermediate.as_slice());
+        assert_eq!(
+            reopened.root_cert().map(<[u8]>::to_vec),
+            keyring.root_cert().map(<[u8]>::to_vec)
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_certificate_minted_after_a_restart_chains_to_the_recorded_tenant_ca() {
+        let dir = temp_state_dir("keyring-restart");
+
+        // First lifetime: onboard the tenant, recording its CA.
+        let mut first = KeyringStore::new(&dir)
+            .load_or_generate()
+            .expect("first boot");
+        let tenant_ca_der = first.sign_tenant_ca("acme").expect("tenant ca");
+
+        // Restart: a fresh keyring loaded from the same state directory.
+        let second = KeyringStore::new(&dir).load_or_generate().expect("restart");
+        let leaf_der = second
+            .sign_user_cert("acme", &test_spki())
+            .expect("leaf minted after restart");
+
+        let (_, tenant_ca) =
+            x509_parser::parse_x509_certificate(&tenant_ca_der).expect("parse tenant ca");
+        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).expect("parse leaf");
+        assert_eq!(
+            leaf.issuer().to_string(),
+            tenant_ca.subject().to_string(),
+            "the leaf chains to the tenant CA recorded before the restart"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn revocation_removes_the_persisted_tenant_ca() {
+        let dir = temp_state_dir("keyring-revoke");
+        let mut keyring = KeyringStore::new(&dir).load_or_generate().expect("boot");
+        keyring.sign_tenant_ca("acme").expect("tenant ca");
+        keyring.revoke_ca("acme").expect("revoke");
+
+        // A restart sees no tenant CA: revocation is durable, not per-boot.
+        let restarted = KeyringStore::new(&dir).load_or_generate().expect("restart");
+        assert!(matches!(
+            restarted.sign_user_cert("acme", &test_spki()),
+            Err(KeyringError::TenantCaNotFound { .. })
+        ));
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

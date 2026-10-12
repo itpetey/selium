@@ -2,7 +2,6 @@
 // @generated
 extern crate alloc;
 use super::*;
-
 pub enum IdentityRequestOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -167,7 +166,6 @@ impl ::core::fmt::Debug for IdentityRequest<'_> {
       ds.finish()
   }
 }
-
 #[inline]
 /// Verifies that a buffer of bytes contains a `IdentityRequest`
 /// and returns it.

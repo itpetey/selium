@@ -87,6 +87,7 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
                     handlers: Vec::new(),
                 },
             ],
+            state_dir: None,
         })
         .expect("bootstrap connector and bridge-server");
     let find = |name: &str| {
@@ -612,6 +613,7 @@ fn spawn_guest(
                 serving_role: None,
                 handlers: Vec::new(),
             }],
+            state_dir: None,
         })
         .expect("bootstrap guest");
     report

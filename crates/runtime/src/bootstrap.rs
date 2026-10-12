@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     thread,
     time::{Duration, Instant},
 };
@@ -46,6 +46,11 @@ pub(crate) struct LoadedGuest {
 impl Runtime {
     /// Boots all configured system guests in dependency order.
     pub fn bootstrap_system_guests(&self, mut config: RuntimeConfig) -> Result<BootstrapReport> {
+        // Boot is state-rooted: root the volume layer at the configured state
+        // directory, load or generate the host PKI hierarchy, and reconstruct
+        // per-tenant volume usage — all before any guest runs.
+        self.prepare_state_root(config.state_dir.as_deref())?;
+
         // The metering producer: a one-second host ticker projecting fresh
         // per-process observations into the kernel, so the bookkeeper's
         // `MeteringRead` polls observe live consumption (the accountant's
@@ -133,32 +138,37 @@ impl Runtime {
             self.publish_seed_domain(domain, tenant)?;
         }
 
-        let mut pending = BTreeMap::new();
+        // Pending guests in **declaration order**. Dependencies decide who is
+        // *eligible* to start next; the configuration's order decides which
+        // eligible guest goes first. Ordering by name instead would silently
+        // ignore the configured sequence, so two dependency-ready guests would
+        // boot in an order the config never stated — and a guest whose startup
+        // needs a peer it does not declare would lose that race.
+        let mut names = BTreeSet::new();
+        let mut pending: Vec<SystemGuestDescriptor> =
+            Vec::with_capacity(config.system_guests.len());
         for descriptor in config.system_guests {
-            let name = descriptor.name.clone();
-            if pending.insert(name.clone(), descriptor).is_some() {
-                return Err(Error::DuplicateDescriptor(name));
+            if !names.insert(descriptor.name.clone()) {
+                return Err(Error::DuplicateDescriptor(descriptor.name));
             }
+            pending.push(descriptor);
         }
 
         let mut ready = BTreeSet::new();
         let mut report = BootstrapReport::default();
 
         while !pending.is_empty() {
-            let ready_name = pending.iter().find_map(|(name, descriptor)| {
+            let eligible = pending.iter().position(|descriptor| {
                 descriptor
                     .dependencies
                     .iter()
                     .all(|dependency| ready.contains(dependency))
-                    .then_some(name.clone())
             });
-            let Some(name) = ready_name else {
+            let Some(index) = eligible else {
                 if let Some(missing_dependency) = pending
-                    .values()
+                    .iter()
                     .flat_map(|descriptor| descriptor.dependencies.iter())
-                    .find(|dependency| {
-                        !ready.contains(*dependency) && !pending.contains_key(*dependency)
-                    })
+                    .find(|dependency| !ready.contains(*dependency) && !names.contains(*dependency))
                 {
                     self.rollback_bootstrapped(&report);
                     return Err(Error::UnknownDependency(missing_dependency.clone()));
@@ -167,9 +177,8 @@ impl Runtime {
                 return Err(Error::DependencyCycle);
             };
 
-            let descriptor = pending
-                .remove(&name)
-                .ok_or_else(|| Error::DescriptorNotFound(name.clone()))?;
+            let descriptor = pending.remove(index);
+            let name = descriptor.name.clone();
             let bootstrapped = match self.spawn_system_guest(descriptor.clone()) {
                 Ok(bootstrapped) => bootstrapped,
                 Err(error) => {
@@ -558,7 +567,97 @@ impl Runtime {
 mod tests {
     use super::*;
     use selium_abi::{Capability, CapabilityGrant, LocalityScope, ResourceSelector};
+    use selium_kernel::Kernel;
     use wasmtiny::WasmValue;
+
+    /// A unique temporary state directory for a test.
+    fn temp_state_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "selium-{tag}-{}-{nanos}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn state_root_boot_is_clean_against_fresh_and_existing_directories() {
+        let dir = temp_state_dir("state-root");
+        let boot = |dir: &std::path::Path| {
+            let runtime = Runtime::default();
+            runtime
+                .bootstrap_system_guests(RuntimeConfig {
+                    start_discovery: false,
+                    system_guests: Vec::new(),
+                    domain_table: Vec::new(),
+                    state_dir: Some(dir.to_path_buf()),
+                })
+                .expect("clean bootstrap");
+            runtime
+        };
+
+        // A fresh directory: the volume layer is rooted there and a hierarchy
+        // is generated and persisted.
+        let fresh = boot(&dir);
+        assert_eq!(fresh.kernel().volumes().root(), dir);
+        let first_cert = fresh
+            .keyring_intermediate_cert()
+            .expect("first boot installs a keyring");
+
+        // An existing directory: same root, same hierarchy, still clean.
+        let existing = boot(&dir);
+        assert_eq!(existing.kernel().volumes().root(), dir);
+        assert_eq!(
+            existing
+                .keyring_intermediate_cert()
+                .expect("restart reuses the keyring"),
+            first_cert,
+            "a restart must not replace the persisted hierarchy"
+        );
+
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn resident_volume_bytes_seed_the_tenant_usage_at_boot() {
+        let dir = temp_state_dir("usage-seed");
+        // A pre-populated state directory: two tenants hold resident bytes.
+        {
+            let kernel = Kernel::with_state_dir(1, &dir);
+            let volumes = kernel.volumes();
+            let volume = volumes.open(Some("acme"), "orders").expect("open acme");
+            volumes
+                .append(volume.local_id, b"0123456789")
+                .expect("append");
+            let volume = volumes.open(Some("beta"), "assets").expect("open beta");
+            volumes.append(volume.local_id, b"abc").expect("append");
+        }
+
+        let runtime = Runtime::default();
+        runtime
+            .bootstrap_system_guests(RuntimeConfig {
+                start_discovery: false,
+                system_guests: Vec::new(),
+                domain_table: Vec::new(),
+                state_dir: Some(dir.clone()),
+            })
+            .expect("bootstrap");
+
+        let quota = runtime.kernel().quota();
+        assert_eq!(
+            quota.used("acme", ResourceClass::Volume),
+            10,
+            "acme's resident bytes are reconstructed before any guest runs"
+        );
+        assert_eq!(quota.used("beta", ResourceClass::Volume), 3);
+
+        drop(std::fs::remove_dir_all(&dir));
+    }
 
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (export \"{entrypoint}\") {body}))"))
@@ -599,6 +698,7 @@ mod tests {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         };
 
         let report = runtime
@@ -611,6 +711,55 @@ mod tests {
                 .entrypoint_results(report.guests[0].process_id)
                 .expect("entrypoint results"),
             vec![WasmValue::I32(7)]
+        );
+    }
+
+    #[test]
+    fn declaration_order_breaks_ties_among_dependency_ready_guests() {
+        // Names deliberately disagree with the configured order: among guests
+        // whose dependencies are all satisfied, the configuration's order is
+        // the boot order. Ordering by name instead would let a guest whose
+        // startup needs a peer it has not declared lose that race.
+        let runtime = Runtime::default();
+        let guest = |name: &str, dependencies: Vec<String>| SystemGuestDescriptor {
+            name: name.to_string(),
+            module_id: format!("{name}-module"),
+            module_bytes: module_with_entrypoint("boot", ""),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::ProcessLifecycle,
+                vec![ResourceSelector::Locality(LocalityScope::Cluster)],
+            )],
+            dependencies,
+            readiness: ReadinessCondition::Immediate,
+            tenant: None,
+            serving_role: None,
+            handlers: Vec::new(),
+        };
+
+        let report = runtime
+            .bootstrap_system_guests(RuntimeConfig {
+                start_discovery: false,
+                domain_table: Vec::new(),
+                system_guests: vec![
+                    guest("zulu", Vec::new()),
+                    guest("alpha", Vec::new()),
+                    guest("mike", vec!["zulu".to_string()]),
+                ],
+                state_dir: None,
+            })
+            .expect("bootstrap guests");
+
+        let order: Vec<&str> = report
+            .guests
+            .iter()
+            .map(|bootstrapped| bootstrapped.name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["zulu", "alpha", "mike"],
+            "the configured order is the boot order once dependencies allow it"
         );
     }
 
@@ -667,6 +816,7 @@ mod tests {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         };
 
         let report = runtime
@@ -703,6 +853,7 @@ mod tests {
                 handlers: Vec::new(),
             }],
             domain_table: Vec::new(),
+            state_dir: None,
         };
 
         let err = runtime
@@ -748,6 +899,7 @@ mod tests {
                 serving_role: Some("sel:///dns/resolve".to_string()),
                 handlers: Vec::new(),
             }],
+            state_dir: None,
         };
 
         let err = runtime

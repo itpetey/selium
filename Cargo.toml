@@ -23,6 +23,7 @@ members = [
   "guests/control-plane",
   "guests/discovery",
   "guests/identity",
+  "guests/store",
   "integration/discovery-probe",
   "integration/dns-demo",
   "integration/identity-onboard",
@@ -53,6 +54,8 @@ blake3 = { version = "1.8", default-features = false }
 bytes = { version = "1.12", default-features = false }
 clap = { version = "4.6", default-features = false }
 flatbuffers = { version = "25.12", default-features = false }
+flatbuffers-build = { version = "0.2", default-features = false }
+flatc-fork = { version = "0.6.0", default-features = false }
 futures = { version = "0.3", default-features = false }
 getrandom = { version = "0.4", default-features = false }
 parking_lot = { version = "0.12", default-features = false }

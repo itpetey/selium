@@ -266,6 +266,7 @@ pub fn finish_control_request_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(
     root: ::flatbuffers::WIPOffset<ControlRequest<'a>>) {
   fbb.finish(root, None);
 }
+
 #[inline]
 pub fn finish_size_prefixed_control_request_buffer<'a, 'b, A: ::flatbuffers::Allocator + 'a>(fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>, root: ::flatbuffers::WIPOffset<ControlRequest<'a>>) {
   fbb.finish_size_prefixed(root, None);

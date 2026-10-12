@@ -1,6 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use parking_lot::Mutex;
@@ -27,6 +31,9 @@ pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
 /// Serving tenant tracked per (process_id, region_id) so FreeRegion can revoke
 /// the region's URI (minted under principal provenance).
 pub(crate) type RegionTenants = HashMap<(ProcessId, u64), String>;
+/// Serving tenant tracked per (process_id, volume local id) so an append is
+/// reserved against the tenant the volume was minted under, not the writer's.
+pub(crate) type VolumeTenants = HashMap<(ProcessId, u64), String>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Wait registry keyed by (process_id, region_id).
 pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
@@ -64,6 +71,9 @@ pub struct Runtime {
     /// Serving tenant tracked per (process_id, region_id) so FreeRegion can
     /// revoke the region's URI.
     pub(crate) region_tenants: Arc<Mutex<RegionTenants>>,
+    /// Serving tenant tracked per (process_id, volume local id) so an append is
+    /// reserved against the tenant the volume was minted under.
+    pub(crate) volume_tenants: Arc<Mutex<VolumeTenants>>,
     /// Principal tenant tracked per (process_id, queue_id) so process
     /// teardown can revoke the queue's URI under the tenant it was minted
     /// for (which may differ from the creating process's own tenant).
@@ -153,6 +163,10 @@ pub struct Runtime {
     /// the spawn-time anchor and the per-second `refresh_cpu_budgets`, removed
     /// at process teardown.
     pub(crate) cpu_budget_windows: Arc<Mutex<HashMap<ProcessId, CpuBudgetWindow>>>,
+    /// Guards the one-shot state-root preparation: rooting the volume layer,
+    /// loading or generating the host keyring, and reconstructing per-tenant
+    /// volume usage all happen exactly once, before any guest runs.
+    state_root_prepared: Arc<AtomicBool>,
 }
 
 /// Per-process CPU budget window: the wall-clock minute the process's engine
@@ -202,6 +216,7 @@ impl Runtime {
             discovery_listener_shared_id: Arc::new(Mutex::new(None)),
             discovery_process: Arc::new(Mutex::new(None)),
             region_tenants: Arc::new(Mutex::new(HashMap::new())),
+            volume_tenants: Arc::new(Mutex::new(HashMap::new())),
             queue_tenants: Arc::new(Mutex::new(HashMap::new())),
             process_quota_tenants: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -220,6 +235,7 @@ impl Runtime {
             metering_ticker_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker_counts: Arc::new(Mutex::new(HashMap::new())),
             cpu_budget_windows: Arc::new(Mutex::new(HashMap::new())),
+            state_root_prepared: Arc::new(AtomicBool::new(false)),
         };
 
         // Initialise the mio network poller if possible (best-effort).
@@ -234,6 +250,62 @@ impl Runtime {
         }
 
         runtime
+    }
+
+    /// Prepares the durable state root, once, before any guest runs.
+    ///
+    /// Roots the kernel's volume layer at `state_dir`, reconstructs per-tenant
+    /// volume usage from the resident bytes there, and loads (or, on first
+    /// boot, generates and persists) the host PKI hierarchy. A kernel built
+    /// with a throwaway volume root is re-rooted here — legal precisely because
+    /// no volume has been opened yet; see
+    /// [`selium_kernel::VolumeRegistry::set_root`].
+    pub(crate) fn prepare_state_root(&self, state_dir: Option<&Path>) -> Result<()> {
+        if self.state_root_prepared.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(dir) = state_dir {
+            self.kernel.volumes().set_root(dir)?;
+        }
+        self.seed_volume_usage()?;
+        if let Some(dir) = state_dir {
+            self.load_or_generate_keyring(dir)?;
+        }
+        Ok(())
+    }
+
+    /// Seeds the quota counters with each tenant's resident volume bytes.
+    ///
+    /// Durable storage belongs to the tenant, not to a process, and the bytes
+    /// are read back off the volume layout rather than remembered: without this
+    /// a restart would let a tenant append its whole ceiling again on top of
+    /// what it already holds.
+    fn seed_volume_usage(&self) -> Result<()> {
+        for (tenant, bytes) in self.kernel.volumes().usage_by_tenant()? {
+            if bytes > 0 {
+                // Force-accepted, not denied: the bytes are already resident,
+                // so the counter reflects them and later allocations face the
+                // authored ceiling.
+                self.kernel
+                    .quota()
+                    .force_consume(&tenant, ResourceClass::Volume, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads the host keyring from the state directory, generating and
+    /// persisting a fresh hierarchy on first boot. An already-installed
+    /// keyring is left in place.
+    fn load_or_generate_keyring(&self, state_dir: &Path) -> Result<()> {
+        if self.keyring.lock().is_some() {
+            return Ok(());
+        }
+        let keyring = crate::keyring::KeyringStore::new(state_dir)
+            .load_or_generate()
+            .map_err(|error| Error::Host(error.to_string()))?;
+        *self.keyring.lock() = Some(keyring);
+        Ok(())
     }
 
     /// Returns a clone of the runtime kernel handle.
@@ -266,6 +338,23 @@ impl Runtime {
         .map_err(|error| Error::Host(error.to_string()))?;
         *self.keyring.lock() = Some(keyring);
         Ok(())
+    }
+
+    /// Loads or generates the host keyring under a state directory.
+    pub fn initialize_keyring_from_state(&self, state_dir: impl Into<PathBuf>) -> Result<()> {
+        self.load_or_generate_keyring(&state_dir.into())
+    }
+
+    /// Returns the installed keyring's intermediate certificate (public DER),
+    /// or `None` when no keyring is installed.
+    ///
+    /// Observable state for embedders and tests; no private material is
+    /// exposed.
+    pub fn keyring_intermediate_cert(&self) -> Option<Vec<u8>> {
+        self.keyring
+            .lock()
+            .as_ref()
+            .map(|keyring| keyring.intermediate_cert().to_vec())
     }
 
     /// Generates a fresh root + intermediate hierarchy and installs it as the

@@ -219,9 +219,11 @@ pub struct AccountBook {
 }
 
 /// Shared accounting state handed between the rolling loop and RPC handlers.
+///
+/// The durable ledger is *not* held here: it is an async RPC client, so it is
+/// cloned to the async callers and never locked with the projection.
 struct Shared {
     accounts: AccountBook,
-    ledger: DurableLog,
     buckets: Subscriber<MeteringBucket, ShmTransport>,
     narrowing: Arc<LiveTable<String, Vec<u8>, ShmTransport>>,
     window: Option<RollingWindow>,
@@ -266,7 +268,10 @@ impl From<&MeteringBucket> for Usage {
         Self {
             cpu_instructions: bucket.cpu_instructions,
             memory_bytes: bucket.memory_bytes,
-            storage_bytes: bucket.storage_bytes,
+            // The bucket carries no storage reading: durable storage is a
+            // tenant fact read from the volume layer, not a per-process
+            // measurement the bookkeeper can reduce.
+            storage_bytes: 0,
             bandwidth_bytes: bucket.bandwidth_bytes,
         }
     }
@@ -361,7 +366,11 @@ impl RollingWindow {
         entry.merge_gauges(Usage {
             cpu_instructions: 0,
             memory_bytes: bucket.memory_bytes,
-            storage_bytes: bucket.storage_bytes,
+            // A tenant's storage dimension is its resident volume bytes,
+            // sampled from the volume layer: durable storage is a tenant fact,
+            // not a per-process measurement, so the bucket carries no storage
+            // reading to reduce.
+            storage_bytes: selium_guest::volume::tenant_usage(&bucket.tenant).unwrap_or(0),
             bandwidth_bytes: 0,
         });
     }
@@ -421,6 +430,7 @@ impl AccountBook {
 
     /// Re-applies replayed record payloads in log order. Undecodable records
     /// are skipped with a warning (a torn write must not lose the projection).
+    /// Materialises the projection from a replayed durable log.
     pub fn rebuild_payloads(&mut self, payloads: impl IntoIterator<Item = Vec<u8>>) {
         for payload in payloads {
             match selium_abi::decode_rkyv::<LedgerRecord>(&payload) {
@@ -428,16 +438,6 @@ impl AccountBook {
                 Err(error) => warn!("accountant: skipping undecodable ledger record: {error}"),
             }
         }
-    }
-
-    /// Replays the durable ledger into the projection.
-    pub fn rebuild(&mut self, ledger: &DurableLog) -> selium_guest::Result<()> {
-        let payloads = ledger
-            .replay(None, u32::MAX)?
-            .into_iter()
-            .map(|record| record.payload);
-        self.rebuild_payloads(payloads);
-        Ok(())
     }
 }
 
@@ -458,39 +458,26 @@ impl Shared {
         }
     }
 
-    /// Rolls the current window into the ledger (appending one record per
-    /// tenant) and returns the rolled records.
+    /// Rolls the current window into the ledger's record set and returns the
+    /// rolled records.
+    ///
+    /// The records are applied to the projection here but appended by the
+    /// caller: the ledger is an async client and appends must not run under
+    /// this state's lock.
     fn roll_window(&mut self, window: RollingWindow) -> Vec<LedgerRecord> {
         let records = window.into_records(&self.accounts.accounts);
         for record in &records {
-            self.append_record(record);
             self.accounts.apply_record(record.clone());
         }
         records
     }
 
-    /// Appends a ledger record, updated the projection, and re-authors the
-    /// tenant's enforcement state.
-    fn apply_policy(&mut self, tenant: &str, record: LedgerRecord) {
-        self.append_record(&record);
-        self.accounts.apply_record(record);
+    /// Applies a policy record to the projection and re-authors the tenant's
+    /// enforcement state, returning the record for the caller to append.
+    fn apply_policy(&mut self, tenant: &str, record: LedgerRecord) -> LedgerRecord {
+        self.accounts.apply_record(record.clone());
         self.author_enforcement(tenant);
-    }
-
-    /// Appends an encoded ledger record, tolerating encode/append failures with
-    /// a warning (usage history is advisory; enforcement is the preemptive path).
-    fn append_record(&mut self, record: &LedgerRecord) {
-        let timestamp_ms = time::now()
-            .map(|nanos| nanos / 1_000_000)
-            .unwrap_or_default();
-        match selium_abi::encode_rkyv(record) {
-            Ok(payload) => {
-                if let Err(error) = self.ledger.append(timestamp_ms, Vec::new(), payload) {
-                    warn!("accountant: ledger append failed: {error}");
-                }
-            }
-            Err(error) => warn!("accountant: ledger record encode failed: {error}"),
-        }
+        record
     }
 
     /// Authors the tenant's enforcement state (quotas + narrowing) from its
@@ -509,13 +496,13 @@ impl Shared {
             account.delinquent,
         );
 
-        for class in [ResourceClass::SharedRegion] {
-            if let Err(error) = quota_set(tenant, class.clone(), enforcement.memory_quota) {
-                warn!(tenant, class = ?class, "accountant: quota set failed: {error}");
-            }
-        }
-        for class in [ResourceClass::DurableLog, ResourceClass::BlobStore] {
-            if let Err(error) = quota_set(tenant, class.clone(), enforcement.storage_quota) {
+        // Memory and storage are separate quota dimensions with separate
+        // ceilings; each is authored under its own class.
+        for (class, limit) in [
+            (ResourceClass::SharedRegion, enforcement.memory_quota),
+            (ResourceClass::Volume, enforcement.storage_quota),
+        ] {
+            if let Err(error) = quota_set(tenant, class.clone(), limit) {
                 warn!(tenant, class = ?class, "accountant: quota set failed: {error}");
             }
         }
@@ -549,7 +536,7 @@ pub fn accountant_grants() -> Vec<CapabilityGrant> {
         CapabilityGrant::new(Capability::QuotaWrite, Vec::new()),
         CapabilityGrant::new(
             Capability::Storage,
-            vec![ResourceSelector::ResourceClass(ResourceClass::DurableLog)],
+            vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
         ),
         CapabilityGrant::new(
             Capability::SharedMemory,
@@ -693,7 +680,10 @@ pub fn reduce_samples(
         bucket.merge_gauges(Usage {
             cpu_instructions: 0,
             memory_bytes: sample.observation.memory_bytes,
-            storage_bytes: sample.observation.storage_bytes,
+            // Durable storage is not a per-process reading: a tenant's
+            // resident volume bytes are read by the accountant from the
+            // volume layer, not reduced from process observations.
+            storage_bytes: 0,
             bandwidth_bytes: 0,
         });
     }
@@ -707,12 +697,19 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("accountant: started");
 
-    let ledger = DurableLog::open(LEDGER_LOG).with_context(|| "accountant: ledger open failed")?;
-    let accounts = AccountBook::default();
-    let mut accounts = accounts;
-    accounts
-        .rebuild(&ledger)
-        .with_context(|| "accountant: ledger replay failed")?;
+    let ledger = ctx
+        .open_log(LEDGER_LOG)
+        .await
+        .with_context(|| "accountant: ledger open failed")?;
+    let mut accounts = AccountBook::default();
+    let ledger_payloads = ledger
+        .replay(None, u32::MAX)
+        .await
+        .with_context(|| "accountant: ledger replay failed")?
+        .into_iter()
+        .map(|record| record.payload)
+        .collect::<Vec<_>>();
+    accounts.rebuild_payloads(ledger_payloads);
 
     // Attach the bookkeeper's bucket topic.
     let topic = ctx
@@ -733,7 +730,6 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
 
     let shared = Arc::new(Mutex::new(Shared {
         accounts,
-        ledger,
         buckets,
         narrowing,
         window: None,
@@ -792,7 +788,7 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     mark_ready();
 
     // The rolling loop runs alongside the control surface.
-    spawn(roll_loop(shared.clone()));
+    spawn(roll_loop(shared.clone(), ledger.clone()));
 
     // Serve the control surface.
     loop {
@@ -812,13 +808,31 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
                 continue;
             }
         };
-        spawn(handle_control(connection, shared.clone()));
+        spawn(handle_control(connection, shared.clone(), ledger.clone()));
     }
 }
 
-/// Applies one operator/billing control to the shared state.
-fn apply_control(
+/// Appends one ledger record, tolerating encode/append failures with a warning
+/// (usage history is advisory; enforcement is the preemptive path).
+async fn append_ledger(ledger: &DurableLog, record: &LedgerRecord) {
+    let timestamp_ms = time::now()
+        .map(|nanos| nanos / 1_000_000)
+        .unwrap_or_default();
+    match selium_abi::encode_rkyv(record) {
+        Ok(payload) => {
+            if let Err(error) = ledger.append(timestamp_ms, Vec::new(), payload).await {
+                warn!("accountant: ledger append failed: {error}");
+            }
+        }
+        Err(error) => warn!("accountant: ledger record encode failed: {error}"),
+    }
+}
+
+/// Applies one operator/billing control to the shared state and appends its
+/// ledger record.
+async fn apply_control(
     shared: &Arc<Mutex<Shared>>,
+    ledger: &DurableLog,
     control: AccountantControl,
 ) -> AccountantControlResponse {
     let (tenant, record) = match control {
@@ -848,12 +862,13 @@ fn apply_control(
         ),
     };
 
-    {
+    let record = {
         let mut shared = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shared.apply_policy(&tenant, record);
-    }
+        shared.apply_policy(&tenant, record)
+    };
+    append_ledger(ledger, &record).await;
 
     AccountantControlResponse::Updated { tenant }
 }
@@ -945,7 +960,6 @@ async fn bookkeeper(mut ctx: Context) -> anyhow::Result<()> {
                 tenant: tenant.clone(),
                 cpu_instructions: usage.cpu_instructions,
                 memory_bytes: usage.memory_bytes,
-                storage_bytes: usage.storage_bytes,
                 bandwidth_bytes: usage.bandwidth_bytes,
                 // Publish-time stamp: the accountant buckets windows by this
                 // stamp, not by its receive-time clock.
@@ -992,6 +1006,7 @@ fn create_live_table(capacity: u64) -> selium_wire::Result<(u64, NarrowingLiveTa
 async fn handle_control(
     mut connection: selium_shm::rpc::RpcConnection<AccountantControl, AccountantControlResponse>,
     shared: Arc<Mutex<Shared>>,
+    ledger: DurableLog,
 ) {
     let operator = match process_tenant(connection.client_process_id()) {
         Ok(None) => true,
@@ -1012,7 +1027,7 @@ async fn handle_control(
                     Ok(_) if !operator => AccountantControlResponse::Error {
                         context: "operator tier required".to_string(),
                     },
-                    Ok(payload) => apply_control(&shared, payload),
+                    Ok(payload) => apply_control(&shared, &ledger, payload).await,
                     Err(error) => AccountantControlResponse::Error {
                         context: format!("{error}"),
                     },
@@ -1045,7 +1060,7 @@ fn roll_due(shared: &mut Shared) -> Vec<LedgerRecord> {
 
 /// The rolling loop: drains bookkeeper buckets into the current minute window
 /// and rolls a completed window into the ledger, re-evaluating enforcement.
-async fn roll_loop(shared: Arc<Mutex<Shared>>) {
+async fn roll_loop(shared: Arc<Mutex<Shared>>, ledger: DurableLog) {
     loop {
         // Drain available buckets into the current window, rolling when the
         // minute has elapsed. The read is scoped so its `RefMut` drops before
@@ -1060,19 +1075,26 @@ async fn roll_loop(shared: Arc<Mutex<Shared>>) {
                 .read_with_tag();
             match read {
                 Ok((bucket, _tag)) => {
-                    let mut shared = shared
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // Roll the elapsed window BEFORE merging: the merge
-                    // starts the next minute's window, and rolling first
-                    // guarantees the completed window reaches the ledger
-                    // instead of being dropped by the boundary replacement.
-                    for record in roll_due(&mut shared) {
-                        if let LedgerRecord::Window { tenant, .. } = &record {
-                            shared.author_enforcement(tenant);
+                    let rolled = {
+                        let mut shared = shared
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Roll the elapsed window BEFORE merging: the merge
+                        // starts the next minute's window, and rolling first
+                        // guarantees the completed window reaches the ledger
+                        // instead of being dropped by the boundary replacement.
+                        let records = roll_due(&mut shared);
+                        for record in &records {
+                            if let LedgerRecord::Window { tenant, .. } = record {
+                                shared.author_enforcement(tenant);
+                            }
                         }
+                        shared.merge_bucket(bucket);
+                        records
+                    };
+                    for record in &rolled {
+                        append_ledger(&ledger, record).await;
                     }
-                    shared.merge_bucket(bucket);
                 }
                 Err(selium_wire::error::Error::BufferEmpty) => break,
                 Err(error) => {
@@ -1083,16 +1105,20 @@ async fn roll_loop(shared: Arc<Mutex<Shared>>) {
         }
 
         // A minute ticks even without traffic: roll an elapsed window.
-        {
+        let rolled = {
             let mut shared = shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let records = roll_due(&mut shared);
-            for record in records {
-                if let LedgerRecord::Window { tenant, .. } = &record {
+            for record in &records {
+                if let LedgerRecord::Window { tenant, .. } = record {
                     shared.author_enforcement(tenant);
                 }
             }
+            records
+        };
+        for record in &rolled {
+            append_ledger(&ledger, record).await;
         }
 
         let next = Instant::now()
@@ -1297,7 +1323,6 @@ mod tests {
                 observation: MeteringObservation {
                     cpu_instructions: 100,
                     memory_bytes: 1_000,
-                    storage_bytes: 500,
                     bandwidth_bytes: 50,
                 },
             },
@@ -1307,7 +1332,6 @@ mod tests {
                 observation: MeteringObservation {
                     cpu_instructions: 300,
                     memory_bytes: 2_000,
-                    storage_bytes: 700,
                     bandwidth_bytes: 10,
                 },
             },
@@ -1318,14 +1342,13 @@ mod tests {
                 observation: MeteringObservation {
                     cpu_instructions: 9_000,
                     memory_bytes: 9_000,
-                    storage_bytes: 9_000,
                     bandwidth_bytes: 9_000,
                 },
             },
         ];
 
         let first = reduce_samples(&samples, &mut last_counters);
-        assert_eq!(first["acme"], usage(400, 2_000, 700, 60));
+        assert_eq!(first["acme"], usage(400, 2_000, 0, 60));
 
         // A second tick differences only the incremental counters and samples
         // the gauges directly.
@@ -1335,12 +1358,11 @@ mod tests {
             observation: MeteringObservation {
                 cpu_instructions: 150,
                 memory_bytes: 900,
-                storage_bytes: 600,
                 bandwidth_bytes: 75,
             },
         }];
         let second = reduce_samples(&second_samples, &mut last_counters);
-        assert_eq!(second["acme"], usage(50, 900, 600, 25));
+        assert_eq!(second["acme"], usage(50, 900, 0, 25));
     }
 
     #[test]
@@ -1353,7 +1375,6 @@ mod tests {
             tenant: "acme".to_string(),
             cpu_instructions: 100,
             memory_bytes: 1_000,
-            storage_bytes: 500,
             bandwidth_bytes: 50,
             published_unix_s: 0,
         });
@@ -1361,15 +1382,17 @@ mod tests {
             tenant: "acme".to_string(),
             cpu_instructions: 50,
             memory_bytes: 800,
-            storage_bytes: 900,
             bandwidth_bytes: 25,
             published_unix_s: 0,
         });
 
+        // Counters accumulate and the memory gauge takes the window's peak.
+        // Storage is not reduced from the bucket: a tenant's storage dimension
+        // is read from the volume layer, which is absent in a native test.
         assert_eq!(
             window.usage["acme"],
-            usage(150, 1_000, 900, 75),
-            "counters accumulate; gauges take the peak"
+            usage(150, 1_000, 0, 75),
+            "counters accumulate; the memory gauge takes the peak"
         );
     }
 
@@ -1404,7 +1427,6 @@ mod tests {
             tenant: "acme".to_string(),
             cpu_instructions: 1_200,
             memory_bytes: 12_000,
-            storage_bytes: 6_000,
             bandwidth_bytes: 3_000,
             published_unix_s: 0,
         });
@@ -1412,7 +1434,6 @@ mod tests {
             tenant: "beta".to_string(),
             cpu_instructions: 10,
             memory_bytes: 20,
-            storage_bytes: 30,
             bandwidth_bytes: 40,
             published_unix_s: 0,
         });
@@ -1434,9 +1455,9 @@ mod tests {
             } => {
                 assert_eq!(tenant, "acme");
                 assert_eq!(*window_start_s, 120);
-                assert_eq!(*windowed_usage, usage(1_200, 12_000, 6_000, 3_000));
-                // Above the plan in every dimension.
-                assert_eq!(*windowed_overage, usage(200, 2_000, 1_000, 1_000));
+                assert_eq!(*windowed_usage, usage(1_200, 12_000, 0, 3_000));
+                // Above the plan in the reduced dimensions.
+                assert_eq!(*windowed_overage, usage(200, 2_000, 0, 1_000));
             }
             other => panic!("expected window record, got {other:?}"),
         }

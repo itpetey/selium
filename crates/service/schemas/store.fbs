@@ -1,0 +1,90 @@
+// FlatBuffers schema for the durable store system guest's RPC surface.
+//
+// The store owns durable-log and blob-store semantics over the host's opaque
+// volume primitive. Every request is scoped to the session's tenant — which the
+// store derives from the delivering process's authority, never from a field
+// here — and to a log or blob-store name.
+namespace selium.store;
+
+// A durable-log record header key/value pair.
+table Header {
+    key: string;
+    value: string;
+}
+
+// A durable-log record as replayed to a client.
+table LogRecord {
+    sequence: ulong;
+    timestamp_ms: ulong;
+    headers: [Header];
+    payload: [ubyte];
+}
+
+// Store request message.
+//
+// Variant tag values:
+//   0 = OpenLog { log }
+//   1 = Append { log, timestamp_ms, headers, payload }
+//   2 = Replay { log, from_sequence, limit }
+//   3 = WriteCheckpoint { log, checkpoint, sequence }
+//   4 = ReadCheckpoint { log, checkpoint }
+//   5 = PutBlob { store, payload }
+//   6 = GetBlob { store, blob_id }
+//   7 = SetManifest { store, manifest, blob_id }
+//   8 = GetManifest { store, manifest }
+table StoreRequest {
+    variant: ubyte;
+    // Durable log name (log variants).
+    log: string;
+    // Blob-store name (blob variants).
+    store: string;
+    // Record timestamp in milliseconds (Append).
+    timestamp_ms: ulong;
+    // Record headers (Append).
+    headers: [Header];
+    // Record or blob bytes (Append, PutBlob).
+    payload: [ubyte];
+    // First sequence to include; 0 means from the start (Replay).
+    from_sequence: ulong;
+    // Maximum records to return (Replay).
+    limit: uint;
+    // Checkpoint name (WriteCheckpoint, ReadCheckpoint).
+    checkpoint: string;
+    // Sequence a checkpoint records (WriteCheckpoint).
+    sequence: ulong;
+    // Blob id (GetBlob, SetManifest).
+    blob_id: string;
+    // Manifest name (SetManifest, GetManifest).
+    manifest: string;
+}
+
+// Store response message.
+//
+// Variant tag values:
+//   0 = Ok
+//   1 = Appended { sequence }
+//   2 = Replay { records }
+//   3 = Checkpoint { sequence }
+//   4 = CheckpointMissing
+//   5 = BlobId { blob_id }
+//   6 = Bytes { payload }
+//   7 = NotFound
+//   8 = Error { code, message }
+table StoreResponse {
+    variant: ubyte;
+    // Sequence assigned to an append (Appended), or a checkpoint's sequence
+    // (Checkpoint).
+    sequence: ulong;
+    // Replayed records (Replay).
+    records: [LogRecord];
+    // Content-derived blob id (BlobId).
+    blob_id: string;
+    // Blob bytes (Bytes).
+    payload: [ubyte];
+    // Stable machine-readable error code (Error).
+    code: string;
+    // Human-readable error detail (Error).
+    message: string;
+}
+
+root_type StoreRequest;

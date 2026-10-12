@@ -60,6 +60,7 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
             )],
         )],
         domain_table: Vec::new(),
+        state_dir: None,
     };
 
     let report = runtime

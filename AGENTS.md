@@ -141,9 +141,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 ### Crate roles
 - `selium-abi`: canonical host/guest contract (capabilities, scopes, hostcalls, framing)
-- `selium-kernel`: primitive host-side resources (shared memory, network, storage, processes, activity, metering)
+- `selium-kernel`: primitive host-side resources (shared memory, network, durable volumes, processes, activity, metering)
 - `selium-runtime`: wasmtiny-backed execution, sessions, capability enforcement, config-driven bootstrap of system guests
-- `selium-guest`: ergonomic guest SDK (typed handles, codecs, tracing, async reactor)
+- `selium-guest`: ergonomic guest SDK (typed handles, codecs, tracing, async reactor; durable-log/blob handles are RPC clients of `selium-store`)
 - `selium-guest-macros`: procedural macros for entrypoints and interface metadata
 - `selium-memory` / `selium-shm` / `selium-wire`: shared-memory substrate, ring channels, and transport-agnostic messaging patterns
 
