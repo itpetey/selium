@@ -5,48 +5,20 @@
 //! native tests (including the torn-tail recovery cases, which need a volume
 //! that can be truncated).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use crate::format::{self, Record};
 
-/// A store operation failure, mapped onto a typed RPC error by the entrypoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Failure {
-    /// Stable machine-readable code (`NotFound`, `UnknownBlob`, `Format`, …).
-    pub code: &'static str,
-    /// Human-readable detail.
-    pub message: String,
-}
+/// Blob stores recovered and live, keyed by `(tenant, blob-store name)`.
+type BlobMap = HashMap<(String, String), BlobState>;
+/// Logs recovered and live, keyed by `(tenant, log name)`.
+type LogMap<H> = HashMap<(String, String), LogState<H>>;
 
-impl Failure {
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            code: "NotFound",
-            message: message.into(),
-        }
-    }
-
-    fn format(message: impl Into<String>) -> Self {
-        Self {
-            code: "Format",
-            message: message.into(),
-        }
-    }
-
-    fn host(message: impl Into<String>) -> Self {
-        Self {
-            code: "Host",
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.message)
-    }
-}
+/// Appends written between syncs before the store forces one.
+const SYNC_THRESHOLD_BYTES: u64 = 64 * 1024;
 
 /// One open volume in the volume layer.
 pub trait VolumeHandle {
@@ -77,8 +49,14 @@ pub trait Volumes {
     fn remove(&self, tenant: Option<&str>, name: &str) -> Result<u64, Failure>;
 }
 
-/// Appends written between syncs before the store forces one.
-const SYNC_THRESHOLD_BYTES: u64 = 64 * 1024;
+/// A store operation failure, mapped onto a typed RPC error by the entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Stable machine-readable code (`NotFound`, `UnknownBlob`, `Format`, …).
+    pub code: &'static str,
+    /// Human-readable detail.
+    pub message: String,
+}
 
 /// A durable log's recovered and live state.
 struct LogState<H> {
@@ -96,16 +74,40 @@ struct BlobState {
     manifests: HashMap<String, String>,
 }
 
-/// Logs recovered and live, keyed by `(tenant, log name)`.
-type LogMap<H> = HashMap<(String, String), LogState<H>>;
-/// Blob stores recovered and live, keyed by `(tenant, blob-store name)`.
-type BlobMap = HashMap<(String, String), BlobState>;
-
 /// The durable store: logs and blob stores owned per tenant.
 pub struct Store<V: Volumes> {
     volumes: V,
     logs: Mutex<LogMap<V::Handle>>,
     blob_stores: Mutex<BlobMap>,
+}
+
+impl Failure {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: "NotFound",
+            message: message.into(),
+        }
+    }
+
+    fn format(message: impl Into<String>) -> Self {
+        Self {
+            code: "Format",
+            message: message.into(),
+        }
+    }
+
+    fn host(message: impl Into<String>) -> Self {
+        Self {
+            code: "Host",
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
 }
 
 impl<V: Volumes> Store<V> {
@@ -459,10 +461,10 @@ impl<V: Volumes> Store<V> {
     }
 }
 
-fn serving(tenant: &str) -> Option<&str> {
-    (!tenant.is_empty()).then_some(tenant)
-}
-
 fn poisoned<T>(_error: std::sync::PoisonError<T>) -> Failure {
     Failure::host("store state lock poisoned")
+}
+
+fn serving(tenant: &str) -> Option<&str> {
+    (!tenant.is_empty()).then_some(tenant)
 }

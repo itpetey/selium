@@ -2,6 +2,9 @@ use selium_abi::{HostcallOutput, HostcallRequest, LocalResourceId};
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
 
+/// Read chunk size used by [`Volume::read_all`].
+const CHUNK_BYTES: u32 = 64 * 1024;
+
 /// Guest handle for an open durable volume.
 ///
 /// A volume is an opaque byte container owned by the host: the guest chooses
@@ -115,9 +118,6 @@ impl Volume {
         }
     }
 }
-
-/// Read chunk size used by [`Volume::read_all`].
-const CHUNK_BYTES: u32 = 64 * 1024;
 
 /// Lists the volume names recorded under a tenant.
 ///

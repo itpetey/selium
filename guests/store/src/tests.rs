@@ -3,11 +3,15 @@
 //! The tests run the real [`Store`] over an in-memory volume layer, which can
 //! be truncated behind the store's back to simulate a power cycle mid-append.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-use crate::format;
-use crate::store::{Failure, Store, VolumeHandle, Volumes};
+use crate::{
+    format,
+    store::{Failure, Store, VolumeHandle, Volumes},
+};
 
 /// Kind of volume key: `(tenant, name)`.
 type VolumeKey = (String, String);
@@ -15,6 +19,11 @@ type VolumeKey = (String, String);
 #[derive(Clone, Default)]
 struct MemVolumes {
     files: Arc<Mutex<HashMap<VolumeKey, Vec<u8>>>>,
+}
+
+struct MemVolume {
+    files: Arc<Mutex<HashMap<VolumeKey, Vec<u8>>>>,
+    key: VolumeKey,
 }
 
 impl MemVolumes {
@@ -59,43 +68,6 @@ impl MemVolumes {
     }
 }
 
-struct MemVolume {
-    files: Arc<Mutex<HashMap<VolumeKey, Vec<u8>>>>,
-    key: VolumeKey,
-}
-
-impl MemVolume {
-    /// Locks the shared volume map, surfacing poisoning as a store failure.
-    fn files(&self) -> Result<std::sync::MutexGuard<'_, HashMap<VolumeKey, Vec<u8>>>, Failure> {
-        self.files.lock().map_err(|_error| Failure {
-            code: "Host",
-            message: "test volume lock poisoned".to_string(),
-        })
-    }
-}
-
-impl VolumeHandle for MemVolume {
-    fn append(&self, bytes: &[u8]) -> Result<u64, Failure> {
-        let mut files = self.files()?;
-        let file = files.entry(self.key.clone()).or_default();
-        let offset = file.len() as u64;
-        file.extend_from_slice(bytes);
-        Ok(offset)
-    }
-
-    fn read_all(&self) -> Result<Vec<u8>, Failure> {
-        Ok(self.files()?.get(&self.key).cloned().unwrap_or_default())
-    }
-
-    fn len(&self) -> Result<u64, Failure> {
-        Ok(self.read_all()?.len() as u64)
-    }
-
-    fn sync(&self) -> Result<(), Failure> {
-        Ok(())
-    }
-}
-
 impl Volumes for MemVolumes {
     type Handle = MemVolume;
 
@@ -133,10 +105,93 @@ impl Volumes for MemVolumes {
     }
 }
 
-fn store() -> (MemVolumes, Store<MemVolumes>) {
-    let volumes = MemVolumes::default();
-    let store = Store::new(volumes.clone());
-    (volumes, store)
+impl MemVolume {
+    /// Locks the shared volume map, surfacing poisoning as a store failure.
+    fn files(&self) -> Result<std::sync::MutexGuard<'_, HashMap<VolumeKey, Vec<u8>>>, Failure> {
+        self.files.lock().map_err(|_error| Failure {
+            code: "Host",
+            message: "test volume lock poisoned".to_string(),
+        })
+    }
+}
+
+impl VolumeHandle for MemVolume {
+    fn append(&self, bytes: &[u8]) -> Result<u64, Failure> {
+        let mut files = self.files()?;
+        let file = files.entry(self.key.clone()).or_default();
+        let offset = file.len() as u64;
+        file.extend_from_slice(bytes);
+        Ok(offset)
+    }
+
+    fn read_all(&self) -> Result<Vec<u8>, Failure> {
+        Ok(self.files()?.get(&self.key).cloned().unwrap_or_default())
+    }
+
+    fn len(&self) -> Result<u64, Failure> {
+        Ok(self.read_all()?.len() as u64)
+    }
+
+    fn sync(&self) -> Result<(), Failure> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_torn_tail_is_discarded_and_sequence_numbering_resumes() {
+    let (volumes, store) = store();
+    append(&store, "orders", b"first");
+    append(&store, "orders", b"second");
+    let segment = format::log_volume("orders", 0);
+    let complete = volumes.volume_len(Some("acme"), &segment);
+
+    // A partially written record lands at the tail, then the host restarts.
+    volumes.append_raw(Some("acme"), &segment, &[0x40, 0x00, 0x00, 0x00, 0x01]);
+    assert!(volumes.volume_len(Some("acme"), &segment) > complete);
+
+    let restarted = Store::new(volumes.clone());
+    let records = restarted
+        .replay("acme", "orders", 0, u32::MAX)
+        .expect("replay");
+    assert_eq!(records.len(), 2, "only the complete records are replayed");
+
+    // The next append continues after the last complete sequence, in a fresh
+    // segment that leaves the torn bytes behind.
+    let sequence = restarted
+        .append("acme", "orders", 7, Vec::new(), b"third".to_vec())
+        .expect("append after recovery");
+    assert_eq!(sequence, 3);
+    let records = restarted
+        .replay("acme", "orders", 0, u32::MAX)
+        .expect("replay");
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2].payload, b"third".to_vec());
+    let segment = format::log_volume("orders", 1);
+    assert!(volumes.volume_len(Some("acme"), &segment) > 0);
+}
+
+#[test]
+fn a_truncated_volume_mid_record_keeps_the_complete_prefix() {
+    let (volumes, store) = store();
+    append(&store, "orders", b"first");
+    append(&store, "orders", b"second");
+    let segment = format::log_volume("orders", 0);
+    let complete = volumes.volume_len(Some("acme"), &segment);
+    // Cut the volume in the middle of the second record's frame.
+    volumes.truncate(Some("acme"), &segment, complete - 3);
+
+    let restarted = Store::new(volumes);
+    let records = restarted
+        .replay("acme", "orders", 0, u32::MAX)
+        .expect("replay");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, b"first".to_vec());
+    assert_eq!(
+        restarted
+            .append("acme", "orders", 7, Vec::new(), b"second".to_vec())
+            .expect("append"),
+        2
+    );
 }
 
 fn append(store: &Store<MemVolumes>, log: &str, payload: &[u8]) -> u64 {
@@ -176,34 +231,6 @@ fn append_and_replay_are_ordered() {
 }
 
 #[test]
-fn checkpoint_references_an_existing_sequence() {
-    let (_volumes, store) = store();
-    let sequence = append(&store, "orders", b"first");
-    store
-        .write_checkpoint("acme", "orders", "boot", sequence)
-        .expect("checkpoint");
-    assert_eq!(
-        store
-            .read_checkpoint("acme", "orders", "boot")
-            .expect("read checkpoint"),
-        Some(sequence)
-    );
-    assert_eq!(
-        store
-            .read_checkpoint("acme", "orders", "missing")
-            .expect("read missing"),
-        None
-    );
-    assert_eq!(
-        store
-            .write_checkpoint("acme", "orders", "broken", sequence + 5)
-            .expect_err("missing sequence rejected")
-            .code,
-        "NotFound"
-    );
-}
-
-#[test]
 fn blob_put_get_and_manifest_round_trip() {
     let (_volumes, store) = store();
     let blob_id = store.put_blob("acme", "assets", b"module").expect("put");
@@ -235,18 +262,31 @@ fn blob_put_get_and_manifest_round_trip() {
 }
 
 #[test]
-fn identical_names_in_two_tenants_are_distinct() {
+fn checkpoint_references_an_existing_sequence() {
     let (_volumes, store) = store();
-    assert_eq!(append(&store, "orders", b"acme-1"), 1);
-    let beta = store
-        .append("beta", "orders", 7, Vec::new(), b"beta-1".to_vec())
-        .expect("beta append");
-    assert_eq!(beta, 1, "beta's log has its own sequence space");
-
-    let acme = store.replay("acme", "orders", 0, u32::MAX).expect("acme");
-    let beta = store.replay("beta", "orders", 0, u32::MAX).expect("beta");
-    assert_eq!(acme[0].payload, b"acme-1".to_vec());
-    assert_eq!(beta[0].payload, b"beta-1".to_vec());
+    let sequence = append(&store, "orders", b"first");
+    store
+        .write_checkpoint("acme", "orders", "boot", sequence)
+        .expect("checkpoint");
+    assert_eq!(
+        store
+            .read_checkpoint("acme", "orders", "boot")
+            .expect("read checkpoint"),
+        Some(sequence)
+    );
+    assert_eq!(
+        store
+            .read_checkpoint("acme", "orders", "missing")
+            .expect("read missing"),
+        None
+    );
+    assert_eq!(
+        store
+            .write_checkpoint("acme", "orders", "broken", sequence + 5)
+            .expect_err("missing sequence rejected")
+            .code,
+        "NotFound"
+    );
 }
 
 #[test]
@@ -271,106 +311,6 @@ fn cross_tenant_blob_read_is_excluded() {
             .get_manifest("beta", "assets", "latest")
             .expect("beta manifest"),
         None
-    );
-}
-
-#[test]
-fn a_torn_tail_is_discarded_and_sequence_numbering_resumes() {
-    let (volumes, store) = store();
-    append(&store, "orders", b"first");
-    append(&store, "orders", b"second");
-    let segment = format::log_volume("orders", 0);
-    let complete = volumes.volume_len(Some("acme"), &segment);
-
-    // A partially written record lands at the tail, then the host restarts.
-    volumes.append_raw(Some("acme"), &segment, &[0x40, 0x00, 0x00, 0x00, 0x01]);
-    assert!(volumes.volume_len(Some("acme"), &segment) > complete);
-
-    let restarted = Store::new(volumes.clone());
-    let records = restarted
-        .replay("acme", "orders", 0, u32::MAX)
-        .expect("replay");
-    assert_eq!(records.len(), 2, "only the complete records are replayed");
-
-    // The next append continues after the last complete sequence, in a fresh
-    // segment that leaves the torn bytes behind.
-    let sequence = restarted
-        .append("acme", "orders", 7, Vec::new(), b"third".to_vec())
-        .expect("append after recovery");
-    assert_eq!(sequence, 3);
-    let records = restarted
-        .replay("acme", "orders", 0, u32::MAX)
-        .expect("replay");
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[2].payload, b"third".to_vec());
-    let segment = format::log_volume("orders", 1);
-    assert!(volumes.volume_len(Some("acme"), &segment) > 0);
-}
-
-#[test]
-fn synced_state_survives_a_store_restart() {
-    let (volumes, store) = store();
-    let sequence = append(&store, "orders", b"durable");
-    store
-        .write_checkpoint("acme", "orders", "boot", sequence)
-        .expect("checkpoint");
-    let blob_id = store.put_blob("acme", "assets", b"module").expect("put");
-    store
-        .set_manifest("acme", "assets", "latest", &blob_id)
-        .expect("manifest");
-
-    // A fresh store over the same volumes is what a restart produces.
-    let restarted = Store::new(volumes);
-    let records = restarted
-        .replay("acme", "orders", 0, u32::MAX)
-        .expect("replay");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload, b"durable".to_vec());
-    assert_eq!(
-        restarted
-            .read_checkpoint("acme", "orders", "boot")
-            .expect("checkpoint"),
-        Some(sequence)
-    );
-    assert_eq!(
-        restarted.get_blob("acme", "assets", &blob_id).expect("get"),
-        Some(b"module".to_vec())
-    );
-    assert_eq!(
-        restarted
-            .get_manifest("acme", "assets", "latest")
-            .expect("manifest"),
-        Some(blob_id)
-    );
-    assert_eq!(
-        restarted
-            .append("acme", "orders", 7, Vec::new(), b"next".to_vec())
-            .expect("append"),
-        2
-    );
-}
-
-#[test]
-fn a_truncated_volume_mid_record_keeps_the_complete_prefix() {
-    let (volumes, store) = store();
-    append(&store, "orders", b"first");
-    append(&store, "orders", b"second");
-    let segment = format::log_volume("orders", 0);
-    let complete = volumes.volume_len(Some("acme"), &segment);
-    // Cut the volume in the middle of the second record's frame.
-    volumes.truncate(Some("acme"), &segment, complete - 3);
-
-    let restarted = Store::new(volumes);
-    let records = restarted
-        .replay("acme", "orders", 0, u32::MAX)
-        .expect("replay");
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].payload, b"first".to_vec());
-    assert_eq!(
-        restarted
-            .append("acme", "orders", 7, Vec::new(), b"second".to_vec())
-            .expect("append"),
-        2
     );
 }
 
@@ -420,5 +360,69 @@ fn format_round_trips_records_and_volume_names() {
             .expect("checkpoint volume")
             .expect("decode"),
         "orders".to_string()
+    );
+}
+
+#[test]
+fn identical_names_in_two_tenants_are_distinct() {
+    let (_volumes, store) = store();
+    assert_eq!(append(&store, "orders", b"acme-1"), 1);
+    let beta = store
+        .append("beta", "orders", 7, Vec::new(), b"beta-1".to_vec())
+        .expect("beta append");
+    assert_eq!(beta, 1, "beta's log has its own sequence space");
+
+    let acme = store.replay("acme", "orders", 0, u32::MAX).expect("acme");
+    let beta = store.replay("beta", "orders", 0, u32::MAX).expect("beta");
+    assert_eq!(acme[0].payload, b"acme-1".to_vec());
+    assert_eq!(beta[0].payload, b"beta-1".to_vec());
+}
+
+fn store() -> (MemVolumes, Store<MemVolumes>) {
+    let volumes = MemVolumes::default();
+    let store = Store::new(volumes.clone());
+    (volumes, store)
+}
+
+#[test]
+fn synced_state_survives_a_store_restart() {
+    let (volumes, store) = store();
+    let sequence = append(&store, "orders", b"durable");
+    store
+        .write_checkpoint("acme", "orders", "boot", sequence)
+        .expect("checkpoint");
+    let blob_id = store.put_blob("acme", "assets", b"module").expect("put");
+    store
+        .set_manifest("acme", "assets", "latest", &blob_id)
+        .expect("manifest");
+
+    // A fresh store over the same volumes is what a restart produces.
+    let restarted = Store::new(volumes);
+    let records = restarted
+        .replay("acme", "orders", 0, u32::MAX)
+        .expect("replay");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, b"durable".to_vec());
+    assert_eq!(
+        restarted
+            .read_checkpoint("acme", "orders", "boot")
+            .expect("checkpoint"),
+        Some(sequence)
+    );
+    assert_eq!(
+        restarted.get_blob("acme", "assets", &blob_id).expect("get"),
+        Some(b"module".to_vec())
+    );
+    assert_eq!(
+        restarted
+            .get_manifest("acme", "assets", "latest")
+            .expect("manifest"),
+        Some(blob_id)
+    );
+    assert_eq!(
+        restarted
+            .append("acme", "orders", 7, Vec::new(), b"next".to_vec())
+            .expect("append"),
+        2
     );
 }

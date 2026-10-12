@@ -22,46 +22,46 @@ use selium_service::{
 use selium_shm::rpc;
 use sha2::{Digest, Sha256};
 
-/// The served identity route.
-const IDENTITY_ROUTE: &str = "sel:///identity";
-/// The served control-plane route.
-const CONTROL_ROUTE: &str = "sel:///control";
 /// The served accountant control route.
 const ACCOUNTANT_ROUTE: &str = "sel:///accountant";
+/// The served control-plane route.
+const CONTROL_ROUTE: &str = "sel:///control";
+/// The served identity route.
+const IDENTITY_ROUTE: &str = "sel:///identity";
 const LEAF_MANIFEST: &str = "acme-leaf";
 /// Manifest the post-restart leaf is published under.
 const LEAF_MANIFEST_AFTER_RESTART: &str = "acme-leaf-after-restart";
+/// Entry mode: upload a module and record a deployment through the control
+/// plane, then log the outcome for the host-side test.
+pub const MODE_DEPLOY: u64 = 3;
+/// Entry mode: issue a further user leaf for an already-onboarded tenant,
+/// proving the tenant CA recorded before a restart still signs leaves after it.
+pub const MODE_ISSUE: u64 = 2;
 /// Entry mode: onboard the tenant, issue a user leaf, record grants.
 pub const MODE_ONBOARD: u64 = 0;
 /// Entry mode: revoke the tenant (removes its anchor, deletes its CA key).
 pub const MODE_REVOKE: u64 = 1;
-/// Entry mode: issue a further user leaf for an already-onboarded tenant,
-/// proving the tenant CA recorded before a restart still signs leaves after it.
-pub const MODE_ISSUE: u64 = 2;
-/// Entry mode: upload a module and record a deployment through the control
-/// plane, then log the outcome for the host-side test.
-pub const MODE_DEPLOY: u64 = 3;
-/// Entry mode: read a workload's recorded deployment back through the control
-/// plane and log it, so a restart's survival is observable host-side.
-pub const MODE_VERIFY_DEPLOYMENT: u64 = 4;
 /// Entry mode: author a process-count ceiling through the accountant's control
 /// surface, so the durable ledger carries a policy record a restart must
 /// replay and re-author.
 pub const MODE_SET_QUOTA: u64 = 5;
-/// Process-count ceiling the quota leg authors.
-pub const QUOTA_PROCESSES: u64 = 7;
-/// Module the deploy leg uploads.
-const MODULE_MANIFEST: &str = "power-cycle/module";
+/// Entry mode: read a workload's recorded deployment back through the control
+/// plane and log it, so a restart's survival is observable host-side.
+pub const MODE_VERIFY_DEPLOYMENT: u64 = 4;
 /// Module bytes the deploy leg uploads.
 const MODULE_BYTES: &[u8] = b"selium power-cycle module";
+/// Module the deploy leg uploads.
+const MODULE_MANIFEST: &str = "power-cycle/module";
+/// Blob store + manifest the issued leaf is written to, for host-side pickup.
+const OUTPUT_STORE: &str = "selium.identity-onboard.out";
+/// Process-count ceiling the quota leg authors.
+pub const QUOTA_PROCESSES: u64 = 7;
+/// The tenant this driver onboards and revokes.
+const TENANT: &str = "acme";
 /// Workload the deploy leg records.
 const WORKLOAD_ID: &str = "power-cycle-worker";
 /// Replica count the deploy leg records.
 const WORKLOAD_REPLICAS: u32 = 2;
-/// Blob store + manifest the issued leaf is written to, for host-side pickup.
-const OUTPUT_STORE: &str = "selium.identity-onboard.out";
-/// The tenant this driver onboards and revokes.
-const TENANT: &str = "acme";
 
 /// The baseline data-plane grants conferred on the onboarded principals:
 /// tenant-scoped shared memory, host queues, and network streams.
@@ -91,6 +91,22 @@ fn acme_client_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
+/// Resolves the control plane's serving route and connects to its surface.
+async fn control_client(
+    ctx: &mut Context,
+) -> anyhow::Result<rpc::OwnedRpcClient<ControlRequest, ControlResponse>> {
+    let target = ctx
+        .lookup(CONTROL_ROUTE)
+        .await
+        .with_context(|| "identity-onboard: control route resolve failed")?
+        .ok_or_else(|| anyhow::anyhow!("identity-onboard: control route not found"))?;
+    let sender = ResourceSender::attach(target.resource_id)
+        .with_context(|| "identity-onboard: control listener attach failed")?;
+    rpc::connect::<ControlRequest, ControlResponse, _>(sender, 4096, 4096)
+        .await
+        .with_context(|| "identity-onboard: control rpc connect failed")
+}
+
 /// Resolves the identity guest's serving route and connects to its tiered
 /// request surface.
 async fn identity_client(
@@ -106,6 +122,42 @@ async fn identity_client(
     rpc::connect::<IdentityRequest, IdentityResponse, _>(sender, 4096, 4096)
         .await
         .with_context(|| "identity-onboard: identity rpc connect failed")
+}
+
+/// Issues a further leaf for an already-onboarded tenant and publishes it under
+/// a distinct manifest, leaving the recorded tenant CA untouched. A failure
+/// here means either the tenant CA or the tenant's durable record did not
+/// survive the restart.
+async fn issue_leaf_after_restart(
+    ctx: &mut Context,
+    client: &mut rpc::OwnedRpcClient<IdentityRequest, IdentityResponse>,
+    spki_der: Vec<u8>,
+) -> anyhow::Result<()> {
+    let issued = client
+        .request(IdentityRequest::IssueUserCert {
+            tenant: TENANT.to_string(),
+            spki_der,
+        })
+        .await
+        .with_context(|| "identity-onboard: post-restart issue failed")?;
+    let IdentityResponse::UserCertIssued { certificate_der } = issued else {
+        bail!("identity-onboard: unexpected issue response: {issued:?}");
+    };
+
+    let blobs = ctx
+        .open_blob_store(OUTPUT_STORE)
+        .await
+        .with_context(|| "identity-onboard: output blob store open failed")?;
+    let blob_id = blobs
+        .put(certificate_der)
+        .await
+        .with_context(|| "identity-onboard: post-restart leaf put failed")?;
+    blobs
+        .set_manifest(LEAF_MANIFEST_AFTER_RESTART, blob_id)
+        .await
+        .with_context(|| "identity-onboard: post-restart leaf manifest failed")?;
+    info!("identity-onboard: issued a further {TENANT} certificate after the restart");
+    Ok(())
 }
 
 /// Onboard `acme`, mint a user certificate from the supplied client SPKI, and
@@ -219,55 +271,35 @@ async fn onboard_acme(
     Ok(())
 }
 
-/// Resolves the control plane's serving route and connects to its surface.
-async fn control_client(
-    ctx: &mut Context,
-) -> anyhow::Result<rpc::OwnedRpcClient<ControlRequest, ControlResponse>> {
+/// Authors a process-count ceiling through the accountant's control surface.
+///
+/// The accountant appends a policy record to its durable ledger and re-authors
+/// enforcement, so a restart that replays the ledger must re-author the same
+/// ceiling.
+async fn set_process_quota(ctx: &mut Context) -> anyhow::Result<()> {
     let target = ctx
-        .lookup(CONTROL_ROUTE)
+        .lookup(ACCOUNTANT_ROUTE)
         .await
-        .with_context(|| "identity-onboard: control route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: control route not found"))?;
+        .with_context(|| "identity-onboard: accountant route resolve failed")?
+        .ok_or_else(|| anyhow::anyhow!("identity-onboard: accountant route not found"))?;
     let sender = ResourceSender::attach(target.resource_id)
-        .with_context(|| "identity-onboard: control listener attach failed")?;
-    rpc::connect::<ControlRequest, ControlResponse, _>(sender, 4096, 4096)
-        .await
-        .with_context(|| "identity-onboard: control rpc connect failed")
-}
+        .with_context(|| "identity-onboard: accountant listener attach failed")?;
+    let mut client =
+        rpc::connect::<AccountantControl, AccountantControlResponse, _>(sender, 4096, 4096)
+            .await
+            .with_context(|| "identity-onboard: accountant rpc connect failed")?;
 
-/// Issues a further leaf for an already-onboarded tenant and publishes it under
-/// a distinct manifest, leaving the recorded tenant CA untouched. A failure
-/// here means either the tenant CA or the tenant's durable record did not
-/// survive the restart.
-async fn issue_leaf_after_restart(
-    ctx: &mut Context,
-    client: &mut rpc::OwnedRpcClient<IdentityRequest, IdentityResponse>,
-    spki_der: Vec<u8>,
-) -> anyhow::Result<()> {
-    let issued = client
-        .request(IdentityRequest::IssueUserCert {
+    let response = client
+        .request(AccountantControl::SetProcessQuota {
             tenant: TENANT.to_string(),
-            spki_der,
+            processes: QUOTA_PROCESSES,
         })
         .await
-        .with_context(|| "identity-onboard: post-restart issue failed")?;
-    let IdentityResponse::UserCertIssued { certificate_der } = issued else {
-        bail!("identity-onboard: unexpected issue response: {issued:?}");
+        .with_context(|| "identity-onboard: set process quota failed")?;
+    let AccountantControlResponse::Updated { tenant } = response else {
+        bail!("identity-onboard: unexpected quota response: {response:?}");
     };
-
-    let blobs = ctx
-        .open_blob_store(OUTPUT_STORE)
-        .await
-        .with_context(|| "identity-onboard: output blob store open failed")?;
-    let blob_id = blobs
-        .put(certificate_der)
-        .await
-        .with_context(|| "identity-onboard: post-restart leaf put failed")?;
-    blobs
-        .set_manifest(LEAF_MANIFEST_AFTER_RESTART, blob_id)
-        .await
-        .with_context(|| "identity-onboard: post-restart leaf manifest failed")?;
-    info!("identity-onboard: issued a further {TENANT} certificate after the restart");
+    info!("power-cycle: authored {tenant} process ceiling {QUOTA_PROCESSES}");
     Ok(())
 }
 
@@ -331,37 +363,5 @@ async fn verify_deployment(ctx: &mut Context) -> anyhow::Result<()> {
         ),
         None => info!("power-cycle: deployment {WORKLOAD_ID} absent"),
     }
-    Ok(())
-}
-
-/// Authors a process-count ceiling through the accountant's control surface.
-///
-/// The accountant appends a policy record to its durable ledger and re-authors
-/// enforcement, so a restart that replays the ledger must re-author the same
-/// ceiling.
-async fn set_process_quota(ctx: &mut Context) -> anyhow::Result<()> {
-    let target = ctx
-        .lookup(ACCOUNTANT_ROUTE)
-        .await
-        .with_context(|| "identity-onboard: accountant route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: accountant route not found"))?;
-    let sender = ResourceSender::attach(target.resource_id)
-        .with_context(|| "identity-onboard: accountant listener attach failed")?;
-    let mut client =
-        rpc::connect::<AccountantControl, AccountantControlResponse, _>(sender, 4096, 4096)
-            .await
-            .with_context(|| "identity-onboard: accountant rpc connect failed")?;
-
-    let response = client
-        .request(AccountantControl::SetProcessQuota {
-            tenant: TENANT.to_string(),
-            processes: QUOTA_PROCESSES,
-        })
-        .await
-        .with_context(|| "identity-onboard: set process quota failed")?;
-    let AccountantControlResponse::Updated { tenant } = response else {
-        bail!("identity-onboard: unexpected quota response: {response:?}");
-    };
-    info!("power-cycle: authored {tenant} process ceiling {QUOTA_PROCESSES}");
     Ok(())
 }

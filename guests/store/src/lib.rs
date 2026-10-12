@@ -43,10 +43,10 @@ use selium_guest::{
 use selium_service::{StoreRecord, StoreRecordHeader, StoreRequest, StoreResponse};
 use selium_shm::rpc::{RpcConnection, RpcError};
 
+use crate::store::{Failure, Store, VolumeHandle, Volumes};
+
 pub mod format;
 pub mod store;
-
-use crate::store::{Failure, Store, VolumeHandle, Volumes};
 
 /// The root-namespace route the store serves on.
 pub const STORE_ROUTE: &str = "sel:///store";
@@ -57,24 +57,6 @@ pub struct HostVolumes;
 /// One open host volume.
 pub struct HostVolume {
     volume: selium_guest::volume::Volume,
-}
-
-impl VolumeHandle for HostVolume {
-    fn append(&self, bytes: &[u8]) -> Result<u64, Failure> {
-        self.volume.append(bytes).map_err(host_failure)
-    }
-
-    fn read_all(&self) -> Result<Vec<u8>, Failure> {
-        self.volume.read_all().map_err(host_failure)
-    }
-
-    fn len(&self) -> Result<u64, Failure> {
-        self.volume.len().map_err(host_failure)
-    }
-
-    fn sync(&self) -> Result<(), Failure> {
-        self.volume.sync().map_err(host_failure)
-    }
 }
 
 impl Volumes for HostVolumes {
@@ -94,96 +76,21 @@ impl Volumes for HostVolumes {
     }
 }
 
-fn host_failure(error: selium_guest::GuestError) -> Failure {
-    Failure {
-        code: "Host",
-        message: error.to_string(),
+impl VolumeHandle for HostVolume {
+    fn append(&self, bytes: &[u8]) -> Result<u64, Failure> {
+        self.volume.append(bytes).map_err(host_failure)
     }
-}
 
-/// Store entrypoint: registers the route, reports readiness, then serves.
-#[entrypoint]
-async fn store_main(mut ctx: Context) -> anyhow::Result<()> {
-    drop(selium_guest::log::init());
-    info!("store: started");
-
-    let listener = ResourceListener::create().with_context(|| "store: listener create failed")?;
-    let route = ctx
-        .serve(Serve {
-            path: vec!["store".to_string()],
-            target: ResourceTarget {
-                uri: String::new(),
-                host_id: String::new(),
-                resource_id: listener.descriptor().shared_id,
-                interface: None,
-                tenant: None,
-                class: ResourceClass::HostQueue,
-                labels: Vec::new(),
-            },
-            default: false,
-        })
-        .await
-        .with_context(|| "store: route registration failed")?;
-    info!(route = %route, "store: route registered");
-    // Readiness is reported only once the route is discoverable.
-    mark_ready();
-
-    let store = Arc::new(Store::new(HostVolumes));
-    loop {
-        let incoming = match listener.recv().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                warn!("store: accept failed: {error}");
-                continue;
-            }
-        };
-        let connection =
-            match selium_shm::rpc::accept::<StoreRequest, StoreResponse>(incoming.into()) {
-                Ok(connection) => connection,
-                Err(error) => {
-                    warn!("store: rpc accept failed: {error}");
-                    continue;
-                }
-            };
-        spawn(handle_connection(store.clone(), connection));
+    fn read_all(&self) -> Result<Vec<u8>, Failure> {
+        self.volume.read_all().map_err(host_failure)
     }
-}
 
-/// Serves one session, deriving its tenant from the delivering process.
-async fn handle_connection(
-    store: Arc<Store<HostVolumes>>,
-    mut connection: RpcConnection<StoreRequest, StoreResponse>,
-) {
-    let client_process_id = connection.client_process_id();
-    let tenant = match process_tenant(client_process_id) {
-        Ok(Some(tenant)) => tenant,
-        Ok(None) => String::new(),
-        Err(error) => {
-            // A session whose tenant cannot be resolved is refused, never
-            // served under a guessed namespace.
-            warn!("store: refusing session from process {client_process_id}: {error}");
-            return;
-        }
-    };
-    info!(client_process_id, tenant = %tenant, "store: session opened");
+    fn len(&self) -> Result<u64, Failure> {
+        self.volume.len().map_err(host_failure)
+    }
 
-    loop {
-        let request = match connection.recv().await {
-            Ok(request) => request,
-            Err(RpcError::ConnectionClosed) => break,
-            Err(error) => {
-                warn!("store: session receive failed: {error}");
-                break;
-            }
-        };
-        let response = match request.payload() {
-            Ok(payload) => dispatch(&store, &tenant, payload),
-            Err(error) => error_response("Malformed", error.to_string()),
-        };
-        if let Err(error) = request.reply(response).await {
-            warn!("store: reply failed: {error}");
-            break;
-        }
+    fn sync(&self) -> Result<(), Failure> {
+        self.volume.sync().map_err(host_failure)
     }
 }
 
@@ -263,6 +170,106 @@ fn dispatch(store: &Store<HostVolumes>, tenant: &str, request: StoreRequest) -> 
     outcome.unwrap_or_else(|failure| error_response(failure.code, failure.message))
 }
 
+fn error_response(code: &str, message: String) -> StoreResponse {
+    StoreResponse::Error {
+        code: code.to_string(),
+        message,
+    }
+}
+
+/// Serves one session, deriving its tenant from the delivering process.
+async fn handle_connection(
+    store: Arc<Store<HostVolumes>>,
+    mut connection: RpcConnection<StoreRequest, StoreResponse>,
+) {
+    let client_process_id = connection.client_process_id();
+    let tenant = match process_tenant(client_process_id) {
+        Ok(Some(tenant)) => tenant,
+        Ok(None) => String::new(),
+        Err(error) => {
+            // A session whose tenant cannot be resolved is refused, never
+            // served under a guessed namespace.
+            warn!("store: refusing session from process {client_process_id}: {error}");
+            return;
+        }
+    };
+    info!(client_process_id, tenant = %tenant, "store: session opened");
+
+    loop {
+        let request = match connection.recv().await {
+            Ok(request) => request,
+            Err(RpcError::ConnectionClosed) => break,
+            Err(error) => {
+                warn!("store: session receive failed: {error}");
+                break;
+            }
+        };
+        let response = match request.payload() {
+            Ok(payload) => dispatch(&store, &tenant, payload),
+            Err(error) => error_response("Malformed", error.to_string()),
+        };
+        if let Err(error) = request.reply(response).await {
+            warn!("store: reply failed: {error}");
+            break;
+        }
+    }
+}
+
+fn host_failure(error: selium_guest::GuestError) -> Failure {
+    Failure {
+        code: "Host",
+        message: error.to_string(),
+    }
+}
+
+/// Store entrypoint: registers the route, reports readiness, then serves.
+#[entrypoint]
+async fn store_main(mut ctx: Context) -> anyhow::Result<()> {
+    drop(selium_guest::log::init());
+    info!("store: started");
+
+    let listener = ResourceListener::create().with_context(|| "store: listener create failed")?;
+    let route = ctx
+        .serve(Serve {
+            path: vec!["store".to_string()],
+            target: ResourceTarget {
+                uri: String::new(),
+                host_id: String::new(),
+                resource_id: listener.descriptor().shared_id,
+                interface: None,
+                tenant: None,
+                class: ResourceClass::HostQueue,
+                labels: Vec::new(),
+            },
+            default: false,
+        })
+        .await
+        .with_context(|| "store: route registration failed")?;
+    info!(route = %route, "store: route registered");
+    // Readiness is reported only once the route is discoverable.
+    mark_ready();
+
+    let store = Arc::new(Store::new(HostVolumes));
+    loop {
+        let incoming = match listener.recv().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!("store: accept failed: {error}");
+                continue;
+            }
+        };
+        let connection =
+            match selium_shm::rpc::accept::<StoreRequest, StoreResponse>(incoming.into()) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    warn!("store: rpc accept failed: {error}");
+                    continue;
+                }
+            };
+        spawn(handle_connection(store.clone(), connection));
+    }
+}
+
 fn to_wire_record(record: format::Record) -> StoreRecord {
     StoreRecord {
         sequence: record.sequence,
@@ -273,13 +280,6 @@ fn to_wire_record(record: format::Record) -> StoreRecord {
             .map(|(key, value)| StoreRecordHeader { key, value })
             .collect(),
         payload: record.payload,
-    }
-}
-
-fn error_response(code: &str, message: String) -> StoreResponse {
-    StoreResponse::Error {
-        code: code.to_string(),
-        message,
     }
 }
 

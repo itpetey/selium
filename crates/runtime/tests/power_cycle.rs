@@ -32,18 +32,41 @@ use spine_common::{
 mod common;
 mod spine_common;
 
-/// The tenant the test onboards.
-const TENANT: &str = "acme";
-/// Blob store the onboarding guest publishes the issued leaf to.
-const ONBOARD_STORE: &str = "selium.identity-onboard.out";
 /// Manifest the post-restart leaf is published under.
 const LEAF_MANIFEST_AFTER_RESTART: &str = "acme-leaf-after-restart";
-/// The identity guest's tenant log, as the guest names it.
-const TENANT_LOG: &str = "selium.identity.tenants";
-/// Environment variable handing the state directory to the second lifetime.
-const STATE_ROOT_ENV: &str = "SELIUM_POWER_CYCLE_ROOT";
+/// Blob store the onboarding guest publishes the issued leaf to.
+const ONBOARD_STORE: &str = "selium.identity-onboard.out";
 /// The second lifetime's test name, re-invoked in a fresh process.
 const SECOND_LIFETIME: &str = "second_lifetime_asserts_survival";
+/// Environment variable handing the state directory to the second lifetime.
+const STATE_ROOT_ENV: &str = "SELIUM_POWER_CYCLE_ROOT";
+/// The tenant the test onboards.
+const TENANT: &str = "acme";
+/// The identity guest's tenant log, as the guest names it.
+const TENANT_LOG: &str = "selium.identity.tenants";
+
+/// The accounting guest: two entrypoints over one module.
+fn accounting_descriptor(
+    name: &str,
+    grants: Vec<selium_abi::CapabilityGrant>,
+    dependencies: Vec<String>,
+) -> selium_runtime::SystemGuestDescriptor {
+    selium_runtime::SystemGuestDescriptor {
+        name: name.to_string(),
+        module_id: "accounting-module".to_string(),
+        module_bytes: read_wasm("selium-accountant", "selium_accountant.wasm"),
+        entrypoint: name.to_string(),
+        arguments: Vec::new(),
+        grants,
+        dependencies,
+        readiness: selium_runtime::ReadinessCondition::ActivityLogContains(
+            "guest ready".to_string(),
+        ),
+        tenant: None,
+        serving_role: None,
+        handlers: Vec::new(),
+    }
+}
 
 /// Boot order-guest set for both lifetimes: discovery, the durable store, the
 /// identity mint authority, the accounting pair, and the control plane.
@@ -71,29 +94,6 @@ fn platform_guests() -> Vec<selium_runtime::SystemGuestDescriptor> {
             "selium_control_plane.wasm",
         )),
     ]
-}
-
-/// The accounting guest: two entrypoints over one module.
-fn accounting_descriptor(
-    name: &str,
-    grants: Vec<selium_abi::CapabilityGrant>,
-    dependencies: Vec<String>,
-) -> selium_runtime::SystemGuestDescriptor {
-    selium_runtime::SystemGuestDescriptor {
-        name: name.to_string(),
-        module_id: "accounting-module".to_string(),
-        module_bytes: read_wasm("selium-accountant", "selium_accountant.wasm"),
-        entrypoint: name.to_string(),
-        arguments: Vec::new(),
-        grants,
-        dependencies,
-        readiness: selium_runtime::ReadinessCondition::ActivityLogContains(
-            "guest ready".to_string(),
-        ),
-        tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

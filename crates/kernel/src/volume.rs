@@ -55,15 +55,6 @@ pub(crate) struct VolumeRegistryInner {
     handles: Mutex<HashMap<LocalResourceId, Arc<VolumeHandle>>>,
 }
 
-impl Drop for VolumeRegistryInner {
-    fn drop(&mut self) {
-        if self.ephemeral.load(Ordering::SeqCst) {
-            let root = self.root.lock().clone();
-            drop(std::fs::remove_dir_all(root));
-        }
-    }
-}
-
 impl VolumeRegistry {
     /// Creates a registry rooted at `root`. The directory is created lazily on
     /// first use, so construction never fails.
@@ -306,90 +297,13 @@ impl VolumeRegistry {
     }
 }
 
-fn dir_bytes(dir: &Path) -> Result<u64> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
-    let mut total = 0u64;
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            total = total.saturating_add(entry.metadata()?.len());
+impl Drop for VolumeRegistryInner {
+    fn drop(&mut self) {
+        if self.ephemeral.load(Ordering::SeqCst) {
+            let root = self.root.lock().clone();
+            drop(std::fs::remove_dir_all(root));
         }
     }
-    Ok(total)
-}
-
-/// Returns whether a directory holds any entry (a missing directory holds none).
-fn dir_has_files(dir: &Path) -> Result<bool> {
-    match std::fs::read_dir(dir) {
-        Ok(mut entries) => Ok(entries.next().is_some()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn unique_temp_root() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "selium-volumes-{}-{nanos}-{unique}",
-        std::process::id()
-    ))
-}
-
-/// Encodes a volume name into a single filesystem-safe component.
-fn encode_name(name: &str) -> Result<String> {
-    if name.is_empty() {
-        return Err(Error::Invalid("volume name must not be empty".to_string()));
-    }
-    let encoded = encode_component(name);
-    if encoded == "." || encoded == ".." {
-        return Err(Error::Invalid(format!("unsafe volume name {name:?}")));
-    }
-    Ok(encoded)
-}
-
-/// Encodes a tenant into a directory component.
-///
-/// Every tenant directory carries a `!` marker prefix so the platform tenant
-/// (no name) is distinct from a tenant literally named like its directory: a
-/// raw `!` never appears in an encoded component, so the prefix round-trips.
-fn encode_tenant(tenant: Option<&str>) -> Result<String> {
-    let raw = tenant.unwrap_or("");
-    if raw.contains('/') || raw.contains('\\') || raw.contains('\0') {
-        return Err(Error::Invalid(format!("unsafe tenant name {raw:?}")));
-    }
-    Ok(format!("!{}", encode_component(raw)))
-}
-
-fn decode_tenant(encoded: &str) -> Result<String> {
-    let rest = encoded
-        .strip_prefix('!')
-        .ok_or_else(|| Error::Invalid(format!("malformed tenant directory {encoded:?}")))?;
-    decode_component(rest)
-}
-
-/// Percent-encodes every byte outside `[A-Za-z0-9._-]` so that any UTF-8 name
-/// maps to one safe path component.
-fn encode_component(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        if is_unreserved(byte) {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-            out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
-        }
-    }
-    out
 }
 
 fn decode_component(encoded: &str) -> Result<String> {
@@ -422,8 +336,94 @@ fn decode_component(encoded: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_error| Error::Invalid(format!("non-utf8 name {encoded:?}")))
 }
 
+fn decode_tenant(encoded: &str) -> Result<String> {
+    let rest = encoded
+        .strip_prefix('!')
+        .ok_or_else(|| Error::Invalid(format!("malformed tenant directory {encoded:?}")))?;
+    decode_component(rest)
+}
+
+fn dir_bytes(dir: &Path) -> Result<u64> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Returns whether a directory holds any entry (a missing directory holds none).
+fn dir_has_files(dir: &Path) -> Result<bool> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Percent-encodes every byte outside `[A-Za-z0-9._-]` so that any UTF-8 name
+/// maps to one safe path component.
+fn encode_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if is_unreserved(byte) {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+            out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+        }
+    }
+    out
+}
+
+/// Encodes a volume name into a single filesystem-safe component.
+fn encode_name(name: &str) -> Result<String> {
+    if name.is_empty() {
+        return Err(Error::Invalid("volume name must not be empty".to_string()));
+    }
+    let encoded = encode_component(name);
+    if encoded == "." || encoded == ".." {
+        return Err(Error::Invalid(format!("unsafe volume name {name:?}")));
+    }
+    Ok(encoded)
+}
+
+/// Encodes a tenant into a directory component.
+///
+/// Every tenant directory carries a `!` marker prefix so the platform tenant
+/// (no name) is distinct from a tenant literally named like its directory: a
+/// raw `!` never appears in an encoded component, so the prefix round-trips.
+fn encode_tenant(tenant: Option<&str>) -> Result<String> {
+    let raw = tenant.unwrap_or("");
+    if raw.contains('/') || raw.contains('\\') || raw.contains('\0') {
+        return Err(Error::Invalid(format!("unsafe tenant name {raw:?}")));
+    }
+    Ok(format!("!{}", encode_component(raw)))
+}
+
 fn is_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn unique_temp_root() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "selium-volumes-{}-{nanos}-{unique}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]

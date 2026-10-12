@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
 

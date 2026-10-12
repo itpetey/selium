@@ -56,6 +56,12 @@ pub(crate) struct StateRoot {
     path: PathBuf,
 }
 
+/// Cross-process guard for the connector's fixed listener port: the spine
+/// test binaries (one runtime per process) must not bind `0.0.0.0:4433`
+/// concurrently. Spin-acquired via an exclusive lock file, released on
+/// drop.
+pub(crate) struct SpinePortGuard(PathBuf);
+
 impl StateRoot {
     /// Creates a unique temporary state root.
     pub(crate) fn new(tag: &str) -> Self {
@@ -100,27 +106,6 @@ impl Drop for StateRoot {
         drop(std::fs::remove_dir_all(&self.path));
     }
 }
-
-/// Creates a runtime whose volume layer is already rooted at `root`.
-///
-/// A test that seeds durable state (TLS material, a ledger) *before* bootstrap
-/// needs the root in place first: the state root may only be set before first
-/// use, so seeding into a throwaway root and re-rooting afterwards is refused
-/// by design. Passing `root.config_dir()` to the bootstrap is then a no-op.
-pub(crate) fn runtime_in_state_root(root: &StateRoot) -> Runtime {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seed = u64::from(std::process::id())
-        ^ COUNTER
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .rotate_left(23);
-    Runtime::new(Kernel::with_state_dir(seed, root.path()))
-}
-
-/// Cross-process guard for the connector's fixed listener port: the spine
-/// test binaries (one runtime per process) must not bind `0.0.0.0:4433`
-/// concurrently. Spin-acquired via an exclusive lock file, released on
-/// drop.
-pub(crate) struct SpinePortGuard(PathBuf);
 
 impl SpinePortGuard {
     /// Acquires the spine port, blocking until no other spine binary holds
@@ -281,40 +266,6 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
     }
 }
 
-/// The durable store system guest: the platform's only owner of durable-log
-/// and blob-store semantics, serving the root-namespace `sel:///store` route
-/// over the host's opaque volumes. Every guest that opens a log or blob store
-/// declares it as a dependency, so the store is ready first.
-pub(crate) fn store_descriptor(dependencies: Vec<String>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "store".to_string(),
-        module_id: "store-module".to_string(),
-        module_bytes: read_wasm("selium-store", "selium_store.wasm"),
-        entrypoint: "store_main".to_string(),
-        arguments: Vec::new(),
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::Storage,
-                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
-            ),
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
-        ],
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
-        tenant: None,
-        serving_role: Some("sel:///store".to_string()),
-        handlers: Vec::new(),
-    }
-}
-
 /// The discovery system guest: RPC listener + registration feed.
 pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
@@ -435,64 +386,6 @@ pub(crate) fn operator_descriptor_named(
     }
 }
 
-/// Reads the issued leaf the onboarding guest wrote to the blob store.
-pub(crate) fn read_issued_leaf(runtime: &Runtime) -> Vec<u8> {
-    let leaf_id =
-        read_manifest(runtime, ONBOARD_STORE, LEAF_MANIFEST).expect("issued leaf manifest present");
-    read_blob(runtime, ONBOARD_STORE, &leaf_id).expect("issued leaf blob present")
-}
-
-/// Writes a blob's content into the store's own layout under the platform
-/// tenant, exactly as the store's `put` does, and returns the content id.
-pub(crate) fn seed_blob(runtime: &Runtime, store: &str, bytes: &[u8]) -> String {
-    let id = selium_store::format::blob_id(bytes);
-    let volumes = runtime.kernel().volumes();
-    let name = selium_store::format::blob_volume(store, &id);
-    let volume = volumes.open(None, &name).expect("open blob volume");
-    volumes.append(volume.local_id, bytes).expect("append blob");
-    volumes.sync(volume.local_id).expect("sync blob volume");
-    drop(volumes.close(volume.local_id));
-    id
-}
-
-/// Points a manifest at a blob id in the store's own manifest layout.
-pub(crate) fn seed_manifest(runtime: &Runtime, store: &str, manifest: &str, blob_id: &str) {
-    let volumes = runtime.kernel().volumes();
-    let name = selium_store::format::manifest_volume(store);
-    let volume = volumes.open(None, &name).expect("open manifest volume");
-    let framed =
-        selium_store::format::frame(&selium_store::format::encode_manifest(manifest, blob_id));
-    volumes
-        .append(volume.local_id, &framed)
-        .expect("append manifest");
-    volumes.sync(volume.local_id).expect("sync manifest volume");
-    drop(volumes.close(volume.local_id));
-}
-
-/// Reads a manifest's blob id out of the store's own layout.
-pub(crate) fn read_manifest(runtime: &Runtime, store: &str, manifest: &str) -> Option<String> {
-    let volumes = runtime.kernel().volumes();
-    let name = selium_store::format::manifest_volume(store);
-    if !volumes.list(None).expect("list volumes").contains(&name) {
-        return None;
-    }
-    let volume = volumes.open(None, &name).expect("open manifest volume");
-    let bytes = volumes
-        .read_at(volume.local_id, 0, u32::MAX as usize)
-        .expect("read manifest volume");
-    drop(volumes.close(volume.local_id));
-    let (frames, _end) = selium_store::format::scan_frames(&bytes);
-    let mut found = None;
-    for frame in frames {
-        if let Ok((name, blob_id)) = selium_store::format::decode_manifest(frame)
-            && name == manifest
-        {
-            found = Some(blob_id);
-        }
-    }
-    found
-}
-
 /// Reads a blob's content out of the store's own layout.
 pub(crate) fn read_blob(runtime: &Runtime, store: &str, blob_id: &str) -> Option<Vec<u8>> {
     let volumes = runtime.kernel().volumes();
@@ -506,6 +399,13 @@ pub(crate) fn read_blob(runtime: &Runtime, store: &str, blob_id: &str) -> Option
         .expect("read blob volume");
     drop(volumes.close(volume.local_id));
     Some(bytes)
+}
+
+/// Reads the issued leaf the onboarding guest wrote to the blob store.
+pub(crate) fn read_issued_leaf(runtime: &Runtime) -> Vec<u8> {
+    let leaf_id =
+        read_manifest(runtime, ONBOARD_STORE, LEAF_MANIFEST).expect("issued leaf manifest present");
+    read_blob(runtime, ONBOARD_STORE, &leaf_id).expect("issued leaf blob present")
 }
 
 /// Reads every complete record a log's volumes hold, in sequence order.
@@ -539,8 +439,74 @@ pub(crate) fn read_log_records(runtime: &Runtime, log: &str) -> Vec<selium_store
     records
 }
 
+/// Reads a manifest's blob id out of the store's own layout.
+pub(crate) fn read_manifest(runtime: &Runtime, store: &str, manifest: &str) -> Option<String> {
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::manifest_volume(store);
+    if !volumes.list(None).expect("list volumes").contains(&name) {
+        return None;
+    }
+    let volume = volumes.open(None, &name).expect("open manifest volume");
+    let bytes = volumes
+        .read_at(volume.local_id, 0, u32::MAX as usize)
+        .expect("read manifest volume");
+    drop(volumes.close(volume.local_id));
+    let (frames, _end) = selium_store::format::scan_frames(&bytes);
+    let mut found = None;
+    for frame in frames {
+        if let Ok((name, blob_id)) = selium_store::format::decode_manifest(frame)
+            && name == manifest
+        {
+            found = Some(blob_id);
+        }
+    }
+    found
+}
+
 pub(crate) fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
     super::common::read_guest_wasm(crate_name, file_name)
+}
+
+/// Creates a runtime whose volume layer is already rooted at `root`.
+///
+/// A test that seeds durable state (TLS material, a ledger) *before* bootstrap
+/// needs the root in place first: the state root may only be set before first
+/// use, so seeding into a throwaway root and re-rooting afterwards is refused
+/// by design. Passing `root.config_dir()` to the bootstrap is then a no-op.
+pub(crate) fn runtime_in_state_root(root: &StateRoot) -> Runtime {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seed = u64::from(std::process::id())
+        ^ COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .rotate_left(23);
+    Runtime::new(Kernel::with_state_dir(seed, root.path()))
+}
+
+/// Writes a blob's content into the store's own layout under the platform
+/// tenant, exactly as the store's `put` does, and returns the content id.
+pub(crate) fn seed_blob(runtime: &Runtime, store: &str, bytes: &[u8]) -> String {
+    let id = selium_store::format::blob_id(bytes);
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::blob_volume(store, &id);
+    let volume = volumes.open(None, &name).expect("open blob volume");
+    volumes.append(volume.local_id, bytes).expect("append blob");
+    volumes.sync(volume.local_id).expect("sync blob volume");
+    drop(volumes.close(volume.local_id));
+    id
+}
+
+/// Points a manifest at a blob id in the store's own manifest layout.
+pub(crate) fn seed_manifest(runtime: &Runtime, store: &str, manifest: &str, blob_id: &str) {
+    let volumes = runtime.kernel().volumes();
+    let name = selium_store::format::manifest_volume(store);
+    let volume = volumes.open(None, &name).expect("open manifest volume");
+    let framed =
+        selium_store::format::frame(&selium_store::format::encode_manifest(manifest, blob_id));
+    volumes
+        .append(volume.local_id, &framed)
+        .expect("append manifest");
+    volumes.sync(volume.local_id).expect("sync manifest volume");
+    drop(volumes.close(volume.local_id));
 }
 
 /// Provisions the connector's own TLS material (server certificate + key)
@@ -551,6 +517,40 @@ pub(crate) fn seed_tls_blob_store(runtime: &Runtime) {
     let key_id = seed_blob(runtime, "tls-certs", BRIDGE_KEY_PEM);
     seed_manifest(runtime, "tls-certs", "cert-pem", &cert_id);
     seed_manifest(runtime, "tls-certs", "key-pem", &key_id);
+}
+
+/// The durable store system guest: the platform's only owner of durable-log
+/// and blob-store semantics, serving the root-namespace `sel:///store` route
+/// over the host's opaque volumes. Every guest that opens a log or blob store
+/// declares it as a dependency, so the store is ready first.
+pub(crate) fn store_descriptor(dependencies: Vec<String>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "store".to_string(),
+        module_id: "store-module".to_string(),
+        module_bytes: read_wasm("selium-store", "selium_store.wasm"),
+        entrypoint: "store_main".to_string(),
+        arguments: Vec::new(),
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::Storage,
+                vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
+            ),
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        ],
+        dependencies,
+        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
+        tenant: None,
+        serving_role: Some("sel:///store".to_string()),
+        handlers: Vec::new(),
+    }
 }
 
 #[expect(clippy::panic, reason = "test helper")]

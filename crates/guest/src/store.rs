@@ -8,13 +8,12 @@ use selium_shm::rpc::{self, OwnedRpcClient};
 
 use crate::{GuestError, Result, async_runtime::yield_now};
 
-/// The root-namespace route the durable store service serves on.
-pub const STORE_ROUTE: &str = "sel:///store";
-
-/// Request ring capacity for a store session.
-const RPC_REQ_CAPACITY: u64 = 64 * 1024;
 /// Reply ring capacity for a store session; sized for replay batches.
 const RPC_REP_CAPACITY: u64 = 256 * 1024;
+/// Request ring capacity for a store session.
+const RPC_REQ_CAPACITY: u64 = 64 * 1024;
+/// The root-namespace route the durable store service serves on.
+pub const STORE_ROUTE: &str = "sel:///store";
 
 /// A typed client of the `selium-store` service.
 ///
@@ -33,6 +32,20 @@ struct StoreClientInner {
     /// request, so concurrent callers cannot interleave frames on one session.
     gate: AtomicBool,
     session: Mutex<Option<OwnedRpcClient<StoreRequest, StoreResponse>>>,
+}
+
+/// A handle to a durable log served by the store.
+#[derive(Clone)]
+pub struct DurableLog {
+    client: StoreClient,
+    name: String,
+}
+
+/// A handle to a blob store served by the store.
+#[derive(Clone)]
+pub struct BlobStore {
+    client: StoreClient,
+    name: String,
 }
 
 impl StoreClient {
@@ -93,47 +106,6 @@ impl StoreClient {
         while self.inner.gate.swap(true, Ordering::AcqRel) {
             yield_now().await;
         }
-    }
-}
-
-/// Maps a store-reported error code onto a [`GuestError`].
-fn store_error(code: &str, message: &str) -> GuestError {
-    if code == "PermissionDenied" {
-        GuestError::PermissionDenied(message.to_string())
-    } else {
-        GuestError::Host(format!("{code}: {message}"))
-    }
-}
-
-/// A handle to a durable log served by the store.
-#[derive(Clone)]
-pub struct DurableLog {
-    client: StoreClient,
-    name: String,
-}
-
-/// A handle to a blob store served by the store.
-#[derive(Clone)]
-pub struct BlobStore {
-    client: StoreClient,
-    name: String,
-}
-
-impl std::fmt::Debug for DurableLog {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DurableLog")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for BlobStore {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BlobStore")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
     }
 }
 
@@ -236,6 +208,15 @@ impl DurableLog {
     }
 }
 
+impl std::fmt::Debug for DurableLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableLog")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BlobStore {
     /// Opens or creates a blob store by name.
     pub async fn open(client: StoreClient, name: impl Into<String>) -> Result<Self> {
@@ -318,8 +299,13 @@ impl BlobStore {
     }
 }
 
-fn unexpected(response: &StoreResponse) -> GuestError {
-    GuestError::Host(format!("unexpected store response: {response:?}"))
+impl std::fmt::Debug for BlobStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlobStore")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Establishes a store session over an attached rendezvous.
@@ -333,4 +319,17 @@ where
         .await
         .map_err(|error| GuestError::Host(format!("store connect: {error}")))?;
     Ok(StoreClient::from_session(session))
+}
+
+/// Maps a store-reported error code onto a [`GuestError`].
+fn store_error(code: &str, message: &str) -> GuestError {
+    if code == "PermissionDenied" {
+        GuestError::PermissionDenied(message.to_string())
+    } else {
+        GuestError::Host(format!("{code}: {message}"))
+    }
+}
+
+fn unexpected(response: &StoreResponse) -> GuestError {
+    GuestError::Host(format!("unexpected store response: {response:?}"))
 }

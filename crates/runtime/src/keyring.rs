@@ -17,8 +17,10 @@
 //! implementation is the day-1 default; a file or HSM backing replaces it
 //! without changing the hostcall surface.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
@@ -101,6 +103,25 @@ pub struct Keyring {
     tenant_cas: Box<dyn CaStore>,
 }
 
+/// File-backed tenant CA store: one certificate/key pair per tenant.
+pub struct FileCaStore {
+    dir: PathBuf,
+}
+
+/// The host keyring persisted under a state directory.
+///
+/// Covers the whole hierarchy — the offline root, the online intermediate and
+/// the per-tenant CAs — so a restart reuses the material it already had rather
+/// than silently replacing it: certificates issued before a restart keep
+/// validating against the tenant CA they chain to. An empty state directory
+/// generates and persists a fresh hierarchy on first boot.
+///
+/// Layout: `<state>/keys/{root,intermediate}.{cert,key}.der` and
+/// `<state>/keys/tenants/<enc tenant>.{cert,key}.der`.
+pub struct KeyringStore {
+    dir: PathBuf,
+}
+
 impl CaStore for InMemoryCaStore {
     fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError> {
         self.by_tenant.insert(tenant.to_string(), ca);
@@ -113,50 +134,6 @@ impl CaStore for InMemoryCaStore {
 
     fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
         self.by_tenant.remove(tenant)
-    }
-}
-
-/// File-backed tenant CA store: one certificate/key pair per tenant.
-pub struct FileCaStore {
-    dir: PathBuf,
-}
-
-impl FileCaStore {
-    /// Creates a store whose material lives under `dir`.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
-    }
-
-    fn cert_path(&self, tenant: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.cert.der", encode_component(tenant)))
-    }
-
-    fn key_path(&self, tenant: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.key.der", encode_component(tenant)))
-    }
-}
-
-impl CaStore for FileCaStore {
-    fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError> {
-        std::fs::create_dir_all(&self.dir)?;
-        write_private(&self.cert_path(tenant), &ca.cert_der)?;
-        write_private(&self.key_path(tenant), &ca.key_der)?;
-        Ok(())
-    }
-
-    fn get(&self, tenant: &str) -> Option<TenantCa> {
-        let cert_der = std::fs::read(self.cert_path(tenant)).ok()?;
-        let key_der = std::fs::read(self.key_path(tenant)).ok()?;
-        Some(TenantCa { cert_der, key_der })
-    }
-
-    fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
-        let ca = self.get(tenant)?;
-        drop(std::fs::remove_file(self.cert_path(tenant)));
-        drop(std::fs::remove_file(self.key_path(tenant)));
-        Some(ca)
     }
 }
 
@@ -309,55 +286,43 @@ impl Keyring {
     }
 }
 
-/// Parameters for a CA certificate: CA basic constraints plus key-cert-sign.
-fn ca_params(common_name: &str) -> CertificateParams {
-    let mut params = CertificateParams::default();
-    params.distinguished_name = distinguished_name(common_name);
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    params.use_authority_key_identifier_extension = true;
-    params
-}
+impl FileCaStore {
+    /// Creates a store whose material lives under `dir`.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
 
-fn distinguished_name(common_name: &str) -> DistinguishedName {
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, common_name);
-    dn
-}
+    fn cert_path(&self, tenant: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.cert.der", encode_component(tenant)))
+    }
 
-/// Parameters for a user leaf: no CA bit, digital signature + client auth.
-fn leaf_params(tenant: &str) -> CertificateParams {
-    let mut params = CertificateParams::default();
-    params.distinguished_name = distinguished_name(&format!("Selium Client {tenant}"));
-    params.is_ca = IsCa::NoCa;
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    params.use_authority_key_identifier_extension = true;
-    params
-}
-
-fn material_from(cert: &Certificate, key: &KeyPair) -> KeyMaterial {
-    KeyMaterial {
-        cert_der: cert.der().to_vec(),
-        key_der: key.serialize_der(),
+    fn key_path(&self, tenant: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.key.der", encode_component(tenant)))
     }
 }
 
-/// The host keyring persisted under a state directory.
-///
-/// Covers the whole hierarchy — the offline root, the online intermediate and
-/// the per-tenant CAs — so a restart reuses the material it already had rather
-/// than silently replacing it: certificates issued before a restart keep
-/// validating against the tenant CA they chain to. An empty state directory
-/// generates and persists a fresh hierarchy on first boot.
-///
-/// Layout: `<state>/keys/{root,intermediate}.{cert,key}.der` and
-/// `<state>/keys/tenants/<enc tenant>.{cert,key}.der`.
-pub struct KeyringStore {
-    dir: PathBuf,
+impl CaStore for FileCaStore {
+    fn insert(&mut self, tenant: &str, ca: TenantCa) -> Result<(), KeyringError> {
+        std::fs::create_dir_all(&self.dir)?;
+        write_private(&self.cert_path(tenant), &ca.cert_der)?;
+        write_private(&self.key_path(tenant), &ca.key_der)?;
+        Ok(())
+    }
+
+    fn get(&self, tenant: &str) -> Option<TenantCa> {
+        let cert_der = std::fs::read(self.cert_path(tenant)).ok()?;
+        let key_der = std::fs::read(self.key_path(tenant)).ok()?;
+        Some(TenantCa { cert_der, key_der })
+    }
+
+    fn remove(&mut self, tenant: &str) -> Option<TenantCa> {
+        let ca = self.get(tenant)?;
+        drop(std::fs::remove_file(self.cert_path(tenant)));
+        drop(std::fs::remove_file(self.key_path(tenant)));
+        Some(ca)
+    }
 }
 
 impl KeyringStore {
@@ -425,27 +390,23 @@ impl KeyringStore {
     }
 }
 
-/// Reads a certificate/key pair, returning `None` when either half is absent.
-fn read_material(cert: &Path, key: &Path) -> Result<Option<KeyMaterial>, KeyringError> {
-    match (std::fs::read(cert), std::fs::read(key)) {
-        (Ok(cert_der), Ok(key_der)) => Ok(Some(KeyMaterial { cert_der, key_der })),
-        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(None)
-        }
-        (Err(error), _) | (_, Err(error)) => Err(error.into()),
-    }
+/// Parameters for a CA certificate: CA basic constraints plus key-cert-sign.
+fn ca_params(common_name: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = distinguished_name(common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    params.use_authority_key_identifier_extension = true;
+    params
 }
 
-/// Writes host-private material, restricting permissions where the platform
-/// supports it.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), KeyringError> {
-    std::fs::write(path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+fn distinguished_name(common_name: &str) -> DistinguishedName {
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, common_name);
+    dn
 }
 
 /// Encodes a tenant name into a single filesystem-safe component.
@@ -467,6 +428,35 @@ fn encode_component(raw: &str) -> String {
     out
 }
 
+/// Parameters for a user leaf: no CA bit, digital signature + client auth.
+fn leaf_params(tenant: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    params.distinguished_name = distinguished_name(&format!("Selium Client {tenant}"));
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.use_authority_key_identifier_extension = true;
+    params
+}
+
+fn material_from(cert: &Certificate, key: &KeyPair) -> KeyMaterial {
+    KeyMaterial {
+        cert_der: cert.der().to_vec(),
+        key_der: key.serialize_der(),
+    }
+}
+
+/// Reads a certificate/key pair, returning `None` when either half is absent.
+fn read_material(cert: &Path, key: &Path) -> Result<Option<KeyMaterial>, KeyringError> {
+    match (std::fs::read(cert), std::fs::read(key)) {
+        (Ok(cert_der), Ok(key_der)) => Ok(Some(KeyMaterial { cert_der, key_der })),
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error.into()),
+    }
+}
+
 /// Validates that stored material round-trips through a signing handle.
 fn validate_material(material: &KeyMaterial) -> Result<(), KeyringError> {
     let key = KeyPair::try_from(material.key_der.as_slice()).map_err(|error| {
@@ -476,6 +466,18 @@ fn validate_material(material: &KeyMaterial) -> Result<(), KeyringError> {
     let _issuer = Issuer::from_ca_cert_der(&cert, key).map_err(|error| {
         KeyringError::InvalidMaterial(format!("certificate parse failed: {error}"))
     })?;
+    Ok(())
+}
+
+/// Writes host-private material, restricting permissions where the platform
+/// supports it.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), KeyringError> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

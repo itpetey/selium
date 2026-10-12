@@ -31,10 +31,10 @@ pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
 /// Serving tenant tracked per (process_id, region_id) so FreeRegion can revoke
 /// the region's URI (minted under principal provenance).
 pub(crate) type RegionTenants = HashMap<(ProcessId, u64), String>;
+pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Serving tenant tracked per (process_id, volume local id) so an append is
 /// reserved against the tenant the volume was minted under, not the writer's.
 pub(crate) type VolumeTenants = HashMap<(ProcessId, u64), String>;
-pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Wait registry keyed by (process_id, region_id).
 pub(crate) type WaitRegistry = HashMap<(ProcessId, u64), Vec<WaitEntry>>;
 
