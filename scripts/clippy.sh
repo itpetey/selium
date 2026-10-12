@@ -20,10 +20,6 @@
 # script runs the exact CI clippy command inside a Linux container so local
 # results match CI.
 #
-# The container layout mirrors CI: the workspace sits two levels below the
-# mount point so the [patch.crates-io] `wasmtiny = { path = "../../wasmtiny" }`
-# path resolves exactly as it does on the runner (proto/arch3 + wasmtiny).
-#
 # Usage:
 #   scripts/clippy.sh                          # CI command: --workspace --all-targets -- -D warnings
 #   scripts/clippy.sh -p selium-connector-http --all-targets -- -D warnings
@@ -45,28 +41,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # ---------------------------------------------------------------------------
-# Resolve the CI-style layout: workspace at <mount>/<parent>/<repo>, with the
-# wasmtiny checkout at <mount>/wasmtiny so `../../wasmtiny` resolves.
+# Resolve the CI-style layout: workspace at <mount>/<parent>/<repo>.
 # ---------------------------------------------------------------------------
 GRANDPARENT="$(cd "$ROOT/../.." && pwd -P)"
 PARENT_NAME="$(basename "$(cd "$ROOT/.." && pwd -P)")"
 REPO_NAME="$(basename "$ROOT")"
 CONTAINER_WS="/work/$PARENT_NAME/$REPO_NAME"
-
-if [ ! -d "$GRANDPARENT/wasmtiny" ]; then
-  if [ -n "${WASMTINY_DIR:-}" ] && [ -d "$WASMTINY_DIR" ]; then
-    WASMTINY_MOUNT=(-v "$(cd "$WASMTINY_DIR" && pwd -P)":/work/wasmtiny)
-    echo "clippy.sh: using wasmtiny checkout at $WASMTINY_DIR"
-  else
-    echo "clippy.sh: $GRANDPARENT/wasmtiny not found." >&2
-    echo "clippy.sh: the workspace [patch.crates-io] wasmtiny path dependency" >&2
-    echo "clippy.sh: (../../wasmtiny) needs it. Point WASMTINY_DIR at a" >&2
-    echo "clippy.sh: wasmtiny checkout, or place one next to $(cd "$ROOT/.." && pwd -P)." >&2
-    exit 1
-  fi
-else
-  WASMTINY_MOUNT=()
-fi
 
 # ---------------------------------------------------------------------------
 # Ensure the Docker daemon is up (best effort on macOS via Docker Desktop).
@@ -89,7 +69,7 @@ fi
 # ---------------------------------------------------------------------------
 # Assemble the run.
 # ---------------------------------------------------------------------------
-RUST_IMAGE="${RUST_IMAGE:-rust:1.98}"
+RUST_IMAGE="${RUST_IMAGE:-rust:latest}"
 
 PLATFORM_ARGS=()
 if [ -n "${DOCKER_PLATFORM:-}" ]; then
@@ -121,7 +101,6 @@ docker run --rm \
   ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
   ${TTY_ARGS[@]+"${TTY_ARGS[@]}"} \
   -v "$GRANDPARENT":/work \
-  ${WASMTINY_MOUNT[@]+"${WASMTINY_MOUNT[@]}"} \
   -v selium-clippy-rustup:/usr/local/rustup \
   -v selium-clippy-cargo:/usr/local/cargo \
   -v selium-clippy-target:/target \
@@ -132,6 +111,8 @@ docker run --rm \
   "$RUST_IMAGE" \
   bash -c '
     set -euo pipefail
+    apt update
+    apt -y install cmake
     cd "$WS"
     # Resolve the toolchain AFTER cd: a rust-toolchain.toml in the workspace
     # (e.g. channel = "stable") selects the toolchain rustup installs the
