@@ -400,7 +400,7 @@ async fn dispatch_loop<R, F>(
                 let tag = next_seq;
                 next_seq += 1;
 
-                let host = selium_abi::uri::normalize_host(
+                let host = selium_abi::uri::normalise_host(
                     get_typed_header(&request.headers, "host").unwrap_or("localhost"),
                 );
 

@@ -4,7 +4,7 @@ The `#[schema]` proc-macro (in `selium-guest-macros`) currently bridges Rust str
 
 However, generic domain types like `LiveTableMessage<K, V>` cannot be Flatbuffers tables directly — Flatbuffers has no concept of generics. The current pattern requires:
 
-1. A hand-written wire type with `#[schema]` where generics are replaced by `Vec<u8>` (for types serialized via `FlatMsg`) or sentinel values (for `Option<scalar>`)
+1. A hand-written wire type with `#[schema]` where generics are replaced by `Vec<u8>` (for types serialised via `FlatMsg`) or sentinel values (for `Option<scalar>`)
 2. A hand-written `FlatMsg` impl on the domain type that bridges: encode K/V to bytes → wrap in wire → encode wire; decode wire → decode K/V from bytes
 
 This is ~60 lines per generic message type. The macro already knows how to generate all of this — it just needs to be told about the two-type mapping.
@@ -17,7 +17,7 @@ The `#[schema]` macro parses three parameters: `path`, `ty`, `binding`. It inspe
 
 **Goals:**
 - Eliminate the manual wire type and `FlatMsg` bridge impl for generic domain types
-- Support automatic detection of which fields need byte-serialization (fields referencing generic params)
+- Support automatic detection of which fields need byte-serialisation (fields referencing generic params)
 - Support `Option<T>` where T is generic (empty bytes = None)
 - Support `Option<scalar>` sentinel values (the existing `#[schema]` already handles this — wire types just pass through)
 - Generate a wire type struct with a nested `#[schema]` attribute (same `path`/`ty`/`binding` as the domain, applied to the generated wire struct)
@@ -46,7 +46,7 @@ A new optional parameter `wire = WireTypeName` triggers wire type generation. Wh
    - **Nested `#[schema]` type** → pass through as-is
 3. Generates `impl<K: FlatMsg, V: FlatMsg> FlatMsg for DomainType<K, V>` that delegates through the wire type
 
-**Rationale**: The `wire` parameter is explicit and opt-in. It doesn't change behavior for existing code. The macro can detect generics automatically from the struct definition — no field-level attributes needed.
+**Rationale**: The `wire` parameter is explicit and opt-in. It doesn't change behaviour for existing code. The macro can detect generics automatically from the struct definition — no field-level attributes needed.
 
 **Alternative considered**: Always auto-generate when the struct has generics. Rejected because some generic structs might map to Flatbuffers differently, and explicit is better for a proc-macro with side effects (generating a whole new struct).
 
@@ -139,11 +139,11 @@ fn decode(bytes: &[u8]) -> Result<Self, InvalidFlatbuffer> {
 
 ### Decision 5: Bounds on generated impl
 
-The generated `FlatMsg` impl requires `K: FlatMsg, V: FlatMsg` (one bound per generic parameter used in byte-serialized fields). The `HasSchema` impl requires the same bounds.
+The generated `FlatMsg` impl requires `K: FlatMsg, V: FlatMsg` (one bound per generic parameter used in byte-serialised fields). The `HasSchema` impl requires the same bounds.
 
 Generic params that appear only in pass-through or sentinel fields don't need the bound — but in practice, a struct where ALL generics are pass-through probably doesn't need the wire generation feature at all.
 
-**Rationale**: Every byte-serialized field calls `FlatMsg::encode`/`FlatMsg::decode` on its value, so the bound is required. Emitting bounds only for actually-used params is more precise but adds complexity for negligible benefit.
+**Rationale**: Every byte-serialised field calls `FlatMsg::encode`/`FlatMsg::decode` on its value, so the bound is required. Emitting bounds only for actually-used params is more precise but adds complexity for negligible benefit.
 
 ## Risks / Trade-offs
 
@@ -153,7 +153,7 @@ Generic params that appear only in pass-through or sentinel fields don't need th
 
 - **`#[schema]` on wire type without `wire` parameter**: If someone accidentally puts `#[schema]` on a generic struct without `wire`, the existing macro will try to generate Flatbuffers encode/decode for generic fields and fail (because `K` doesn't implement the Flatbuffers field accessor pattern). → Mitigation: The macro can detect generic params and emit a helpful compile error: "use `wire = WireTypeName` to generate wire type for generic structs".
 
-- **Multiple generic messages**: As more generic message types are added, each follows the same pattern. → The design generalizes — it's not specific to `LiveTableMessage`.
+- **Multiple generic messages**: As more generic message types are added, each follows the same pattern. → The design generalises — it's not specific to `LiveTableMessage`.
 
 ## Migration Plan
 
@@ -162,7 +162,7 @@ Generic params that appear only in pass-through or sentinel fields don't need th
    - Add `#[schema(wire = LiveTableMessageWire, ...)]` to `LiveTableMessage<K, V>`
    - Remove the manual `LiveTableMessageWire` struct
    - Remove the manual `FlatMsg` and `HasSchema` impls for `LiveTableMessage<K, V>`
-3. Run existing tests to verify round-trip behavior is preserved
+3. Run existing tests to verify round-trip behaviour is preserved
 4. No changes to `.fbs` files, `build.rs`, or Flatbuffers bindings
 
 Rollback: The manual pattern still works. If the generator has issues, revert to the explicit two-type approach.

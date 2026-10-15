@@ -9,7 +9,7 @@
 
 - [x] 2.1 Remove `ChannelRegion` header fields (magic, capacity, writer_count, reader_count, next_tail, tail_cache, signal_shared_id, next_writer_id, next_mutation_id, reader_slots) from `region.rs`
 - [x] 2.2 Define new minimal shared region layout: generation counter (u64) at offset 0 followed by ring buffer data
-- [x] 2.3 Update `RingBuf::create` to initialize only the generation counter
+- [x] 2.3 Update `RingBuf::create` to initialise only the generation counter
 - [x] 2.4 Update `RingBuf::attach` to validate only the region size (no magic constant check)
 - [x] 2.5 Move reader slot allocation from shared region to per-guest `Channel` private state
 

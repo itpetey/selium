@@ -32,7 +32,7 @@ The control-plane request and reply types SHALL be FlatBuffers-encoded messages 
 
 #### Scenario: No text grammar for control
 - **WHEN** a control request cannot be decoded as the typed request message
-- **THEN** the control-plane SHALL return a typed serialization error rather than interpreting a text command
+- **THEN** the control-plane SHALL return a typed serialisation error rather than interpreting a text command
 
 ### Requirement: User-Facing Desired State Ownership
 The control-plane SHALL own the user-facing desired state for workloads: deployments and pipeline bindings. Accepting an update SHALL record it in control-plane-owned durable state and SHALL make it visible through a live-table state projection.

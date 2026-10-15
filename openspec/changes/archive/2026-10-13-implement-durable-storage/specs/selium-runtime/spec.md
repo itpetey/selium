@@ -58,12 +58,12 @@
 - **WHEN** a root process with no `DelegateGrants` grants allocates a region on behalf of tenant "acme" (the connector path: a root connector minting per-stream channels under an authenticated client's tenant)
 - **THEN** the runtime SHALL register the region under `sel://acme/region/<id>`
 
-#### Scenario: Unauthorized cross-tenant allocation denied
+#### Scenario: Unauthorised cross-tenant allocation denied
 - **WHEN** a tenant-scoped process without tenant-scoped delegation attempts to allocate a region for a tenant other than its own
 - **THEN** the runtime SHALL return `AbiErrorCode::PermissionDenied`
 
 #### Scenario: Host queue minted under the serving tenant
-- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is registered under `sel://acme/queue/<id>`; when a cross-tenant mint is authorized, the queue is registered under the serving tenant
+- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is registered under `sel://acme/queue/<id>`; when a cross-tenant mint is authorised, the queue is registered under the serving tenant
 - **THEN** teardown SHALL revoke the queue under the tenant it was minted for
 
 #### Scenario: Volume minted under the serving tenant

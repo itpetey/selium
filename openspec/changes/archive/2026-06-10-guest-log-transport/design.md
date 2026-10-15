@@ -52,7 +52,7 @@
 
 **Rationale:** The `#[schema]` macro already exists and is used for discovery messages. FlatBuffers provide zero-copy reads for consumers that don't need every field. Schema evolution is built-in. Matches the prior art's wire format exactly.
 
-**Alternative considered:** Use `rkyv` (already used for hostcall payloads). Rejected because `rkyv` requires the full type to deserialize; FlatBuffers allow partial reads. Additionally the schema macro tooling is already integrated with `.fbs` files and `flatc-fork`.
+**Alternative considered:** Use `rkyv` (already used for hostcall payloads). Rejected because `rkyv` requires the full type to deserialise; FlatBuffers allow partial reads. Additionally the schema macro tooling is already integrated with `.fbs` files and `flatc-fork`.
 
 ### 3. Tracing subscriber Layer pattern
 

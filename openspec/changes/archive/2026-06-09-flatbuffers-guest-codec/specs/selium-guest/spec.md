@@ -1,9 +1,9 @@
 ## MODIFIED Requirements
 
 ### Requirement: Messaging-Pattern Layer
-`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronization without signal hostcalls. The pattern layer SHALL use `FramedRead`/`FramedWrite` wrappers over byte-stream `Reader`/`Writer` types rather than reimplementing `FrameHeader` encoding/decoding in each pattern.
+`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronisation without signal hostcalls. The pattern layer SHALL use `FramedRead`/`FramedWrite` wrappers over byte-stream `Reader`/`Writer` types rather than reimplementing `FrameHeader` encoding/decoding in each pattern.
 
-`Publisher<T>`, `Subscriber<T>`, `RpcClient<Req, Rep>`, `RpcConnection<Req, Rep>`, and `LiveTable<K, V>` SHALL use the `FlatMsg` trait for serialization instead of `rkyv`. The framing layer (`FrameHeader`, `FramedRead`, `FramedWrite`) remains codec-agnostic and unchanged.
+`Publisher<T>`, `Subscriber<T>`, `RpcClient<Req, Rep>`, `RpcConnection<Req, Rep>`, and `LiveTable<K, V>` SHALL use the `FlatMsg` trait for serialisation instead of `rkyv`. The framing layer (`FrameHeader`, `FramedRead`, `FramedWrite`) remains codec-agnostic and unchanged.
 
 #### Scenario: Guest selects messaging pattern
 - **WHEN** guest code needs pub/sub, fanout, request/reply, stream, or live-table semantics
@@ -58,5 +58,5 @@ The `LiveTable<K, V>` struct SHALL handle two-level encoding:
 ## REMOVED Requirements
 
 ### Requirement: LiveTableMessage rkyv derives
-**Reason**: `LiveTableMessage<K, V>` no longer uses `rkyv` for serialization. It is now a Flatbuffers-backed message with `FlatMsg` encoding.
+**Reason**: `LiveTableMessage<K, V>` no longer uses `rkyv` for serialisation. It is now a Flatbuffers-backed message with `FlatMsg` encoding.
 **Migration**: Replace `#[derive(Archive, Serialize, Deserialize)]` with `#[schema(...)]` on the wire type, and implement `FlatMsg` manually on `LiveTableMessage<K, V>` to handle the generic K/V byte encoding.

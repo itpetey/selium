@@ -24,8 +24,8 @@ pub enum Error {
     /// `selium-wire`.
     #[error("wire error: {0}")]
     Wire(selium_wire::Error),
-    #[error("serialization error: {0}")]
-    Serialization(String),
+    #[error("serialisation error: {0}")]
+    Serialisation(String),
     /// The remote peer terminated a stream with an application error.
     #[error("remote stream error: {0}")]
     Remote(String),
@@ -46,7 +46,7 @@ impl From<selium_wire::Error> for Error {
     fn from(error: selium_wire::Error) -> Self {
         // Enrich where the client has its own variant; pass the rest through.
         match error {
-            selium_wire::Error::SerializationFailed(message) => Error::Serialization(message),
+            selium_wire::Error::SerialisationFailed(message) => Error::Serialisation(message),
             other => Error::Wire(other),
         }
     }
@@ -56,7 +56,7 @@ impl From<RpcError> for Error {
     fn from(error: RpcError) -> Self {
         match error {
             RpcError::ConnectionClosed => Error::Wire(selium_wire::Error::Terminated),
-            RpcError::Serialization(message) => Error::Serialization(message),
+            RpcError::Serialisation(message) => Error::Serialisation(message),
             RpcError::Remote(message) => Error::Remote(message),
             RpcError::InvalidRegion => Error::Wire(selium_wire::Error::InvalidRegion),
             RpcError::LayoutMismatch => Error::Wire(selium_wire::Error::LayoutMismatch),

@@ -22,12 +22,12 @@
 - [x] 4.1 Add `generate_bridge_encode()` — generates `FlatMsg::encode` on domain type that converts each field, constructs wire struct, and calls `FlatMsg::encode(&wire)`
 - [x] 4.2 Add `generate_bridge_decode()` — generates `FlatMsg::decode` on domain type that calls `FlatMsg::decode::<WireType>` then converts wire fields back
 - [x] 4.3 Add `generate_bridge_has_schema()` — generates `HasSchema` impl delegating to `{WireName}Schema`
-- [x] 4.4 Emit correct trait bounds: `K: FlatMsg` for each generic param used in byte-serialized fields
+- [x] 4.4 Emit correct trait bounds: `K: FlatMsg` for each generic param used in byte-serialised fields
 
 ## 5. Macro: Error case for generic without wire
 
 - [x] 5.1 When `#[schema]` has no `wire` param but the struct has generics, emit a compile error: `"struct has generic type parameters; add wire = WireTypeName to use schema"`
-- [x] 5.2 Ensure non-generic structs without `wire` continue to work unchanged (existing behavior)
+- [x] 5.2 Ensure non-generic structs without `wire` continue to work unchanged (existing behaviour)
 
 ## 6. Macro: Wire the expanded output together
 

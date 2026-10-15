@@ -34,7 +34,7 @@
 ## 6. Errors and re-exports
 
 - [x] 6.1 Implement the unified crate error: termination codes map to typed variants at channel open for every handle type (subscriber, publisher, RPC, streaming, live-table), and verify denied-attach and bad-handshake tests return the typed errors at open
-- [x] 6.2 Implement error pass-through/enrichment: `From<selium_wire::Error>` (wire pass-through, serialization enriched) and `From<RpcError>` (remote/serialization/closed semantics), surfaced by every handle newtype
+- [x] 6.2 Implement error pass-through/enrichment: `From<selium_wire::Error>` (wire pass-through, serialisation enriched) and `From<RpcError>` (remote/serialisation/closed semantics), surfaced by every handle newtype
 - [x] 6.3 Re-export `FlatMsg` and the encoding crate, and verify a user type compiles from the `selium-client` import alone
 
 ## 7. Integration

@@ -13,7 +13,7 @@
 - [ ] 2.3 Add `FreeSlot { region_id, table_offset, elem_size, slot_index }` to `HostcallRequest`
 - [ ] 2.4 Add `AllocSlot { slot_index }` to `HostcallOutput`
 - [ ] 2.5 Add `WriteSlot` and `FreeSlot` (unit) to `HostcallOutput`
-- [ ] 2.6 Implement serialization/deserialization for new variants
+- [ ] 2.6 Implement serialisation/deserialisation for new variants
 
 ## 3. selium-guest: ChannelHeaderLayout + memoffset
 

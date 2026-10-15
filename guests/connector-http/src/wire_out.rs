@@ -1,4 +1,4 @@
-//! HTTP/1.1 response serialization for the edge.
+//! HTTP/1.1 response serialisation for the edge.
 //!
 //! Unary responses are written with `Content-Length`; streamed responses
 //! are written with chunked transfer encoding — head first, then chunks

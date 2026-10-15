@@ -58,7 +58,7 @@ pub trait FieldEncoder {
 
 The build script SHALL:
 - Emit `cargo:rerun-if-changed=schemas/` so schemas are tracked for rebuild
-- Generate Rust bindings into `src/fbs/` organized by namespace (e.g., `src/fbs/selium/live_table/`)
+- Generate Rust bindings into `src/fbs/` organised by namespace (e.g., `src/fbs/selium/live_table/`)
 - Auto-generate `src/fbs/mod.rs` to re-export all generated modules
 
 #### Scenario: Schema change triggers rebuild
@@ -83,8 +83,8 @@ When applied to a struct with named fields, the macro SHALL generate:
 2. A `HasSchema` impl linking the type to its schema descriptor
 3. A `FieldEncoder` impl for use as a nested field in parent tables
 4. A `new()` constructor from all fields
-5. A `write_flatbuffer()` method that serializes the struct into a Flatbuffers builder
-6. A `from_flatbuffer()` method that deserializes from a Flatbuffers view
+5. A `write_flatbuffer()` method that serialises the struct into a Flatbuffers builder
+6. A `from_flatbuffer()` method that deserialises from a Flatbuffers view
 7. A `FlatMsg` impl providing `encode()` and `decode()`
 
 #### Scenario: Struct with scalar fields
@@ -112,7 +112,7 @@ The generated code SHALL include:
 1. A `HasSchema` impl
 2. A `FieldEncoder` impl (returning the Flatbuffers enum value directly)
 3. `write_flatbuffer()` mapping Rust variants to Flatbuffers enum values
-4. `from_flatbuffer()` mapping Flatbuffers enum values to Rust variants, with the fallback variant capturing unrecognized values
+4. `from_flatbuffer()` mapping Flatbuffers enum values to Rust variants, with the fallback variant capturing unrecognised values
 
 #### Scenario: Unit-only enum round-trip
 - **WHEN** a `#[schema]`-annotated enum with only unit variants is encoded and decoded
@@ -145,7 +145,7 @@ The generated code SHALL include:
 - **THEN** it SHALL produce valid Rust bindings without errors
 
 ### Requirement: encode_typed / decode_typed Use FlatMsg
-`selium-guest::codec` SHALL provide `encode_typed<T: FlatMsg>` and `decode_typed<T: FlatMsg>` functions that compose frame-level encoding/decoding with `FlatMsg` serialization. These SHALL replace the existing rkyv-based implementations.
+`selium-guest::codec` SHALL provide `encode_typed<T: FlatMsg>` and `decode_typed<T: FlatMsg>` functions that compose frame-level encoding/decoding with `FlatMsg` serialisation. These SHALL replace the existing rkyv-based implementations.
 
 #### Scenario: Typed codec round-trip
 - **WHEN** a `FlatMsg`-implementing type is encoded via `encode_typed` and decoded via `decode_typed`

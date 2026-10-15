@@ -18,7 +18,7 @@
 ### Requirement: RegionProt Enum
 `selium-abi` SHALL define a `RegionProt` enum with variants `ReadOnly` and `ReadWrite`.
 
-#### Scenario: RegionProt serialization
+#### Scenario: RegionProt serialisation
 - **WHEN** a `RegionProt::ReadOnly` value is encoded in a hostcall payload
 - **THEN** it SHALL be represented as `0u8` and `RegionProt::ReadWrite` as `1u8`
 

@@ -45,7 +45,7 @@ Page 1..N: ring buffer data
 `next_tail` is atomically CAS'd by writers across all processes. `reader_slots` are atomically updated by each strong reader. `writer_count` is atomically incremented/decremented across processes.
 
 **Fields staying in `ChannelPrivateState`:**
-- `tail_cache` — writer-local optimization, not needed across processes
+- `tail_cache` — writer-local optimisation, not needed across processes
 - `next_writer_id` — per-guest allocator, each guest gets a unique range or uses CAS on a shared counter (see Decision 3)
 - `next_mutation_id` — per-guest allocator, same reasoning
 
@@ -126,7 +126,7 @@ Each ring is single-writer by construction, so `next_tail` contention is never a
 
 ### 5. `next_writer_id` range allocation
 
-Rather than CAS on every writer creation, each guest can `fetch_add` a block of IDs from the shared counter and allocate from its local block. This is an optimization, not required for correctness. For the initial implementation, direct `fetch_add` on the shared counter is simpler and correct.
+Rather than CAS on every writer creation, each guest can `fetch_add` a block of IDs from the shared counter and allocate from its local block. This is an optimisation, not required for correctness. For the initial implementation, direct `fetch_add` on the shared counter is simpler and correct.
 
 ### 6. TCP stream: shared region with two rings
 
@@ -154,5 +154,5 @@ Rather than CAS on every writer creation, each guest can `fetch_add` a block of 
 
 ## Open Questions
 
-- Should `next_writer_id` and `next_mutation_id` also move to shared memory, or is per-guest allocation with a shared base sufficient? Leaning toward shared memory for simplicity, but the per-guest block allocation optimization can be added later.
+- Should `next_writer_id` and `next_mutation_id` also move to shared memory, or is per-guest allocation with a shared base sufficient? Leaning toward shared memory for simplicity, but the per-guest block allocation optimisation can be added later.
 - Does wasmtiny's `Store` expose a `notify_shared_region` method, or does the kernel need to use a different wake mechanism? If not exposed, writing to the generation counter via `write_shared_memory` should trigger the futex wake implicitly since it's the same `mmap`.

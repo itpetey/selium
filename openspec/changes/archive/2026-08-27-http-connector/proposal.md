@@ -14,7 +14,7 @@ strictest reading of non-negotiable 7 available in this architecture.
 
 HTTP is the first connector because "a web server guest" is the
 motivating use case, and because its mapping exercises the whole pattern
-catalog: unary RPC for typical requests, server-streaming
+catalogue: unary RPC for typical requests, server-streaming
 (`streaming-rpc-patterns`) for chunked/SSE bodies.
 
 ## What Changes

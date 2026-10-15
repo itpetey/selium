@@ -12,7 +12,7 @@
 
 - [x] 3.1 Add a host-held keyring (offline root, online intermediate, per-tenant CA keys) with a pluggable backing, and verify unit tests cover insert/lookup/delete and that no read path returns private keys
 - [x] 3.2 Implement signing hostcall dispatch — `SignTenantCa` generates a tenant CA keypair and signs via the intermediate, `SignUserCert` signs a client SPKI via the tenant's CA key, `RevokeCa` deletes the tenant key — gated by `MintCertificate`, and verify hostcall tests assert denial without the capability and no-private-key-output
-- [x] 3.3 Initialize the keyring at runtime startup (load/unlock the intermediate) and verify startup fails loudly when the intermediate is missing
+- [x] 3.3 Initialise the keyring at runtime startup (load/unlock the intermediate) and verify startup fails loudly when the intermediate is missing
 
 ## 4. Identity Guest
 
@@ -34,5 +34,5 @@
 
 ## 7. Bootstrap and Integration
 
-- [x] 7.1 Wire the identity `SystemGuestDescriptor` (grants including `MintCertificate`; readiness: keyring initialized, registries replayed, tables live) with connector and bridge readiness dependening on identity, and verify the bootstrap-order test passes
+- [x] 7.1 Wire the identity `SystemGuestDescriptor` (grants including `MintCertificate`; readiness: keyring initialised, registries replayed, tables live) with connector and bridge readiness dependening on identity, and verify the bootstrap-order test passes
 - [x] 7.2 Validate the single-host spine end to end — onboard a tenant, mint a user cert, connect a client through the connector, and resolve grants through the bridge — and verify the golden-path integration test passes

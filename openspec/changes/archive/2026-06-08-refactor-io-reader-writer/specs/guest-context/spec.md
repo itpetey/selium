@@ -26,4 +26,4 @@
 
 ### Requirement: Inline RPC implementation in Context
 **Reason**: `Context` previously implemented the RPC framing protocol inline (frame header encoding/decoding, generation counter polling, writer count checks) because `selium-rpc` depended on `selium-guest`, creating a circular dependency. With `RpcClient` now residing in `selium-guest::io::rpc`, the inline implementation is unnecessary.
-**Migration**: No guest code changes required. `Context::lookup` retains the same signature and behavior.
+**Migration**: No guest code changes required. `Context::lookup` retains the same signature and behaviour.

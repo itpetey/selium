@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Host-Agnostic Shared Region Layout
-The shared memory region SHALL contain ring buffer data, a generation counter for `memory.atomic.wait32`/`notify` synchronization, and cross-process coordination fields (`next_tail`, `writer_count`, `reader_slots`) in page 0. Process-local metadata (`tail_cache`, `next_writer_id`, `next_mutation_id`) SHALL reside in per-guest private memory.
+The shared memory region SHALL contain ring buffer data, a generation counter for `memory.atomic.wait32`/`notify` synchronisation, and cross-process coordination fields (`next_tail`, `writer_count`, `reader_slots`) in page 0. Process-local metadata (`tail_cache`, `next_writer_id`, `next_mutation_id`) SHALL reside in per-guest private memory.
 
 #### Scenario: Shared region contains channel coordination metadata
 - **WHEN** a guest inspects the shared region layout

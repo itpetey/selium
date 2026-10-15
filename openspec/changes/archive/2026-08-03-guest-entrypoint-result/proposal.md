@@ -44,10 +44,10 @@ Existing `()`-returning entrypoints are unchanged.
 
 - **Backward compatible**: All existing entrypoints continue to work as before.
 - **Error type constraint**: `E` in `Result<(), E>` must implement `std::error::Error` (providing `Display` for log messages).
-- **Host-side behavior**: Non-zero exit codes cause immediate bootstrap failure with the guest's error already in the activity log.
+- **Host-side behaviour**: Non-zero exit codes cause immediate bootstrap failure with the guest's error already in the activity log.
 
 ## Non-goals
 
 - `Result<T, E>` for `T != ()` (deferred until there's a concrete use case)
 - Structured error propagation via rkyv-encoded hostcalls (deferred)
-- Changing panic behavior — panics still abort the guest process
+- Changing panic behaviour — panics still abort the guest process

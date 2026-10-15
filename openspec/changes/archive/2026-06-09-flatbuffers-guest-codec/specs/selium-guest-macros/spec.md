@@ -27,7 +27,7 @@ At compile time, the macro SHALL:
 
 #### Scenario: Enum with fallback variant
 - **WHEN** an enum has unit variants plus one tuple variant (e.g., `Unknown(i8)`) and is annotated with `#[schema(...)]`
-- **THEN** `from_flatbuffer` SHALL map unrecognized Flatbuffers enum values to the fallback variant, preserving the raw discriminant
+- **THEN** `from_flatbuffer` SHALL map unrecognised Flatbuffers enum values to the fallback variant, preserving the raw discriminant
 
 #### Scenario: Schema hash reflects .fbs content
 - **WHEN** the `.fbs` file referenced by `path` is modified between compilations

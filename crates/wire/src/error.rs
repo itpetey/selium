@@ -36,8 +36,8 @@ pub enum Error {
     ConnectionLost,
     #[error("channel terminated")]
     Terminated,
-    #[error("serialization error: {0}")]
-    SerializationFailed(String),
+    #[error("serialisation error: {0}")]
+    SerialisationFailed(String),
     #[error("invalid shared region")]
     InvalidRegion,
     #[error("region layout mismatch")]
@@ -108,8 +108,8 @@ mod tests {
         assert_eq!(Error::ConnectionLost.to_string(), "connection lost");
         assert_eq!(Error::Terminated.to_string(), "channel terminated");
         assert_eq!(
-            Error::SerializationFailed("bad".to_string()).to_string(),
-            "serialization error: bad"
+            Error::SerialisationFailed("bad".to_string()).to_string(),
+            "serialisation error: bad"
         );
         assert_eq!(Error::InvalidRegion.to_string(), "invalid shared region");
         assert_eq!(Error::LayoutMismatch.to_string(), "region layout mismatch");

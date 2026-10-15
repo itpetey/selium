@@ -192,4 +192,4 @@ unaffected. Rollback is "revert the change"; no data migration applies.
   the connector) — deferred; does not change specs or tasks here.
 - Default listener address/port and default ALPN list — policy to confirm
   at implementation time from provisioning conventions; recorded in the
-  connector's config, not in spec behavior.
+  connector's config, not in spec behaviour.

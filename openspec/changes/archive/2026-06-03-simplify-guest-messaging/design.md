@@ -149,7 +149,7 @@ enum Error {
     InvalidFrame,
     ChannelClosed,
     ConnectionLost,
-    SerializationFailed,
+    SerialisationFailed,
 }
 ```
 
@@ -165,6 +165,6 @@ No `From` chains, no nested wrapping. Each variant maps directly to a distinct f
 |------|------------|
 | Breaking ABI change for all existing guest modules | Version the ABI; old guests continue to work with old `Signal`+`SharedMemory` hostcalls behind a compatibility layer |
 | Generation counter overflow on 32-bit `wait32` | Use `wait64` on 64-bit counter for 64-bit guests; 32-bit guests wrap safely after ~4 billion notifications (decades at 100K/s) |
-| `mprotect` per-page overhead at attach time | One `mprotect` syscall per reader slot per attach; amortized over the lifetime of the channel (minutes to hours) |
+| `mprotect` per-page overhead at attach time | One `mprotect` syscall per reader slot per attach; amortised over the lifetime of the channel (minutes to hours) |
 | Release/acquire fence portability | WASM threads spec guarantees correct lowering to all target architectures; x86 fences are no-ops; ARM uses `stlr`/`ldar` |
 | Snapshot compatibility with shared pages | Snapshots skip shared pages (they're not owned by the instance); restoring an instance re-attaches shared regions by ID |

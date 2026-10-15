@@ -28,7 +28,7 @@ const ITERATIONS: u64 = 1 << 26;
 
 /// A CPU-bound task: `iterations` updates of a task-local accumulator. The
 /// loop-carried dependency (a multiply-add chain) cannot be folded into a
-/// closed form, and the inputs are `black_box`ed so the optimizer cannot treat
+/// closed form, and the inputs are `black_box`ed so the optimiser cannot treat
 /// the loop as constant — so the work is real and measurable.
 async fn cpu_bound(iterations: u64) {
     let mut acc: u64 = std::hint::black_box(0);

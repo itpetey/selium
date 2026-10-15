@@ -68,7 +68,7 @@
 ## 7. Create reference bridge guest
 
 - [x] 7.1 Scaffold `crates/guests/bridge/` as a `cdylib` guest crate depending on `selium-guest`
-- [x] 7.2 Implement `main()` or `#[entrypoint]` that initializes QUIC via `selium-guest::net::quinn`, listens for streams
+- [x] 7.2 Implement `main()` or `#[entrypoint]` that initialises QUIC via `selium-guest::net::quinn`, listens for streams
 - [x] 7.3 For each accepted QUIC stream, create `QuicTransport` (from `selium-quic`) and relay frames to/from `ShmTransport` rings within the bridge's capability grants
 - [x] 7.4 Implement transparent relay: read frame from one transport, write identical frame to the other; preserve correlation tags
 - [x] 7.5 Add `crates/guests/bridge/` to workspace members

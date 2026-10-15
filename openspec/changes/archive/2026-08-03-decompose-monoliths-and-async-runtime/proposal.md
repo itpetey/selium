@@ -64,7 +64,7 @@ Both `selium-kernel` and `selium-runtime` specs need updates:
 - **Kernel loses tokio dep.** Cleaner dependency graph.
 - **Runtime gains tokio dep.** Already in the workspace dependency tree.
 - **Network I/O moves across crate boundary.** `network_runtime.rs` (~860 lines) becomes `runtime/src/network.rs` and is rewritten from threads to tokio tasks.
-- **Concurrency model changes.** Tests that relied on `std::thread::sleep` for synchronization against background threads may need `tokio::time::sleep` or different synchronization strategies.
+- **Concurrency model changes.** Tests that relied on `std::thread::sleep` for synchronisation against background threads may need `tokio::time::sleep` or different synchronisation strategies.
 
 ## Risks
 

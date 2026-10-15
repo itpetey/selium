@@ -30,6 +30,6 @@
 The stream-level frame handling (`QuicTransport` implementing `MessageTransport`) SHALL reside in `selium-quic`. The datagram transport (`QuinnUdpSocket` with shared-memory rings) SHALL remain in `selium-guest`. Bridge guests SHALL use both: the datagram transport to run quinn, and `selium-quic` to wrap streams.
 
 #### Scenario: Bridge guest composes datagram transport + stream transport
-- **WHEN** a bridge guest initializes quinn with `QuinnUdpSocket` (from `selium-guest`)
+- **WHEN** a bridge guest initialises quinn with `QuinnUdpSocket` (from `selium-guest`)
 - **AND** wraps accepted streams in `QuicTransport` (from `selium-quic`)
 - **THEN** the bridge SHALL have full QUIC connectivity and stream-level `MessageTransport` semantics

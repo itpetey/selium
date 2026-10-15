@@ -1,6 +1,6 @@
 # Tasks: Decompose Monoliths and Make Runtime Async
 
-## Phase 1: Kernel Sub-Structs (no behavior change)
+## Phase 1: Kernel Sub-Structs (no behaviour change)
 
 - [x] **1.1** Extract `MemoryRegistry` from `KernelInner`. Move `store`, `shared_regions`, `shared_mappings`, `next_local_id`, `next_shared_id` into new struct. Move `memory.rs` methods to `impl MemoryRegistry`. Keep `id_seed` on `KernelInner`; pass to `MemoryRegistry::new(seed)`.
 - [x] **1.2** Extract `ProcessTable` from `KernelInner`. Move `processes`, `activity_log`, `activity_log_changed`, `guest_logs`, `metering`, `next_process_id` into new struct. Move `process.rs` methods to `impl ProcessTable`. Pass `id_seed` at construction.
@@ -12,7 +12,7 @@
 - [x] **1.8** Remove dead code: `Kernel::host_queue_recv` async fn.
 - [x] **1.9** Drop tokio dependency from `selium-kernel`. Replace `tokio::sync::Notify` in `HostQueueState` with `parking_lot::Condvar`. Update `close_tcp_listener` to use condvar.
 
-## Phase 2: Runtime Sub-Structs (no behavior change)
+## Phase 2: Runtime Sub-Structs (no behaviour change)
 
 - [x] **2.1** Extract `GuestTable` from `Runtime`. Move `loaded_guests`, `module_registry` and their methods.
 - [x] **2.2** Extract `ProcessAuthorityTable` from `Runtime`. Move `process_authorities` and authority methods (`persist`, `restore`, `tenant`, `set_parent`).

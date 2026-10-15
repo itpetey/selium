@@ -19,6 +19,6 @@ The QUIC connector guest (`selium-connector-quic`) SHALL implement `quinn::UdpSe
 The connector guest SHALL own both halves of QUIC data movement: the datagram adapter (`AsyncUdpSocket` over shared-memory rings) and the per-stream byte relay SHALL reside in `selium-connector-quic`. App guests SHALL NOT depend on quinn; the connector SHALL deliver relayed byte channels via `selium-guest::net::quic` over shared memory.
 
 #### Scenario: Bridge guest composes datagram transport + stream transport
-- **WHEN** a connector guest (successor to the bridge) initializes quinn with its `AsyncUdpSocket` adapter (implemented in `selium-connector-quic`)
+- **WHEN** a connector guest (successor to the bridge) initialises quinn with its `AsyncUdpSocket` adapter (implemented in `selium-connector-quic`)
 - **AND** relays accepted streams to app guests as per-stream shared-memory byte channels
 - **THEN** the external QUIC client SHALL have full connectivity, and the app guest SHALL read and write bytes with no quinn dependency

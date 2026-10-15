@@ -1,8 +1,8 @@
 //! Selium runtime built on top of Wasmtiny and the Selium kernel.
 
 pub use config::{
-    BootstrapReport, BootstrappedGuest, ProcessAuthority, ReadinessCondition, RuntimeConfig,
-    SystemGuestArg, SystemGuestDescriptor,
+    BootstrapReport, BootstrappedGuest, ProcessAuthority, RuntimeConfig, SystemGuestArg,
+    SystemGuestDescriptor,
 };
 pub use error::{Error, Result};
 pub use keyring::{CaStore, InMemoryCaStore, KeyMaterial, Keyring, KeyringBootstrap, KeyringError};

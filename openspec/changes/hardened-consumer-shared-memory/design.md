@@ -135,4 +135,4 @@ The fix: consumers get `PROT_READ` for everything, and position updates go throu
 7. Update `Channel::attach` to validate layout version and size.
 8. Update consumer attach paths to use `RegionProt::ReadOnly` with `reader_slot: None`.
 
-**Rollback:** Each step is independently testable. The old layout and direct-write path can coexist with the new hostcall path during migration — old code uses the old mechanism, new code uses the new one. Regions created by new code are incompatible with old code (version mismatch), which is the desired behavior.
+**Rollback:** Each step is independently testable. The old layout and direct-write path can coexist with the new hostcall path during migration — old code uses the old mechanism, new code uses the new one. Regions created by new code are incompatible with old code (version mismatch), which is the desired behaviour.

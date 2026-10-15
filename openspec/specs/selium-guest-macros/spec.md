@@ -39,7 +39,7 @@ Provide procedural macros for Selium guest entrypoints and generated guest inter
 
 #### Scenario: Existing void entrypoint unchanged
 - **WHEN** a guest defines `#[entrypoint] async fn main()`
-- **THEN** the generated glue SHALL be identical in behavior to the current implementation
+- **THEN** the generated glue SHALL be identical in behaviour to the current implementation
 - **AND** the export SHALL have no return value
 
 ### Requirement: Generated Pattern Metadata
@@ -140,26 +140,26 @@ The macro SHALL automatically detect which struct fields reference generic type 
 #### Scenario: Direct generic field detection
 
 - **WHEN** `struct Msg<K> { pub key: K }` is processed
-- **THEN** the macro SHALL identify `key` as a byte-serialized field because `K` is a generic parameter
+- **THEN** the macro SHALL identify `key` as a byte-serialised field because `K` is a generic parameter
 - **AND** the generated wire field SHALL be `pub key_bytes: Vec<u8>`
 
 #### Scenario: Option-wrapped generic field detection
 
 - **WHEN** `struct Msg<V> { pub value: Option<V> }` is processed
-- **THEN** the macro SHALL identify `value` as a byte-serialized field because `V` is a generic parameter inside `Option`
+- **THEN** the macro SHALL identify `value` as a byte-serialised field because `V` is a generic parameter inside `Option`
 - **AND** the generated wire field SHALL be `pub value_bytes: Vec<u8>`
 
 #### Scenario: Concrete type field is not detected as generic
 
 - **WHEN** `struct Msg<K> { pub id: u64 }` is processed and `u64` is not a generic parameter
-- **THEN** the macro SHALL NOT treat `id` as byte-serialized
+- **THEN** the macro SHALL NOT treat `id` as byte-serialised
 - **AND** the generated wire field SHALL be `pub id: u64` (pass-through)
 
 ### Requirement: Bridge encode impl for generic types
 
-The macro SHALL generate `FlatMsg::encode` on the domain type that: for each byte-serialized field, calls `FlatMsg::encode` on the field value to produce `Vec<u8>`; for each `Option<generic>` field, encodes `Some` values to bytes and `None` to empty `Vec`; for each `Option<scalar>` field, converts `None` to the zero sentinel; constructs the wire struct with all converted fields; and delegates to `FlatMsg::encode(&wire)`.
+The macro SHALL generate `FlatMsg::encode` on the domain type that: for each byte-serialised field, calls `FlatMsg::encode` on the field value to produce `Vec<u8>`; for each `Option<generic>` field, encodes `Some` values to bytes and `None` to empty `Vec`; for each `Option<scalar>` field, converts `None` to the zero sentinel; constructs the wire struct with all converted fields; and delegates to `FlatMsg::encode(&wire)`.
 
-#### Scenario: Encode serializes generics to bytes
+#### Scenario: Encode serialises generics to bytes
 
 - **WHEN** `encode` is called on `Msg { key: "hello".to_string() }` where `key: K` and `K = String`
 - **THEN** the generated code SHALL call `FlatMsg::encode(&value.key)` to produce the bytes for `key_bytes`
@@ -176,7 +176,7 @@ The macro SHALL generate `FlatMsg::encode` on the domain type that: for each byt
 
 ### Requirement: Bridge decode impl for generic types
 
-The macro SHALL generate `FlatMsg::decode` on the domain type that: decodes the wire struct via `FlatMsg::decode(bytes)`; for each byte-serialized field, calls `FlatMsg::decode(&wire.field_bytes)` to reconstruct the typed value; for each `Option<generic>` field, returns `None` if bytes are empty and `Some(FlatMsg::decode(...))` otherwise; for each `Option<scalar>` field, converts the zero sentinel to `None`.
+The macro SHALL generate `FlatMsg::decode` on the domain type that: decodes the wire struct via `FlatMsg::decode(bytes)`; for each byte-serialised field, calls `FlatMsg::decode(&wire.field_bytes)` to reconstruct the typed value; for each `Option<generic>` field, returns `None` if bytes are empty and `Some(FlatMsg::decode(...))` otherwise; for each `Option<scalar>` field, converts the zero sentinel to `None`.
 
 #### Scenario: Decode reconstructs generics from bytes
 

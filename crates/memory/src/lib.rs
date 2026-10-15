@@ -867,7 +867,7 @@ pub fn register_generation_wait(
 /// Installs a global region provider.
 ///
 /// This should be called once per process, typically during guest or runtime
-/// initialization. Subsequent calls return an error.
+/// initialisation. Subsequent calls return an error.
 pub fn set_region_provider(provider: Box<dyn RegionProvider>) -> Result<()> {
     GLOBAL_REGION_PROVIDER
         .set(provider)

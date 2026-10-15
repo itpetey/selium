@@ -40,7 +40,7 @@ The crate SHALL map bridge termination frames (`PipeControl::Terminate`) to type
 - **THEN** the channel open SHALL return an error carrying the termination code (bad handshake vs attach failure), for every handle type
 
 ### Requirement: Unified Error Surface
-Connection, TLS, transport, framing, RPC, and termination failures SHALL surface through one crate error type. Underlying `selium-wire` errors SHALL pass through a dedicated wire variant; failures the client can classify (termination codes, remote stream errors, serialization) SHALL map to dedicated variants.
+Connection, TLS, transport, framing, RPC, and termination failures SHALL surface through one crate error type. Underlying `selium-wire` errors SHALL pass through a dedicated wire variant; failures the client can classify (termination codes, remote stream errors, serialisation) SHALL map to dedicated variants.
 
 #### Scenario: Connection failure surfaces typed error
 - **WHEN** a connect or channel open fails for any reason

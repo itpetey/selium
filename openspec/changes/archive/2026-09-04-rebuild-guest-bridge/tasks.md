@@ -31,7 +31,7 @@
 - [x] 5.1 Scaffold the `bridge-channel` crate (cdylib) and add to workspace members; verify wasm32 build succeeds
 - [x] 5.2 Attach the delivered region as a `ByteStream` (`attach_blocking`) from the entrypoint arg; verify byte round-trip against a connector-style peer half (mirror the existing `stream.rs` test)
 - [x] 5.3 Read the typed handshake frame naming a channel URI, resolve it via discovery, and `AttachRegion` the ring; verify the resolve-and-attach happy path with a test
-- [x] 5.4 On denied attach, send a typed termination frame and close the stream; verify the "Bridge attempts to attach to unauthorized channel" scenario
+- [x] 5.4 On denied attach, send a typed termination frame and close the stream; verify the "Bridge attempts to attach to unauthorised channel" scenario
 - [x] 5.5 Splice frames stream⇄ring using `FramedRead`/`FramedWrite` over the byte channel and `ShmTransport`, preserving tag/flags/payload; verify an RPC correlation tag preserved end-to-end (tag 7 in/out)
 - [x] 5.6 Tear down the whole pipe on either half closing — client FIN drops the fabric membership and exits, fabric close finishes/resets the stream and exits; verify both directions (incl. a quiet fabric channel after client disconnect)
 

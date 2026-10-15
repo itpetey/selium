@@ -14,7 +14,7 @@
 - [x] 2.3 Convert discovery, discovery-probe, dns-demo, quic-demo, net-demo, spine-demo entrypoints (anyhow already present on discovery-probe; add `anyhow = { workspace = true, features = ["std"] }` to the 10 fallible guests); verify all guest wasm32 builds and guest/runtime test suites pass.
 - [x] 2.4 Leave the four infallible entrypoints (external-api, supervisor, scheduler, cluster) as `()`; verify workspace `cargo check --all-targets` stays clean.
 
-## 3. Error type standardization (thiserror)
+## 3. Error type standardisation (thiserror)
 
 - [x] 3.1 Convert connector-quic/connector-http `TlsError` and connector-http `ForwardError` to `#[derive(thiserror::Error)]`, add `thiserror.workspace = true` to both connectors; verify host checks, clippy, and wasm32 builds.
 - [x] 3.2 Convert `RpcError` (wire), `HttpServeError` + `InitError` (guest SDK), and `WireError` (proto-dns, new `thiserror` dep) to derives; remove now-unused `fmt` imports; verify wire/guest/proto-dns checks, clippy, and tests.

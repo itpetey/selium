@@ -10,7 +10,7 @@ Handles SHALL include `Reader` (strong byte-stream reader), `WeakReader` (weak b
 - **THEN** the SDK SHALL expose a typed handle rather than requiring direct ABI framing code
 
 ### Requirement: Messaging-Pattern Layer
-`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronization without signal hostcalls. The pattern layer SHALL use `FramedRead`/`FramedWrite` wrappers over byte-stream `Reader`/`Writer` types rather than reimplementing `FrameHeader` encoding/decoding in each pattern.
+`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronisation without signal hostcalls. The pattern layer SHALL use `FramedRead`/`FramedWrite` wrappers over byte-stream `Reader`/`Writer` types rather than reimplementing `FrameHeader` encoding/decoding in each pattern.
 
 #### Scenario: Guest selects messaging pattern
 - **WHEN** guest code needs pub/sub, fanout, request/reply, stream, or live-table semantics

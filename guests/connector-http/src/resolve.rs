@@ -143,7 +143,7 @@ impl RouteResolver {
         host: &str,
         path: &str,
     ) -> Result<ResourceTarget, ResolveError> {
-        let host = uri::normalize_host(host);
+        let host = uri::normalise_host(host);
         let cache_key = format!("{}:{}", host, path);
         if let Some(route) = self.cache.get(&cache_key) {
             return Ok(route.target.clone());

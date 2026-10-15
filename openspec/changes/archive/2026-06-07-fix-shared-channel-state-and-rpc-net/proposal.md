@@ -5,11 +5,11 @@ The "dumb host, smart guest" migration moved cross-process coordination metadata
 ## What Changes
 
 - **BREAKING**: Move `next_tail`, `writer_count`, and `reader_slots` from per-guest `ChannelPrivateState` back into the shared memory region, so channels support many-to-many cross-process coordination with proper backpressure
-- Keep `tail_cache`, `next_writer_id`, and `next_mutation_id` in per-guest private memory as process-local optimizations
+- Keep `tail_cache`, `next_writer_id`, and `next_mutation_id` in per-guest private memory as process-local optimisations
 - Implement the `selium-rpc` crate with `RpcClient`, `RpcConnection`, `RpcRequest`, and `RpcAccept` on top of the fixed ring buffer
 - Un-stub `TcpStream` and `UdpSocket` guest handles to attach shared regions returned by kernel network hostcalls and read/write via `RingBuf`
 - Rewrite kernel network proxy (`proxy_inbound`, `proxy_outbound`, `udp_proxy_recv`, `udp_proxy_send`) to use the unified ring buffer layout with shared-memory coordination fields
-- Remove the kernel-side `read_shared_memory`/`write_shared_memory`-based ring buffer implementation in `network_runtime.rs` in favor of directly operating on the shared region layout that guests use
+- Remove the kernel-side `read_shared_memory`/`write_shared_memory`-based ring buffer implementation in `network_runtime.rs` in favour of directly operating on the shared region layout that guests use
 - Un-stub `Context::from_raw` and `Context::lookup` once the RPC client is working
 
 ## Capabilities

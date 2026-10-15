@@ -79,7 +79,7 @@ See proposal.md - Why. This design is shaped by the foundation already in place:
 
 ### 8. Bootstrap authority
 
-**Decision:** Identity boots as a system guest holding `MintCertificate` (bootstrap-provisioned), `Storage` (registries), `SystemRegistration` (root/suitably-scoped registration), and its interface privileges. It registers a root-namespace serving route (e.g. `sel:///identity`). Readiness is satisfied when the host keyring is initialized, the intermediate is loaded, the registries are replayed, and the anchor/grant tables are live. Connector readiness depends on identity readiness (anchor table available).
+**Decision:** Identity boots as a system guest holding `MintCertificate` (bootstrap-provisioned), `Storage` (registries), `SystemRegistration` (root/suitably-scoped registration), and its interface privileges. It registers a root-namespace serving route (e.g. `sel:///identity`). Readiness is satisfied when the host keyring is initialised, the intermediate is loaded, the registries are replayed, and the anchor/grant tables are live. Connector readiness depends on identity readiness (anchor table available).
 
 ## Risks / Trade-offs
 
@@ -87,7 +87,7 @@ See proposal.md - Why. This design is shaped by the foundation already in place:
 - **[Identity guest becomes a single point of failure]** → Durable-log state + restart-based recovery; the runtime supervisor restarts it.
 - **[Connector anchor staleness across the cluster]** → Live-table push with verifier rebuild; cross-host propagation is deferred and addressed under cluster work.
 - **[ABI enum growth]** → New variants are additive and rkyv-encoded; keep them minimal (three hostcalls, one capability).
-- **[Scope of the mint capability needs care in the admission matrix]** → Reuse the `DelegateGrants` non-conferability rule verbatim; keep admission centralized in `capability-enforcement`.
+- **[Scope of the mint capability needs care in the admission matrix]** → Reuse the `DelegateGrants` non-conferability rule verbatim; keep admission centralised in `capability-enforcement`.
 
 ## Migration Plan
 

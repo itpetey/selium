@@ -3,7 +3,7 @@
 ### Requirement: Typed RPC Client
 `selium-guest::io::rpc` SHALL provide an `RpcClient<Req, Rep>` that sends typed requests and receives typed replies over shared-memory ring buffers. The client SHALL use `FramedWrite` for the request ring and `FramedRead` for the reply ring, rather than working with `RingBuf` directly.
 
-Both `Req` and `Rep` SHALL implement `FlatMsg` for serialization. The framing layer remains codec-agnostic.
+Both `Req` and `Rep` SHALL implement `FlatMsg` for serialisation. The framing layer remains codec-agnostic.
 
 #### Scenario: Client sends request and receives reply
 - **WHEN** a client calls `RpcClient::request(req)` with a valid request payload
@@ -16,7 +16,7 @@ Both `Req` and `Rep` SHALL implement `FlatMsg` for serialization. The framing la
 ### Requirement: Typed RPC Connection
 `selium-guest::io::rpc` SHALL provide an `RpcConnection<Req, Rep>` that receives typed requests and allows sending typed replies. The connection SHALL use `FramedRead` for the request ring and `FramedWrite` for the reply ring.
 
-Both `Req` and `Rep` SHALL implement `FlatMsg` for serialization.
+Both `Req` and `Rep` SHALL implement `FlatMsg` for serialisation.
 
 #### Scenario: Server receives request and sends reply
 - **WHEN** a server calls `RpcConnection::recv()` and a request frame is available on the request ring

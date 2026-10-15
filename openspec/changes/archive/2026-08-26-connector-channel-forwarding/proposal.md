@@ -22,7 +22,7 @@ story rests on unstated behaviour.
   rendezvous delivery → `rpc::accept` server side. Composes existing
   primitives (`discovery-registration`, `secure-rpc`,
   `capability-enforcement`); introduces no new transport mechanism.
-- **Authorize `HostQueueAttach`**: attach to a host queue owned by
+- **Authorise `HostQueueAttach`**: attach to a host queue owned by
   another process SHALL require an `ExplicitResource` grant naming that
   queue or receipt of the queue descriptor through discovery under a
   granted URI. Ungranted attach attempts are denied loudly.

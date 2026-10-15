@@ -261,7 +261,7 @@ where
             if crate::free_region(shared_id).is_err() {
                 // Best-effort reclaim; surface the rendezvous error instead.
             }
-            return Err(RpcError::Serialization(format!(
+            return Err(RpcError::Serialisation(format!(
                 "rendezvous send failed: {error}"
             )));
         }
@@ -332,7 +332,7 @@ where
             if crate::free_region(shared_id).is_err() {
                 // Best-effort reclaim; surface the rendezvous error instead.
             }
-            return Err(RpcError::Serialization(format!(
+            return Err(RpcError::Serialisation(format!(
                 "rendezvous send failed: {error}"
             )));
         }
@@ -382,10 +382,10 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
         Error::ConnectionLost | Error::ChannelClosed | Error::Terminated => {
             RpcError::ConnectionClosed
         }
-        Error::SerializationFailed(message) | Error::Guest(message) => {
-            RpcError::Serialization(message)
+        Error::SerialisationFailed(message) | Error::Guest(message) => {
+            RpcError::Serialisation(message)
         }
-        other => RpcError::Serialization(other.to_string()),
+        other => RpcError::Serialisation(other.to_string()),
     }
 }
 

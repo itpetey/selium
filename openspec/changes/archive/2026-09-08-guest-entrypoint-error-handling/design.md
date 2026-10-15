@@ -25,7 +25,7 @@ custom error types still hand-rolled `Error + Display`.
 
 **Non-Goals:**
 
-- Changing the ABI or exit codes (behavior-identical conversions).
+- Changing the ABI or exit codes (behaviour-identical conversions).
 - Making infallible `()` entrypoints fallible.
 - `anyhow` in `selium-guest` itself (SDK errors stay typed
   `GuestError`; guests compose with `anyhow`).
@@ -43,7 +43,7 @@ The `Result` path flows through the existing
 
 - *Alternative:* always `?` — impossible for `()` entrypoints (no error
   channel); always `.expect` — forfeits graceful failure where an error
-  channel exists. The per-return-kind branch keeps both behaviors.
+  channel exists. The per-return-kind branch keeps both behaviours.
 
 ### 2. `Context` owns the raw handle
 
@@ -112,7 +112,7 @@ code.
   exactly the guests with the most fallible startup.
 - *Alternative:* keep the panic and require services to spawn their loop
   and return — an intrusive restructuring of every service guest for no
-  behavioral gain.
+  behavioural gain.
 
 ## Risks / Trade-offs
 
@@ -121,13 +121,13 @@ code.
 - [`Context::from_raw` panic path removed for `Result` entrypoints]
   → exit code stays 1, log emission unchanged; only the mechanism
   (panic vs `Err`) differs.
-- [fmt normalizes untouched code (e.g. a guest `net/quic.rs` test
+- [fmt normalises untouched code (e.g. a guest `net/quic.rs` test
   assertion)] → benign style-only churn inside an already-touched crate;
   `cargo fmt --all` is a repo gate.
 
 ## Migration Plan
 
-No runtime/ABI migration: duplicates of the old behavior do not coexist.
+No runtime/ABI migration: duplicates of the old behaviour do not coexist.
 Docs (`SystemGuestDescriptor::set_discovery_handle`, OpenSpec wording)
 updated in the same change so no stale "manual `Context::from_raw`"
 guidance survives.

@@ -277,7 +277,7 @@ where
                     let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
                         Ok(msg) => msg,
                         Err(e) => {
-                            return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                            return std::task::Poll::Ready(Err(Error::SerialisationFailed(
                                 format!("{e}"),
                             )));
                         }
@@ -365,7 +365,7 @@ where
                         let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
                             Ok(msg) => msg,
                             Err(e) => {
-                                return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                                return std::task::Poll::Ready(Err(Error::SerialisationFailed(
                                     format!("{e}"),
                                 )));
                             }
@@ -530,7 +530,7 @@ where
                     let msg: LiveTableMessage<K, V> = match FlatMsg::decode(&payload) {
                         Ok(msg) => msg,
                         Err(e) => {
-                            return std::task::Poll::Ready(Err(Error::SerializationFailed(
+                            return std::task::Poll::Ready(Err(Error::SerialisationFailed(
                                 format!("{e}"),
                             )));
                         }

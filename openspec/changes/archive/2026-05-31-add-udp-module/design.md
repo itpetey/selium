@@ -15,7 +15,7 @@ The kernel already has the infrastructure for shared-memory ring buffers, signal
 
 **Non-Goals:**
 - Quinn integration (deferred to a separate change)
-- High-performance optimizations (GSO, GRO, segment offload) — single-datagram per channel frame is sufficient initially
+- High-performance optimisations (GSO, GRO, segment offload) — single-datagram per channel frame is sufficient initially
 - Connected UDP sockets (`connect(2)`) — addressing is always explicit per datagram
 - ICMP or error reporting beyond `WouldBlock` / basic I/O errors
 

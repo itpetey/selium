@@ -140,7 +140,7 @@ impl CaStore for InMemoryCaStore {
 impl Keyring {
     /// Initialises a keyring from bootstrap material, failing loudly when the
     /// intermediate is missing or invalid.
-    pub fn initialize(
+    pub fn initialise(
         tenant_cas: Box<dyn CaStore>,
         bootstrap: KeyringBootstrap,
     ) -> Result<Self, KeyringError> {
@@ -337,7 +337,7 @@ impl KeyringStore {
     /// when the state directory holds none.
     pub fn load_or_generate(&self) -> Result<Keyring, KeyringError> {
         if let Some(bootstrap) = self.load()? {
-            return Keyring::initialize(Box::new(FileCaStore::new(self.tenants_dir())), bootstrap);
+            return Keyring::initialise(Box::new(FileCaStore::new(self.tenants_dir())), bootstrap);
         }
         let keyring = Keyring::generate()?;
         self.persist(&keyring)?;
@@ -495,8 +495,8 @@ mod tests {
     }
 
     #[test]
-    fn initialize_fails_loudly_without_intermediate() {
-        let result = Keyring::initialize(
+    fn initialise_fails_loudly_without_intermediate() {
+        let result = Keyring::initialise(
             Box::new(InMemoryCaStore::default()),
             KeyringBootstrap {
                 root: None,
@@ -507,8 +507,8 @@ mod tests {
     }
 
     #[test]
-    fn initialize_rejects_invalid_intermediate() {
-        let result = Keyring::initialize(
+    fn initialise_rejects_invalid_intermediate() {
+        let result = Keyring::initialise(
             Box::new(InMemoryCaStore::default()),
             KeyringBootstrap {
                 root: None,

@@ -1,8 +1,8 @@
 ## Context
 
-The arch3 guest SDK (`selium-guest`) currently uses `rkyv` for all serialization — pub/sub messages, RPC requests/replies, and live table records. The prior art in `../main/system/userland/` demonstrates a proven two-layer approach: `rkyv` for internal hostcall (driver) transport, and Flatbuffers for public wire protocols between guests. This design extends that pattern to arch3.
+The arch3 guest SDK (`selium-guest`) currently uses `rkyv` for all serialisation — pub/sub messages, RPC requests/replies, and live table records. The prior art in `../main/system/userland/` demonstrates a proven two-layer approach: `rkyv` for internal hostcall (driver) transport, and Flatbuffers for public wire protocols between guests. This design extends that pattern to arch3.
 
-The framing layer (`FrameHeader`, `FramedRead`, `FramedWrite`, ring buffer I/O) is already codec-agnostic — it operates on raw `[u8]` payloads. This means the serialization codec can be swapped without touching the transport layer.
+The framing layer (`FrameHeader`, `FramedRead`, `FramedWrite`, ring buffer I/O) is already codec-agnostic — it operates on raw `[u8]` payloads. This means the serialisation codec can be swapped without touching the transport layer.
 
 ## Goals / Non-Goals
 
@@ -147,7 +147,7 @@ The `SchemaDescriptor` adds a content-addressable layer:
 
 ## Risks / Trade-offs
 
-- **Larger wire size**: Flatbuffers includes field offsets and vtable metadata. For small messages, this overhead is noticeable. Mitigation: Flatbuffers' zero-copy access means we don't pay deserialization CPU cost, and the schema-driven approach gives us the option to use `force_align` and other space optimizations.
+- **Larger wire size**: Flatbuffers includes field offsets and vtable metadata. For small messages, this overhead is noticeable. Mitigation: Flatbuffers' zero-copy access means we don't pay deserialisation CPU cost, and the schema-driven approach gives us the option to use `force_align` and other space optimisations.
 
 - **Build dependency on flatc-fork**: `flatc-fork` is a less-commonly-used crate. Mitigation: It's already vetted in the prior art (`../main/`), and the generated code is checked in so builds work without it once the generated files exist.
 

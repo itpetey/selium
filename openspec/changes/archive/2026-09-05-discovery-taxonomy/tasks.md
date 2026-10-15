@@ -8,7 +8,7 @@
 
 - [x] 2.1 Rewrite `registration_uris`/`queue_registration_uri` in `discovery.rs` to emit `sel://<tenant>/<type>/<id>` (principal tenant, singular segments, no purpose alias); verify the unit tests assert the new URIs
 - [x] 2.2 Register a `sel://<tenant>/proc/<id>` node at spawn and revoke it in `cleanup_process_resources`; verify new tests for spawn-register and teardown-revoke
-- [x] 2.3 Thread the serving tenant through `AllocRegion` (and the byte-channel allocation path) and authorize cross-tenant allocation via tenant-scoped delegation, denying otherwise; verify "system allocates for another tenant" and "unauthorized cross-tenant denied" tests
+- [x] 2.3 Thread the serving tenant through `AllocRegion` (and the byte-channel allocation path) and authorise cross-tenant allocation via tenant-scoped delegation, denying otherwise; verify "system allocates for another tenant" and "unauthorised cross-tenant denied" tests
 - [x] 2.4 Move well-known channel URIs to the root tenant (`sel:///dns/resolve` style) in bootstrap provisioning and teardown; verify the provision/revoke scenarios against the new URIs
 
 ## 3. Discovery guest: store and query rewrite
@@ -22,8 +22,8 @@
 
 ## 4. Connectors: external-name resolution
 
-- [x] 4.1 In `http`/`dns`/`quic` route resolution, replace `sel-<proto>://` construction with normalization of the incoming address and an external-name lookup; verify route resolution tests use the new keys
-- [x] 4.2 Remove `protocol_uri`/`is_protocol_scheme` usage from connector code paths; verify `uri.rs` compiles with those helpers deleted or reduced to internal normalization
+- [x] 4.1 In `http`/`dns`/`quic` route resolution, replace `sel-<proto>://` construction with normalisation of the incoming address and an external-name lookup; verify route resolution tests use the new keys
+- [x] 4.2 Remove `protocol_uri`/`is_protocol_scheme` usage from connector code paths; verify `uri.rs` compiles with those helpers deleted or reduced to internal normalisation
 
 ## 5. Integration and validation
 
@@ -34,10 +34,10 @@
 ## 6. Review follow-ups (hardening and spec alignment)
 
 - [x] 6.1 Add `quic-connector` and `guest-bridge` delta specs (SNI → normalised bare names with eviction normalisation; bridge route → `sel://<tenant>/bridge`) and list both capabilities in the proposal; verify no main spec still mandates the retired `sel-quic://` grammar
-- [x] 6.2 Authorize cross-tenant allocation for root principals (option B) alongside tenant-scoped delegation, in both `AllocRegion` and `HostQueueCreate`; verify `root_process_allocates_for_any_tenant_without_delegation` (the connector mTLS path) and a tenant-scoped denial test pass
+- [x] 6.2 Authorise cross-tenant allocation for root principals (option B) alongside tenant-scoped delegation, in both `AllocRegion` and `HostQueueCreate`; verify `root_process_allocates_for_any_tenant_without_delegation` (the connector mTLS path) and a tenant-scoped denial test pass
 - [x] 6.3 Add the serving-tenant parameter to `HostQueueCreate` (ABI + guest `create_for_tenant`), register queues under the principal tenant, and revoke them under that tenant at teardown; verify the queue provenance substrate test passes
 - [x] 6.4 Require at least one `Tenant` selector on `DelegateGrants` grants in `validate_grants`; verify a selector-less grant is rejected at spawn and a tenant-scoped one admitted
-- [x] 6.5 Authorize Tier-2 revocations: aliases and external names only, within the caller's tenant, for targets the caller owns; typed URIs `Forbidden`, unknown keys `NotFound`; verify cross-tenant, unowned, typed-URI, and unknown-key tests pass
+- [x] 6.5 Authorise Tier-2 revocations: aliases and external names only, within the caller's tenant, for targets the caller owns; typed URIs `Forbidden`, unknown keys `NotFound`; verify cross-tenant, unowned, typed-URI, and unknown-key tests pass
 - [x] 6.6 Make alias registration verify the claimed target exists and its class matches the owned resource (class-aware ownership table); verify existence and class-mismatch tests pass
 - [x] 6.7 Fail closed when the caller's tenant lookup errors (deny instead of silently unscoping); verify the per-variant denial mapping is tested
 - [x] 6.8 Make teardown staged and retryable: revocation entries removed only after a successful publish, failed stops retain the process authority, and `cleanup_failed_process` keeps the authority for a later retry; verify retry tests for both stop paths pass

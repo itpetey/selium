@@ -86,7 +86,7 @@ grants into the guest's authority table at rendezvous delivery.
 Why: zero runtime bookkeeping per forwarded connection (connectors may
 forward thousands/sec), and the deny property we need ("third party
 cannot claim handoff rights") follows from queue attachment being
-authorized, which the previous decision secures.
+authorised, which the previous decision secures.
 
 Alternative considered: runtime-injected per-region grants. Rejected —
 mutating authority tables at message-delivery rate adds contention and

@@ -71,7 +71,7 @@ with scheduler (placement), supervisor (recovery), and discovery (naming).
 
 **Alternative considered:** A stateless facade that fans out per request.
 - Rejected: no owned read projection; inspector verbs would fan out and
-  synthesize on every query.
+  synthesise on every query.
 
 ### 3. Serve a host-queue listener; the bridge performs the RPC rendezvous
 
@@ -89,7 +89,7 @@ rendezvous: the bridge-channel allocates a two-ring session region
 enqueues the session's shared id into the served queue via
 `ResourceSender` (the handoff metadata is empty until guest-spawned
 children can receive pointer arguments — today's `Process::start` carries
-integers only — with authorization resting on the runtime's attach
+integers only — with authorisation resting on the runtime's attach
 enforcement); on teardown the bridge frees the session region so the
 server observes session end, mirroring `OwnedRpcClient`'s drop semantics.
 
@@ -149,9 +149,9 @@ client, policy in domain guests" boundary honest.
 **Alternative considered:** Command the supervisor directly for recovery.
 - Rejected: inverts the supervisor's designed control-loop direction.
 
-### 6. Authorize via capability enforcement, not re-derived identity
+### 6. Authorise via capability enforcement, not re-derived identity
 
-**Decision:** The control plane authorizes by consulting the runtime for the
+**Decision:** The control plane authorises by consulting the runtime for the
 caller's tenant and capabilities (`process_tenant` / `process_capability`) on
 the bridge-channel peer it sees, plus the capability checks the runtime already
 enforces at attach time. It does not decode TLS identity itself.
@@ -163,7 +163,7 @@ plane's.
 
 **Alternative considered:** Have the bridge pass the fingerprint to the guest.
 - Rejected: couples the guest to a transport identity format and re-implements
-  authorization where the capability system already owns it.
+  authorisation where the capability system already owns it.
 
 ### 7. Presentation hierarchy is a label projection; containment stays with the runtime
 

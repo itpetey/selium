@@ -4,7 +4,7 @@
 
 `selium-wire` has unary RPC over `MessageTransport` with frame-tag
 correlation (`transport-abstraction`). Connectors (`http-connector`)
-need streaming shapes; the pattern catalog is one variant short.
+need streaming shapes; the pattern catalogue is one variant short.
 
 ## Goals / Non-Goals
 

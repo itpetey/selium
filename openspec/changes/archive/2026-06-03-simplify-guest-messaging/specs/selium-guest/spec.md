@@ -8,7 +8,7 @@
 - **THEN** the SDK SHALL expose a typed handle rather than requiring direct ABI framing code
 
 ### Requirement: Messaging-Pattern Layer
-`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronization without signal hostcalls.
+`selium-guest` SHALL provide a messaging-pattern layer built above the shared memory substrate, using native WASM atomics for synchronisation without signal hostcalls.
 
 #### Scenario: Guest selects messaging pattern
 - **WHEN** guest code needs pub/sub, fanout, request/reply, stream, or live-table semantics
@@ -60,7 +60,7 @@ All atomic compare-and-swap loops SHALL use exponential backoff with no hard ite
 - **THEN** each writer SHALL retry CAS with increasing backoff delays up to a maximum of 64 spin-loop iterations between attempts
 
 ### Requirement: Host-Agnostic Shared Region Layout
-The shared memory region SHALL contain only ring buffer data and a generation counter for `memory.atomic.wait32`/`notify` synchronization; all other metadata SHALL reside in per-guest private memory.
+The shared memory region SHALL contain only ring buffer data and a generation counter for `memory.atomic.wait32`/`notify` synchronisation; all other metadata SHALL reside in per-guest private memory.
 
 #### Scenario: Shared region contains no channel metadata
 - **WHEN** a guest inspects the shared region layout

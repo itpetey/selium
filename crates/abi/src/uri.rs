@@ -46,7 +46,7 @@ impl DomainTable {
     /// (lowercased, trailing dot stripped).
     pub fn seed(&mut self, domain: impl Into<String>, tenant: impl Into<String>) {
         self.entries
-            .insert(normalize_host(&domain.into()), tenant.into());
+            .insert(normalise_host(&domain.into()), tenant.into());
     }
 
     /// Returns the tenant mapped for an exact domain, if provisioned.
@@ -116,7 +116,7 @@ pub fn labels_from_path(path: &str) -> Option<Vec<String>> {
 
 /// Normalises a host/authority value: lowercased, trailing dot stripped, and
 /// a numeric `:port` suffix removed.
-pub fn normalize_host(host: &str) -> String {
+pub fn normalise_host(host: &str) -> String {
     let host = host.trim().to_ascii_lowercase();
     let host = host.strip_suffix('.').unwrap_or(&host);
     if let Some((name, port)) = host.rsplit_once(':')
@@ -198,7 +198,7 @@ pub fn path_from_labels(labels: &[&str]) -> Option<String> {
 /// - `example.com` with `example.com -> acme` → `("acme", [])` (apex)
 /// - `localhost` → `("", ["localhost"])` (single synthetic label, root namespace)
 pub fn resolve_wire_name(name: &str, domains: &DomainTable) -> Option<(String, Vec<String>)> {
-    let name = normalize_host(name);
+    let name = normalise_host(name);
     if name.is_empty() {
         return None;
     }
@@ -343,10 +343,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_host_strips_case_dots_and_ports() {
-        assert_eq!(normalize_host("Example.COM."), "example.com");
-        assert_eq!(normalize_host("example.com:443"), "example.com");
-        assert_eq!(normalize_host("bridge"), "bridge");
+    fn normalise_host_strips_case_dots_and_ports() {
+        assert_eq!(normalise_host("Example.COM."), "example.com");
+        assert_eq!(normalise_host("example.com:443"), "example.com");
+        assert_eq!(normalise_host("bridge"), "bridge");
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl RouteResolver {
     /// canonical (lowercased, trailing-dot-stripped) name, so a raw SNI
     /// must be normalised to hit the cache entry.
     pub fn evict(&mut self, name: &str) {
-        self.cache.remove(&normalize_sni(name));
+        self.cache.remove(&normalise_sni(name));
     }
 
     /// Returns whether a route is cached for the given name.
@@ -103,7 +103,7 @@ impl RouteResolver {
     /// route, which is then resolved via discovery. Resolution happens once
     /// per connection; the connector caches the result.
     pub async fn resolve(&mut self, server_name: &str) -> Result<ResourceTarget, ResolveError> {
-        let name = normalize_sni(server_name);
+        let name = normalise_sni(server_name);
         if let Some(route) = self.cache.get(&name) {
             return Ok(route.target.clone());
         }
@@ -144,8 +144,8 @@ impl RouteResolver {
 }
 
 /// Normalises a raw SNI server name: lowercased, trailing dot stripped.
-fn normalize_sni(server_name: &str) -> String {
-    uri::normalize_host(server_name)
+fn normalise_sni(server_name: &str) -> String {
+    uri::normalise_host(server_name)
 }
 
 #[cfg(test)]
@@ -153,9 +153,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_sni_lowercases_and_strips_trailing_dot() {
-        assert_eq!(normalize_sni("Example.COM."), "example.com");
-        assert_eq!(normalize_sni("example.com"), "example.com");
+    fn normalise_sni_lowercases_and_strips_trailing_dot() {
+        assert_eq!(normalise_sni("Example.COM."), "example.com");
+        assert_eq!(normalise_sni("example.com"), "example.com");
     }
 
     #[test]

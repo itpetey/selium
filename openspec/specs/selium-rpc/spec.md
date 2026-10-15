@@ -5,7 +5,7 @@ Define the typed RPC client and connection types in `selium-wire`, generic over 
 ## Requirements
 
 ### Requirement: Typed RPC Client
-`selium-wire` SHALL provide an `RpcClient<Req, Rep, M>` generic over `M: MessageTransport` that sends typed requests and receives typed replies. The client SHALL use `FramedWrite<M>` for the request channel and `FramedRead<M>` for the reply channel. Connection establishment SHALL be parameterized by a `Rendezvous` trait rather than hard-wired to `ResourceSender`.
+`selium-wire` SHALL provide an `RpcClient<Req, Rep, M>` generic over `M: MessageTransport` that sends typed requests and receives typed replies. The client SHALL use `FramedWrite<M>` for the request channel and `FramedRead<M>` for the reply channel. Connection establishment SHALL be parameterised by a `Rendezvous` trait rather than hard-wired to `ResourceSender`.
 
 #### Scenario: Client sends request and receives reply
 - **WHEN** a client calls `RpcClient::request(req)` with a valid request payload

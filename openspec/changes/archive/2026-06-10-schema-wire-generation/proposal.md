@@ -5,8 +5,8 @@ The current `#[schema]` macro requires a manual two-type pattern for generic mes
 ## What Changes
 
 - Extend `#[schema]` to accept a `wire` parameter that triggers automatic wire type generation and FlatMsg bridge impl generation
-- When `#[schema]` is placed on a struct with generic type parameters, the macro auto-detects which fields need byte-serialization (any field whose type references a generic parameter) and generates the corresponding `*_bytes: Vec<u8>` wire fields
-- `Option<T>` where `T` is a generic parameter is treated as optional byte-serialization (empty `Vec<u8>` = `None`)
+- When `#[schema]` is placed on a struct with generic type parameters, the macro auto-detects which fields need byte-serialisation (any field whose type references a generic parameter) and generates the corresponding `*_bytes: Vec<u8>` wire fields
+- `Option<T>` where `T` is a generic parameter is treated as optional byte-serialisation (empty `Vec<u8>` = `None`)
 - `Option<T>` where `T` is a concrete scalar uses the existing sentinel-value approach (0 = None)
 - All other concrete fields pass through to the wire type unchanged
 - The macro generates `LiveTableMessageWire` (or `{TypeName}Wire`) with its own `#[schema]` annotation, and a `FlatMsg` impl on the domain type that bridges through the wire type
@@ -20,7 +20,7 @@ The current `#[schema]` macro requires a manual two-type pattern for generic mes
 
 ### Modified Capabilities
 
-- `selium-guest-macros`: The `#[schema]` macro gains a new `wire` parameter and the ability to generate an additional wire struct and bridge `FlatMsg` impl. New scenarios cover generic type detection, byte-serialization of generic fields, optional generic fields, and the generated bridge impl.
+- `selium-guest-macros`: The `#[schema]` macro gains a new `wire` parameter and the ability to generate an additional wire struct and bridge `FlatMsg` impl. New scenarios cover generic type detection, byte-serialisation of generic fields, optional generic fields, and the generated bridge impl.
 
 ## Impact
 

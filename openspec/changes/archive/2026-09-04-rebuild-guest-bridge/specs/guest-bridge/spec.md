@@ -21,7 +21,7 @@ A bridge-channel SHALL be a transparent relay: `selium-wire` frames SHALL pass t
 ### Requirement: Bridge Enforces Capability Grants
 A bridge-channel SHALL be subject to the same `CapabilityGrant`/`ResourceSelector` system as any other guest, holding the grants of the client whose identity it was spawned for. The runtime SHALL reject `AttachRegion` calls for channels the client has not been granted, and the bridge-channel SHALL surface the denial to the external client as a termination frame.
 
-#### Scenario: Bridge attempts to attach to unauthorized channel
+#### Scenario: Bridge attempts to attach to unauthorised channel
 - **WHEN** a bridge-channel calls `AttachRegion` for a channel the client lacks grants for
 - **THEN** the host SHALL return an error
 - **AND** the bridge-channel SHALL close the pipe, sending the failure to the external client
@@ -39,7 +39,7 @@ The bridge-server and bridge-channel SHALL be implemented as standard WASM guest
 
 #### Scenario: Bridge deployed via normal guest lifecycle
 - **WHEN** the platform starts a bridge-server and it spawns bridge-channel guests via `Process::start` holding the client's grants
-- **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initializes a pipe and relays frames to/from channels within its grants
+- **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initialises a pipe and relays frames to/from channels within its grants
 
 ## ADDED Requirements
 

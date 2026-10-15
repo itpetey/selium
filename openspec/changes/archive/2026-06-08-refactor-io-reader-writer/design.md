@@ -75,7 +75,7 @@ The concrete `Reader`, `WeakReader`, `Writer`, and `WeakWriter` types directly i
 
 Each `Writer::poll_write(buf)` call creates one frame containing the full `buf`. No internal buffering or batching.
 
-**Rationale**: Simplicity. This matches the current `TcpStream` behavior and avoids introducing a flush policy. Batching can be added later without breaking the `AsyncWrite` contract — the writer would buffer internally and flush on `poll_flush` or when the buffer reaches a threshold. The 12-byte `FrameHeader` overhead per write is acceptable for the initial implementation.
+**Rationale**: Simplicity. This matches the current `TcpStream` behaviour and avoids introducing a flush policy. Batching can be added later without breaking the `AsyncWrite` contract — the writer would buffer internally and flush on `poll_flush` or when the buffer reaches a threshold. The 12-byte `FrameHeader` overhead per write is acceptable for the initial implementation.
 
 ### Decision 5: Upgrade/downgrade consume self
 
@@ -94,7 +94,7 @@ impl WeakWriter {
 }
 ```
 
-**Rationale**: Consuming `self` prevents double-drop bugs. The old handle is gone; the new handle has the correct Drop behavior. For `Writer::downgrade`, we call `decrement_writer_count()` before returning the `WeakWriter` because `Writer::Drop` would have done so, but `WeakWriter::Drop` does not. This keeps the writer_count accurate.
+**Rationale**: Consuming `self` prevents double-drop bugs. The old handle is gone; the new handle has the correct Drop behaviour. For `Writer::downgrade`, we call `decrement_writer_count()` before returning the `WeakWriter` because `Writer::Drop` would have done so, but `WeakWriter::Drop` does not. This keeps the writer_count accurate.
 
 **Alternative considered**: `&mut self` methods that mutate in place. Rejected because it creates an ambiguous state during the transition (e.g., has the reader_slot been released yet?) and risks double-free on panic.
 
@@ -151,7 +151,7 @@ Add a block comment above the unsafe impls explaining:
 ## Risks / Trade-offs
 
 - **[Breaking API change]** All consumers of `selium-guest`, `selium-rpc`, and `selium-tables` need import path updates. → Mitigation: This is a prototype with a small, controlled set of consumers (the system guest crates). Changes are mechanical find-and-replace.
-- **[Frame overhead for byte streams]** Each `poll_write` creates a 12-byte `FrameHeader`. For large writes this is negligible; for tiny writes it's proportionally expensive. → Mitigation: Accept for now. Future optimization can add internal buffering to `Writer` without changing the `AsyncWrite` contract.
+- **[Frame overhead for byte streams]** Each `poll_write` creates a 12-byte `FrameHeader`. For large writes this is negligible; for tiny writes it's proportionally expensive. → Mitigation: Accept for now. Future optimisation can add internal buffering to `Writer` without changing the `AsyncWrite` contract.
 - **[Generation counter for overwrite detection in Reader]** `Reader` must track `last_generation` and compare on every `poll_read`. This adds an atomic load per read. → Mitigation: The generation counter is already loaded for notification checks; the additional comparison is cheap. No extra atomic op needed.
 - **[Quinn integration complexity]** Bridging Quinn's poll-based `UdpSender`/`AsyncUdpSocket` traits with the async `UdpSocket` methods requires buffering. → Mitigation: Implement against `RingBuf` directly (matching the TcpStream pattern), avoiding the impedance mismatch with async methods. The Quinn types own their own `RingBuf` handles for send/recv.
 

@@ -21,9 +21,9 @@ Two load-bearing details shape the rewrite. First, `uri.rs` is the single source
 
 **D2 — Leaf aliases with reverse revocation.** A bare single-segment name under a tenant (`sel://acme/proxy`) resolves to a typed target `(type, id)`; an alias never names another alias; class nouns are reserved so an alias can't shadow a type segment; revoking a target revokes its aliases. Alternative: positional alias substitution anywhere — rejected, it reintroduces alias→alias resolution we deliberately excluded.
 
-**D3 — Principal provenance with root-principal exemption.** Resources mint under the serving tenant, not the allocating process's tenant. Cross-tenant allocation is authorized two ways: a **root principal** (no tenant) may mint for any tenant — connectors and other trusted edge infrastructure run as root, and the QUIC connector under mTLS mints per-stream channels under the authenticated client's tenant without per-tenant grants — or a **tenant-scoped delegation grant** (`DelegateGrants` + `Tenant(T)`). Delegation grants must carry a `Tenant` selector: a selector-less grant would vacuously match every tenant including root, so validation rejects it. Alternative: process provenance — rejected, it strands bridged regions under the root connector's namespace and breaks tenant walks. Alternative considered post-review: per-tenant grants on the connector — rejected, each new tenant would require a connector restart and the CLI has no grant-provisioning path.
+**D3 — Principal provenance with root-principal exemption.** Resources mint under the serving tenant, not the allocating process's tenant. Cross-tenant allocation is authorised two ways: a **root principal** (no tenant) may mint for any tenant — connectors and other trusted edge infrastructure run as root, and the QUIC connector under mTLS mints per-stream channels under the authenticated client's tenant without per-tenant grants — or a **tenant-scoped delegation grant** (`DelegateGrants` + `Tenant(T)`). Delegation grants must carry a `Tenant` selector: a selector-less grant would vacuously match every tenant including root, so validation rejects it. Alternative: process provenance — rejected, it strands bridged regions under the root connector's namespace and breaks tenant walks. Alternative considered post-review: per-tenant grants on the connector — rejected, each new tenant would require a connector restart and the CLI has no grant-provisioning path.
 
-**D4 — External names are opaque keys; `sel-proto://` is retired.** A guest binds its real address (`https://acme.com/path/`, or a bare hostname for SNI-only transport); the connector normalizes incoming traffic to the canonical key and looks it up. Discovery neither parses nor validates the scheme. Alternative: keep `sel-proto://` — rejected, it's a fake URL that re-encodes host+path and forces a second grammar.
+**D4 — External names are opaque keys; `sel-proto://` is retired.** A guest binds its real address (`https://acme.com/path/`, or a bare hostname for SNI-only transport); the connector normalises incoming traffic to the canonical key and looks it up. Discovery neither parses nor validates the scheme. Alternative: keep `sel-proto://` — rejected, it's a fake URL that re-encodes host+path and forces a second grammar.
 
 **D5 — Labels for classification, not hierarchy or edges.** `labels: [(key,value)]` on the target plus a flat `label → targets` index answers "what processes are in deployment X" without re-opening multi-home paths or reintroducing the graph. Containment ("what resources does process X hold") deliberately stays in the runtime.
 
@@ -45,13 +45,13 @@ Two load-bearing details shape the rewrite. First, `uri.rs` is the single source
 ## Migration Plan
 
 1. `selium-abi`: `ResourceTarget` gains class + labels; add prefix/label query and multi-target response variants.
-2. `selium-runtime`: `registration_uris` → new schema; process-node spawn/teardown registration; `AllocRegion` principal/tenant propagation with delegation authorization; well-known channels move to the root tenant.
+2. `selium-runtime`: `registration_uris` → new schema; process-node spawn/teardown registration; `AllocRegion` principal/tenant propagation with delegation authorisation; well-known channels move to the root tenant.
 3. `guests/discovery`: store rewrite (typed-id map, alias map with reverse revocation, label index, prefix/label query handlers, wired tenant scoping, opaque external names).
-4. Connectors (`http`, `dns`, `quic`): normalize incoming addresses and resolve as external-name keys; delete `sel-proto://` route construction.
+4. Connectors (`http`, `dns`, `quic`): normalise incoming addresses and resolve as external-name keys; delete `sel-proto://` route construction.
 5. Docs and examples: `sel-http://…` → `https://…`, `sel://_sys/…` → `sel:///…`.
 
 ## Open Questions
 
-- **External-name canonical form for SNI-only protocols**: bare normalized hostname vs a registered scheme (`quic://`?). Default: bare hostname.
+- **External-name canonical form for SNI-only protocols**: bare normalised hostname vs a registered scheme (`quic://`?). Default: bare hostname.
 - **Label query scope**: per-tenant only, or root-level cross-tenant listing for system principals. Default: per-tenant.
 - **`ProcessInspect` hostcall**: out of this change; expected to land as a separate runtime change.

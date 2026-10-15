@@ -13,7 +13,7 @@
 
 #### Scenario: Panic in future aborts the guest
 - **WHEN** `run_entrypoint_with_result` is called and a spawned task panics during reactor polling
-- **THEN** the guest process SHALL abort (same behavior as `run_entrypoint_safely`)
+- **THEN** the guest process SHALL abort (same behaviour as `run_entrypoint_safely`)
 
 ### Requirement: JoinHandle Result Access
 `selium-guest` SHALL expose a `pub(crate)` accessor on `JoinHandle<T>` that drains and returns the completed task's output.

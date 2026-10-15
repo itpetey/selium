@@ -23,7 +23,7 @@ The bridge SHALL be a transparent relay: `selium-wire` frames SHALL pass through
 ### Requirement: Bridge Enforces Capability Grants
 The bridge SHALL be subject to the same `CapabilityGrant`/`ResourceSelector` system as any other guest. It SHALL only be able to `attach` to channels that its grants permit. The runtime SHALL reject `attach_region` calls for resources the bridge's owning user has not been granted.
 
-#### Scenario: Bridge attempts to attach to unauthorized channel
+#### Scenario: Bridge attempts to attach to unauthorised channel
 - **WHEN** a bridge calls `attach_region` for a channel the user lacks grants for
 - **THEN** the host SHALL return an error, and the bridge SHALL propagate the failure to the external client
 
@@ -40,7 +40,7 @@ The bridge SHALL be implemented as a standard WASM guest using `selium-guest` an
 
 #### Scenario: Bridge deployed via normal guest lifecycle
 - **WHEN** the platform starts a bridge guest via `Process::start` with appropriate capability grants
-- **THEN** the bridge SHALL initialize QUIC on the granted UDP socket, accept incoming streams, and relay frames to/from channels within its grants
+- **THEN** the bridge SHALL initialise QUIC on the granted UDP socket, accept incoming streams, and relay frames to/from channels within its grants
 
 ### Requirement: Acceptor Guest Demux
 The system SHALL support an acceptor guest (or a well-known listener) that owns the public UDP endpoint, accepts incoming QUIC connections, and spawns per-user bridge guests via `Process::start`. Connection demux SHALL happen in guest code, not in the runtime.

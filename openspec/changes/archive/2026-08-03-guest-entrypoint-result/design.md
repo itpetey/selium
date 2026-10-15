@@ -16,7 +16,7 @@ We want to let entrypoints return `Result<()>` so guests can use `?` for error p
 **Non-Goals:**
 - `Result<T, E>` for `T != ()`
 - Structured error propagation (rkyv-encoded hostcalls)
-- Changing panic behavior
+- Changing panic behaviour
 
 ## Decisions
 
@@ -118,4 +118,4 @@ And equivalent for sync variants of each.
 
 - **`JoinHandle::take_result` panics if the task hasn't completed** — the reactor polls until all tasks are done, so the result must be present. If this invariant breaks, the panic message should be clear enough to debug.
 - **`std::error::Error` trait bound** — if a guest wants to use a custom error type that doesn't implement `Error`, they'll get a compile error. This is intentional; `Error` is standard practice.
-- **Host-side `EntrypointFailed`** — this changes bootstrap behavior for any guest that starts returning `Result<()>`. If a guest previously logged an error and `return;`-ed (silent from host perspective), it will now cause a bootstrap failure. This is the intended behavior.
+- **Host-side `EntrypointFailed`** — this changes bootstrap behaviour for any guest that starts returning `Result<()>`. If a guest previously logged an error and `return;`-ed (silent from host perspective), it will now cause a bootstrap failure. This is the intended behaviour.

@@ -25,7 +25,7 @@
 ### Modified Capabilities
 
 - `framed-io`: Framed read/write abstractions become transport-generic. `FramedRead`/`FramedWrite` operate over any `MessageTransport` rather than being ring-specific. Side-channel coordination (`generation()`, `load_writer_count()`) moves behind the transport trait.
-- `selium-rpc`: `RpcClient`/`RpcConnection` become generic over `MessageTransport` instead of depending on `crate::io::channels` directly. Connection establishment (`connect`/`accept`) is parameterized by a `Rendezvous` trait rather than hard-wired to `ResourceSender`.
+- `selium-rpc`: `RpcClient`/`RpcConnection` become generic over `MessageTransport` instead of depending on `crate::io::channels` directly. Connection establishment (`connect`/`accept`) is parameterised by a `Rendezvous` trait rather than hard-wired to `ResourceSender`.
 - `selium-guest`: Shrinks to a WASM SDK only. It installs the hostcall-backed `RegionProvider` and mailbox reactor, provides `net/*` (including QUIC datagram transport for guests), resources, storage, process management, logging subscriber, and re-exports the lower crates to preserve the existing public API surface.
 - `guest-shared-memory`: `SharedRegion::allocate`/`attach`/`free` become methods on a `RegionProvider` trait implementation rather than `cfg`-gated free functions. The memory module itself (`RegionMapping` + atomics) is unaffected.
 - `quinn-transport`: QUIC stream framing moves from `selium-guest::net::quinn` into `selium-quic` as a `MessageTransport` impl. The guest retains the UDP datagram hostcall plumbing needed to *feed* quinn, but the stream framing is shared with the external client.

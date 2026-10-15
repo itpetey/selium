@@ -57,8 +57,8 @@ pub enum RpcError {
     #[error("RPC buffer empty")]
     BufferEmpty,
     /// Encoding or decoding failed.
-    #[error("serialization error: {0}")]
-    Serialization(String),
+    #[error("serialisation error: {0}")]
+    Serialisation(String),
     /// The remote peer terminated the stream with an application error.
     ///
     /// Carries the error message sent by the peer (stream-error frame).
@@ -99,8 +99,8 @@ impl From<Error> for RpcError {
             Error::ConnectionLost | Error::ChannelClosed | Error::Terminated => {
                 Self::ConnectionClosed
             }
-            Error::SerializationFailed(msg) | Error::Guest(msg) => Self::Serialization(msg),
-            other => Self::Serialization(other.to_string()),
+            Error::SerialisationFailed(msg) | Error::Guest(msg) => Self::Serialisation(msg),
+            other => Self::Serialisation(other.to_string()),
         }
     }
 }
@@ -179,7 +179,7 @@ where
             }
 
             return FlatMsg::decode(&payload_bytes)
-                .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")));
+                .map_err(|e| RpcError::Serialisation(format!("decode reply: {e}")));
         }
     }
 }
@@ -280,10 +280,10 @@ where
     /// Decodes the request payload from Flatbuffers bytes.
     pub fn payload(&self) -> std::result::Result<Req, RpcError> {
         Req::decode(&self.payload_bytes)
-            .map_err(|e| RpcError::Serialization(format!("decode request: {e}")))
+            .map_err(|e| RpcError::Serialisation(format!("decode request: {e}")))
     }
 
-    /// Returns the deserialized request payload by value.
+    /// Returns the deserialised request payload by value.
     pub fn into_payload(self) -> std::result::Result<Req, RpcError> {
         self.payload()
     }
@@ -312,7 +312,7 @@ where
             }
 
             let decoded: Rep = FlatMsg::decode(&payload_bytes)
-                .map_err(|e| RpcError::Serialization(format!("decode reply: {e}")))?;
+                .map_err(|e| RpcError::Serialisation(format!("decode reply: {e}")))?;
 
             Ok(Some(decoded))
         }

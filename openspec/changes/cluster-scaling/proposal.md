@@ -15,4 +15,4 @@ Day 1 uses full mesh QUIC connections between hosts. This scales as O(n²), whic
 
 - Geographic routing
 - Multi-region deployment
-- Cross-datacenter replication
+- Cross-data-centre replication

@@ -154,7 +154,7 @@ impl<T, M: MessageTransport> Subscriber<T, M> {
         let (payload, tag, _flags) = self.reader.read_frame()?;
         self.last_generation = self.reader.generation()?;
         let value: T =
-            FlatMsg::decode(&payload).map_err(|e| Error::SerializationFailed(format!("{e}")))?;
+            FlatMsg::decode(&payload).map_err(|e| Error::SerialisationFailed(format!("{e}")))?;
         Ok((value, tag))
     }
 
@@ -176,7 +176,7 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
             return match this.reader.poll_frame(cx) {
                 Poll::Ready(Ok((payload, _tag, _flags))) => match FlatMsg::decode(&payload) {
                     Ok(value) => Poll::Ready(Some(Ok(value))),
-                    Err(e) => Poll::Ready(Some(Err(Error::SerializationFailed(format!("{e}"))))),
+                    Err(e) => Poll::Ready(Some(Err(Error::SerialisationFailed(format!("{e}"))))),
                 },
                 Poll::Ready(Err(Error::Terminated)) => Poll::Ready(None),
                 Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -229,7 +229,7 @@ impl<T: FlatMsg + Unpin, M: MessageTransport> Stream for Subscriber<T, M> {
 
             match FlatMsg::decode(&payload) {
                 Ok(value) => Poll::Ready(Some(Ok(value))),
-                Err(e) => Poll::Ready(Some(Err(Error::SerializationFailed(format!("{e}"))))),
+                Err(e) => Poll::Ready(Some(Err(Error::SerialisationFailed(format!("{e}"))))),
             }
         } else {
             // No data available — register a generation wait instead of spinning.

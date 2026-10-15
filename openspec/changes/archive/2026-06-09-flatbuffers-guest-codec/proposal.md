@@ -1,10 +1,10 @@
 ## Why
 
-The guest-side I/O codec currently uses `rkyv` for all serialization (pub/sub, RPC, live tables). While `rkyv` works well for the internal ABI boundary between guest and host, it is a Rust-only serialization framework with an implicit schema defined entirely by Rust type definitions. This makes it impossible to share message schemas with non-Rust consumers, precludes schema versioning, and prevents cross-language interop — a core requirement for a platform where guests may be written in multiple languages and where message schemas need to evolve independently of the codec implementation.
+The guest-side I/O codec currently uses `rkyv` for all serialisation (pub/sub, RPC, live tables). While `rkyv` works well for the internal ABI boundary between guest and host, it is a Rust-only serialisation framework with an implicit schema defined entirely by Rust type definitions. This makes it impossible to share message schemas with non-Rust consumers, precludes schema versioning, and prevents cross-language interop — a core requirement for a platform where guests may be written in multiple languages and where message schemas need to evolve independently of the codec implementation.
 
 ## What Changes
 
-- **BREAKING**: Replace `rkyv`-based serialization in the guest I/O codec layer (`encode_typed`/`decode_typed`, `Publisher<T>`, `Subscriber<T>`, `RpcClient<Req,Rep>`, `RpcConnection<Req,Rep>`, `LiveTable<K,V>`) with Flatbuffers-based schema-driven serialization
+- **BREAKING**: Replace `rkyv`-based serialisation in the guest I/O codec layer (`encode_typed`/`decode_typed`, `Publisher<T>`, `Subscriber<T>`, `RpcClient<Req,Rep>`, `RpcConnection<Req,Rep>`, `LiveTable<K,V>`) with Flatbuffers-based schema-driven serialisation
 - Add `.fbs` schema files as canonical, versionable, cross-language message definitions
 - Add a `#[schema]` proc macro that bridges idiomatic Rust types to generated Flatbuffers bindings
 - Add `FlatMsg`, `HasSchema`, and `FieldEncoder` traits providing the encode/decode contract

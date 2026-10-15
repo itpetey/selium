@@ -15,7 +15,7 @@ A bridge-channel SHALL be a transparent relay: `selium-wire` frames SHALL pass t
 ### Requirement: Bridge Enforces Capability Grants
 A bridge-channel SHALL be subject to the same `CapabilityGrant`/`ResourceSelector` system as any other guest, holding the grants of the client whose identity it was spawned for. The runtime SHALL reject `AttachRegion` calls for channels the client has not been granted, and the bridge-channel SHALL surface the denial to the external client as a termination frame.
 
-#### Scenario: Bridge attempts to attach to unauthorized channel
+#### Scenario: Bridge attempts to attach to unauthorised channel
 - **WHEN** a bridge-channel calls `AttachRegion` for a channel the client lacks grants for
 - **THEN** the host SHALL return an error
 - **AND** the bridge-channel SHALL close the pipe, sending the failure to the external client
@@ -33,7 +33,7 @@ The bridge-server and bridge-channel SHALL be implemented as standard WASM guest
 
 #### Scenario: Bridge deployed via normal guest lifecycle
 - **WHEN** the platform starts a bridge-server and it spawns bridge-channel guests via `Process::start` holding the client's grants
-- **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initializes a pipe and relays frames to/from channels within its grants
+- **THEN** the bridge-server receives authenticated stream handoffs and each bridge-channel initialises a pipe and relays frames to/from channels within its grants
 
 ### Requirement: Per-Tenant Bridge Server
 The system SHALL support a single per-platform `bridge-server` system guest serving every tenant. The bridge-server SHALL register a `sel:///bridge` serving route (a root-namespace leaf alias) so the QUIC connector delivers bridge-bound connections to it as per-stream handoffs, and SHALL derive each stream's tenant from the handoff's authenticated identity. The bridge-server SHALL NOT terminate QUIC itself and SHALL NOT relay stream bytes.
@@ -121,7 +121,7 @@ The bridge-server SHALL bound bridge-channel spawns through the host-enforced pe
 - **THEN** the bridge-server SHALL attach-then-close the stream and SHALL require no guest-local spawn counter to handle the refusal
 
 ### Requirement: Host-Queue RPC Rendezvous
-For a handshake URI that resolves to a host-queue target, the bridge-channel SHALL establish an RPC session on the external client's behalf, mirroring the internal `rpc::connect` path: allocate a two-ring shared-memory session region, splice the client's stream into it (request frames stream → request ring; reply ring → stream), and enqueue the session's shared id into the served queue. The handoff metadata SHALL carry the resolved client identity once guest-spawned processes can receive pointer arguments (today guest `Process::start` carries integer arguments only); until then the metadata is empty and authorization rests on the runtime's capability enforcement at queue attach. The session region SHALL be freed on pipe teardown so the serving guest observes session end, mirroring an internal client's drop.
+For a handshake URI that resolves to a host-queue target, the bridge-channel SHALL establish an RPC session on the external client's behalf, mirroring the internal `rpc::connect` path: allocate a two-ring shared-memory session region, splice the client's stream into it (request frames stream → request ring; reply ring → stream), and enqueue the session's shared id into the served queue. The handoff metadata SHALL carry the resolved client identity once guest-spawned processes can receive pointer arguments (today guest `Process::start` carries integer arguments only); until then the metadata is empty and authorisation rests on the runtime's capability enforcement at queue attach. The session region SHALL be freed on pipe teardown so the serving guest observes session end, mirroring an internal client's drop.
 
 #### Scenario: External RPC client reaches a served host queue
 - **WHEN** an external client sends a handshake naming a URI that resolves to a host-queue target

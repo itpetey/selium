@@ -44,5 +44,5 @@
 
 #### Scenario: Existing void entrypoint unchanged
 - **WHEN** a guest defines `#[entrypoint] async fn main()`
-- **THEN** the generated glue SHALL be identical in behavior to the current implementation
+- **THEN** the generated glue SHALL be identical in behaviour to the current implementation
 - **AND** the export SHALL have no return value

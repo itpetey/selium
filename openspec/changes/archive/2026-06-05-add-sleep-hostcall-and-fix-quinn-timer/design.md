@@ -26,7 +26,7 @@ The runtime already has the pattern for async operations that complete based on 
 **Rationale**: The simplest possible timer hostcall. The guest computes the remaining duration and fires a sleep. The host returns `Empty` when the time elapses. This is intentionally minimal — no deadline parameter on the hostcall itself because the guest can compute `millis` from its own deadline and the host's monotonic clock.
 
 **Alternatives considered**:
-- `SleepUntil { deadline_nanos: u64 }`: The host would need to interpret the guest's monotonic clock, which may have a different epoch. Computing the duration guest-side avoids clock synchronization issues.
+- `SleepUntil { deadline_nanos: u64 }`: The host would need to interpret the guest's monotonic clock, which may have a different epoch. Computing the duration guest-side avoids clock synchronisation issues.
 - Timer shared region per guest with `memory.atomic.wait32`: More complex on both sides; requires host-side timer polling loop per guest; no advantage over a simple hostcall.
 - Re-add `SignalWait` with timeout: Adds unnecessary ABI surface (create/close/wait lifecycle) when a single fire-and-forget sleep suffices.
 
@@ -47,4 +47,4 @@ This reduces `Timer` to ~30 lines of straightforward code.
 ## Risks / Trade-offs
 
 - **Poll-based wakeup granularity**: The timer resolution depends on how frequently the guest reactor polls. With the current `DEFAULT_READINESS_POLL_MS` of 10ms in the bootstrap, worst-case timer latency is ~10ms. This is acceptable for Quinn's timeout management (typical QUIC timers are on the order of 25ms–500ms). **Mitigation**: If finer granularity is needed later, the readiness poll interval can be reduced or a mailbox-based wakeup can be added.
-- **No timeout on `Sleep` itself**: The sleep hostcall always succeeds after the specified duration. If the guest wants a timeout-bounded sleep, it can race the sleep against another operation. **Mitigation**: This matches the old `SignalWait` behavior where the timeout was the primary mechanism, not a fallback.
+- **No timeout on `Sleep` itself**: The sleep hostcall always succeeds after the specified duration. If the guest wants a timeout-bounded sleep, it can race the sleep against another operation. **Mitigation**: This matches the old `SignalWait` behaviour where the timeout was the primary mechanism, not a fallback.

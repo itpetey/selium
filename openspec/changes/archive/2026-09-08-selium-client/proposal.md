@@ -1,11 +1,11 @@
 ## Why
 
-There is no client SDK for Selium's fabric. External users must hand-roll a quinn endpoint, TLS and mTLS configuration, the bridge handshake frame, and `selium-wire` framing over raw QUIC streams — today that code exists only inside tests (`quic_spine`, the connector's native handshake tests). This change productizes that boilerplate as a single crate so an external user goes from nothing to a typed stream in a few lines.
+There is no client SDK for Selium's fabric. External users must hand-roll a quinn endpoint, TLS and mTLS configuration, the bridge handshake frame, and `selium-wire` framing over raw QUIC streams — today that code exists only inside tests (`quic_spine`, the connector's native handshake tests). This change productises that boilerplate as a single crate so an external user goes from nothing to a typed stream in a few lines.
 
 ## What Changes
 
 - New `selium-client` crate at `crates/client/`: a native (host-side) library, not a WASM guest.
-- Full SDK surface: one QUIC connection, one bidirectional stream per channel URI, typed `Publisher`/`Subscriber`/`RpcClient`/server-streaming/bidi-streaming/live-table handles with transport generics hidden and a single crate error type (wire/RPC errors pass through; termination codes, remote stream errors, and serialization map to dedicated variants).
+- Full SDK surface: one QUIC connection, one bidirectional stream per channel URI, typed `Publisher`/`Subscriber`/`RpcClient`/server-streaming/bidi-streaming/live-table handles with transport generics hidden and a single crate error type (wire/RPC errors pass through; termination codes, remote stream errors, and serialisation map to dedicated variants).
 - QUIC (TLS 1.3) and mTLS client-auth plumbing: trust the server cert, present the client identity cert/key (provisioned out-of-band; the provisioning path itself is out of scope).
 - Deterministic bridge handshake: the client sends `PipeControl::Handshake { uri }` and awaits the bridge's typed reply — a new `PipeControl::Accepted` frame on success (sent after attach, before the relay begins), or `PipeControl::Terminate` on refusal — so attach failures surface as typed errors at channel open, for every handle type.
 - A waker-honest async read path in `selium-wire`, selected per transport: native reads over non-ring transports park on the socket instead of the cooperative yield loop.

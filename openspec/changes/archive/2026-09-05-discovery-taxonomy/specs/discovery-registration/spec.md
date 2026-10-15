@@ -100,14 +100,14 @@ The discovery service SHALL support prefix listing under the typed schema, for e
 - **THEN** the discovery service SHALL NOT return tenant "acme"'s targets
 
 ### Requirement: External Name Registry
-External bindings SHALL register their public address as an opaque name-to-target key, for example `https://acme.com/path/`, or a bare hostname for server-name-only protocols. The discovery service SHALL store and match external names opaquely, without interpreting their scheme or path; the serving connector is responsible for normalizing incoming addresses to the registered key.
+External bindings SHALL register their public address as an opaque name-to-target key, for example `https://acme.com/path/`, or a bare hostname for server-name-only protocols. The discovery service SHALL store and match external names opaquely, without interpreting their scheme or path; the serving connector is responsible for normalising incoming addresses to the registered key.
 
 #### Scenario: External address resolves
 - **WHEN** a connector registers `https://acme.com/path/` as the key for a serving guest
 - **THEN** resolving that key SHALL return the serving guest's target
 
-#### Scenario: Opaque matching is exact after normalization
-- **WHEN** the connector normalizes an incoming address to the canonical registered key
+#### Scenario: Opaque matching is exact after normalisation
+- **WHEN** the connector normalises an incoming address to the canonical registered key
 - **THEN** the lookup SHALL match, and a differently-but-non-equivalently-spelled key SHALL NOT match
 
 ### Requirement: Process Node Addressing
@@ -117,7 +117,7 @@ Every process SHALL be addressable as a typed entry `sel://<tenant>/proc/<id>` f
 - **WHEN** process 123 of tenant "acme" is spawned and allocates nothing
 - **THEN** resolving `sel://acme/proc/123` SHALL return the process's target
 
-### Requirement: Guest Revocation Authorization
+### Requirement: Guest Revocation Authorisation
 A guest (Tier-2) SHALL be permitted to revoke only custom registrations — leaf aliases and opaque external names — whose target resource the guest owns, and only within the guest's own tenant. Revocation of a typed URI over Tier-2 SHALL be rejected (`Forbidden`): typed URIs are runtime-minted and revoked over the Tier-1 feed. Revocation of an unknown key SHALL return `NotFound`.
 
 #### Scenario: Guest revokes own external name

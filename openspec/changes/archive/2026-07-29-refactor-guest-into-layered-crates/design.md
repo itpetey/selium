@@ -50,7 +50,7 @@ selium-guest     ── HostcallRegionProvider, mailbox reactor, platform/hostca
 
 `selium-quic` (separate crate) ── `QuicTransport` (impl `MessageTransport`), shared by external client + bridge guests
 
-**Rationale:** Each crate has one dependency direction (upward in the diagram). No crate depends on a higher crate. `selium-wire` is the "pattern library" — it depends on `selium-encoding` for payload serialization and on `tokio` I/O traits, but NOT on any specific transport. `selium-shm` and `selium-quic` are peer transport implementations.
+**Rationale:** Each crate has one dependency direction (upward in the diagram). No crate depends on a higher crate. `selium-wire` is the "pattern library" — it depends on `selium-encoding` for payload serialisation and on `tokio` I/O traits, but NOT on any specific transport. `selium-shm` and `selium-quic` are peer transport implementations.
 
 **Alternative considered:** Put transport trait in `selium-shm` and have `selium-quic` depend on it. Rejected because it makes QUIC depend on shared-memory concepts and muddies the dependency direction.
 
@@ -123,7 +123,7 @@ RPC connection setup (passing `shared_id` from client to server) is abstracted b
 
 **[Risk] `MessageTransport` trait may grow as new transport-specific needs emerge** → Mitigation: Start minimal with the three side-channel methods that have clear semantics across transports. Add optional methods with default impls if needed.
 
-**[Risk] Per-user bridge guests add connection latency (guest spawn per connection)** → Mitigation: Pre-spawn bridge pools for known users; the scheduler already supports fast process start. Measure before optimizing. The security win justifies the overhead for the common case.
+**[Risk] Per-user bridge guests add connection latency (guest spawn per connection)** → Mitigation: Pre-spawn bridge pools for known users; the scheduler already supports fast process start. Measure before optimising. The security win justifies the overhead for the common case.
 
 **[Risk] Breaking change for `selium-runtime` imports** → Mitigation: The change is contained to runtime internals. The public guest API is preserved via re-exports. Runtime changes are mechanical (`selium_guest::io::rpc` → `selium_wire::rpc`).
 

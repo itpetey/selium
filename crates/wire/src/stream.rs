@@ -267,7 +267,7 @@ where
                         return match FlatMsg::decode(&payload) {
                             Ok(item) => Poll::Ready(Some(Ok(item))),
                             Err(e) => {
-                                Poll::Ready(Some(Err(RpcError::Serialization(format!("{e}")))))
+                                Poll::Ready(Some(Err(RpcError::Serialisation(format!("{e}")))))
                             }
                         };
                     }
@@ -329,7 +329,7 @@ where
                         match FlatMsg::decode(&payload) {
                             Ok(item) => Poll::Ready(Some(Ok(item))),
                             Err(e) => {
-                                Poll::Ready(Some(Err(RpcError::Serialization(format!("{e}")))))
+                                Poll::Ready(Some(Err(RpcError::Serialisation(format!("{e}")))))
                             }
                         }
                     }
@@ -489,7 +489,7 @@ where
     /// Decodes the request payload.
     pub fn payload(&self) -> std::result::Result<Req, RpcError> {
         Req::decode(&self.payload_bytes)
-            .map_err(|e| RpcError::Serialization(format!("decode request: {e}")))
+            .map_err(|e| RpcError::Serialisation(format!("decode request: {e}")))
     }
 
     /// Decodes and returns the request payload by value.
@@ -862,7 +862,7 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
 
                 FlatMsg::decode(&payload)
                     .map(Some)
-                    .map_err(|e| RpcError::Serialization(format!("{e}")))
+                    .map_err(|e| RpcError::Serialisation(format!("{e}")))
             }
             Err(Error::BufferEmpty) => Ok(None),
             Err(e) => Err(e.into()),
@@ -917,7 +917,7 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
 
                 return FlatMsg::decode(&payload)
                     .map(Some)
-                    .map_err(|e| RpcError::Serialization(format!("{e}")));
+                    .map_err(|e| RpcError::Serialisation(format!("{e}")));
             }
         }
 
@@ -965,7 +965,7 @@ impl<Resp, M: MessageTransport> BidiReceiver<'_, Resp, M> {
 
                         return FlatMsg::decode(&payload)
                             .map(Some)
-                            .map_err(|e| RpcError::Serialization(format!("{e}")));
+                            .map_err(|e| RpcError::Serialisation(format!("{e}")));
                     }
                     Err(Error::BufferEmpty) => {}
                     Err(e) => return Err(e.into()),
@@ -1117,7 +1117,7 @@ where
     /// Decodes the request payload.
     pub fn payload(&self) -> std::result::Result<Req, RpcError> {
         Req::decode(&self.payload_bytes)
-            .map_err(|e| RpcError::Serialization(format!("decode request: {e}")))
+            .map_err(|e| RpcError::Serialisation(format!("decode request: {e}")))
     }
 
     /// Decodes and returns the request payload by value.
@@ -1296,7 +1296,7 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
 
                 FlatMsg::decode(&payload)
                     .map(Some)
-                    .map_err(|e| RpcError::Serialization(format!("{e}")))
+                    .map_err(|e| RpcError::Serialisation(format!("{e}")))
             }
             Err(Error::BufferEmpty) => Ok(None),
             Err(e) => Err(e.into()),
@@ -1351,7 +1351,7 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
 
                 return FlatMsg::decode(&payload)
                     .map(Some)
-                    .map_err(|e| RpcError::Serialization(format!("{e}")));
+                    .map_err(|e| RpcError::Serialisation(format!("{e}")));
             }
         }
 
@@ -1399,7 +1399,7 @@ impl<Item, M: MessageTransport> BidiRequestStream<'_, Item, M> {
 
                         return FlatMsg::decode(&payload)
                             .map(Some)
-                            .map_err(|e| RpcError::Serialization(format!("{e}")));
+                            .map_err(|e| RpcError::Serialisation(format!("{e}")));
                     }
                     Err(Error::BufferEmpty) => {}
                     Err(e) => return Err(e.into()),
