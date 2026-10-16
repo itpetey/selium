@@ -10,7 +10,11 @@
 
 // Each integration test binary compiles this module independently and uses
 // only the helpers its guests need; per-binary, some helpers are dead code.
-#![allow(dead_code, reason = "shared spine test-support compiled per binary")]
+#![allow(
+    dead_code,
+    clippy::panic,
+    reason = "shared spine test-support compiled per binary"
+)]
 
 use std::{
     fs::OpenOptions,
@@ -310,7 +314,7 @@ pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescript
 }
 
 pub(crate) fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let messages = runtime
+    runtime
         .kernel()
         .processes()
         .drain_log_channel(process_id)
@@ -330,8 +334,7 @@ pub(crate) fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
                 .expect("decode log record")
                 .message
         })
-        .collect();
-    messages
+        .collect()
 }
 
 /// The identity system guest: sole mint authority, keyring-backed signing,
