@@ -13,6 +13,59 @@ use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
+/// A resource minted under a serving tenant is revoked under the tenant it was
+/// minted for when its owning process exits, and its quota comes back to that
+/// same tenant's ceiling — the case the tenant side maps used to miss.
+#[test]
+fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    // A ceiling only `acme` is subject to, so a mis-attributed release shows.
+    runtime
+        .kernel()
+        .quota()
+        .set("acme", ResourceClass::SharedRegion, 2 * 65536);
+
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    // A root-principal guest mints for a named tenant without delegation.
+    let pid = spawn_guest(&runtime, "root-minter", None, grants);
+    let _ = drain_uris(&mut subscriber); // process-node registration
+
+    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("cross-tenant mint");
+    let (registered, _, _) = drain_uris(&mut subscriber);
+    assert!(
+        registered.contains(&format!("sel://acme/region/{region_id}")),
+        "the region is registered under the tenant it was minted for, got: {registered:?}"
+    );
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::SharedRegion),
+        65536,
+        "the reservation is charged to the serving tenant's ceiling"
+    );
+
+    // Teardown: the registration is revoked by identity (the registry revokes
+    // under the tenant it recorded), and the quota returns to that tenant.
+    runtime.stop_process(pid).expect("stop process");
+    let (_, _revoked, revoked_resources) = drain_uris(&mut subscriber);
+    assert!(
+        revoked_resources.contains(&("region".to_string(), region_id)),
+        "expected identity-keyed revocation at teardown, got: {revoked_resources:?}"
+    );
+    assert_eq!(
+        runtime
+            .kernel()
+            .quota()
+            .used("acme", ResourceClass::SharedRegion),
+        0,
+        "the reservation is released to the tenant it was charged to, not the owner's"
+    );
+}
+
 #[expect(
     clippy::panic_in_result_fn,
     reason = "test helper surfaces unexpected hostcall output as a panic"
@@ -164,59 +217,6 @@ fn host_queue_registration_uses_principal_provenance() {
     assert!(
         revoked_resources.contains(&("queue".to_string(), queue_id)),
         "expected identity-keyed queue revocation at teardown, got: {revoked_resources:?}"
-    );
-}
-
-/// A resource minted under a serving tenant is revoked under the tenant it was
-/// minted for when its owning process exits, and its quota comes back to that
-/// same tenant's ceiling — the case the tenant side maps used to miss.
-#[test]
-fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
-    let (runtime, mut subscriber) = runtime_with_feed();
-    // A ceiling only `acme` is subject to, so a mis-attributed release shows.
-    runtime
-        .kernel()
-        .quota()
-        .set("acme", ResourceClass::SharedRegion, 2 * 65536);
-
-    let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-    )];
-    // A root-principal guest mints for a named tenant without delegation.
-    let pid = spawn_guest(&runtime, "root-minter", None, grants);
-    let _ = drain_uris(&mut subscriber); // process-node registration
-
-    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("cross-tenant mint");
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(
-        registered.contains(&format!("sel://acme/region/{region_id}")),
-        "the region is registered under the tenant it was minted for, got: {registered:?}"
-    );
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::SharedRegion),
-        65536,
-        "the reservation is charged to the serving tenant's ceiling"
-    );
-
-    // Teardown: the registration is revoked by identity (the registry revokes
-    // under the tenant it recorded), and the quota returns to that tenant.
-    runtime.stop_process(pid).expect("stop process");
-    let (_, _revoked, revoked_resources) = drain_uris(&mut subscriber);
-    assert!(
-        revoked_resources.contains(&("region".to_string(), region_id)),
-        "expected identity-keyed revocation at teardown, got: {revoked_resources:?}"
-    );
-    assert_eq!(
-        runtime
-            .kernel()
-            .quota()
-            .used("acme", ResourceClass::SharedRegion),
-        0,
-        "the reservation is released to the tenant it was charged to, not the owner's"
     );
 }
 

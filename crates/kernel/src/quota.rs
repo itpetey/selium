@@ -33,6 +33,14 @@ struct QuotaState {
     used: u64,
 }
 
+/// A resource's outstanding quota reservation: the tenant whose ceiling was
+/// charged and the amount still held.
+#[derive(Debug, Clone)]
+struct Reservation {
+    tenant: String,
+    amount: u64,
+}
+
 struct QuotaTableInner {
     quotas: Mutex<HashMap<(String, ResourceClass), QuotaState>>,
     /// Which tenant's counter each resource's reservation was charged to.
@@ -43,14 +51,6 @@ struct QuotaTableInner {
     /// charged against, so the metering domain records the debit here rather
     /// than letting the release path re-derive a tenant. Consumed on release.
     reservations: Mutex<HashMap<(ResourceClass, u64), Reservation>>,
-}
-
-/// A resource's outstanding quota reservation: the tenant whose ceiling was
-/// charged and the amount still held.
-#[derive(Debug, Clone)]
-struct Reservation {
-    tenant: String,
-    amount: u64,
 }
 
 impl QuotaTable {

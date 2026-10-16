@@ -4,6 +4,104 @@ use selium_abi::{
 };
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
+/// The push form of owner-scoped handoff: the owner authorises exactly one
+/// client process, that client's attach succeeds on that basis alone, and no
+/// other process gains one.
+#[test]
+fn an_owner_push_authorisation_admits_exactly_the_named_peer() {
+    let runtime = Runtime::default();
+    let queue_grant = || {
+        CapabilityGrant::new(
+            Capability::HostQueue,
+            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+        )
+    };
+    let spawn = |name: &str| {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module_with_entrypoint("boot"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![queue_grant()],
+                tenant: None,
+                discovery_service: false,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest")
+    };
+    let owner = spawn("owner");
+    let peer = spawn("peer");
+    let bystander = spawn("bystander");
+
+    // The owner creates the queue and pushes an authorisation naming `peer`.
+    let (status, op_id) = runtime.begin_hostcall(
+        owner.process_id,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    let CompletionState::Ready(HostcallOutput::HostQueue(descriptor)) =
+        runtime.poll_hostcall(owner.process_id, op_id)
+    else {
+        panic!("expected a host queue descriptor");
+    };
+    let shared_id = descriptor.shared_id;
+
+    // Before the authorisation, neither peer nor bystander has a basis.
+    for process in [peer.process_id, bystander.process_id] {
+        let (status, _op_id) =
+            runtime.begin_hostcall(process, HostcallRequest::HostQueueAttach { shared_id });
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "an unauthorised process must not attach"
+        );
+    }
+
+    let (status, _op_id) = runtime.begin_hostcall(
+        owner.process_id,
+        HostcallRequest::AuthoriseAttach {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: peer.process_id,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the owner authorises a named peer"
+    );
+
+    // The named peer's attach is now authorised.
+    let (status, op_id) = runtime.begin_hostcall(
+        peer.process_id,
+        HostcallRequest::HostQueueAttach { shared_id },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the authorised peer attaches on its recorded basis"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(peer.process_id, op_id),
+        CompletionState::Ready(_)
+    ));
+
+    // No other process gained a basis from that authorisation.
+    let (status, _op_id) = runtime.begin_hostcall(
+        bystander.process_id,
+        HostcallRequest::HostQueueAttach { shared_id },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "an authorisation names one peer; nobody else gains a basis"
+    );
+}
+
 /// Task 4.2 & 3.1: Concurrent connections use distinct regions; all reclaim
 /// on disconnect.
 #[test]
@@ -196,43 +294,6 @@ fn concurrent_connections_use_distinct_regions() {
     ));
 }
 
-/// The queue's owner declares it attachable by resolution, then the client's
-/// resolve is recorded under that live declaration — the owner-scoped handoff
-/// the runtime accepts in place of the removed discovery-gated recording.
-fn owner_declares_and_records_resolve(
-    runtime: &Runtime,
-    owner: selium_abi::ProcessId,
-    client: selium_abi::ProcessId,
-    shared_id: u64,
-) {
-    let (status, _op) = runtime.begin_hostcall(
-        owner,
-        HostcallRequest::DeclareAttachableByResolution {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            scope: selium_abi::AttachDeclarationScope::Any,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "the queue owner must declare it attachable by resolution"
-    );
-    let (status, _op) = runtime.begin_hostcall(
-        client,
-        HostcallRequest::RecordResolvedResourceFor {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            client_process_id: client,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "a resolve recording under a live declaration must be accepted"
-    );
-}
-
 #[test]
 fn foundation_crates_work_together_through_hostcalls() {
     let runtime = Runtime::default();
@@ -324,6 +385,43 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
         "(module (memory 1) (func (export \"{entrypoint}\")))"
     ))
     .expect("compile wat")
+}
+
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: selium_abi::ProcessId,
+    client: selium_abi::ProcessId,
+    shared_id: u64,
+) {
+    let (status, _op) = runtime.begin_hostcall(
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the queue owner must declare it attachable by resolution"
+    );
+    let (status, _op) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
+    );
 }
 
 /// Attach authority flows from ownership and owner declarations only: a
@@ -486,104 +584,6 @@ fn owner_scoped_attach_authorisation() {
         runtime.poll_hostcall(peer, op_id),
         CompletionState::Ready(_)
     ));
-}
-
-/// The push form of owner-scoped handoff: the owner authorises exactly one
-/// client process, that client's attach succeeds on that basis alone, and no
-/// other process gains one.
-#[test]
-fn an_owner_push_authorisation_admits_exactly_the_named_peer() {
-    let runtime = Runtime::default();
-    let queue_grant = || {
-        CapabilityGrant::new(
-            Capability::HostQueue,
-            vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )
-    };
-    let spawn = |name: &str| {
-        runtime
-            .spawn_system_guest(SystemGuestDescriptor {
-                name: name.to_string(),
-                module_id: format!("{name}-module"),
-                module_bytes: module_with_entrypoint("boot"),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants: vec![queue_grant()],
-                tenant: None,
-                discovery_service: false,
-                handlers: Vec::new(),
-            })
-            .expect("spawn guest")
-    };
-    let owner = spawn("owner");
-    let peer = spawn("peer");
-    let bystander = spawn("bystander");
-
-    // The owner creates the queue and pushes an authorisation naming `peer`.
-    let (status, op_id) = runtime.begin_hostcall(
-        owner.process_id,
-        HostcallRequest::HostQueueCreate {
-            serving_tenant: None,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    let CompletionState::Ready(HostcallOutput::HostQueue(descriptor)) =
-        runtime.poll_hostcall(owner.process_id, op_id)
-    else {
-        panic!("expected a host queue descriptor");
-    };
-    let shared_id = descriptor.shared_id;
-
-    // Before the authorisation, neither peer nor bystander has a basis.
-    for process in [peer.process_id, bystander.process_id] {
-        let (status, _op_id) =
-            runtime.begin_hostcall(process, HostcallRequest::HostQueueAttach { shared_id });
-        assert_eq!(
-            status,
-            selium_abi::HOSTCALL_STATUS_FAILED,
-            "an unauthorised process must not attach"
-        );
-    }
-
-    let (status, _op_id) = runtime.begin_hostcall(
-        owner.process_id,
-        HostcallRequest::AuthoriseAttach {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            client_process_id: peer.process_id,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "the owner authorises a named peer"
-    );
-
-    // The named peer's attach is now authorised.
-    let (status, op_id) = runtime.begin_hostcall(
-        peer.process_id,
-        HostcallRequest::HostQueueAttach { shared_id },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "the authorised peer attaches on its recorded basis"
-    );
-    assert!(matches!(
-        runtime.poll_hostcall(peer.process_id, op_id),
-        CompletionState::Ready(_)
-    ));
-
-    // No other process gained a basis from that authorisation.
-    let (status, _op_id) = runtime.begin_hostcall(
-        bystander.process_id,
-        HostcallRequest::HostQueueAttach { shared_id },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_FAILED,
-        "an authorisation names one peer; nobody else gains a basis"
-    );
 }
 
 #[test]

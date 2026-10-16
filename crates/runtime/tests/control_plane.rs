@@ -38,21 +38,6 @@ fn bootstrap(runtime: &Runtime, state: &spine_common::StateRoot) -> BootstrapRep
         .expect("bootstrap system guests")
 }
 
-/// Boots one additional guest against an already-running discovery service.
-fn bootstrap_one(
-    runtime: &Runtime,
-    state: &spine_common::StateRoot,
-    descriptor: SystemGuestDescriptor,
-) -> BootstrapReport {
-    runtime
-        .bootstrap_system_guests(RuntimeConfig {
-            start_discovery: false,
-            system_guests: vec![descriptor],
-            state_dir: state.config_dir(),
-        })
-        .expect("bootstrap extra guest")
-}
-
 #[expect(clippy::panic, reason = "test helper panics on an unknown guest name")]
 fn bootstrap_extra(
     runtime: &Runtime,
@@ -67,14 +52,19 @@ fn bootstrap_extra(
     bootstrap_one(runtime, state, descriptor)
 }
 
-#[expect(clippy::panic, reason = "test helper panics on a missing guest")]
-fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
-    report
-        .guests
-        .iter()
-        .find(|guest| guest.name == name)
-        .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
-        .process_id
+/// Boots one additional guest against an already-running discovery service.
+fn bootstrap_one(
+    runtime: &Runtime,
+    state: &spine_common::StateRoot,
+    descriptor: SystemGuestDescriptor,
+) -> BootstrapReport {
+    runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![descriptor],
+            state_dir: state.config_dir(),
+        })
+        .expect("bootstrap extra guest")
 }
 
 #[test]
@@ -171,34 +161,6 @@ fn control_plane_bootstrap_slice_end_to_end() {
     drop(runtime.stop_process(probe));
 }
 
-fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "control-probe".to_string(),
-        module_id: "control-probe-module".to_string(),
-        module_bytes,
-        entrypoint: "control_probe".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
-        ],
-        tenant: None,
-        discovery_service: false,
-        handlers: Vec::new(),
-    }
-}
-
-fn control_probe_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-control-probe", "selium_control_probe.wasm")
-}
-
 fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "control-plane".to_string(),
@@ -231,6 +193,34 @@ fn control_plane_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-control-plane", "selium_control_plane.wasm")
 }
 
+fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "control-probe".to_string(),
+        module_id: "control-probe-module".to_string(),
+        module_bytes,
+        entrypoint: "control_probe".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        ],
+        tenant: None,
+        discovery_service: false,
+        handlers: Vec::new(),
+    }
+}
+
+fn control_probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-control-probe", "selium_control_probe.wasm")
+}
+
 fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "discovery".to_string(),
@@ -260,4 +250,14 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 
 fn discovery_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
+}
+
+#[expect(clippy::panic, reason = "test helper panics on a missing guest")]
+fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
+    report
+        .guests
+        .iter()
+        .find(|guest| guest.name == name)
+        .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
+        .process_id
 }

@@ -237,22 +237,6 @@ fn discovery_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
 }
 
-fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let frames = runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel");
-    frames
-        .iter()
-        .map(|frame| {
-            selium_service::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
-}
-
 /// Drains the feed, collecting registered URIs and host-authored handler
 /// registrations. Both are asserted from one drain because reading the ring
 /// consumes every event in it.
@@ -281,6 +265,22 @@ fn drain_feed_registrations(
         }
     }
     (uris, handlers)
+}
+
+fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let frames = runtime
+        .kernel()
+        .processes()
+        .drain_log_channel(process_id)
+        .expect("drain log channel");
+    frames
+        .iter()
+        .map(|frame| {
+            selium_service::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
 }
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]

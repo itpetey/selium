@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use selium_abi::uri::{self, DomainTable};
 use selium_abi::{
     HostcallOutput, HostcallRequest, RegionAllocation, RegionProt, ResourceClass, ResourceKind,
+    uri::{self, DomainTable},
 };
 use selium_service::{
     CatalogueRecord, ControlRequest, ControlResponse, DiscoveryRequest, DiscoveryResponse,

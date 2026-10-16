@@ -46,6 +46,8 @@ use sha2::{Digest, Sha256};
 pub const ANCHOR_KEY_PREFIX: &str = "client-ca-";
 /// Serving route path for the anchor live table (`sel:///identity-anchors`).
 pub const ANCHOR_TABLE_PATH: &str = "identity-anchors";
+/// Durable log name for the advisory domain registry.
+pub const DOMAIN_LOG: &str = "selium.identity.domains";
 /// Serving route path for the grant live table (`sel:///identity-grants`).
 pub const GRANT_TABLE_PATH: &str = "identity-grants";
 /// Serving route path for the request surface (`sel:///identity`).
@@ -56,8 +58,6 @@ pub const PRINCIPAL_LOG: &str = "selium.identity.principals";
 const TABLE_CAPACITY: u64 = 64 * 1024;
 /// Durable log name for the tenant registry.
 pub const TENANT_LOG: &str = "selium.identity.tenants";
-/// Durable log name for the advisory domain registry.
-pub const DOMAIN_LOG: &str = "selium.identity.domains";
 
 /// An advisory domain registry record appended to the durable log.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -127,47 +127,6 @@ pub struct PrincipalRegistry {
 #[derive(Debug, Clone, Default)]
 pub struct DomainRegistry {
     by_domain: BTreeMap<String, String>,
-}
-
-impl DomainRegistry {
-    /// Applies one domain record in replay order.
-    pub fn apply_record(&mut self, record: DomainRecord) {
-        match record {
-            DomainRecord::Set { domain, tenant } => {
-                self.by_domain.insert(domain, tenant);
-            }
-            DomainRecord::Remove { domain } => {
-                self.by_domain.remove(&domain);
-            }
-        }
-    }
-
-    /// Materialises the projection from a replayed durable log.
-    pub async fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
-        let payloads = log
-            .replay(None, u32::MAX)
-            .await?
-            .into_iter()
-            .map(|record| record.payload);
-        self.rebuild_payloads(payloads);
-        Ok(())
-    }
-
-    /// Re-applies replayed record payloads in log order. Undecodable records
-    /// are skipped with a warning.
-    pub fn rebuild_payloads(&mut self, payloads: impl IntoIterator<Item = Vec<u8>>) {
-        for payload in payloads {
-            match selium_abi::decode_rkyv::<DomainRecord>(&payload) {
-                Ok(record) => self.apply_record(record),
-                Err(error) => warn!("identity: skipping undecodable domain record: {error}"),
-            }
-        }
-    }
-
-    /// Returns the recorded mappings, in domain order.
-    pub fn entries(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.by_domain.iter()
-    }
 }
 
 /// The caller's tier, derived from its process tenant.
@@ -293,6 +252,47 @@ impl PrincipalRegistry {
     /// Iterates the projected `(fingerprint, grants)` pairs.
     pub fn entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
         self.by_fingerprint.iter()
+    }
+}
+
+impl DomainRegistry {
+    /// Applies one domain record in replay order.
+    pub fn apply_record(&mut self, record: DomainRecord) {
+        match record {
+            DomainRecord::Set { domain, tenant } => {
+                self.by_domain.insert(domain, tenant);
+            }
+            DomainRecord::Remove { domain } => {
+                self.by_domain.remove(&domain);
+            }
+        }
+    }
+
+    /// Materialises the projection from a replayed durable log.
+    pub async fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
+        let payloads = log
+            .replay(None, u32::MAX)
+            .await?
+            .into_iter()
+            .map(|record| record.payload);
+        self.rebuild_payloads(payloads);
+        Ok(())
+    }
+
+    /// Re-applies replayed record payloads in log order. Undecodable records
+    /// are skipped with a warning.
+    pub fn rebuild_payloads(&mut self, payloads: impl IntoIterator<Item = Vec<u8>>) {
+        for payload in payloads {
+            match selium_abi::decode_rkyv::<DomainRecord>(&payload) {
+                Ok(record) => self.apply_record(record),
+                Err(error) => warn!("identity: skipping undecodable domain record: {error}"),
+            }
+        }
+    }
+
+    /// Returns the recorded mappings, in domain order.
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.by_domain.iter()
     }
 }
 
@@ -510,48 +510,6 @@ async fn handle_request(
                 },
             }
         }
-    }
-}
-
-/// Records a domain→tenant mapping durably and publishes it to discovery.
-async fn set_domain(domain: &str, tenant: &str, state: &IdentityState) -> Result<(), String> {
-    let record = DomainRecord::Set {
-        domain: domain.to_string(),
-        tenant: tenant.to_string(),
-    };
-    let timestamp_ms = selium_guest::time::now()
-        .map(|nanos| nanos / 1_000_000)
-        .map_err(|error| error.to_string())?;
-    let payload = selium_abi::encode_rkyv(&record).map_err(|error| error.to_string())?;
-    state
-        .domain_log
-        .append(timestamp_ms, Vec::new(), payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    state
-        .domains
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .apply_record(record);
-    let mut ctx = Context::from_raw(state.discovery_handle)
-        .await
-        .map_err(|error| error.to_string())?;
-    publish_domain(&mut ctx, domain, tenant).await
-}
-
-/// Publishes one advisory domain mapping to discovery.
-async fn publish_domain(ctx: &mut Context, domain: &str, tenant: &str) -> Result<(), String> {
-    match ctx
-        .discovery()
-        .request(DiscoveryRequest::SetDomain {
-            domain: domain.to_string(),
-            tenant: tenant.to_string(),
-        })
-        .await
-    {
-        Ok(DiscoveryResponse::Registered) => Ok(()),
-        Ok(other) => Err(format!("unexpected discovery response: {other:?}")),
-        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -794,6 +752,22 @@ async fn mint_tenant_ca(tenant: &str, state: &IdentityState) -> Result<(), Strin
     Ok(())
 }
 
+/// Publishes one advisory domain mapping to discovery.
+async fn publish_domain(ctx: &mut Context, domain: &str, tenant: &str) -> Result<(), String> {
+    match ctx
+        .discovery()
+        .request(DiscoveryRequest::SetDomain {
+            domain: domain.to_string(),
+            tenant: tenant.to_string(),
+        })
+        .await
+    {
+        Ok(DiscoveryResponse::Registered) => Ok(()),
+        Ok(other) => Err(format!("unexpected discovery response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Publishes a principal's grant set to the grant table. An empty grant set is
 /// a delete: the bridge treats an absent fingerprint as "refuse the handoff".
 fn publish_grants(
@@ -907,6 +881,32 @@ async fn revoke_tenant(tenant: &str, state: &IdentityState) -> Result<(), String
         .delete(anchor_key(tenant))
         .map_err(|error| format!("anchor removal failed: {error}"))?;
     Ok(())
+}
+
+/// Records a domain→tenant mapping durably and publishes it to discovery.
+async fn set_domain(domain: &str, tenant: &str, state: &IdentityState) -> Result<(), String> {
+    let record = DomainRecord::Set {
+        domain: domain.to_string(),
+        tenant: tenant.to_string(),
+    };
+    let timestamp_ms = selium_guest::time::now()
+        .map(|nanos| nanos / 1_000_000)
+        .map_err(|error| error.to_string())?;
+    let payload = selium_abi::encode_rkyv(&record).map_err(|error| error.to_string())?;
+    state
+        .domain_log
+        .append(timestamp_ms, Vec::new(), payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    state
+        .domains
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_record(record);
+    let mut ctx = Context::from_raw(state.discovery_handle)
+        .await
+        .map_err(|error| error.to_string())?;
+    publish_domain(&mut ctx, domain, tenant).await
 }
 
 /// Records a principal's baseline grant set and publishes it to the grant table.

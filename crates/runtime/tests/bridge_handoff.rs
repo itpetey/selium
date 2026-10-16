@@ -314,6 +314,36 @@ fn deliver_handoff(
     stream_region
 }
 
+/// A bridge-channel stub whose `__selium_guest_poll` export reports entrypoint
+/// completion (`1`): its poll-owner entrypoint has returned, so the runtime
+/// reaps it as a normal exit.
+fn module_with_completing_poll() -> Vec<u8> {
+    wat::parse_str(
+        "(module
+            (memory 1)
+            (func (export \"bridge_channel\"))
+            (func (export \"__selium_guest_poll\") (result i32) i32.const 1))",
+    )
+    .expect("compile wat")
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    module_with_entrypoint_args(entrypoint, 0)
+}
+
+fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
+    let params: String = "i64 ".repeat(args).trim_end().to_string();
+    let params = if params.is_empty() {
+        String::new()
+    } else {
+        format!("(param {params})")
+    };
+    wat::parse_str(format!(
+        "(module (memory 1) (func (export \"{entrypoint}\") {params}))"
+    ))
+    .expect("compile wat")
+}
+
 /// The queue's owner declares it attachable by resolution, then the client's
 /// resolve is recorded under that live declaration — the owner-scoped handoff
 /// the runtime accepts in place of the removed discovery-gated recording.
@@ -349,36 +379,6 @@ fn owner_declares_and_records_resolve(
         selium_abi::HOSTCALL_STATUS_READY,
         "a resolve recording under a live declaration must be accepted"
     );
-}
-
-/// A bridge-channel stub whose `__selium_guest_poll` export reports entrypoint
-/// completion (`1`): its poll-owner entrypoint has returned, so the runtime
-/// reaps it as a normal exit.
-fn module_with_completing_poll() -> Vec<u8> {
-    wat::parse_str(
-        "(module
-            (memory 1)
-            (func (export \"bridge_channel\"))
-            (func (export \"__selium_guest_poll\") (result i32) i32.const 1))",
-    )
-    .expect("compile wat")
-}
-
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    module_with_entrypoint_args(entrypoint, 0)
-}
-
-fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
-    let params: String = "i64 ".repeat(args).trim_end().to_string();
-    let params = if params.is_empty() {
-        String::new()
-    } else {
-        format!("(param {params})")
-    };
-    wat::parse_str(format!(
-        "(module (memory 1) (func (export \"{entrypoint}\") {params}))"
-    ))
-    .expect("compile wat")
 }
 
 /// Task 7.2: exceeding a tenant's process ceiling is denied by the quota and

@@ -76,6 +76,40 @@ impl Drop for HostcallFuture {
     }
 }
 
+/// Authorises `client_process_id` to attach the shared resource named by
+/// `resource_class`/`resource_id`. The caller must own the resource or hold
+/// an `ExplicitResource` capability for it; no guest identity is privileged.
+/// The host records the handoff as the client's attach basis.
+pub fn authorise_attach(
+    resource_class: selium_abi::ResourceClass,
+    resource_id: selium_abi::SharedResourceId,
+    client_process_id: selium_abi::ProcessId,
+) -> Result<()> {
+    hostcall_ready(HostcallRequest::AuthoriseAttach {
+        resource_class,
+        resource_id,
+        client_process_id,
+    })
+    .map(|_| ())
+}
+
+/// Declares a resource the caller owns attachable by resolution, with a
+/// declaration scope naming which callers the declaration admits. While a
+/// live declaration holds, the host accepts a resolve-recording within its
+/// scope as the client's attach basis.
+pub fn declare_attachable_by_resolution(
+    resource_class: selium_abi::ResourceClass,
+    resource_id: selium_abi::SharedResourceId,
+    scope: selium_abi::AttachDeclarationScope,
+) -> Result<()> {
+    hostcall_ready(HostcallRequest::DeclareAttachableByResolution {
+        resource_class,
+        resource_id,
+        scope,
+    })
+    .map(|_| ())
+}
+
 /// Maps a process tenant to its namespace: `None` (or empty) → `Root`, a
 /// named tenant → `Tenant(t)`.
 pub fn namespace_from_tenant(tenant: Option<&str>) -> selium_abi::Namespace {
@@ -164,40 +198,6 @@ pub fn random_bytes(len: u32) -> Result<Vec<u8>> {
             "unexpected hostcall output for RandomBytes: {other:?}"
         ))),
     }
-}
-
-/// Authorises `client_process_id` to attach the shared resource named by
-/// `resource_class`/`resource_id`. The caller must own the resource or hold
-/// an `ExplicitResource` capability for it; no guest identity is privileged.
-/// The host records the handoff as the client's attach basis.
-pub fn authorise_attach(
-    resource_class: selium_abi::ResourceClass,
-    resource_id: selium_abi::SharedResourceId,
-    client_process_id: selium_abi::ProcessId,
-) -> Result<()> {
-    hostcall_ready(HostcallRequest::AuthoriseAttach {
-        resource_class,
-        resource_id,
-        client_process_id,
-    })
-    .map(|_| ())
-}
-
-/// Declares a resource the caller owns attachable by resolution, with a
-/// declaration scope naming which callers the declaration admits. While a
-/// live declaration holds, the host accepts a resolve-recording within its
-/// scope as the client's attach basis.
-pub fn declare_attachable_by_resolution(
-    resource_class: selium_abi::ResourceClass,
-    resource_id: selium_abi::SharedResourceId,
-    scope: selium_abi::AttachDeclarationScope,
-) -> Result<()> {
-    hostcall_ready(HostcallRequest::DeclareAttachableByResolution {
-        resource_class,
-        resource_id,
-        scope,
-    })
-    .map(|_| ())
 }
 
 /// Records that a resolve performed by `client_process_id` returned the named

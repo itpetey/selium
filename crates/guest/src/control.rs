@@ -8,12 +8,12 @@ use selium_shm::rpc::{self, OwnedRpcClient};
 
 use crate::{GuestError, Result, async_runtime::yield_now};
 
+/// The root-namespace route the control-plane service serves on.
+pub const CONTROL_ROUTE: &str = "sel:///control";
 /// Reply ring capacity for a control-plane session; sized for catalogue reads.
 const RPC_REP_CAPACITY: u64 = 64 * 1024;
 /// Request ring capacity for a control-plane session.
 const RPC_REQ_CAPACITY: u64 = 64 * 1024;
-/// The root-namespace route the control-plane service serves on.
-pub const CONTROL_ROUTE: &str = "sel:///control";
 
 /// A typed client of the `selium-control-plane` service.
 ///

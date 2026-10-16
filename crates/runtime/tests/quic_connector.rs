@@ -17,43 +17,6 @@ use selium_abi::{
 };
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
-/// The queue's owner declares it attachable by resolution, then the client's
-/// resolve is recorded under that live declaration — the owner-scoped handoff
-/// the runtime accepts in place of the removed discovery-gated recording.
-fn owner_declares_and_records_resolve(
-    runtime: &Runtime,
-    owner: ProcessId,
-    client: ProcessId,
-    shared_id: u64,
-) {
-    let (status, _) = runtime.begin_hostcall(
-        owner,
-        HostcallRequest::DeclareAttachableByResolution {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            scope: selium_abi::AttachDeclarationScope::Any,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "the queue owner must declare it attachable by resolution"
-    );
-    let (status, _) = runtime.begin_hostcall(
-        client,
-        HostcallRequest::RecordResolvedResourceFor {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            client_process_id: client,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "a resolve recording under a live declaration must be accepted"
-    );
-}
-
 /// Task 6.2 substrate layer: a full Park ring parks writers (no loss), the
 /// channel mechanism the connector's backpressure honesty is built on.
 #[tokio::test]
@@ -146,6 +109,43 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
         "(module (memory 1) (func (export \"{entrypoint}\")))"
     ))
     .expect("compile wat")
+}
+
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: ProcessId,
+    client: ProcessId,
+    shared_id: u64,
+) {
+    let (status, _) = runtime.begin_hostcall(
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the queue owner must declare it attachable by resolution"
+    );
+    let (status, _) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
+    );
 }
 
 /// Task 6.1 substrate layer: the connector ↔ app-guest channel handoff.

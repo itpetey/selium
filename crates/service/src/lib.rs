@@ -21,6 +21,13 @@ pub mod log;
 // Allow generated schema bindings to refer to this crate by name.
 extern crate self as selium_service;
 
+/// Lifetime of an owner-registered route's lease, in milliseconds.
+///
+/// Both sides of the contract need this number: the registry expires a lapsed
+/// lease into a revocation, and the SDK's renewal task must renew inside the
+/// window. It lives here, in the shared service crate, so the registry's sweep
+/// and the SDK's renewal interval cannot drift apart.
+pub const REGISTRATION_LEASE_TTL_MS: u64 = 30_000;
 /// Termination code for a channel the bridge could not resolve or attach.
 pub const TERMINATE_ATTACH_FAILED: u32 = 2;
 /// Termination code for a malformed or missing client handshake.
@@ -152,14 +159,6 @@ pub struct ResourceTarget {
     /// Classification key/value label pairs.
     pub labels: Vec<Label>,
 }
-
-/// Lifetime of an owner-registered route's lease, in milliseconds.
-///
-/// Both sides of the contract need this number: the registry expires a lapsed
-/// lease into a revocation, and the SDK's renewal task must renew inside the
-/// window. It lives here, in the shared service crate, so the registry's sweep
-/// and the SDK's renewal interval cannot drift apart.
-pub const REGISTRATION_LEASE_TTL_MS: u64 = 30_000;
 
 /// Request sent to the discovery service.
 #[derive(Debug, Clone, PartialEq, Eq)]

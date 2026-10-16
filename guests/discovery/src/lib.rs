@@ -30,14 +30,19 @@ use selium_wire::{
     pubsub::{Publisher, Subscriber},
 };
 
-pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
-pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
-pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
-pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
-/// The root-namespace route the discovery route-change table is served on.
-pub const ROUTE_TABLE_ROUTE: &str = "sel:///discovery-routes";
 /// The route-change live table: key = registered URI, value = target.
 pub type RouteTable = LiveTable<String, ResourceTarget, ShmTransport>;
+
+pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
+pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
+/// Lease lifetime: a guest registration lapses if its owner does not renew it
+/// within this window. Shared with the SDK's renewal task, which renews at half
+/// this interval.
+pub const LEASE_TTL_MS: u64 = selium_service::REGISTRATION_LEASE_TTL_MS;
+pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
+/// The root-namespace route the discovery route-change table is served on.
+pub const ROUTE_TABLE_ROUTE: &str = "sel:///discovery-routes";
+pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
 
 #[pattern_interface]
 pub trait DiscoveryControl {
@@ -45,6 +50,16 @@ pub trait DiscoveryControl {
     fn remove(uri: String);
     fn resolve_exact(uri: String);
     fn resolve_prefix(prefix: String);
+}
+
+/// A guest registration's lease: the owning process and the wall-clock
+/// deadline it must renew before.
+#[derive(Debug, Clone, Copy)]
+pub struct Lease {
+    /// Process that owns the registration.
+    pub owner: ProcessId,
+    /// Wall-clock deadline in milliseconds since the Unix epoch.
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,21 +95,6 @@ pub struct DiscoveryStore {
     /// to this internal URI.
     root_services: HashMap<String, String>,
 }
-
-/// A guest registration's lease: the owning process and the wall-clock
-/// deadline it must renew before.
-#[derive(Debug, Clone, Copy)]
-pub struct Lease {
-    /// Process that owns the registration.
-    pub owner: ProcessId,
-    /// Wall-clock deadline in milliseconds since the Unix epoch.
-    pub expires_at_ms: u64,
-}
-
-/// Lease lifetime: a guest registration lapses if its owner does not renew it
-/// within this window. Shared with the SDK's renewal task, which renews at half
-/// this interval.
-pub const LEASE_TTL_MS: u64 = selium_service::REGISTRATION_LEASE_TTL_MS;
 
 impl DiscoveryStore {
     /// Seeds the advisory domain→tenant table (out-of-band provisioning).
@@ -716,6 +716,23 @@ fn attach_feed_subscriber(
     Ok(Subscriber::new(framed, None))
 }
 
+/// Builds the route-change live table over its own ring, returning the ring id
+/// and the table.
+fn create_route_table() -> selium_wire::Result<(u64, RouteTable)> {
+    let channel = Channel::create_with_backpressure(
+        256 * 1024,
+        ChannelBackpressure::Drop,
+        ResourceKind::LiveTable,
+    )?;
+    let region_id = channel.region_id();
+    let write = ShmTransport::new(&channel, &channel)?;
+    let read = ShmTransport::new(&channel, &channel)?;
+    let publisher = Publisher::new(FramedWrite::new(write));
+    let subscriber = Subscriber::new(FramedRead::new(read), None);
+    let table = LiveTable::new(publisher, subscriber)?;
+    Ok((region_id, table))
+}
+
 /// Response used when the caller's tenant scope could not be verified
 /// (fail-closed): reads disclose nothing, writes are refused. A tenant
 /// *absence* (verified `None`, i.e. a root/system principal) is legitimate
@@ -736,74 +753,6 @@ fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
         | DiscoveryRequest::SetHealth { .. }
         | DiscoveryRequest::RegisterHandler { .. }
         | DiscoveryRequest::SetDomain { .. } => DiscoveryResponse::Forbidden,
-    }
-}
-
-/// Builds the route-change live table over its own ring, returning the ring id
-/// and the table.
-fn create_route_table() -> selium_wire::Result<(u64, RouteTable)> {
-    let channel = Channel::create_with_backpressure(
-        256 * 1024,
-        ChannelBackpressure::Drop,
-        ResourceKind::LiveTable,
-    )?;
-    let region_id = channel.region_id();
-    let write = ShmTransport::new(&channel, &channel)?;
-    let read = ShmTransport::new(&channel, &channel)?;
-    let publisher = Publisher::new(FramedWrite::new(write));
-    let subscriber = Subscriber::new(FramedRead::new(read), None);
-    let table = LiveTable::new(publisher, subscriber)?;
-    Ok((region_id, table))
-}
-
-/// Projects the store's registrations onto the route table, publishing only
-/// real changes: a set for every new or changed route, a delete for every
-/// removed route. The table's per-entry version is the route's generation.
-fn sync_route_table(store: &DiscoveryStore, table: &RouteTable) -> selium_wire::Result<()> {
-    let current: std::collections::HashMap<&str, &ResourceTarget> = store
-        .registrations
-        .iter()
-        .map(|(uri, target)| (uri.as_str(), target))
-        .collect();
-    for (uri, target) in &current {
-        let uri = (*uri).to_string();
-        if table.get(&uri)?.as_ref() != Some(*target) {
-            table.set(uri, (*target).clone())?;
-        }
-    }
-    for (uri, record) in table.scan(usize::MAX)? {
-        if record.value.is_some() && !current.contains_key(uri.as_str()) {
-            table.delete(uri)?;
-        }
-    }
-    Ok(())
-}
-
-/// Periodically expires lapsed guest-registration leases, revoking the routes
-/// and publishing the resulting route changes.
-async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
-    const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
-    loop {
-        let deadline = match selium_guest::time::now() {
-            Ok(now) => selium_guest::Instant::from_nanos(now.saturating_add(SWEEP_INTERVAL_NANOS)),
-            Err(error) => {
-                selium_guest::warn!("discovery lease sweep clock failed: {error}");
-                selium_guest::yield_now().await;
-                continue;
-            }
-        };
-        selium_guest::Timer::new(deadline).await;
-
-        let now_ms = selium_guest::time::now()
-            .map(|nanos| nanos / 1_000_000)
-            .unwrap_or(0);
-        let mut store = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.expire_leases(now_ms);
-        if let Err(error) = sync_route_table(&store, &route_table) {
-            selium_guest::warn!("discovery route table sync failed: {error}");
-        }
     }
 }
 
@@ -1124,14 +1073,9 @@ async fn handler(
     }
 }
 
-/// Returns whether a caller's tenant admits a target's tenant. The check is
-/// skipped when either side is absent (backward-compatible with root/system
-/// registrations and untracked tenants).
-fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
-    match (caller, target) {
-        (Some(caller), Some(target)) => caller == target,
-        _ => true,
-    }
+/// The root-namespace route a host-authored protocol handler resolves on.
+fn handler_uri(scheme: &str) -> String {
+    format!("{}/handler/{}", uri::SEL_PREFIX, scheme)
 }
 
 /// The tenant-scoped health route for `name`.
@@ -1144,10 +1088,67 @@ fn health_uri(tenant: Option<&str>, name: &str) -> String {
     )
 }
 
-/// The root-namespace route a host-authored protocol handler resolves on.
-fn handler_uri(scheme: &str) -> String {
-    format!("{}/handler/{}", uri::SEL_PREFIX, scheme)
+/// Periodically expires lapsed guest-registration leases, revoking the routes
+/// and publishing the resulting route changes.
+async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
+    const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
+    loop {
+        let deadline = match selium_guest::time::now() {
+            Ok(now) => selium_guest::Instant::from_nanos(now.saturating_add(SWEEP_INTERVAL_NANOS)),
+            Err(error) => {
+                selium_guest::warn!("discovery lease sweep clock failed: {error}");
+                selium_guest::yield_now().await;
+                continue;
+            }
+        };
+        selium_guest::Timer::new(deadline).await;
+
+        let now_ms = selium_guest::time::now()
+            .map(|nanos| nanos / 1_000_000)
+            .unwrap_or(0);
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.expire_leases(now_ms);
+        if let Err(error) = sync_route_table(&store, &route_table) {
+            selium_guest::warn!("discovery route table sync failed: {error}");
+        }
+    }
 }
+
+/// Projects the store's registrations onto the route table, publishing only
+/// real changes: a set for every new or changed route, a delete for every
+/// removed route. The table's per-entry version is the route's generation.
+fn sync_route_table(store: &DiscoveryStore, table: &RouteTable) -> selium_wire::Result<()> {
+    let current: std::collections::HashMap<&str, &ResourceTarget> = store
+        .registrations
+        .iter()
+        .map(|(uri, target)| (uri.as_str(), target))
+        .collect();
+    for (uri, target) in &current {
+        let uri = (*uri).to_string();
+        if table.get(&uri)?.as_ref() != Some(*target) {
+            table.set(uri, (*target).clone())?;
+        }
+    }
+    for (uri, record) in table.scan(usize::MAX)? {
+        if record.value.is_some() && !current.contains_key(uri.as_str()) {
+            table.delete(uri)?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether a caller's tenant admits a target's tenant. The check is
+/// skipped when either side is absent (backward-compatible with root/system
+/// registrations and untracked tenants).
+fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
+    match (caller, target) {
+        (Some(caller), Some(target)) => caller == target,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

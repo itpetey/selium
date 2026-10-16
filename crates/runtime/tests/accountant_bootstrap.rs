@@ -63,6 +63,62 @@ fn accountant_descriptor_grants_are_bootstrap_admissible() {
     );
 }
 
+/// 7.1: the bookkeeper guest's grant set is admissible at bootstrap, carrying
+/// `MeteringRead` and `ActivityRead` for telemetry reduction.
+#[test]
+fn bookkeeper_descriptor_grants_are_bootstrap_admissible() {
+    let runtime = Runtime::default();
+    let bytes = module_with_entrypoint(BOOKKEEPER_ENTRYPOINT);
+
+    let guest = runtime
+        .spawn_system_guest(descriptor(
+            "bookkeeper",
+            "bookkeeper-module",
+            &bytes,
+            BOOKKEEPER_ENTRYPOINT,
+            bookkeeper_grants(),
+            Vec::new(),
+        ))
+        .expect("bookkeeper descriptor must be admissible at bootstrap");
+
+    let authority = runtime
+        .restore_process_authority(guest.process_id)
+        .expect("bookkeeper authority");
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::MeteringRead)
+    );
+    assert!(
+        authority
+            .grants
+            .iter()
+            .any(|grant| grant.capability == Capability::ActivityRead)
+    );
+}
+
+fn descriptor(
+    name: &str,
+    module_id: &str,
+    module_bytes: &[u8],
+    entrypoint: &str,
+    grants: Vec<CapabilityGrant>,
+    _dependencies: Vec<String>,
+) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: name.to_string(),
+        module_id: module_id.to_string(),
+        module_bytes: module_bytes.to_vec(),
+        entrypoint: entrypoint.to_string(),
+        arguments: Vec::new(),
+        grants,
+        tenant: None,
+        discovery_service: false,
+        handlers: Vec::new(),
+    }
+}
+
 /// 4.1 + 7.1: one module boots both entrypoints (two descriptors over the same
 /// module bytes), and dependency order boots the bookkeeper before the
 /// accountant even when the accountant is listed first.
@@ -118,62 +174,6 @@ fn guests_boot_in_declaration_order_from_the_same_module_bytes() {
         .map(|guest| guest.name.as_str())
         .collect();
     assert_eq!(names, vec!["accountant", "bookkeeper", "discovery"]);
-}
-
-/// 7.1: the bookkeeper guest's grant set is admissible at bootstrap, carrying
-/// `MeteringRead` and `ActivityRead` for telemetry reduction.
-#[test]
-fn bookkeeper_descriptor_grants_are_bootstrap_admissible() {
-    let runtime = Runtime::default();
-    let bytes = module_with_entrypoint(BOOKKEEPER_ENTRYPOINT);
-
-    let guest = runtime
-        .spawn_system_guest(descriptor(
-            "bookkeeper",
-            "bookkeeper-module",
-            &bytes,
-            BOOKKEEPER_ENTRYPOINT,
-            bookkeeper_grants(),
-            Vec::new(),
-        ))
-        .expect("bookkeeper descriptor must be admissible at bootstrap");
-
-    let authority = runtime
-        .restore_process_authority(guest.process_id)
-        .expect("bookkeeper authority");
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::MeteringRead)
-    );
-    assert!(
-        authority
-            .grants
-            .iter()
-            .any(|grant| grant.capability == Capability::ActivityRead)
-    );
-}
-
-fn descriptor(
-    name: &str,
-    module_id: &str,
-    module_bytes: &[u8],
-    entrypoint: &str,
-    grants: Vec<CapabilityGrant>,
-    _dependencies: Vec<String>,
-) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: name.to_string(),
-        module_id: module_id.to_string(),
-        module_bytes: module_bytes.to_vec(),
-        entrypoint: entrypoint.to_string(),
-        arguments: Vec::new(),
-        grants,
-        tenant: None,
-        discovery_service: false,
-        handlers: Vec::new(),
-    }
 }
 
 /// One module exporting both accounting entrypoints, mirroring the shipped

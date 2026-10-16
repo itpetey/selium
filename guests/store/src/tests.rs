@@ -203,6 +203,55 @@ fn a_truncated_volume_mid_record_keeps_the_complete_prefix() {
     );
 }
 
+#[test]
+fn an_absent_blob_or_manifest_resolves_to_no_slice() {
+    let (_volumes, store) = store();
+    let blob_id = store
+        .put_blob("acme", "assets", b"module-bytes")
+        .expect("put");
+
+    // A blob id the store does not hold.
+    assert_eq!(
+        store
+            .resolve_slice("acme", "assets", "no-such-blob")
+            .expect("resolve absent"),
+        None,
+        "an absent blob cannot be resolved"
+    );
+    // A blob that belongs to another store's namespace is not resolvable
+    // through this one.
+    assert_eq!(
+        store
+            .resolve_slice("acme", "other-store", &blob_id)
+            .expect("resolve absent store"),
+        None,
+        "a blob outside the named store resolves to nothing"
+    );
+    // A manifest the store has not recorded.
+    assert_eq!(
+        store
+            .get_manifest("acme", "assets", "latest")
+            .expect("manifest"),
+        None,
+        "an absent manifest cannot be resolved"
+    );
+    // Once recorded, the manifest's blob resolves to a slice.
+    store
+        .set_manifest("acme", "assets", "latest", &blob_id)
+        .expect("manifest");
+    let id = store
+        .get_manifest("acme", "assets", "latest")
+        .expect("manifest")
+        .expect("recorded");
+    assert!(
+        store
+            .resolve_slice("acme", "assets", &id)
+            .expect("resolve manifest")
+            .is_some(),
+        "a manifest resolves to the slice covering its blob"
+    );
+}
+
 fn append(store: &Store<MemVolumes>, log: &str, payload: &[u8]) -> u64 {
     store
         .append("acme", log, 7, Vec::new(), payload.to_vec())
@@ -303,55 +352,6 @@ fn blob_slice_is_stable_across_further_writes() {
             .resolve_slice("beta", "assets", &blob_id)
             .expect("resolve cross-tenant"),
         None
-    );
-}
-
-#[test]
-fn an_absent_blob_or_manifest_resolves_to_no_slice() {
-    let (_volumes, store) = store();
-    let blob_id = store
-        .put_blob("acme", "assets", b"module-bytes")
-        .expect("put");
-
-    // A blob id the store does not hold.
-    assert_eq!(
-        store
-            .resolve_slice("acme", "assets", "no-such-blob")
-            .expect("resolve absent"),
-        None,
-        "an absent blob cannot be resolved"
-    );
-    // A blob that belongs to another store's namespace is not resolvable
-    // through this one.
-    assert_eq!(
-        store
-            .resolve_slice("acme", "other-store", &blob_id)
-            .expect("resolve absent store"),
-        None,
-        "a blob outside the named store resolves to nothing"
-    );
-    // A manifest the store has not recorded.
-    assert_eq!(
-        store
-            .get_manifest("acme", "assets", "latest")
-            .expect("manifest"),
-        None,
-        "an absent manifest cannot be resolved"
-    );
-    // Once recorded, the manifest's blob resolves to a slice.
-    store
-        .set_manifest("acme", "assets", "latest", &blob_id)
-        .expect("manifest");
-    let id = store
-        .get_manifest("acme", "assets", "latest")
-        .expect("manifest")
-        .expect("recorded");
-    assert!(
-        store
-            .resolve_slice("acme", "assets", &id)
-            .expect("resolve manifest")
-            .is_some(),
-        "a manifest resolves to the slice covering its blob"
     );
 }
 

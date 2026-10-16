@@ -203,43 +203,6 @@ fn app_guest_without_network_grants() {
     ));
 }
 
-/// The queue's owner declares it attachable by resolution, then the client's
-/// resolve is recorded under that live declaration — the owner-scoped handoff
-/// the runtime accepts in place of the removed discovery-gated recording.
-fn owner_declares_and_records_resolve(
-    runtime: &Runtime,
-    owner: ProcessId,
-    client: ProcessId,
-    shared_id: u64,
-) {
-    let (status, _op) = runtime.begin_hostcall(
-        owner,
-        HostcallRequest::DeclareAttachableByResolution {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            scope: selium_abi::AttachDeclarationScope::Any,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "the queue owner must be able to declare it attachable by resolution"
-    );
-    let (status, _op) = runtime.begin_hostcall(
-        client,
-        HostcallRequest::RecordResolvedResourceFor {
-            resource_class: ResourceClass::HostQueue,
-            resource_id: shared_id,
-            client_process_id: client,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_READY,
-        "a resolve recording under a live declaration must be accepted"
-    );
-}
-
 /// Task 4.3 substrate layer: a full Park ring parks writers until the
 /// reader drains; no frames are lost.
 ///
@@ -621,6 +584,43 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
         "(module (memory 1) (func (export \"{entrypoint}\")))"
     ))
     .expect("compile wat")
+}
+
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: ProcessId,
+    client: ProcessId,
+    shared_id: u64,
+) {
+    let (status, _op) = runtime.begin_hostcall(
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the queue owner must be able to declare it attachable by resolution"
+    );
+    let (status, _op) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
+    );
 }
 
 fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> ProcessId {

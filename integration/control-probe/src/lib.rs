@@ -10,6 +10,7 @@
 //! spec's "catalogue unreachable" scenario: the host allocation primitive
 //! succeeds independently of the catalogue.
 //!
+
 use anyhow::Result;
 use selium_abi::ResourceKind;
 use selium_guest::{Context, entrypoint, info};

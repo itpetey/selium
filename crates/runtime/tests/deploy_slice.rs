@@ -57,20 +57,6 @@ fn deploy_probe_descriptor(module_bytes: Vec<u8>, child_module: Vec<u8>) -> Syst
     }
 }
 
-fn probe_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-deploy-probe", "selium_deploy_probe.wasm")
-}
-
-#[expect(clippy::panic, reason = "test helper panics on a missing guest")]
-fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
-    report
-        .guests
-        .iter()
-        .find(|guest| guest.name == name)
-        .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
-        .process_id
-}
-
 #[test]
 #[ignore = "requires the discovery, store and deploy-probe guests built for wasm32-unknown-unknown"]
 fn deploy_spawns_from_a_durable_slice_across_restart() {
@@ -128,4 +114,18 @@ fn deploy_spawns_from_a_durable_slice_across_restart() {
         "expected the probe to spawn from a durable slice after restart, got: {logs:?}"
     );
     runtime.stop_process(probe).expect("stop probe");
+}
+
+#[expect(clippy::panic, reason = "test helper panics on a missing guest")]
+fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
+    report
+        .guests
+        .iter()
+        .find(|guest| guest.name == name)
+        .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
+        .process_id
+}
+
+fn probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-deploy-probe", "selium_deploy_probe.wasm")
 }

@@ -70,10 +70,10 @@ use selium_shm::rpc;
 
 /// Blob store name holding uploaded module bytes.
 pub const CONTROL_BLOB_STORE: &str = "selium.control-plane.modules";
-/// Durable log name holding the control plane's desired-state records.
-pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
 /// Durable log name holding the resource catalogue's records.
 pub const CONTROL_CATALOGUE_LOG: &str = "selium.control-plane.catalogue";
+/// Durable log name holding the control plane's desired-state records.
+pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
 /// The internal route segment the control plane serves under.
 pub const CONTROL_PATH: &str = "control";
 
@@ -106,6 +106,33 @@ struct DesiredStateView {
 /// through discovery; this method is the seam that client replaces.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SchedulerClient;
+
+/// The guest-owned resource catalogue: named resources projected from the
+/// catalogue's durable log, partitioned by requestor namespace.
+///
+/// The runtime holds no naming metadata; registration and lookup are RPCs to
+/// the control plane, scoped to the session's tenant. The durable log is the
+/// store of record, so the projection is rebuilt from replay on boot.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceCatalogue {
+    partitions: BTreeMap<Namespace, BTreeMap<String, CatalogueRecord>>,
+}
+
+/// The catalogue's shared state: its durable log (the store of record) and the
+/// projected read model rebuilt from replay.
+#[derive(Clone)]
+struct CatalogueState {
+    log: DurableLog,
+    projection: Arc<Mutex<ResourceCatalogue>>,
+}
+
+/// One accepted session's scope: the requestor namespace derived from the
+/// delivering process's tenant and the process id that opened the session.
+#[derive(Clone)]
+struct Session {
+    namespace: Namespace,
+    client_process_id: selium_abi::ProcessId,
+}
 
 impl ControlPlaneState {
     /// Applies one desired-state record (a log entry, in replay order) into
@@ -158,27 +185,17 @@ impl ControlPlaneState {
     }
 }
 
-/// The typed refusal for a catalogue operation a session may not perform, or
-/// `None` when the session is admitted.
-///
-/// A session may only register or remove a name it owns: naming a resource
-/// owned by another process would let a session record a name for a peer it
-/// does not control. Kept separate from the request handler so the rule is
-/// testable without a live store.
-fn catalogue_owner_refusal(client_process_id: u64, owner: u64) -> Option<String> {
-    (client_process_id != owner)
-        .then(|| format!("process {client_process_id} cannot manage a resource owned by {owner}"))
-}
-
-/// The guest-owned resource catalogue: named resources projected from the
-/// catalogue's durable log, partitioned by requestor namespace.
-///
-/// The runtime holds no naming metadata; registration and lookup are RPCs to
-/// the control plane, scoped to the session's tenant. The durable log is the
-/// store of record, so the projection is rebuilt from replay on boot.
-#[derive(Debug, Clone, Default)]
-pub struct ResourceCatalogue {
-    partitions: BTreeMap<Namespace, BTreeMap<String, CatalogueRecord>>,
+impl SchedulerClient {
+    /// Delegates one scheduler interaction, returning its typed outcome.
+    pub fn delegate(&self, request: SchedulerRequest) -> selium_guest::Result<SchedulerResponse> {
+        debug!(
+            ?request,
+            "control-plane: scheduler delegation deferred until the scheduler guest lands its RPC service"
+        );
+        Ok(SchedulerResponse::Deferred {
+            reason: "scheduler service not yet online".to_string(),
+        })
+    }
 }
 
 impl ResourceCatalogue {
@@ -232,35 +249,6 @@ impl ResourceCatalogue {
             }
         }
         Ok(())
-    }
-}
-
-/// The catalogue's shared state: its durable log (the store of record) and the
-/// projected read model rebuilt from replay.
-#[derive(Clone)]
-struct CatalogueState {
-    log: DurableLog,
-    projection: Arc<Mutex<ResourceCatalogue>>,
-}
-
-/// One accepted session's scope: the requestor namespace derived from the
-/// delivering process's tenant and the process id that opened the session.
-#[derive(Clone)]
-struct Session {
-    namespace: Namespace,
-    client_process_id: selium_abi::ProcessId,
-}
-
-impl SchedulerClient {
-    /// Delegates one scheduler interaction, returning its typed outcome.
-    pub fn delegate(&self, request: SchedulerRequest) -> selium_guest::Result<SchedulerResponse> {
-        debug!(
-            ?request,
-            "control-plane: scheduler delegation deferred until the scheduler guest lands its RPC service"
-        );
-        Ok(SchedulerResponse::Deferred {
-            reason: "scheduler service not yet online".to_string(),
-        })
     }
 }
 
@@ -344,6 +332,18 @@ fn accept_delegated(
             context: format!("{error}"),
         },
     }
+}
+
+/// The typed refusal for a catalogue operation a session may not perform, or
+/// `None` when the session is admitted.
+///
+/// A session may only register or remove a name it owns: naming a resource
+/// owned by another process would let a session record a name for a peer it
+/// does not control. Kept separate from the request handler so the rule is
+/// testable without a live store.
+fn catalogue_owner_refusal(client_process_id: u64, owner: u64) -> Option<String> {
+    (client_process_id != owner)
+        .then(|| format!("process {client_process_id} cannot manage a resource owned by {owner}"))
 }
 
 /// Control-plane entrypoint.
