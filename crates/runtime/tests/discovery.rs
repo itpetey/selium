@@ -22,7 +22,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
     RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_service::{DiscoveryRequest, FlatMsg};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
@@ -53,7 +53,10 @@ fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<DiscoveryRequest, Shm
         .expect("discovery feed region id");
     let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
     let capacity = channel.ring().capacity();
-    let transport = ShmTransport::new(&channel, &channel).expect("feed transport");
+    // Replay from the start of the ring: bootstrap-time events (the
+    // host-authored handler registrations) are published before this test
+    // attaches, so a tail-starting reader would never see them.
+    let transport = ShmTransport::new_replay(&channel, &channel).expect("feed transport");
     Subscriber::new(FramedRead::new(transport), Some(capacity))
 }
 
@@ -67,7 +70,6 @@ fn discovery_bootstrap_slice_end_to_end() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(discovery_wasm),
                 discovery_probe_descriptor(probe_wasm),
@@ -89,22 +91,10 @@ fn discovery_bootstrap_slice_end_to_end() {
         .find(|g| g.name == "discovery-probe")
         .expect("probe guest in report");
 
-    // --- 2.2: Assert both guests reached readiness ---
-    let activity = runtime.activity_log();
-    assert!(
-        activity
-            .iter()
-            .any(|event| event.process_id == Some(discovery_guest.process_id)
-                && event.message.contains("guest ready")),
-        "expected discovery GuestReady, got: {activity:?}"
-    );
-    assert!(
-        activity
-            .iter()
-            .any(|event| event.process_id == Some(probe_guest.process_id)
-                && event.message.contains("guest ready")),
-        "expected probe GuestReady, got: {activity:?}"
-    );
+    // --- 2.2: Convergence ---
+    // There is no readiness gate and no GuestReady activity; the probe's own
+    // log and the Tier-1 flow below are the convergence evidence.
+    let _ = discovery_guest;
 
     // --- Drain probe log and verify the guest ran ---
     let probe_messages = drain_log_messages(&runtime, probe_guest.process_id);
@@ -137,26 +127,36 @@ fn discovery_bootstrap_slice_end_to_end() {
     // root tenant as a typed `sel:///region/<id>` URI.
     let expected_uri = format!("sel:///region/{host_region_id}");
 
-    let registered = drain_register_uris(&mut subscriber);
+    // One drain of the feed collects both categories: the ring is consumed as it
+    // is read, so separate drains would swallow each other's events.
+    let (registered, handlers) = drain_feed_registrations(&mut subscriber);
+
+    // Handler registrations are host-authored from the descriptor, published
+    // on the feed so a serve-side guest can resolve the owning process without
+    // any guest being able to forge the pin.
+    assert!(
+        handlers.contains(&("sel-probe".to_string(), probe_guest.process_id)),
+        "expected a host-authored handler registration for the probe's scheme, got: {handlers:?}"
+    );
     assert!(
         registered.contains(&expected_uri),
         "expected Tier-1 register URI {expected_uri}, got: {registered:?}"
     );
 
     // --- 2.4: Assert revocation ---
-    // Stop the probe process — the runtime must publish Revoke events for
-    // the typed registrations it minted, plus a single owner-keyed
-    // RevokeByOwner (revocation of any routes the process registered itself
-    // lives in discovery, keyed by the recorded owner — there is no runtime
-    // side map of guest-registered routes).
+    // Stop the probe process — the runtime must publish identity-keyed
+    // RevokeResource events for the shared resources it minted, plus a single
+    // owner-keyed RevokeByOwner (revocation of any routes the process
+    // registered itself lives in discovery, keyed by the recorded owner —
+    // there is no runtime side map of guest-registered routes).
     runtime
         .stop_process(probe_guest.process_id)
         .expect("stop probe process");
 
-    let (revoked, revoked_owners) = drain_revoke_events(&mut subscriber);
+    let (_revoked, revoked_owners, revoked_resources) = drain_revoke_events(&mut subscriber);
     assert!(
-        revoked.contains(&expected_uri),
-        "expected revoke for {expected_uri}, got: {revoked:?}"
+        revoked_resources.contains(&("region".to_string(), host_region_id)),
+        "expected identity-keyed revoke for region {host_region_id}, got: {revoked_resources:?}"
     );
     assert!(
         revoked_owners.contains(&probe_guest.process_id),
@@ -191,11 +191,13 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The registry probes capability state and records
+            // registrations under a bootstrap-provisioned authority, not a
+            // privileged guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: true,
         handlers: Vec::new(),
     }
 }
@@ -217,11 +219,11 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
-        handlers: Vec::new(),
+        discovery_service: false,
+        // Declares a protocol handler so the host publishes a host-authored
+        // handler registration on the Tier-1 feed at spawn.
+        handlers: vec!["sel-probe".to_string()],
     }
 }
 
@@ -251,23 +253,34 @@ fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
         .collect()
 }
 
+/// Drains the feed, collecting registered URIs and host-authored handler
+/// registrations. Both are asserted from one drain because reading the ring
+/// consumes every event in it.
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_register_uris(
+fn drain_feed_registrations(
     subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
-) -> std::collections::HashSet<String> {
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<(String, ProcessId)>,
+) {
     let mut uris = std::collections::HashSet::new();
+    let mut handlers = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => {
-                if let DiscoveryRequest::Register { uri, .. } = request {
+            Ok((request, _tag)) => match request {
+                DiscoveryRequest::Register { uri, .. } => {
                     uris.insert(uri);
                 }
-            }
+                DiscoveryRequest::RegisterHandler { scheme, process_id } => {
+                    handlers.insert((scheme, process_id));
+                }
+                _ => {}
+            },
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    uris
+    (uris, handlers)
 }
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
@@ -276,9 +289,11 @@ fn drain_revoke_events(
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<ProcessId>,
+    std::collections::HashSet<(String, u64)>,
 ) {
     let mut uris = std::collections::HashSet::new();
     let mut owners = std::collections::HashSet::new();
+    let mut resources = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
             Ok((request, _tag)) => match request {
@@ -288,11 +303,14 @@ fn drain_revoke_events(
                 DiscoveryRequest::RevokeByOwner { process_id } => {
                     owners.insert(process_id);
                 }
+                DiscoveryRequest::RevokeResource { class, id } => {
+                    resources.insert((class, id));
+                }
                 _ => {}
             },
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    (uris, owners)
+    (uris, owners, resources)
 }

@@ -23,6 +23,7 @@ impl<'a> IdentityRequest<'a> {
   pub const VT_SPKI_DER: ::flatbuffers::VOffsetT = 8;
   pub const VT_FINGERPRINT: ::flatbuffers::VOffsetT = 10;
   pub const VT_GRANTS: ::flatbuffers::VOffsetT = 12;
+  pub const VT_DOMAIN: ::flatbuffers::VOffsetT = 14;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -34,6 +35,7 @@ impl<'a> IdentityRequest<'a> {
     args: &'args IdentityRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<IdentityRequest<'bldr>> {
     let mut builder = IdentityRequestBuilder::new(_fbb);
+    if let Some(x) = args.domain { builder.add_domain(x); }
     if let Some(x) = args.grants { builder.add_grants(x); }
     if let Some(x) = args.fingerprint { builder.add_fingerprint(x); }
     if let Some(x) = args.spki_der { builder.add_spki_der(x); }
@@ -78,6 +80,13 @@ impl<'a> IdentityRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(IdentityRequest::VT_GRANTS, None)}
   }
+  #[inline]
+  pub fn domain(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(IdentityRequest::VT_DOMAIN, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for IdentityRequest<'_> {
@@ -91,6 +100,7 @@ impl ::flatbuffers::Verifiable for IdentityRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("spki_der", Self::VT_SPKI_DER, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("fingerprint", Self::VT_FINGERPRINT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("grants", Self::VT_GRANTS, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("domain", Self::VT_DOMAIN, false)?
      .finish();
     Ok(())
   }
@@ -101,6 +111,7 @@ pub struct IdentityRequestArgs<'a> {
     pub spki_der: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
     pub fingerprint: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
     pub grants: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub domain: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for IdentityRequestArgs<'a> {
   #[inline]
@@ -111,6 +122,7 @@ impl<'a> Default for IdentityRequestArgs<'a> {
       spki_der: None,
       fingerprint: None,
       grants: None,
+      domain: None,
     }
   }
 }
@@ -141,6 +153,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> IdentityRequestBuilder<'a, 'b
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(IdentityRequest::VT_GRANTS, grants);
   }
   #[inline]
+  pub fn add_domain(&mut self, domain: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(IdentityRequest::VT_DOMAIN, domain);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> IdentityRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     IdentityRequestBuilder {
@@ -163,6 +179,7 @@ impl ::core::fmt::Debug for IdentityRequest<'_> {
       ds.field("spki_der", &self.spki_der());
       ds.field("fingerprint", &self.fingerprint());
       ds.field("grants", &self.grants());
+      ds.field("domain", &self.domain());
       ds.finish()
   }
 }

@@ -14,7 +14,7 @@
 
 use anyhow::{Context as _, bail};
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_guest::{Context, ResourceSender, entrypoint, info, mark_ready};
+use selium_guest::{Context, ResourceSender, entrypoint, info};
 use selium_service::{
     AccountantControl, AccountantControlResponse, ControlRequest, ControlResponse, IdentityRequest,
     IdentityResponse,
@@ -206,7 +206,6 @@ async fn onboard(mut ctx: Context, spki: (u64, u64), mode: u64) -> anyhow::Resul
         other => bail!("identity-onboard: unknown entry mode {other}"),
     }
 
-    mark_ready();
     Ok(())
 }
 

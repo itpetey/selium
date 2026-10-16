@@ -19,7 +19,6 @@ fn entrypoint_with_u64_param_receives_argument() {
     let config = RuntimeConfig {
         start_discovery: false,
         system_guests: vec![descriptor],
-        domain_table: Vec::new(),
         state_dir: None,
     };
 
@@ -33,9 +32,7 @@ fn module_with_entrypoint_and_i64_param(entrypoint: &str) -> Vec<u8> {
     wat::parse_str(format!(
         "(module
             (import \"selium\" \"process_id\" (func $process_id (result i64)))
-            (import \"selium\" \"mark_ready\" (func $mark_ready))
             (func (export \"{entrypoint}\") (param i64)
-                call $mark_ready
                 call $process_id
                 drop))"
     ))

@@ -2,7 +2,7 @@ use selium_guest::{
     Capability, CapabilityGrant, EntrypointMetadata, InterfaceMetadata, LocalityScope,
     ResourceSelector, entrypoint, pattern_interface,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 #[pattern_interface]
 #[expect(dead_code, reason = "macro-generated interface used at build time")]
@@ -16,7 +16,7 @@ async fn demo_entrypoint() {
 }
 
 #[test]
-fn descriptors_can_override_readiness_after_macro_generation() {
+fn descriptors_build_from_macro_metadata() {
     let mut descriptor = SystemGuestDescriptor::from_entrypoint_metadata(
         "demo",
         "demo-module",
@@ -27,12 +27,10 @@ fn descriptors_can_override_readiness_after_macro_generation() {
             vec![ResourceSelector::Locality(LocalityScope::Cluster)],
         )],
     );
-    descriptor.readiness = ReadinessCondition::ActivityLogContains("bootstrapped".to_string());
+    // `descriptor` stays mutable for callers that adjust it before bootstrap.
+    descriptor.entrypoint = "demo_entrypoint".to_string();
 
-    assert!(matches!(
-        descriptor.readiness,
-        ReadinessCondition::ActivityLogContains(_)
-    ));
+    assert_eq!(descriptor.entrypoint, "demo_entrypoint");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -59,7 +57,6 @@ async fn macros_generate_metadata_compatible_with_runtime_and_tracing() {
                 vec![ResourceSelector::Locality(LocalityScope::Cluster)],
             )],
         )],
-        domain_table: Vec::new(),
         state_dir: None,
     };
 
@@ -74,9 +71,7 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
     wat::parse_str(format!(
         "(module
             (import \"selium\" \"process_id\" (func $process_id (result i64)))
-            (import \"selium\" \"mark_ready\" (func $mark_ready))
             (func (export \"{entrypoint}\")
-                call $mark_ready
                 call $process_id
                 drop))"
     ))

@@ -4,7 +4,7 @@
 
 See `proposal.md` — Why. Design-shaping facts of the current system, on top of the durable-storage change (`implement-durable-storage`) this one is sequenced after:
 
-- `Runtime` holds the metadata this change removes: `module_registry` (module id to bytes, populated only at bootstrap or by tests), `domain_table` (advisory domain mapping seeded from `RuntimeConfig`), `region_tenants` and `queue_tenants` (provenance side maps used to revoke a single resource's URI), `process_registrations` (role-readiness bookkeeping), plus `handler_schemes` and `worker_counts` as boot-time policy.
+- `Runtime` holds the metadata this change removes: `module_registry` (module id to bytes, populated only at bootstrap or by tests), `domain_table` (advisory domain mapping seeded from `RuntimeConfig`), `region_tenants` and `queue_tenants` (provenance side maps used to revoke a single resource's URI), plus `worker_counts` as boot-time policy. (Role-readiness bookkeeping and handler sets are retired by the follow-up readiness change.)
 - Four hostcalls are accepted only from "the process the runtime believes is discovery" (`RecordRegistration`, `RecordResolvedQueueFor`, `RecordResolvedRegionFor`, `ProcessCapability`), because a guest that could record resolve results for another process could confer authority it does not hold.
 - `ProcessStart { module_id }` resolves bytes through `module_registry`; the control plane stores uploaded modules in a blob store, and nothing bridges the two, so deploying an uploaded module cannot work today.
 - Attachment today has four bases: ownership, an `ExplicitResource` grant, host-queue handoff, and a discovery-recorded resolve.
@@ -16,7 +16,7 @@ See `proposal.md` — Why. Design-shaping facts of the current system, on top of
 - Authority flows from ownership and capabilities, so any registry implementation (or none) fits: no hostcall names a privileged guest.
 - Resource naming, ownership and handoff metadata live in durable guest state — the catalogue — rebuilt by replay after a restart.
 - Module bytes reach the engine from guest-owned storage, so an uploaded module becomes runnable.
-- Delete the host-side maps this change exists to remove: module registry, domain table, registration tracking, tenant side maps.
+- Delete the host-side maps this change exists to remove: module registry, domain table, tenant side maps.
 
 **Non-Goals:**
 - Placement, supervision and scaling work that will *consume* the catalogue (those guests remain frozen).
@@ -61,9 +61,9 @@ Identity owns the tenant namespace and the operator tier; the advisory domain-to
 
 Alternative considered: the control plane (customer-facing desired state rather than platform naming); discovery (a resolver should not be the store of record for its own input).
 
-### D6: Readiness by discovery lookup, revocation by resource identity
+### D6: Revocation by resource identity
 
-The runtime asks discovery whether a role's registration is observable instead of keeping `process_registrations`, and revocation names a resource identity (class, id) on the Tier-1 feed — a new `RevokeResource` variant — instead of reconstructing a tenant from a side map. This also fixes the documented cross-tenant revocation miss: the registry revokes under the tenant it recorded.
+Revocation names a resource identity (class, id) on the Tier-1 feed — a new `RevokeResource` variant — instead of reconstructing a tenant from a side map. The registry revokes under the tenant it recorded, which also fixes the documented cross-tenant revocation miss. (Role readiness and its host-side registration set are retired by the follow-up readiness change, not here.)
 
 ### D7: Volume prefix scoping uses the existing selector vocabulary
 
@@ -85,7 +85,7 @@ Sequenced after `implement-durable-storage`:
 2. Catalogue records, request surface and projection in the control plane; `Context` resource operations.
 3. `ProcessStart` module bytes; delete `module_registry` and `register_module_bytes`.
 4. Domain table to identity, published to discovery; delete `RuntimeConfig::domain_table`.
-5. Readiness by discovery lookup; `RevokeResource` on the feed; delete `process_registrations`, `region_tenants` and `queue_tenants`.
+5. `RevokeResource` on the feed; delete `region_tenants` and `queue_tenants`.
 6. Volume prefix admission; update targeted tests.
 
 Rollback: revert; the previous hostcall gating and host-side maps return. Nothing durable depends on the new shapes except catalogue records written by the control plane, which the reverted code simply ignores.
@@ -95,3 +95,9 @@ Rollback: revert; the previous hostcall gating and host-side maps return. Nothin
 - Should the catalogue also own process records (a durable who-runs-what view), or does that remain the control plane's desired state?
 - Should the capability probe (`ProcessCapability`) fold into the catalogue surface instead of staying a hostcall?
 - When the supervisor and scheduler are unfrozen, which guest owns "spawn from the catalogue"?
+
+## Verification evidence
+
+- **No hostcall gates on a guest's name.** The four discovery-identity hostcalls are gone: `RecordResolvedQueueFor`/`RecordResolvedRegionFor` are replaced by owner-scoped handoff (`AuthoriseAttach`, `DeclareAttachableByResolution`, `RecordResolvedResourceFor`); `ProcessCapability` is gated by the bootstrap-provisioned `ProcessProbe` authority; `RecordRegistration` is gated by the same authority (and is retired entirely by the `reactive-discovery` follow-up). No runtime code branches on a guest's name.
+- **Bootstrap without the discovery guest still starts the ABI path.** Runtime tests bootstrap guests with `start_discovery: false` (no discovery guest present) and exercise allocation, attach, and the process lifecycle through the ABI path — `foundation_smoke`, `host_queue_*`, and the `process_*` unit tests all pass.
+- **Handoff, catalogue, module-slice, revocation, and domain ownership** are exercised by the `discovery`, `control_plane`, `deploy_slice`, and `identity_spine` integration tests plus the native unit tests cited in `tasks.md`.

@@ -14,12 +14,6 @@ pub enum Error {
     #[error("unknown process authority: {0}")]
     /// Process authority was not registered.
     UnknownProcessAuthority(ProcessId),
-    #[error("unknown dependency: {0}")]
-    /// System guest dependency is not present in the configuration.
-    UnknownDependency(String),
-    #[error("dependency cycle or unresolved dependency detected")]
-    /// System guest dependencies cannot be resolved.
-    DependencyCycle,
     #[error("invalid grant for capability {0:?}")]
     /// Capability grant is invalid.
     InvalidGrant(Capability),
@@ -29,18 +23,9 @@ pub enum Error {
     #[error("duplicate system guest descriptor: {0}")]
     /// Duplicate system guest name was supplied.
     DuplicateDescriptor(String),
-    #[error("module id already registered with different bytes: {0}")]
-    /// Module id was already registered with different bytes.
-    ModuleConflict(String),
-    #[error("module not registered: {0}")]
-    /// Module id is not registered.
-    UnknownModule(String),
     #[error("invalid entrypoint argument encoding")]
     /// Entrypoint argument bytes are invalid.
     InvalidEntrypointArgument,
-    #[error("readiness condition not satisfied for guest `{0}`")]
-    /// System guest did not satisfy its readiness condition.
-    ReadinessUnsatisfied(String),
     #[error("guest entrypoint returned an error: {0}")]
     /// Guest entrypoint returned a non-zero exit code.
     EntrypointFailed(String),

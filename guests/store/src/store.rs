@@ -315,6 +315,33 @@ impl<V: Volumes> Store<V> {
             .and_then(|state| state.manifests.get(name).cloned()))
     }
 
+    /// Resolves a stored blob to a durable slice: the volume holding its bytes
+    /// and the byte length. Blob volumes are append-only and never rewritten,
+    /// so a slice a caller holds stays valid and never yields different bytes.
+    ///
+    /// The returned offset is always zero: a blob volume holds exactly one
+    /// blob.
+    pub fn resolve_slice(
+        &self,
+        tenant: &str,
+        store: &str,
+        blob_id: &str,
+    ) -> Result<Option<(String, u64)>, Failure> {
+        self.recover_blob_store(tenant, store)?;
+        let stores = self.blob_stores.lock().map_err(poisoned)?;
+        let Some(state) = stores.get(&(tenant.to_string(), store.to_string())) else {
+            return Ok(None);
+        };
+        if !state.blobs.contains(blob_id) {
+            return Ok(None);
+        }
+        drop(stores);
+        let volume_name = format::blob_volume(store, blob_id);
+        let handle = self.volumes.open(serving(tenant), &volume_name)?;
+        let len = handle.len()?;
+        Ok(Some((volume_name, len)))
+    }
+
     fn with_log<R>(
         &self,
         tenant: &str,

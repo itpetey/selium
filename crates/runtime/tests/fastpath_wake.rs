@@ -43,7 +43,7 @@ use std::{
 };
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 
 /// Drains the guest's log channel and decodes each frame as a `LogRecord`.
@@ -232,11 +232,9 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        dependencies: Vec::new(),
         // The test polls the guest log channel itself for phase markers.
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }

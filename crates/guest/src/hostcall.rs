@@ -166,67 +166,56 @@ pub fn random_bytes(len: u32) -> Result<Vec<u8>> {
     }
 }
 
-/// Records, on behalf of the discovery service, that `process_id` registered
-/// the route `uri`. The runtime accepts this hostcall only from the discovery
-/// system guest and uses the record to gate the readiness of role-declared
-/// system guests on discoverable self-registration.
-pub fn record_registration(process_id: selium_abi::ProcessId, uri: &str) -> Result<()> {
-    hostcall_ready(HostcallRequest::RecordRegistration {
-        process_id,
-        uri: uri.to_string(),
-    })
-    .map(|_| ())
-}
-
-/// Records, on behalf of the discovery service, that a discovery resolve
-/// performed by `client_process_id` returned `shared_id`. The runtime
-/// accepts this hostcall only from the discovery system guest; the recorded
-/// id gives the resolving client an authorisation basis for cross-process
-/// `HostQueueAttach`.
-pub fn record_resolved_queue_for(
+/// Authorises `client_process_id` to attach the shared resource named by
+/// `resource_class`/`resource_id`. The caller must own the resource or hold
+/// an `ExplicitResource` capability for it; no guest identity is privileged.
+/// The host records the handoff as the client's attach basis.
+pub fn authorise_attach(
+    resource_class: selium_abi::ResourceClass,
+    resource_id: selium_abi::SharedResourceId,
     client_process_id: selium_abi::ProcessId,
-    shared_id: selium_abi::SharedResourceId,
 ) -> Result<()> {
-    hostcall_ready(HostcallRequest::RecordResolvedQueueFor {
+    hostcall_ready(HostcallRequest::AuthoriseAttach {
+        resource_class,
+        resource_id,
         client_process_id,
-        shared_id,
     })
     .map(|_| ())
 }
 
-/// Records, on behalf of the discovery service, that a discovery resolve
-/// performed by `client_process_id` returned a shared region. The runtime
-/// accepts this hostcall only from the discovery system guest; the recorded
-/// id gives the resolving client an authorisation basis for `AttachRegion`
-/// on a region it did not allocate (e.g. an identity guest's live tables).
-pub fn record_resolved_region_for(
+/// Declares a resource the caller owns attachable by resolution, with a
+/// declaration scope naming which callers the declaration admits. While a
+/// live declaration holds, the host accepts a resolve-recording within its
+/// scope as the client's attach basis.
+pub fn declare_attachable_by_resolution(
+    resource_class: selium_abi::ResourceClass,
+    resource_id: selium_abi::SharedResourceId,
+    scope: selium_abi::AttachDeclarationScope,
+) -> Result<()> {
+    hostcall_ready(HostcallRequest::DeclareAttachableByResolution {
+        resource_class,
+        resource_id,
+        scope,
+    })
+    .map(|_| ())
+}
+
+/// Records that a resolve performed by `client_process_id` returned the named
+/// shared resource. Accepted only under a live attachable-by-resolution
+/// declaration whose scope admits the client; the recorded id gives the
+/// resolving client an authorisation basis for the corresponding cross-process
+/// attach hostcall (`HostQueueAttach` for queues, `AttachRegion` for regions).
+pub fn record_resolved_resource_for(
+    resource_class: selium_abi::ResourceClass,
+    resource_id: selium_abi::SharedResourceId,
     client_process_id: selium_abi::ProcessId,
-    shared_id: selium_abi::SharedResourceId,
 ) -> Result<()> {
-    hostcall_ready(HostcallRequest::RecordResolvedRegionFor {
+    hostcall_ready(HostcallRequest::RecordResolvedResourceFor {
+        resource_class,
+        resource_id,
         client_process_id,
-        shared_id,
     })
     .map(|_| ())
-}
-
-/// Resolves the bootstrap-registered protocol handler for `scheme`
-/// (e.g. `sel-quic`) to its process id.
-///
-/// Handler registrations are Tier-1 (runtime-published at bootstrap), so the
-/// result cannot be forged by guests. Serve-side guests use it to pin the
-/// process legitimately allowed to deliver handoffs (see
-/// [`ResourceListener::expect_sender`](crate::ResourceListener::expect_sender)).
-pub fn resolve_protocol_handler(scheme: &str) -> Result<Option<selium_abi::ProcessId>> {
-    match hostcall_ready(HostcallRequest::ResolveProtocolHandler {
-        scheme: scheme.to_string(),
-    })? {
-        HostcallOutput::U64(process_id) => Ok(Some(process_id)),
-        HostcallOutput::Empty => Ok(None),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ResolveProtocolHandler: {other:?}"
-        ))),
-    }
 }
 
 /// Deletes a tenant CA key from the host keyring. Requires the

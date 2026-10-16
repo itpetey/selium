@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use selium_abi::{
-    ActivityEvent, CompletionState, HostcallEnvelope, ProcessId, pack_hostcall_status,
-};
+use selium_abi::{CompletionState, HostcallEnvelope, ProcessId, pack_hostcall_status};
 use wasmtiny::{
     FunctionType, NumType, ValType, WasmApplication, WasmError, WasmValue,
     runtime::{HostCaller, HostFunc},
@@ -17,11 +15,6 @@ use crate::{
         wasm_i64_arg, write_guest_memory,
     },
 };
-
-struct MarkReadyHostFunc {
-    runtime: Runtime,
-    process_id: selium_abi::ProcessId,
-}
 
 struct ProcessIdHostFunc {
     process_id: selium_abi::ProcessId,
@@ -45,28 +38,6 @@ struct HostcallDropHostFunc {
 struct MailboxRegisterHostFunc {
     runtime: Runtime,
     process_id: ProcessId,
-}
-
-impl HostFunc for MarkReadyHostFunc {
-    fn call(
-        &self,
-        _caller: &mut HostCaller<'_>,
-        _args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        self.runtime
-            .kernel
-            .processes()
-            .record_activity(ActivityEvent {
-                kind: selium_abi::ActivityKind::GuestReady,
-                process_id: Some(self.process_id),
-                message: "guest ready".to_string(),
-            });
-        Ok(Vec::new())
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        None
-    }
 }
 
 impl HostFunc for ProcessIdHostFunc {
@@ -248,15 +219,6 @@ fn selium_host_imports(
             "process_id".to_string(),
             Box::new(ProcessIdHostFunc { process_id }),
             FunctionType::new(vec![], vec![ValType::Num(NumType::I64)]),
-        ),
-        (
-            "selium".to_string(),
-            "mark_ready".to_string(),
-            Box::new(MarkReadyHostFunc {
-                runtime: runtime.clone(),
-                process_id,
-            }),
-            FunctionType::empty(),
         ),
         (
             "selium".to_string(),

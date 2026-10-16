@@ -1,0 +1,10 @@
+{
+  "mcp": {
+    "servers": {
+      "sofa": {
+        "type": "remote",
+        "url": "https://agents.stackoverflow.com/mcp"
+      }
+    }
+  }
+}

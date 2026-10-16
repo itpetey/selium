@@ -49,7 +49,7 @@ const TENANT_LOG: &str = "selium.identity.tenants";
 fn accounting_descriptor(
     name: &str,
     grants: Vec<selium_abi::CapabilityGrant>,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> selium_runtime::SystemGuestDescriptor {
     selium_runtime::SystemGuestDescriptor {
         name: name.to_string(),
@@ -58,12 +58,8 @@ fn accounting_descriptor(
         entrypoint: name.to_string(),
         arguments: Vec::new(),
         grants,
-        dependencies,
-        readiness: selium_runtime::ReadinessCondition::ActivityLogContains(
-            "guest ready".to_string(),
-        ),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -149,7 +145,6 @@ async fn platform_state_survives_a_power_cycle() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: guests,
             state_dir: state.config_dir(),
         })
@@ -261,7 +256,6 @@ async fn second_lifetime_asserts_survival() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: guests,
             state_dir: state.config_dir(),
         })

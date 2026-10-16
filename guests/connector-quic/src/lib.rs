@@ -38,7 +38,7 @@ use anyhow::Context as _;
 use quinn::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use selium_guest::{
-    Context, Instant, ResourceSender, UdpSocket, entrypoint, error, info, mark_ready, spawn, warn,
+    Context, Instant, ResourceSender, UdpSocket, entrypoint, error, info, spawn, warn,
 };
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
@@ -510,7 +510,6 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
             warn!("quic-connector: initial anchor rebuild failed: {e}");
         }
     }
-    mark_ready();
 
     // Watch the anchor table and rebuild the union verifier on change.
     let anchors = Arc::new(anchors);

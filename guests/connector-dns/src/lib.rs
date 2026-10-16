@@ -24,7 +24,7 @@ use correlate::{InFlight, response_from_parsed};
 use parking_lot::Mutex;
 use selium_guest::{
     Context, Datagram, Instant, ResourceClass, ResourceListener, ResourceTarget, Serve, Timer,
-    UdpSocket, debug, entrypoint, info, mark_ready, spawn, warn,
+    UdpSocket, debug, entrypoint, info, spawn, warn,
 };
 use selium_proto_dns::{DnsOutcome, DnsQuery, DnsResponse, wire};
 use selium_shm::rpc::{self, RpcConnection, RpcError};
@@ -112,7 +112,10 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result
     .await
     .with_context(|| "dns-connector: serve failed")?;
 
-    mark_ready();
+    // Health is published state: advertise the DNS connector's health.
+    if let Err(error) = ctx.publish_health("dns-connector").await {
+        warn!("dns-connector: health publish failed: {error}");
+    }
 
     let socket = Arc::new(Mutex::new(socket));
     let inflight = InFlight::new();

@@ -56,12 +56,26 @@ When a guest instance terminates, `selium-runtime` SHALL automatically clean up 
 - **THEN** no `std::thread::spawn` for timer management occurs
 - **AND** no `std::sync::mpsc::channel` for timer requests is created
 
+### Requirement: Resource Revocation by Identity
+
+The runtime SHALL revoke a resource's registration by resource identity (class and id) rather than by a runtime-maintained tenant side map: a resource minted under a serving tenant SHALL have its registration revoked under the tenant it was minted for, and process teardown SHALL revoke everything the registry records against the process as owner.
+
+#### Scenario: Minted resource revokes under its tenant
+
+- **WHEN** a resource minted for tenant `acme` is freed
+- **THEN** its registration SHALL be revoked under `acme`
+
+#### Scenario: Teardown needs no side map
+
+- **WHEN** a process exits
+- **THEN** its registrations SHALL be revoked from the owner recorded in the registry, without the runtime holding per-resource tenant records
+
 ### Requirement: Sub-Struct Architecture
 `selium-runtime` SHALL decompose `Runtime` into sub-structs, each with its own methods:
 
-- `GuestTable` — loaded guests, module registry
+- `GuestTable` — loaded guests
 - `ProcessAuthorityTable` — process authorities, grants, parent relationships
-- `ResourceTracker` — local handle owners, shared resource owners, region purposes
+- `ResourceTracker` — local handle owners, shared resource owners
 - `HostcallEngine` — operation state machine, mailboxes
 - `DiscoveryState` — discovery publisher, listener handle
 
@@ -97,7 +111,7 @@ When a guest instance terminates, `selium-runtime` SHALL automatically clean up 
 
 ### Requirement: Discovery-Enabled Bootstrap
 
-`selium-runtime` SHALL support `start_discovery` in `RuntimeConfig`, creating the Tier-1 feed ring and RPC listener, injecting tagged `WasmValue` entrypoint arguments (feed region id and listener handle into the discovery guest; listener handle into other guests with empty argument lists), and gating readiness per guest on `mark_ready()`.
+`selium-runtime` SHALL support `start_discovery` in `RuntimeConfig`, creating the Tier-1 feed ring and RPC listener, injecting tagged `WasmValue` entrypoint arguments (feed region id and listener handle into the discovery guest; listener handle into other guests with empty argument lists), and spawning declared guests without gating their startup on another guest's readiness.
 
 #### Scenario: Discovery wiring uses tagged argument encoding
 
@@ -106,8 +120,8 @@ When a guest instance terminates, `selium-runtime` SHALL automatically clean up 
 
 #### Scenario: Readiness is per-guest
 
-- **WHEN** a bootstrapped guest does not call `mark_ready()` within the readiness window
-- **THEN** the runtime rolls back the bootstrap and reports `ReadinessUnsatisfied` naming that guest
+- **WHEN** a bootstrapped guest has not registered its serving route
+- **THEN** the runtime SHALL still start it and SHALL NOT roll back the bootstrap on that basis, because readiness is no longer a per-guest gate
 
 #### Scenario: Application guest receives discovery handle
 
@@ -270,12 +284,12 @@ The runtime SHALL publish a Tier-1 registration for a process node `sel://<tenan
 - **WHEN** a root process with no `DelegateGrants` grants allocates a region on behalf of tenant "acme" (the connector path: a root connector minting per-stream channels under an authenticated client's tenant)
 - **THEN** the runtime SHALL register the region under `sel://acme/region/<id>`
 
-#### Scenario: Unauthorized cross-tenant allocation denied
+#### Scenario: Unauthorised cross-tenant allocation denied
 - **WHEN** a tenant-scoped process without tenant-scoped delegation attempts to allocate a region for a tenant other than its own
 - **THEN** the runtime SHALL return `AbiErrorCode::PermissionDenied`
 
 #### Scenario: Host queue minted under the serving tenant
-- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is registered under `sel://acme/queue/<id>`; when a cross-tenant mint is authorized, the queue is registered under the serving tenant
+- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is registered under `sel://acme/queue/<id>`; when a cross-tenant mint is authorised, the queue is registered under the serving tenant
 - **THEN** teardown SHALL revoke the queue under the tenant it was minted for
 
 #### Scenario: Volume minted under the serving tenant
@@ -353,3 +367,25 @@ The runtime SHALL publish a Tier-1 registration for a process node `sel://<tenan
 
 - **WHEN** a volume is removed
 - **THEN** its bytes SHALL be released from the tenant's volume usage
+
+### Requirement: Host-Authored Protocol Handler Registration
+
+The runtime SHALL publish a protocol handler registration for each guest
+descriptor that declares handlers, on the Tier-1 feed, so the registration is
+host-authored and cannot be forged by a guest. Handler resolution SHALL be a
+discovery lookup; the runtime SHALL NOT keep a host-side handler registry.
+
+#### Scenario: Handler registration is host-authored
+
+- **WHEN** the runtime spawns a guest whose descriptor declares a protocol handler
+- **THEN** it SHALL publish that handler's registration on the Tier-1 feed
+
+#### Scenario: Handler resolution is a discovery lookup
+
+- **WHEN** a serve-side guest resolves the handler for a protocol scheme
+- **THEN** it SHALL obtain the owning process from discovery, not from a runtime-maintained map
+
+#### Scenario: Guests cannot forge a handler
+
+- **WHEN** a guest registers a protocol handler route it was not assigned
+- **THEN** the registration SHALL NOT be treated as host-authored authority

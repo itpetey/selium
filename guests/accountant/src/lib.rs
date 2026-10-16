@@ -33,7 +33,7 @@ use selium_abi::{
 };
 use selium_guest::{
     ActivityLog, Context, DurableLog, Instant, Metering, ResourceListener, ResourceTarget, Serve,
-    Timer, entrypoint, info, mark_ready, process_tenant, quota_set, spawn, time, warn,
+    Timer, entrypoint, info, process_tenant, quota_set, spawn, time, warn,
 };
 use selium_service::{AccountantControl, AccountantControlResponse, MeteringBucket, TenantPlan};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
@@ -785,7 +785,10 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
     .await
     .with_context(|| "accountant: serve control surface failed")?;
 
-    mark_ready();
+    // Health is published state: advertise the accountant's health.
+    if let Err(error) = ctx.publish_health("accountant").await {
+        warn!("accountant: health publish failed: {error}");
+    }
 
     // The rolling loop runs alongside the control surface.
     spawn(roll_loop(shared.clone(), ledger.clone()));
@@ -913,8 +916,6 @@ async fn bookkeeper(mut ctx: Context) -> anyhow::Result<()> {
     let mut inventory: HashMap<ProcessId, Option<String>> = HashMap::new();
     let mut last_counters: HashMap<ProcessId, CumulativeCounters> = HashMap::new();
     let mut activity_cursor = 0_usize;
-
-    mark_ready();
 
     let mut next = Instant::now().map_err(|e| anyhow::anyhow!("bookkeeper: clock failed: {e}"))?;
     loop {

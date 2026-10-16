@@ -19,10 +19,7 @@
 use std::time::{Duration, Instant};
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_proto_dns::RESOLVE_URI;
-use selium_runtime::{
-    ReadinessCondition, Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor,
-};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 
 mod common;
@@ -52,10 +49,8 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
             // Self-registration in the root namespace requires the capability.
             CapabilityGrant::new(Capability::SystemRegistration, vec![]),
         ],
-        dependencies: vec!["discovery".to_string()],
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: Some(RESOLVE_URI.to_string()),
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -87,10 +82,8 @@ fn demo_descriptor(module_bytes: Vec<u8>, connect: String) -> SystemGuestDescrip
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        dependencies: vec!["dns-connector".to_string()],
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -117,11 +110,13 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The registry probes capability state and records
+            // registrations under a bootstrap-provisioned authority, not a
+            // privileged guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: true,
         handlers: Vec::new(),
     }
 }
@@ -160,7 +155,6 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(discovery_wasm()),
                 connector_descriptor(connector_wasm(), format!("udp://{resolver_addr}")),

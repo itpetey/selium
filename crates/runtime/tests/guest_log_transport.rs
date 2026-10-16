@@ -13,7 +13,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
     RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
@@ -137,20 +137,28 @@ fn drain_register_uris(
 /// returns the set of URI strings they contain.
 fn drain_revoke_uris(
     subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
-) -> std::collections::HashSet<String> {
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<(String, u64)>,
+) {
     let mut uris = std::collections::HashSet::new();
+    let mut resources = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => {
-                if let DiscoveryRequest::Revoke { uri } = request {
+            Ok((request, _tag)) => match request {
+                DiscoveryRequest::Revoke { uri } => {
                     uris.insert(uri);
                 }
-            }
+                DiscoveryRequest::RevokeResource { class, id } => {
+                    resources.insert((class, id));
+                }
+                _ => {}
+            },
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    uris
+    (uris, resources)
 }
 
 #[test]
@@ -257,15 +265,21 @@ fn process_termination_publishes_discovery_revoke_events() {
     // Stop the process — this should publish Revoke operations.
     runtime.stop_process(process_id).expect("stop process");
 
-    let revoked = drain_revoke_uris(&mut subscriber);
+    let (revoked, revoked_resources) = drain_revoke_uris(&mut subscriber);
     assert!(
-        !revoked.is_empty(),
+        !revoked.is_empty() || !revoked_resources.is_empty(),
         "expected Revoke events to be published after termination"
     );
 
-    // Every previously registered URI should have a matching revocation.
+    // Every previously registered URI should have a matching revocation:
+    // either a URI-keyed Revoke, or an identity-keyed RevokeResource whose
+    // class and id the URI ends with.
     for uri in &registered {
-        assert!(revoked.contains(uri), "expected revocation for {uri}");
+        let covered = revoked.contains(uri)
+            || revoked_resources
+                .iter()
+                .any(|(class, id)| uri.ends_with(&format!("/{class}/{id}")));
+        assert!(covered, "expected revocation for {uri}");
     }
 }
 
@@ -279,7 +293,6 @@ fn runtime_with_discovery_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTr
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
             system_guests: vec![],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap discovery");
@@ -304,10 +317,8 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
             entrypoint: "boot".to_string(),
             arguments: Vec::new(),
             grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn guest")

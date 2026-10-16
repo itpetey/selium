@@ -25,6 +25,9 @@ impl<'a> StoreResponse<'a> {
   pub const VT_PAYLOAD: ::flatbuffers::VOffsetT = 12;
   pub const VT_CODE: ::flatbuffers::VOffsetT = 14;
   pub const VT_MESSAGE: ::flatbuffers::VOffsetT = 16;
+  pub const VT_VOLUME: ::flatbuffers::VOffsetT = 18;
+  pub const VT_OFFSET: ::flatbuffers::VOffsetT = 20;
+  pub const VT_LEN: ::flatbuffers::VOffsetT = 22;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -36,7 +39,10 @@ impl<'a> StoreResponse<'a> {
     args: &'args StoreResponseArgs<'args>
   ) -> ::flatbuffers::WIPOffset<StoreResponse<'bldr>> {
     let mut builder = StoreResponseBuilder::new(_fbb);
+    builder.add_len(args.len);
+    builder.add_offset(args.offset);
     builder.add_sequence(args.sequence);
+    if let Some(x) = args.volume { builder.add_volume(x); }
     if let Some(x) = args.message { builder.add_message(x); }
     if let Some(x) = args.code { builder.add_code(x); }
     if let Some(x) = args.payload { builder.add_payload(x); }
@@ -96,6 +102,27 @@ impl<'a> StoreResponse<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(StoreResponse::VT_MESSAGE, None)}
   }
+  #[inline]
+  pub fn volume(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(StoreResponse::VT_VOLUME, None)}
+  }
+  #[inline]
+  pub fn offset(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(StoreResponse::VT_OFFSET, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn len(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(StoreResponse::VT_LEN, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for StoreResponse<'_> {
@@ -111,6 +138,9 @@ impl ::flatbuffers::Verifiable for StoreResponse<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("payload", Self::VT_PAYLOAD, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("code", Self::VT_CODE, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("message", Self::VT_MESSAGE, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("volume", Self::VT_VOLUME, false)?
+     .visit_field::<u64>("offset", Self::VT_OFFSET, false)?
+     .visit_field::<u64>("len", Self::VT_LEN, false)?
      .finish();
     Ok(())
   }
@@ -123,6 +153,9 @@ pub struct StoreResponseArgs<'a> {
     pub payload: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
     pub code: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub message: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub volume: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub offset: u64,
+    pub len: u64,
 }
 impl<'a> Default for StoreResponseArgs<'a> {
   #[inline]
@@ -135,6 +168,9 @@ impl<'a> Default for StoreResponseArgs<'a> {
       payload: None,
       code: None,
       message: None,
+      volume: None,
+      offset: 0,
+      len: 0,
     }
   }
 }
@@ -173,6 +209,18 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> StoreResponseBuilder<'a, 'b, 
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(StoreResponse::VT_MESSAGE, message);
   }
   #[inline]
+  pub fn add_volume(&mut self, volume: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(StoreResponse::VT_VOLUME, volume);
+  }
+  #[inline]
+  pub fn add_offset(&mut self, offset: u64) {
+    self.fbb_.push_slot::<u64>(StoreResponse::VT_OFFSET, offset, 0);
+  }
+  #[inline]
+  pub fn add_len(&mut self, len: u64) {
+    self.fbb_.push_slot::<u64>(StoreResponse::VT_LEN, len, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> StoreResponseBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     StoreResponseBuilder {
@@ -197,6 +245,9 @@ impl ::core::fmt::Debug for StoreResponse<'_> {
       ds.field("payload", &self.payload());
       ds.field("code", &self.code());
       ds.field("message", &self.message());
+      ds.field("volume", &self.volume());
+      ds.field("offset", &self.offset());
+      ds.field("len", &self.len());
       ds.finish()
   }
 }

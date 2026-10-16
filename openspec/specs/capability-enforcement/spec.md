@@ -41,11 +41,26 @@ that knowing one id confers negligible advantage in guessing another.
 - **THEN** the attempt fails ownership validation regardless of the id's
   numeric proximity to ids it does own
 
+### Requirement: Owner-Scoped Resource Handoff
+
+A resource's owner MAY authorise another process to attach it, and a holder of an explicit capability for the resource MAY do the same; the host SHALL record the authorisation as the named peer's attach basis. No guest role or name SHALL confer this authority, and an authorisation SHALL name exactly one resource and one client process.
+
+#### Scenario: Owner authorises attach
+
+- **WHEN** a guest authorises a peer for a region it owns
+- **THEN** the peer's `AttachRegion` SHALL succeed and no other process SHALL gain a basis
+
+#### Scenario: Role confers nothing
+
+- **WHEN** the discovery service authorises a resource it does not own and holds no explicit capability for
+- **THEN** the authorisation SHALL be denied
+
 ### Requirement: Ownership-Checked Attach
 
 `AttachRegion` SHALL succeed only when the caller owns the region, holds
-an `ExplicitResource` grant for it, or received it through the documented
-host-queue handoff. No other implicit sharing SHALL exist.
+an `ExplicitResource` grant for it, received it through the documented
+host-queue handoff, or was authorised by the region's owner through the
+owner-scoped handoff. No other implicit sharing SHALL exist.
 
 #### Scenario: Queue handoff shares ownership
 
@@ -53,6 +68,11 @@ host-queue handoff. No other implicit sharing SHALL exist.
   to
 - **THEN** ownership is shared with the receiver at receive time and the
   subsequent `AttachRegion` succeeds
+
+#### Scenario: Owner authorisation admits a peer
+
+- **WHEN** a region's owner authorises a client process for it
+- **THEN** that process's `AttachRegion` SHALL succeed
 
 #### Scenario: No implicit sharing
 
@@ -125,14 +145,20 @@ Plain string prefix semantics SHALL remain for non-network URIs.
 
 A `CapabilityGrant` containing `ResourceSelector::UriPrefix` SHALL be
 accepted at grant-registration time only if the same grant's selectors
-include `ResourceClass::TcpListener`, `ResourceClass::TcpStream`, or
-`ResourceClass::UdpSocket`. Otherwise registration SHALL fail loudly.
+include a resource class for which the prefix is evaluatable: a network
+class (`TcpListener`, `TcpStream`, `UdpSocket`) for endpoint URIs, or
+`Volume` for volume names. Otherwise registration SHALL fail loudly.
 
 #### Scenario: UriPrefix on non-network class rejected
 - **WHEN** a grant is registered with selectors
   `[ResourceClass(SharedRegion), UriPrefix("tcp://10.0.0.5:443")]`
 - **THEN** registration SHALL fail with an error explaining that
   `UriPrefix` is not evaluatable for that class
+
+#### Scenario: Volume name prefix admitted
+- **WHEN** a grant is registered with selectors
+  `[ResourceClass(Volume), UriPrefix("selium.control-plane")]`
+- **THEN** registration SHALL succeed, and the prefix SHALL scope which volumes the grant admits
 
 ### Requirement: Namespace Selector Hierarchy
 

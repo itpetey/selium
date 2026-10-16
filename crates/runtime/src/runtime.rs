@@ -8,7 +8,9 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use selium_abi::{OperationId, ProcessId, ResourceClass, TaskId};
+use selium_abi::{
+    AttachDeclarationScope, OperationId, ProcessId, ResourceClass, SharedResourceId, TaskId,
+};
 use selium_kernel::Kernel;
 use selium_service::DiscoveryRequest;
 use selium_shm::transport::ShmTransport;
@@ -26,11 +28,6 @@ use crate::{
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<DiscoveryRequest, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-/// Principal tenant per `(process_id, queue shared id)` for host queues.
-pub(crate) type QueueTenants = HashMap<(ProcessId, u64), String>;
-/// Serving tenant tracked per (process_id, region_id) so FreeRegion can revoke
-/// the region's URI (minted under principal provenance).
-pub(crate) type RegionTenants = HashMap<(ProcessId, u64), String>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Serving tenant tracked per (process_id, volume local id) so an append is
 /// reserved against the tenant the volume was minted under, not the writer's.
@@ -57,7 +54,6 @@ pub struct Runtime {
     pub(crate) loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
     pub(crate) local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
     pub(crate) shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
-    pub(crate) module_registry: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub(crate) next_operation_id: Arc<Mutex<OperationId>>,
     pub(crate) operations: Arc<Mutex<HashMap<OperationId, HostOperation>>>,
     pub(crate) mailboxes: Arc<Mutex<HashMap<ProcessId, Arc<GuestMailbox>>>>,
@@ -65,19 +61,16 @@ pub struct Runtime {
     pub(crate) discovery_publisher: Arc<Mutex<Option<DiscoveryPublisher>>>,
     /// Shared id of the discovery RPC listener, when discovery is enabled.
     pub(crate) discovery_listener_shared_id: Arc<Mutex<Option<u64>>>,
-    /// Process id of the booted discovery system guest, if any. Only this
-    /// process may call `RecordResolvedQueueFor` on behalf of resolvers.
-    pub(crate) discovery_process: Arc<Mutex<Option<ProcessId>>>,
-    /// Serving tenant tracked per (process_id, region_id) so FreeRegion can
-    /// revoke the region's URI.
-    pub(crate) region_tenants: Arc<Mutex<RegionTenants>>,
+    /// Owner-declared attachable-by-resolution declarations, keyed by resource
+    /// identity. While an entry holds, a resolve-recording naming a client
+    /// process inside the declaration's scope becomes that process's attach
+    /// basis. Entries are removed when the resource is freed or its owner
+    /// exits.
+    pub(crate) attachable_by_resolution:
+        Arc<Mutex<HashMap<(ResourceClass, SharedResourceId), AttachDeclarationScope>>>,
     /// Serving tenant tracked per (process_id, volume local id) so an append is
     /// reserved against the tenant the volume was minted under.
     pub(crate) volume_tenants: Arc<Mutex<VolumeTenants>>,
-    /// Principal tenant tracked per (process_id, queue_id) so process
-    /// teardown can revoke the queue's URI under the tenant it was minted
-    /// for (which may differ from the creating process's own tenant).
-    pub(crate) queue_tenants: Arc<Mutex<QueueTenants>>,
     /// Tenant whose `ResourceClass::Process` quota a spawned child consumed,
     /// keyed by the child's process id. Recorded by `ProcessStart`; teardown
     /// releases the slot exactly once by removing (and reading) the entry.
@@ -123,14 +116,6 @@ pub struct Runtime {
     /// so kernel-side sends (e.g. an accepted connection enqueued by the
     /// network poller) can wake the parked receiving guest.
     pub(crate) queue_waiters: Arc<Mutex<HashMap<u64, u64>>>,
-    /// Internal route URIs a process has registered with discovery, recorded
-    /// by the discovery system guest via `RecordRegistration`. Used to gate
-    /// the readiness of a role-declared system guest on its registration
-    /// being observable in discovery. Cleared when the process terminates.
-    pub(crate) process_registrations: Arc<Mutex<HashMap<ProcessId, HashSet<String>>>>,
-    /// Protocol schemes a booted system guest handles (e.g. `sel-http`),
-    /// keyed by process id. Revoked when the process terminates.
-    pub(crate) handler_schemes: Arc<Mutex<HashMap<ProcessId, Vec<String>>>>,
     /// Process ids whose guest reactor is currently being executed by a
     /// host thread. Guarantees at most one thread enters a guest's WASM
     /// store; losers of the race return and rely on the winner's
@@ -143,7 +128,7 @@ pub struct Runtime {
     /// first handle observed on a Tokio thread is reused for those.
     pub(crate) timer_handle: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
     /// Host-held PKI keyring backing the certificate-signing hostcalls.
-    /// Initialised at startup (see [`Runtime::initialize_keyring`]); the
+    /// Initialised at startup (see [`Runtime::initialise_keyring`]); the
     /// signing hostcalls fail loudly while it is absent.
     pub(crate) keyring: Arc<Mutex<Option<crate::keyring::Keyring>>>,
     /// Host-side metering projector: accumulates per-process cumulative
@@ -208,16 +193,13 @@ impl Runtime {
             loaded_guests: Arc::new(Mutex::new(HashMap::new())),
             local_handle_owners: Arc::new(Mutex::new(HashMap::new())),
             shared_resource_owners: Arc::new(Mutex::new(HashMap::new())),
-            module_registry: Arc::new(Mutex::new(HashMap::new())),
             next_operation_id: Arc::new(Mutex::new(1)),
             operations,
             mailboxes,
             discovery_publisher: Arc::new(Mutex::new(None)),
             discovery_listener_shared_id: Arc::new(Mutex::new(None)),
-            discovery_process: Arc::new(Mutex::new(None)),
-            region_tenants: Arc::new(Mutex::new(HashMap::new())),
+            attachable_by_resolution: Arc::new(Mutex::new(HashMap::new())),
             volume_tenants: Arc::new(Mutex::new(HashMap::new())),
-            queue_tenants: Arc::new(Mutex::new(HashMap::new())),
             process_quota_tenants: Arc::new(Mutex::new(HashMap::new())),
             wait_registry: Arc::new(Mutex::new(HashMap::new())),
             region_attachments: Arc::new(Mutex::new(HashMap::new())),
@@ -226,8 +208,6 @@ impl Runtime {
             process_fastpath: Arc::new(Mutex::new(HashMap::new())),
             kick_counts: Arc::new(Mutex::new(HashMap::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
-            process_registrations: Arc::new(Mutex::new(HashMap::new())),
-            handler_schemes: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
             timer_handle: Arc::new(std::sync::OnceLock::new()),
             keyring: Arc::new(Mutex::new(None)),
@@ -330,8 +310,8 @@ impl Runtime {
     /// loudly when the intermediate is missing or invalid. Identity depends
     /// on this at startup: a host that cannot sign tenant CAs must not
     /// bootstrap the mint authority.
-    pub fn initialize_keyring(&self, bootstrap: crate::keyring::KeyringBootstrap) -> Result<()> {
-        let keyring = crate::keyring::Keyring::initialize(
+    pub fn initialise_keyring(&self, bootstrap: crate::keyring::KeyringBootstrap) -> Result<()> {
+        let keyring = crate::keyring::Keyring::initialise(
             Box::new(crate::keyring::InMemoryCaStore::default()),
             bootstrap,
         )
@@ -341,7 +321,7 @@ impl Runtime {
     }
 
     /// Loads or generates the host keyring under a state directory.
-    pub fn initialize_keyring_from_state(&self, state_dir: impl Into<PathBuf>) -> Result<()> {
+    pub fn initialise_keyring_from_state(&self, state_dir: impl Into<PathBuf>) -> Result<()> {
         self.load_or_generate_keyring(&state_dir.into())
     }
 
@@ -365,25 +345,6 @@ impl Runtime {
             crate::keyring::Keyring::generate().map_err(|error| Error::Host(error.to_string()))?;
         *self.keyring.lock() = Some(keyring);
         Ok(())
-    }
-
-    /// Records a route registration for `process_id`, as reported by the
-    /// discovery system guest. Used to gate role-declared readiness on
-    /// discoverable self-registration.
-    pub(crate) fn record_registration(&self, process_id: ProcessId, uri: String) {
-        self.process_registrations
-            .lock()
-            .entry(process_id)
-            .or_default()
-            .insert(uri);
-    }
-
-    /// Returns whether `process_id` has a recorded registration for `uri`.
-    pub fn has_registration(&self, process_id: ProcessId, uri: &str) -> bool {
-        self.process_registrations
-            .lock()
-            .get(&process_id)
-            .is_some_and(|uris| uris.contains(uri))
     }
 
     /// Publishes a typed discovery operation to the discovery feed.

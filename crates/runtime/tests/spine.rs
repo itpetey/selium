@@ -15,7 +15,7 @@
 //! ```
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 
 mod common;
@@ -48,10 +48,8 @@ fn spine_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             Capability::SharedMemory,
             vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
         )],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -71,19 +69,9 @@ fn wasm_guest_runs_golden_path() {
         .expect("bootstrap spine demo guest");
     let process_id = bootstrapped.process_id;
 
-    // The guest signalled readiness via `mark_ready()` from inside WASM.
-    let activity = runtime.activity_log();
-    assert!(
-        activity
-            .iter()
-            .any(|event| event.process_id == Some(process_id)
-                && event.message.contains("guest ready")),
-        "expected a GuestReady activity event, got: {activity:?}"
-    );
-
-    // The guest initialised its log transport inside WASM (AllocRegion +
-    // AttachRegion mapping into linear memory) and published structured log
-    // records. The kernel drains them as frames from shared memory.
+    // The guest's own log is the convergence evidence (there is no readiness
+    // signal): it initialised its log transport inside WASM and published
+    // structured records, which the kernel drains as frames from shared memory.
     let messages = drain_log_messages(&runtime, process_id);
     assert!(
         messages.iter().any(|message| message == "hello spine"),

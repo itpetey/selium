@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_kernel::Kernel;
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 use tokio::time::sleep;
 
@@ -14,9 +14,7 @@ struct AppDef {
     path: PathBuf,
     entrypoint: String,
     module_id: String,
-    dependencies: Vec<String>,
     tenant: Option<String>,
-    readiness: String,
 }
 
 /// Selium runtime — loads and executes WebAssembly system guests.
@@ -36,10 +34,14 @@ struct Cli {
 
     /// One or more app definitions.
     ///
-    /// Format: name=NAME,path=WASM[,entrypoint=FN][,module-id=ID][,dependencies=A,B][,tenant=T][,readiness=COND]
+    /// Format: name=NAME,path=WASM[,entrypoint=FN][,module-id=ID][,tenant=T]
     ///
     /// Required keys: name, path.
-    /// Defaults: entrypoint="main", module-id=<name>, readiness="immediate".
+    /// Defaults: entrypoint="main", module-id=<name>.
+    ///
+    /// Boot order is declaration order: there is no readiness or dependency
+    /// key. A guest converges on its peers by watching (or retrying) their
+    /// routes, not by the host withholding a start.
     #[arg(long, value_parser = parse_app)]
     app: Vec<AppDef>,
 
@@ -59,12 +61,6 @@ async fn main() -> Result<()> {
         .app
         .iter()
         .map(|app| {
-            let readiness = if app.readiness == "immediate" {
-                ReadinessCondition::Immediate
-            } else {
-                ReadinessCondition::ActivityLogContains(app.readiness.clone())
-            };
-
             Ok(SystemGuestDescriptor {
                 name: app.name.clone(),
                 module_id: app.module_id.clone(),
@@ -72,10 +68,8 @@ async fn main() -> Result<()> {
                 entrypoint: app.entrypoint.clone(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: app.dependencies.clone(),
-                readiness,
                 tenant: app.tenant.clone(),
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
         })
@@ -96,7 +90,6 @@ async fn main() -> Result<()> {
     let config = RuntimeConfig {
         start_discovery: cli.start_discovery,
         system_guests: guests,
-        domain_table: Vec::new(),
         state_dir,
     };
     let report = runtime.bootstrap_system_guests(config)?;
@@ -166,10 +159,8 @@ fn net_demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -209,9 +200,7 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
     let mut path = None;
     let mut entrypoint = "main".to_owned();
     let mut module_id = None;
-    let mut dependencies = Vec::new();
     let mut tenant = None;
-    let mut readiness = "immediate".to_owned();
 
     for (key, val) in &kvs {
         match key.as_str() {
@@ -229,9 +218,6 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
             }
             "entrypoint" => entrypoint = val.clone(),
             "module-id" => module_id = Some(val.clone()),
-            "dependencies" => {
-                dependencies = val.split(',').map(|s| s.trim().to_owned()).collect();
-            }
             "tenant" => {
                 tenant = if val.is_empty() {
                     None
@@ -239,7 +225,6 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
                     Some(val.clone())
                 }
             }
-            "readiness" => readiness = val.clone(),
             unknown => return Err(format!("unknown key '{}'", unknown)),
         }
     }
@@ -253,9 +238,7 @@ fn parse_app(raw: &str) -> Result<AppDef, String> {
         path,
         entrypoint,
         module_id,
-        dependencies,
         tenant,
-        readiness,
     })
 }
 
@@ -280,7 +263,6 @@ async fn run_demo_net_wake(runtime: Runtime) -> Result<()> {
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
             system_guests: vec![net_demo_descriptor(module_bytes)],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .map_err(|error| anyhow::anyhow!("bootstrap: {error}"))?;

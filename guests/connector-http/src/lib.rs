@@ -17,9 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use selium_guest::{
-    Context, TcpListener, TcpStream, debug, entrypoint, error, info, mark_ready, spawn, warn,
-};
+use selium_guest::{Context, TcpListener, TcpStream, debug, entrypoint, error, info, spawn, warn};
 use thiserror::Error;
 use tokio_rustls::TlsAcceptor;
 // Feature-unification anchor, not a code dependency: pulls in `ring` (with its
@@ -66,12 +64,12 @@ enum TlsError {
 /// Custom `getrandom` backend for wasm32, invoked by the `getrandom` crate
 /// when built with the `custom` backend (`getrandom_backend = "custom"`).
 ///
-/// Fills the caller's (possibly uninitialized) buffer by calling the host
+/// Fills the caller's (possibly uninitialised) buffer by calling the host
 /// `RandomBytes` hostcall, then copies the bytes into the destination.
 ///
 /// # Safety
 /// The contract is defined by `getrandom`: `dest` must be valid for writes of
-/// `len` bytes, and on success the entire buffer must be initialized.
+/// `len` bytes, and on success the entire buffer must be initialised.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 unsafe extern "Rust" fn __getrandom_v03_custom(
@@ -145,8 +143,6 @@ async fn connector_http(mut ctx: Context) -> anyhow::Result<()> {
     let listener =
         TcpListener::bind("0.0.0.0:443").with_context(|| "http-connector: bind failed")?;
     info!("http-connector: bound to 0.0.0.0:443");
-
-    mark_ready();
 
     // Fetch the advisory domain table once, so Host resolution can project
     // wire names onto the tenant tree locally before the discovery lookup.

@@ -35,6 +35,22 @@ struct QuotaState {
 
 struct QuotaTableInner {
     quotas: Mutex<HashMap<(String, ResourceClass), QuotaState>>,
+    /// Which tenant's counter each resource's reservation was charged to.
+    ///
+    /// A resource may be minted under a serving tenant that differs from the
+    /// allocating process's own tenant (a root principal, or tenant-scoped
+    /// delegation). A release must credit the ledger the reservation was
+    /// charged against, so the metering domain records the debit here rather
+    /// than letting the release path re-derive a tenant. Consumed on release.
+    reservations: Mutex<HashMap<(ResourceClass, u64), Reservation>>,
+}
+
+/// A resource's outstanding quota reservation: the tenant whose ceiling was
+/// charged and the amount still held.
+#[derive(Debug, Clone)]
+struct Reservation {
+    tenant: String,
+    amount: u64,
 }
 
 impl QuotaTable {
@@ -42,6 +58,7 @@ impl QuotaTable {
         Self {
             inner: Arc::new(QuotaTableInner {
                 quotas: Mutex::new(HashMap::new()),
+                reservations: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -146,6 +163,82 @@ impl QuotaTable {
             state.used = state.used.saturating_sub(amount);
         }
     }
+
+    /// Records that a resource's `amount` reservation was charged to `tenant`'s
+    /// counter for `class`, so the release path credits the same ledger.
+    ///
+    /// Call after a successful [`try_consume`](Self::try_consume) for the
+    /// resource, once its identity is known. The platform tenant holds no
+    /// tracked counter, so it records nothing.
+    pub fn note_reservation(
+        &self,
+        class: ResourceClass,
+        resource_id: u64,
+        tenant: &str,
+        amount: u64,
+    ) {
+        if tenant.is_empty() {
+            return;
+        }
+        self.inner.reservations.lock().insert(
+            (class, resource_id),
+            Reservation {
+                tenant: tenant.to_string(),
+                amount,
+            },
+        );
+    }
+
+    /// Releases a resource's reservation, returning `amount` to the counter it
+    /// was charged against. Returns whether a reservation was recorded.
+    ///
+    /// This is the symmetric counterpart of
+    /// [`note_reservation`](Self::note_reservation): a cross-tenant mint is
+    /// freed under the tenant whose ceiling absorbed it, not under the freeing
+    /// process's own tenant.
+    pub fn release_reservation(&self, class: ResourceClass, resource_id: u64) -> bool {
+        let Some(reservation) = self
+            .inner
+            .reservations
+            .lock()
+            .remove(&(class.clone(), resource_id))
+        else {
+            return false;
+        };
+        self.release(&reservation.tenant, class, reservation.amount);
+        true
+    }
+
+    /// Moves a resource's reservation from the tenant it was charged to onto
+    /// `to`, returning `amount` to the original counter and force-consuming it
+    /// against the receiving tenant.
+    ///
+    /// This is the ledger half of a cross-tenant handoff: the reservation
+    /// follows the resource, so freeing it later credits whoever holds it now.
+    /// A reservation that was never recorded (the platform tenant holds no
+    /// tracked counter) is a no-op, and the caller keeps the transfer's
+    /// accounting.
+    pub fn transfer_reservation(
+        &self,
+        class: ResourceClass,
+        resource_id: u64,
+        to: &str,
+        amount: u64,
+    ) -> bool {
+        let from = {
+            let mut reservations = self.inner.reservations.lock();
+            let Some(reservation) = reservations.get_mut(&(class.clone(), resource_id)) else {
+                return false;
+            };
+            if reservation.tenant == to {
+                return false;
+            }
+            std::mem::replace(&mut reservation.tenant, to.to_string())
+        };
+        self.release(&from, class.clone(), amount);
+        self.force_consume(to, class, amount);
+        true
+    }
 }
 
 impl Default for QuotaState {
@@ -162,6 +255,54 @@ mod tests {
     use selium_abi::ResourceClass;
 
     use super::*;
+
+    #[test]
+    fn a_reservation_releases_under_the_tenant_it_was_charged_to() {
+        // A cross-tenant mint: the reservation is charged to `acme`'s ceiling
+        // while the resource is owned by a root process. The release must
+        // credit `acme`, not the freeing process's own (platform) tenant.
+        let table = QuotaTable::new();
+        table.set("acme", ResourceClass::SharedRegion, 128);
+        table
+            .try_consume("acme", ResourceClass::SharedRegion, 64)
+            .expect("within acme ceiling");
+        table.note_reservation(ResourceClass::SharedRegion, 7, "acme", 64);
+
+        assert!(table.release_reservation(ResourceClass::SharedRegion, 7));
+        assert_eq!(table.used("acme", ResourceClass::SharedRegion), 0);
+        // The reservation is consumed: a second release is a no-op.
+        assert!(!table.release_reservation(ResourceClass::SharedRegion, 7));
+    }
+
+    #[test]
+    fn the_platform_tenant_holds_no_tracked_reservation() {
+        let table = QuotaTable::new();
+        table.note_reservation(ResourceClass::SharedRegion, 9, "", 4096);
+        assert!(
+            !table.release_reservation(ResourceClass::SharedRegion, 9),
+            "the platform tenant is unrestricted, so there is nothing to credit"
+        );
+    }
+
+    #[test]
+    fn a_transferred_reservation_releases_under_the_receiving_tenant() {
+        // Cross-tenant handoff: the reservation follows the resource, so a
+        // later free credits whoever holds it now.
+        let table = QuotaTable::new();
+        table.set("acme", ResourceClass::SharedRegion, 1024);
+        table.set("beta", ResourceClass::SharedRegion, 1024);
+        table
+            .try_consume("acme", ResourceClass::SharedRegion, 64)
+            .expect("within acme ceiling");
+        table.note_reservation(ResourceClass::SharedRegion, 3, "acme", 64);
+
+        assert!(table.transfer_reservation(ResourceClass::SharedRegion, 3, "beta", 64));
+        assert_eq!(table.used("acme", ResourceClass::SharedRegion), 0);
+        assert_eq!(table.used("beta", ResourceClass::SharedRegion), 64);
+
+        assert!(table.release_reservation(ResourceClass::SharedRegion, 3));
+        assert_eq!(table.used("beta", ResourceClass::SharedRegion), 0);
+    }
 
     #[test]
     fn set_lookup_and_clear_cover_the_counter_lifecycle() {

@@ -20,6 +20,7 @@ namespace selium.identity;
 //   3 = IssueUserCert { tenant, spki_der }
 //   4 = SetPrincipalGrants { tenant, fingerprint, grants }
 //   5 = RemovePrincipal { tenant, fingerprint }
+//   6 = SetDomain { domain, tenant }
 table IdentityRequest {
     variant: ubyte;
     // Tenant the request targets (all data variants).
@@ -30,6 +31,8 @@ table IdentityRequest {
     fingerprint: [ubyte];
     // rkyv-encoded baseline grants (SetPrincipalGrants).
     grants: [ubyte];
+    // Domain to map (SetDomain).
+    domain: string;
 }
 
 // Identity response message.
@@ -42,6 +45,7 @@ table IdentityRequest {
 //   4 = PrincipalRecorded { fingerprint }
 //   5 = PrincipalRemoved { fingerprint }
 //   6 = Error { step, context }
+//   7 = DomainRecorded { domain }
 table IdentityResponse {
     variant: ubyte;
     // Tenant (TenantRecorded, Rotated, Revoked).
@@ -54,6 +58,8 @@ table IdentityResponse {
     step: string;
     // Error context (Error).
     context: string;
+    // Domain recorded (DomainRecorded).
+    domain: string;
 }
 
 root_type IdentityRequest;

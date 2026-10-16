@@ -1,0 +1,24 @@
+[package]
+name = "selium-control-probe"
+version.workspace = true
+edition.workspace = true
+description = "Resource-catalogue probe test fixture guest"
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+selium-abi.workspace = true
+selium-guest.workspace = true
+selium-shm.workspace = true
+
+[lints]
+workspace = true

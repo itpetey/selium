@@ -22,7 +22,7 @@ use std::{
 use selium_abi::{Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector};
 use selium_client::{ClientIdentity, ConnectOptions, FlatMsg as _};
 use selium_kernel::Kernel;
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestArg, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestArg, SystemGuestDescriptor};
 
 /// The single-instance bridge route's server certificate (SAN `bridge`),
 /// provisioned into the `tls-certs` blob store before the connector guest
@@ -110,12 +110,32 @@ impl Drop for StateRoot {
 impl SpinePortGuard {
     /// Acquires the spine port, blocking until no other spine binary holds
     /// it.
+    ///
+    /// A holder that is killed before its `Drop` runs leaves the lock file
+    /// behind, which would otherwise wedge every later spine test in this
+    /// container forever. A lock older than [`STALE_LOCK_AGE`] is therefore
+    /// treated as abandoned and removed: live spine binaries hold it for at
+    /// most a couple of minutes, so anything that old belongs to a dead run.
     pub(crate) fn acquire() -> Self {
+        const STALE_LOCK_AGE: Duration = Duration::from_secs(600);
         let path = std::env::temp_dir().join("selium-quic-spine-4433.lock");
         loop {
             match OpenOptions::new().create_new(true).write(true).open(&path) {
                 Ok(_) => return Self(path),
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                Err(_) => {
+                    if let Ok(metadata) = std::fs::metadata(&path)
+                        && let Ok(age) = metadata.modified().and_then(|modified| {
+                            std::time::SystemTime::now()
+                                .duration_since(modified)
+                                .map_err(std::io::Error::other)
+                        })
+                        && age > STALE_LOCK_AGE
+                    {
+                        drop(std::fs::remove_file(&path));
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         }
     }
@@ -134,14 +154,15 @@ impl Drop for SpinePortGuard {
 /// `DelegateGrants` grant and `SystemRegistration` for its root route.
 pub(crate) fn bridge_server_descriptor(
     module_bytes: Vec<u8>,
-    dependencies: Vec<String>,
+    bridge_channel_module: Vec<u8>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "bridge-server".to_string(),
         module_id: "bridge-server-module".to_string(),
         module_bytes,
         entrypoint: "bridge_server".to_string(),
-        arguments: Vec::new(),
+        arguments: vec![SystemGuestArg::Pointer(bridge_channel_module)],
         grants: vec![
             CapabilityGrant::new(
                 Capability::ProcessLifecycle,
@@ -161,10 +182,8 @@ pub(crate) fn bridge_server_descriptor(
                 vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
         ],
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -200,7 +219,7 @@ pub(crate) fn client_options_no_identity() -> ConnectOptions {
 /// from blobs, client anchors from the identity anchor live table.
 pub(crate) fn connector_descriptor(
     module_bytes: Vec<u8>,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "quic-connector".to_string(),
@@ -226,10 +245,8 @@ pub(crate) fn connector_descriptor(
                 vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
         ],
-        dependencies,
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: vec!["sel-quic".to_string()],
     }
 }
@@ -258,10 +275,8 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
             ),
             CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
-        dependencies: vec!["discovery".to_string(), "store".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -283,28 +298,40 @@ pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescript
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The registry probes capability state and records
+            // registrations under a bootstrap-provisioned authority, not a
+            // privileged guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: true,
         handlers: Vec::new(),
     }
 }
 
 pub(crate) fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
+    let messages = runtime
         .kernel()
         .processes()
         .drain_log_channel(process_id)
-        .expect("drain log channel")
+        .unwrap_or_else(|error| {
+            let tail: Vec<String> = runtime
+                .activity_log()
+                .iter()
+                .rev()
+                .take(10)
+                .map(|event| event.message.clone())
+                .collect();
+            panic!("drain log channel {process_id}: {error}; activity tail: {tail:#?}")
+        })
         .iter()
         .map(|frame| {
             selium_service::log::LogRecord::decode(frame)
                 .expect("decode log record")
                 .message
         })
-        .collect()
+        .collect();
+    messages
 }
 
 /// The identity system guest: sole mint authority, keyring-backed signing,
@@ -317,10 +344,8 @@ pub(crate) fn identity_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescripto
         entrypoint: "identity_main".to_string(),
         arguments: Vec::new(),
         grants: selium_identity::identity_grants(),
-        dependencies: vec!["discovery".to_string(), "store".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -342,9 +367,9 @@ pub(crate) fn operator_descriptor(
     module_bytes: Vec<u8>,
     spki: Vec<u8>,
     mode: u64,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
-    operator_descriptor_named("identity-onboard", module_bytes, spki, mode, dependencies)
+    operator_descriptor_named("identity-onboard", module_bytes, spki, mode, _dependencies)
 }
 
 /// The same operator guest under an explicit name.
@@ -356,7 +381,7 @@ pub(crate) fn operator_descriptor_named(
     module_bytes: Vec<u8>,
     spki: Vec<u8>,
     mode: u64,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: name.to_string(),
@@ -378,10 +403,8 @@ pub(crate) fn operator_descriptor_named(
                 vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
         ],
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -523,7 +546,7 @@ pub(crate) fn seed_tls_blob_store(runtime: &Runtime) {
 /// and blob-store semantics, serving the root-namespace `sel:///store` route
 /// over the host's opaque volumes. Every guest that opens a log or blob store
 /// declares it as a dependency, so the store is ready first.
-pub(crate) fn store_descriptor(dependencies: Vec<String>) -> SystemGuestDescriptor {
+pub(crate) fn store_descriptor(_dependencies: Vec<String>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "store".to_string(),
         module_id: "store-module".to_string(),
@@ -543,12 +566,14 @@ pub(crate) fn store_descriptor(dependencies: Vec<String>) -> SystemGuestDescript
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The store serves a root-namespace route, and the registry gates a
+            // root registration on the system-registration capability it must
+            // therefore probe for.
             CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: Some("sel:///store".to_string()),
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }

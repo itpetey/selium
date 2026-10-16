@@ -16,6 +16,11 @@ pub enum DiscoveryRequestOffset {}
 ///   5 = RevokeByOwner { process_id }
 ///   6 = SeedDomain { domain, tenant }
 ///   7 = ListDomains
+///   8 = RevokeResource { class, id }
+///   9 = Renew { uri }
+///  10 = SetHealth { name, healthy }
+///  11 = RegisterHandler { scheme, process_id }
+///  12 = SetDomain { domain, tenant }
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -39,6 +44,11 @@ impl<'a> DiscoveryRequest<'a> {
   pub const VT_PROCESS_ID: ::flatbuffers::VOffsetT = 18;
   pub const VT_DOMAIN: ::flatbuffers::VOffsetT = 20;
   pub const VT_TENANT: ::flatbuffers::VOffsetT = 22;
+  pub const VT_CLASS: ::flatbuffers::VOffsetT = 24;
+  pub const VT_ID: ::flatbuffers::VOffsetT = 26;
+  pub const VT_NAME: ::flatbuffers::VOffsetT = 28;
+  pub const VT_HEALTHY: ::flatbuffers::VOffsetT = 30;
+  pub const VT_SCHEME: ::flatbuffers::VOffsetT = 32;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -50,14 +60,19 @@ impl<'a> DiscoveryRequest<'a> {
     args: &'args DiscoveryRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<DiscoveryRequest<'bldr>> {
     let mut builder = DiscoveryRequestBuilder::new(_fbb);
+    builder.add_id(args.id);
     builder.add_process_id(args.process_id);
     builder.add_owner(args.owner);
+    if let Some(x) = args.scheme { builder.add_scheme(x); }
+    if let Some(x) = args.name { builder.add_name(x); }
+    if let Some(x) = args.class { builder.add_class(x); }
     if let Some(x) = args.tenant { builder.add_tenant(x); }
     if let Some(x) = args.domain { builder.add_domain(x); }
     if let Some(x) = args.target { builder.add_target(x); }
     if let Some(x) = args.value { builder.add_value(x); }
     if let Some(x) = args.key { builder.add_key(x); }
     if let Some(x) = args.uri { builder.add_uri(x); }
+    builder.add_healthy(args.healthy);
     builder.add_root_service(args.root_service);
     builder.add_variant(args.variant);
     builder.finish()
@@ -144,6 +159,47 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_TENANT, None)}
   }
+  /// Resource class segment of the resource whose registration is revoked
+  /// (RevokeResource variant).
+  #[inline]
+  pub fn class(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_CLASS, None)}
+  }
+  /// Resource id whose registration is revoked (RevokeResource variant).
+  #[inline]
+  pub fn id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(DiscoveryRequest::VT_ID, Some(0)).unwrap()}
+  }
+  /// Health record name (SetHealth variant).
+  #[inline]
+  pub fn name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_NAME, None)}
+  }
+  /// Whether the guest is healthy (SetHealth variant).
+  #[inline]
+  pub fn healthy(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(DiscoveryRequest::VT_HEALTHY, Some(false)).unwrap()}
+  }
+  /// Protocol scheme (RegisterHandler variant).
+  #[inline]
+  pub fn scheme(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_SCHEME, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
@@ -162,6 +218,11 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
      .visit_field::<u64>("process_id", Self::VT_PROCESS_ID, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("domain", Self::VT_DOMAIN, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("tenant", Self::VT_TENANT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("class", Self::VT_CLASS, false)?
+     .visit_field::<u64>("id", Self::VT_ID, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+     .visit_field::<bool>("healthy", Self::VT_HEALTHY, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("scheme", Self::VT_SCHEME, false)?
      .finish();
     Ok(())
   }
@@ -177,6 +238,11 @@ pub struct DiscoveryRequestArgs<'a> {
     pub process_id: u64,
     pub domain: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub tenant: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub class: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub id: u64,
+    pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub healthy: bool,
+    pub scheme: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for DiscoveryRequestArgs<'a> {
   #[inline]
@@ -192,6 +258,11 @@ impl<'a> Default for DiscoveryRequestArgs<'a> {
       process_id: 0,
       domain: None,
       tenant: None,
+      class: None,
+      id: 0,
+      name: None,
+      healthy: false,
+      scheme: None,
     }
   }
 }
@@ -242,6 +313,26 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryRequestBuilder<'a, '
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_TENANT, tenant);
   }
   #[inline]
+  pub fn add_class(&mut self, class: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_CLASS, class);
+  }
+  #[inline]
+  pub fn add_id(&mut self, id: u64) {
+    self.fbb_.push_slot::<u64>(DiscoveryRequest::VT_ID, id, 0);
+  }
+  #[inline]
+  pub fn add_name(&mut self, name: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_NAME, name);
+  }
+  #[inline]
+  pub fn add_healthy(&mut self, healthy: bool) {
+    self.fbb_.push_slot::<bool>(DiscoveryRequest::VT_HEALTHY, healthy, false);
+  }
+  #[inline]
+  pub fn add_scheme(&mut self, scheme: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_SCHEME, scheme);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DiscoveryRequestBuilder {
@@ -269,6 +360,11 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
       ds.field("process_id", &self.process_id());
       ds.field("domain", &self.domain());
       ds.field("tenant", &self.tenant());
+      ds.field("class", &self.class());
+      ds.field("id", &self.id());
+      ds.field("name", &self.name());
+      ds.field("healthy", &self.healthy());
+      ds.field("scheme", &self.scheme());
       ds.finish()
   }
 }

@@ -153,6 +153,14 @@ pub struct ResourceTarget {
     pub labels: Vec<Label>,
 }
 
+/// Lifetime of an owner-registered route's lease, in milliseconds.
+///
+/// Both sides of the contract need this number: the registry expires a lapsed
+/// lease into a revocation, and the SDK's renewal task must renew inside the
+/// window. It lives here, in the shared service crate, so the registry's sweep
+/// and the SDK's renewal interval cannot drift apart.
+pub const REGISTRATION_LEASE_TTL_MS: u64 = 30_000;
+
 /// Request sent to the discovery service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[schema(
@@ -209,6 +217,47 @@ pub enum DiscoveryRequest {
     /// Request the provisioned domain→tenant table. Used by connectors to
     /// obtain a copy for local wire-name resolution.
     ListDomains,
+    /// Revoke the registration recorded for a resource identity (published by
+    /// the runtime when a resource is freed). The registry revokes under the
+    /// tenant it recorded at registration, so a cross-tenant mint is revoked
+    /// under the tenant it was minted for.
+    RevokeResource {
+        /// Resource class segment (e.g. `region`, `queue`).
+        class: String,
+        /// Shared resource id.
+        id: u64,
+    },
+    /// Renew a guest registration's lease, keeping the route live.
+    Renew {
+        /// URI of the registration to renew.
+        uri: String,
+    },
+    /// Set a guest's health record (Tier-2): `healthy` publishes it, `!healthy`
+    /// removes it. Health is published state, not a readiness signal.
+    SetHealth {
+        /// Health record name, scoped to the caller's tenant.
+        name: String,
+        /// Whether the guest is healthy.
+        healthy: bool,
+    },
+    /// Register a host-authored protocol handler (Tier-1 only): the runtime
+    /// publishes this from a guest descriptor, so the registration cannot be
+    /// forged by a guest. Resolution is a discovery lookup.
+    RegisterHandler {
+        /// Protocol scheme (e.g. `sel-quic`).
+        scheme: String,
+        /// Process that handles the scheme.
+        process_id: u64,
+    },
+    /// Seed the advisory domain-to-tenant mapping. Accepted from a caller
+    /// holding the bootstrap-provisioned `DomainWrite` authority (the identity
+    /// guest owns the mapping durably).
+    SetDomain {
+        /// Domain to map (e.g. `example.com`).
+        domain: String,
+        /// Tenant the domain maps to (e.g. `acme`).
+        tenant: String,
+    },
 }
 
 /// Response from the discovery service.
@@ -310,6 +359,54 @@ pub enum DesiredStateRecord {
     },
 }
 
+/// A named platform resource recorded in the guest-owned catalogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.CatalogueRecord",
+    binding = "selium_service::fbs::selium::control::CatalogueRecord"
+)]
+pub struct CatalogueRecord {
+    /// Registered name.
+    pub uri: String,
+    /// Resource class URI segment (e.g. `region`, `volume`).
+    pub class: String,
+    /// Process that owns the underlying resource.
+    pub owner: u64,
+    /// Tenant the name was registered under.
+    pub tenant: String,
+    /// Informational purpose tag.
+    pub purpose: String,
+    /// Shared resource id the name resolves to.
+    pub resource_id: u64,
+}
+
+/// A catalogue log record appended to the control plane's catalogue durable log.
+///
+/// The log is the catalogue's store of record: registrations and removals are
+/// appended in order and the tenant-partitioned projection is rebuilt from
+/// replay on boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[schema(
+    path = "schemas/control.fbs",
+    ty = "selium.control.CatalogueLogRecord",
+    binding = "selium_service::fbs::selium::control::CatalogueLogRecord"
+)]
+pub enum CatalogueLogRecord {
+    /// A named resource registration.
+    Register {
+        /// The catalogue record.
+        record: CatalogueRecord,
+    },
+    /// A named resource removal.
+    Remove {
+        /// URI of the name being removed.
+        uri: String,
+        /// Tenant the removed name belonged to.
+        tenant: String,
+    },
+}
+
 /// A target returned by a control-plane resolve. The resolve projection of a
 /// discovered resource: enough to attach (resource id, host) without the full
 /// `ResourceTarget` taxonomy (class, tenant, interface, labels), which stays in
@@ -391,6 +488,29 @@ pub enum ControlRequest {
         /// Workload identifier.
         workload_id: String,
     },
+    /// Register a named resource in the guest-owned catalogue.
+    RegisterResource {
+        /// Registered name.
+        uri: String,
+        /// Resource class URI segment (e.g. `region`, `volume`).
+        class: String,
+        /// Process that owns the underlying resource.
+        owner: u64,
+        /// Informational purpose tag.
+        purpose: String,
+        /// Shared resource id the name resolves to.
+        resource_id: u64,
+    },
+    /// Remove a named resource from the catalogue.
+    RemoveResource {
+        /// URI of the name to remove.
+        uri: String,
+    },
+    /// Resolve a catalogue name to its record.
+    LookupResource {
+        /// URI of the name to resolve.
+        uri: String,
+    },
 }
 
 /// Response from the control-plane service.
@@ -433,6 +553,22 @@ pub enum ControlResponse {
         step: String,
         /// Context describing the failure.
         context: String,
+    },
+    /// A catalogue registration outcome: the recorded resource.
+    Registered {
+        /// The recorded catalogue entry.
+        record: CatalogueRecord,
+    },
+    /// A catalogue removal outcome.
+    Removed {
+        /// URI of the removed name.
+        uri: String,
+    },
+    /// A catalogue lookup outcome.
+    Lookup {
+        /// The named resource, or `None` when the name is unknown in the
+        /// session's tenant.
+        record: Option<CatalogueRecord>,
     },
 }
 
@@ -545,6 +681,14 @@ pub enum IdentityRequest {
         /// SHA-256 fingerprint of the principal's leaf SPKI.
         fingerprint: Vec<u8>,
     },
+    /// Record the advisory domain-to-tenant mapping (operator tier). The
+    /// identity guest owns the mapping durably and publishes it to discovery.
+    SetDomain {
+        /// Domain to map (e.g. `example.com`).
+        domain: String,
+        /// Tenant the domain maps to (e.g. `acme`).
+        tenant: String,
+    },
 }
 
 /// Response from the identity service.
@@ -584,6 +728,11 @@ pub enum IdentityResponse {
     PrincipalRemoved {
         /// The removed principal's fingerprint.
         fingerprint: Vec<u8>,
+    },
+    /// A domain-to-tenant mapping was recorded.
+    DomainRecorded {
+        /// The recorded domain.
+        domain: String,
     },
     /// A typed failure naming the failed step and its context.
     Error {
@@ -820,6 +969,18 @@ pub enum StoreRequest {
         /// Manifest name.
         manifest: String,
     },
+    /// Resolve a stored blob (by id or through a manifest) to a durable slice.
+    ///
+    /// The slice names the volume, offset and length of the blob's bytes so a
+    /// caller can hand the range to the host without copying the bytes.
+    ResolveSlice {
+        /// Blob-store name.
+        store: String,
+        /// Manifest name to resolve (mutually exclusive with `blob_id`).
+        manifest: Option<String>,
+        /// Blob id to resolve (mutually exclusive with `manifest`).
+        blob_id: Option<String>,
+    },
 }
 
 /// Response from the durable store service.
@@ -867,6 +1028,15 @@ pub enum StoreResponse {
         code: String,
         /// Human-readable error detail.
         message: String,
+    },
+    /// A durable slice naming a stored blob's bytes.
+    Slice {
+        /// Volume name holding the blob's bytes.
+        volume: String,
+        /// Byte offset of the blob within the volume.
+        offset: u64,
+        /// Byte length of the blob.
+        len: u64,
     },
 }
 
@@ -1274,6 +1444,11 @@ mod tests {
             process_id: 0,
             domain: None,
             tenant: None,
+            class: None,
+            id: 0,
+            name: None,
+            healthy: false,
+            scheme: None,
         };
         let root = crate::fbs::selium::discovery::DiscoveryRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1299,6 +1474,11 @@ mod tests {
             process_id: 0,
             domain: None,
             tenant: None,
+            class: None,
+            id: 0,
+            name: None,
+            healthy: false,
+            scheme: None,
         };
         let root = crate::fbs::selium::discovery::DiscoveryRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1657,6 +1837,7 @@ mod tests {
             spki_der: None,
             fingerprint: None,
             grants: None,
+            domain: None,
         };
         let root = crate::fbs::selium::identity::IdentityRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1679,6 +1860,10 @@ mod tests {
             uri: None,
             manifest: None,
             bytes: None,
+            class: None,
+            owner: 0,
+            purpose: None,
+            resource_id: 0,
         };
         let root = crate::fbs::selium::control::ControlRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1766,6 +1951,56 @@ mod tests {
         let bytes = FlatMsg::encode(&request);
         let decoded: DiscoveryRequest = FlatMsg::decode(&bytes).expect("decode");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_revoke_resource_round_trips() {
+        let request = DiscoveryRequest::RevokeResource {
+            class: "region".to_string(),
+            id: 42,
+        };
+        let bytes = FlatMsg::encode(&request);
+        let decoded: DiscoveryRequest = FlatMsg::decode(&bytes).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_register_handler_round_trips() {
+        let request = DiscoveryRequest::RegisterHandler {
+            scheme: "sel-quic".to_string(),
+            process_id: 42,
+        };
+        let decoded: DiscoveryRequest =
+            FlatMsg::decode(&FlatMsg::encode(&request)).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn discovery_set_domain_round_trips() {
+        let request = DiscoveryRequest::SetDomain {
+            domain: "example.com".to_string(),
+            tenant: "acme".to_string(),
+        };
+        let decoded: DiscoveryRequest =
+            FlatMsg::decode(&FlatMsg::encode(&request)).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn identity_set_domain_round_trips() {
+        let request = IdentityRequest::SetDomain {
+            domain: "example.com".to_string(),
+            tenant: "acme".to_string(),
+        };
+        let decoded: IdentityRequest = FlatMsg::decode(&FlatMsg::encode(&request)).expect("decode");
+        assert_eq!(decoded, request);
+
+        let response = IdentityResponse::DomainRecorded {
+            domain: "example.com".to_string(),
+        };
+        let decoded: IdentityResponse =
+            FlatMsg::decode(&FlatMsg::encode(&response)).expect("decode");
+        assert_eq!(decoded, response);
     }
 
     #[test]
@@ -1977,5 +2212,94 @@ mod tests {
             result.is_err(),
             "missing required nested field must fail decode"
         );
+    }
+
+    #[test]
+    fn catalogue_record_round_trips() {
+        let record = CatalogueRecord {
+            uri: "sel://acme/db".to_string(),
+            class: "region".to_string(),
+            owner: 7,
+            tenant: "acme".to_string(),
+            purpose: "live-table".to_string(),
+            resource_id: 42,
+        };
+        let decoded: CatalogueRecord = FlatMsg::decode(&FlatMsg::encode(&record)).expect("decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn catalogue_log_record_round_trips() {
+        for record in [
+            CatalogueLogRecord::Register {
+                record: CatalogueRecord {
+                    uri: "sel://acme/db".to_string(),
+                    class: "region".to_string(),
+                    owner: 7,
+                    tenant: "acme".to_string(),
+                    purpose: "live-table".to_string(),
+                    resource_id: 42,
+                },
+            },
+            CatalogueLogRecord::Remove {
+                uri: "sel://acme/db".to_string(),
+                tenant: "acme".to_string(),
+            },
+        ] {
+            let decoded: CatalogueLogRecord =
+                FlatMsg::decode(&FlatMsg::encode(&record)).expect("decode");
+            assert_eq!(decoded, record);
+        }
+    }
+
+    #[test]
+    fn control_catalogue_requests_round_trip() {
+        for request in [
+            ControlRequest::RegisterResource {
+                uri: "sel://acme/db".to_string(),
+                class: "region".to_string(),
+                owner: 7,
+                purpose: "live-table".to_string(),
+                resource_id: 42,
+            },
+            ControlRequest::RemoveResource {
+                uri: "sel://acme/db".to_string(),
+            },
+            ControlRequest::LookupResource {
+                uri: "sel://acme/db".to_string(),
+            },
+        ] {
+            let decoded: ControlRequest =
+                FlatMsg::decode(&FlatMsg::encode(&request)).expect("decode");
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn control_catalogue_responses_round_trip() {
+        let record = CatalogueRecord {
+            uri: "sel://acme/db".to_string(),
+            class: "region".to_string(),
+            owner: 7,
+            tenant: "acme".to_string(),
+            purpose: "live-table".to_string(),
+            resource_id: 42,
+        };
+        for response in [
+            ControlResponse::Registered {
+                record: record.clone(),
+            },
+            ControlResponse::Removed {
+                uri: "sel://acme/db".to_string(),
+            },
+            ControlResponse::Lookup {
+                record: Some(record.clone()),
+            },
+            ControlResponse::Lookup { record: None },
+        ] {
+            let decoded: ControlResponse =
+                FlatMsg::decode(&FlatMsg::encode(&response)).expect("decode");
+            assert_eq!(decoded, response);
+        }
     }
 }

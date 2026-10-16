@@ -142,7 +142,6 @@ fn backoff_delay(initial_delay_ms: u64, max_delay_ms: u64, failures: u32) -> u64
 async fn supervisor_main() {
     drop(selium_guest::log::init());
     selium_guest::info!(guest = "selium-supervisor", "system guest booting");
-    selium_guest::mark_ready();
 }
 
 #[cfg(test)]

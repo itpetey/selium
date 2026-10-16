@@ -24,6 +24,29 @@
 //! - **resolve** → discovery (`Context::lookup`),
 //! - **module upload** → the store service (blob put + manifest set,
 //!   tenant-prefixed manifest names).
+//!
+//! ## Resource catalogue
+//!
+//! The control plane also owns the platform's guest-owned **resource
+//! catalogue**: durable records naming resources (URI, class, owning process,
+//! tenant, purpose, resource id) appended to [`CONTROL_CATALOGUE_LOG`] and
+//! projected into a tenant-partitioned read model rebuilt by replay on boot.
+//! The catalogue serves three operations over the same tenant-scoped session
+//! surface as the desired-state verbs:
+//!
+//! - `ControlRequest::RegisterResource` — record a name, owner-checked against
+//!   the session's process and class-checked against the closed resource-class
+//!   set,
+//! - `ControlRequest::RemoveResource` — tombstone a name the session's process
+//!   owns,
+//! - `ControlRequest::LookupResource` — resolve a name within the session's
+//!   tenant (a name registered under another tenant is invisible).
+//!
+//! The served catalogue operations are exactly the `ControlRequest` variants
+//! `RegisterResource`, `RemoveResource`, and `LookupResource`; the
+//! `handle_request` match is exhaustive, so a request variant without a
+//! catalogue path would not compile. `ControlRequest::Resolve` remains a
+//! discovery lookup, not a catalogue lookup.
 
 use std::{
     collections::BTreeMap,
@@ -35,12 +58,13 @@ use selium_abi::{
     Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector, ScopeContext,
 };
 use selium_guest::{
-    BlobStore, Context, DurableLog, ResourceListener, Serve, debug, entrypoint, info, mark_ready,
+    BlobStore, Context, DurableLog, ResourceListener, Serve, debug, entrypoint, info,
     namespace_from_tenant, spawn, warn,
 };
 use selium_service::{
-    ControlRequest, ControlResponse, DelegationStatus, Deployment, DesiredStateRecord, FlatMsg,
-    PipelineBinding, ResolvedTarget, ResourceTarget, SchedulerRequest, SchedulerResponse,
+    CatalogueLogRecord, CatalogueRecord, ControlRequest, ControlResponse, DelegationStatus,
+    Deployment, DesiredStateRecord, FlatMsg, PipelineBinding, ResolvedTarget, ResourceTarget,
+    SchedulerRequest, SchedulerResponse,
 };
 use selium_shm::rpc;
 
@@ -48,6 +72,8 @@ use selium_shm::rpc;
 pub const CONTROL_BLOB_STORE: &str = "selium.control-plane.modules";
 /// Durable log name holding the control plane's desired-state records.
 pub const CONTROL_LOG: &str = "selium.control-plane.desired-state";
+/// Durable log name holding the resource catalogue's records.
+pub const CONTROL_CATALOGUE_LOG: &str = "selium.control-plane.catalogue";
 /// The internal route segment the control plane serves under.
 pub const CONTROL_PATH: &str = "control";
 
@@ -130,6 +156,99 @@ impl ControlPlaneState {
         }
         Ok(())
     }
+}
+
+/// The typed refusal for a catalogue operation a session may not perform, or
+/// `None` when the session is admitted.
+///
+/// A session may only register or remove a name it owns: naming a resource
+/// owned by another process would let a session record a name for a peer it
+/// does not control. Kept separate from the request handler so the rule is
+/// testable without a live store.
+fn catalogue_owner_refusal(client_process_id: u64, owner: u64) -> Option<String> {
+    (client_process_id != owner)
+        .then(|| format!("process {client_process_id} cannot manage a resource owned by {owner}"))
+}
+
+/// The guest-owned resource catalogue: named resources projected from the
+/// catalogue's durable log, partitioned by requestor namespace.
+///
+/// The runtime holds no naming metadata; registration and lookup are RPCs to
+/// the control plane, scoped to the session's tenant. The durable log is the
+/// store of record, so the projection is rebuilt from replay on boot.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceCatalogue {
+    partitions: BTreeMap<Namespace, BTreeMap<String, CatalogueRecord>>,
+}
+
+impl ResourceCatalogue {
+    /// Applies one catalogue log record into the partition named by the
+    /// record's tenant.
+    pub fn apply_record(&mut self, record: CatalogueLogRecord) {
+        match record {
+            CatalogueLogRecord::Register { record } => {
+                self.register(&namespace_from_tenant(Some(record.tenant.as_str())), record);
+            }
+            CatalogueLogRecord::Remove { uri, tenant } => {
+                let namespace = namespace_from_tenant(Some(tenant.as_str()));
+                if let Some(view) = self.partitions.get_mut(&namespace) {
+                    view.remove(&uri);
+                }
+            }
+        }
+    }
+
+    /// Records a name in the given namespace, replacing any prior record.
+    pub fn register(&mut self, namespace: &Namespace, record: CatalogueRecord) {
+        self.partitions
+            .entry(namespace.clone())
+            .or_default()
+            .insert(record.uri.clone(), record);
+    }
+
+    /// Removes a name from the given namespace, returning whether it existed.
+    pub fn remove(&mut self, namespace: &Namespace, uri: &str) -> bool {
+        self.partitions
+            .get_mut(namespace)
+            .is_some_and(|view| view.remove(uri).is_some())
+    }
+
+    /// Looks up a name in the given namespace.
+    pub fn lookup(&self, namespace: &Namespace, uri: &str) -> Option<&CatalogueRecord> {
+        self.partitions
+            .get(namespace)
+            .and_then(|view| view.get(uri))
+    }
+
+    /// Materialises the projection from previously appended log records.
+    async fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
+        let records = log.replay(None, u32::MAX).await?;
+        for record in records {
+            match FlatMsg::decode(&record.payload) {
+                Ok(entry) => self.apply_record(entry),
+                Err(error) => {
+                    warn!("control-plane: skipping undecodable catalogue record: {error}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The catalogue's shared state: its durable log (the store of record) and the
+/// projected read model rebuilt from replay.
+#[derive(Clone)]
+struct CatalogueState {
+    log: DurableLog,
+    projection: Arc<Mutex<ResourceCatalogue>>,
+}
+
+/// One accepted session's scope: the requestor namespace derived from the
+/// delivering process's tenant and the process id that opened the session.
+#[derive(Clone)]
+struct Session {
+    namespace: Namespace,
+    client_process_id: selium_abi::ProcessId,
 }
 
 impl SchedulerClient {
@@ -242,6 +361,10 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
         .open_log(CONTROL_LOG)
         .await
         .with_context(|| "control-plane: log open failed")?;
+    let catalogue_log = ctx
+        .open_log(CONTROL_CATALOGUE_LOG)
+        .await
+        .with_context(|| "control-plane: catalogue log open failed")?;
     let blobs = ctx
         .open_blob_store(CONTROL_BLOB_STORE)
         .await
@@ -252,6 +375,16 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
         .await
         .with_context(|| "control-plane: projection rebuild failed")?;
     let state = Arc::new(Mutex::new(desired));
+
+    let mut catalogue = ResourceCatalogue::default();
+    catalogue
+        .rebuild(&catalogue_log)
+        .await
+        .with_context(|| "control-plane: catalogue rebuild failed")?;
+    let catalogue = CatalogueState {
+        log: catalogue_log,
+        projection: Arc::new(Mutex::new(catalogue)),
+    };
 
     // The server creates its own listener: self-registration replaces the
     // runtime's well-known-URI queue minting. Sessions are internal
@@ -280,8 +413,10 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
     .await
     .with_context(|| "control-plane: serve failed")?;
 
-    // Ready only after the route is registered.
-    mark_ready();
+    // Health is published state: advertise the control plane's health.
+    if let Err(error) = ctx.publish_health("control-plane").await {
+        warn!("control-plane: health publish failed: {error}");
+    }
 
     let discovery_handle = ctx.raw_handle();
 
@@ -300,7 +435,8 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
         // bridge-channel spawned under its authenticated tenant, so the
         // bridge-channel's process owner *is* that tenant. Refuse the session
         // only when the process-tenant lookup itself fails.
-        let namespace = match selium_guest::process_namespace(incoming.client_process_id) {
+        let client_process_id = incoming.client_process_id;
+        let namespace = match selium_guest::process_namespace(client_process_id) {
             Ok(namespace) => namespace,
             Err(error) => {
                 warn!("control-plane: refusing session with unresolvable tenant: {error}");
@@ -321,8 +457,12 @@ async fn control_plane_main(mut ctx: Context) -> anyhow::Result<()> {
             discovery_handle,
             state.clone(),
             log.clone(),
+            catalogue.clone(),
             blobs.clone(),
-            namespace,
+            Session {
+                namespace,
+                client_process_id,
+            },
         ));
     }
 }
@@ -349,7 +489,7 @@ fn delegation_status(response: SchedulerResponse) -> DelegationStatus {
 }
 
 /// Serves one accepted RPC session: each request is decoded (`request.payload`
-/// is the typed decode; a failure becomes a typed serialization error rather
+/// is the typed decode; a failure becomes a typed serialisation error rather
 /// than any text-grammar interpretation), handled scoped to the session's
 /// requestor namespace, and replied to over the session's reply ring.
 async fn handle_connection(
@@ -357,8 +497,9 @@ async fn handle_connection(
     discovery_handle: u64,
     state: Arc<Mutex<ControlPlaneState>>,
     log: DurableLog,
+    catalogue: CatalogueState,
     blobs: BlobStore,
-    namespace: Namespace,
+    session: Session,
 ) {
     // Each connection builds its own discovery client for `Resolve`; the
     // bootstrap context cannot be shared across concurrent handlers.
@@ -375,7 +516,10 @@ async fn handle_connection(
             Ok(request) => {
                 let response = match request.payload() {
                     Ok(payload) => {
-                        handle_request(&mut ctx, &log, &blobs, &state, &namespace, payload).await
+                        handle_request(
+                            &mut ctx, &log, &catalogue, &blobs, &state, &session, payload,
+                        )
+                        .await
                     }
                     Err(error) => {
                         warn!("control-plane: request decode failed: {error}");
@@ -405,11 +549,14 @@ async fn handle_connection(
 async fn handle_request(
     ctx: &mut Context,
     log: &DurableLog,
+    catalogue: &CatalogueState,
     blobs: &BlobStore,
     state: &Mutex<ControlPlaneState>,
-    namespace: &Namespace,
+    session: &Session,
     request: ControlRequest,
 ) -> ControlResponse {
+    let namespace = &session.namespace;
+    let client_process_id = session.client_process_id;
     let tenant = tenant_label(namespace);
     match request {
         ControlRequest::Resolve { uri } => match ctx.lookup(&uri).await {
@@ -521,6 +668,102 @@ async fn handle_request(
                 .deployment(namespace, &workload_id)
                 .cloned(),
         },
+        ControlRequest::RegisterResource {
+            uri,
+            class,
+            owner,
+            purpose,
+            resource_id,
+        } => {
+            if ResourceClass::from_uri_segment(&class).is_none() {
+                return ControlResponse::Error {
+                    step: "catalogue".to_string(),
+                    context: format!("unknown resource class segment {class:?}"),
+                };
+            }
+            // A session may only name a resource it owns: registering on
+            // another process's behalf is refused with a typed error.
+            if let Some(refusal) = catalogue_owner_refusal(client_process_id, owner) {
+                return ControlResponse::Error {
+                    step: "catalogue".to_string(),
+                    context: format!("{refusal} (register)"),
+                };
+            }
+            let record = CatalogueRecord {
+                uri,
+                class,
+                owner,
+                tenant,
+                purpose,
+                resource_id,
+            };
+            if let Err(error) = record_catalogue(
+                &catalogue.log,
+                &catalogue.projection,
+                CatalogueLogRecord::Register {
+                    record: record.clone(),
+                },
+            )
+            .await
+            {
+                return ControlResponse::Error {
+                    step: "storage".to_string(),
+                    context: format!("{error}"),
+                };
+            }
+            ControlResponse::Registered { record }
+        }
+        ControlRequest::RemoveResource { uri } => {
+            let owner = catalogue
+                .projection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lookup(namespace, &uri)
+                .map(|record| record.owner);
+            match owner {
+                None => ControlResponse::Error {
+                    step: "catalogue".to_string(),
+                    context: format!("no catalogue record for {uri:?} in this tenant"),
+                },
+                Some(owner) if catalogue_owner_refusal(client_process_id, owner).is_some() => {
+                    ControlResponse::Error {
+                        step: "catalogue".to_string(),
+                        context: format!(
+                            "{} (remove)",
+                            catalogue_owner_refusal(client_process_id, owner)
+                                .expect("the guard reported a refusal")
+                        ),
+                    }
+                }
+                Some(_) => {
+                    if let Err(error) = record_catalogue(
+                        &catalogue.log,
+                        &catalogue.projection,
+                        CatalogueLogRecord::Remove {
+                            uri: uri.clone(),
+                            tenant,
+                        },
+                    )
+                    .await
+                    {
+                        return ControlResponse::Error {
+                            step: "storage".to_string(),
+                            context: format!("{error}"),
+                        };
+                    }
+                    ControlResponse::Removed { uri }
+                }
+            }
+        }
+        ControlRequest::LookupResource { uri } => {
+            let record = catalogue
+                .projection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lookup(namespace, &uri)
+                .cloned();
+            ControlResponse::Lookup { record }
+        }
     }
 }
 
@@ -535,6 +778,24 @@ async fn record(
     let payload = FlatMsg::encode(&record);
     log.append(timestamp_ms, Vec::new(), payload).await?;
     state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_record(record);
+    Ok(())
+}
+
+/// Appends a catalogue log record to the catalogue's durable log and applies
+/// it to the projection, keeping the store of record and the read model in
+/// step.
+async fn record_catalogue(
+    log: &DurableLog,
+    catalogue: &Mutex<ResourceCatalogue>,
+    record: CatalogueLogRecord,
+) -> selium_guest::Result<()> {
+    let timestamp_ms = selium_guest::time::now().map(|nanos| nanos / 1_000_000)?;
+    let payload = FlatMsg::encode(&record);
+    log.append(timestamp_ms, Vec::new(), payload).await?;
+    catalogue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_record(record);
@@ -939,5 +1200,93 @@ mod tests {
         );
 
         server.await.expect("server task");
+    }
+
+    fn catalogue_record(uri: &str, class: &str, owner: u64, tenant: &str) -> CatalogueRecord {
+        CatalogueRecord {
+            uri: uri.to_string(),
+            class: class.to_string(),
+            owner,
+            tenant: tenant.to_string(),
+            purpose: "rpc".to_string(),
+            resource_id: 42,
+        }
+    }
+
+    /// 2.1: catalogue records apply into the registering tenant's partition
+    /// and lookups are tenant-scoped.
+    #[test]
+    fn catalogue_records_apply_and_scope_by_tenant() {
+        let mut catalogue = ResourceCatalogue::default();
+        catalogue.apply_record(CatalogueLogRecord::Register {
+            record: catalogue_record("acme-db", "region", 7, "acme"),
+        });
+        catalogue.apply_record(CatalogueLogRecord::Register {
+            record: catalogue_record("beta-db", "region", 9, "beta"),
+        });
+
+        assert_eq!(
+            catalogue.lookup(&ns("acme"), "acme-db"),
+            Some(&catalogue_record("acme-db", "region", 7, "acme"))
+        );
+        assert_eq!(
+            catalogue.lookup(&ns("beta"), "beta-db"),
+            Some(&catalogue_record("beta-db", "region", 9, "beta"))
+        );
+        // A name registered under another tenant is invisible.
+        assert_eq!(catalogue.lookup(&ns("acme"), "beta-db"), None);
+        assert_eq!(catalogue.lookup(&ns("beta"), "acme-db"), None);
+    }
+
+    /// 2.1: a session may only register or remove a name it owns — naming a
+    /// resource owned by another process is refused with a typed error.
+    #[test]
+    fn a_catalogue_registration_or_removal_requires_session_ownership() {
+        assert_eq!(
+            catalogue_owner_refusal(7, 7),
+            None,
+            "the owner may register and remove its own names"
+        );
+        let refusal = catalogue_owner_refusal(7, 9).expect("a non-owner is refused");
+        assert!(
+            refusal.contains('7') && refusal.contains('9'),
+            "the refusal names both processes: {refusal}"
+        );
+    }
+
+    /// 2.1: removal stops resolving the name, and replay rebuilds the
+    /// projection from the ordered log records.
+    #[test]
+    fn catalogue_replay_rebuilds_projection_with_removals() {
+        let records = vec![
+            CatalogueLogRecord::Register {
+                record: catalogue_record("acme-db", "region", 7, "acme"),
+            },
+            CatalogueLogRecord::Register {
+                record: catalogue_record("acme-tmp", "region", 7, "acme"),
+            },
+            CatalogueLogRecord::Remove {
+                uri: "acme-tmp".to_string(),
+                tenant: "acme".to_string(),
+            },
+        ];
+
+        let mut catalogue = ResourceCatalogue::default();
+        for record in records {
+            // Round-trip each record through the log codec, as replay does.
+            let payload = FlatMsg::encode(&record);
+            let decoded: CatalogueLogRecord = FlatMsg::decode(&payload).expect("decode record");
+            catalogue.apply_record(decoded);
+        }
+
+        assert_eq!(
+            catalogue.lookup(&ns("acme"), "acme-db"),
+            Some(&catalogue_record("acme-db", "region", 7, "acme"))
+        );
+        assert_eq!(
+            catalogue.lookup(&ns("acme"), "acme-tmp"),
+            None,
+            "a removed name no longer resolves after replay"
+        );
     }
 }

@@ -32,7 +32,7 @@ use std::{
 use anyhow::Context as _;
 use selium_abi::ResourceClass;
 use selium_guest::{
-    Context, GuestError, ResourceSender, Result, entrypoint, info, mark_ready,
+    Context, GuestError, ResourceSender, Result, entrypoint, info,
     net::{
         ByteStream,
         bytes::{ByteStreamReader, ByteStreamWriter},
@@ -436,8 +436,6 @@ async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> 
     let stream = ByteStream::attach_blocking(shared_id)
         .with_context(|| "bridge-channel: attach stream region failed")?;
 
-    mark_ready();
-
     bridge_pipe(
         stream,
         move |uri| async move {
@@ -450,7 +448,7 @@ async fn bridge_channel(mut ctx: Context, shared_id: u64) -> anyhow::Result<()> 
         // The queue handoff for a rendezvoused session. The handoff metadata
         // is empty today: the resolved client identity cannot yet be
         // forwarded to a guest-spawned child (guest `Process::start` carries
-        // integer arguments only), and serving guests authorize via the
+        // integer arguments only), and serving guests authorise via the
         // runtime's capability enforcement, not the metadata. Identity
         // pass-through lands with pointer-argument spawn support.
         |queue_id, session_id| async move {

@@ -1306,12 +1306,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-control-probe"
+version = "1.0.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "selium-abi",
+ "selium-guest",
+ "selium-shm",
+]
+
+[[package]]
+name = "selium-deploy-probe"
+version = "1.0.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "selium-abi",
+ "selium-guest",
+]
+
+[[package]]
 name = "selium-discovery"
 version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-abi",
  "selium-guest",
+ "selium-memory",
  "selium-service",
  "selium-shm",
  "selium-wire",

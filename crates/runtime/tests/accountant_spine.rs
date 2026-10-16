@@ -35,7 +35,7 @@ use selium_accountant::{
     ACCOUNTANT_ENTRYPOINT, BOOKKEEPER_ENTRYPOINT, LEDGER_LOG, LedgerRecord, accountant_grants,
     bookkeeper_grants,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use spine_common::{
     StateRoot, discovery_descriptor, read_wasm, runtime_in_state_root, store_descriptor,
 };
@@ -50,7 +50,7 @@ fn accounting_descriptor(
     name: &str,
     entrypoint: &str,
     grants: Vec<CapabilityGrant>,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: name.to_string(),
@@ -59,10 +59,8 @@ fn accounting_descriptor(
         entrypoint: entrypoint.to_string(),
         arguments: Vec::new(),
         grants,
-        dependencies,
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -76,7 +74,6 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
                 store_descriptor(vec!["discovery".to_string()]),
@@ -241,10 +238,8 @@ fn workload_descriptor() -> SystemGuestDescriptor {
                 ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
             ],
         )],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
         tenant: Some(TENANT.to_string()),
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }

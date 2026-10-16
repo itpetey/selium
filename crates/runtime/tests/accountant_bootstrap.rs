@@ -19,7 +19,7 @@ use selium_abi::{Capability, CapabilityGrant};
 use selium_accountant::{
     ACCOUNTANT_ENTRYPOINT, BOOKKEEPER_ENTRYPOINT, accountant_grants, bookkeeper_grants,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 /// 7.1: the accountant guest's grant set is admissible at bootstrap, carrying
 /// `QuotaWrite` (bootstrap-provisioned only), durable-log storage, and the
@@ -67,7 +67,7 @@ fn accountant_descriptor_grants_are_bootstrap_admissible() {
 /// module bytes), and dependency order boots the bookkeeper before the
 /// accountant even when the accountant is listed first.
 #[test]
-fn bookkeeper_boots_before_accountant_from_the_same_module_bytes() {
+fn guests_boot_in_declaration_order_from_the_same_module_bytes() {
     let runtime = Runtime::default();
     // The same module bytes carry both entrypoints, as the entrypoint macro
     // emits a distinct export per function.
@@ -103,12 +103,10 @@ fn bookkeeper_boots_before_accountant_from_the_same_module_bytes() {
         Vec::new(),
     );
 
-    // The accountant is listed first: dependency order must still boot the
-    // bookkeeper before it (discovery first, then bookkeeper, then accountant).
+    // There is no dependency sequencer: guests boot in declaration order.
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
-            domain_table: Vec::new(),
             system_guests: vec![account, bookkeeper, discovery],
             state_dir: None,
         })
@@ -119,23 +117,7 @@ fn bookkeeper_boots_before_accountant_from_the_same_module_bytes() {
         .iter()
         .map(|guest| guest.name.as_str())
         .collect();
-    let discovery_pos = names
-        .iter()
-        .position(|name| *name == "discovery")
-        .expect("discovery booted");
-    let bookkeeper_pos = names
-        .iter()
-        .position(|name| *name == "bookkeeper")
-        .expect("bookkeeper booted");
-    let accountant_pos = names
-        .iter()
-        .position(|name| *name == "accountant")
-        .expect("accountant booted");
-    assert!(discovery_pos < bookkeeper_pos, "discovery boots first");
-    assert!(
-        bookkeeper_pos < accountant_pos,
-        "bookkeeper boots before the accountant"
-    );
+    assert_eq!(names, vec!["accountant", "bookkeeper", "discovery"]);
 }
 
 /// 7.1: the bookkeeper guest's grant set is admissible at bootstrap, carrying
@@ -179,7 +161,7 @@ fn descriptor(
     module_bytes: &[u8],
     entrypoint: &str,
     grants: Vec<CapabilityGrant>,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: name.to_string(),
@@ -188,10 +170,8 @@ fn descriptor(
         entrypoint: entrypoint.to_string(),
         arguments: Vec::new(),
         grants,
-        dependencies,
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }

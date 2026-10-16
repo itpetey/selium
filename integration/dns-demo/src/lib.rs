@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context as _, bail};
-use selium_guest::{Context, TcpStream, entrypoint, error, info, mark_ready};
+use selium_guest::{Context, TcpStream, entrypoint, error, info};
 
 /// The name the demo resolves.
 const DEMO_NAME: &str = "example.test";
@@ -47,6 +47,5 @@ async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) -> anyhow::Result<(
         Err(e) => error!("dns-demo: connect failed: {e}"),
     }
 
-    mark_ready();
     Ok(())
 }

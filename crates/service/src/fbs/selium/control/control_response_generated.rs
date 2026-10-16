@@ -28,6 +28,8 @@ impl<'a> ControlResponse<'a> {
   pub const VT_STEP: ::flatbuffers::VOffsetT = 18;
   pub const VT_CONTEXT: ::flatbuffers::VOffsetT = 20;
   pub const VT_TARGET: ::flatbuffers::VOffsetT = 22;
+  pub const VT_RECORD: ::flatbuffers::VOffsetT = 24;
+  pub const VT_URI: ::flatbuffers::VOffsetT = 26;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -39,6 +41,8 @@ impl<'a> ControlResponse<'a> {
     args: &'args ControlResponseArgs<'args>
   ) -> ::flatbuffers::WIPOffset<ControlResponse<'bldr>> {
     let mut builder = ControlResponseBuilder::new(_fbb);
+    if let Some(x) = args.uri { builder.add_uri(x); }
+    if let Some(x) = args.record { builder.add_record(x); }
     if let Some(x) = args.target { builder.add_target(x); }
     if let Some(x) = args.context { builder.add_context(x); }
     if let Some(x) = args.step { builder.add_step(x); }
@@ -123,6 +127,20 @@ impl<'a> ControlResponse<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<ResolvedTarget>>(ControlResponse::VT_TARGET, None)}
   }
+  #[inline]
+  pub fn record(&self) -> Option<CatalogueRecord<'a>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<CatalogueRecord>>(ControlResponse::VT_RECORD, None)}
+  }
+  #[inline]
+  pub fn uri(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(ControlResponse::VT_URI, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for ControlResponse<'_> {
@@ -141,6 +159,8 @@ impl ::flatbuffers::Verifiable for ControlResponse<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("step", Self::VT_STEP, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("context", Self::VT_CONTEXT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<ResolvedTarget>>("target", Self::VT_TARGET, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<CatalogueRecord>>("record", Self::VT_RECORD, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("uri", Self::VT_URI, false)?
      .finish();
     Ok(())
   }
@@ -156,6 +176,8 @@ pub struct ControlResponseArgs<'a> {
     pub step: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub context: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub target: Option<::flatbuffers::WIPOffset<ResolvedTarget<'a>>>,
+    pub record: Option<::flatbuffers::WIPOffset<CatalogueRecord<'a>>>,
+    pub uri: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for ControlResponseArgs<'a> {
   #[inline]
@@ -171,6 +193,8 @@ impl<'a> Default for ControlResponseArgs<'a> {
       step: None,
       context: None,
       target: None,
+      record: None,
+      uri: None,
     }
   }
 }
@@ -221,6 +245,14 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ControlResponseBuilder<'a, 'b
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<ResolvedTarget>>(ControlResponse::VT_TARGET, target);
   }
   #[inline]
+  pub fn add_record(&mut self, record: ::flatbuffers::WIPOffset<CatalogueRecord<'b >>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<CatalogueRecord>>(ControlResponse::VT_RECORD, record);
+  }
+  #[inline]
+  pub fn add_uri(&mut self, uri: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ControlResponse::VT_URI, uri);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ControlResponseBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     ControlResponseBuilder {
@@ -248,6 +280,8 @@ impl ::core::fmt::Debug for ControlResponse<'_> {
       ds.field("step", &self.step());
       ds.field("context", &self.context());
       ds.field("target", &self.target());
+      ds.field("record", &self.record());
+      ds.field("uri", &self.uri());
       ds.finish()
   }
 }

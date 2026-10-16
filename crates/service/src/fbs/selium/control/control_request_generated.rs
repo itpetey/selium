@@ -25,6 +25,10 @@ impl<'a> ControlRequest<'a> {
   pub const VT_URI: ::flatbuffers::VOffsetT = 12;
   pub const VT_MANIFEST: ::flatbuffers::VOffsetT = 14;
   pub const VT_BYTES: ::flatbuffers::VOffsetT = 16;
+  pub const VT_CLASS: ::flatbuffers::VOffsetT = 18;
+  pub const VT_OWNER: ::flatbuffers::VOffsetT = 20;
+  pub const VT_PURPOSE: ::flatbuffers::VOffsetT = 22;
+  pub const VT_RESOURCE_ID: ::flatbuffers::VOffsetT = 24;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -36,6 +40,10 @@ impl<'a> ControlRequest<'a> {
     args: &'args ControlRequestArgs<'args>
   ) -> ::flatbuffers::WIPOffset<ControlRequest<'bldr>> {
     let mut builder = ControlRequestBuilder::new(_fbb);
+    builder.add_resource_id(args.resource_id);
+    builder.add_owner(args.owner);
+    if let Some(x) = args.purpose { builder.add_purpose(x); }
+    if let Some(x) = args.class { builder.add_class(x); }
     if let Some(x) = args.bytes { builder.add_bytes(x); }
     if let Some(x) = args.manifest { builder.add_manifest(x); }
     if let Some(x) = args.uri { builder.add_uri(x); }
@@ -96,6 +104,34 @@ impl<'a> ControlRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(ControlRequest::VT_BYTES, None)}
   }
+  #[inline]
+  pub fn class(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(ControlRequest::VT_CLASS, None)}
+  }
+  #[inline]
+  pub fn owner(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(ControlRequest::VT_OWNER, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn purpose(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(ControlRequest::VT_PURPOSE, None)}
+  }
+  #[inline]
+  pub fn resource_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(ControlRequest::VT_RESOURCE_ID, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for ControlRequest<'_> {
@@ -111,6 +147,10 @@ impl ::flatbuffers::Verifiable for ControlRequest<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("uri", Self::VT_URI, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("manifest", Self::VT_MANIFEST, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("bytes", Self::VT_BYTES, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("class", Self::VT_CLASS, false)?
+     .visit_field::<u64>("owner", Self::VT_OWNER, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("purpose", Self::VT_PURPOSE, false)?
+     .visit_field::<u64>("resource_id", Self::VT_RESOURCE_ID, false)?
      .finish();
     Ok(())
   }
@@ -123,6 +163,10 @@ pub struct ControlRequestArgs<'a> {
     pub uri: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub manifest: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub bytes: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub class: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub owner: u64,
+    pub purpose: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub resource_id: u64,
 }
 impl<'a> Default for ControlRequestArgs<'a> {
   #[inline]
@@ -135,6 +179,10 @@ impl<'a> Default for ControlRequestArgs<'a> {
       uri: None,
       manifest: None,
       bytes: None,
+      class: None,
+      owner: 0,
+      purpose: None,
+      resource_id: 0,
     }
   }
 }
@@ -173,6 +221,22 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> ControlRequestBuilder<'a, 'b,
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ControlRequest::VT_BYTES, bytes);
   }
   #[inline]
+  pub fn add_class(&mut self, class: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ControlRequest::VT_CLASS, class);
+  }
+  #[inline]
+  pub fn add_owner(&mut self, owner: u64) {
+    self.fbb_.push_slot::<u64>(ControlRequest::VT_OWNER, owner, 0);
+  }
+  #[inline]
+  pub fn add_purpose(&mut self, purpose: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(ControlRequest::VT_PURPOSE, purpose);
+  }
+  #[inline]
+  pub fn add_resource_id(&mut self, resource_id: u64) {
+    self.fbb_.push_slot::<u64>(ControlRequest::VT_RESOURCE_ID, resource_id, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> ControlRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     ControlRequestBuilder {
@@ -197,6 +261,10 @@ impl ::core::fmt::Debug for ControlRequest<'_> {
       ds.field("uri", &self.uri());
       ds.field("manifest", &self.manifest());
       ds.field("bytes", &self.bytes());
+      ds.field("class", &self.class());
+      ds.field("owner", &self.owner());
+      ds.field("purpose", &self.purpose());
+      ds.field("resource_id", &self.resource_id());
       ds.finish()
   }
 }

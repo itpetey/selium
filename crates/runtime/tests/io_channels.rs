@@ -8,7 +8,7 @@ use selium_abi::{
     RegionProt,
 };
 use selium_memory::FrameHeader;
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 
 /// Tests AllocRegion and FreeRegion lifecycle.
 #[test]
@@ -234,13 +234,10 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> ProcessId {
                         selium_abi::ResourceClass::SharedRegion,
                     )],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap");

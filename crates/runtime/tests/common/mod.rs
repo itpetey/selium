@@ -58,7 +58,7 @@ impl std::fmt::Display for Profile {
 /// Reads a guest's wasm module, preferring (and building) the release profile.
 ///
 /// Release is the recommended build for the interpreted-wasm spine tests that
-/// are too slow at debug optimization (e.g. the TLS handshake in quic_spine),
+/// are too slow at debug optimisation (e.g. the TLS handshake in quic_spine),
 /// and building it here also guarantees the artifact is fresh.
 pub fn read_guest_wasm(crate_name: &str, wasm_file: &str) -> Vec<u8> {
     build_guest(crate_name, Profile::Release);

@@ -15,6 +15,10 @@ pub mod selium {
   }
   pub mod control {
     use super::*;
+    mod catalogue_log_record_generated;
+    pub use self::catalogue_log_record_generated::*;
+    mod catalogue_record_generated;
+    pub use self::catalogue_record_generated::*;
     mod control_request_generated;
     pub use self::control_request_generated::*;
     mod control_response_generated;

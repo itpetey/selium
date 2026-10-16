@@ -16,25 +16,6 @@ The runtime SHALL revoke a resource's registration by resource identity (class a
 - **WHEN** a process exits
 - **THEN** its registrations SHALL be revoked from the owner recorded in the registry, without the runtime holding per-resource tenant records
 
-### Requirement: Role Readiness by Discovery Lookup
-
-The runtime SHALL determine a role-declared guest's readiness by querying discovery for the declared role's registration, and SHALL NOT retain a per-process registration set. A guest whose registration is not observable SHALL NOT be reported ready.
-
-#### Scenario: Readiness requires an observable registration
-
-- **WHEN** a role-declared guest signals ready but its registration is not observable in discovery
-- **THEN** the runtime SHALL NOT report it ready
-
-#### Scenario: Observable registration admits readiness
-
-- **WHEN** the declared role's registration is observable in discovery
-- **THEN** the runtime SHALL report the guest ready
-
-#### Scenario: No host-side registration record
-
-- **WHEN** the runtime holds no registration record for a process
-- **THEN** readiness SHALL still be determined from discovery
-
 ## MODIFIED Requirements
 
 ### Requirement: Sub-Struct Architecture

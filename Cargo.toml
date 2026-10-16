@@ -25,6 +25,8 @@ members = [
   "guests/identity",
   "guests/store",
   "integration/discovery-probe",
+  "integration/control-probe",
+  "integration/deploy-probe",
   "integration/dns-demo",
   "integration/identity-onboard",
   "integration/mt-demo",

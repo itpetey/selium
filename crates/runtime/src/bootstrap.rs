@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    thread,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeSet;
 
 use selium_abi::{
     ActivityEvent, Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
@@ -16,15 +12,11 @@ use wasmtiny::{WasmApplication, WasmValue};
 use crate::{
     Error, Result,
     config::{
-        BootstrapReport, BootstrappedGuest, ReadinessCondition, RuntimeConfig, SystemGuestArg,
-        SystemGuestDescriptor,
+        BootstrapReport, BootstrappedGuest, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor,
     },
     error::map_wasm_error,
     runtime::{DiscoveryPublisher, Runtime},
 };
-
-const DEFAULT_READINESS_POLL_MS: u64 = 10;
-const DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
 
 pub(crate) enum GuestExecution {
     /// The cooperative single-worker reactor (interpreter path): the host
@@ -44,7 +36,14 @@ pub(crate) struct LoadedGuest {
 }
 
 impl Runtime {
-    /// Boots all configured system guests in dependency order.
+    /// Boots all configured system guests in declaration order, in a single
+    /// pass.
+    ///
+    /// There is no readiness gate and no dependency sequencer: boot order is
+    /// the configuration's declaration order, and convergence on peers is the
+    /// guests' concern (they watch or retry routes rather than rely on the
+    /// host to withhold a start). An entrypoint failure still rolls back the
+    /// guests started so far.
     pub fn bootstrap_system_guests(&self, mut config: RuntimeConfig) -> Result<BootstrapReport> {
         // Boot is state-rooted: root the volume layer at the configured state
         // directory, load or generate the host PKI hierarchy, and reconstruct
@@ -97,7 +96,7 @@ impl Runtime {
             let feed_region_id =
                 discovery_feed_region_id.expect("discovery feed region id must be present");
             for descriptor in &mut config.system_guests {
-                if descriptor.name == "discovery" {
+                if descriptor.discovery_service {
                     descriptor.set_discovery_feed_and_handle(feed_region_id, listener_shared_id);
                     // Add explicit resource grants so the discovery guest can attach
                     // to the feed region and listener queue created by setup_discovery.
@@ -132,53 +131,16 @@ impl Runtime {
             }
         }
 
-        // Seed the out-of-band domain→tenant table into discovery (a no-op
-        // when discovery is not enabled).
-        for (domain, tenant) in &config.domain_table {
-            self.publish_seed_domain(domain, tenant)?;
-        }
-
-        // Pending guests in **declaration order**. Dependencies decide who is
-        // *eligible* to start next; the configuration's order decides which
-        // eligible guest goes first. Ordering by name instead would silently
-        // ignore the configured sequence, so two dependency-ready guests would
-        // boot in an order the config never stated — and a guest whose startup
-        // needs a peer it does not declare would lose that race.
+        // Guests are spawned in declaration order in a single pass. There is
+        // no readiness gate and no dependency sequencer: ordering and
+        // convergence are the guests' concern, expressed through route watches
+        // and retry rather than host policy.
         let mut names = BTreeSet::new();
-        let mut pending: Vec<SystemGuestDescriptor> =
-            Vec::with_capacity(config.system_guests.len());
+        let mut report = BootstrapReport::default();
         for descriptor in config.system_guests {
             if !names.insert(descriptor.name.clone()) {
                 return Err(Error::DuplicateDescriptor(descriptor.name));
             }
-            pending.push(descriptor);
-        }
-
-        let mut ready = BTreeSet::new();
-        let mut report = BootstrapReport::default();
-
-        while !pending.is_empty() {
-            let eligible = pending.iter().position(|descriptor| {
-                descriptor
-                    .dependencies
-                    .iter()
-                    .all(|dependency| ready.contains(dependency))
-            });
-            let Some(index) = eligible else {
-                if let Some(missing_dependency) = pending
-                    .iter()
-                    .flat_map(|descriptor| descriptor.dependencies.iter())
-                    .find(|dependency| !ready.contains(*dependency) && !names.contains(*dependency))
-                {
-                    self.rollback_bootstrapped(&report);
-                    return Err(Error::UnknownDependency(missing_dependency.clone()));
-                }
-                self.rollback_bootstrapped(&report);
-                return Err(Error::DependencyCycle);
-            };
-
-            let descriptor = pending.remove(index);
-            let name = descriptor.name.clone();
             let bootstrapped = match self.spawn_system_guest(descriptor.clone()) {
                 Ok(bootstrapped) => bootstrapped,
                 Err(error) => {
@@ -186,52 +148,10 @@ impl Runtime {
                     return Err(error);
                 }
             };
-            // A role-declared system guest is ready only when its declared
-            // route is observable in discovery (recorded by the discovery
-            // service), on top of the ordinary readiness signal.
-            let role_registered = match descriptor.serving_role.as_deref() {
-                Some(role) => self.wait_for_registration(bootstrapped.process_id, role),
-                None => true,
-            };
-            if !self.wait_for_readiness(bootstrapped.process_id, &descriptor.readiness)
-                || !role_registered
-            {
-                drop(self.stop_process(bootstrapped.process_id));
-                self.rollback_bootstrapped(&report);
-                return Err(Error::ReadinessUnsatisfied(descriptor.name));
-            }
-            ready.insert(name);
             report.guests.push(bootstrapped);
         }
 
         Ok(report)
-    }
-
-    /// Publishes an out-of-band domain→tenant seed event to the discovery
-    /// feed. A no-op when discovery is not enabled.
-    fn publish_seed_domain(&self, domain: &str, tenant: &str) -> Result<()> {
-        let request = DiscoveryRequest::SeedDomain {
-            domain: domain.to_string(),
-            tenant: tenant.to_string(),
-        };
-        self.publish_discovery_event(request)
-    }
-
-    /// Waits until the discovery service has recorded a registration for
-    /// `role_uri` by `process_id`, with the same timeout budget as the
-    /// ordinary readiness poll. `mark_ready()` carries no payload; readiness
-    /// is verified by observing the registration record in discovery.
-    fn wait_for_registration(&self, process_id: selium_abi::ProcessId, role_uri: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(DEFAULT_READINESS_TIMEOUT_MS);
-        loop {
-            if self.has_registration(process_id, role_uri) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(DEFAULT_READINESS_POLL_MS));
-        }
     }
 
     /// Creates the discovery pub/sub feed ring and RPC listener.
@@ -395,10 +315,6 @@ impl Runtime {
             selium_abi::ResourceClass::Process,
             process.local_id,
         );
-        self.register_module_bytes(
-            descriptor.module_id.clone(),
-            descriptor.module_bytes.clone(),
-        )?;
         self.kernel.processes().record_activity(ActivityEvent {
             kind: selium_abi::ActivityKind::GuestBootstrapped,
             process_id: Some(process.local_id),
@@ -410,12 +326,6 @@ impl Runtime {
             "bootstrapped system guest"
         );
 
-        // Record the discovery service's process identity so the runtime can
-        // restrict `RecordResolvedQueueFor` to the trusted discovery guest.
-        if descriptor.name == "discovery" {
-            *self.discovery_process.lock() = Some(process.local_id);
-        }
-
         // Register the process node (`sel://<tenant>/proc/<id>`) so every
         // process is discoverable from spawn. Publishing is a no-op when
         // discovery is not enabled.
@@ -426,12 +336,18 @@ impl Runtime {
             return Err(error);
         }
 
-        // Remember the protocol schemes this guest handles so serve-side
-        // guests can pin it via `ResolveProtocolHandler`.
-        if !descriptor.handlers.is_empty() {
-            self.handler_schemes
-                .lock()
-                .insert(process.local_id, descriptor.handlers.clone());
+        // Publish a host-authored handler registration for each protocol scheme
+        // this guest handles, so serve-side guests can pin it via a discovery
+        // lookup. Host authorship keeps the pin unforgeable.
+        for scheme in &descriptor.handlers {
+            let request = DiscoveryRequest::RegisterHandler {
+                scheme: scheme.clone(),
+                process_id: process.local_id,
+            };
+            if let Err(error) = self.publish_discovery_event(request) {
+                self.cleanup_failed_process(process.local_id)?;
+                return Err(error);
+            }
         }
 
         Ok(BootstrappedGuest {
@@ -525,37 +441,6 @@ impl Runtime {
         Ok(loaded_guest)
     }
 
-    pub(crate) fn wait_for_readiness(
-        &self,
-        process_id: selium_abi::ProcessId,
-        condition: &ReadinessCondition,
-    ) -> bool {
-        match condition {
-            ReadinessCondition::Immediate => true,
-            ReadinessCondition::ActivityLogContains(fragment) => {
-                let deadline = Instant::now() + Duration::from_millis(DEFAULT_READINESS_TIMEOUT_MS);
-                let mut cursor = 0;
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    let events = self
-                        .kernel
-                        .processes()
-                        .wait_for_activity_from(cursor, remaining.as_millis() as u64);
-                    cursor += events.len();
-                    if events.iter().any(|event| {
-                        event.process_id == Some(process_id) && event.message.contains(fragment)
-                    }) {
-                        return true;
-                    }
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                    thread::sleep(Duration::from_millis(DEFAULT_READINESS_POLL_MS));
-                }
-            }
-        }
-    }
-
     pub(crate) fn rollback_bootstrapped(&self, report: &BootstrapReport) {
         for guest in report.guests.iter().rev() {
             drop(self.stop_process(guest.process_id));
@@ -594,7 +479,6 @@ mod tests {
                 .bootstrap_system_guests(RuntimeConfig {
                     start_discovery: false,
                     system_guests: Vec::new(),
-                    domain_table: Vec::new(),
                     state_dir: Some(dir.to_path_buf()),
                 })
                 .expect("clean bootstrap");
@@ -643,7 +527,6 @@ mod tests {
             .bootstrap_system_guests(RuntimeConfig {
                 start_discovery: false,
                 system_guests: Vec::new(),
-                domain_table: Vec::new(),
                 state_dir: Some(dir.clone()),
             })
             .expect("bootstrap");
@@ -668,9 +551,7 @@ mod tests {
         wat::parse_str(format!(
             "(module
                 (import \"selium\" \"process_id\" (func $process_id (result i64)))
-                (import \"selium\" \"mark_ready\" (func $mark_ready))
                 (func (export \"{entrypoint}\") (result i64)
-                    call $mark_ready
                     call $process_id))"
         ))
         .expect("compile runtime bridge wat")
@@ -691,13 +572,10 @@ mod tests {
                     Capability::ProcessLifecycle,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         };
 
@@ -715,13 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn declaration_order_breaks_ties_among_dependency_ready_guests() {
-        // Names deliberately disagree with the configured order: among guests
-        // whose dependencies are all satisfied, the configuration's order is
-        // the boot order. Ordering by name instead would let a guest whose
-        // startup needs a peer it has not declared lose that race.
+    fn declaration_order_is_the_boot_order() {
+        // Guests spawn in declaration order in a single pass; there is no
+        // dependency sequencer.
         let runtime = Runtime::default();
-        let guest = |name: &str, dependencies: Vec<String>| SystemGuestDescriptor {
+        let guest = |name: &str| SystemGuestDescriptor {
             name: name.to_string(),
             module_id: format!("{name}-module"),
             module_bytes: module_with_entrypoint("boot", ""),
@@ -731,22 +607,15 @@ mod tests {
                 Capability::ProcessLifecycle,
                 vec![ResourceSelector::Locality(LocalityScope::Cluster)],
             )],
-            dependencies,
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         };
 
         let report = runtime
             .bootstrap_system_guests(RuntimeConfig {
                 start_discovery: false,
-                domain_table: Vec::new(),
-                system_guests: vec![
-                    guest("zulu", Vec::new()),
-                    guest("alpha", Vec::new()),
-                    guest("mike", vec!["zulu".to_string()]),
-                ],
+                system_guests: vec![guest("zulu"), guest("alpha"), guest("mike")],
                 state_dir: None,
             })
             .expect("bootstrap guests");
@@ -756,11 +625,7 @@ mod tests {
             .iter()
             .map(|bootstrapped| bootstrapped.name.as_str())
             .collect();
-        assert_eq!(
-            order,
-            vec!["zulu", "alpha", "mike"],
-            "the configured order is the boot order once dependencies allow it"
-        );
+        assert_eq!(order, vec!["zulu", "alpha", "mike"]);
     }
 
     #[test]
@@ -777,10 +642,8 @@ mod tests {
                     Capability::ActivityRead,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn bridged guest");
@@ -809,13 +672,10 @@ mod tests {
                     Capability::ProcessLifecycle,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         };
 
@@ -846,13 +706,10 @@ mod tests {
                     Capability::ProcessLifecycle,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         };
 
@@ -866,23 +723,12 @@ mod tests {
     }
 
     #[test]
-    fn role_declared_readiness_requires_observable_registration() {
-        let runtime = Runtime::default();
-        // No registration recorded yet → the declared role is not observable.
-        assert!(!runtime.has_registration(42, "sel:///dns/resolve"));
-        // Once discovery records the registration, readiness is satisfied.
-        runtime.record_registration(42, "sel:///dns/resolve".to_string());
-        assert!(runtime.has_registration(42, "sel:///dns/resolve"));
-    }
-
-    #[test]
-    fn silent_role_guest_fails_readiness() {
-        // A role-declared guest whose registration is never observable in
-        // discovery does not reach ready.
+    fn bootstrap_does_not_gate_on_readiness() {
+        // A guest that never registers a serving route still boots: there is
+        // no readiness gate.
         let runtime = Runtime::default();
         let config = RuntimeConfig {
             start_discovery: false,
-            domain_table: Vec::new(),
             system_guests: vec![SystemGuestDescriptor {
                 name: "silent".to_string(),
                 module_id: "silent-module".to_string(),
@@ -893,21 +739,16 @@ mod tests {
                     Capability::ProcessLifecycle,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: Some("sel:///dns/resolve".to_string()),
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
             state_dir: None,
         };
 
-        let err = runtime
+        let report = runtime
             .bootstrap_system_guests(config)
-            .expect_err("a silent role guest must not be admitted as ready");
-        assert!(
-            matches!(err, Error::ReadinessUnsatisfied(ref name) if name == "silent"),
-            "expected ReadinessUnsatisfied, got {err:?}"
-        );
+            .expect("a guest without a registration still boots");
+        assert_eq!(report.guests.len(), 1);
     }
 }

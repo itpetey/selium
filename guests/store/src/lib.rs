@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use selium_guest::{
-    Context, ResourceClass, ResourceListener, ResourceTarget, Serve, entrypoint, info, mark_ready,
+    Context, ResourceClass, ResourceListener, ResourceTarget, Serve, entrypoint, info,
     process_tenant, spawn, warn,
 };
 use selium_service::{StoreRecord, StoreRecordHeader, StoreRequest, StoreResponse};
@@ -165,6 +165,35 @@ fn dispatch(store: &Store<HostVolumes>, tenant: &str, request: StoreRequest) -> 
                 Some(blob_id) => StoreResponse::BlobId { blob_id },
                 None => StoreResponse::NotFound,
             }),
+        StoreRequest::ResolveSlice {
+            store: name,
+            manifest,
+            blob_id,
+        } => {
+            let resolved = match (manifest, blob_id) {
+                (Some(manifest), _) => {
+                    store
+                        .get_manifest(tenant, &name, &manifest)
+                        .and_then(|id| match id {
+                            Some(id) => store.resolve_slice(tenant, &name, &id),
+                            None => Ok(None),
+                        })
+                }
+                (_, Some(blob_id)) => store.resolve_slice(tenant, &name, &blob_id),
+                (None, None) => Err(Failure {
+                    code: "MalformedRequest",
+                    message: "ResolveSlice needs a manifest or blob id".to_string(),
+                }),
+            };
+            resolved.map(|slice| match slice {
+                Some((volume, len)) => StoreResponse::Slice {
+                    volume,
+                    offset: 0,
+                    len,
+                },
+                None => StoreResponse::NotFound,
+            })
+        }
     };
 
     outcome.unwrap_or_else(|failure| error_response(failure.code, failure.message))
@@ -246,8 +275,10 @@ async fn store_main(mut ctx: Context) -> anyhow::Result<()> {
         .await
         .with_context(|| "store: route registration failed")?;
     info!(route = %route, "store: route registered");
-    // Readiness is reported only once the route is discoverable.
-    mark_ready();
+    // Health is published state: advertise the store's health.
+    if let Err(error) = ctx.publish_health("store").await {
+        warn!("store: health publish failed: {error}");
+    }
 
     let store = Arc::new(Store::new(HostVolumes));
     loop {

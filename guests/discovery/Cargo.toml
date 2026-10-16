@@ -21,5 +21,8 @@ selium-service.workspace = true
 selium-shm.workspace = true
 selium-wire.workspace = true
 
+[dev-dependencies]
+selium-memory.workspace = true
+
 [lints]
 workspace = true

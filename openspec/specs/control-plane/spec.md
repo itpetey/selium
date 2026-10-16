@@ -31,7 +31,7 @@ The control-plane request and reply types SHALL be FlatBuffers-encoded messages 
 
 #### Scenario: No text grammar for control
 - **WHEN** a control request cannot be decoded as the typed request message
-- **THEN** the control-plane SHALL return a typed serialization error rather than interpreting a text command
+- **THEN** the control-plane SHALL return a typed serialisation error rather than interpreting a text command
 
 ### Requirement: User-Facing Desired State Ownership
 The control-plane SHALL own the user-facing desired state for workloads: deployments and pipeline bindings. Desired state SHALL be recorded in a single platform-scoped durable log whose records carry the tenant they belong to, and SHALL be projected into a read model partitioned by tenant. Reads in a session SHALL observe only the session's own tenant partition.
@@ -131,3 +131,22 @@ The control plane SHALL encode the desired-state records it appends to its durab
 #### Scenario: Desired-state types live in the service crate
 - **WHEN** the control plane constructs or matches `DesiredStateRecord`, `Deployment`, or `PipelineBinding`
 - **THEN** it SHALL import those types from `selium-service`, not `selium-abi`
+
+### Requirement: Resource Catalogue Ownership
+
+The control-plane SHALL own the platform resource catalogue: it SHALL record named resources (URI, class, owning process, tenant, purpose) in a durable log, serve registration and lookup scoped to the session's tenant, and rebuild the projection by replay on boot.
+
+#### Scenario: Registration recorded durably
+
+- **WHEN** a guest registers a named resource in a tenant-scoped session
+- **THEN** the control-plane SHALL append the record and resolve the name thereafter
+
+#### Scenario: Lookup is tenant-scoped
+
+- **WHEN** a session scoped to tenant `beta` resolves a name registered under `acme`
+- **THEN** the control-plane SHALL answer as if the name does not exist
+
+#### Scenario: Catalogue rebuilt on boot
+
+- **WHEN** the control-plane restarts
+- **THEN** replayed records SHALL restore every named resource

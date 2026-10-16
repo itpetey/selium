@@ -27,11 +27,12 @@ pub mod udp;
 /// cannot forge. Fails closed: binding without a registered handler would
 /// leave the listener unable to distinguish legitimate deliveries from
 /// forgeries, so it is an error.
-pub(crate) fn pin_to_scheme_handler(
+pub(crate) async fn pin_to_scheme_handler(
+    ctx: &mut crate::Context,
     listener: &mut crate::ResourceListener,
     scheme: &str,
 ) -> crate::Result<()> {
-    let handler = crate::resolve_protocol_handler(scheme)?.ok_or_else(|| {
+    let handler = ctx.resolve_protocol_handler(scheme).await?.ok_or_else(|| {
         crate::GuestError::Host(format!(
             "no protocol handler registered for scheme `{scheme}`; refusing to serve unpinned handoffs"
         ))

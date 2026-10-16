@@ -1,96 +1,202 @@
 //! Control-plane bootstrap integration test.
 //!
-//! Deploys the real `selium-discovery` and `selium-control-plane` WASM guests
-//! on a single host and asserts the control-plane slice end-to-end: bootstrap
-//! with discovery wiring, self-registration of the root `control` serving
-//! route, and readiness signalling (which fires only after the route is
-//! registered).
+//! Deploys the real `selium-discovery`, `selium-store`, `selium-control-plane`
+//! and `selium-control-probe` WASM guests on a single host and asserts the
+//! control-plane slice end-to-end: bootstrap with discovery wiring,
+//! self-registration of the root `control` serving route, readiness
+//! signalling, a named-resource round trip through the guest-owned catalogue,
+//! and a catalogue replay after the control plane restarts.
 //!
-//! This test is `#[ignore]`d by default because it requires both WASM guests
-//! to be built for `wasm32-unknown-unknown` first:
+//! This test is `#[ignore]`d by default because it requires the WASM guests to
+//! be built for `wasm32-unknown-unknown` first:
 //!
 //! ```sh
-//! cargo build --target wasm32-unknown-unknown -p selium-discovery -p selium-control-plane
+//! cargo build --target wasm32-unknown-unknown \
+//!   -p selium-discovery -p selium-store -p selium-control-plane -p selium-control-probe
 //! cargo test -p selium-runtime --test control_plane -- --ignored
 //! ```
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_runtime::{ReadinessCondition, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{BootstrapReport, Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 mod common;
 mod spine_common;
 
-#[test]
-#[ignore = "requires the control-plane and discovery guests built for wasm32-unknown-unknown"]
-fn control_plane_bootstrap_slice_end_to_end() {
-    let discovery_wasm = discovery_wasm();
-    let control_plane_wasm = control_plane_wasm();
-
-    let state = spine_common::StateRoot::new("control-plane");
-    let runtime = spine_common::runtime_in_state_root(&state);
-    let report = runtime
+/// Boots discovery, the store, and the control plane against the given state
+/// root.
+fn bootstrap(runtime: &Runtime, state: &spine_common::StateRoot) -> BootstrapReport {
+    runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
-                discovery_descriptor(discovery_wasm),
+                discovery_descriptor(discovery_wasm()),
                 spine_common::store_descriptor(vec!["discovery".to_string()]),
-                control_plane_descriptor(control_plane_wasm),
+                control_plane_descriptor(control_plane_wasm()),
             ],
             state_dir: state.config_dir(),
         })
-        .expect("bootstrap system guests");
+        .expect("bootstrap system guests")
+}
 
-    // Discovery and the store must be ready before the control plane
-    // (declared dependencies).
+/// Boots one additional guest against an already-running discovery service.
+fn bootstrap_one(
+    runtime: &Runtime,
+    state: &spine_common::StateRoot,
+    descriptor: SystemGuestDescriptor,
+) -> BootstrapReport {
+    runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![descriptor],
+            state_dir: state.config_dir(),
+        })
+        .expect("bootstrap extra guest")
+}
+
+#[expect(clippy::panic, reason = "test helper panics on an unknown guest name")]
+fn bootstrap_extra(
+    runtime: &Runtime,
+    state: &spine_common::StateRoot,
+    name: &str,
+) -> BootstrapReport {
+    let descriptor = match name {
+        "control-plane" => control_plane_descriptor(control_plane_wasm()),
+        "control-probe" => control_probe_descriptor(control_probe_wasm()),
+        other => panic!("unknown extra guest {other}"),
+    };
+    bootstrap_one(runtime, state, descriptor)
+}
+
+#[expect(clippy::panic, reason = "test helper panics on a missing guest")]
+fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
+    report
+        .guests
+        .iter()
+        .find(|guest| guest.name == name)
+        .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
+        .process_id
+}
+
+#[test]
+#[ignore = "requires the control-plane, discovery, store and probe guests built for wasm32-unknown-unknown"]
+fn control_plane_bootstrap_slice_end_to_end() {
+    let state = spine_common::StateRoot::new("control-plane");
+    let runtime = spine_common::runtime_in_state_root(&state);
+
+    // ── Bootstrap, self-registration, readiness ────────────────────────────
+    let report = bootstrap(&runtime, &state);
     assert_eq!(report.guests.len(), 3);
-    let discovery_guest = report
-        .guests
-        .iter()
-        .find(|guest| guest.name == "discovery")
-        .expect("discovery guest in report");
-    let control_guest = report
-        .guests
-        .iter()
-        .find(|guest| guest.name == "control-plane")
-        .expect("control-plane guest in report");
+    let discovery_guest = find(&report, "discovery");
+    let control_guest = find(&report, "control-plane");
     assert!(
         report.guests.iter().any(|guest| guest.name == "store"),
         "the store guest is bootstrapped"
     );
+    let _ = discovery_guest;
 
-    // Both serving guests reached readiness.
-    let activity = runtime.activity_log();
-    assert!(
-        activity
-            .iter()
-            .any(|event| event.process_id == Some(discovery_guest.process_id)
-                && event.message.contains("guest ready")),
-        "expected discovery GuestReady, got: {activity:?}"
+    // There is no readiness gate and no host-side registration record: the
+    // probe's catalogue and health round trips below are the convergence
+    // evidence (they only succeed once discovery and the control plane serve).
+
+    // ── The probe registers a named resource ───────────────────────────────
+    let probe_report = bootstrap_extra(&runtime, &state, "control-probe");
+    let probe = find(&probe_report, "control-probe");
+    // Waited, not drained: the probe runs asynchronously, so its catalogue and
+    // health round trips land after bootstrap returns.
+    let logs = spine_common::wait_for_logs(
+        &runtime,
+        probe,
+        &[
+            ("catalogue registered", 1),
+            ("health published and observed: true", 1),
+        ],
+        std::time::Duration::from_secs(60),
     );
     assert!(
-        activity
-            .iter()
-            .any(|event| event.process_id == Some(control_guest.process_id)
-                && event.message.contains("guest ready")),
-        "expected control-plane GuestReady, got: {activity:?}"
+        logs.iter()
+            .any(|line| line.contains("catalogue registered")),
+        "expected the probe to register a named region, got: {logs:?}"
     );
 
-    // The control route registered: readiness is signalled only after
-    // `Context::serve` registers `sel:///control` in discovery, and
-    // discovery records the registration with the runtime before replying.
-    assert!(
-        runtime.has_registration(control_guest.process_id, "sel:///control"),
-        "expected the control route to be registered and observable"
-    );
-
-    // Cleanup.
+    // Stop the probe and the control plane so a later boot must rebuild the
+    // catalogue from the store's durable log rather than from memory.
+    runtime.stop_process(probe).expect("stop probe");
     runtime
-        .stop_process(control_guest.process_id)
+        .stop_process(control_guest)
         .expect("stop control-plane");
-    runtime
-        .stop_process(discovery_guest.process_id)
-        .expect("stop discovery");
+
+    // With the catalogue unreachable (the control plane is down), an
+    // anonymous allocation still succeeds.
+    let anon_report = bootstrap_extra(&runtime, &state, "control-probe");
+    let anon = find(&anon_report, "control-probe");
+    let logs = spine_common::wait_for_logs(
+        &runtime,
+        anon,
+        &[
+            ("catalogue unreachable", 1),
+            ("anonymous allocation succeeded", 1),
+        ],
+        std::time::Duration::from_secs(60),
+    );
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("catalogue unreachable")),
+        "expected the probe to observe an unreachable catalogue, got: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("anonymous allocation succeeded")),
+        "expected anonymous allocation without the catalogue, got: {logs:?}"
+    );
+    runtime.stop_process(anon).expect("stop anonymous probe");
+
+    // ── The catalogue rebuilds from replay on restart ──────────────────────
+    let _cp_report = bootstrap_extra(&runtime, &state, "control-plane");
+    let probe_report = bootstrap_extra(&runtime, &state, "control-probe");
+    let probe = find(&probe_report, "control-probe");
+    let logs = spine_common::wait_for_logs(
+        &runtime,
+        probe,
+        &[("catalogue replayed", 1)],
+        std::time::Duration::from_secs(60),
+    );
+    assert!(
+        logs.iter().any(|line| line.contains("catalogue replayed")),
+        "expected the catalogue to rebuild from replay, got: {logs:?}"
+    );
+
+    for guest in &report.guests {
+        drop(runtime.stop_process(guest.process_id));
+    }
+    drop(runtime.stop_process(probe));
+}
+
+fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "control-probe".to_string(),
+        module_id: "control-probe-module".to_string(),
+        module_bytes,
+        entrypoint: "control_probe".to_string(),
+        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        ],
+        tenant: None,
+        discovery_service: false,
+        handlers: Vec::new(),
+    }
+}
+
+fn control_probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-control-probe", "selium_control_probe.wasm")
 }
 
 fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
@@ -115,10 +221,8 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             ),
             CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
-        dependencies: vec!["discovery".to_string(), "store".to_string()],
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -143,11 +247,13 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The registry probes capability state and records
+            // registrations under a bootstrap-provisioned authority, not a
+            // privileged guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: true,
         handlers: Vec::new(),
     }
 }

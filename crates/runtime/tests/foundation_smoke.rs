@@ -2,7 +2,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, LocalityScope,
     RegionProt, ResourceClass, ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 /// Task 4.2 & 3.1: Concurrent connections use distinct regions; all reclaim
 /// on disconnect.
@@ -55,7 +55,7 @@ fn concurrent_connections_use_distinct_regions() {
 
     // Discovery records the queue on the connector's behalf (simulates
     // discovery resolve).
-    discovery_records_resolve(&runtime, connector, listener.shared_id);
+    owner_declares_and_records_resolve(&runtime, server, connector, listener.shared_id);
 
     // Connector attaches to the queue.
     let (_, op_id) = runtime.begin_hostcall(
@@ -196,24 +196,40 @@ fn concurrent_connections_use_distinct_regions() {
     ));
 }
 
-/// Spawns the discovery system guest and has it record `shared_id` as the
-/// result of a resolve performed by `client`, mirroring what the real
-/// discovery service does after a successful Resolve. The runtime accepts
-/// `RecordResolvedQueueFor` only from the process booted under the
-/// "discovery" name.
-fn discovery_records_resolve(runtime: &Runtime, client: selium_abi::ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new());
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: selium_abi::ProcessId,
+    client: selium_abi::ProcessId,
+    shared_id: u64,
+) {
     let (status, _op) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
         },
     );
     assert_eq!(
         status,
         selium_abi::HOSTCALL_STATUS_READY,
-        "discovery service must be able to record resolve results"
+        "the queue owner must declare it attachable by resolution"
+    );
+    let (status, _op) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
     );
 }
 
@@ -233,13 +249,10 @@ fn foundation_crates_work_together_through_hostcalls() {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap runtime");
@@ -280,13 +293,10 @@ fn hostcalls_enforce_session_grants() {
                     Capability::ProcessLifecycle,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap runtime");
@@ -316,22 +326,22 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
     .expect("compile wat")
 }
 
-/// A process that is not the discovery service must not be able to record a
-/// resolve on its own behalf: self-recording would let any guest learn or
-/// guess a queue id and self-authorize cross-process `HostQueueAttach`.
+/// Attach authority flows from ownership and owner declarations only: a
+/// process that neither owns the resource nor holds an explicit capability
+/// cannot authorise or declare it, an undeclared resource refuses a resolve
+/// recording, and a declaration's scope bounds who a recording admits.
 #[test]
-fn non_discovery_process_cannot_self_authorize_attach() {
+fn owner_scoped_attach_authorisation() {
     let runtime = Runtime::default();
-
-    // Owner creates the target queue.
-    let owner = spawn_guest(
-        &runtime,
-        "owner-selfauth",
+    let queue_grants = || {
         vec![CapabilityGrant::new(
             Capability::HostQueue,
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )],
-    );
+        )]
+    };
+
+    // Owner creates the target queue.
+    let owner = spawn_guest(&runtime, "owner-handoff", queue_grants());
     let (_, op_id) = runtime.begin_hostcall(
         owner,
         HostcallRequest::HostQueueCreate {
@@ -344,84 +354,235 @@ fn non_discovery_process_cannot_self_authorize_attach() {
         panic!("expected host queue");
     };
 
-    // Attacker knows (or guesses) the queue id but has no grant for it and
-    // has never resolved it via discovery.
-    let attacker = spawn_guest(
-        &runtime,
-        "attacker",
-        vec![CapabilityGrant::new(
+    // A process with no standing for the queue.
+    let peer = spawn_guest(&runtime, "peer-handoff", queue_grants());
+
+    // Attempt 1: an undeclared resource refuses a resolve recording, even
+    // when the recorder names itself as the client.
+    let (status, op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            client_process_id: peer,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "an undeclared resource must refuse a resolve recording"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(peer, op_id),
+        CompletionState::Failed(_)
+    ));
+
+    // Attempt 2: a process that neither owns the resource nor holds an
+    // explicit capability cannot declare it attachable by resolution.
+    let (status, _op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "a non-owner must not declare a resource attachable"
+    );
+
+    // Attempt 3: nor can it push-authorise an attach.
+    let (status, _op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::AuthoriseAttach {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            client_process_id: peer,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "a non-owner must not authorise an attach"
+    );
+
+    // With no basis recorded, attach stays denied.
+    let (status, _op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::HostQueueAttach {
+            shared_id: queue.shared_id,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+
+    // The owner declares the resource attachable by resolution for the
+    // `acme` tenant only; the peer (root tenant) is outside that scope and
+    // its recording is refused.
+    let (status, _op_id) = runtime.begin_hostcall(
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            scope: selium_abi::AttachDeclarationScope::Tenant("acme".to_string()),
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    let (status, op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            client_process_id: peer,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_FAILED,
+        "a client outside the declaration scope must be refused"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(peer, op_id),
+        CompletionState::Failed(_)
+    ));
+
+    // The owner widens the scope; the peer's resolve now records and its
+    // attach succeeds.
+    let (status, _op_id) = runtime.begin_hostcall(
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    let (status, _op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: queue.shared_id,
+            client_process_id: peer,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a recording inside the declaration scope must be accepted"
+    );
+    let (status, op_id) = runtime.begin_hostcall(
+        peer,
+        HostcallRequest::HostQueueAttach {
+            shared_id: queue.shared_id,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a recorded client must be allowed to attach"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(peer, op_id),
+        CompletionState::Ready(_)
+    ));
+}
+
+/// The push form of owner-scoped handoff: the owner authorises exactly one
+/// client process, that client's attach succeeds on that basis alone, and no
+/// other process gains one.
+#[test]
+fn an_owner_push_authorisation_admits_exactly_the_named_peer() {
+    let runtime = Runtime::default();
+    let queue_grant = || {
+        CapabilityGrant::new(
             Capability::HostQueue,
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-        )],
-    );
+        )
+    };
+    let spawn = |name: &str| {
+        runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module_with_entrypoint("boot"),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: vec![queue_grant()],
+                tenant: None,
+                discovery_service: false,
+                handlers: Vec::new(),
+            })
+            .expect("spawn guest")
+    };
+    let owner = spawn("owner");
+    let peer = spawn("peer");
+    let bystander = spawn("bystander");
 
-    // Attempt 1: attacker records its own resolve — must be denied because
-    // only the discovery service may call RecordResolvedQueueFor.
+    // The owner creates the queue and pushes an authorisation naming `peer`.
     let (status, op_id) = runtime.begin_hostcall(
-        attacker,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: attacker,
-            shared_id: queue.shared_id,
+        owner.process_id,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: None,
         },
     );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_FAILED,
-        "non-discovery process must be denied recording resolve results"
-    );
-    assert!(matches!(
-        runtime.poll_hostcall(attacker, op_id),
-        CompletionState::Failed(_)
-    ));
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    let CompletionState::Ready(HostcallOutput::HostQueue(descriptor)) =
+        runtime.poll_hostcall(owner.process_id, op_id)
+    else {
+        panic!("expected a host queue descriptor");
+    };
+    let shared_id = descriptor.shared_id;
 
-    // Attempt 2: with no recorded basis, attach remains denied.
-    let (status, op_id) = runtime.begin_hostcall(
-        attacker,
-        HostcallRequest::HostQueueAttach {
-            shared_id: queue.shared_id,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_FAILED,
-        "attach must remain denied without a legitimate resolve basis"
-    );
-    assert!(matches!(
-        runtime.poll_hostcall(attacker, op_id),
-        CompletionState::Failed(_)
-    ));
-
-    // Attempt 3: even with a legitimate recording in flight (discovery
-    // records for the *owner*), the attacker gains nothing — recordings are
-    // scoped to the client process they name.
-    discovery_records_resolve(&runtime, owner, queue.shared_id);
-    let (status, op_id) = runtime.begin_hostcall(
-        attacker,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: attacker,
-            shared_id: queue.shared_id,
-        },
-    );
-    assert_eq!(
-        status,
-        selium_abi::HOSTCALL_STATUS_FAILED,
-        "recording must stay denied for non-discovery callers"
-    );
-    assert!(matches!(
-        runtime.poll_hostcall(attacker, op_id),
-        CompletionState::Failed(_)
-    ));
+    // Before the authorisation, neither peer nor bystander has a basis.
+    for process in [peer.process_id, bystander.process_id] {
+        let (status, _op_id) =
+            runtime.begin_hostcall(process, HostcallRequest::HostQueueAttach { shared_id });
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "an unauthorised process must not attach"
+        );
+    }
 
     let (status, _op_id) = runtime.begin_hostcall(
-        attacker,
-        HostcallRequest::HostQueueAttach {
-            shared_id: queue.shared_id,
+        owner.process_id,
+        HostcallRequest::AuthoriseAttach {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: peer.process_id,
         },
     );
     assert_eq!(
         status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the owner authorises a named peer"
+    );
+
+    // The named peer's attach is now authorised.
+    let (status, op_id) = runtime.begin_hostcall(
+        peer.process_id,
+        HostcallRequest::HostQueueAttach { shared_id },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the authorised peer attaches on its recorded basis"
+    );
+    assert!(matches!(
+        runtime.poll_hostcall(peer.process_id, op_id),
+        CompletionState::Ready(_)
+    ));
+
+    // No other process gained a basis from that authorisation.
+    let (status, _op_id) = runtime.begin_hostcall(
+        bystander.process_id,
+        HostcallRequest::HostQueueAttach { shared_id },
+    );
+    assert_eq!(
+        status,
         selium_abi::HOSTCALL_STATUS_FAILED,
-        "attach must stay denied for the attacker"
+        "an authorisation names one peer; nobody else gains a basis"
     );
 }
 
@@ -445,10 +606,8 @@ fn resolve_basis_allows_foreign_queue_attach() {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn owner");
@@ -465,10 +624,8 @@ fn resolve_basis_allows_foreign_queue_attach() {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn resolver");
@@ -485,10 +642,8 @@ fn resolve_basis_allows_foreign_queue_attach() {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn intruder");
@@ -510,7 +665,7 @@ fn resolve_basis_allows_foreign_queue_attach() {
 
     // Step 2: The discovery service records the queue id on behalf of
     // process B, as it would after B's successful discovery resolve.
-    discovery_records_resolve(&runtime, proc_b.process_id, shared_id);
+    owner_declares_and_records_resolve(&runtime, proc_a.process_id, proc_b.process_id, shared_id);
 
     // Step 3: Process B attaches to A's queue — should succeed via resolve basis.
     let (status, op_id) = runtime.begin_hostcall(
@@ -608,7 +763,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         )],
     );
 
-    discovery_records_resolve(&runtime, connector, queue_a.shared_id);
+    owner_declares_and_records_resolve(&runtime, server_a, connector, queue_a.shared_id);
 
     let (status, op_id) = runtime.begin_hostcall(
         connector,
@@ -641,7 +796,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         },
     );
     // The attach fails because: (a) connector is not owner, (b) no
-    // ExplicitResource grant, (c) resolved_queue_ids contains an id
+    // ExplicitResource grant, (c) the resolved-resource basis contains an id
     // that may or may not still be valid in the kernel. The key property
     // is that the failure is loud — no misrouting to a wrong guest.
     if stale_status == selium_abi::HOSTCALL_STATUS_READY {
@@ -650,7 +805,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
         // right owner. In any case, no data is forwarded to a wrong guest.
         let _ = runtime.poll_hostcall(connector, stale_op);
     } else {
-        // Attach failed loudly — this is the desired behavior for stale
+        // Attach failed loudly — this is the desired behaviour for stale
         // routes: fail at attach, not silently misroute.
         assert!(matches!(
             runtime.poll_hostcall(connector, stale_op),
@@ -696,7 +851,7 @@ fn revocation_stale_route_fails_loudly_then_re_registration_succeeds() {
 
     // Connector re-resolves (recorded by the discovery service) and attaches
     // to the replacement queue.
-    discovery_records_resolve(&runtime, connector, queue_b.shared_id);
+    owner_declares_and_records_resolve(&runtime, server_b, connector, queue_b.shared_id);
 
     let (status, op_id) = runtime.begin_hostcall(
         connector,
@@ -736,13 +891,10 @@ fn spawn_guest(
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants,
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap guest");
@@ -821,7 +973,7 @@ fn zero_grant_guest_round_trip_via_host_queue() {
 
     // Step 2: The discovery service records the queue id on behalf of the
     // connector (as it would after the connector's discovery resolve).
-    discovery_records_resolve(&runtime, connector, listener.shared_id);
+    owner_declares_and_records_resolve(&runtime, server, connector, listener.shared_id);
 
     // Step 3: Connector attaches to the server's queue (resolve-basis).
     let (_, op_id) = runtime.begin_hostcall(

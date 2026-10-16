@@ -157,7 +157,6 @@ fn host_satisfies(host: &HostPlacementInput, spec: &WorkloadSpec) -> bool {
 async fn scheduler_main() {
     drop(selium_guest::log::init());
     selium_guest::info!(guest = "selium-scheduler", "system guest booting");
-    selium_guest::mark_ready();
 }
 
 #[cfg(test)]
@@ -180,7 +179,6 @@ mod tests {
             tenant: "tenant-a".to_string(),
             cpu_millis: 250,
             memory_bytes: 512,
-            dependencies: Vec::new(),
             isolation_key: None,
         }
     }

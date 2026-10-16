@@ -1,6 +1,6 @@
 use selium_abi::{
     ActivityEvent, CapabilityGrant, HostcallOutput, HostcallRequest, MeteringObservation,
-    ProcessDescriptor,
+    ModuleSource, ProcessDescriptor,
 };
 
 use crate::{GuestError, Result, hostcall::hostcall_ready};
@@ -20,15 +20,19 @@ pub struct ActivityLog;
 pub struct Metering;
 
 impl Process {
-    /// Starts a process from a module, entrypoint, arguments, and grants.
-    /// The child inherits the parent's tenant.
+    /// Starts a process from a module source, entrypoint, arguments, and
+    /// grants. The child inherits the parent's tenant.
+    ///
+    /// The module source is either inline bytes or a durable slice the host
+    /// reads from its own volume layer, so module bytes never round-trip
+    /// through a guest.
     pub fn start(
-        module_id: impl Into<String>,
+        source: ModuleSource,
         entrypoint: impl Into<String>,
         arguments: Vec<Vec<u8>>,
         grants: Vec<CapabilityGrant>,
     ) -> Result<Self> {
-        Self::start_for_tenant(module_id, entrypoint, arguments, grants, None)
+        Self::start_for_tenant(source, entrypoint, arguments, grants, None)
     }
 
     /// Starts a process under an explicit `tenant`.
@@ -38,14 +42,14 @@ impl Process {
     /// for a root parent, so cross-tenant authority is always a grant, not
     /// the parent's bootstrap tenant (the runtime denies the spawn otherwise).
     pub fn start_for_tenant(
-        module_id: impl Into<String>,
+        source: ModuleSource,
         entrypoint: impl Into<String>,
         arguments: Vec<Vec<u8>>,
         grants: Vec<CapabilityGrant>,
         tenant: Option<&str>,
     ) -> Result<Self> {
         match hostcall_ready(HostcallRequest::ProcessStart {
-            module_id: module_id.into(),
+            source,
             entrypoint: entrypoint.into(),
             arguments,
             grants,

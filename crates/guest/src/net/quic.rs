@@ -128,7 +128,7 @@ impl QuicServe {
     pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
-        super::pin_to_scheme_handler(&mut listener, QUIC_SCHEME)?;
+        super::pin_to_scheme_handler(ctx, &mut listener, QUIC_SCHEME).await?;
 
         let target = quic_target(&listener);
         let uri = ctx

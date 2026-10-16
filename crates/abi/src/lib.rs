@@ -194,6 +194,19 @@ pub enum Capability {
     /// `DelegateGrants` and `MintCertificate`, it can never be conferred on a
     /// child process. Held solely by the accounting system guest.
     QuotaWrite,
+    /// Permission to probe whether another process holds a capability via the
+    /// `ProcessCapability` hostcall. Bootstrap-provisioned only: like
+    /// `DelegateGrants`, `MintCertificate` and `QuotaWrite`, it can never be
+    /// conferred on a child process. Held by a registry implementation (e.g.
+    /// the discovery system guest) that must gate a request against the
+    /// caller's grants.
+    ProcessProbe,
+    /// Permission to author the advisory domain-to-tenant mapping via the
+    /// `SetDomain` discovery request. Bootstrap-provisioned only: like
+    /// `DelegateGrants`, `MintCertificate` and `QuotaWrite`, it can never be
+    /// conferred on a child process. Held solely by the identity system guest,
+    /// which owns the mapping durably.
+    DomainWrite,
 }
 
 /// Identity of a resource in either local-handle or shared-resource space.
@@ -309,6 +322,23 @@ pub enum ResourceSelector {
     /// grandchildren, etc.). Used by metering/activity/guest-log read
     /// grants so supervisors can read their descendants' telemetry.
     Children,
+}
+
+/// Scope an owner-declared attachable-by-resolution declaration admits.
+///
+/// The owner of a shared resource authors the declaration and the host
+/// enforces it: a resolve-recording naming a client process is accepted as
+/// that process's attach basis only when the declaration's scope admits the
+/// process. A narrower scope keeps the owner's authority from being broadened
+/// by a resolver.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum AttachDeclarationScope {
+    /// Any client process is admitted by the declaration.
+    Any,
+    /// Only client processes whose tenant matches the named tenant are
+    /// admitted by the declaration.
+    Tenant(String),
 }
 
 /// Grant allowing one capability within the intersection of its selectors.
@@ -449,14 +479,35 @@ pub struct ProcessDescriptor {
     pub entrypoint: String,
 }
 
+/// Source of a process's module bytes.
+///
+/// The runtime holds no module catalogue: every spawn supplies the module
+/// bytes, either inline in the hostcall payload or as a durable slice the
+/// runtime reads from its own volume layer under the caller's storage
+/// authority. A slice keeps module bytes from round-tripping through a guest.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum ModuleSource {
+    /// Inline module bytes carried in the hostcall payload.
+    Inline(Vec<u8>),
+    /// A durable slice: the runtime reads `len` bytes at `offset` from the
+    /// named volume through its own volume layer.
+    Slice {
+        /// Volume name holding the module bytes.
+        volume: String,
+        /// Byte offset of the module within the volume.
+        offset: u64,
+        /// Byte length of the module.
+        len: u64,
+    },
+}
+
 /// Kind of event recorded in the activity log.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(bytecheck())]
 pub enum ActivityKind {
     /// A process was started.
     ProcessStarted,
-    /// A guest reported readiness.
-    GuestReady,
     /// A system guest was bootstrapped.
     GuestBootstrapped,
     /// A process was stopped.
@@ -593,8 +644,8 @@ pub enum HostcallRequest {
     },
     /// Start a process.
     ProcessStart {
-        /// Module id to execute.
-        module_id: String,
+        /// Module bytes source: inline bytes or a durable slice.
+        source: ModuleSource,
         /// Entrypoint export to invoke.
         entrypoint: String,
         /// Encoded entrypoint arguments.
@@ -689,15 +740,6 @@ pub enum HostcallRequest {
     /// tenant scope. Used by system guests (e.g. the bridge-server) to
     /// verify handoff identities against their own tenant.
     SelfInfo,
-    /// Returns the process id of the registered Tier-1 protocol handler for
-    /// `scheme` (e.g. `sel-quic`), if one is registered. Handler
-    /// registrations are bootstrap-authoritative (runtime-published), so
-    /// the result cannot be forged by guests. Used by serve-side guests to
-    /// pin which process may legitimately deliver handoffs.
-    ResolveProtocolHandler {
-        /// Protocol scheme to resolve (e.g. `sel-quic`).
-        scheme: String,
-    },
     /// Allocate a shared memory region mapped into guest linear memory.
     AllocRegion {
         /// Number of pages to allocate.
@@ -719,24 +761,16 @@ pub enum HostcallRequest {
         /// Process whose tenant to look up.
         process_id: ProcessId,
     },
-    /// Returns whether a process holds a capability. Restricted to the
-    /// discovery system guest so it can gate root-registration requests
-    /// against the caller's grants.
+    /// Returns whether a process holds a capability. Gated by the
+    /// bootstrap-provisioned `ProcessProbe` capability rather than by any
+    /// guest identity, so the runtime records which process may gate
+    /// root-registration requests against another caller's grants. The probe
+    /// discloses nothing beyond the capability asked for.
     ProcessCapability {
         /// Process whose grants to check.
         process_id: ProcessId,
         /// Capability to check.
         capability: Capability,
-    },
-    /// Records that a route was registered by a process, so the runtime can
-    /// gate the readiness of a role-declared system guest on its registration
-    /// being observable in discovery. Restricted to the discovery system
-    /// guest.
-    RecordRegistration {
-        /// Process that registered the route.
-        process_id: ProcessId,
-        /// Internal URI the route was registered under.
-        uri: String,
     },
     /// Free a previously allocated shared memory region.
     FreeRegion {
@@ -792,27 +826,45 @@ pub enum HostcallRequest {
         /// The new generation value written by the guest.
         generation: u64,
     },
-    /// Record that a discovery resolve performed by `client_process_id`
-    /// returned `shared_id`. Callable only by the discovery system guest;
-    /// the runtime rejects the hostcall from any other process. This gives
-    /// the resolved client an authorisation basis for cross-process
-    /// `HostQueueAttach` without requiring an `ExplicitResource` grant.
-    RecordResolvedQueueFor {
-        /// Process that performed the discovery resolve.
+    /// Authorise a named client process to attach a shared resource the
+    /// caller owns or holds an explicit capability for. The host records the
+    /// authorisation as the named peer's attach basis. No guest identity is
+    /// privileged for this purpose, and exactly one resource and one client
+    /// process are named.
+    AuthoriseAttach {
+        /// Class of the shared resource being handed off.
+        resource_class: ResourceClass,
+        /// Shared resource id being handed off.
+        resource_id: SharedResourceId,
+        /// Client process being authorised to attach the resource.
         client_process_id: ProcessId,
-        /// Queue id returned to that process by the resolve.
-        shared_id: SharedResourceId,
     },
-    /// Record that a discovery resolve performed by `client_process_id`
-    /// returned a shared region. Callable only by the discovery system
-    /// guest; the recorded id gives the resolving client an authorisation
-    /// basis for `AttachRegion` on a region it did not allocate (the basis
-    /// peer guests use to attach an identity guest's published live tables).
-    RecordResolvedRegionFor {
-        /// Process that performed the discovery resolve.
+    /// Declare a resource the caller owns attachable by resolution, with a
+    /// declaration scope naming which callers the declaration admits. While a
+    /// live declaration holds, the host accepts a resolve-recording naming a
+    /// client process for that resource as the process's attach basis.
+    DeclareAttachableByResolution {
+        /// Class of the shared resource being declared.
+        resource_class: ResourceClass,
+        /// Shared resource id being declared.
+        resource_id: SharedResourceId,
+        /// Scope the declaration admits.
+        scope: AttachDeclarationScope,
+    },
+    /// Record that a resolve performed by `client_process_id` returned the
+    /// named shared resource. Accepted only while the resource carries a live
+    /// attachable-by-resolution declaration whose scope admits the client; the
+    /// recorded id gives the resolving client an authorisation basis for the
+    /// corresponding cross-process attach hostcall (`HostQueueAttach` for
+    /// queues, `AttachRegion` for shared regions). No guest identity is
+    /// privileged for recording.
+    RecordResolvedResourceFor {
+        /// Class of the resolved shared resource.
+        resource_class: ResourceClass,
+        /// Shared resource id returned to the client by the resolve.
+        resource_id: SharedResourceId,
+        /// Process that performed the resolve.
         client_process_id: ProcessId,
-        /// Region id returned to that process by the resolve.
-        shared_id: SharedResourceId,
     },
     /// Sign a tenant CA: generate a host-held tenant CA keypair and sign it
     /// via the online intermediate key. Returns the DER-encoded tenant CA
@@ -1051,8 +1103,10 @@ impl ResourceSelector {
     /// The enforcement matrix is:
     /// - `Tenant`, `Namespace`, `Locality`, `ResourceClass`, `ExplicitResource`,
     ///   `Children`: evaluatable.
-    /// - `UriPrefix`: evaluatable only when the same grant also carries a network
-    ///   `ResourceClass` selector (`TcpListener`, `TcpStream`, or `UdpSocket`).
+    /// - `UriPrefix`: evaluatable only when the same grant also carries a
+    ///   resource-class selector the prefix applies to: a network class
+    ///   (`TcpListener`, `TcpStream`, or `UdpSocket`) for endpoint URIs, or
+    ///   `Volume` for volume names.
     pub fn is_evaluatable(&self, grant_selectors: &[ResourceSelector]) -> bool {
         match self {
             Self::UriPrefix(_) => grant_selectors.iter().any(|s| {
@@ -1061,6 +1115,7 @@ impl ResourceSelector {
                     Self::ResourceClass(ResourceClass::TcpListener)
                         | Self::ResourceClass(ResourceClass::TcpStream)
                         | Self::ResourceClass(ResourceClass::UdpSocket)
+                        | Self::ResourceClass(ResourceClass::Volume)
                 )
             }),
             Self::Tenant(_)
@@ -1489,6 +1544,7 @@ mod tests {
             Capability::DelegateGrants,
             Capability::HostQueue,
             Capability::MintCertificate,
+            Capability::ProcessProbe,
         ] {
             let encoded = encode_rkyv(&capability).expect("encode");
             let decoded: Capability = decode_rkyv(&encoded).expect("decode");
@@ -1659,19 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_protocol_handler_round_trip() {
-        let envelope = HostcallEnvelope {
-            request: HostcallRequest::ResolveProtocolHandler {
-                scheme: "sel-quic".to_string(),
-            },
-            task_id: None,
-        };
-        let encoded = encode_rkyv(&envelope).expect("encode");
-        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
-        assert_eq!(decoded, envelope);
-    }
-
-    #[test]
     fn sign_tenant_ca_round_trip() {
         let envelope = HostcallEnvelope {
             request: HostcallRequest::SignTenantCa {
@@ -1720,17 +1763,84 @@ mod tests {
     }
 
     #[test]
-    fn record_resolved_region_for_round_trip() {
+    fn authorise_attach_round_trip() {
         let envelope = HostcallEnvelope {
-            request: HostcallRequest::RecordResolvedRegionFor {
+            request: HostcallRequest::AuthoriseAttach {
+                resource_class: ResourceClass::SharedRegion,
+                resource_id: 7,
                 client_process_id: 42,
-                shared_id: 7,
             },
             task_id: None,
         };
         let encoded = encode_rkyv(&envelope).expect("encode");
         let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn declare_attachable_by_resolution_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::DeclareAttachableByResolution {
+                resource_class: ResourceClass::HostQueue,
+                resource_id: 9,
+                scope: AttachDeclarationScope::Tenant("acme".to_string()),
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn record_resolved_resource_for_round_trip() {
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::RecordResolvedResourceFor {
+                resource_class: ResourceClass::SharedRegion,
+                resource_id: 7,
+                client_process_id: 42,
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn a_durable_slice_module_source_round_trips() {
+        // The slice variant carries the whole module reference (volume, offset,
+        // length) across the envelope; a truncated or reordered field would
+        // spawn from the wrong bytes.
+        let envelope = HostcallEnvelope {
+            request: HostcallRequest::ProcessStart {
+                source: ModuleSource::Slice {
+                    volume: "selium.control-plane.modules".to_string(),
+                    offset: 4096,
+                    len: 65_536,
+                },
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: None,
+            },
+            task_id: None,
+        };
+        let encoded = encode_rkyv(&envelope).expect("encode");
+        let decoded: HostcallEnvelope = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn attach_declaration_scope_round_trip() {
+        for scope in [
+            AttachDeclarationScope::Any,
+            AttachDeclarationScope::Tenant("acme".to_string()),
+        ] {
+            let encoded = encode_rkyv(&scope).expect("encode");
+            let decoded: AttachDeclarationScope = decode_rkyv(&encoded).expect("decode");
+            assert_eq!(decoded, scope);
+        }
     }
 
     #[test]
@@ -2129,9 +2239,34 @@ mod tests {
     }
 
     #[test]
-    fn uri_prefix_not_evaluatable_without_network_class() {
+    fn uri_prefix_evaluatable_with_volume_class() {
         let selectors = vec![
             ResourceSelector::ResourceClass(ResourceClass::Volume),
+            ResourceSelector::UriPrefix("selium.control-plane".to_string()),
+        ];
+        assert!(selectors[1].is_evaluatable(&selectors));
+
+        // The prefix scopes which volume names the grant admits: plain
+        // `starts_with` matching on the volume name.
+        let grant = CapabilityGrant::new(Capability::Storage, selectors);
+        let admitted = ScopeContext {
+            resource_class: Some(ResourceClass::Volume),
+            uri: Some("selium.control-plane.modules".to_string()),
+            ..ScopeContext::default()
+        };
+        let refused = ScopeContext {
+            resource_class: Some(ResourceClass::Volume),
+            uri: Some("acme.private".to_string()),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&admitted));
+        assert!(!grant.allows(&refused));
+    }
+
+    #[test]
+    fn uri_prefix_not_evaluatable_without_an_applicable_class() {
+        let selectors = vec![
+            ResourceSelector::ResourceClass(ResourceClass::SharedRegion),
             ResourceSelector::UriPrefix("tcp://10.0.0.5:443".to_string()),
         ];
         assert!(!selectors[1].is_evaluatable(&selectors));

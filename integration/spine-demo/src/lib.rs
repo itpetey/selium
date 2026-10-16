@@ -52,6 +52,5 @@ async fn spine_demo() -> anyhow::Result<()> {
         }
     }
 
-    selium_guest::mark_ready();
     Ok(())
 }

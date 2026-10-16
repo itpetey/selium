@@ -25,7 +25,7 @@
 //!
 //! `#[ignore]`d by default because it requires the guests built for
 //! `wasm32-unknown-unknown` first (release profile — the TLS handshake runs
-//! through the wasm interpreter, too slow at debug optimization for the
+//! through the wasm interpreter, too slow at debug optimisation for the
 //! quinn timeouts):
 //!
 //! ```sh
@@ -80,7 +80,6 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
                 store_descriptor(vec!["discovery".to_string()]),
@@ -105,6 +104,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
                 ),
                 bridge_server_descriptor(
                     read_wasm("selium-bridge", "selium_bridge.wasm"),
+                    read_wasm("selium-bridge-channel", "selium_bridge_channel.wasm"),
                     vec![
                         "discovery".to_string(),
                         "identity".to_string(),
@@ -147,13 +147,6 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
     let connector = find("quic-connector");
     let bridge = find("bridge-server");
     let control_plane = find("control-plane");
-
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            read_wasm("selium-bridge-channel", "selium_bridge_channel.wasm"),
-        )
-        .expect("register bridge-channel module");
 
     // Identity and the onboarding operator reported ready (bootstrap gates on
     // it), so the tenant CA is minted, the leaf issued, and grants recorded.
@@ -293,7 +286,6 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
     let revoke_guest = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
-            domain_table: Vec::new(),
             system_guests: vec![operator_descriptor(
                 read_wasm("selium-identity-onboard", "selium_identity_onboard.wasm"),
                 Vec::new(),

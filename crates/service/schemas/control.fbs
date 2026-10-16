@@ -36,6 +36,9 @@ table DelegationStatus {
 //   3 = Resolve { uri }
 //   4 = Upload { manifest, bytes }
 //   5 = Status { workload_id }
+//   6 = RegisterResource { uri, class, owner, purpose, resource_id }
+//   7 = RemoveResource { uri }
+//   8 = LookupResource { uri }
 table ControlRequest {
     variant: ubyte;
     // Workload identifier (Deploy, Scale, Stop, Status variants).
@@ -50,6 +53,14 @@ table ControlRequest {
     manifest: string;
     // Uploaded module bytes (Upload variant).
     bytes: [ubyte];
+    // Resource class URI segment (RegisterResource variant).
+    class: string;
+    // Owning process id (RegisterResource variant).
+    owner: ulong;
+    // Informational purpose tag (RegisterResource variant).
+    purpose: string;
+    // Shared resource id (RegisterResource variant).
+    resource_id: ulong;
 }
 
 // Control-plane response message.
@@ -60,6 +71,9 @@ table ControlRequest {
 //   2 = Status { deployment }
 //   3 = Resolved { target }
 //   4 = Error { step, context }
+//   5 = Registered { record }
+//   6 = Removed { uri }
+//   7 = Lookup { record }
 table ControlResponse {
     variant: ubyte;
     // Manifest name for an uploaded module (Uploaded variant).
@@ -80,6 +94,10 @@ table ControlResponse {
     context: string;
     // Resolved target (Resolved variant).
     target: ResolvedTarget;
+    // Catalogue record (Registered, Lookup variants).
+    record: CatalogueRecord;
+    // URI of a removed name (Removed variant).
+    uri: string;
 }
 
 // A pipeline binding between workload endpoints, recorded as desired state.
@@ -107,6 +125,39 @@ table DesiredStateRecord {
     // Workload identifier (Stop variant).
     workload_id: string;
     // Tenant the record belongs to (all variants).
+    tenant: string;
+}
+
+// A named platform resource recorded in the guest-owned catalogue.
+//
+// The catalogue lives in the control-plane guest (see the
+// `resource-catalogue` spec): the runtime holds no naming metadata. `uri` is
+// the registered name; `class` is the resource class's URI segment (e.g.
+// `region`, `volume`); `owner` is the process that owns the underlying
+// resource; `tenant` is the registering session's tenant scope; `purpose` is
+// a free-form informational tag; `resource_id` is the shared resource id the
+// name resolves to.
+table CatalogueRecord {
+    uri: string;
+    class: string;
+    owner: ulong;
+    tenant: string;
+    purpose: string;
+    resource_id: ulong;
+}
+
+// A catalogue log record appended to the control plane's catalogue durable log.
+//
+// Variant tag values:
+//   0 = Register(record)
+//   1 = Remove { uri }
+table CatalogueLogRecord {
+    variant: ubyte;
+    // The catalogue record (Register variant).
+    record: CatalogueRecord;
+    // URI of the removed name (Remove variant).
+    uri: string;
+    // Tenant the removed name belonged to (Remove variant).
     tenant: string;
 }
 

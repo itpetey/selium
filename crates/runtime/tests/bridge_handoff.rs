@@ -19,7 +19,7 @@ use selium_abi::{
     HostcallRequest, Namespace, ProcessId, RegionProt, ResourceClass, ResourceIdentity,
     ResourceSelector, client_identity::ClientIdentity,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 /// Bootstraps the connector (the registered Tier-1 handler for `sel-quic`)
 /// and the single per-platform bridge-server (a root guest holding a
@@ -35,7 +35,6 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
-            domain_table: Vec::new(),
             system_guests: vec![
                 SystemGuestDescriptor {
                     name: "bridge-connector".to_string(),
@@ -53,10 +52,8 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
                             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
                         ),
                     ],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
                     tenant: None,
-                    serving_role: None,
+                    discovery_service: false,
                     handlers: vec!["sel-quic".to_string()],
                 },
                 SystemGuestDescriptor {
@@ -80,10 +77,8 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
                             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
                         ),
                     ],
-                    dependencies: Vec::new(),
-                    readiness: ReadinessCondition::Immediate,
                     tenant: None,
-                    serving_role: None,
+                    discovery_service: false,
                     handlers: Vec::new(),
                 },
             ],
@@ -100,21 +95,10 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
     let connector = find("bridge-connector").process_id;
     let bridge_server = find("bridge-server").process_id;
 
-    // The bridge-server pins its listener to the registered `sel-quic`
-    // handler: handoffs from any other process must be refused. The handler
-    // resolution is bootstrap-authoritative.
-    let (_, handler_op) = runtime.begin_hostcall(
-        bridge_server,
-        HostcallRequest::ResolveProtocolHandler {
-            scheme: "sel-quic".to_string(),
-        },
-    );
-    match runtime.poll_hostcall(bridge_server, handler_op) {
-        CompletionState::Ready(HostcallOutput::U64(handler)) => {
-            assert_eq!(handler, connector, "handler pin must be the connector")
-        }
-        other => panic!("expected handler pid, got {other:?}"),
-    }
+    // Handler resolution is now a discovery lookup (the runtime publishes a
+    // host-authored handler registration on the Tier-1 feed); this substrate
+    // test drives hostcalls directly, so the pin is exercised by the bridge
+    // spine test rather than here.
 
     (runtime, connector, bridge_server)
 }
@@ -142,7 +126,12 @@ fn bridge_listener_and_connector_queue(
         panic!("bridge-server should create its own listener queue");
     };
 
-    discovery_records_resolve(runtime, connector, server_listener.shared_id);
+    owner_declares_and_records_resolve(
+        runtime,
+        bridge_server,
+        connector,
+        server_listener.shared_id,
+    );
     let (_, attach_op) = runtime.begin_hostcall(
         connector,
         HostcallRequest::HostQueueAttach {
@@ -168,13 +157,6 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
     // entrypoint, so the registration is exercised at the queue-minting
     // level).
     let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
-
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_entrypoint("bridge_channel"),
-        )
-        .expect("register bridge-channel module");
 
     // 1. The bridge-server creates its own listener queue (self-registration
     //    replaces the runtime's well-known-URI queue minting). The queue is
@@ -207,7 +189,13 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
     //    hold these grants). The root-scoped delegation admits the grants
     //    because every child grant carries a tenant selector, and the root
     //    namespace is greater than any tenant.
-    let child_pid = spawn_bridge_channel(&runtime, bridge_server, "acme", stream_region.region_id);
+    let child_pid = spawn_bridge_channel(
+        &runtime,
+        module_with_entrypoint("bridge_channel"),
+        bridge_server,
+        "acme",
+        stream_region.region_id,
+    );
 
     // 5. The bridge-channel runs under the identity's tenant, not the root
     //    bridge-server's: the tenant-scoped spawn scopes the child to the
@@ -232,12 +220,6 @@ fn bridge_server_delegates_and_child_attaches_stream_region() {
 #[test]
 fn completed_bridge_channel_is_reaped_without_zombie() {
     let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_completing_poll(),
-        )
-        .expect("register bridge-channel module");
     // An authored ceiling makes the process-slot usage observable.
     runtime
         .kernel()
@@ -245,7 +227,13 @@ fn completed_bridge_channel_is_reaped_without_zombie() {
         .set("acme", ResourceClass::Process, 5);
 
     let before = runtime.loaded_guest_count();
-    let child = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
+    let child = spawn_bridge_channel(
+        &runtime,
+        module_with_completing_poll(),
+        bridge_server,
+        "acme",
+        42,
+    );
     assert_eq!(runtime.loaded_guest_count(), before + 1);
     assert_eq!(
         runtime
@@ -326,16 +314,41 @@ fn deliver_handoff(
     stream_region
 }
 
-fn discovery_records_resolve(runtime: &Runtime, client: ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new(), None);
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: ProcessId,
+    client: ProcessId,
+    shared_id: u64,
+) {
     let (status, _op) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: selium_abi::AttachDeclarationScope::Any,
         },
     );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the queue owner must declare it attachable by resolution"
+    );
+    let (status, _op) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
+    );
 }
 
 /// A bridge-channel stub whose `__selium_guest_poll` export reports entrypoint
@@ -374,12 +387,6 @@ fn module_with_entrypoint_args(entrypoint: &str, args: usize) -> Vec<u8> {
 #[test]
 fn process_ceiling_denies_bridge_channel_spawn() {
     let (runtime, _connector, bridge_server) = bootstrap_connector_and_bridge();
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_completing_poll(),
-        )
-        .expect("register bridge-channel module");
     // Author a ceiling of one bridge-channel process for the tenant.
     runtime
         .kernel()
@@ -387,11 +394,23 @@ fn process_ceiling_denies_bridge_channel_spawn() {
         .set("acme", ResourceClass::Process, 1);
 
     // One spawn consumes the only slot.
-    let first = spawn_bridge_channel(&runtime, bridge_server, "acme", 42);
+    let first = spawn_bridge_channel(
+        &runtime,
+        module_with_completing_poll(),
+        bridge_server,
+        "acme",
+        42,
+    );
 
     // The second spawn is denied before a second child is created.
-    let denied = spawn_bridge_channel_result(&runtime, bridge_server, "acme", 43)
-        .expect_err("a spawn over the ceiling must be denied");
+    let denied = spawn_bridge_channel_result(
+        &runtime,
+        module_with_entrypoint("bridge_channel"),
+        bridge_server,
+        "acme",
+        43,
+    )
+    .expect_err("a spawn over the ceiling must be denied");
     assert_eq!(denied.code, AbiErrorCode::QuotaExceeded);
     assert_eq!(
         runtime
@@ -409,7 +428,13 @@ fn process_ceiling_denies_bridge_channel_spawn() {
     // The bridge keeps no spawn counter: once the first child exits (the poll
     // completion reaps it), its slot returns and a spawn succeeds again.
     runtime.poll_guest(first);
-    let _second = spawn_bridge_channel(&runtime, bridge_server, "acme", 44);
+    let _second = spawn_bridge_channel(
+        &runtime,
+        module_with_entrypoint("bridge_channel"),
+        bridge_server,
+        "acme",
+        44,
+    );
     assert_eq!(
         runtime
             .kernel()
@@ -454,13 +479,6 @@ fn recv_handoff(
 fn single_instance_bridge_serves_two_tenants_without_leak() {
     let (runtime, connector, bridge_server) = bootstrap_connector_and_bridge();
 
-    runtime
-        .register_module_bytes(
-            "bridge-channel-module".to_string(),
-            module_with_entrypoint("bridge_channel"),
-        )
-        .expect("register bridge-channel module");
-
     let (server_listener_local_id, connector_queue_local_id) =
         bridge_listener_and_connector_queue(&runtime, connector, bridge_server);
 
@@ -495,8 +513,20 @@ fn single_instance_bridge_serves_two_tenants_without_leak() {
 
     // Each handoff spawns a bridge-channel scoped to its own identity's
     // tenant under the root `DelegateGrants`.
-    let acme_child = spawn_bridge_channel(&runtime, bridge_server, "acme", acme_region.region_id);
-    let beta_child = spawn_bridge_channel(&runtime, bridge_server, "beta", beta_region.region_id);
+    let acme_child = spawn_bridge_channel(
+        &runtime,
+        module_with_entrypoint("bridge_channel"),
+        bridge_server,
+        "acme",
+        acme_region.region_id,
+    );
+    let beta_child = spawn_bridge_channel(
+        &runtime,
+        module_with_entrypoint("bridge_channel"),
+        bridge_server,
+        "beta",
+        beta_region.region_id,
+    );
     assert_eq!(
         runtime.process_tenant(acme_child).as_deref(),
         Some("acme"),
@@ -532,11 +562,12 @@ fn single_instance_bridge_serves_two_tenants_without_leak() {
 #[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
 fn spawn_bridge_channel(
     runtime: &Runtime,
+    module: Vec<u8>,
     bridge_server: ProcessId,
     tenant: &str,
     region_id: u64,
 ) -> ProcessId {
-    spawn_bridge_channel_result(runtime, bridge_server, tenant, region_id)
+    spawn_bridge_channel_result(runtime, module, bridge_server, tenant, region_id)
         .unwrap_or_else(|error| panic!("delegated spawn must succeed, got {error:?}"))
 }
 
@@ -549,6 +580,7 @@ fn spawn_bridge_channel(
 )]
 fn spawn_bridge_channel_result(
     runtime: &Runtime,
+    module: Vec<u8>,
     bridge_server: ProcessId,
     tenant: &str,
     region_id: u64,
@@ -572,7 +604,7 @@ fn spawn_bridge_channel_result(
     let (status, spawn_op) = runtime.begin_hostcall(
         bridge_server,
         HostcallRequest::ProcessStart {
-            module_id: "bridge-channel-module".to_string(),
+            source: selium_abi::ModuleSource::Inline(module),
             entrypoint: "bridge_channel".to_string(),
             arguments: Vec::new(),
             grants: child_grants,
@@ -588,39 +620,6 @@ fn spawn_bridge_channel_result(
         CompletionState::Failed(error) => Err(error),
         other => panic!("expected spawn outcome, got status={status} outcome={other:?}"),
     }
-}
-
-fn spawn_guest(
-    runtime: &Runtime,
-    name: &str,
-    grants: Vec<CapabilityGrant>,
-    tenant: Option<&str>,
-) -> ProcessId {
-    let report = runtime
-        .bootstrap_system_guests(RuntimeConfig {
-            start_discovery: false,
-            domain_table: Vec::new(),
-            system_guests: vec![SystemGuestDescriptor {
-                name: name.to_string(),
-                module_id: format!("{name}-module"),
-                module_bytes: module_with_entrypoint("boot"),
-                entrypoint: "boot".to_string(),
-                arguments: Vec::new(),
-                grants,
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
-                tenant: tenant.map(str::to_string),
-                serving_role: None,
-                handlers: Vec::new(),
-            }],
-            state_dir: None,
-        })
-        .expect("bootstrap guest");
-    report
-        .guests
-        .first()
-        .expect("bootstrap report contains the requested guest")
-        .process_id
 }
 
 /// Attempts to attach `region_id`, returning the attach offset on success or

@@ -147,6 +147,21 @@ pub fn render(command: &Command, response: ControlResponse) -> (String, ExitCode
         ControlResponse::Error { step, context } => {
             (format!("{step}: {context}"), ExitCode::FAILURE)
         }
+        ControlResponse::Registered { record } => (
+            format!("registered {} ({})", record.uri, record.class),
+            ExitCode::SUCCESS,
+        ),
+        ControlResponse::Removed { uri } => (format!("removed {uri}"), ExitCode::SUCCESS),
+        ControlResponse::Lookup {
+            record: Some(record),
+        } => (
+            format!(
+                "{}: {} resource {}",
+                record.uri, record.class, record.resource_id
+            ),
+            ExitCode::SUCCESS,
+        ),
+        ControlResponse::Lookup { record: None } => ("not found".to_string(), ExitCode::FAILURE),
     }
 }
 

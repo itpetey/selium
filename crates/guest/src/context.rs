@@ -1,11 +1,27 @@
+use std::time::Duration;
+
 use selium_abi::uri::{self, DomainTable};
-use selium_service::{DiscoveryRequest, DiscoveryResponse, ResourceTarget};
-use selium_shm::rpc::{self, OwnedRpcClient};
+use selium_abi::{
+    HostcallOutput, HostcallRequest, RegionAllocation, RegionProt, ResourceClass, ResourceKind,
+};
+use selium_service::{
+    CatalogueRecord, ControlRequest, ControlResponse, DiscoveryRequest, DiscoveryResponse,
+    REGISTRATION_LEASE_TTL_MS, ResourceTarget,
+};
+use selium_shm::{
+    Channel,
+    rpc::{self, OwnedRpcClient},
+    transport::ShmTransport,
+};
+use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 
 use crate::{
     GuestError,
+    control::{self, CONTROL_ROUTE, ControlClient},
+    hostcall::hostcall_ready,
     resource::ResourceSender,
     store::{self, BlobStore, DurableLog, STORE_ROUTE, StoreClient},
+    watch::{ROUTE_TABLE_ROUTE, RouteWatch},
 };
 
 /// RPC ring capacity for discovery replies.
@@ -40,6 +56,12 @@ pub struct Context {
     client: OwnedRpcClient<DiscoveryRequest, DiscoveryResponse>,
     /// Client of the durable store service, connected lazily on first use.
     store_client: Option<StoreClient>,
+    /// Client of the control-plane resource catalogue, connected lazily on
+    /// first use.
+    control_client: Option<ControlClient>,
+    /// URIs this context has already started a lease renewal for, so repeated
+    /// registrations of one route keep a single renewal task.
+    renewing: std::collections::BTreeSet<String>,
 }
 
 impl Context {
@@ -68,6 +90,8 @@ impl Context {
             handle: discovery_handle,
             client,
             store_client: None,
+            control_client: None,
+            renewing: std::collections::BTreeSet::new(),
         })
     }
 
@@ -105,6 +129,256 @@ impl Context {
         BlobStore::open(client, name).await
     }
 
+    /// Returns a client of the control-plane resource catalogue, connecting
+    /// on first use.
+    ///
+    /// The control route is resolved for the caller, so a guest never has to
+    /// know it. When the catalogue is not reachable the request fails with a
+    /// typed error rather than hanging; name resolution is gated on the
+    /// catalogue, allocation is not.
+    pub async fn catalogue(&mut self) -> Result<ControlClient, GuestError> {
+        if let Some(client) = self.control_client.clone() {
+            return Ok(client);
+        }
+        let target = self.lookup(CONTROL_ROUTE).await?.ok_or_else(|| {
+            GuestError::Host(format!("catalogue service unreachable: {CONTROL_ROUTE}"))
+        })?;
+        let sender = ResourceSender::attach(target.resource_id)?;
+        let client = control::connect(sender).await?;
+        self.control_client = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Allocates a shared region and registers a name for it with the resource
+    /// catalogue.
+    ///
+    /// Allocation is a host primitive (the `AllocRegion` hostcall) and stays
+    /// independent of the catalogue; only the name registration is an RPC, so
+    /// an unreachable catalogue never blocks allocation itself. The region is
+    /// registered under the calling guest's tenant and its own process as
+    /// owner.
+    pub async fn create_region(
+        &mut self,
+        name: impl Into<String>,
+        pages: u32,
+        purpose: ResourceKind,
+    ) -> Result<RegionAllocation, GuestError> {
+        // Hot path: the host allocates the region; no catalogue dependency.
+        let allocation = match hostcall_ready(HostcallRequest::AllocRegion {
+            pages,
+            prot: RegionProt::ReadWrite,
+            purpose,
+            serving_tenant: None,
+        })
+        .map_err(|error| GuestError::Host(error.to_string()))?
+        {
+            HostcallOutput::RegionAlloc(allocation) => allocation,
+            other => {
+                return Err(GuestError::Host(format!(
+                    "unexpected hostcall output for AllocRegion: {other:?}"
+                )));
+            }
+        };
+
+        let name = name.into();
+        let client = self.catalogue().await?;
+        let reply = client
+            .request(ControlRequest::RegisterResource {
+                uri: name,
+                class: ResourceClass::SharedRegion.uri_segment().to_string(),
+                owner: crate::process_id(),
+                purpose: format!("{purpose:?}"),
+                resource_id: allocation.region_id,
+            })
+            .await?;
+        match reply {
+            ControlResponse::Registered { .. } => Ok(allocation),
+            other => Err(GuestError::Host(format!(
+                "unexpected catalogue registration reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// Resolves a catalogue name to the record it identifies, scoped to the
+    /// calling guest's tenant.
+    ///
+    /// Returns `None` when the name is unknown in the caller's tenant (a name
+    /// registered under another tenant is invisible).
+    pub async fn resolve_region(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<CatalogueRecord>, GuestError> {
+        let client = self.catalogue().await?;
+        match client
+            .request(ControlRequest::LookupResource {
+                uri: name.to_string(),
+            })
+            .await?
+        {
+            ControlResponse::Lookup { record } => Ok(record),
+            other => Err(GuestError::Host(format!(
+                "unexpected catalogue lookup reply: {other:?}"
+            ))),
+        }
+    }
+
+    /// Watches a registry route, yielding its lifecycle changes.
+    ///
+    /// The watch is seeded from the route's current state (an authoritative
+    /// one-shot resolve) and then applies changes from the discovery
+    /// route-change table, so a consumer converges on a provider that is not
+    /// yet registered and re-attaches when a provider is replaced.
+    ///
+    /// ```ignore
+    /// // Guest code: converge on the store, then re-attach if it restarts.
+    /// let mut watch = ctx.watch("sel:///store").await?;
+    /// while let Ok(event) = watch.next().await {
+    ///     match event {
+    ///         RouteEvent::Appeared(target) | RouteEvent::Replaced(target) => {
+    ///             let sender = ResourceSender::attach(target.resource_id)?;
+    ///             // ... use the store ...
+    ///         }
+    ///         RouteEvent::Revoked => { /* wait for the provider to return */ }
+    ///     }
+    /// }
+    /// ```
+    pub async fn watch(&mut self, uri: &str) -> Result<RouteWatch, GuestError> {
+        let table = self.lookup(ROUTE_TABLE_ROUTE).await?.ok_or_else(|| {
+            GuestError::Host(format!("route table unreachable: {ROUTE_TABLE_ROUTE}"))
+        })?;
+        let channel = Channel::attach(table.resource_id)
+            .map_err(|error| GuestError::Host(format!("route table attach: {error}")))?;
+        let transport = ShmTransport::new_replay(&channel, &channel)
+            .map_err(|error| GuestError::Host(format!("route table transport: {error}")))?;
+        let subscriber = Subscriber::new(FramedRead::new(transport), None);
+        let view = LiveTableView::new(subscriber)
+            .map_err(|error| GuestError::Host(format!("route table view: {error}")))?;
+        // Authoritative seed: a one-shot resolve is not subject to ring wrap.
+        let seed = self.lookup(uri).await?;
+        // Read the baseline version *after* the seed, so it can only lag the
+        // seed — never lead it. A change published between the resolve and this
+        // read is therefore reported once as a real replacement, while a change
+        // published before both is already in the seed and produces no
+        // duplicate `Appeared`+`Replaced` pair.
+        view.sync()
+            .map_err(|error| GuestError::Host(format!("route table sync: {error}")))?;
+        let version = view
+            .get_record(&uri.to_string())
+            .map_err(|error| GuestError::Host(format!("route table read: {error}")))?
+            .map(|record| record.version)
+            .unwrap_or(0);
+        Ok(RouteWatch::new(uri.to_string(), seed, version, view))
+    }
+
+    /// Resolves a route once it is ready, converging rather than failing when
+    /// the provider has not registered yet.
+    ///
+    /// This is the retry-aware form of [`lookup`](Self::lookup): it re-resolves
+    /// on a jittered exponential backoff until the route appears or `bound`
+    /// elapses, so a consumer started before its provider converges while a
+    /// provider that never appears yields a typed timeout error rather than
+    /// waiting forever. An unreachable registry surfaces as a typed error.
+    ///
+    /// Long-lived consumers that must also observe later replacements should
+    /// use [`watch`](Self::watch) instead: delivery there is event-driven.
+    pub async fn resolve_ready(
+        &mut self,
+        uri: &str,
+        bound: Duration,
+    ) -> Result<ResourceTarget, GuestError> {
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+        const MAX_BACKOFF: Duration = Duration::from_millis(500);
+        let deadline = crate::Instant::now()?.checked_add(bound).ok_or_else(|| {
+            GuestError::Host(format!("resolve bound overflows the clock for {uri}"))
+        })?;
+        let mut backoff = INITIAL_BACKOFF;
+        let mut attempt: u32 = 0;
+        loop {
+            if let Some(target) = self.lookup(uri).await? {
+                return Ok(target);
+            }
+            let now = crate::Instant::now()?;
+            if now >= deadline {
+                return Err(GuestError::Host(format!(
+                    "route did not become ready within {bound:?}: {uri}"
+                )));
+            }
+            let wait = backoff.min(deadline - now);
+            crate::Timer::new(now + wait + jitter_for(crate::process_id(), attempt, wait)).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            attempt = attempt.wrapping_add(1);
+        }
+    }
+
+    /// Publishes this guest's health as observable state.
+    ///
+    /// Health is a tenant-scoped record peers and the supervisor can resolve
+    /// and watch — a health *record*, not a readiness signal. The record is not
+    /// lease-expired (that would report every healthy long-running guest as
+    /// unhealthy) and is revoked when this guest's process exits; liveness
+    /// itself is carried by the route leases this guest renews.
+    pub async fn publish_health(&mut self, name: &str) -> Result<(), GuestError> {
+        let response = self
+            .discovery()
+            .request(DiscoveryRequest::SetHealth {
+                name: name.to_string(),
+                healthy: true,
+            })
+            .await
+            .map_err(|e| GuestError::Host(format!("discovery health publish: {e}")))?;
+        match response {
+            DiscoveryResponse::Registered => Ok(()),
+            other => Err(GuestError::Host(format!(
+                "unexpected discovery response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Removes this guest's health record, marking it unhealthy.
+    pub async fn unpublish_health(&mut self, name: &str) -> Result<(), GuestError> {
+        let response = self
+            .discovery()
+            .request(DiscoveryRequest::SetHealth {
+                name: name.to_string(),
+                healthy: false,
+            })
+            .await
+            .map_err(|e| GuestError::Host(format!("discovery health unpublish: {e}")))?;
+        match response {
+            DiscoveryResponse::Revoked => Ok(()),
+            other => Err(GuestError::Host(format!(
+                "unexpected discovery response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Observes a health record in the caller's tenant.
+    ///
+    /// Returns whether the record is present. Absence is not an error: a record
+    /// may never have been published, or may have been revoked or lapsed.
+    pub async fn observe_health(&mut self, name: &str) -> Result<bool, GuestError> {
+        let (_, tenant) = crate::self_info()?;
+        Ok(self
+            .lookup(&health_uri(tenant.as_deref(), name))
+            .await?
+            .is_some())
+    }
+
+    /// Resolves the bootstrap-registered protocol handler for `scheme` via
+    /// discovery.
+    ///
+    /// Handler registration is host-authored (published on the Tier-1 feed
+    /// from a guest descriptor), so the result cannot be forged by a guest.
+    /// Serve-side guests use it to pin the process legitimately allowed to
+    /// deliver handoffs.
+    pub async fn resolve_protocol_handler(
+        &mut self,
+        scheme: &str,
+    ) -> Result<Option<selium_abi::ProcessId>, GuestError> {
+        let uri = format!("{}/handler/{}", uri::SEL_PREFIX, scheme);
+        Ok(self.lookup(&uri).await?.map(|target| target.resource_id))
+    }
+
     /// Returns the raw discovery host-queue handle this context was built
     /// from. Useful when a guest needs to forward the handle onward (e.g. to
     /// a spawned child via [`crate::Process::start`]) after receiving its
@@ -117,9 +391,10 @@ impl Context {
     /// wire name) to a resource via the discovery service.
     ///
     /// Convenience method that delegates to `self.discovery().request()`.
-    /// A successful resolve also gives the caller an authorisation basis for
-    /// `HostQueueAttach` on the returned queue: the discovery service records
-    /// the resolved id with the runtime on the caller's behalf.
+    /// When the resolved resource's owner declared it attachable by
+    /// resolution, the discovery service records the resolved id with the
+    /// runtime on the caller's behalf, giving the caller an authorisation
+    /// basis for `HostQueueAttach`/`AttachRegion` on the returned resource.
     pub async fn lookup(&mut self, uri: &str) -> Result<Option<ResourceTarget>, GuestError> {
         let request = DiscoveryRequest::Resolve(uri.to_string());
 
@@ -203,7 +478,25 @@ impl Context {
         // onto the target so discovery registers under that URI.
         let mut target = serve.target;
         target.uri = uri.clone();
+        // A served resource is published for other guests to resolve and
+        // attach, so the owner declares it attachable by resolution. The
+        // declaration admits the whole platform: discovery's own resolve is
+        // already tenant-scoped, and root-namespace system guests must be able
+        // to attach a served resource too (e.g. a shared connector).
+        let attachable_class = matches!(
+            target.class,
+            selium_abi::ResourceClass::SharedRegion | selium_abi::ResourceClass::HostQueue
+        )
+        .then(|| target.class.clone());
+        let resource_id = target.resource_id;
         self.register_inner(&uri, target, serve.default).await?;
+        if let Some(class) = attachable_class {
+            crate::hostcall::declare_attachable_by_resolution(
+                class,
+                resource_id,
+                selium_abi::AttachDeclarationScope::Any,
+            )?;
+        }
         Ok(uri)
     }
 
@@ -229,7 +522,10 @@ impl Context {
             .map_err(|e| GuestError::Host(format!("discovery register: {e}")))?;
 
         match response {
-            DiscoveryResponse::Registered => Ok(()),
+            DiscoveryResponse::Registered => {
+                self.spawn_lease_renewal(uri.to_string());
+                Ok(())
+            }
             DiscoveryResponse::Forbidden => Err(GuestError::Host(
                 "registration forbidden: process does not own the route or lacks the \
                  system-registration capability"
@@ -239,6 +535,49 @@ impl Context {
                 "unexpected discovery response: {other:?}"
             ))),
         }
+    }
+
+    /// Spawns a background task that renews the lease of a registration this
+    /// guest owns, keeping its route (or health record) live.
+    ///
+    /// At most one renewal task runs per URI: `serve` and `publish_health` may
+    /// both register the same route during a guest's boot.
+    fn spawn_lease_renewal(&mut self, uri: String) {
+        if !self.renewing.insert(uri.clone()) {
+            return;
+        }
+        // Renew at half the registry's lease TTL, leaving a full half-window of
+        // margin before expiry.
+        let interval = Duration::from_millis(REGISTRATION_LEASE_TTL_MS / 2);
+        let handle = self.handle;
+        crate::spawn(async move {
+            let mut ctx = match Context::from_raw(handle).await {
+                Ok(ctx) => ctx,
+                Err(_) => return,
+            };
+            loop {
+                let deadline = match crate::Instant::now() {
+                    Ok(now) => now + interval,
+                    Err(_) => return,
+                };
+                crate::Timer::new(deadline).await;
+                let response = ctx
+                    .discovery()
+                    .request(DiscoveryRequest::Renew { uri: uri.clone() })
+                    .await;
+                match response {
+                    Ok(DiscoveryResponse::Registered) => {}
+                    // The route is gone or no longer this guest's to renew, so
+                    // stopping here is what lets a revoked record lapse.
+                    Ok(_) => return,
+                    // A transient transport failure does not surrender the
+                    // lease: one half-window still remains before expiry, so
+                    // keep trying at the next interval instead of letting a
+                    // live registration lapse on a single hiccup.
+                    Err(_) => {}
+                }
+            }
+        });
     }
 
     /// Revokes a URI→target mapping in the discovery service.
@@ -264,6 +603,32 @@ impl Context {
     }
 }
 
+/// The tenant-scoped health route for `name`.
+fn health_uri(tenant: Option<&str>, name: &str) -> String {
+    format!(
+        "{}{}/health/{}",
+        uri::SEL_PREFIX,
+        tenant.unwrap_or_default(),
+        name
+    )
+}
+
+/// Spreads retrying consumers apart so they do not stampede one provider.
+///
+/// The offset is derived from the process id and the attempt number — no
+/// entropy source is needed in a guest, and two consumers converging on the
+/// same route still wake at different times.
+fn jitter_for(process_id: u64, attempt: u32, wait: Duration) -> Duration {
+    let span_ms = wait.as_millis() as u64 / 2;
+    if span_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mixed = process_id
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(attempt % 64);
+    Duration::from_millis(mixed % span_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,8 +642,27 @@ mod tests {
     }
 
     #[test]
+    fn jitter_spreads_retrying_consumers_within_half_the_backoff() {
+        let wait = Duration::from_millis(100);
+        // Deterministic for a given process and attempt: no entropy source is
+        // available in a guest.
+        let first = jitter_for(42, 0, wait);
+        assert_eq!(first, jitter_for(42, 0, wait));
+        assert!(first < wait / 2, "jitter stays inside its half-window");
+        assert!(
+            jitter_for(43, 0, wait) != first,
+            "two consumers do not wake in lockstep"
+        );
+        assert_ne!(jitter_for(42, 1, wait), first, "successive attempts differ");
+        assert_eq!(
+            jitter_for(42, 0, Duration::from_millis(1)),
+            Duration::ZERO,
+            "no jitter below a 2 ms window"
+        );
+    }
+
+    #[test]
     fn serve_rejects_non_projectable_paths() {
-        // Typed resource paths and non-DNS-safe segments cannot project.
         assert!(uri::labels_from_path("region/7").is_none());
         assert!(uri::labels_from_path("Foo").is_none());
         assert_eq!(

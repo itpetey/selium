@@ -143,7 +143,7 @@ Every process SHALL be addressable as a typed entry `sel://<tenant>/proc/<id>` f
 - **WHEN** process 123 of tenant "acme" is spawned and allocates nothing
 - **THEN** resolving `sel://acme/proc/123` SHALL return the process's target
 
-### Requirement: Guest Revocation Authorization
+### Requirement: Guest Revocation Authorisation
 A guest (Tier-2) SHALL be permitted to revoke only custom registrations — leaf aliases and opaque external names — whose target resource the guest owns, and only within the guest's own tenant. Revocation of a typed URI over Tier-2 SHALL be rejected (`Forbidden`): typed URIs are runtime-minted and revoked over the Tier-1 feed. Revocation of an unknown key SHALL return `NotFound`.
 
 #### Scenario: Guest revokes own external name
@@ -214,7 +214,7 @@ Registration in the root/system tenant SHALL be permitted only when the guest ho
 - **THEN** the registration SHALL be accepted
 
 ### Requirement: FlatBuffers Tier-1 Discovery Feed
-The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded `DiscoveryRequest` values. The runtime SHALL publish typed `DiscoveryRequest` values (encoded via `FlatMsg`) instead of raw rkyv bytes, and the discovery guest SHALL subscribe to and decode typed `DiscoveryRequest` values via `FlatMsg`. The feed representation SHALL cover every Tier-1 operation — `Register` (including an optional owner), `Revoke`, `RevokeByOwner`, and `SeedDomain` — without lossy collapse onto an unrelated variant.
+The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded `DiscoveryRequest` values. The runtime SHALL publish typed `DiscoveryRequest` values (encoded via `FlatMsg`) instead of raw rkyv bytes, and the discovery guest SHALL subscribe to and decode typed `DiscoveryRequest` values via `FlatMsg`. The feed representation SHALL cover every Tier-1 operation — `Register` (including an optional owner), `Revoke`, `RevokeByOwner`, `RevokeResource` (revoking the registration recorded for a resource identity), `RegisterHandler`, and `SeedDomain` — without lossy collapse onto an unrelated variant.
 
 #### Scenario: Process-node registration round-trips over the feed
 - **WHEN** the runtime publishes a `DiscoveryRequest::Register` for a spawned process
@@ -225,6 +225,14 @@ The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded `Dis
 - **THEN** the feed SHALL carry the operation with its `process_id` intact
 - **AND** the discovery guest SHALL decode it as `RevokeByOwner` rather than another variant
 
+#### Scenario: Revoke-by-resource round-trips over the feed
+- **WHEN** the runtime publishes `DiscoveryRequest::RevokeResource { class, id }` for a freed resource
+- **THEN** the discovery guest SHALL decode it and revoke the registration recorded for that resource identity
+
+#### Scenario: Host-authored handler registration round-trips
+- **WHEN** the runtime publishes a host-authored handler registration
+- **THEN** the discovery guest SHALL record the handler's owning process
+
 #### Scenario: Seed-domain round-trips over the feed
 - **WHEN** the runtime publishes `DiscoveryRequest::SeedDomain { domain, tenant }`
 - **THEN** the feed SHALL carry both `domain` and `tenant` intact to the discovery guest
@@ -232,3 +240,24 @@ The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded `Dis
 #### Scenario: Feed is not rkyv-encoded
 - **WHEN** the runtime publishes to or the discovery guest reads from the Tier-1 feed
 - **THEN** neither side SHALL use `selium_abi::encode_rkyv` or `decode_rkyv` for the feed payload
+
+### Requirement: Route Change Publication
+
+The registry SHALL publish route lifecycle changes — appearance, replacement and
+revocation (including lease expiry) — to watching consumers, and SHALL carry a
+generation that advances on replacement.
+
+#### Scenario: Registration publishes an appearance
+
+- **WHEN** a route is registered
+- **THEN** the registry SHALL publish an appearance for that route
+
+#### Scenario: Lease expiry publishes a revocation
+
+- **WHEN** a registration's lease lapses
+- **THEN** the registry SHALL publish a revocation for that route
+
+#### Scenario: Replacement advances the generation
+
+- **WHEN** a route is re-registered with a new target
+- **THEN** the published change SHALL carry a generation greater than the previous registration's

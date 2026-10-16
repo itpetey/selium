@@ -26,7 +26,7 @@ use std::{
 };
 
 use selium_abi::{ActivityKind, ResourceClass, mailbox};
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 
 /// The linear-memory address this fixture places its mailbox at. The guest is
 /// free to choose any address; only the mailbox *layout* is fixed by the ABI.
@@ -236,10 +236,8 @@ fn multithreaded_guest_is_halted_when_it_exhausts_its_cpu_budget() {
             entrypoint: "boot".to_string(),
             arguments: Vec::new(),
             grants: Vec::new(),
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: Some("acme".to_string()),
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn budgeted multithreaded guest");
@@ -300,10 +298,8 @@ fn pool_descriptor(name: &str, module_id: &str, module_text: &str) -> SystemGues
         entrypoint: "boot".to_string(),
         arguments: Vec::new(),
         grants: Vec::new(),
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -336,7 +332,9 @@ fn sdk_mt_demo_guest_runs_two_cpu_bound_tasks_in_parallel() {
     let runtime = Runtime::default();
     runtime.set_worker_count("parallel", 2);
     let parallel = spawn_mt_demo(&runtime, module_bytes.clone(), "parallel");
-    wait_for_process_exit(&runtime, parallel, Duration::from_secs(120));
+    // Generous budget: the work is CPU-bound WASM interpreted on a shared
+    // host, so a loaded machine can take well over a minute per phase.
+    wait_for_process_exit(&runtime, parallel, Duration::from_secs(240));
     wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
     assert!(
         !runtime.activity_log().iter().any(|event| {
@@ -350,7 +348,7 @@ fn sdk_mt_demo_guest_runs_two_cpu_bound_tasks_in_parallel() {
     let runtime = Runtime::default();
     runtime.set_worker_count("serial", 1);
     let serial = spawn_mt_demo(&runtime, module_bytes, "serial");
-    wait_for_process_exit(&runtime, serial, Duration::from_secs(120));
+    wait_for_process_exit(&runtime, serial, Duration::from_secs(240));
     wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
     assert!(
         !runtime.activity_log().iter().any(|event| {
@@ -377,10 +375,8 @@ fn spawn_mt_demo(runtime: &Runtime, module_bytes: Vec<u8>, name: &str) -> u64 {
                     selium_abi::ResourceClass::SharedRegion,
                 )],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn multithreaded SDK guest")

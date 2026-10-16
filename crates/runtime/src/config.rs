@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::PathBuf};
 
-use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId};
+use selium_abi::{CapabilityGrant, EntrypointMetadata, ProcessId, ResourceClass};
 
 /// A single entrypoint argument, in declaration order.
 ///
@@ -13,15 +13,6 @@ pub enum SystemGuestArg {
     Integer(u64),
     /// A pointer argument passed as two `i64` slots: `(address, length)`.
     Pointer(Vec<u8>),
-}
-
-/// Condition used to decide when a bootstrapped system guest is ready.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadinessCondition {
-    /// Guest is considered ready immediately after start.
-    Immediate,
-    /// Guest is ready once the activity log contains the supplied text.
-    ActivityLogContains(String),
 }
 
 /// Configuration for a system guest that should be bootstrapped by the runtime.
@@ -39,24 +30,23 @@ pub struct SystemGuestDescriptor {
     pub arguments: Vec<SystemGuestArg>,
     /// Capability grants assigned to the guest process.
     pub grants: Vec<CapabilityGrant>,
-    /// Names of system guests that must become ready first.
-    pub dependencies: Vec<String>,
-    /// Readiness condition for this guest.
-    pub readiness: ReadinessCondition,
     /// Tenant identity for this guest. `None` means "platform tenant".
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
-    /// Serving role this guest declares: the internal route URI it registers
-    /// itself (e.g. `sel:///dns/resolve` or `sel://acme/bridge`). When set,
-    /// readiness additionally requires the registration to be observable in
-    /// discovery (recorded by the discovery service), replacing the runtime's
-    /// old well-known-URI provisioning. `mark_ready()` stays a bare signal.
-    pub serving_role: Option<String>,
     /// Protocol handler names this guest serves (e.g. `sel-http` for
-    /// `selium-connector-http`). The runtime records these so serve-side
-    /// guests can pin their listeners to the handler process via
-    /// `ResolveProtocolHandler`; the registry is revoked on teardown.
+    /// `selium-connector-http`). The runtime publishes a host-authored
+    /// registration for each so serve-side guests can pin their listeners to
+    /// the handler process.
     pub handlers: Vec<String>,
+    /// Declares this guest as the platform's discovery service: it consumes the
+    /// Tier-1 feed ring and hosts the RPC listener other guests resolve
+    /// through.
+    ///
+    /// Bootstrap wires the feed region and listener handle into whichever
+    /// descriptor declares this, so the runtime never has to recognise a guest
+    /// by name — a differently-named registry implementation composes the same
+    /// way. It is bootstrap *wiring*, not authority: no hostcall is gated on it.
+    pub discovery_service: bool,
 }
 
 /// Runtime bootstrap configuration.
@@ -67,9 +57,6 @@ pub struct RuntimeConfig {
     /// When true, the runtime creates the discovery pub/sub feed ring and
     /// discovery listener, and wires them into the discovery system guest.
     pub start_discovery: bool,
-    /// Out-of-band domain→tenant mapping, seeded into the discovery service
-    /// at startup (advisory: routes and scopes names, never authenticates).
-    pub domain_table: Vec<(String, String)>,
     /// State directory rooting durable state: the kernel's volume layer, the
     /// host PKI hierarchy, and the per-tenant volume usage reconstructed at
     /// boot. `None` keeps the kernel's throwaway volume root and leaves the
@@ -104,14 +91,12 @@ pub struct ProcessAuthority {
     /// Parent process id, if spawned by another process. `None` for
     /// bootstrapped system guests. Used by the `Children` selector.
     pub parent: Option<ProcessId>,
-    /// Queue ids returned to this process by successful discovery Resolve
-    /// calls. Provides an authorisation basis for cross-process
-    /// `HostQueueAttach` without requiring an `ExplicitResource` grant.
-    pub resolved_queue_ids: HashSet<u64>,
-    /// Region ids returned to this process by successful discovery Resolve
-    /// calls. Provides an authorisation basis for `AttachRegion` on a region
-    /// the process did not allocate (e.g. an identity guest's live tables).
-    pub resolved_region_ids: HashSet<u64>,
+    /// Shared resources this process has an attach basis for beyond ownership
+    /// and `ExplicitResource` grants: resources a peer authorised it for
+    /// through the owner-scoped handoff (`AuthoriseAttach`) and resources it
+    /// resolved under a live owner declaration
+    /// (`RecordResolvedResourceFor`). Keyed by class and shared id.
+    pub resolved_resources: HashSet<(ResourceClass, u64)>,
 }
 
 impl SystemGuestDescriptor {
@@ -130,11 +115,9 @@ impl SystemGuestDescriptor {
             entrypoint: metadata.name,
             arguments: Vec::new(),
             grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
             handlers: Vec::new(),
+            discovery_service: false,
         }
     }
 
@@ -213,11 +196,9 @@ mod tests {
             entrypoint: "boot".to_string(),
             arguments: Vec::new(),
             grants: Vec::new(),
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
             handlers: Vec::new(),
+            discovery_service: false,
         };
         assert!(descriptor.arguments.is_empty());
     }

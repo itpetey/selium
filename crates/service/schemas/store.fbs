@@ -32,6 +32,7 @@ table LogRecord {
 //   6 = GetBlob { store, blob_id }
 //   7 = SetManifest { store, manifest, blob_id }
 //   8 = GetManifest { store, manifest }
+//   9 = ResolveSlice { store, manifest, blob_id }
 table StoreRequest {
     variant: ubyte;
     // Durable log name (log variants).
@@ -52,9 +53,9 @@ table StoreRequest {
     checkpoint: string;
     // Sequence a checkpoint records (WriteCheckpoint).
     sequence: ulong;
-    // Blob id (GetBlob, SetManifest).
+    // Blob id (GetBlob, SetManifest, ResolveSlice).
     blob_id: string;
-    // Manifest name (SetManifest, GetManifest).
+    // Manifest name (SetManifest, GetManifest, ResolveSlice).
     manifest: string;
 }
 
@@ -70,6 +71,7 @@ table StoreRequest {
 //   6 = Bytes { payload }
 //   7 = NotFound
 //   8 = Error { code, message }
+//   9 = Slice { volume, offset, len }
 table StoreResponse {
     variant: ubyte;
     // Sequence assigned to an append (Appended), or a checkpoint's sequence
@@ -85,6 +87,12 @@ table StoreResponse {
     code: string;
     // Human-readable error detail (Error).
     message: string;
+    // Volume name holding the blob's bytes (Slice).
+    volume: string;
+    // Byte offset of the blob within the volume (Slice).
+    offset: ulong;
+    // Byte length of the blob (Slice).
+    len: ulong;
 }
 
 root_type StoreRequest;

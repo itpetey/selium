@@ -22,7 +22,7 @@
 ### Requirement: RegionProt Enum
 `selium-abi` SHALL define a `RegionProt` enum with variants `ReadOnly` and `ReadWrite`.
 
-#### Scenario: RegionProt serialization
+#### Scenario: RegionProt serialisation
 - **WHEN** a `RegionProt::ReadOnly` value is encoded in a hostcall payload
 - **THEN** it SHALL be represented as `0u8` and `RegionProt::ReadWrite` as `1u8`
 
@@ -134,19 +134,86 @@ envelope's existing `task_id` field.
 - **WHEN** a process without a `MintCertificate` grant invokes a certificate-signing hostcall
 - **THEN** the runtime SHALL deny the hostcall with a capability error
 
-### Requirement: Resolved-Resource Recording Hostcall Variants
+### Requirement: Process Start Module Source
 
-`HostcallRequest` SHALL define recording variants `RecordResolvedQueueFor` and `RecordResolvedRegionFor`, each naming a client process and the resource id a discovery Resolve returned to it. Both SHALL be accepted only from the discovery system guest; any other caller SHALL be denied with a capability error. A recorded id SHALL give the named client process an authorisation basis for the corresponding cross-process attach hostcall (`HostQueueAttach` for queues, `AttachRegion` for shared regions) on a resource it did not allocate — the basis peer guests use to attach a publishing guest's live tables.
+`HostcallRequest::ProcessStart` SHALL carry either inline module bytes or a durable slice — a volume name, byte offset and byte length — instead of naming a host-side module registry entry. The runtime SHALL instantiate the process from those bytes, reading a slice from its own volume layer, and SHALL keep no module catalogue.
 
-#### Scenario: Non-discovery caller is denied
+#### Scenario: Spawn from inline bytes
 
-- **WHEN** a process other than the discovery system guest invokes `RecordResolvedQueueFor` or `RecordResolvedRegionFor`
+- **WHEN** a caller starts a process supplying module bytes
+- **THEN** the process SHALL instantiate from those bytes
+
+#### Scenario: Spawn from a durable slice
+
+- **WHEN** a caller starts a process naming a durable slice the store produced
+- **THEN** the runtime SHALL read the bytes from the volume layer and instantiate the process from them, without the caller ever holding the module bytes
+
+#### Scenario: Slice outside the caller's authority
+
+- **WHEN** a caller names a durable slice on a volume its storage authority does not cover
+- **THEN** the spawn SHALL fail with a permission error and no process SHALL be created
+
+#### Scenario: No host-side catalogue
+
+- **WHEN** the runtime restarts
+- **THEN** it SHALL hold no module bytes of its own, and every spawn SHALL supply the module source
+
+### Requirement: Capability Probe Gated by Authority
+
+`HostcallRequest` SHALL define a capability-probe variant reporting whether a named process holds a capability, gated by a bootstrap-provisioned authority rather than by any guest identity. The probe SHALL disclose nothing beyond the capability asked for.
+
+#### Scenario: Authorised probe
+
+- **WHEN** a guest holding the probe authority asks whether a process holds a capability
+- **THEN** the host SHALL answer truthfully for that capability
+
+#### Scenario: Unauthorised probe denied
+
+- **WHEN** a guest without the probe authority asks
+- **THEN** the hostcall SHALL be denied with a permission error
+
+### Requirement: Owner-Scoped Attach Authorisation
+
+`HostcallRequest` SHALL define attach-authorisation variants for shared resources. A variant SHALL be accepted only from the resource's owner or an explicit-capability holder, SHALL name exactly one resource and one client process, and SHALL record an attach basis for that process. No guest identity SHALL be privileged for this purpose.
+
+#### Scenario: Owner authorises a peer
+
+- **WHEN** the owner of a region authorises a client process for it
+- **THEN** the host SHALL record the authorisation for exactly that resource and client process
+
+#### Scenario: Non-owner caller is denied
+
+- **WHEN** a process that neither owns the resource nor holds an explicit capability for it invokes a recording variant
 - **THEN** the runtime SHALL deny the hostcall with a capability error
 
 #### Scenario: Recorded id authorises the attach
 
-- **WHEN** the discovery system guest records a region id resolved by a client process
-- **THEN** that client process's subsequent `AttachRegion` on the region SHALL be authorised
+- **WHEN** a process authorised for a region attaches it
+- **THEN** the `AttachRegion` hostcall SHALL be authorised
+
+#### Scenario: No privileged guest identity
+
+- **WHEN** any guest invokes the variant for a resource it does not own
+- **THEN** the runtime SHALL deny the hostcall, regardless of the guest's role as a registry or discovery service
+
+### Requirement: Owner-Declared Resolvable Attach
+
+A resource's owner MAY declare a resource attachable by resolution, with a declaration scope naming which callers the declaration admits (for example the owner's tenant). While a declaration holds, the host SHALL accept a resolve-recording naming a client process for that resource as that process's attach basis, and SHALL refuse a record the declaration's scope does not admit. No guest identity SHALL be privileged for recording.
+
+#### Scenario: Declared resource admits a resolver
+
+- **WHEN** a resource is declared attachable by resolution for the owner's tenant and a process in that tenant is recorded as having resolved it
+- **THEN** that process's attach on the resource SHALL be authorised
+
+#### Scenario: Undeclared resource refuses a record
+
+- **WHEN** a record names a resource with no attachable-by-resolution declaration
+- **THEN** the host SHALL refuse to record an attach basis
+
+#### Scenario: Declaration scope enforced
+
+- **WHEN** a record names a client process outside the declaration's scope
+- **THEN** the host SHALL refuse to record an attach basis
 
 ### Requirement: Quota Hostcall Variants
 

@@ -79,3 +79,60 @@ Registration in the root/system tenant SHALL be permitted only when the guest ho
 
 - **WHEN** a guest requests a durable log and no store service is reachable
 - **THEN** the request SHALL fail with a typed error rather than panicking or hanging indefinitely
+
+### Requirement: Context resource operations
+
+`Context` SHALL provide resource operations that allocate a shared region and register it under a name with the resource catalogue, and resolve a registered name to its resource. Named-resource registration SHALL be an RPC to a system guest; anonymous allocation SHALL remain available without the catalogue.
+
+#### Scenario: Named region creation
+
+- **WHEN** a guest creates a named region through the context
+- **THEN** the region SHALL be allocated by the host and recorded in the catalogue under the guest's tenant
+
+#### Scenario: Name resolution
+
+- **WHEN** a guest resolves a catalogue name
+- **THEN** it SHALL receive the registered resource's target
+
+#### Scenario: Allocation without the catalogue
+
+- **WHEN** the catalogue is unreachable
+- **THEN** allocating an anonymous region SHALL still succeed
+
+### Requirement: Context route watch
+
+`Context` SHALL provide a route watch: given a URI, it returns a stream of route
+changes (appearance, replacement, revocation) seeded from the route's current
+state, so a guest converges on a provider without polling and re-attaches after a
+provider restarts.
+
+#### Scenario: Guest watches a route and converges
+
+- **WHEN** a guest watches a URI whose provider has not yet registered
+- **THEN** the watch SHALL yield an appearance once the provider registers
+
+#### Scenario: Guest re-attaches after a provider restarts
+
+- **WHEN** a watched route's target is replaced
+- **THEN** the watch SHALL yield a replacement the guest can use to re-attach
+
+#### Scenario: Watch outlives an unreachable registry
+
+- **WHEN** the registry is unreachable while a guest watches a route
+- **THEN** the watch SHALL surface a typed error rather than hanging indefinitely
+
+### Requirement: Context health reporting
+
+`Context` SHALL let a guest publish its health as observable state, replacing the
+removed `mark_ready` hostcall. Publishing health SHALL NOT be required for the
+guest to run.
+
+#### Scenario: Guest publishes health
+
+- **WHEN** a guest becomes healthy
+- **THEN** it SHALL be able to publish a health record through the context
+
+#### Scenario: Health is optional
+
+- **WHEN** a guest never publishes health
+- **THEN** it SHALL still run and serve its routes

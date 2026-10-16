@@ -11,10 +11,10 @@
 //! ```
 
 use selium_abi::{
-    Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ResourceClass,
-    ResourceSelector,
+    AttachDeclarationScope, Capability, CapabilityGrant, CompletionState, HostcallOutput,
+    HostcallRequest, ResourceClass, ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 fn backpressure_queue_grants() -> Vec<CapabilityGrant> {
     vec![
@@ -29,16 +29,41 @@ fn backpressure_queue_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
-fn discovery_records_resolve(runtime: &Runtime, client: selium_abi::ProcessId, shared_id: u64) {
-    let discovery = spawn_guest(runtime, "discovery", Vec::new());
+/// The queue's owner declares it attachable by resolution, then the client's
+/// resolve is recorded under that live declaration — the owner-scoped handoff
+/// the runtime accepts in place of the removed discovery-gated recording.
+fn owner_declares_and_records_resolve(
+    runtime: &Runtime,
+    owner: selium_abi::ProcessId,
+    client: selium_abi::ProcessId,
+    shared_id: u64,
+) {
     let (status, _op) = runtime.begin_hostcall(
-        discovery,
-        HostcallRequest::RecordResolvedQueueFor {
-            client_process_id: client,
-            shared_id,
+        owner,
+        HostcallRequest::DeclareAttachableByResolution {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            scope: AttachDeclarationScope::Any,
         },
     );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "the queue owner must be able to declare it attachable by resolution"
+    );
+    let (status, _op) = runtime.begin_hostcall(
+        client,
+        HostcallRequest::RecordResolvedResourceFor {
+            resource_class: ResourceClass::HostQueue,
+            resource_id: shared_id,
+            client_process_id: client,
+        },
+    );
+    assert_eq!(
+        status,
+        selium_abi::HOSTCALL_STATUS_READY,
+        "a resolve recording under a live declaration must be accepted"
+    );
 }
 
 /// A sender enqueues a connection with an opaque metadata payload; the
@@ -63,7 +88,7 @@ fn handoff_metadata_delivered() {
     };
 
     // The receiver attaches to the shared queue to obtain its own handle.
-    discovery_records_resolve(&runtime, receiver, queue.shared_id);
+    owner_declares_and_records_resolve(&runtime, sender, receiver, queue.shared_id);
     let (_, attach_op) = runtime.begin_hostcall(
         receiver,
         HostcallRequest::HostQueueAttach {
@@ -129,7 +154,7 @@ fn handoff_no_metadata_yields_empty() {
     };
 
     // The receiver attaches to the shared queue to obtain its own handle.
-    discovery_records_resolve(&runtime, receiver, queue.shared_id);
+    owner_declares_and_records_resolve(&runtime, sender, receiver, queue.shared_id);
     let (_, attach_op) = runtime.begin_hostcall(
         receiver,
         HostcallRequest::HostQueueAttach {
@@ -189,13 +214,10 @@ fn spawn_guest(
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants,
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap guest");

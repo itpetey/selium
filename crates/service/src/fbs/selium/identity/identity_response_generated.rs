@@ -24,6 +24,7 @@ impl<'a> IdentityResponse<'a> {
   pub const VT_FINGERPRINT: ::flatbuffers::VOffsetT = 10;
   pub const VT_STEP: ::flatbuffers::VOffsetT = 12;
   pub const VT_CONTEXT: ::flatbuffers::VOffsetT = 14;
+  pub const VT_DOMAIN: ::flatbuffers::VOffsetT = 16;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -35,6 +36,7 @@ impl<'a> IdentityResponse<'a> {
     args: &'args IdentityResponseArgs<'args>
   ) -> ::flatbuffers::WIPOffset<IdentityResponse<'bldr>> {
     let mut builder = IdentityResponseBuilder::new(_fbb);
+    if let Some(x) = args.domain { builder.add_domain(x); }
     if let Some(x) = args.context { builder.add_context(x); }
     if let Some(x) = args.step { builder.add_step(x); }
     if let Some(x) = args.fingerprint { builder.add_fingerprint(x); }
@@ -87,6 +89,13 @@ impl<'a> IdentityResponse<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(IdentityResponse::VT_CONTEXT, None)}
   }
+  #[inline]
+  pub fn domain(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(IdentityResponse::VT_DOMAIN, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for IdentityResponse<'_> {
@@ -101,6 +110,7 @@ impl ::flatbuffers::Verifiable for IdentityResponse<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("fingerprint", Self::VT_FINGERPRINT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("step", Self::VT_STEP, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("context", Self::VT_CONTEXT, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("domain", Self::VT_DOMAIN, false)?
      .finish();
     Ok(())
   }
@@ -112,6 +122,7 @@ pub struct IdentityResponseArgs<'a> {
     pub fingerprint: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
     pub step: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub context: Option<::flatbuffers::WIPOffset<&'a str>>,
+    pub domain: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for IdentityResponseArgs<'a> {
   #[inline]
@@ -123,6 +134,7 @@ impl<'a> Default for IdentityResponseArgs<'a> {
       fingerprint: None,
       step: None,
       context: None,
+      domain: None,
     }
   }
 }
@@ -157,6 +169,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> IdentityResponseBuilder<'a, '
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(IdentityResponse::VT_CONTEXT, context);
   }
   #[inline]
+  pub fn add_domain(&mut self, domain: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(IdentityResponse::VT_DOMAIN, domain);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> IdentityResponseBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     IdentityResponseBuilder {
@@ -180,6 +196,7 @@ impl ::core::fmt::Debug for IdentityResponse<'_> {
       ds.field("fingerprint", &self.fingerprint());
       ds.field("step", &self.step());
       ds.field("context", &self.context());
+      ds.field("domain", &self.domain());
       ds.finish()
   }
 }

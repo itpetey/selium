@@ -55,7 +55,6 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
                 store_descriptor(vec!["discovery".to_string()]),
@@ -100,7 +99,6 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
     let respawn_report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: false,
-            domain_table: Vec::new(),
             system_guests: vec![accounting_descriptor(
                 ACCOUNTANT_ENTRYPOINT,
                 ACCOUNTANT_ENTRYPOINT,
@@ -116,27 +114,24 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
         .expect("respawn accountant");
     let respawn = respawn_report.guests.first().expect("respawned accountant");
 
-    // Wait for readiness (the respawned guest re-publishes its narrowing
-    // table and control surface), then re-verify the re-authoring.
+    // There is no readiness signal: drive the respawned guest and wait for the
+    // re-authored enforcement to become observable.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let ready = runtime
+        runtime.poll_guest(respawn.process_id);
+        if runtime
             .kernel()
-            .processes()
-            .read_activity_from(0)
-            .iter()
-            .any(|event| {
-                event.process_id == Some(respawn.process_id)
-                    && event.message.contains("guest ready")
-            });
-        if ready {
+            .quota()
+            .lookup(ACTIVE, ResourceClass::SharedRegion)
+            == Some(40 * 65_536)
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "respawned accountant never reached readiness"
+            "respawned accountant never re-authored enforcement"
         );
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     assert_enforcement_reauthored(&runtime);
@@ -151,7 +146,7 @@ fn accounting_descriptor(
     name: &str,
     entrypoint: &str,
     grants: Vec<selium_abi::CapabilityGrant>,
-    dependencies: Vec<String>,
+    _dependencies: Vec<String>,
 ) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: name.to_string(),
@@ -160,12 +155,8 @@ fn accounting_descriptor(
         entrypoint: entrypoint.to_string(),
         arguments: Vec::new(),
         grants,
-        dependencies,
-        readiness: selium_runtime::ReadinessCondition::ActivityLogContains(
-            "guest ready".to_string(),
-        ),
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }

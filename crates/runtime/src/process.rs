@@ -70,11 +70,6 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
-        // If the discovery service stopped, drop its recorded identity so
-        // `RecordResolvedQueueFor` is no longer accepted from any caller.
-        if *self.discovery_process.lock() == Some(process_id) {
-            *self.discovery_process.lock() = None;
-        }
         // An already-reaped process (retry after `cleanup_failed_process`)
         // reports NotFound; the kernel state is already reclaimed.
         if let Err(error) = self.kernel.processes().reap_process(process_id)
@@ -368,19 +363,6 @@ impl Runtime {
         self.wake_process_task(process_id, task_id);
     }
 
-    /// Registers module bytes under an id, rejecting conflicting bytes.
-    pub fn register_module_bytes(&self, module_id: String, module_bytes: Vec<u8>) -> Result<()> {
-        let mut registry = self.module_registry.lock();
-        match registry.get(&module_id) {
-            Some(existing) if existing == &module_bytes => Ok(()),
-            Some(_) => Err(Error::ModuleConflict(module_id)),
-            None => {
-                registry.insert(module_id, module_bytes);
-                Ok(())
-            }
-        }
-    }
-
     pub(crate) fn persist_process_authority(
         &self,
         process_id: ProcessId,
@@ -394,8 +376,7 @@ impl Runtime {
                 grants,
                 tenant,
                 parent,
-                resolved_queue_ids: HashSet::new(),
-                resolved_region_ids: HashSet::new(),
+                resolved_resources: HashSet::new(),
             },
         );
     }
@@ -540,68 +521,61 @@ impl Runtime {
         let request = DiscoveryRequest::Revoke { uri: node_uri };
         self.publish_discovery_event(request)?;
 
-        // Revoke all region registrations minted for this process, publishing
-        // Revoke operations to the discovery feed under the serving tenant.
-        // Staged: each `region_tenants` entry is removed only after its
-        // revocation publishes successfully, so a failed teardown can be
-        // retried without losing bookkeeping. The (region, tenant) pairs are
-        // captured so the auto-free pass below can return destroyed regions'
-        // bytes to the quota of the tenant they were minted for.
-        let region_keys: Vec<(ProcessId, u64)> = self
-            .region_tenants
-            .lock()
-            .keys()
-            .filter(|(pid, _)| *pid == process_id)
-            .copied()
-            .collect();
-        let mut region_quota_facts: Vec<(u64, String)> = Vec::new();
-        for key in region_keys {
-            let serving_tenant = self.region_tenants.lock().get(&key).cloned();
-            if let Some(serving_tenant) = serving_tenant {
-                let uri = crate::discovery::region_registration_uri(&serving_tenant, key.1);
-                let request = DiscoveryRequest::Revoke { uri };
-                self.publish_discovery_event(request)?;
-                region_quota_facts.push((key.1, serving_tenant));
-                self.region_tenants.lock().remove(&key);
-            }
-        }
-
         // Owner-keyed revocation: ask discovery to revoke every route the
         // process registered itself (via `serve`). There is no runtime side
         // map of guest-registered routes — discovery records each route's
         // owner and revokes them on this event.
         let request = DiscoveryRequest::RevokeByOwner { process_id };
         self.publish_discovery_event(request)?;
-        self.process_registrations.lock().remove(&process_id);
 
-        // Revoke tier-1 registrations for host queues created by this
-        // process, under the principal tenant each queue was minted for.
-        // Staged like the region revocations above. The (queue, principal)
-        // pairs are captured so the handle-release pass below can return the
-        // still-queued items' pipe slots to the owner's quota — the
-        // `queue_tenants` entries are removed here, before that pass runs.
-        let queue_keys: Vec<(ProcessId, u64)> = self
-            .queue_tenants
+        // Snapshot the shared resources this process owns before the ownership
+        // sets are mutated: used for identity-keyed revocation, for dropping
+        // declarations, and for returning quota.
+        let owner_tenant = process_tenant.clone().unwrap_or_default();
+        let owned_shared: Vec<(ResourceClass, u64)> = self
+            .shared_resource_owners
             .lock()
-            .keys()
-            .filter(|(pid, _)| *pid == process_id)
-            .copied()
+            .iter()
+            .filter(|(_, owners)| owners.contains(&process_id))
+            .map(|(key, _)| key.clone())
             .collect();
-        let mut queue_quota_facts: Vec<(u64, String)> = Vec::new();
-        for key in queue_keys {
-            let principal = self.queue_tenants.lock().get(&key).cloned();
-            if let Some(principal) = principal {
-                let request = DiscoveryRequest::Revoke {
-                    uri: crate::discovery::queue_registration_uri(&principal, key.1),
+
+        // Revoke region and queue registrations by resource identity: the
+        // registry recorded each resource's tenant at registration and revokes
+        // under it, so a cross-tenant mint is revoked under the tenant it was
+        // minted for. No runtime tenant side map.
+        for (class, id) in &owned_shared {
+            if matches!(
+                class,
+                ResourceClass::SharedRegion | ResourceClass::HostQueue
+            ) {
+                let request = DiscoveryRequest::RevokeResource {
+                    class: class.uri_segment().to_string(),
+                    id: *id,
                 };
                 self.publish_discovery_event(request)?;
-                queue_quota_facts.push((key.1, principal));
-                self.queue_tenants.lock().remove(&key);
             }
         }
 
-        // Drop the protocol-handler pinning registry for this process.
-        self.handler_schemes.lock().remove(&process_id);
+        // Quota facts for the reclaim passes below, keyed by the owning
+        // process's tenant. Queues meter their queued items against the
+        // owner; regions release through the quota ledger's own reservation
+        // record, so no tenant fact is needed for them.
+        let queue_quota_facts: Vec<(u64, String)> = owned_shared
+            .iter()
+            .filter(|(class, _)| *class == ResourceClass::HostQueue)
+            .map(|(_, id)| (*id, owner_tenant.clone()))
+            .collect();
+
+        // Drop attachable-by-resolution declarations for resources this
+        // process still owns: a dead owner confers nothing, and a later spawn
+        // reusing the id must not inherit the declaration.
+        if !owned_shared.is_empty() {
+            let mut declarations = self.attachable_by_resolution.lock();
+            for key in &owned_shared {
+                declarations.remove(key);
+            }
+        }
 
         let owned_handles = self
             .local_handle_owners
@@ -684,21 +658,24 @@ impl Runtime {
             let mapping_count = self.kernel.memory().shared_region_mapping_count(shared_id);
             self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
             if mapping_count == 0 {
-                // The region is destroyed: return its bytes to the quota of
-                // the tenant it was minted for. (Regions with surviving
-                // mappings keep their reservation — the resource is still
-                // live for its co-attachers.)
+                // The region is destroyed: return its bytes to the ledger the
+                // reservation was charged against — the tenant it was minted
+                // for, which for a cross-tenant mint is not this process's own
+                // tenant. (Regions with surviving mappings keep their
+                // reservation — the resource is still live for its
+                // co-attachers.)
                 let region_len = self.kernel.memory().shared_region_len(shared_id).ok();
                 drop(self.kernel.memory().destroy_shared_region(shared_id));
-                if let (Some(len), Some((_, tenant))) = (
-                    region_len,
-                    region_quota_facts
-                        .iter()
-                        .find(|(id, _)| *id == shared_id)
-                        .cloned(),
-                ) {
+                if !self
+                    .kernel
+                    .quota()
+                    .release_reservation(ResourceClass::SharedRegion, shared_id)
+                    && let Some(len) = region_len
+                {
+                    // No reservation was recorded (the platform tenant holds no
+                    // tracked counter): fall back to the owner's own tenant.
                     self.kernel.quota().release(
-                        &tenant,
+                        &owner_tenant,
                         ResourceClass::SharedRegion,
                         u64::from(len),
                     );
@@ -1107,14 +1084,6 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn module_bytes(&self, module_id: &str) -> Result<Vec<u8>> {
-        self.module_registry
-            .lock()
-            .get(module_id)
-            .cloned()
-            .ok_or_else(|| Error::UnknownModule(module_id.to_string()))
-    }
-
     /// Executes the guest reactor until it stalls.
     ///
     /// # Memory-model contract (single-entry invariant)
@@ -1503,7 +1472,7 @@ fn window_budget(window_start_instructions: u64, ceiling: Option<u64>) -> Option
 mod tests {
     use super::*;
     use crate::mailbox::GuestMailbox;
-    use crate::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+    use crate::{Runtime, SystemGuestDescriptor};
     use selium_abi::{
         ActivityKind, CompletionState, HostcallOutput, HostcallRequest, LocalityScope,
         MeteringObservation, Namespace, RegionProt, ResourceKind, ResourceSelector,
@@ -1541,10 +1510,8 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn guest");
@@ -1591,10 +1558,8 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn guest");
@@ -1639,10 +1604,8 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn guest");
@@ -1776,10 +1739,8 @@ mod tests {
                     Capability::ActivityRead,
                     vec![ResourceSelector::Locality(LocalityScope::Cluster)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn guest");
@@ -1824,10 +1785,8 @@ mod tests {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn metered guest");
@@ -1901,10 +1860,8 @@ mod tests {
                 entrypoint: "main".to_string(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn polled guest");
@@ -1968,10 +1925,8 @@ mod tests {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: Some("acme".to_string()),
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn budgeted guest")
@@ -2185,10 +2140,8 @@ mod tests {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn owner-a");
@@ -2204,10 +2157,8 @@ mod tests {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn owner-b");
@@ -2271,10 +2222,8 @@ mod tests {
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants: Vec::new(),
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: Some(tenant.to_string()),
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             })
             .expect("spawn guest")
@@ -2335,7 +2284,6 @@ mod tests {
             .bootstrap_system_guests(crate::RuntimeConfig {
                 start_discovery: true,
                 system_guests: Vec::new(),
-                domain_table: Vec::new(),
                 state_dir: None,
             })
             .expect("bootstrap discovery");
@@ -2385,7 +2333,6 @@ mod tests {
             .bootstrap_system_guests(crate::RuntimeConfig {
                 start_discovery: true,
                 system_guests: Vec::new(),
-                domain_table: Vec::new(),
                 state_dir: None,
             })
             .expect("bootstrap discovery");
@@ -2435,10 +2382,8 @@ mod tests {
             entrypoint: "boot".to_string(),
             arguments: Vec::new(),
             grants: vec![CapabilityGrant::new(Capability::DelegateGrants, Vec::new())],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         });
         assert!(
@@ -2460,10 +2405,8 @@ mod tests {
                 Capability::DelegateGrants,
                 vec![ResourceSelector::Tenant("acme".to_string())],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         });
         assert!(admitted.is_ok(), "tenant-scoped DelegateGrants is admitted");
@@ -2486,10 +2429,8 @@ mod tests {
                 Capability::DelegateGrants,
                 vec![ResourceSelector::Namespace(Namespace::Root)],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         });
         assert!(
@@ -2511,10 +2452,8 @@ mod tests {
                     "acme".to_string(),
                 ))],
             )],
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         });
         assert!(

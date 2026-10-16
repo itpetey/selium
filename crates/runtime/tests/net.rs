@@ -7,7 +7,7 @@ use selium_abi::{
     AbiErrorCode, Capability, CapabilityGrant, CompletionState, HostcallRequest, ResourceClass,
     ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 
 #[expect(clippy::panic, reason = "test helper")]
 fn assert_failed_with_code(
@@ -110,10 +110,8 @@ fn spawn_with_grants(
             entrypoint: "boot".to_string(),
             arguments: Vec::new(),
             grants,
-            dependencies: Vec::new(),
-            readiness: ReadinessCondition::Immediate,
             tenant: None,
-            serving_role: None,
+            discovery_service: false,
             handlers: Vec::new(),
         })
         .expect("spawn net test guest")
@@ -271,10 +269,8 @@ fn uri_prefix_without_network_class_rejected_at_spawn() {
                 "tcp://10.0.0.5:443".to_string(),
             )],
         )],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     });
 

@@ -19,23 +19,26 @@ pub use crate::{
         spawn, yield_now,
     },
     context::{Context, Serve},
+    control::{CONTROL_ROUTE, ControlClient},
     error::{GuestError, Result},
     hostcall::{
-        namespace_from_tenant, process_capability, process_namespace, process_tenant, quota_clear,
-        quota_set, random_bytes, record_registration, record_resolved_queue_for,
-        record_resolved_region_for, resolve_protocol_handler, revoke_ca, self_info, sign_tenant_ca,
+        authorise_attach, declare_attachable_by_resolution, namespace_from_tenant,
+        process_capability, process_namespace, process_tenant, quota_clear, quota_set,
+        random_bytes, record_resolved_resource_for, revoke_ca, self_info, sign_tenant_ca,
         sign_user_cert,
     },
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
-    platform::{mark_ready, process_id},
+    platform::process_id,
     process::{ActivityLog, Metering, Process},
     resource::{Accept, IncomingConnection, ResourceListener, ResourceSender},
-    store::{BlobStore, DurableLog, STORE_ROUTE, StoreClient},
+    store::{BlobStore, DurableLog, STORE_ROUTE, Slice, StoreClient},
     time::{Instant, Timer, now},
+    watch::{ROUTE_TABLE_ROUTE, RouteEvent, RouteWatch},
 };
 pub use selium_abi::{
-    Capability, CapabilityGrant, EntrypointMetadata, LocalityScope, Namespace, RegionProt,
-    ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext,
+    AttachDeclarationScope, Capability, CapabilityGrant, EntrypointMetadata, LocalityScope,
+    ModuleSource, Namespace, RegionProt, ResourceClass, ResourceIdentity, ResourceSelector,
+    ScopeContext,
 };
 // Re-export service message types and encoding types.
 pub use selium_guest_macros::{entrypoint, pattern_interface, schema};
@@ -52,6 +55,7 @@ pub use tracing::{debug, error, info, trace, warn};
 pub mod args;
 mod async_runtime;
 mod context;
+mod control;
 mod error;
 mod hostcall;
 mod hostcall_region_provider;
@@ -63,6 +67,7 @@ mod resource;
 mod store;
 pub mod time;
 pub mod volume;
+mod watch;
 
 /// The multithreaded worker entry export: the runtime calls this on each
 /// dedicated OS worker thread of a multithreaded guest, passing the worker's

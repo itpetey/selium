@@ -186,7 +186,7 @@ impl HttpServe {
     pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
-        super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
+        super::pin_to_scheme_handler(ctx, &mut listener, HTTP_SCHEME).await?;
 
         let target = http_target(&listener, None);
         let uri = ctx
@@ -289,7 +289,7 @@ impl HttpServeStream {
     pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;
-        super::pin_to_scheme_handler(&mut listener, HTTP_SCHEME)?;
+        super::pin_to_scheme_handler(ctx, &mut listener, HTTP_SCHEME).await?;
 
         let target = http_target(
             &listener,

@@ -50,7 +50,7 @@ use std::{
 
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_client::ConnectOptions;
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 
 mod common;
@@ -131,11 +131,13 @@ fn connector_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::Storage,
                 vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
             ),
+            // The connector registers its root serving route through the
+            // discovery service, which gates that on the bootstrap-provisioned
+            // probe authority rather than on a guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: vec!["discovery".to_string(), "store".to_string()],
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: vec!["sel-quic".to_string()],
     }
 }
@@ -170,10 +172,8 @@ fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         // The demo serves a `sel-quic` route, which requires the connector's
         // handler registration to be observable in discovery — a real
         // dependency, not an ordering accident.
-        dependencies: vec!["discovery".to_string(), "quic-connector".to_string()],
-        readiness: ReadinessCondition::Immediate,
         tenant: None,
-        serving_role: None,
+        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -201,11 +201,13 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
+            // The registry probes capability state (e.g. whether a guest may
+            // register a root route) under a bootstrap-provisioned authority,
+            // not a privileged guest identity.
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
-        dependencies: Vec::new(),
-        readiness: ReadinessCondition::ActivityLogContains("guest ready".to_string()),
         tenant: None,
-        serving_role: None,
+        discovery_service: true,
         handlers: Vec::new(),
     }
 }
@@ -285,7 +287,6 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
                 connector_descriptor(connector_wasm()),
                 demo_descriptor(demo_wasm()),
             ],
-            domain_table: Vec::new(),
             state_dir: state.config_dir(),
         })
         .expect("bootstrap discovery, connector and demo guests");

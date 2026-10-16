@@ -30,10 +30,10 @@ use std::{
 use anyhow::Context as _;
 use rkyv::{Archive, Deserialize, Serialize};
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceKind, ResourceSelector};
-use selium_guest::{
-    Context, DurableLog, ResourceListener, Serve, entrypoint, info, mark_ready, spawn, warn,
+use selium_guest::{Context, DurableLog, ResourceListener, Serve, entrypoint, info, spawn, warn};
+use selium_service::{
+    DiscoveryRequest, DiscoveryResponse, FlatMsg, IdentityRequest, IdentityResponse, ResourceTarget,
 };
-use selium_service::{FlatMsg, IdentityRequest, IdentityResponse, ResourceTarget};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{
     LiveTable,
@@ -56,6 +56,23 @@ pub const PRINCIPAL_LOG: &str = "selium.identity.principals";
 const TABLE_CAPACITY: u64 = 64 * 1024;
 /// Durable log name for the tenant registry.
 pub const TENANT_LOG: &str = "selium.identity.tenants";
+/// Durable log name for the advisory domain registry.
+pub const DOMAIN_LOG: &str = "selium.identity.domains";
+
+/// An advisory domain registry record appended to the durable log.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub enum DomainRecord {
+    /// Record a domain→tenant mapping.
+    Set {
+        /// Domain (e.g. `example.com`).
+        domain: String,
+        /// Tenant the domain maps to.
+        tenant: String,
+    },
+    /// Remove a domain mapping.
+    Remove { domain: String },
+}
 
 /// A tenant registry record appended to the durable log.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -106,6 +123,53 @@ pub struct PrincipalRegistry {
     by_fingerprint: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
+/// The replayed advisory domain projection: `domain -> tenant`.
+#[derive(Debug, Clone, Default)]
+pub struct DomainRegistry {
+    by_domain: BTreeMap<String, String>,
+}
+
+impl DomainRegistry {
+    /// Applies one domain record in replay order.
+    pub fn apply_record(&mut self, record: DomainRecord) {
+        match record {
+            DomainRecord::Set { domain, tenant } => {
+                self.by_domain.insert(domain, tenant);
+            }
+            DomainRecord::Remove { domain } => {
+                self.by_domain.remove(&domain);
+            }
+        }
+    }
+
+    /// Materialises the projection from a replayed durable log.
+    pub async fn rebuild(&mut self, log: &DurableLog) -> selium_guest::Result<()> {
+        let payloads = log
+            .replay(None, u32::MAX)
+            .await?
+            .into_iter()
+            .map(|record| record.payload);
+        self.rebuild_payloads(payloads);
+        Ok(())
+    }
+
+    /// Re-applies replayed record payloads in log order. Undecodable records
+    /// are skipped with a warning.
+    pub fn rebuild_payloads(&mut self, payloads: impl IntoIterator<Item = Vec<u8>>) {
+        for payload in payloads {
+            match selium_abi::decode_rkyv::<DomainRecord>(&payload) {
+                Ok(record) => self.apply_record(record),
+                Err(error) => warn!("identity: skipping undecodable domain record: {error}"),
+            }
+        }
+    }
+
+    /// Returns the recorded mappings, in domain order.
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.by_domain.iter()
+    }
+}
+
 /// The caller's tier, derived from its process tenant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tier {
@@ -121,10 +185,14 @@ pub enum Tier {
 struct IdentityState {
     tenants: Arc<Mutex<TenantRegistry>>,
     principals: Arc<Mutex<PrincipalRegistry>>,
+    domains: Arc<Mutex<DomainRegistry>>,
     tenant_log: DurableLog,
     principal_log: DurableLog,
+    domain_log: DurableLog,
     anchors: Arc<LiveTable<String, Vec<u8>, ShmTransport>>,
     grants: Arc<LiveTable<Vec<u8>, Vec<u8>, ShmTransport>>,
+    /// Raw discovery host-queue handle, used to publish domain mappings.
+    discovery_handle: u64,
 }
 
 impl TenantRegistry {
@@ -270,6 +338,7 @@ pub fn fingerprint_of(spki_der: &[u8]) -> Vec<u8> {
 pub fn identity_grants() -> Vec<CapabilityGrant> {
     vec![
         CapabilityGrant::new(Capability::MintCertificate, Vec::new()),
+        CapabilityGrant::new(Capability::DomainWrite, Vec::new()),
         CapabilityGrant::new(
             Capability::Storage,
             vec![ResourceSelector::ResourceClass(ResourceClass::Volume)],
@@ -429,6 +498,60 @@ async fn handle_request(
             remove_principal(&tenant, &fingerprint, state).await;
             IdentityResponse::PrincipalRemoved { fingerprint }
         }
+        IdentityRequest::SetDomain { domain, tenant } => {
+            if !tier.is_operator() {
+                return tier_refused("set a domain mapping");
+            }
+            match set_domain(&domain, &tenant, state).await {
+                Ok(()) => IdentityResponse::DomainRecorded { domain },
+                Err(context) => IdentityResponse::Error {
+                    step: "domain".to_string(),
+                    context,
+                },
+            }
+        }
+    }
+}
+
+/// Records a domain→tenant mapping durably and publishes it to discovery.
+async fn set_domain(domain: &str, tenant: &str, state: &IdentityState) -> Result<(), String> {
+    let record = DomainRecord::Set {
+        domain: domain.to_string(),
+        tenant: tenant.to_string(),
+    };
+    let timestamp_ms = selium_guest::time::now()
+        .map(|nanos| nanos / 1_000_000)
+        .map_err(|error| error.to_string())?;
+    let payload = selium_abi::encode_rkyv(&record).map_err(|error| error.to_string())?;
+    state
+        .domain_log
+        .append(timestamp_ms, Vec::new(), payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    state
+        .domains
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_record(record);
+    let mut ctx = Context::from_raw(state.discovery_handle)
+        .await
+        .map_err(|error| error.to_string())?;
+    publish_domain(&mut ctx, domain, tenant).await
+}
+
+/// Publishes one advisory domain mapping to discovery.
+async fn publish_domain(ctx: &mut Context, domain: &str, tenant: &str) -> Result<(), String> {
+    match ctx
+        .discovery()
+        .request(DiscoveryRequest::SetDomain {
+            domain: domain.to_string(),
+            tenant: tenant.to_string(),
+        })
+        .await
+    {
+        Ok(DiscoveryResponse::Registered) => Ok(()),
+        Ok(other) => Err(format!("unexpected discovery response: {other:?}")),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -448,6 +571,10 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
         .open_log(PRINCIPAL_LOG)
         .await
         .with_context(|| "identity: principal log open failed")?;
+    let domain_log = ctx
+        .open_log(DOMAIN_LOG)
+        .await
+        .with_context(|| "identity: domain log open failed")?;
 
     let mut tenant_registry = TenantRegistry::default();
     tenant_registry
@@ -461,6 +588,12 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
         .await
         .with_context(|| "identity: principal registry replay failed")?;
     let principals = Arc::new(Mutex::new(principal_registry));
+    let mut domain_registry = DomainRegistry::default();
+    domain_registry
+        .rebuild(&domain_log)
+        .await
+        .with_context(|| "identity: domain registry replay failed")?;
+    let domains = Arc::new(Mutex::new(domain_registry));
 
     let (anchor_region, anchors) = create_live_table::<String, Vec<u8>>(TABLE_CAPACITY)
         .map_err(|e| anyhow::anyhow!("identity: anchor table create failed: {e}"))?;
@@ -488,6 +621,23 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
             if let Err(e) = publish_grants(&grants, fingerprint, grant_bytes) {
                 warn!("identity: grant re-publish failed: {e}");
             }
+        }
+    }
+
+    // Re-publish replayed domain mappings to discovery (the identity guest owns
+    // the advisory mapping durably; discovery stays a resolver).
+    let domain_entries: Vec<(String, String)> = {
+        let domains = domains
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        domains
+            .entries()
+            .map(|(domain, tenant)| (domain.clone(), tenant.clone()))
+            .collect()
+    };
+    for (domain, tenant) in &domain_entries {
+        if let Err(e) = publish_domain(&mut ctx, domain, tenant).await {
+            warn!("identity: domain re-publish failed for {domain}: {e}");
         }
     }
 
@@ -549,14 +699,22 @@ async fn identity_main(mut ctx: Context) -> anyhow::Result<()> {
     let state = Arc::new(IdentityState {
         tenants,
         principals,
+        domains: domains.clone(),
         tenant_log,
         principal_log,
+        domain_log,
         anchors,
         grants,
+        discovery_handle: ctx.raw_handle(),
     });
 
-    mark_ready();
+    // Health is published state: advertise the identity guest's health.
+    if let Err(error) = ctx.publish_health("identity").await {
+        warn!("identity: health publish failed: {error}");
+    }
 
+    // Re-publish the domain mappings periodically so a discovery restart
+    // converges without operator intervention.
     loop {
         let incoming = match listener.recv().await {
             Ok(incoming) => incoming,
@@ -880,6 +1038,40 @@ mod tests {
         });
 
         assert_eq!(registry.grants(&[0xAA; 32]), None);
+    }
+
+    #[test]
+    fn domain_registry_replays_set_and_remove() {
+        // Provisioning is durable: replaying the log restores the mapping and
+        // honours removals (the identity guest owns the advisory table).
+        let mut registry = DomainRegistry::default();
+        let records = vec![
+            DomainRecord::Set {
+                domain: "example.com".to_string(),
+                tenant: "acme".to_string(),
+            },
+            DomainRecord::Set {
+                domain: "example.org".to_string(),
+                tenant: "beta".to_string(),
+            },
+            DomainRecord::Remove {
+                domain: "example.org".to_string(),
+            },
+        ];
+        for record in records {
+            let encoded = selium_abi::encode_rkyv(&record).expect("encode");
+            let decoded: DomainRecord = selium_abi::decode_rkyv(&encoded).expect("decode");
+            registry.apply_record(decoded);
+        }
+
+        let entries: Vec<(String, String)> = registry
+            .entries()
+            .map(|(domain, tenant)| (domain.clone(), tenant.clone()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("example.com".to_string(), "acme".to_string())]
+        );
     }
 
     /// Simulates a restart replay: a principal's grants recorded across a

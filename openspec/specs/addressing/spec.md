@@ -31,11 +31,15 @@ A named service's wire name SHALL be its internal path segments reversed, joined
 - **THEN** the wire name SHALL be the bare label `control` with no tenant domain suffix, resolving to the internal path `sel:///control`
 
 ### Requirement: Advisory Domain-to-Tenant Table
-The system SHALL maintain a domain-to-tenant mapping (`example.com -> acme`) provisioned out-of-band. The mapping SHALL be used for routing and for scoping which tenant may register names under a domain. The mapping SHALL NOT be an authentication source.
+The system SHALL maintain a domain-to-tenant mapping (`example.com -> acme`) owned durably by the identity guest and published to discovery, surviving restart. The mapping SHALL be used for routing and for scoping which tenant may register names under a domain. The mapping SHALL NOT be an authentication source.
 
 #### Scenario: Provisioned domain routes to its tenant
-- **WHEN** a wire name ends in a registered domain
+- **WHEN** a domain is provisioned for a tenant through the identity guest and a wire name ends in that domain
 - **THEN** the resolver SHALL derive the tenant from the mapping and resolve the reversed labels within that tenant's namespace
+
+#### Scenario: Mapping survives restart
+- **WHEN** the identity guest restarts
+- **THEN** the provisioned domain-to-tenant mapping SHALL be re-published to discovery without operator re-provisioning
 
 #### Scenario: Mapping is advisory, not authoritative for identity
 - **WHEN** a client connects using a wire name under a domain
@@ -91,14 +95,3 @@ Route registrations SHALL be revoked when their owning process exits, keyed by t
 #### Scenario: Guest exit revokes its routes
 - **WHEN** a guest that registered routes exits or is killed
 - **THEN** its registrations SHALL be revoked and cease resolving
-
-### Requirement: Registration-Gated Readiness
-A system guest whose descriptor declares a serving role SHALL NOT be admitted as ready until its registration for that role is observable in discovery. `mark_ready()` SHALL remain a bare signal carrying no payload; the runtime SHALL verify registration by querying discovery rather than by reading a payload from the guest.
-
-#### Scenario: System guest ready only after registering
-- **WHEN** a system guest declares a serving role and signals readiness before registering it
-- **THEN** the runtime SHALL NOT admit the guest as ready and SHALL treat it as failing its readiness condition until the registration is observable in discovery
-
-#### Scenario: Readiness verified via discovery, not a payload
-- **WHEN** the runtime gates the readiness of a role-declared guest
-- **THEN** it SHALL observe the guest's owner-keyed registrations in discovery rather than depend on any data the guest passes back at readiness

@@ -7,6 +7,12 @@
 //! against the advisory domain table, defaulting to the synthetic tenant
 //! label) and reverses the remaining labels into a path. Everything is
 //! tenant-scoped; the empty tenant is the reserved root namespace.
+//!
+//! Owner-registered routes carry a lease (see [`LEASE_TTL_MS`]): an owner
+//! renews it through `DiscoveryRequest::Renew`, and the lease sweep revokes a
+//! lapsed registration as if its owner had revoked it. Host-authored (Tier-1)
+//! registrations are not leased; the runtime revokes them when their owning
+//! process exits.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -14,16 +20,24 @@ use std::{
 };
 
 use anyhow::Context as _;
-use selium_abi::{Capability, ProcessId, uri};
-use selium_guest::{InterfaceMetadata, entrypoint, pattern_interface};
+use selium_abi::{Capability, ProcessId, ResourceClass, ResourceKind, uri};
+use selium_guest::{AttachDeclarationScope, InterfaceMetadata, entrypoint, pattern_interface};
 use selium_service::{DiscoveryRequest, DiscoveryResponse, DomainEntry, ResourceTarget};
-use selium_shm::{Channel, transport::ShmTransport};
-use selium_wire::{framed::FramedRead, pubsub::Subscriber};
+use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
+use selium_wire::{
+    LiveTable,
+    framed::{FramedRead, FramedWrite},
+    pubsub::{Publisher, Subscriber},
+};
 
 pub const DISCOVERY_EXCHANGE: &str = "selium.discovery.resolve";
 pub const INTERFACE_METADATA_TABLE: &str = "selium.discovery.interfaces";
 pub const REGISTRATION_LOG: &str = "selium.discovery.registrations";
 pub const URI_LIVE_TABLE: &str = "selium.discovery.uri-table";
+/// The root-namespace route the discovery route-change table is served on.
+pub const ROUTE_TABLE_ROUTE: &str = "sel:///discovery-routes";
+/// The route-change live table: key = registered URI, value = target.
+pub type RouteTable = LiveTable<String, ResourceTarget, ShmTransport>;
 
 #[pattern_interface]
 pub trait DiscoveryControl {
@@ -44,6 +58,10 @@ pub struct DiscoveryStore {
     /// parsing the URI — the recorded class pins which *kind* of resource
     /// the owner may alias or name externally.
     ownership: HashMap<(u64, u64), selium_abi::ResourceClass>,
+    /// Lease per owner-registered route: liveness is observable registration.
+    /// Host-authored (Tier-1) registrations are not leased; they are revoked
+    /// on process exit by the runtime.
+    leases: HashMap<String, Lease>,
     /// Leaf aliases: alias URI → canonical typed URI.
     aliases: HashMap<String, String>,
     /// Reverse alias index: canonical typed URI → alias URIs, for reverse
@@ -63,6 +81,21 @@ pub struct DiscoveryStore {
     root_services: HashMap<String, String>,
 }
 
+/// A guest registration's lease: the owning process and the wall-clock
+/// deadline it must renew before.
+#[derive(Debug, Clone, Copy)]
+pub struct Lease {
+    /// Process that owns the registration.
+    pub owner: ProcessId,
+    /// Wall-clock deadline in milliseconds since the Unix epoch.
+    pub expires_at_ms: u64,
+}
+
+/// Lease lifetime: a guest registration lapses if its owner does not renew it
+/// within this window. Shared with the SDK's renewal task, which renews at half
+/// this interval.
+pub const LEASE_TTL_MS: u64 = selium_service::REGISTRATION_LEASE_TTL_MS;
+
 impl DiscoveryStore {
     /// Seeds the advisory domain→tenant table (out-of-band provisioning).
     pub fn seed_domain(&mut self, domain: &str, tenant: &str) {
@@ -72,6 +105,98 @@ impl DiscoveryStore {
     /// Returns whether the domain table maps `domain`.
     pub fn domain_tenant(&self, domain: &str) -> Option<&str> {
         self.domains.get(domain)
+    }
+
+    /// Records or refreshes a guest registration's lease.
+    pub fn set_lease(&mut self, uri: &str, owner: ProcessId, now_ms: u64) {
+        self.leases.insert(
+            uri.to_string(),
+            Lease {
+                owner,
+                expires_at_ms: now_ms.saturating_add(LEASE_TTL_MS),
+            },
+        );
+    }
+
+    /// Renews a guest registration's lease if `owner` holds it. Returns
+    /// whether the lease was renewed.
+    pub fn renew_lease(&mut self, uri: &str, owner: ProcessId, now_ms: u64) -> bool {
+        match self.leases.get_mut(uri) {
+            Some(lease) if lease.owner == owner => {
+                lease.expires_at_ms = now_ms.saturating_add(LEASE_TTL_MS);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Expires every lapsed lease, revoking the registration as if its owner
+    /// had revoked it. Watchers observe the resulting revocation.
+    pub fn expire_leases(&mut self, now_ms: u64) {
+        let expired: Vec<String> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.expires_at_ms <= now_ms)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for uri in expired {
+            if self.aliases.contains_key(&uri) {
+                self.revoke_alias(&uri);
+            } else {
+                self.revoke_key(&uri);
+            }
+        }
+    }
+
+    /// Registers a host-authored protocol handler (Tier-1).
+    ///
+    /// Handler registration is host-authored so a serve-side pin cannot be
+    /// forged by a guest; resolution is an ordinary discovery lookup.
+    pub fn set_handler(&mut self, scheme: &str, process_id: ProcessId) {
+        let uri = handler_uri(scheme);
+        let target = ResourceTarget {
+            uri: uri.clone(),
+            host_id: String::new(),
+            resource_id: process_id,
+            interface: None,
+            tenant: None,
+            class: selium_abi::ResourceClass::Process,
+            labels: Vec::new(),
+        };
+        self.registrations.insert(uri.clone(), target);
+        self.route_owners.insert(uri.clone(), process_id);
+    }
+
+    /// Sets or clears a guest's health record for `name` under `tenant`.
+    ///
+    /// Health is published state, not a resource route: it is not lease-expired
+    /// (a lapsing lease would mark every healthy long-running guest unhealthy
+    /// until its owner renewed it again) and is not subject to the typed-resource
+    /// ownership check. Liveness is carried by the route leases, and the record
+    /// itself is revoked when its owner's process exits.
+    pub fn set_health(
+        &mut self,
+        tenant: Option<&str>,
+        caller: ProcessId,
+        name: &str,
+        healthy: bool,
+    ) {
+        let uri = health_uri(tenant, name);
+        if healthy {
+            let target = ResourceTarget {
+                uri: uri.clone(),
+                host_id: String::new(),
+                resource_id: caller,
+                interface: None,
+                tenant: tenant.map(str::to_string),
+                class: selium_abi::ResourceClass::Process,
+                labels: Vec::new(),
+            };
+            self.registrations.insert(uri.clone(), target);
+            self.route_owners.insert(uri.clone(), caller);
+        } else {
+            self.revoke_key(&uri);
+        }
     }
 
     /// Stores a Tier-1 registration under its exact key, populates the
@@ -98,6 +223,7 @@ impl DiscoveryStore {
     /// to it and cleaning its label index entries.
     fn revoke_key(&mut self, key: &str) {
         let removed = self.registrations.remove(key);
+        self.leases.remove(key);
         // Reverse alias revocation: revoking a target revokes its aliases
         // (and, for single-segment routes registered under those alias keys,
         // their exact-key entries too).
@@ -149,6 +275,7 @@ impl DiscoveryStore {
             }
         }
         self.registrations.remove(alias);
+        self.leases.remove(alias);
         self.route_owners.remove(alias);
         self.root_services.retain(|_, uri| uri != alias);
     }
@@ -164,6 +291,27 @@ impl DiscoveryStore {
             .map(|(uri, _)| uri.clone())
             .collect();
         for key in owned_keys {
+            if self.aliases.contains_key(&key) {
+                self.revoke_alias(&key);
+            } else {
+                self.revoke_key(&key);
+            }
+        }
+    }
+
+    /// Revokes every registration whose target is the named resource identity
+    /// (class + id). The registry recorded the resource's tenant at
+    /// registration, so a resource minted under a serving tenant is revoked
+    /// under the tenant it was minted for — the runtime needs no tenant side
+    /// map.
+    pub fn revoke_resource(&mut self, class: &str, id: u64) {
+        let keys: Vec<String> = self
+            .registrations
+            .iter()
+            .filter(|(_, target)| target.resource_id == id && target.class.uri_segment() == class)
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for key in keys {
             if self.aliases.contains_key(&key) {
                 self.revoke_alias(&key);
             } else {
@@ -190,10 +338,19 @@ impl DiscoveryStore {
             DiscoveryRequest::SeedDomain { domain, tenant } => {
                 self.seed_domain(&domain, &tenant);
             }
+            DiscoveryRequest::RevokeResource { class, id } => {
+                self.revoke_resource(&class, id);
+            }
+            DiscoveryRequest::RegisterHandler { scheme, process_id } => {
+                self.set_handler(&scheme, process_id);
+            }
             // Query variants never arrive over the feed.
             DiscoveryRequest::Resolve(_)
             | DiscoveryRequest::ResolvePrefix(_)
             | DiscoveryRequest::ResolveLabels { .. }
+            | DiscoveryRequest::Renew { .. }
+            | DiscoveryRequest::SetHealth { .. }
+            | DiscoveryRequest::SetDomain { .. }
             | DiscoveryRequest::ListDomains => {}
         }
     }
@@ -318,11 +475,10 @@ impl DiscoveryStore {
             Some(_) => raw.to_string(),
             None => {
                 let (domain_tenant, path) = uri::resolve_wire_name(raw, &self.domains)?;
-                if domain_tenant.is_empty() {
-                    if !root_allowed {
-                        return None;
-                    }
-                } else if !tenant_admits(caller_tenant, Some(&domain_tenant)) {
+                if domain_tenant.is_empty() && !root_allowed {
+                    return None;
+                }
+                if !path.is_empty() && !tenant_admits(caller_tenant, Some(&domain_tenant)) {
                     // Foreign domain: the mapping does not own this tenant.
                     return None;
                 }
@@ -346,10 +502,56 @@ impl DiscoveryStore {
             // them directly.
             return None;
         }
+        if first == "handler" {
+            // The handler namespace is host-authored (Tier-1): a guest may not
+            // register a handler route, so the serve-side pin stays unforgeable.
+            return None;
+        }
+        if first == "health" {
+            // The health namespace is reserved: health records are published
+            // through `SetHealth` under their owner's own name, so a guest
+            // cannot shadow or forge another guest's health record by
+            // registering a same-named route.
+            return None;
+        }
         if self.ownership.get(&(caller, resource_id)) != Some(class) {
             return None;
         }
         Some(uri_str)
+    }
+
+    /// The internal key a raw registration form resolves to, without admission
+    /// checks.
+    ///
+    /// Renewal keys off this so a lease taken out under a projected internal
+    /// URI is renewed by the same raw form the owner registered with; the
+    /// owner check in [`renew_lease`](Self::renew_lease) remains the gate.
+    fn registration_key(&self, raw: &str) -> Option<String> {
+        match uri::parse_sel(raw) {
+            Some(_) => Some(raw.to_string()),
+            None => {
+                let (domain_tenant, path) = uri::resolve_wire_name(raw, &self.domains)?;
+                if path.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "{}{}/{}",
+                    uri::SEL_PREFIX,
+                    domain_tenant,
+                    path.join("/")
+                ))
+            }
+        }
+    }
+
+    /// Renews a lease named by any registration form (an internal `sel://` URI
+    /// or a wire name), keyed exactly as [`registration_uri`](Self::registration_uri)
+    /// keyed the original registration.
+    pub fn renew_lease_raw(&mut self, raw: &str, owner: ProcessId, now_ms: u64) -> bool {
+        match self.registration_key(raw) {
+            Some(key) => self.renew_lease(&key, owner, now_ms),
+            None => false,
+        }
     }
 
     /// Applies a guest (Tier-2) registration with the full validation chain:
@@ -528,7 +730,80 @@ fn denied_response(request: &DiscoveryRequest) -> DiscoveryResponse {
         DiscoveryRequest::Register { .. }
         | DiscoveryRequest::Revoke { .. }
         | DiscoveryRequest::RevokeByOwner { .. }
-        | DiscoveryRequest::SeedDomain { .. } => DiscoveryResponse::Forbidden,
+        | DiscoveryRequest::SeedDomain { .. }
+        | DiscoveryRequest::RevokeResource { .. }
+        | DiscoveryRequest::Renew { .. }
+        | DiscoveryRequest::SetHealth { .. }
+        | DiscoveryRequest::RegisterHandler { .. }
+        | DiscoveryRequest::SetDomain { .. } => DiscoveryResponse::Forbidden,
+    }
+}
+
+/// Builds the route-change live table over its own ring, returning the ring id
+/// and the table.
+fn create_route_table() -> selium_wire::Result<(u64, RouteTable)> {
+    let channel = Channel::create_with_backpressure(
+        256 * 1024,
+        ChannelBackpressure::Drop,
+        ResourceKind::LiveTable,
+    )?;
+    let region_id = channel.region_id();
+    let write = ShmTransport::new(&channel, &channel)?;
+    let read = ShmTransport::new(&channel, &channel)?;
+    let publisher = Publisher::new(FramedWrite::new(write));
+    let subscriber = Subscriber::new(FramedRead::new(read), None);
+    let table = LiveTable::new(publisher, subscriber)?;
+    Ok((region_id, table))
+}
+
+/// Projects the store's registrations onto the route table, publishing only
+/// real changes: a set for every new or changed route, a delete for every
+/// removed route. The table's per-entry version is the route's generation.
+fn sync_route_table(store: &DiscoveryStore, table: &RouteTable) -> selium_wire::Result<()> {
+    let current: std::collections::HashMap<&str, &ResourceTarget> = store
+        .registrations
+        .iter()
+        .map(|(uri, target)| (uri.as_str(), target))
+        .collect();
+    for (uri, target) in &current {
+        let uri = (*uri).to_string();
+        if table.get(&uri)?.as_ref() != Some(*target) {
+            table.set(uri, (*target).clone())?;
+        }
+    }
+    for (uri, record) in table.scan(usize::MAX)? {
+        if record.value.is_some() && !current.contains_key(uri.as_str()) {
+            table.delete(uri)?;
+        }
+    }
+    Ok(())
+}
+
+/// Periodically expires lapsed guest-registration leases, revoking the routes
+/// and publishing the resulting route changes.
+async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
+    const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
+    loop {
+        let deadline = match selium_guest::time::now() {
+            Ok(now) => selium_guest::Instant::from_nanos(now.saturating_add(SWEEP_INTERVAL_NANOS)),
+            Err(error) => {
+                selium_guest::warn!("discovery lease sweep clock failed: {error}");
+                selium_guest::yield_now().await;
+                continue;
+            }
+        };
+        selium_guest::Timer::new(deadline).await;
+
+        let now_ms = selium_guest::time::now()
+            .map(|nanos| nanos / 1_000_000)
+            .unwrap_or(0);
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.expire_leases(now_ms);
+        if let Err(error) = sync_route_table(&store, &route_table) {
+            selium_guest::warn!("discovery route table sync failed: {error}");
+        }
     }
 }
 
@@ -548,12 +823,62 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
         shared_id = listener.descriptor().shared_id,
         "discovery feed and listener attached"
     );
-    selium_guest::mark_ready();
 
     let store = Arc::new(Mutex::new(DiscoveryStore::default()));
 
+    // The route-change table: consumers watch it to converge on providers.
+    let (route_region, route_table) =
+        create_route_table().with_context(|| "failed to create discovery route table")?;
+    let route_table = Arc::new(route_table);
+    {
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.store(
+            ResourceTarget {
+                uri: ROUTE_TABLE_ROUTE.to_string(),
+                host_id: String::new(),
+                resource_id: route_region,
+                interface: None,
+                tenant: None,
+                class: ResourceClass::SharedRegion,
+                labels: Vec::new(),
+            },
+            Some(selium_guest::process_id()),
+        );
+    }
+    // Declare the table's region attachable so consumers can resolve and
+    // attach it.
+    selium_guest::declare_attachable_by_resolution(
+        ResourceClass::SharedRegion,
+        route_region,
+        AttachDeclarationScope::Any,
+    )
+    .with_context(|| "failed to declare the route table attachable")?;
+    {
+        let store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = sync_route_table(&store, &route_table) {
+            selium_guest::warn!("discovery route table initial sync failed: {error}");
+        }
+    }
+
     // Spawn the feed processing loop.
-    selium_guest::spawn(feed_loop(store.clone(), feed_subscriber));
+    selium_guest::spawn(feed_loop(
+        store.clone(),
+        route_table.clone(),
+        feed_subscriber,
+    ));
+    // Spawn the lease sweep loop.
+    selium_guest::spawn(lease_sweep_loop(store.clone(), route_table.clone()));
+
+    // Discovery publishes no health record of its own: it is the registry, its
+    // entrypoint takes raw infrastructure handles rather than a `Context`, and
+    // publishing would mean an RPC from this guest to its own listener — a
+    // self-join the SDK does not model (it deadlocks the guest's reactor
+    // against its own accept loop). Health is published state and an absent
+    // record is valid: peers observe discovery by the routes it serves.
 
     // Accept incoming RPC connections forever.
     loop {
@@ -575,20 +900,27 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
             };
 
         let store = store.clone();
-        selium_guest::spawn(handler(store, connection));
+        let route_table = route_table.clone();
+        selium_guest::spawn(handler(store, route_table, connection));
     }
 }
 
 async fn feed_loop(
     store: Arc<Mutex<DiscoveryStore>>,
+    route_table: Arc<RouteTable>,
     mut subscriber: Subscriber<DiscoveryRequest, ShmTransport>,
 ) {
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply_tier1_event(request),
+            Ok((request, _tag)) => {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store.apply_tier1_event(request);
+                if let Err(error) = sync_route_table(&store, &route_table) {
+                    selium_guest::warn!("discovery route table sync failed: {error}");
+                }
+            }
             Err(selium_wire::error::Error::BufferEmpty) => {
                 selium_guest::yield_now().await;
             }
@@ -602,6 +934,7 @@ async fn feed_loop(
 
 async fn handler(
     store: Arc<Mutex<DiscoveryStore>>,
+    route_table: Arc<RouteTable>,
     mut conn: selium_shm::rpc::RpcConnection<DiscoveryRequest, DiscoveryResponse>,
 ) {
     let client_process_id = conn.client_process_id();
@@ -624,36 +957,33 @@ async fn handler(
                     let mut store = store
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match request.payload() {
+                    let response = match request.payload() {
                         Ok(payload) if !scope_verified => denied_response(&payload),
                         Ok(payload) => match payload {
                             DiscoveryRequest::Resolve(uri) => {
                                 match store.resolve_exact(&uri, caller_tenant.as_deref()) {
                                     Some(target) => {
-                                        // Record the resolved id with the runtime so
-                                        // the resolving client gains an authorisation
-                                        // basis for cross-process `HostQueueAttach`.
-                                        if let Err(error) = selium_guest::record_resolved_queue_for(
-                                            client_process_id,
-                                            target.resource_id,
-                                        ) {
-                                            selium_guest::warn!(
-                                                "resolve authorisation record failed: {error}"
-                                            );
-                                        }
-                                        // A resolved shared region also gains an
-                                        // authorisation basis for `AttachRegion`, the
-                                        // path live-table consumers (connector, bridge)
-                                        // use to attach the identity guest's tables.
-                                        if target.class == selium_abi::ResourceClass::SharedRegion
-                                            && let Err(error) =
-                                                selium_guest::record_resolved_region_for(
-                                                    client_process_id,
-                                                    target.resource_id,
-                                                )
+                                        // A resolved shared resource (region or
+                                        // queue) gains an authorisation basis
+                                        // for the resolving client, but only
+                                        // when its owner declared it attachable
+                                        // by resolution: the runtime enforces
+                                        // the declaration's scope and refuses an
+                                        // undeclared resource. No guest identity
+                                        // is privileged for recording.
+                                        if matches!(
+                                            target.class,
+                                            selium_abi::ResourceClass::SharedRegion
+                                                | selium_abi::ResourceClass::HostQueue
+                                        ) && let Err(error) =
+                                            selium_guest::record_resolved_resource_for(
+                                                target.class.clone(),
+                                                target.resource_id,
+                                                client_process_id,
+                                            )
                                         {
                                             selium_guest::warn!(
-                                                "resolve region authorisation record failed: {error}"
+                                                "resolve authorisation record failed: {error}"
                                             );
                                         }
                                         DiscoveryResponse::Found(target)
@@ -702,17 +1032,41 @@ async fn handler(
                                     root_allowed,
                                     root_service,
                                 );
-                                // Record the registration with the runtime (on
-                                // success) so role-declared readiness can be
-                                // gated on discoverable self-registration.
                                 if matches!(response, DiscoveryResponse::Registered)
                                     && let Some(uri) = registered_uri
-                                    && let Err(error) =
-                                        selium_guest::record_registration(client_process_id, &uri)
                                 {
-                                    selium_guest::warn!("registration record failed: {error}");
+                                    let now_ms = selium_guest::time::now()
+                                        .map(|nanos| nanos / 1_000_000)
+                                        .unwrap_or(0);
+                                    store.set_lease(&uri, client_process_id, now_ms);
                                 }
                                 response
+                            }
+                            DiscoveryRequest::Renew { uri } => {
+                                let now_ms = selium_guest::time::now()
+                                    .map(|nanos| nanos / 1_000_000)
+                                    .unwrap_or(0);
+                                // Keyed exactly as the original registration was,
+                                // so a wire-name registration renews the lease
+                                // taken out under its projected internal URI.
+                                if store.renew_lease_raw(&uri, client_process_id, now_ms) {
+                                    DiscoveryResponse::Registered
+                                } else {
+                                    DiscoveryResponse::Forbidden
+                                }
+                            }
+                            DiscoveryRequest::SetHealth { name, healthy } => {
+                                store.set_health(
+                                    caller_tenant.as_deref(),
+                                    client_process_id,
+                                    &name,
+                                    healthy,
+                                );
+                                if healthy {
+                                    DiscoveryResponse::Registered
+                                } else {
+                                    DiscoveryResponse::Revoked
+                                }
                             }
                             DiscoveryRequest::Revoke { uri } => store.apply_revoke(
                                 client_process_id,
@@ -722,9 +1076,27 @@ async fn handler(
                             DiscoveryRequest::ListDomains => {
                                 DiscoveryResponse::Domains(store.domain_entries())
                             }
+                            DiscoveryRequest::SetDomain { domain, tenant } => {
+                                // The advisory domain mapping is authored by the
+                                // bootstrap-provisioned `DomainWrite` authority
+                                // (the identity guest), not by any guest identity.
+                                let allowed = selium_guest::process_capability(
+                                    client_process_id,
+                                    Capability::DomainWrite,
+                                )
+                                .unwrap_or(false);
+                                if allowed {
+                                    store.seed_domain(&domain, &tenant);
+                                    DiscoveryResponse::Registered
+                                } else {
+                                    DiscoveryResponse::Forbidden
+                                }
+                            }
                             // Tier-1-only operations never arrive over RPC.
                             DiscoveryRequest::SeedDomain { .. }
-                            | DiscoveryRequest::RevokeByOwner { .. } => {
+                            | DiscoveryRequest::RevokeByOwner { .. }
+                            | DiscoveryRequest::RevokeResource { .. }
+                            | DiscoveryRequest::RegisterHandler { .. } => {
                                 DiscoveryResponse::Forbidden
                             }
                         },
@@ -732,7 +1104,11 @@ async fn handler(
                             selium_guest::warn!("discovery payload decode failed: {error}");
                             continue;
                         }
+                    };
+                    if let Err(error) = sync_route_table(&store, &route_table) {
+                        selium_guest::warn!("discovery route table sync failed: {error}");
                     }
+                    response
                 };
                 if let Err(error) = request.reply(response).await {
                     selium_guest::warn!("discovery reply failed: {error}");
@@ -758,6 +1134,20 @@ fn tenant_admits(caller: Option<&str>, target: Option<&str>) -> bool {
     }
 }
 
+/// The tenant-scoped health route for `name`.
+fn health_uri(tenant: Option<&str>, name: &str) -> String {
+    format!(
+        "{}{}/health/{}",
+        uri::SEL_PREFIX,
+        tenant.unwrap_or_default(),
+        name
+    )
+}
+
+/// The root-namespace route a host-authored protocol handler resolves on.
+fn handler_uri(scheme: &str) -> String {
+    format!("{}/handler/{}", uri::SEL_PREFIX, scheme)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,6 +1589,41 @@ mod tests {
 
         store.apply_tier1_event(DiscoveryRequest::RevokeByOwner { process_id: 42 });
         assert_eq!(store.resolve_exact("bridge.acme", Some("acme")), None);
+    }
+
+    #[test]
+    fn tier1_revoke_resource_revokes_by_identity() {
+        // A resource free arrives as a Tier-1 RevokeResource event; the store
+        // revokes the registration recorded for that resource identity under
+        // the tenant it recorded — the runtime needs no tenant side map.
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        store.store(queue("beta", 9), Some(99));
+        assert!(
+            store
+                .resolve_exact("sel://acme/queue/7", Some("acme"))
+                .is_some()
+        );
+        assert!(
+            store
+                .resolve_exact("sel://beta/queue/9", Some("beta"))
+                .is_some()
+        );
+
+        store.apply_tier1_event(DiscoveryRequest::RevokeResource {
+            class: "queue".to_string(),
+            id: 7,
+        });
+        assert_eq!(
+            store.resolve_exact("sel://acme/queue/7", Some("acme")),
+            None
+        );
+        assert!(
+            store
+                .resolve_exact("sel://beta/queue/9", Some("beta"))
+                .is_some(),
+            "only the named resource identity is revoked"
+        );
     }
 
     #[test]
@@ -1660,5 +2085,210 @@ mod tests {
                 selium_abi::ResourceClass::HostQueue,
             ))
         );
+    }
+
+    #[test]
+    fn route_table_publishes_appear_replace_and_revoke() {
+        drop(selium_memory::set_region_provider(Box::new(
+            selium_memory::HeapRegionProvider::new(),
+        )));
+        let (region_id, table) = create_route_table().expect("create route table");
+
+        let mut store = DiscoveryStore::default();
+        let uri = "sel://acme/queue/7".to_string();
+        store.store(queue("acme", 7), Some(42));
+        sync_route_table(&store, &table).expect("sync register");
+
+        let channel = Channel::attach(region_id).expect("attach route table");
+        let transport = ShmTransport::new_replay(&channel, &channel).expect("transport");
+        let subscriber = Subscriber::new(FramedRead::new(transport), None);
+        let view: selium_wire::LiveTableView<String, ResourceTarget, ShmTransport> =
+            selium_wire::LiveTableView::new(subscriber).expect("view");
+
+        let appeared = view.get_record(&uri).expect("get").expect("appeared");
+        assert_eq!(
+            appeared.value.as_ref().map(|target| target.resource_id),
+            Some(7)
+        );
+        let first_version = appeared.version;
+
+        // Replace the same URI with a new target: the generation advances.
+        store.store(
+            target(&uri, 99, Some("acme"), selium_abi::ResourceClass::HostQueue),
+            Some(42),
+        );
+        sync_route_table(&store, &table).expect("sync replace");
+        view.sync().expect("view sync");
+        let replaced = view.get_record(&uri).expect("get").expect("replaced");
+        assert_eq!(
+            replaced.value.as_ref().map(|target| target.resource_id),
+            Some(99)
+        );
+        assert!(
+            replaced.version > first_version,
+            "replacement advances the generation"
+        );
+
+        // Revoke: the table publishes a tombstone.
+        store.revoke_key(&uri);
+        sync_route_table(&store, &table).expect("sync revoke");
+        view.sync().expect("view sync");
+        let revoked = view.get_record(&uri).expect("get").expect("tombstone");
+        assert!(revoked.value.is_none(), "revocation is a tombstone");
+    }
+
+    #[test]
+    fn lease_renewal_keeps_a_registration_live() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        store.set_lease("sel://acme/queue/7", 42, 1_000);
+        assert!(store.renew_lease("sel://acme/queue/7", 42, 1_000 + LEASE_TTL_MS - 1));
+        store.expire_leases(1_000 + LEASE_TTL_MS + 5);
+        assert!(
+            store
+                .resolve_exact("sel://acme/queue/7", Some("acme"))
+                .is_some(),
+            "a renewed lease stays live"
+        );
+    }
+
+    #[test]
+    fn lapsed_lease_expires_the_registration() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        store.set_lease("sel://acme/queue/7", 42, 1_000);
+        store.expire_leases(1_000 + LEASE_TTL_MS + 1);
+        assert_eq!(
+            store.resolve_exact("sel://acme/queue/7", Some("acme")),
+            None,
+            "a lapsed lease revokes the registration"
+        );
+    }
+
+    #[test]
+    fn lease_renewal_requires_the_owner() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        store.set_lease("sel://acme/queue/7", 42, 1_000);
+        assert!(!store.renew_lease("sel://acme/queue/7", 99, 1_000));
+    }
+
+    /// A wire-name registration is leased under its projected internal URI, so
+    /// renewal has to key the same way registration did: renewing the raw wire
+    /// name must find the lease, not miss it and lapse the route.
+    #[test]
+    fn a_wire_name_registration_renews_under_the_key_it_was_registered_with() {
+        let mut store = DiscoveryStore::default();
+        // `bridge.acme` projects to `sel://acme/bridge`.
+        store.set_lease("sel://acme/bridge", 42, 1_000);
+        assert!(
+            store.renew_lease_raw("bridge.acme", 42, 1_000),
+            "renewing by the raw wire name finds the projected lease"
+        );
+        store.expire_leases(1_000 + LEASE_TTL_MS + 1);
+        assert!(
+            !store.renew_lease_raw("bridge.acme", 42, 1_000 + LEASE_TTL_MS + 2),
+            "a lease nobody renewed has lapsed"
+        );
+    }
+
+    #[test]
+    fn a_health_record_outlives_the_lease_window_and_dies_with_its_owner() {
+        // Health is advisory published state, not a leased route: it must not
+        // lapse while its guest is alive and healthy (that would report every
+        // long-running guest as unhealthy), but it disappears with the process
+        // that wrote it.
+        let mut store = DiscoveryStore::default();
+        store.set_health(Some("acme"), 7, "api", true);
+        store.expire_leases(LEASE_TTL_MS * 3);
+        assert!(
+            store
+                .resolve_exact("sel://acme/health/api", Some("acme"))
+                .is_some(),
+            "a health record is not lease-expired"
+        );
+
+        store.revoke_by_owner(7);
+        assert_eq!(
+            store.resolve_exact("sel://acme/health/api", Some("acme")),
+            None,
+            "a health record is revoked when its owner exits"
+        );
+    }
+
+    /// The health namespace is reserved: a guest cannot shadow another guest's
+    /// health record by registering a same-named route of its own.
+    #[test]
+    fn the_health_namespace_is_reserved_against_guest_registration() {
+        let mut store = DiscoveryStore::default();
+        store.store(queue("acme", 7), Some(42));
+        assert_eq!(
+            store.registration_uri(
+                "sel://acme/health/api",
+                42,
+                Some("acme"),
+                false,
+                7,
+                &selium_abi::ResourceClass::HostQueue,
+            ),
+            None,
+            "a guest may not register inside the health namespace"
+        );
+    }
+
+    #[test]
+    fn health_record_sets_resolves_and_clears() {
+        // Health is published state: a tenant-scoped record a peer resolves.
+        let mut store = DiscoveryStore::default();
+        store.set_health(Some("acme"), 7, "api", true);
+        assert!(
+            store
+                .resolve_exact("sel://acme/health/api", Some("acme"))
+                .is_some()
+        );
+
+        store.set_health(Some("acme"), 7, "api", false);
+        assert!(
+            store
+                .resolve_exact("sel://acme/health/api", Some("acme"))
+                .is_none(),
+            "an absent health record is not observable"
+        );
+    }
+
+    #[test]
+    fn handler_registration_resolves_and_is_revoked_by_owner() {
+        let mut store = DiscoveryStore::default();
+        store.apply_tier1_event(DiscoveryRequest::RegisterHandler {
+            scheme: "sel-quic".to_string(),
+            process_id: 42,
+        });
+        let target = store
+            .resolve_exact("sel:///handler/sel-quic", None)
+            .expect("handler resolves");
+        assert_eq!(target.resource_id, 42);
+
+        store.revoke_by_owner(42);
+        assert_eq!(store.resolve_exact("sel:///handler/sel-quic", None), None);
+    }
+
+    #[test]
+    fn guests_cannot_register_a_handler_route() {
+        // The handler namespace is host-authored: even a root-authorised guest
+        // registration of a handler route is refused, so the pin is unforgeable.
+        let mut store = DiscoveryStore::default();
+        let response = store.apply_register(
+            7,
+            None,
+            target(
+                "sel:///handler/sel-quic",
+                7,
+                None,
+                selium_abi::ResourceClass::Process,
+            ),
+            true,
+            false,
+        );
+        assert!(matches!(response, DiscoveryResponse::Forbidden));
     }
 }

@@ -48,6 +48,19 @@ pub struct BlobStore {
     name: String,
 }
 
+/// A durable slice naming a stored blob's bytes: the volume holding them and
+/// the byte range within it. Hand a slice to `ProcessStart` so module bytes
+/// never round-trip through a guest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slice {
+    /// Volume name holding the blob's bytes.
+    pub volume: String,
+    /// Byte offset of the blob within the volume.
+    pub offset: u64,
+    /// Byte length of the blob.
+    pub len: u64,
+}
+
 impl StoreClient {
     /// Wraps an established RPC session to the store service.
     pub fn from_session(session: OwnedRpcClient<StoreRequest, StoreResponse>) -> Self {
@@ -293,6 +306,35 @@ impl BlobStore {
             .await?
         {
             StoreResponse::BlobId { blob_id } => Ok(Some(blob_id)),
+            StoreResponse::NotFound => Ok(None),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Resolves a manifest to a durable slice naming the blob's bytes.
+    ///
+    /// Blob volumes are append-only and never rewritten, so a slice a caller
+    /// holds stays valid and never yields different bytes. Returns `None` when
+    /// the manifest is unknown in the caller's tenant.
+    pub async fn resolve_slice(&self, manifest: impl Into<String>) -> Result<Option<Slice>> {
+        match self
+            .client
+            .request(StoreRequest::ResolveSlice {
+                store: self.name.clone(),
+                manifest: Some(manifest.into()),
+                blob_id: None,
+            })
+            .await?
+        {
+            StoreResponse::Slice {
+                volume,
+                offset,
+                len,
+            } => Ok(Some(Slice {
+                volume,
+                offset,
+                len,
+            })),
             StoreResponse::NotFound => Ok(None),
             other => Err(unexpected(&other)),
         }

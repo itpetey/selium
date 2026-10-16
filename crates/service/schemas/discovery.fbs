@@ -54,6 +54,11 @@ table DomainEntry {
 ///   5 = RevokeByOwner { process_id }
 ///   6 = SeedDomain { domain, tenant }
 ///   7 = ListDomains
+///   8 = RevokeResource { class, id }
+///   9 = Renew { uri }
+///  10 = SetHealth { name, healthy }
+///  11 = RegisterHandler { scheme, process_id }
+///  12 = SetDomain { domain, tenant }
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
@@ -75,6 +80,17 @@ table DiscoveryRequest {
     domain: string;
     /// Tenant the domain maps to (SeedDomain variant).
     tenant: string;
+    /// Resource class segment of the resource whose registration is revoked
+    /// (RevokeResource variant).
+    class: string;
+    /// Resource id whose registration is revoked (RevokeResource variant).
+    id: ulong;
+    /// Health record name (SetHealth variant).
+    name: string;
+    /// Whether the guest is healthy (SetHealth variant).
+    healthy: bool;
+    /// Protocol scheme (RegisterHandler variant).
+    scheme: string;
 }
 
 /// Discovery response message.

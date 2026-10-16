@@ -15,7 +15,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
     RegionProt, ResourceClass, ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 /// Task 4.1 substrate: the connector's raw UDP socket is capability-gated by
 /// `Network + UdpSocket`; a guest without that grant cannot bind one.
@@ -137,13 +137,10 @@ fn spawn_guest(runtime: &Runtime, name: &str, grants: Vec<CapabilityGrant>) -> P
                 entrypoint: "boot".to_string(),
                 arguments: Vec::new(),
                 grants,
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap guest");

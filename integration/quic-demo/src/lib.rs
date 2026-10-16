@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use selium_guest::{
-    Context, GuestError, entrypoint, error, info, mark_ready,
+    Context, GuestError, entrypoint, error, info,
     net::quic::{QuicServe, QuicStream},
     spawn,
     time::{Instant, Timer},
@@ -85,7 +85,6 @@ async fn quic_demo(ctx: Context) -> anyhow::Result<()> {
         .await
         .with_context(|| "quic-demo: bind failed")?;
     info!("quic-demo: bound {SERVE_NAME}");
-    mark_ready();
 
     loop {
         let stream = serve

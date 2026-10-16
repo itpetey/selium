@@ -19,8 +19,6 @@ const PARK_TIMEOUT_NANOS: u64 = 250_000_000;
 unsafe extern "C" {
     #[link_name = "process_id"]
     fn selium_process_id() -> u64;
-    #[link_name = "mark_ready"]
-    fn selium_mark_ready();
     #[link_name = "hostcall_create"]
     pub(crate) fn selium_hostcall_create(request_ptr: *const u8, request_len: usize) -> u64;
     #[link_name = "hostcall_poll"]
@@ -33,12 +31,6 @@ unsafe extern "C" {
     pub(crate) fn selium_hostcall_drop(operation_id: u64) -> u32;
     #[link_name = "mailbox_register"]
     fn selium_mailbox_register(mailbox_ptr: *mut u8, mailbox_len: usize);
-}
-
-/// Marks the current guest as ready for runtime readiness checks.
-pub fn mark_ready() {
-    // SAFETY: `selium_mark_ready` is a host import with no safety invariants.
-    unsafe { selium_mark_ready() }
 }
 
 /// Returns the current guest process id assigned by the host.
@@ -322,9 +314,6 @@ unsafe fn mailbox_cell(offset: usize) -> *mut core::sync::atomic::AtomicU32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn selium_mailbox_register(_: *mut u8, _: usize) {}
-
-#[cfg(not(target_arch = "wasm32"))]
-unsafe fn selium_mark_ready() {}
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn selium_process_id() -> u64 {

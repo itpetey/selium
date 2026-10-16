@@ -49,7 +49,6 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
     let report = runtime
         .bootstrap_system_guests(RuntimeConfig {
             start_discovery: true,
-            domain_table: Vec::new(),
             // No identity guest: mTLS is off (opt-in via identity deployment).
             system_guests: vec![
                 discovery_descriptor(read_wasm("selium-discovery", "selium_discovery.wasm")),
@@ -60,6 +59,7 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
                 ),
                 bridge_server_descriptor(
                     read_wasm("selium-bridge", "selium_bridge.wasm"),
+                    read_wasm("selium-bridge-channel", "selium_bridge_channel.wasm"),
                     vec!["discovery".to_string(), "quic-connector".to_string()],
                 ),
             ],

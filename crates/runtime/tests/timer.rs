@@ -10,7 +10,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ResourceClass,
     ResourceSelector,
 };
-use selium_runtime::{ReadinessCondition, Runtime, SystemGuestDescriptor};
+use selium_runtime::{Runtime, SystemGuestDescriptor};
 
 /// Multiple concurrent sleep hostcalls should all complete independently.
 #[test]
@@ -174,13 +174,10 @@ fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
                     Capability::SharedMemory,
                     vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
                 )],
-                dependencies: Vec::new(),
-                readiness: ReadinessCondition::Immediate,
                 tenant: None,
-                serving_role: None,
+                discovery_service: false,
                 handlers: Vec::new(),
             }],
-            domain_table: Vec::new(),
             state_dir: None,
         })
         .expect("bootstrap");

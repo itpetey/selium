@@ -34,7 +34,7 @@ use selium_abi::{
     client_identity::ClientIdentity,
 };
 use selium_guest::{
-    Context, Process, ResourceListener, Serve, entrypoint, error, info, mark_ready,
+    Context, ModuleSource, Process, ResourceListener, Serve, entrypoint, error, info,
     net::ByteStream, warn,
 };
 use selium_service::ResourceTarget;
@@ -42,8 +42,6 @@ use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 
 const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
-/// The `bridge-channel` module id and entrypoint this server spawns.
-const BRIDGE_CHANNEL_MODULE: &str = "bridge-channel-module";
 /// The identity guest's published grant table route.
 const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
 /// The accountant guest's published narrowing table route.
@@ -230,9 +228,18 @@ fn bridge_channel_grants(
 /// listener and self-registers its serving route via [`Context::serve`]; the
 /// runtime no longer provisions the route or injects a listener argument.
 #[entrypoint]
-async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
+async fn bridge_server(mut ctx: Context, bridge_channel_module: (u64, u64)) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
     info!("bridge-server: started");
+
+    // The bridge-channel module bytes are supplied by the embedder as a
+    // bootstrap pointer argument — the runtime keeps no module catalogue, so
+    // the spawner supplies the source for every spawn.
+    // SAFETY: the runtime wrote the bridge-channel module bytes into this
+    // guest's linear memory for this entrypoint invocation.
+    let bridge_channel_module =
+        unsafe { selium_guest::args::bytes(bridge_channel_module.0, bridge_channel_module.1) }
+            .to_vec();
 
     // The server creates its own listener: self-registration replaces the
     // runtime's well-known-URI queue minting.
@@ -244,7 +251,9 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
     // bridge route forge an authenticated identity and mint grants. Handoffs
     // from any process other than the registered `sel-quic` handler are
     // refused by the listener.
-    let connector = selium_guest::resolve_protocol_handler("sel-quic")
+    let connector = ctx
+        .resolve_protocol_handler("sel-quic")
+        .await
         .with_context(|| "bridge-server: connector resolve failed")?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -288,7 +297,11 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
             NarrowingTable::empty()
         }
     };
-    mark_ready();
+
+    // Health is published state: advertise the bridge server's health.
+    if let Err(error) = ctx.publish_health("bridge-server").await {
+        warn!("bridge-server: health publish failed: {error}");
+    }
 
     loop {
         grant_table.sync();
@@ -334,7 +347,7 @@ async fn bridge_server(mut ctx: Context) -> anyhow::Result<()> {
         );
 
         match Process::start_for_tenant(
-            BRIDGE_CHANNEL_MODULE,
+            ModuleSource::Inline(bridge_channel_module.clone()),
             BRIDGE_CHANNEL_ENTRYPOINT,
             vec![arg_u64(ctx.raw_handle()), arg_u64(incoming.shared_id)],
             child_grants,

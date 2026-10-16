@@ -27,7 +27,6 @@ async fn discovery_probe(mut _ctx: Context) -> Result<()> {
     selium_guest::info!(region_id = channel.region_id(), "probe: region allocated");
 
     selium_guest::info!("guest ready");
-    selium_guest::mark_ready();
 
     Ok(())
 }
