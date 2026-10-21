@@ -22,7 +22,7 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, ProcessId,
     RegionProt, ResourceClass, ResourceKind, ResourceSelector,
 };
-use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
+use selium_runtime::{Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor};
 use selium_service::{DiscoveryRequest, FlatMsg};
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
@@ -208,7 +208,13 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         module_id: "discovery-probe-module".to_string(),
         module_bytes,
         entrypoint: "discovery_probe".to_string(),
-        arguments: Vec::new(), // populated by bootstrap via set_discovery_handle
+        // Bootstrap prepends the discovery handle (the leading argument is a
+        // pointer). The probe's remaining arguments are its route URI and its
+        // role; role `0` is the region-allocating probe this test drives.
+        arguments: vec![
+            SystemGuestArg::Pointer(Vec::new()),
+            SystemGuestArg::Integer(0),
+        ],
         grants: vec![
             CapabilityGrant::new(
                 Capability::SharedMemory,

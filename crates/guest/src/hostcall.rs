@@ -140,6 +140,30 @@ pub fn process_capability(
     }
 }
 
+/// Whether `process_id` owns the resource named by `class` and `resource_id`.
+///
+/// Answers from the host's ownership records, which are updated synchronously
+/// as the host mints a resource. A guest cannot reconstruct that reliably from
+/// a pushed feed — the feed can lag a resource the caller has only just
+/// created — so this is the question to ask before admitting anything that
+/// depends on ownership.
+pub fn process_owns_resource(
+    process_id: selium_abi::ProcessId,
+    class: selium_abi::ResourceClass,
+    resource_id: u64,
+) -> Result<bool> {
+    match hostcall_ready(HostcallRequest::ProcessOwnsResource {
+        process_id,
+        resource_class: class,
+        resource_id,
+    })? {
+        HostcallOutput::U64(value) => Ok(value != 0),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessOwnsResource: {other:?}"
+        ))),
+    }
+}
+
 /// Derives a caller's requestor namespace from its process owner.
 ///
 /// The tenant is read from the runtime's persisted process authority — the

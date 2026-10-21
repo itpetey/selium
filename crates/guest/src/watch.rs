@@ -58,14 +58,15 @@ impl RouteWatch {
     /// execution budget until the runtime reaps the process. Parking hands the
     /// task back and costs nothing while idle.
     ///
-    /// Known gap: a *cross-guest* write to the table does not yet wake a parked
-    /// watcher — the guest's generation-wait registry resolves intra-guest wakes
-    /// only, and no host path signals a guest parked on a watched region. A
-    /// watch therefore converges when the host next polls the consumer (every
-    /// platform poll pass), not on the write alone. The yield fallback exists
-    /// for the SDK unit tests: in a guest, yielding self-wakes, which is the
-    /// budget problem above, and the monotonic-clock hostcall (which selects the
-    /// fallback) always fails outside a host.
+    /// Convergence is wake-driven: a task parked on the table registers its
+    /// interest with the host (`WaitRegister`), and the publish that changes
+    /// the route — from *any* guest process — advances the region's generation
+    /// and delivers a mailbox wake back to this task. The watch therefore
+    /// converges on the write itself, not on the host's next poll.
+    ///
+    /// The yield fallback is for the SDK unit tests, which run outside a host:
+    /// there the monotonic-clock hostcall that selects the park path always
+    /// fails, and no host exists to wake anything anyway.
     pub async fn next(&mut self) -> Result<RouteEvent> {
         if let Some(event) = self.pending.take() {
             return Ok(event);

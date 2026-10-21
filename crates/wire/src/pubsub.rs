@@ -158,6 +158,32 @@ impl<T, M: MessageTransport> Subscriber<T, M> {
         Ok((value, tag))
     }
 
+    /// Awaits the next message, parking on the transport's read waker while
+    /// the buffer is empty.
+    ///
+    /// The parking counterpart of [`read_with_tag`](Self::read_with_tag). A
+    /// consumer that drains with `read_with_tag` has no way to wait for the
+    /// next write: on an empty buffer all it can do is spin or yield, and a
+    /// yield only re-arms the task locally. Parking registers interest with the
+    /// host (`WaitRegister`), so the task is resumed by the write itself —
+    /// including a write from the *host*, which a spin loop cannot distinguish
+    /// from silence. Reads already-buffered data first, so the await is only
+    /// reached when there is genuinely nothing left.
+    pub async fn recv_with_tag(&mut self) -> Result<(T, u32)>
+    where
+        T: FlatMsg,
+    {
+        match self.read_with_tag() {
+            Err(Error::BufferEmpty) => {}
+            other => return other,
+        }
+        let (payload, tag, _flags) = self.reader.read_frame_async().await?;
+        self.last_generation = self.reader.generation()?;
+        let value: T =
+            FlatMsg::decode(&payload).map_err(|e| Error::SerialisationFailed(format!("{e}")))?;
+        Ok((value, tag))
+    }
+
     /// Updates the capacity used for overwrite detection.
     pub fn set_capacity(&mut self, capacity: u64) {
         self.capacity = Some(capacity);

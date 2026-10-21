@@ -23,4 +23,5 @@ mod network;
 mod process;
 mod region_provider;
 mod runtime;
+mod timer;
 mod wasm;

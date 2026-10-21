@@ -335,6 +335,19 @@ impl Runtime {
         self.loaded_guests.lock().len()
     }
 
+    /// Returns whether `process_id` is currently resident, whether it is
+    /// loaded and idle-resident or executing on some thread's reactor.
+    ///
+    /// Unlike [`loaded_guest_count`](Self::loaded_guest_count), which drops
+    /// while another thread drives a guest (the poll removes it from
+    /// `loaded_guests` for the duration), this is stable against a concurrent
+    /// poll: a guest executing elsewhere is still resident.
+    #[doc(hidden)]
+    pub fn is_guest_resident(&self, process_id: ProcessId) -> bool {
+        self.loaded_guests.lock().contains_key(&process_id)
+            || self.executing_guests.lock().contains(&process_id)
+    }
+
     /// Returns the provisioned worker-pool size of a multithreaded guest, if
     /// the process runs on the multithreaded execution path.
     pub fn multithreaded_worker_count(&self, process_id: ProcessId) -> Option<usize> {

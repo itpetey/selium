@@ -313,6 +313,22 @@ pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescript
     }
 }
 
+/// Drains a process's log channel, or returns nothing when the process has
+/// already been reaped (there is no channel left, and no frames coming).
+pub(crate) fn drain_logs_if_live(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        return Vec::new();
+    };
+    frames
+        .iter()
+        .map(|frame| {
+            selium_service::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
+
 pub(crate) fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
     runtime
         .kernel()
@@ -591,7 +607,12 @@ pub(crate) fn wait_for_logs(
     let mut seen: Vec<String> = Vec::new();
     let start = Instant::now();
     while start.elapsed() < timeout {
-        seen.extend(drain_logs(runtime, process_id));
+        // A guest that has already exited has no log channel left. That is not
+        // an error for a waiter: it means no further frames are coming, and
+        // the interesting diagnosis is what it logged *before* it went. Report
+        // the timeout rather than panicking on the drain, so the accumulated
+        // lines are what the caller sees.
+        seen.extend(drain_logs_if_live(runtime, process_id));
         if needles.iter().all(|(needle, count)| {
             seen.iter()
                 .filter(|message| message.contains(needle))

@@ -80,7 +80,15 @@ fn deploy_spawns_from_a_durable_slice_across_restart() {
         .expect("bootstrap system guests");
 
     let probe = find(&report, "deploy-probe");
-    let logs = spine_common::drain_logs(&runtime, probe);
+    // Waited, not drained: the probe parks on its blob-store and store RPCs,
+    // so on a correct reactor the entrypoint hands back before it has logged —
+    // its own wake resumes it, but only after this returns.
+    let logs = spine_common::wait_for_logs(
+        &runtime,
+        probe,
+        &[("uploaded module", 1), ("durable slice", 1)],
+        std::time::Duration::from_secs(30),
+    );
     assert!(
         logs.iter().any(|line| line.contains("uploaded module")),
         "expected the probe to upload the module, got: {logs:?}"
@@ -102,7 +110,12 @@ fn deploy_spawns_from_a_durable_slice_across_restart() {
         })
         .expect("re-bootstrap probe");
     let probe = find(&report, "deploy-probe");
-    let logs = spine_common::drain_logs(&runtime, probe);
+    let logs = spine_common::wait_for_logs(
+        &runtime,
+        probe,
+        &[("reusing persisted manifest", 1), ("durable slice", 1)],
+        std::time::Duration::from_secs(30),
+    );
     assert!(
         logs.iter()
             .any(|line| line.contains("reusing persisted manifest")),

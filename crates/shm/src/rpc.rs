@@ -65,9 +65,6 @@ pub struct OwnedRpcClient<Req, Rep> {
     shared_id: u64,
 }
 
-/// Yields once and re-checks, used by [`wait_for_server_accept`].
-struct YieldOnce(bool);
-
 /// A [`ServerStreamClient`] that owns its session region.
 ///
 /// Mirrors [`OwnedRpcClient`] for server-streaming sessions: the session
@@ -107,23 +104,6 @@ impl<Req, Rep> Drop for OwnedRpcClient<Req, Rep> {
         if crate::free_region(self.shared_id).is_err() {
             // Already reclaimed (e.g. peer freed it first, or process
             // teardown raced); nothing further to do during drop.
-        }
-    }
-}
-
-impl std::future::Future for YieldOnce {
-    type Output = ();
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        if self.0 {
-            std::task::Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
         }
     }
 }
@@ -181,6 +161,16 @@ where
     let reply_transport =
         ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
 
+    // Announce acceptance: the client `wait_for_server_accept` parks on this
+    // region's generation, and the writer count alone does not wake it. The
+    // bump is after the reader/writer are in place, so a woken client observes
+    // the second writer immediately.
+    request_channel
+        .ring()
+        .region()
+        .bump_generation()
+        .map_err(|error| RpcError::Serialisation(error.to_string()))?;
+
     Ok(RpcConnection::new(
         FramedRead::new(request_transport),
         FramedWrite::new(reply_transport),
@@ -206,6 +196,14 @@ where
         ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
     let reply_transport =
         ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+
+    // Announce acceptance (see `accept`): the client parks on the request
+    // region's generation, not on the writer count.
+    request_channel
+        .ring()
+        .region()
+        .bump_generation()
+        .map_err(|error| RpcError::Serialisation(error.to_string()))?;
 
     Ok(ServerStreamConnection::new(
         FramedRead::new(request_transport),
@@ -400,15 +398,54 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
 /// The accept signal is the writer count on the request channel. The client
 /// contributes exactly one writer (its request transport's write half); the
 /// server contributes a second when it builds its request transport during
-/// accept. Because a transport registers its eager reader before its writer,
-/// observing the second writer guarantees the server's reader is already in
-/// place. If the server never accepts, the caller parks here — the honest
-/// backpressure outcome for a route nobody serves.
+/// accept, and advances the region's generation to announce it (see
+/// [`accept`]). Because a transport registers its eager reader before its
+/// writer, observing the second writer guarantees the server's reader is
+/// already in place.
+///
+/// The wait registers a generation wait on the request region, so an
+/// unaccepted session *parks*: the reactor hands the task back and the host
+/// is free to drive other work (including the server's accept). Busy-yielding
+/// instead would re-queue the task locally, spinning the reactor for as long
+/// as the server has not accepted — visible as an entrypoint that never
+/// reaches its first park.
 async fn wait_for_server_accept(channel: &Channel) -> Result<()> {
-    while channel.ring().region().load_writer_count()? < 2 {
-        YieldOnce(false).await;
+    let region = channel.ring().region();
+    let region_id = region.region_id();
+    loop {
+        if region.load_writer_count()? >= 2 {
+            return Ok(());
+        }
+        let generation = region.load_generation()?;
+        // Lost-wake guard: an accept that landed between the count read and
+        // the generation read is re-checked synchronously rather than parked
+        // through.
+        if region.load_writer_count()? >= 2 || region.load_generation()? != generation {
+            continue;
+        }
+        // Park until the generation moves, then re-check the writer count.
+        // `registered` makes the future complete on the poll *after* the
+        // registration, so the loop re-checks exactly once per wake.
+        let mut registered = false;
+        std::future::poll_fn(|cx| {
+            if registered {
+                return std::task::Poll::Ready(());
+            }
+            registered = true;
+            if !selium_memory::register_generation_wait(region_id, generation, cx.waker()) {
+                // No reactor callback installed (e.g. a host-side consumer):
+                // fall back to a self-wake so the loop re-checks.
+                cx.waker().wake_by_ref();
+            }
+            // Check-after-register: an accept that landed between the reads
+            // above and the registration self-wakes us instead of being lost.
+            if region.load_generation().ok() != Some(generation) {
+                cx.waker().wake_by_ref();
+            }
+            std::task::Poll::Pending
+        })
+        .await;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -503,6 +540,39 @@ mod tests {
         assert_eq!(reply, PongMsg("pong".to_string()));
 
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn accept_advances_the_request_generation_to_signal_the_client() {
+        // `wait_for_server_accept` parks on the request region's generation;
+        // `accept` must advance it once the server's reader/writer are in
+        // place, or a client whose connect is not accepted in the same nested
+        // poll stays parked (previously: spun) forever.
+        setup();
+        let (request_channel, _reply_channel, shared_id) =
+            create_rpc_region(4096, 4096).expect("create_rpc_region");
+        let before = request_channel
+            .ring()
+            .region()
+            .load_generation()
+            .expect("generation before accept");
+
+        let incoming = IncomingConnection {
+            client_process_id: 1,
+            shared_id,
+        };
+        let _connection: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+
+        let after = request_channel
+            .ring()
+            .region()
+            .load_generation()
+            .expect("generation after accept");
+        assert!(
+            after > before,
+            "accept must advance the request region generation \
+             ({before} -> {after}) to wake a parked client"
+        );
     }
 
     #[tokio::test]

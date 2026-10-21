@@ -33,6 +33,8 @@ members = [
   "integration/net-demo",
   "integration/quic-demo",
   "integration/spine-demo",
+  "integration/timer-probe",
+  "integration/wake-probe",
 ]
 exclude = ["vendor"]
 # Frozen during the spine rebuild (kept in-tree for later increments):

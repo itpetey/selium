@@ -886,6 +886,23 @@ pub enum HostcallRequest {
         /// Tenant whose CA key is revoked.
         tenant: String,
     },
+    /// Whether `process_id` owns the resource named by `resource_class` and
+    /// `resource_id`.
+    ///
+    /// The host records ownership **synchronously**, inside the hostcall that
+    /// mints the resource, so this answer is authoritative and cannot lag a
+    /// resource the caller has only just created. A guest that reconstructs
+    /// ownership from a pushed feed cannot make that guarantee, which is what
+    /// makes this the right question to ask before admitting an action that
+    /// depends on ownership (e.g. registering a route for a resource).
+    ProcessOwnsResource {
+        /// Process whose ownership to check.
+        process_id: ProcessId,
+        /// Class of the resource.
+        resource_class: ResourceClass,
+        /// Resource id within that class.
+        resource_id: u64,
+    },
 }
 
 /// Hostcall request paired with the guest task that initiated it.

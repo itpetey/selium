@@ -199,6 +199,20 @@ impl DiscoveryStore {
         }
     }
 
+    /// Records that `process_id` owns `(resource_id, class)`.
+    ///
+    /// Used to seed the ownership table from the host's authoritative answer,
+    /// so admission does not depend on the Tier-1 feed having caught up with a
+    /// resource the caller has only just created.
+    pub fn record_ownership(
+        &mut self,
+        process_id: ProcessId,
+        resource_id: u64,
+        class: selium_abi::ResourceClass,
+    ) {
+        self.ownership.insert((process_id, resource_id), class);
+    }
+
     /// Stores a Tier-1 registration under its exact key, populates the
     /// ownership table from `owner`, and maintains the label index for typed
     /// targets.
@@ -588,8 +602,14 @@ impl DiscoveryStore {
             // the route too.
             let canonical = uri::resource_uri(tenant, target.class.clone(), target.resource_id);
             if !self.registrations.contains_key(&canonical) {
-                // The claimed target is not registered (e.g. it was already
-                // revoked); a dangling route would resolve to nothing.
+                // The claimed target is not registered under this tenant (e.g.
+                // it was already revoked, or the host minted it under a
+                // different tenant); a dangling route would resolve to
+                // nothing. The canonical typed registration is host-authored on
+                // the Tier-1 feed and cannot be reconstructed here: the
+                // ownership table keys `(process, resource)` without the
+                // resource's tenant, so synthesising it would let a caller
+                // alias a resource minted under another tenant.
                 return DiscoveryResponse::NotFound;
             }
             self.aliases.insert(uri_str.clone(), canonical.clone());
@@ -860,7 +880,13 @@ async fn feed_loop(
     mut subscriber: Subscriber<DiscoveryRequest, ShmTransport>,
 ) {
     loop {
-        match subscriber.read_with_tag() {
+        // Park on the feed rather than yielding. The feed's writer is the
+        // *host* (it publishes Tier-1 lifecycle events), and a yield only
+        // re-arms this task locally — it tells nobody that the feed has data.
+        // Parking registers interest in the region with the host, so the host's
+        // own publish wakes this task; without it a Tier-1 event sits unread
+        // until something unrelated re-enters the guest.
+        match subscriber.recv_with_tag().await {
             Ok((request, _tag)) => {
                 let mut store = store
                     .lock()
@@ -869,9 +895,6 @@ async fn feed_loop(
                 if let Err(error) = sync_route_table(&store, &route_table) {
                     selium_guest::warn!("discovery route table sync failed: {error}");
                 }
-            }
-            Err(selium_wire::error::Error::BufferEmpty) => {
-                selium_guest::yield_now().await;
             }
             Err(error) => {
                 selium_guest::warn!("discovery feed read failed: {error}");
@@ -955,6 +978,27 @@ async fn handler(
                                 root_service,
                                 ..
                             } => {
+                                // Ownership is a host fact, and the host
+                                // records it as it mints the resource. This
+                                // table is filled from the Tier-1 feed, so it
+                                // can still be missing a resource the caller
+                                // has only just created — the caller then gets
+                                // refused for a resource it does own. Ask the
+                                // authority and seed the table from its answer,
+                                // so admission never depends on feed latency.
+                                if selium_guest::process_owns_resource(
+                                    client_process_id,
+                                    target.class.clone(),
+                                    target.resource_id,
+                                )
+                                .unwrap_or(false)
+                                {
+                                    store.record_ownership(
+                                        client_process_id,
+                                        target.resource_id,
+                                        target.class.clone(),
+                                    );
+                                }
                                 // Root-namespace registrations (a `sel:///…`
                                 // URI or a single-label wire name) require the
                                 // system-registration capability.
@@ -1092,9 +1136,19 @@ fn health_uri(tenant: Option<&str>, name: &str) -> String {
 /// and publishing the resulting route changes.
 async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
     const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
+    let mut ticks: u64 = 0;
     loop {
-        let deadline = match selium_guest::time::now() {
-            Ok(now) => selium_guest::Instant::from_nanos(now.saturating_add(SWEEP_INTERVAL_NANOS)),
+        // The sweep *interval* is measured on the monotonic clock, the same
+        // domain `Timer` compares its deadline against. Wall-clock
+        // nanoseconds since the epoch (`selium_guest::time::now`) are a
+        // different domain entirely — feeding one into `Instant::from_nanos`
+        // puts the deadline ~56 years in the future and the sweep never ticks.
+        // Wall-clock time is still the right domain for *lease expiry*, below:
+        // a lease is stored against the clock every participant reads.
+        let deadline = match selium_guest::Instant::now() {
+            Ok(now) => now
+                .checked_add(std::time::Duration::from_nanos(SWEEP_INTERVAL_NANOS))
+                .unwrap_or(selium_guest::Instant::MAX),
             Err(error) => {
                 selium_guest::warn!("discovery lease sweep clock failed: {error}");
                 selium_guest::yield_now().await;
@@ -1106,6 +1160,16 @@ async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<Ro
         let now_ms = selium_guest::time::now()
             .map(|nanos| nanos / 1_000_000)
             .unwrap_or(0);
+        // A first-tick marker: the sweep runs on a timer, so "it fired" is
+        // otherwise unobservable from outside, and an integration test cannot
+        // tell a ticking sweep from one parked on a deadline that never
+        // arrives. Marking only the *first* tick keeps the probe free — a
+        // 0.5 Hz heartbeat writes a ring frame and wakes the host on every
+        // beat, which is enough to perturb the spines sharing this host.
+        if ticks == 0 {
+            selium_guest::info!("discovery lease sweep tick");
+        }
+        ticks += 1;
         let mut store = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

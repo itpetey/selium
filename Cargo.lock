@@ -1563,6 +1563,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "selium-timer-probe"
+version = "1.0.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "selium-guest",
+]
+
+[[package]]
+name = "selium-wake-probe"
+version = "1.0.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "selium-guest",
+ "selium-shm",
+ "selium-wire",
+]
+
+[[package]]
 name = "selium-wire"
 version = "1.0.0-alpha.7"
 dependencies = [

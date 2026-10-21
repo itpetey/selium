@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -107,45 +106,21 @@ impl Runtime {
             },
         );
 
-        // Register SleepWait timer so the guest is woken via mailbox when
-        // the deadline arrives. The wake is spawned context-free: a guest
-        // executed inline on a non-Tokio thread (e.g. the kernel poller's
-        // datagram-wake path) has no ambient reactor, so reuse a handle
-        // captured from the first Tokio-threaded hostcall — falling back to
-        // a minimal dedicated runtime when no Tokio context was ever seen.
+        // Hand the guest's sleep deadline to the runtime's timer driver, which
+        // owns the deadline queue and delivers the completion wake through the
+        // ordinary mailbox path. The driver runs on its own thread, so the
+        // wake lands whether the caller is on a Tokio thread, a kernel poller
+        // thread, or anywhere else — and cannot be dropped along with an
+        // executor that happened to be borrowed here.
         if let HostOperationState::SleepWait { deadline } = state
             && let Some(tid) = task_id
         {
-            let duration = deadline.saturating_duration_since(Instant::now());
-            let operations = Arc::clone(&self.operations);
-            let runtime = self.clone();
-            let timer = async move {
-                tokio::time::sleep(duration).await;
-                if let Some(op) = operations.lock().get_mut(&operation_id) {
-                    op.state = HostOperationState::Ready(HostcallOutput::Empty);
-                }
-                // Deliver through the standard wake path (mailbox enqueue +
-                // inline guest poll). A bare enqueue is a lost wake when the
-                // guest reactor is stalled with only this timer outstanding:
-                // nothing else would ever poll it, deadlocking timer-driven
-                // progress (e.g. quinn loss detection, pacing, delayed ACKs).
-                runtime.wake_process_task(process_id, tid);
-            };
-            let ambient = tokio::runtime::Handle::try_current().ok();
-            if let Some(handle) = ambient.as_ref() {
-                drop(self.timer_handle.set(handle.clone()));
-            }
-            match ambient.or_else(|| self.timer_handle.get().cloned()) {
-                Some(handle) => drop(handle.spawn(timer)),
-                None => drop(std::thread::spawn(move || {
-                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_time()
-                        .build()
-                    {
-                        runtime.block_on(timer);
-                    }
-                })),
-            }
+            crate::timer::TimerDriver::for_runtime(self).schedule(crate::timer::SleepRequest {
+                deadline,
+                operation_id,
+                process_id,
+                task_id: tid,
+            });
         }
 
         (status, operation_id)
@@ -1290,6 +1265,31 @@ impl Runtime {
             HostcallRequest::ProcessTenant { process_id } => Ok(HostOperationState::Ready(
                 HostcallOutput::Tenant(self.process_tenant(process_id)),
             )),
+            HostcallRequest::ProcessOwnsResource {
+                process_id: owner,
+                resource_class,
+                resource_id,
+            } => {
+                // Ownership is read from the host's authoritative owner sets:
+                // the shared-resource set (regions, queues, volumes) and the
+                // process-local-handle set (the `Process` node a spawned
+                // process owns as itself). The host records into both
+                // synchronously as it mints a resource, so this answer cannot
+                // lag a resource the caller has only just created.
+                let owns = self
+                    .shared_resource_owners
+                    .lock()
+                    .get(&(resource_class.clone(), resource_id))
+                    .is_some_and(|owners| owners.contains(&owner))
+                    || self
+                        .local_handle_owners
+                        .lock()
+                        .get(&(resource_class, resource_id))
+                        .is_some_and(|owners| owners.contains(&owner));
+                Ok(HostOperationState::Ready(HostcallOutput::U64(u64::from(
+                    owns,
+                ))))
+            }
             HostcallRequest::ProcessCapability {
                 process_id: target_process_id,
                 capability,
@@ -2246,6 +2246,24 @@ mod tests {
     fn module_with_entrypoint(entrypoint: &str, body: &str) -> Vec<u8> {
         wat::parse_str(format!("(module (func (export \"{entrypoint}\") {body}))"))
             .expect("compile wat")
+    }
+
+    /// Allocates a shared region for `process_id`, returning its region id.
+    fn allocate_region(runtime: &Runtime, process_id: ProcessId) -> SharedResourceId {
+        let (status, op) = runtime.begin_hostcall(
+            process_id,
+            HostcallRequest::AllocRegion {
+                pages: 1,
+                prot: selium_abi::RegionProt::ReadWrite,
+                purpose: selium_abi::ResourceKind::SharedMemory,
+                serving_tenant: None,
+            },
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        match runtime.poll_hostcall(process_id, op) {
+            CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) => alloc.region_id,
+            other => panic!("expected RegionAlloc, got {other:?}"),
+        }
     }
 
     fn spawn_with_grants(
@@ -5414,5 +5432,81 @@ mod tests {
             runtime.poll_hostcall(spawner.process_id, op),
             CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
         ));
+    }
+
+    /// Task 1.1: a guest registering interest in a region through
+    /// `WaitRegister` is recorded in the wait registry under
+    /// `(process_id, region_id)`, so a later generation advance — from this
+    /// process or any other — can route a wake back to its task.
+    #[test]
+    fn wait_register_records_the_waiting_process_keyed_by_region() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+        let region_id = allocate_region(&runtime, guest.process_id);
+
+        let (status, _op) = runtime.begin_hostcall_with_task(
+            guest.process_id,
+            HostcallRequest::WaitRegister {
+                region_id,
+                generation: 7,
+            },
+            Some(1),
+            None,
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+
+        let registry = runtime.wait_registry.lock();
+        let entries = registry
+            .get(&(guest.process_id, region_id))
+            .expect("wait registered under (process, region)");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.first().map(|entry| entry.generation), Some(7));
+        assert_eq!(entries.first().map(|entry| entry.task_id), Some(1));
+    }
+
+    /// Task 1.3: a generation advance that targets a stopped process is a
+    /// no-op — it neither panics nor leaves a stale registration behind, and
+    /// a repeat advance stays a no-op (delivery is idempotent).
+    #[test]
+    fn generation_advance_for_a_stopped_process_is_a_no_op() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            )],
+        );
+        let region_id = allocate_region(&runtime, guest.process_id);
+        let (status, _op) = runtime.begin_hostcall_with_task(
+            guest.process_id,
+            HostcallRequest::WaitRegister {
+                region_id,
+                generation: 1,
+            },
+            Some(1),
+            None,
+        );
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+
+        runtime
+            .stop_process(guest.process_id)
+            .expect("stop process with an outstanding wait registration");
+
+        // Deliver twice: the mailbox for a stopped process is gone, so each
+        // advance is dropped without error and without leaving the registry
+        // populated.
+        runtime.note_generation_advance(region_id, 2);
+        runtime.note_generation_advance(region_id, 3);
+        assert!(
+            runtime.wait_registry.lock().is_empty(),
+            "a delivered wake must not leave the registration behind"
+        );
     }
 }

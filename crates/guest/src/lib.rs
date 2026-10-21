@@ -23,9 +23,9 @@ pub use crate::{
     error::{GuestError, Result},
     hostcall::{
         authorise_attach, declare_attachable_by_resolution, namespace_from_tenant,
-        process_capability, process_namespace, process_tenant, quota_clear, quota_set,
-        random_bytes, record_resolved_resource_for, revoke_ca, self_info, sign_tenant_ca,
-        sign_user_cert,
+        process_capability, process_namespace, process_owns_resource, process_tenant, quota_clear,
+        quota_set, random_bytes, record_resolved_resource_for, revoke_ca, self_info,
+        sign_tenant_ca, sign_user_cert,
     },
     net::{Datagram, TcpListener, TcpStream, UdpSocket},
     platform::process_id,
@@ -108,5 +108,12 @@ pub fn init() -> Result<()> {
             .map_err(|error| GuestError::Host(error.to_string()))?;
     }
     crate::platform::register_mailbox();
+    // Install the generation-wait callbacks before any entrypoint work. A
+    // channel, RPC, or route-table read that finds its ring empty parks on
+    // `register_generation_wait`; with no callback installed that returns
+    // false and every caller self-wakes, so the entrypoint's *first* park
+    // spins the reactor instead of stalling. `poll_reactor` also installs
+    // them (idempotently) for the host-driven polls.
+    crate::async_runtime::install_generation_wait_callbacks();
     Ok(())
 }

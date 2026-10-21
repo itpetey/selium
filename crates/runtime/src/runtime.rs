@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,7 +14,7 @@ use selium_abi::{
 use selium_kernel::Kernel;
 use selium_service::DiscoveryRequest;
 use selium_shm::transport::ShmTransport;
-use selium_wire::pubsub::Publisher;
+use selium_wire::{MessageTransport, pubsub::Publisher};
 
 use crate::{
     bootstrap::LoadedGuest,
@@ -121,12 +121,10 @@ pub struct Runtime {
     /// store; losers of the race return and rely on the winner's
     /// pending-wake re-check (see `poll_guest_until_stalled`).
     pub(crate) executing_guests: Arc<Mutex<HashSet<ProcessId>>>,
-    /// Captured ambient Tokio runtime handle, used to spawn `Sleep`
-    /// hostcall timer wakes. Guests can be executed inline on non-Tokio
-    /// threads (e.g. the kernel poller's datagram-wake path), where
-    /// `tokio::spawn` would panic for lack of a thread-local reactor; the
-    /// first handle observed on a Tokio thread is reused for those.
-    pub(crate) timer_handle: Arc<std::sync::OnceLock<tokio::runtime::Handle>>,
+    /// The runtime's timer driver, started lazily on the first guest-issued
+    /// `Sleep`. Owns every guest sleep deadline so the completion wake never
+    /// depends on an ambient executor context (see `timer`).
+    pub(crate) timer_driver: Arc<OnceLock<crate::timer::TimerDriver>>,
     /// Host-held PKI keyring backing the certificate-signing hostcalls.
     /// Initialised at startup (see [`Runtime::initialise_keyring`]); the
     /// signing hostcalls fail loudly while it is absent.
@@ -209,7 +207,7 @@ impl Runtime {
             kick_counts: Arc::new(Mutex::new(HashMap::new())),
             queue_waiters: Arc::new(Mutex::new(HashMap::new())),
             executing_guests: Arc::new(Mutex::new(HashSet::new())),
-            timer_handle: Arc::new(std::sync::OnceLock::new()),
+            timer_driver: Arc::new(OnceLock::new()),
             keyring: Arc::new(Mutex::new(None)),
             metering: Arc::new(Mutex::new(crate::metering::MeteringProjector::default())),
             metering_ticker_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -351,15 +349,33 @@ impl Runtime {
     ///
     /// Returns `Ok(())` if discovery is enabled and the publish succeeds. If
     /// discovery is not enabled, this is a no-op.
+    ///
+    /// The host is itself a writer on the feed, so it owes its subscriber the
+    /// same wake a guest writer owes: the commit advances the region's
+    /// generation, and every process that registered interest in that region
+    /// (discovery, via `WaitRegister`) must be signalled. Without this the feed
+    /// is write-only in practice — discovery's feed loop stays parked until
+    /// something unrelated re-enters the guest, so a Tier-1 event can sit
+    /// unread indefinitely and the routes it removes stay resolvable.
     pub(crate) fn publish_discovery_event(&self, request: DiscoveryRequest) -> Result<()> {
-        let mut publisher = self.discovery_publisher.lock();
-        if let Some(ref mut publisher) = *publisher {
-            publisher
-                .publish(&request)
-                .map_err(|error| crate::Error::Host(format!("discovery publish failed: {error}")))
-        } else {
-            Ok(())
+        // Scoped so the publisher lock is released before the wake is
+        // delivered: the wake re-enters the woken guest inline, and that guest
+        // may itself publish to the feed.
+        let committed = {
+            let mut publisher = self.discovery_publisher.lock();
+            let Some(publisher) = publisher.as_mut() else {
+                return Ok(());
+            };
+            publisher.publish(&request).map_err(|error| {
+                crate::Error::Host(format!("discovery publish failed: {error}"))
+            })?;
+            let transport = publisher.writer().inner();
+            Some((transport.write_region_id(), transport.generation()))
+        };
+        if let Some((region_id, Ok(generation))) = committed {
+            self.note_generation_advance(region_id, generation);
         }
+        Ok(())
     }
 
     /// Returns the registered mailbox of `process_id`, if the guest has
