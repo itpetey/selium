@@ -42,6 +42,58 @@ const ROLE_PROVIDER: u64 = 1;
 /// typed target to be registered under its own URI first).
 const ROUTE: &str = "sel://probe/app/service";
 
+/// Waits for the consumer to report an appearance and returns the resource id
+/// it converged on.
+#[expect(clippy::panic, reason = "test helper: a malformed log line is a bug")]
+fn appeared_resource(runtime: &Runtime, consumer_id: u64) -> u64 {
+    let line = expect_line(
+        runtime,
+        consumer_id,
+        "consumer: appeared",
+        Duration::from_secs(30),
+    );
+    line.split_whitespace()
+        .next_back()
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("appeared line carries no resource id: {line:?}"))
+}
+
+/// Bootstraps the discovery service plus a route-watch consumer.
+fn bootstrap_discovery_and_consumer(runtime: &Runtime) -> (u64, u64) {
+    let report = runtime
+        .bootstrap_system_guests(RuntimeConfig {
+            start_discovery: true,
+            system_guests: vec![
+                discovery_descriptor(discovery_wasm()),
+                probe_descriptor(
+                    // The leading argument is a pointer, so bootstrap
+                    // prepends the discovery handle for this guest.
+                    vec![
+                        SystemGuestArg::Pointer(ROUTE.as_bytes().to_vec()),
+                        SystemGuestArg::Integer(ROLE_CONSUMER),
+                    ],
+                    ROLE_CONSUMER,
+                ),
+            ],
+            state_dir: None,
+        })
+        .expect("bootstrap discovery and consumer");
+
+    let consumer = report
+        .guests
+        .iter()
+        .find(|guest| guest.name == guest_name(ROLE_CONSUMER))
+        .expect("consumer in report")
+        .process_id;
+    let discovery = report
+        .guests
+        .iter()
+        .find(|guest| guest.name == "discovery")
+        .expect("discovery in report")
+        .process_id;
+    (consumer, discovery)
+}
+
 /// Task 4.2: a consumer started before its provider converges, and re-attaches
 /// after the provider restarts.
 #[test]
@@ -106,97 +158,6 @@ fn consumer_converges_on_a_provider_that_starts_later_and_restarts() {
     }
 }
 
-/// Bootstraps the discovery service plus a route-watch consumer.
-fn bootstrap_discovery_and_consumer(runtime: &Runtime) -> (u64, u64) {
-    let report = runtime
-        .bootstrap_system_guests(RuntimeConfig {
-            start_discovery: true,
-            system_guests: vec![
-                discovery_descriptor(discovery_wasm()),
-                probe_descriptor(
-                    // The leading argument is a pointer, so bootstrap
-                    // prepends the discovery handle for this guest.
-                    vec![
-                        SystemGuestArg::Pointer(ROUTE.as_bytes().to_vec()),
-                        SystemGuestArg::Integer(ROLE_CONSUMER),
-                    ],
-                    ROLE_CONSUMER,
-                ),
-            ],
-            state_dir: None,
-        })
-        .expect("bootstrap discovery and consumer");
-
-    let consumer = report
-        .guests
-        .iter()
-        .find(|guest| guest.name == guest_name(ROLE_CONSUMER))
-        .expect("consumer in report")
-        .process_id;
-    let discovery = report
-        .guests
-        .iter()
-        .find(|guest| guest.name == "discovery")
-        .expect("discovery in report")
-        .process_id;
-    (consumer, discovery)
-}
-
-/// Spawns a provider for [`ROUTE`], wiring in the discovery listener handle
-/// that `bootstrap_system_guests` would otherwise have supplied.
-#[expect(
-    clippy::panic,
-    reason = "test helper: a failed entrypoint is a test failure"
-)]
-fn spawn_provider(runtime: &Runtime) -> u64 {
-    let listener = runtime
-        .discovery_listener_shared_id()
-        .expect("discovery listener shared id");
-    let mut descriptor = probe_descriptor(
-        vec![
-            SystemGuestArg::Integer(listener),
-            SystemGuestArg::Pointer(ROUTE.as_bytes().to_vec()),
-            SystemGuestArg::Integer(ROLE_PROVIDER),
-        ],
-        ROLE_PROVIDER,
-    );
-    descriptor.grants.push(CapabilityGrant::new(
-        Capability::HostQueue,
-        vec![ResourceSelector::ExplicitResource(
-            ResourceIdentity::Shared(listener),
-        )],
-    ));
-    runtime
-        .spawn_system_guest(descriptor)
-        .unwrap_or_else(|error| {
-            panic!(
-                "spawn provider guest: {error}; activity: {:#?}",
-                runtime.activity_log()
-            )
-        })
-        .process_id
-}
-
-/// Waits for the consumer to report an appearance and returns the resource id
-/// it converged on.
-#[expect(clippy::panic, reason = "test helper: a malformed log line is a bug")]
-fn appeared_resource(runtime: &Runtime, consumer_id: u64) -> u64 {
-    let line = expect_line(
-        runtime,
-        consumer_id,
-        "consumer: appeared",
-        Duration::from_secs(30),
-    );
-    line.split_whitespace()
-        .next_back()
-        .and_then(|id| id.parse::<u64>().ok())
-        .unwrap_or_else(|| panic!("appeared line carries no resource id: {line:?}"))
-}
-
-fn guest_name(mode: u64) -> String {
-    format!("discovery-probe-{mode}")
-}
-
 fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "discovery".to_string(),
@@ -221,29 +182,6 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         ],
         tenant: None,
         discovery_service: true,
-        handlers: Vec::new(),
-    }
-}
-
-fn probe_descriptor(arguments: Vec<SystemGuestArg>, mode: u64) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: guest_name(mode),
-        module_id: format!("discovery-probe-{mode}-module"),
-        module_bytes: discovery_probe_wasm(),
-        entrypoint: "discovery_probe".to_string(),
-        arguments,
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        tenant: Some("probe".to_string()),
-        discovery_service: false,
         handlers: Vec::new(),
     }
 }
@@ -286,4 +224,66 @@ fn expect_line(runtime: &Runtime, process_id: u64, prefix: &str, timeout: Durati
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for {prefix:?} in guest log; got {seen:?}");
+}
+
+fn guest_name(mode: u64) -> String {
+    format!("discovery-probe-{mode}")
+}
+
+fn probe_descriptor(arguments: Vec<SystemGuestArg>, mode: u64) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: guest_name(mode),
+        module_id: format!("discovery-probe-{mode}-module"),
+        module_bytes: discovery_probe_wasm(),
+        entrypoint: "discovery_probe".to_string(),
+        arguments,
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        tenant: Some("probe".to_string()),
+        discovery_service: false,
+        handlers: Vec::new(),
+    }
+}
+
+/// Spawns a provider for [`ROUTE`], wiring in the discovery listener handle
+/// that `bootstrap_system_guests` would otherwise have supplied.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a failed entrypoint is a test failure"
+)]
+fn spawn_provider(runtime: &Runtime) -> u64 {
+    let listener = runtime
+        .discovery_listener_shared_id()
+        .expect("discovery listener shared id");
+    let mut descriptor = probe_descriptor(
+        vec![
+            SystemGuestArg::Integer(listener),
+            SystemGuestArg::Pointer(ROUTE.as_bytes().to_vec()),
+            SystemGuestArg::Integer(ROLE_PROVIDER),
+        ],
+        ROLE_PROVIDER,
+    );
+    descriptor.grants.push(CapabilityGrant::new(
+        Capability::HostQueue,
+        vec![ResourceSelector::ExplicitResource(
+            ResourceIdentity::Shared(listener),
+        )],
+    ));
+    runtime
+        .spawn_system_guest(descriptor)
+        .unwrap_or_else(|error| {
+            panic!(
+                "spawn provider guest: {error}; activity: {:#?}",
+                runtime.activity_log()
+            )
+        })
+        .process_id
 }

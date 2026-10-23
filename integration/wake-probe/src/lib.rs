@@ -30,57 +30,24 @@ use selium_wire::framed::{FramedRead, FramedWrite};
 
 /// Ring data capacity for the probe channel.
 const CHANNEL_CAPACITY: u64 = 4096;
-/// Publish cadence of the publisher role.
-const PUBLISH_INTERVAL_NANOS: u64 = 100_000_000;
-/// The publisher role: create the channel and publish frames.
-const MODE_PUBLISHER: u64 = 0;
-/// The watcher role: attach to the publisher's channel and park on a read.
-const MODE_WATCHER: u64 = 1;
 /// The parker role: create the channel and park on it without ever
 /// publishing. A watcher attached to a parker's channel therefore parks
 /// forever, which is what a host-polling-budget test needs: nothing will
 /// legitimately wake it, so any budget it spends is spent purely on being
 /// polled.
 const MODE_PARKER: u64 = 2;
+/// The publisher role: create the channel and publish frames.
+const MODE_PUBLISHER: u64 = 0;
+/// The watcher role: attach to the publisher's channel and park on a read.
+const MODE_WATCHER: u64 = 1;
 /// The yielder role: a task that only ever yields, forever. Used to pin the
 /// host-side yield accounting — a pass that merely re-arms a yielded task is
 /// not forward progress, so a polling host must not re-enter on it.
 const MODE_YIELDER: u64 = 3;
+/// Publish cadence of the publisher role.
+const PUBLISH_INTERVAL_NANOS: u64 = 100_000_000;
 /// How often the yielder reports progress, in yields.
 const YIELD_LOG_INTERVAL: u64 = 100;
-
-#[entrypoint]
-async fn wake_probe(mode: u64, region: (u64, u64)) -> anyhow::Result<()> {
-    drop(selium_guest::log::init());
-    match mode {
-        MODE_PUBLISHER => publisher().await,
-        MODE_PARKER => parker().await,
-        MODE_YIELDER => yielder().await,
-        MODE_WATCHER => {
-            // SAFETY: the runtime wrote these bytes into this guest's linear
-            // memory for this entrypoint invocation.
-            let region_id = unsafe { selium_guest::args::str(region.0, region.1) }
-                .context("wake-probe: region id argument")?
-                .parse::<u64>()
-                .context("wake-probe: region id is not a u64")?;
-            watcher(region_id).await
-        }
-        other => bail!("wake-probe: unknown mode {other}"),
-    }
-}
-
-/// Yields forever, logging every [`YIELD_LOG_INTERVAL`] yields.
-async fn yielder() -> anyhow::Result<()> {
-    info!("wake-probe: yielding");
-    let mut yields: u64 = 0;
-    loop {
-        selium_guest::yield_now().await;
-        yields += 1;
-        if yields.is_multiple_of(YIELD_LOG_INTERVAL) {
-            info!("wake-probe: yielded {yields}");
-        }
-    }
-}
 
 /// Creates a channel, announces its region id, and declares it attachable so
 /// a [`MODE_WATCHER`] peer can record a resolve and attach — a peer attach is
@@ -138,6 +105,26 @@ async fn publisher() -> anyhow::Result<()> {
     }
 }
 
+#[entrypoint]
+async fn wake_probe(mode: u64, region: (u64, u64)) -> anyhow::Result<()> {
+    drop(selium_guest::log::init());
+    match mode {
+        MODE_PUBLISHER => publisher().await,
+        MODE_PARKER => parker().await,
+        MODE_YIELDER => yielder().await,
+        MODE_WATCHER => {
+            // SAFETY: the runtime wrote these bytes into this guest's linear
+            // memory for this entrypoint invocation.
+            let region_id = unsafe { selium_guest::args::str(region.0, region.1) }
+                .context("wake-probe: region id argument")?
+                .parse::<u64>()
+                .context("wake-probe: region id is not a u64")?;
+            watcher(region_id).await
+        }
+        other => bail!("wake-probe: unknown mode {other}"),
+    }
+}
+
 /// Attaches to `region_id` and parks until a frame arrives, then logs it.
 async fn watcher(region_id: u64) -> anyhow::Result<()> {
     record_resolved_resource_for(ResourceClass::SharedRegion, region_id, process_id())
@@ -156,4 +143,17 @@ async fn watcher(region_id: u64) -> anyhow::Result<()> {
         String::from_utf8_lossy(&payload).trim()
     );
     Ok(())
+}
+
+/// Yields forever, logging every [`YIELD_LOG_INTERVAL`] yields.
+async fn yielder() -> anyhow::Result<()> {
+    info!("wake-probe: yielding");
+    let mut yields: u64 = 0;
+    loop {
+        selium_guest::yield_now().await;
+        yields += 1;
+        if yields.is_multiple_of(YIELD_LOG_INTERVAL) {
+            info!("wake-probe: yielded {yields}");
+        }
+    }
 }

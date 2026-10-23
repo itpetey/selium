@@ -31,6 +31,34 @@ mod common;
 /// test exists to catch.
 const FIRST_TICK_BOUND: Duration = Duration::from_secs(30);
 
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
+        ],
+        tenant: None,
+        discovery_service: true,
+        handlers: Vec::new(),
+    }
+}
+
 #[test]
 #[ignore = "requires the discovery guest built for wasm32-unknown-unknown"]
 fn discovery_lease_sweep_ticks_on_its_timer() {
@@ -64,34 +92,6 @@ fn discovery_lease_sweep_ticks_on_its_timer() {
         first_tick < FIRST_TICK_BOUND,
         "the sweep must tick on its timer; first tick at {first_tick:?}"
     );
-}
-
-fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(), // populated by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
-            CapabilityGrant::new(
-                Capability::RouteClaim,
-                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
-            ),
-        ],
-        tenant: None,
-        discovery_service: true,
-        handlers: Vec::new(),
-    }
 }
 
 /// Polls the guest log channel until a line starting with `prefix` appears.

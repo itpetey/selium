@@ -557,11 +557,6 @@ pub fn accountant_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
-/// The exact root route `path` names.
-fn root_route(path: &str) -> String {
-    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
-}
-
 /// Every capability variant: a delinquent tenant's narrowing set, so conferral
 /// reduces the baseline grants to nothing.
 pub fn all_capabilities() -> Vec<Capability> {
@@ -1147,6 +1142,11 @@ async fn roll_loop(shared: Arc<Mutex<Shared>>, ledger: DurableLog) {
             .unwrap_or_else(|| Instant::now().expect("accountant clock"));
         Timer::new(next).await;
     }
+}
+
+/// The exact root route `path` names.
+fn root_route(path: &str) -> String {
+    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
 }
 
 /// Syncs the process inventory from lifecycle activity events since `cursor`.

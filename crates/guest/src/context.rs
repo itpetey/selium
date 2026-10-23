@@ -24,13 +24,13 @@ use crate::{
     watch::{ROUTE_TABLE_ROUTE, RouteWatch},
 };
 
+/// How long a serve-side guest waits for a protocol-handler claim to be
+/// published before treating it as absent.
+const HANDLER_RESOLVE_BOUND: Duration = Duration::from_secs(60);
 /// RPC ring capacity for discovery replies.
 const RPC_REP_CAPACITY: u64 = 4096;
 /// RPC ring capacity for discovery requests.
 const RPC_REQ_CAPACITY: u64 = 4096;
-/// How long a serve-side guest waits for a protocol-handler claim to be
-/// published before treating it as absent.
-const HANDLER_RESOLVE_BOUND: Duration = Duration::from_secs(60);
 /// How long a boot-time platform-service lookup converges before failing.
 ///
 /// System services publish their own routes from their entrypoints, so a

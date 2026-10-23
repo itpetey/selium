@@ -110,6 +110,16 @@ pub fn declare_attachable_by_resolution(
     .map(|_| ())
 }
 
+/// The exact reserved URIs the host expects this process to publish.
+pub fn expected_claims(process_id: selium_abi::ProcessId) -> Result<Vec<String>> {
+    match hostcall_ready(HostcallRequest::ExpectedClaims { process_id })? {
+        HostcallOutput::Claims(claims) => Ok(claims),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ExpectedClaims: {other:?}"
+        ))),
+    }
+}
+
 /// Maps a process tenant to its namespace: `None` (or empty) → `Root`, a
 /// named tenant → `Tenant(t)`.
 pub fn namespace_from_tenant(tenant: Option<&str>) -> selium_abi::Namespace {
@@ -150,40 +160,6 @@ pub fn process_capability_for_uri(
         HostcallOutput::U64(value) => Ok(value != 0),
         other => Err(GuestError::Host(format!(
             "unexpected hostcall output for ProcessCapability: {other:?}"
-        ))),
-    }
-}
-
-/// The authoritative ownership answer for `(class, resource_id)`.
-///
-/// Answers from the host's mint-time records, which are updated synchronously
-/// as the host mints a resource. A guest cannot reconstruct that reliably from
-/// a pushed feed — the feed can lag a resource the caller has only just
-/// created — so this is the question to ask before admitting anything that
-/// depends on ownership.
-pub fn resource_authority(
-    process_id: selium_abi::ProcessId,
-    class: selium_abi::ResourceClass,
-    resource_id: u64,
-) -> Result<selium_abi::ResourceAuthority> {
-    match hostcall_ready(HostcallRequest::ProcessOwnsResource {
-        process_id,
-        resource_class: class,
-        resource_id,
-    })? {
-        HostcallOutput::ResourceAuthority(authority) => Ok(authority),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ProcessOwnsResource: {other:?}"
-        ))),
-    }
-}
-
-/// The exact reserved URIs the host expects this process to publish.
-pub fn expected_claims(process_id: selium_abi::ProcessId) -> Result<Vec<String>> {
-    match hostcall_ready(HostcallRequest::ExpectedClaims { process_id })? {
-        HostcallOutput::Claims(claims) => Ok(claims),
-        other => Err(GuestError::Host(format!(
-            "unexpected hostcall output for ExpectedClaims: {other:?}"
         ))),
     }
 }
@@ -277,6 +253,30 @@ pub fn record_resolved_resource_for(
         client_process_id,
     })
     .map(|_| ())
+}
+
+/// The authoritative ownership answer for `(class, resource_id)`.
+///
+/// Answers from the host's mint-time records, which are updated synchronously
+/// as the host mints a resource. A guest cannot reconstruct that reliably from
+/// a pushed feed — the feed can lag a resource the caller has only just
+/// created — so this is the question to ask before admitting anything that
+/// depends on ownership.
+pub fn resource_authority(
+    process_id: selium_abi::ProcessId,
+    class: selium_abi::ResourceClass,
+    resource_id: u64,
+) -> Result<selium_abi::ResourceAuthority> {
+    match hostcall_ready(HostcallRequest::ProcessOwnsResource {
+        process_id,
+        resource_class: class,
+        resource_id,
+    })? {
+        HostcallOutput::ResourceAuthority(authority) => Ok(authority),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessOwnsResource: {other:?}"
+        ))),
+    }
 }
 
 /// Deletes a tenant CA key from the host keyring. Requires the

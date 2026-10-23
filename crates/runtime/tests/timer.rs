@@ -160,45 +160,37 @@ fn sleep_zero_completes_immediately() {
     }
 }
 
-/// Task 2.2: a real `wasm32` guest awaiting `Timer` is resumed at its
-/// deadline when nothing else happens in the platform.
-///
-/// The probe guest's poll-owner task parks on the `Sleep` hostcall and logs
-/// only once the timer fires, so the log line appearing at all proves the
-/// wake was delivered by the runtime's timer driver. The test deliberately
-/// never calls `poll_guest`: a host poll would mask a missing timer wake.
-/// The probe sleeps 250 ms, so the wake must also land no earlier than that.
-///
-/// `#[ignore]`d by default because it requires the probe guest built for
-/// `wasm32-unknown-unknown`:
-///
-/// ```sh
-/// cargo build --target wasm32-unknown-unknown -p selium-timer-probe
-/// cargo test -p selium-runtime --test timer -- --ignored
-/// ```
-#[test]
-#[ignore = "requires the timer-probe guest built for wasm32-unknown-unknown"]
-fn wasm32_guest_timer_resumes_at_deadline() {
-    let runtime = Runtime::default();
-    let bootstrapped = runtime
-        .spawn_system_guest(timer_probe_descriptor())
-        .expect("bootstrap timer probe guest");
-    let process_id = bootstrapped.process_id;
+/// Spawns a minimal guest with shared-memory grants.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test helper: bootstrap always returns one guest"
+)]
+fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
+    let module = wat::parse_str(format!("(module (memory 1) (func (export \"{name}\") ))"))
+        .expect("compile wat");
 
-    let start = Instant::now();
-    wait_for_log(
-        &runtime,
-        process_id,
-        "timer-probe: timer fired",
-        Duration::from_secs(10),
-    );
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(250),
-        "the guest resumed before its deadline: {elapsed:?}"
-    );
+    let report = runtime
+        .bootstrap_system_guests(selium_runtime::RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![SystemGuestDescriptor {
+                name: name.to_string(),
+                module_id: format!("{name}-module"),
+                module_bytes: module,
+                entrypoint: name.to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::SharedMemory,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+                )],
+                tenant: None,
+                discovery_service: false,
+                handlers: Vec::new(),
+            }],
+            state_dir: None,
+        })
+        .expect("bootstrap");
 
-    runtime.stop_process(process_id).expect("stop process");
+    report.guests[0].process_id
 }
 
 fn timer_probe_descriptor() -> SystemGuestDescriptor {
@@ -246,35 +238,43 @@ fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Durat
     panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
 }
 
-/// Spawns a minimal guest with shared-memory grants.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "test helper: bootstrap always returns one guest"
-)]
-fn spawn_guest(runtime: &Runtime, name: &str) -> u64 {
-    let module = wat::parse_str(format!("(module (memory 1) (func (export \"{name}\") ))"))
-        .expect("compile wat");
+/// Task 2.2: a real `wasm32` guest awaiting `Timer` is resumed at its
+/// deadline when nothing else happens in the platform.
+///
+/// The probe guest's poll-owner task parks on the `Sleep` hostcall and logs
+/// only once the timer fires, so the log line appearing at all proves the
+/// wake was delivered by the runtime's timer driver. The test deliberately
+/// never calls `poll_guest`: a host poll would mask a missing timer wake.
+/// The probe sleeps 250 ms, so the wake must also land no earlier than that.
+///
+/// `#[ignore]`d by default because it requires the probe guest built for
+/// `wasm32-unknown-unknown`:
+///
+/// ```sh
+/// cargo build --target wasm32-unknown-unknown -p selium-timer-probe
+/// cargo test -p selium-runtime --test timer -- --ignored
+/// ```
+#[test]
+#[ignore = "requires the timer-probe guest built for wasm32-unknown-unknown"]
+fn wasm32_guest_timer_resumes_at_deadline() {
+    let runtime = Runtime::default();
+    let bootstrapped = runtime
+        .spawn_system_guest(timer_probe_descriptor())
+        .expect("bootstrap timer probe guest");
+    let process_id = bootstrapped.process_id;
 
-    let report = runtime
-        .bootstrap_system_guests(selium_runtime::RuntimeConfig {
-            start_discovery: false,
-            system_guests: vec![SystemGuestDescriptor {
-                name: name.to_string(),
-                module_id: format!("{name}-module"),
-                module_bytes: module,
-                entrypoint: name.to_string(),
-                arguments: Vec::new(),
-                grants: vec![CapabilityGrant::new(
-                    Capability::SharedMemory,
-                    vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-                )],
-                tenant: None,
-                discovery_service: false,
-                handlers: Vec::new(),
-            }],
-            state_dir: None,
-        })
-        .expect("bootstrap");
+    let start = Instant::now();
+    wait_for_log(
+        &runtime,
+        process_id,
+        "timer-probe: timer fired",
+        Duration::from_secs(10),
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "the guest resumed before its deadline: {elapsed:?}"
+    );
 
-    report.guests[0].process_id
+    runtime.stop_process(process_id).expect("stop process");
 }

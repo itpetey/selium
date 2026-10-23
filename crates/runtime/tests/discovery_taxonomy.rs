@@ -15,6 +15,15 @@ use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
+/// Events observed on the revocation-only feed.
+#[derive(Default)]
+struct FeedEvents {
+    registered: HashSet<String>,
+    revoked: HashSet<String>,
+    gone: HashSet<ProcessId>,
+    freed: HashSet<(String, u64)>,
+}
+
 /// A resource minted under a serving tenant is attributed to that tenant by
 /// the authority and released under it when the owner exits — the case the
 /// tenant side maps used to miss.
@@ -79,6 +88,92 @@ fn a_cross_tenant_mint_reports_and_releases_under_the_minting_tenant() {
     );
 }
 
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "test helper surfaces unexpected hostcall output as a panic"
+)]
+#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
+fn alloc_region(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    serving_tenant: Option<&str>,
+) -> Result<u64, AbiErrorCode> {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::AllocRegion {
+            pages: 1,
+            prot: RegionProt::ReadWrite,
+            purpose: ResourceKind::SharedMemory,
+            serving_tenant: serving_tenant.map(str::to_string),
+        },
+    );
+    if status != selium_abi::HOSTCALL_STATUS_READY {
+        let state = runtime.poll_hostcall(process_id, op_id);
+        return match state {
+            CompletionState::Failed(error) => Err(error.code),
+            other => panic!("expected failure, got {other:?}"),
+        };
+    }
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) => Ok(alloc.region_id),
+        other => panic!("expected RegionAlloc, got {other:?}"),
+    }
+}
+
+/// The authority answer for a `(class, id)` the caller is expected to own.
+#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
+fn authority(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    class: ResourceClass,
+    id: u64,
+) -> ResourceAuthority {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::ProcessOwnsResource {
+            process_id,
+            resource_class: class,
+            resource_id: id,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::ResourceAuthority(authority)) => authority,
+        other => panic!("expected ResourceAuthority, got {other:?}"),
+    }
+}
+
+/// Creates a host queue through `HostQueueCreate`, optionally minted under a
+/// serving tenant, and returns its shared id.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "test helper surfaces unexpected hostcall output as a panic"
+)]
+#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
+fn create_queue(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    serving_tenant: Option<&str>,
+) -> Result<u64, AbiErrorCode> {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::HostQueueCreate {
+            serving_tenant: serving_tenant.map(str::to_string),
+        },
+    );
+    if status != selium_abi::HOSTCALL_STATUS_READY {
+        let state = runtime.poll_hostcall(process_id, op_id);
+        return match state {
+            CompletionState::Failed(error) => Err(error.code),
+            other => panic!("expected failure, got {other:?}"),
+        };
+    }
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::HostQueue(descriptor)) => Ok(descriptor.shared_id),
+        other => panic!("expected HostQueue, got {other:?}"),
+    }
+}
+
 #[test]
 fn discovery_lifecycle_over_the_feed_is_revocation_only() {
     let (runtime, mut subscriber) = runtime_with_feed();
@@ -112,6 +207,61 @@ fn discovery_lifecycle_over_the_feed_is_revocation_only() {
         events.freed.contains(&("region".to_string(), region_id)),
         "expected identity-keyed region revoke, got: {:?}",
         events.freed
+    );
+}
+
+#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
+fn drain_feed(subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>) -> FeedEvents {
+    let mut events = FeedEvents::default();
+    loop {
+        match subscriber.read_with_tag() {
+            Ok((request, _tag)) => match request {
+                DiscoveryRequest::Register { uri, .. } => {
+                    events.registered.insert(uri);
+                }
+                DiscoveryRequest::Revoke { uri } => {
+                    events.revoked.insert(uri);
+                }
+                DiscoveryRequest::ProcessGone { process_id } => {
+                    events.gone.insert(process_id);
+                }
+                DiscoveryRequest::ResourceFreed { class, id } => {
+                    events.freed.insert((class, id));
+                }
+                _ => {}
+            },
+            Err(selium_wire::error::Error::BufferEmpty) => break,
+            Err(error) => panic!("feed read failed: {error}"),
+        }
+    }
+    events
+}
+
+#[test]
+fn expected_claims_are_visible_without_publication() {
+    let (runtime, _subscriber) = runtime_with_feed();
+    let claimed = "sel:///control";
+    let grants = vec![CapabilityGrant::new(
+        Capability::RouteClaim,
+        vec![ResourceSelector::Uri(claimed.to_string())],
+    )];
+    let pid = spawn_guest(&runtime, "claim-holder", None, grants);
+
+    // The host knows the expected claim even though the process published
+    // nothing, so reconciliation can report drift.
+    assert_eq!(runtime.expected_claims(pid), vec![claimed.to_string()]);
+    assert!(
+        runtime.restore_process_authority(pid).is_some(),
+        "the non-publishing guest remains in the process table"
+    );
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::Process, pid),
+        ResourceAuthority {
+            owned: true,
+            tenant: Some(String::new()),
+            other_classes: Vec::new(),
+        },
+        "the non-publishing guest remains in the ownership sets"
     );
 }
 
@@ -152,6 +302,10 @@ fn host_queue_authority_uses_principal_provenance() {
         "expected identity-keyed queue revocation at teardown, got: {:?}",
         events.freed
     );
+}
+
+fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
+    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
 }
 
 #[test]
@@ -214,201 +368,6 @@ fn root_process_allocates_for_any_tenant_without_delegation() {
     );
 }
 
-#[test]
-fn system_process_allocates_for_another_tenant_with_delegation() {
-    let (runtime, mut subscriber) = runtime_with_feed();
-    // A root/system process (no tenant) holding tenant-scoped delegation for
-    // tenant "acme".
-    let grants = vec![
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        ),
-        CapabilityGrant::new(
-            Capability::DelegateGrants,
-            vec![ResourceSelector::Tenant("acme".to_string())],
-        ),
-    ];
-    let pid = spawn_guest(&runtime, "system-allocator", None, grants);
-
-    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("delegated allocation");
-    let events = drain_feed(&mut subscriber);
-    assert!(events.registered.is_empty());
-    assert_eq!(
-        authority(&runtime, pid, ResourceClass::SharedRegion, region_id).tenant,
-        Some("acme".to_string())
-    );
-}
-
-#[test]
-fn unauthorised_cross_tenant_allocation_is_denied() {
-    let (runtime, _subscriber) = runtime_with_feed();
-    // A tenant-scoped process (tenant "acme") without delegation for "beta"
-    // cannot mint a region for it.
-    let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-    )];
-    let pid = spawn_guest(&runtime, "unprivileged", Some("acme"), grants);
-
-    let result = alloc_region(&runtime, pid, Some("beta"));
-    assert_eq!(result, Err(AbiErrorCode::PermissionDenied));
-}
-
-/// The authority answer for a `(class, id)` the caller is expected to own.
-#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
-fn authority(
-    runtime: &Runtime,
-    process_id: ProcessId,
-    class: ResourceClass,
-    id: u64,
-) -> ResourceAuthority {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::ProcessOwnsResource {
-            process_id,
-            resource_class: class,
-            resource_id: id,
-        },
-    );
-    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::ResourceAuthority(authority)) => authority,
-        other => panic!("expected ResourceAuthority, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "test helper surfaces unexpected hostcall output as a panic"
-)]
-#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
-fn alloc_region(
-    runtime: &Runtime,
-    process_id: ProcessId,
-    serving_tenant: Option<&str>,
-) -> Result<u64, AbiErrorCode> {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::AllocRegion {
-            pages: 1,
-            prot: RegionProt::ReadWrite,
-            purpose: ResourceKind::SharedMemory,
-            serving_tenant: serving_tenant.map(str::to_string),
-        },
-    );
-    if status != selium_abi::HOSTCALL_STATUS_READY {
-        let state = runtime.poll_hostcall(process_id, op_id);
-        return match state {
-            CompletionState::Failed(error) => Err(error.code),
-            other => panic!("expected failure, got {other:?}"),
-        };
-    }
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::RegionAlloc(alloc)) => Ok(alloc.region_id),
-        other => panic!("expected RegionAlloc, got {other:?}"),
-    }
-}
-
-/// Creates a host queue through `HostQueueCreate`, optionally minted under a
-/// serving tenant, and returns its shared id.
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "test helper surfaces unexpected hostcall output as a panic"
-)]
-#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
-fn create_queue(
-    runtime: &Runtime,
-    process_id: ProcessId,
-    serving_tenant: Option<&str>,
-) -> Result<u64, AbiErrorCode> {
-    let (status, op_id) = runtime.begin_hostcall(
-        process_id,
-        HostcallRequest::HostQueueCreate {
-            serving_tenant: serving_tenant.map(str::to_string),
-        },
-    );
-    if status != selium_abi::HOSTCALL_STATUS_READY {
-        let state = runtime.poll_hostcall(process_id, op_id);
-        return match state {
-            CompletionState::Failed(error) => Err(error.code),
-            other => panic!("expected failure, got {other:?}"),
-        };
-    }
-    match runtime.poll_hostcall(process_id, op_id) {
-        CompletionState::Ready(HostcallOutput::HostQueue(descriptor)) => Ok(descriptor.shared_id),
-        other => panic!("expected HostQueue, got {other:?}"),
-    }
-}
-
-/// Events observed on the revocation-only feed.
-#[derive(Default)]
-struct FeedEvents {
-    registered: HashSet<String>,
-    revoked: HashSet<String>,
-    gone: HashSet<ProcessId>,
-    freed: HashSet<(String, u64)>,
-}
-
-#[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_feed(subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>) -> FeedEvents {
-    let mut events = FeedEvents::default();
-    loop {
-        match subscriber.read_with_tag() {
-            Ok((request, _tag)) => match request {
-                DiscoveryRequest::Register { uri, .. } => {
-                    events.registered.insert(uri);
-                }
-                DiscoveryRequest::Revoke { uri } => {
-                    events.revoked.insert(uri);
-                }
-                DiscoveryRequest::ProcessGone { process_id } => {
-                    events.gone.insert(process_id);
-                }
-                DiscoveryRequest::ResourceFreed { class, id } => {
-                    events.freed.insert((class, id));
-                }
-                _ => {}
-            },
-            Err(selium_wire::error::Error::BufferEmpty) => break,
-            Err(error) => panic!("feed read failed: {error}"),
-        }
-    }
-    events
-}
-
-fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
-    wat::parse_str(format!("(module (func (export \"{entrypoint}\")))")).expect("compile wat")
-}
-
-#[test]
-fn expected_claims_are_visible_without_publication() {
-    let (runtime, _subscriber) = runtime_with_feed();
-    let claimed = "sel:///control";
-    let grants = vec![CapabilityGrant::new(
-        Capability::RouteClaim,
-        vec![ResourceSelector::Uri(claimed.to_string())],
-    )];
-    let pid = spawn_guest(&runtime, "claim-holder", None, grants);
-
-    // The host knows the expected claim even though the process published
-    // nothing, so reconciliation can report drift.
-    assert_eq!(runtime.expected_claims(pid), vec![claimed.to_string()]);
-    assert!(
-        runtime.restore_process_authority(pid).is_some(),
-        "the non-publishing guest remains in the process table"
-    );
-    assert_eq!(
-        authority(&runtime, pid, ResourceClass::Process, pid),
-        ResourceAuthority {
-            owned: true,
-            tenant: Some(String::new()),
-            other_classes: Vec::new(),
-        },
-        "the non-publishing guest remains in the ownership sets"
-    );
-}
-
 /// Creates a runtime with the discovery feed enabled and a subscriber on it.
 fn runtime_with_feed() -> (Runtime, Subscriber<DiscoveryRequest, ShmTransport>) {
     let runtime = Runtime::default();
@@ -453,4 +412,45 @@ fn spawn_guest(
         })
         .expect("spawn guest")
         .process_id
+}
+
+#[test]
+fn system_process_allocates_for_another_tenant_with_delegation() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    // A root/system process (no tenant) holding tenant-scoped delegation for
+    // tenant "acme".
+    let grants = vec![
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        ),
+        CapabilityGrant::new(
+            Capability::DelegateGrants,
+            vec![ResourceSelector::Tenant("acme".to_string())],
+        ),
+    ];
+    let pid = spawn_guest(&runtime, "system-allocator", None, grants);
+
+    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("delegated allocation");
+    let events = drain_feed(&mut subscriber);
+    assert!(events.registered.is_empty());
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::SharedRegion, region_id).tenant,
+        Some("acme".to_string())
+    );
+}
+
+#[test]
+fn unauthorised_cross_tenant_allocation_is_denied() {
+    let (runtime, _subscriber) = runtime_with_feed();
+    // A tenant-scoped process (tenant "acme") without delegation for "beta"
+    // cannot mint a region for it.
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    let pid = spawn_guest(&runtime, "unprivileged", Some("acme"), grants);
+
+    let result = alloc_region(&runtime, pid, Some("beta"));
+    assert_eq!(result, Err(AbiErrorCode::PermissionDenied));
 }

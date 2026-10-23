@@ -21,15 +21,38 @@ use selium_shm::{Channel, ChannelBackpressure};
 
 /// Channel capacity for the probe region.
 const PROBE_CHANNEL_CAPACITY: u64 = 4096;
-/// The historical role: allocate a region, log, and return.
-const ROLE_REGION: u64 = 0;
-/// Register a route and stay resident as its provider.
-const ROLE_PROVIDER: u64 = 1;
-/// Watch a route and log every change the watch emits.
-const ROLE_CONSUMER: u64 = 2;
 /// How long the provider stays resident between checks. Long enough never to
 /// elapse during a test; the entrypoint is a service, not a one-shot job.
 const PROVIDER_PARK: std::time::Duration = std::time::Duration::from_secs(3_600);
+/// Watch a route and log every change the watch emits.
+const ROLE_CONSUMER: u64 = 2;
+/// Register a route and stay resident as its provider.
+const ROLE_PROVIDER: u64 = 1;
+/// The historical role: allocate a region, log, and return.
+const ROLE_REGION: u64 = 0;
+
+/// Watches `uri` and logs every event, forever.
+async fn consumer(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
+    let mut watch = ctx
+        .watch(uri)
+        .await
+        .with_context(|| format!("consumer: watch {uri}"))?;
+    info!("consumer: watching {uri}");
+
+    loop {
+        match watch.next().await.context("consumer: watch")? {
+            RouteEvent::Appeared(target) => {
+                info!("consumer: appeared {uri} {}", target.resource_id);
+            }
+            RouteEvent::Replaced(target) => {
+                info!("consumer: replaced {uri} {}", target.resource_id);
+            }
+            RouteEvent::Revoked => {
+                info!("consumer: revoked {uri}");
+            }
+        }
+    }
+}
 
 #[entrypoint]
 async fn discovery_probe(mut ctx: Context, route: (u64, u64), mode: u64) -> anyhow::Result<()> {
@@ -51,13 +74,6 @@ async fn discovery_probe(mut ctx: Context, route: (u64, u64), mode: u64) -> anyh
         ROLE_CONSUMER => consumer(&mut ctx, route_uri(route)).await,
         other => bail!("discovery-probe: unknown mode {other}"),
     }
-}
-
-/// Decodes the route URI argument the runtime wrote into guest memory.
-fn route_uri(route: (u64, u64)) -> &'static str {
-    // SAFETY: `route` is this entrypoint's pointer argument; the runtime
-    // populated it with the descriptor's argument bytes before the call.
-    unsafe { selium_guest::args::str(route.0, route.1) }.unwrap_or_default()
 }
 
 /// Registers `uri` in the registry and stays resident as its provider.
@@ -96,25 +112,9 @@ async fn provider(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Watches `uri` and logs every event, forever.
-async fn consumer(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
-    let mut watch = ctx
-        .watch(uri)
-        .await
-        .with_context(|| format!("consumer: watch {uri}"))?;
-    info!("consumer: watching {uri}");
-
-    loop {
-        match watch.next().await.context("consumer: watch")? {
-            RouteEvent::Appeared(target) => {
-                info!("consumer: appeared {uri} {}", target.resource_id);
-            }
-            RouteEvent::Replaced(target) => {
-                info!("consumer: replaced {uri} {}", target.resource_id);
-            }
-            RouteEvent::Revoked => {
-                info!("consumer: revoked {uri}");
-            }
-        }
-    }
+/// Decodes the route URI argument the runtime wrote into guest memory.
+fn route_uri(route: (u64, u64)) -> &'static str {
+    // SAFETY: `route` is this entrypoint's pointer argument; the runtime
+    // populated it with the descriptor's argument bytes before the call.
+    unsafe { selium_guest::args::str(route.0, route.1) }.unwrap_or_default()
 }

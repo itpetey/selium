@@ -43,6 +43,18 @@ struct DeadlineQueue {
     arrived: Condvar,
 }
 
+/// The runtime's timer driver: one thread owning every outstanding guest
+/// sleep deadline.
+///
+/// Started lazily on the first guest-issued `Sleep`, so a runtime that hosts
+/// no timers never pays for the thread. The thread lives as long as the
+/// process: it holds a [`Runtime`] handle to deliver wakes, so there is no
+/// moment at which the runtime could go away and strand an outstanding
+/// deadline.
+pub(crate) struct TimerDriver {
+    queue: Arc<DeadlineQueue>,
+}
+
 impl DeadlineQueue {
     /// Pushes a sleep and rouses the driver (which may be parked on an
     /// unbounded wait because the queue was empty).
@@ -88,18 +100,6 @@ impl DeadlineQueue {
     }
 }
 
-/// The runtime's timer driver: one thread owning every outstanding guest
-/// sleep deadline.
-///
-/// Started lazily on the first guest-issued `Sleep`, so a runtime that hosts
-/// no timers never pays for the thread. The thread lives as long as the
-/// process: it holds a [`Runtime`] handle to deliver wakes, so there is no
-/// moment at which the runtime could go away and strand an outstanding
-/// deadline.
-pub(crate) struct TimerDriver {
-    queue: Arc<DeadlineQueue>,
-}
-
 impl TimerDriver {
     /// Returns the driver for `runtime`, starting its thread on first use.
     pub(crate) fn for_runtime(runtime: &Runtime) -> &TimerDriver {
@@ -123,16 +123,6 @@ impl TimerDriver {
     /// Registers a guest sleep, to be completed at `deadline`.
     pub(crate) fn schedule(&self, request: SleepRequest) {
         self.queue.push(request);
-    }
-}
-
-/// The driver loop: park until the earliest deadline, then complete every
-/// sleep that came due.
-fn drive(queue: Arc<DeadlineQueue>, runtime: Runtime) {
-    loop {
-        for request in queue.take_due() {
-            runtime.complete_sleep(&request);
-        }
     }
 }
 
@@ -162,6 +152,16 @@ impl Runtime {
             // Cross-thread wakes are safe here: see the memory-model contract
             // on `poll_guest_until_stalled`.
             self.wake_process_task(request.process_id, request.task_id);
+        }
+    }
+}
+
+/// The driver loop: park until the earliest deadline, then complete every
+/// sleep that came due.
+fn drive(queue: Arc<DeadlineQueue>, runtime: Runtime) {
+    loop {
+        for request in queue.take_due() {
+            runtime.complete_sleep(&request);
         }
     }
 }

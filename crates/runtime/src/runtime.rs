@@ -28,11 +28,11 @@ use crate::{
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<DiscoveryRequest, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
-pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Mint-time principal tenant per resource identity. Recorded synchronously
 /// inside the minting hostcall, so it is the authority for tenant attribution
 /// even when no registration has been projected.
 pub(crate) type ResourceTenants = HashMap<(ResourceClass, u64), String>;
+pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Serving tenant tracked per (process_id, volume local id) so an append is
 /// reserved against the tenant the volume was minted under, not the writer's.
 pub(crate) type VolumeTenants = HashMap<(ProcessId, u64), String>;

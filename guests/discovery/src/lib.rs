@@ -840,6 +840,14 @@ pub fn interface_metadata() -> InterfaceMetadata {
     discoverycontrol_pattern_metadata()
 }
 
+/// Maps an authority read to admission: a failed read fails closed with
+/// `Forbidden`, never falling back to the projected store.
+fn admission_authority(
+    authority: selium_guest::Result<ResourceAuthority>,
+) -> Option<ResourceAuthority> {
+    authority.ok()
+}
+
 fn attach_feed_subscriber(
     feed_region_id: u64,
 ) -> selium_guest::Result<Subscriber<DiscoveryRequest, ShmTransport>> {
@@ -868,14 +876,6 @@ fn create_route_table() -> selium_wire::Result<(u64, RouteTable)> {
     let subscriber = Subscriber::new(FramedRead::new(read), None);
     let table = LiveTable::new(publisher, subscriber)?;
     Ok((region_id, table))
-}
-
-/// Maps an authority read to admission: a failed read fails closed with
-/// `Forbidden`, never falling back to the projected store.
-fn admission_authority(
-    authority: selium_guest::Result<ResourceAuthority>,
-) -> Option<ResourceAuthority> {
-    authority.ok()
 }
 
 /// Response used when the caller's tenant scope could not be verified
@@ -1316,6 +1316,76 @@ fn health_uri(tenant: Option<&str>, name: &str) -> String {
     )
 }
 
+/// Returns whether a registration key is owner-keyed (removed when its owner
+/// exits) rather than identity-keyed (removed only when the host frees the
+/// resource).
+///
+/// Named routes, aliases, health records, and a process's own node are
+/// owner-keyed. Every other typed record is identity-keyed, which is what
+/// preserves a co-owned resource's record when one owner exits.
+fn is_owner_keyed(key: &str) -> bool {
+    match uri::parse_typed(key) {
+        Some((_, ResourceClass::Process, _)) => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+/// Periodically expires lapsed guest-registration leases, revoking the routes
+/// and publishing the resulting route changes.
+async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
+    const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
+    let mut ticks: u64 = 0;
+    let mut reported_drift: BTreeMap<ProcessId, BTreeSet<String>> = BTreeMap::new();
+    let mut missing_since: BTreeMap<ProcessId, u64> = BTreeMap::new();
+    loop {
+        // The sweep *interval* is measured on the monotonic clock, the same
+        // domain `Timer` compares its deadline against. Wall-clock
+        // nanoseconds since the epoch (`selium_guest::time::now`) are a
+        // different domain entirely — feeding one into `Instant::from_nanos`
+        // puts the deadline ~56 years in the future and the sweep never ticks.
+        // Wall-clock time is still the right domain for *lease expiry*, below:
+        // a lease is stored against the clock every participant reads.
+        let deadline = match selium_guest::Instant::now() {
+            Ok(now) => now
+                .checked_add(std::time::Duration::from_nanos(SWEEP_INTERVAL_NANOS))
+                .unwrap_or(selium_guest::Instant::MAX),
+            Err(error) => {
+                selium_guest::warn!("discovery lease sweep clock failed: {error}");
+                selium_guest::yield_now().await;
+                continue;
+            }
+        };
+        selium_guest::Timer::new(deadline).await;
+
+        let now_ms = selium_guest::time::now()
+            .map(|nanos| nanos / 1_000_000)
+            .unwrap_or(0);
+        // A first-tick marker: the sweep runs on a timer, so "it fired" is
+        // otherwise unobservable from outside, and an integration test cannot
+        // tell a ticking sweep from one parked on a deadline that never
+        // arrives. Marking only the *first* tick keeps the probe free — a
+        // 0.5 Hz heartbeat writes a ring frame and wakes the host on every
+        // beat, which is enough to perturb the spines sharing this host.
+        if ticks == 0 {
+            selium_guest::info!("discovery lease sweep tick");
+        }
+        ticks += 1;
+        // Reconcile each process's expected claims against what it actually
+        // published. A claim with no live registration is drift; it is logged
+        // (once per newly observed gap) rather than treated as an accounting
+        // fact, and discovery remains a projection, never the authority.
+        reconcile_claim_drift(&store, &mut reported_drift, &mut missing_since, ticks);
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.expire_leases(now_ms);
+        if let Err(error) = sync_route_table(&store, &route_table) {
+            selium_guest::warn!("discovery route table sync failed: {error}");
+        }
+    }
+}
+
 /// Reports expected claims that have no live registration.
 ///
 /// The host is the authority for what a process *should* publish (its
@@ -1378,61 +1448,6 @@ fn reconcile_claim_drift(
     missing_since.retain(|process_id, _| processes.contains(process_id));
 }
 
-/// Periodically expires lapsed guest-registration leases, revoking the routes
-/// and publishing the resulting route changes.
-async fn lease_sweep_loop(store: Arc<Mutex<DiscoveryStore>>, route_table: Arc<RouteTable>) {
-    const SWEEP_INTERVAL_NANOS: u64 = 2_000_000_000;
-    let mut ticks: u64 = 0;
-    let mut reported_drift: BTreeMap<ProcessId, BTreeSet<String>> = BTreeMap::new();
-    let mut missing_since: BTreeMap<ProcessId, u64> = BTreeMap::new();
-    loop {
-        // The sweep *interval* is measured on the monotonic clock, the same
-        // domain `Timer` compares its deadline against. Wall-clock
-        // nanoseconds since the epoch (`selium_guest::time::now`) are a
-        // different domain entirely — feeding one into `Instant::from_nanos`
-        // puts the deadline ~56 years in the future and the sweep never ticks.
-        // Wall-clock time is still the right domain for *lease expiry*, below:
-        // a lease is stored against the clock every participant reads.
-        let deadline = match selium_guest::Instant::now() {
-            Ok(now) => now
-                .checked_add(std::time::Duration::from_nanos(SWEEP_INTERVAL_NANOS))
-                .unwrap_or(selium_guest::Instant::MAX),
-            Err(error) => {
-                selium_guest::warn!("discovery lease sweep clock failed: {error}");
-                selium_guest::yield_now().await;
-                continue;
-            }
-        };
-        selium_guest::Timer::new(deadline).await;
-
-        let now_ms = selium_guest::time::now()
-            .map(|nanos| nanos / 1_000_000)
-            .unwrap_or(0);
-        // A first-tick marker: the sweep runs on a timer, so "it fired" is
-        // otherwise unobservable from outside, and an integration test cannot
-        // tell a ticking sweep from one parked on a deadline that never
-        // arrives. Marking only the *first* tick keeps the probe free — a
-        // 0.5 Hz heartbeat writes a ring frame and wakes the host on every
-        // beat, which is enough to perturb the spines sharing this host.
-        if ticks == 0 {
-            selium_guest::info!("discovery lease sweep tick");
-        }
-        ticks += 1;
-        // Reconcile each process's expected claims against what it actually
-        // published. A claim with no live registration is drift; it is logged
-        // (once per newly observed gap) rather than treated as an accounting
-        // fact, and discovery remains a projection, never the authority.
-        reconcile_claim_drift(&store, &mut reported_drift, &mut missing_since, ticks);
-        let mut store = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.expire_leases(now_ms);
-        if let Err(error) = sync_route_table(&store, &route_table) {
-            selium_guest::warn!("discovery route table sync failed: {error}");
-        }
-    }
-}
-
 /// Projects the store's registrations onto the route table, publishing only
 /// real changes: a set for every new or changed route, a delete for every
 /// removed route. The table's per-entry version is the route's generation.
@@ -1461,21 +1476,6 @@ fn sync_route_table(store: &DiscoveryStore, table: &RouteTable) -> selium_wire::
         }
     }
     Ok(())
-}
-
-/// Returns whether a registration key is owner-keyed (removed when its owner
-/// exits) rather than identity-keyed (removed only when the host frees the
-/// resource).
-///
-/// Named routes, aliases, health records, and a process's own node are
-/// owner-keyed. Every other typed record is identity-keyed, which is what
-/// preserves a co-owned resource's record when one owner exits.
-fn is_owner_keyed(key: &str) -> bool {
-    match uri::parse_typed(key) {
-        Some((_, ResourceClass::Process, _)) => true,
-        Some(_) => false,
-        None => true,
-    }
 }
 
 /// Returns whether a caller's tenant admits a target's tenant. The check is

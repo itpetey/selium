@@ -1257,43 +1257,6 @@ impl ResourceSelector {
     }
 }
 
-/// Normalises a registry URI to its canonical internal `sel://` spelling:
-/// trailing separators removed, and wire names projected to their internal
-/// path. Non-`sel` values (network endpoints, volume names) are returned
-/// unchanged.
-fn canonical_uri(raw: &str) -> String {
-    if let Some((tenant, path)) = uri::parse_sel(raw) {
-        let path = path.trim_matches('/');
-        if path.is_empty() {
-            return format!("{}{tenant}/", uri::SEL_PREFIX);
-        }
-        return format!("{}{tenant}/{path}", uri::SEL_PREFIX);
-    }
-    if raw.contains("://") {
-        return raw.to_string();
-    }
-    match uri::resolve_wire_name(raw, &uri::DomainTable::new()) {
-        Some((tenant, path)) if path.is_empty() => format!("{}{tenant}/", uri::SEL_PREFIX),
-        Some((tenant, path)) => format!("{}{tenant}/{}", uri::SEL_PREFIX, path.join("/")),
-        None => raw.to_string(),
-    }
-}
-
-/// Path-segment-aware prefix matching for `sel://` registry URIs: a prefix
-/// matches at a segment boundary, so `sel:///control` does not match
-/// `sel:///control-plane`.
-fn sel_prefix_matches(prefix: &str, context: &str) -> bool {
-    let prefix = canonical_uri(prefix);
-    let context = canonical_uri(context);
-    if context == prefix {
-        return true;
-    }
-    match context.strip_prefix(&prefix) {
-        Some(rest) => prefix.ends_with('/') || rest.starts_with('/'),
-        None => false,
-    }
-}
-
 impl CapabilityGrant {
     /// Creates a capability grant with the supplied selectors.
     pub fn new(capability: Capability, selectors: Vec<ResourceSelector>) -> Self {
@@ -1475,6 +1438,43 @@ pub fn pack_hostcall_status(status: u32, value: u32) -> u64 {
 /// Unpacks a hostcall status and value from one `u64` ABI return value.
 pub fn unpack_hostcall_status(encoded: u64) -> (u32, u32) {
     ((encoded >> 32) as u32, encoded as u32)
+}
+
+/// Normalises a registry URI to its canonical internal `sel://` spelling:
+/// trailing separators removed, and wire names projected to their internal
+/// path. Non-`sel` values (network endpoints, volume names) are returned
+/// unchanged.
+fn canonical_uri(raw: &str) -> String {
+    if let Some((tenant, path)) = uri::parse_sel(raw) {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return format!("{}{tenant}/", uri::SEL_PREFIX);
+        }
+        return format!("{}{tenant}/{path}", uri::SEL_PREFIX);
+    }
+    if raw.contains("://") {
+        return raw.to_string();
+    }
+    match uri::resolve_wire_name(raw, &uri::DomainTable::new()) {
+        Some((tenant, path)) if path.is_empty() => format!("{}{tenant}/", uri::SEL_PREFIX),
+        Some((tenant, path)) => format!("{}{tenant}/{}", uri::SEL_PREFIX, path.join("/")),
+        None => raw.to_string(),
+    }
+}
+
+/// Path-segment-aware prefix matching for `sel://` registry URIs: a prefix
+/// matches at a segment boundary, so `sel:///control` does not match
+/// `sel:///control-plane`.
+fn sel_prefix_matches(prefix: &str, context: &str) -> bool {
+    let prefix = canonical_uri(prefix);
+    let context = canonical_uri(context);
+    if context == prefix {
+        return true;
+    }
+    match context.strip_prefix(&prefix) {
+        Some(rest) => prefix.ends_with('/') || rest.starts_with('/'),
+        None => false,
+    }
 }
 
 #[cfg(test)]

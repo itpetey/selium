@@ -366,11 +366,6 @@ pub fn identity_grants() -> Vec<CapabilityGrant> {
     ]
 }
 
-/// The exact root route `path` names.
-fn root_route(path: &str) -> String {
-    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
-}
-
 /// Builds one live table over its own `LiveTable` ring, returning the ring id
 /// and the table.
 fn create_live_table<K, V>(
@@ -897,6 +892,11 @@ async fn revoke_tenant(tenant: &str, state: &IdentityState) -> Result<(), String
         .delete(anchor_key(tenant))
         .map_err(|error| format!("anchor removal failed: {error}"))?;
     Ok(())
+}
+
+/// The exact root route `path` names.
+fn root_route(path: &str) -> String {
+    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
 }
 
 /// Records a domain→tenant mapping durably and publishes it to discovery.

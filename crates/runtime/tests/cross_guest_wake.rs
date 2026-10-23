@@ -26,22 +26,35 @@ use selium_service::FlatMsg;
 
 mod common;
 
-/// The publisher role's integer entrypoint argument.
-const MODE_PUBLISHER: u64 = 0;
-/// The watcher role's integer entrypoint argument.
-const MODE_WATCHER: u64 = 1;
-/// The parker role's integer entrypoint argument: owns a channel nobody
-/// writes to, so an attached watcher parks for the whole test.
-const MODE_PARKER: u64 = 2;
-/// The yielder role's integer entrypoint argument: a task that only yields.
-const MODE_YIELDER: u64 = 3;
-
 /// Upper bound on the instructions one poll pass may cost against a guest
 /// with nothing to do. The interpreted reactor entry (mailbox drain, run-queue
 /// pop, poll-owner check) costs a few thousand; the bound leaves generous
 /// headroom while still failing loudly if the host starts re-entering the
 /// guest on its own re-arm.
 const MAX_INSTRUCTIONS_PER_IDLE_POLL: u64 = 10_000;
+/// The parker role's integer entrypoint argument: owns a channel nobody
+/// writes to, so an attached watcher parks for the whole test.
+const MODE_PARKER: u64 = 2;
+/// The publisher role's integer entrypoint argument.
+const MODE_PUBLISHER: u64 = 0;
+/// The watcher role's integer entrypoint argument.
+const MODE_WATCHER: u64 = 1;
+/// The yielder role's integer entrypoint argument: a task that only yields.
+const MODE_YIELDER: u64 = 3;
+/// How many yields the yielder reports per log line.
+const YIELD_LOG_INTERVAL: u64 = 100;
+
+/// Counts the publisher's log frames over `window`, proving it is still
+/// resident and progressing.
+fn count_publishes(runtime: &Runtime, process_id: u64, window: Duration) -> u64 {
+    let deadline = Instant::now() + window;
+    let mut frames = 0_u64;
+    while Instant::now() < deadline {
+        frames += drain_logs(runtime, process_id).len() as u64;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    frames
+}
 
 /// Task 1.2: a `wasm32` watcher parked on another guest's channel converges on
 /// a frame published by that guest, without the host polling it.
@@ -75,51 +88,40 @@ fn cross_guest_write_wakes_a_parked_watcher() {
     runtime.stop_process(publisher_id).expect("stop publisher");
 }
 
-/// Task 1.3: delivering a wake to a process that has already exited is a
-/// no-op — the delivery is idempotent and tolerates a dead process id.
-#[test]
-#[ignore = "requires the wake-probe guest built for wasm32-unknown-unknown"]
-fn waking_a_stopped_guest_is_a_no_op() {
-    let runtime = Runtime::default();
+/// Drains the guest's log channel and decodes each frame as a `LogRecord`.
+fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .kernel()
+        .processes()
+        .drain_log_channel(process_id)
+        .expect("drain log channel")
+        .iter()
+        .map(|frame| {
+            selium_service::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
 
-    let publisher_id = spawn_probe(&runtime, MODE_PUBLISHER, "");
-    let region_id = parse_channel_region(&runtime, publisher_id, Duration::from_secs(10));
-
-    let watcher_id = spawn_probe(&runtime, MODE_WATCHER, &region_id.to_string());
-    wait_for_log(
-        &runtime,
-        watcher_id,
-        "wake-probe: watching",
-        Duration::from_secs(10),
-    );
-
-    runtime.stop_process(watcher_id).expect("stop watcher");
-
-    // The watcher is registered as a waiter on the channel's region, and the
-    // publisher keeps publishing, so every subsequent generation advance
-    // still targets the stopped process. Delivery must tolerate the dead
-    // process id rather than failing or wedging the runtime: the publisher
-    // must keep running, and a fresh watcher on the same region must still
-    // converge.
-    let published = count_publishes(&runtime, publisher_id, Duration::from_secs(2));
-    assert!(
-        published > 5,
-        "the publisher must keep running while wakes target a stopped process; \
-         saw {published} publishes in 2s"
-    );
-
-    // Delivery is idempotent: a second watcher converges exactly as the first
-    // did, with a dead registration still present for the same region.
-    let survivor_id = spawn_probe(&runtime, MODE_WATCHER, &region_id.to_string());
-    wait_for_log(
-        &runtime,
-        survivor_id,
-        "wake-probe: woke",
-        Duration::from_secs(10),
-    );
-
-    runtime.stop_process(survivor_id).expect("stop survivor");
-    runtime.stop_process(publisher_id).expect("stop publisher");
+/// Waits for the publisher to announce its channel, returning the region id.
+#[expect(clippy::panic, reason = "test helper")]
+fn parse_channel_region(runtime: &Runtime, process_id: u64, timeout: Duration) -> u64 {
+    let start = Instant::now();
+    let mut seen: Vec<String> = Vec::new();
+    while start.elapsed() < timeout {
+        for message in drain_logs(runtime, process_id) {
+            if let Some(region_id) = message
+                .strip_prefix("wake-probe: channel ")
+                .and_then(|rest| rest.trim().parse::<u64>().ok())
+            {
+                return region_id;
+            }
+            seen.push(message);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("timed out waiting for the publisher's channel announcement; got {seen:?}");
 }
 
 /// Task 3.1: a yield-only pass is not forward progress, so a host that keeps
@@ -252,38 +254,6 @@ fn polling_a_yield_only_guest_does_not_re_enter_it() {
     runtime.stop_process(yielder_id).expect("stop yielder");
 }
 
-/// How many yields the yielder reports per log line.
-const YIELD_LOG_INTERVAL: u64 = 100;
-
-/// Counts the publisher's log frames over `window`, proving it is still
-/// resident and progressing.
-fn count_publishes(runtime: &Runtime, process_id: u64, window: Duration) -> u64 {
-    let deadline = Instant::now() + window;
-    let mut frames = 0_u64;
-    while Instant::now() < deadline {
-        frames += drain_logs(runtime, process_id).len() as u64;
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    frames
-}
-
-/// Spawns the probe guest in `mode`, failing loudly with the activity log (which
-/// carries the guest's own log records) when the entrypoint errors.
-#[expect(
-    clippy::panic,
-    reason = "test helper: a failed entrypoint is a test failure"
-)]
-fn spawn_probe(runtime: &Runtime, mode: u64, region_id: &str) -> u64 {
-    let descriptor = probe_descriptor(mode, region_id);
-    match runtime.spawn_system_guest(descriptor) {
-        Ok(bootstrapped) => bootstrapped.process_id,
-        Err(error) => panic!(
-            "spawn probe guest: {error}; activity: {:#?}",
-            runtime.activity_log()
-        ),
-    }
-}
-
 fn probe_descriptor(mode: u64, region_id: &str) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: format!("wake-probe-{mode}"),
@@ -304,40 +274,21 @@ fn probe_descriptor(mode: u64, region_id: &str) -> SystemGuestDescriptor {
     }
 }
 
-/// Waits for the publisher to announce its channel, returning the region id.
-#[expect(clippy::panic, reason = "test helper")]
-fn parse_channel_region(runtime: &Runtime, process_id: u64, timeout: Duration) -> u64 {
-    let start = Instant::now();
-    let mut seen: Vec<String> = Vec::new();
-    while start.elapsed() < timeout {
-        for message in drain_logs(runtime, process_id) {
-            if let Some(region_id) = message
-                .strip_prefix("wake-probe: channel ")
-                .and_then(|rest| rest.trim().parse::<u64>().ok())
-            {
-                return region_id;
-            }
-            seen.push(message);
-        }
-        std::thread::sleep(Duration::from_millis(5));
+/// Spawns the probe guest in `mode`, failing loudly with the activity log (which
+/// carries the guest's own log records) when the entrypoint errors.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a failed entrypoint is a test failure"
+)]
+fn spawn_probe(runtime: &Runtime, mode: u64, region_id: &str) -> u64 {
+    let descriptor = probe_descriptor(mode, region_id);
+    match runtime.spawn_system_guest(descriptor) {
+        Ok(bootstrapped) => bootstrapped.process_id,
+        Err(error) => panic!(
+            "spawn probe guest: {error}; activity: {:#?}",
+            runtime.activity_log()
+        ),
     }
-    panic!("timed out waiting for the publisher's channel announcement; got {seen:?}");
-}
-
-/// Drains the guest's log channel and decodes each frame as a `LogRecord`.
-fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
-        .iter()
-        .map(|frame| {
-            selium_service::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
 }
 
 /// Polls the guest log channel until a message containing `needle` appears.
@@ -353,4 +304,51 @@ fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Durat
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
+}
+
+/// Task 1.3: delivering a wake to a process that has already exited is a
+/// no-op — the delivery is idempotent and tolerates a dead process id.
+#[test]
+#[ignore = "requires the wake-probe guest built for wasm32-unknown-unknown"]
+fn waking_a_stopped_guest_is_a_no_op() {
+    let runtime = Runtime::default();
+
+    let publisher_id = spawn_probe(&runtime, MODE_PUBLISHER, "");
+    let region_id = parse_channel_region(&runtime, publisher_id, Duration::from_secs(10));
+
+    let watcher_id = spawn_probe(&runtime, MODE_WATCHER, &region_id.to_string());
+    wait_for_log(
+        &runtime,
+        watcher_id,
+        "wake-probe: watching",
+        Duration::from_secs(10),
+    );
+
+    runtime.stop_process(watcher_id).expect("stop watcher");
+
+    // The watcher is registered as a waiter on the channel's region, and the
+    // publisher keeps publishing, so every subsequent generation advance
+    // still targets the stopped process. Delivery must tolerate the dead
+    // process id rather than failing or wedging the runtime: the publisher
+    // must keep running, and a fresh watcher on the same region must still
+    // converge.
+    let published = count_publishes(&runtime, publisher_id, Duration::from_secs(2));
+    assert!(
+        published > 5,
+        "the publisher must keep running while wakes target a stopped process; \
+         saw {published} publishes in 2s"
+    );
+
+    // Delivery is idempotent: a second watcher converges exactly as the first
+    // did, with a dead registration still present for the same region.
+    let survivor_id = spawn_probe(&runtime, MODE_WATCHER, &region_id.to_string());
+    wait_for_log(
+        &runtime,
+        survivor_id,
+        "wake-probe: woke",
+        Duration::from_secs(10),
+    );
+
+    runtime.stop_process(survivor_id).expect("stop survivor");
+    runtime.stop_process(publisher_id).expect("stop publisher");
 }
