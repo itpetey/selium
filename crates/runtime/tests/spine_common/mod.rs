@@ -155,7 +155,7 @@ impl Drop for SpinePortGuard {
 
 /// The single per-platform bridge server, conferring from the identity grant
 /// table. Boots as a root guest (`tenant: None`) holding a `Namespace::Root`
-/// `DelegateGrants` grant and `SystemRegistration` for its root route.
+/// `DelegateGrants` grant and the route claim for its root route.
 pub(crate) fn bridge_server_descriptor(
     module_bytes: Vec<u8>,
     bridge_channel_module: Vec<u8>,
@@ -176,7 +176,10 @@ pub(crate) fn bridge_server_descriptor(
                 Capability::DelegateGrants,
                 vec![ResourceSelector::Namespace(Namespace::Root)],
             ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///bridge".to_string())],
+            ),
             CapabilityGrant::new(
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
@@ -277,7 +280,10 @@ pub(crate) fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDesc
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///control".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: false,
@@ -306,6 +312,10 @@ pub(crate) fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescript
             // registrations under a bootstrap-provisioned authority, not a
             // privileged guest identity.
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,
@@ -585,10 +595,12 @@ pub(crate) fn store_descriptor(_dependencies: Vec<String>) -> SystemGuestDescrip
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
-            // The store serves a root-namespace route, and the registry gates a
-            // root registration on the system-registration capability it must
-            // therefore probe for.
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+            // The store serves a root-namespace route under an exclusive
+            // host-issued claim, and probes capability state as the registry.
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///store".to_string())],
+            ),
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
         ],
         tenant: None,

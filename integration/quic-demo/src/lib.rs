@@ -29,7 +29,7 @@ use selium_guest::{
 /// retry briefly instead of failing the deployment.
 const BIND_ATTEMPTS: u8 = 10;
 /// The service path this demo serves. The demo runs in the root/system
-/// tenant (holding the system-registration capability), so the route is
+/// tenant (holding the host-issued route claim), so the route is
 /// `sel:///localhost` and the projected wire name is the bare label
 /// `localhost` — which must match the test client's SNI and the test
 /// certificate's SAN.

@@ -149,7 +149,7 @@ fn connector_wasm() -> Vec<u8> {
 /// The echo demo app guest. Note the grants: HostQueue (create its listener,
 /// attach the discovery listener) + SharedMemory (attach delivered stream
 /// regions) — **no `Network` grant**: QUIC is terminated by the connector.
-/// `SystemRegistration` lets the root-tenant demo register its synthetic
+/// The route claim lets the root-tenant demo register its synthetic
 /// `localhost` route under the root namespace.
 fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
@@ -167,7 +167,10 @@ fn demo_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::SharedMemory,
                 vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
             ),
-            CapabilityGrant::new(Capability::SystemRegistration, vec![]),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///localhost".to_string())],
+            ),
         ],
         // The demo serves a `sel-quic` route, which requires the connector's
         // handler registration to be observable in discovery — a real
@@ -205,6 +208,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             // register a root route) under a bootstrap-provisioned authority,
             // not a privileged guest identity.
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,

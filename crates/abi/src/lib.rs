@@ -15,11 +15,14 @@
 //! | `Tenant` | **Enforced** | `tenant` (from process authority) |
 //! | `Namespace` | **Enforced** | `tenant` (from process authority) |
 //! | `Children` | **Enforced** | requires process-tree access (runtime) |
-//! | `UriPrefix` | **Enforced*** | `uri` (network endpoints only) |
+//! | `Uri` | **Enforced** | `uri` (exact, canonicalised) |
+//! | `UriPrefix` | **Enforced*** | `uri` (network endpoints and `sel://`) |
 //!
 //! \* `UriPrefix` is evaluatable only when the same grant also carries a
-//! network `ResourceClass` selector (`TcpListener`, `TcpStream`, or
-//! `UdpSocket`). Otherwise the grant is rejected at registration time.
+//! selector the prefix applies to: a network `ResourceClass` selector
+//! (`TcpListener`, `TcpStream`, or `UdpSocket`), or `Volume`. Otherwise the
+//! grant is rejected at registration time. For `sel://` URIs the prefix is
+//! path-segment aware rather than a plain string prefix.
 //!
 //! An **empty** selector list means "unrestricted within the capability" and is
 //! explicitly accepted. Intersection semantics apply: all selectors in a grant
@@ -179,11 +182,12 @@ pub enum Capability {
     /// per-tenant bridge-server) that spawn children carrying an external
     /// client's grants.
     DelegateGrants,
-    /// Permission to register routes in the root/system tenant (`sel:///…`),
-    /// replacing the runtime's well-known-URI provisioning. Without this grant
-    /// a guest's `serve` registration in the root namespace is forbidden by
-    /// discovery.
-    SystemRegistration,
+    /// Permission to publish one exact reserved registry name (`sel:///…`)
+    /// under a host-issued, non-delegable claim. The URI the claim covers is
+    /// carried by a `ResourceSelector::Uri`; without a matching claim a guest
+    /// cannot register that name. Bootstrap-provisioned only: a spawn that
+    /// confers it on a child is denied.
+    RouteClaim,
     /// Permission to sign tenant CAs and user certificates through the signing
     /// hostcalls (`SignTenantCa`, `SignUserCert`, `RevokeCa`). Bootstrap-
     /// provisioned only: like `DelegateGrants`, it can never be conferred on a
@@ -310,8 +314,14 @@ pub enum ResourceSelector {
     /// Unlike `Tenant`, this variant also carries the `Root` value, which is
     /// required for `DelegateGrants` to express root-wide delegation.
     Namespace(Namespace),
-    /// Match resources whose URI starts with the prefix.
+    /// Match resources whose URI starts with the prefix. For `sel://` URIs
+    /// matching is path-segment aware; for `tcp://`/`udp://` endpoints it is
+    /// component-aware; other URIs keep plain string-prefix semantics.
     UriPrefix(String),
+    /// Match one exact canonical registry URI. Both sides are normalised to
+    /// the canonical internal `sel://…` form before comparison, and the
+    /// selector is never treated as a prefix.
+    Uri(String),
     /// Match an operation locality.
     Locality(LocalityScope),
     /// Match a resource class.
@@ -349,6 +359,30 @@ pub struct CapabilityGrant {
     pub capability: Capability,
     /// Selectors that must all match for the grant to apply.
     pub selectors: Vec<ResourceSelector>,
+}
+
+/// Authoritative ownership answer for `(class, id)`.
+///
+/// `owned` says whether the queried process owns the resource under the class
+/// it asked about; when it does, `tenant` is the tenant the host minted the
+/// resource under (an empty string for the root/platform tenant). The answer is
+/// read from the host's mint-time records, never from a guest-projected store.
+///
+/// `other_classes` is populated only when `owned` is false: it lists the
+/// classes under which the queried process *does* own a resource with the same
+/// id. It lets an admission decision tell a class mismatch (a permission
+/// failure) apart from an identity the caller does not own at all.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(bytecheck())]
+pub struct ResourceAuthority {
+    /// Whether the queried process owns the resource under the queried class.
+    pub owned: bool,
+    /// Tenant the resource was minted under, when owned.
+    pub tenant: Option<String>,
+    /// Classes the process owns for the same id when it does not own the
+    /// queried class. Empty when `owned` is true or nothing with that id is
+    /// owned.
+    pub other_classes: Vec<ResourceClass>,
 }
 
 /// Stable error code returned across the host-guest ABI.
@@ -706,7 +740,7 @@ pub enum HostcallRequest {
         /// Optional process id filter.
         process_id: Option<ProcessId>,
     },
-    /// Create a host-mediated connection queue, registered with discovery
+    /// Create a host-mediated connection queue, recorded by the host authority
     /// under the principal (serving) tenant. `None` mints the queue under
     /// the allocating process's own tenant; a tenant differing from the
     /// allocating process's own requires cross-tenant allocation authority
@@ -771,7 +805,24 @@ pub enum HostcallRequest {
         process_id: ProcessId,
         /// Capability to check.
         capability: Capability,
+        /// Optional URI to evaluate the grant's selectors against. A
+        /// `RouteClaim` names its exact URI through `ResourceSelector::Uri`,
+        /// so the probe must be asked in that URI's scope.
+        uri: Option<String>,
     },
+    /// Returns the exact reserved URIs the host provisioned this process a
+    /// `RouteClaim` for. The host knows the expectation independently of
+    /// discovery publication, so reconciliation can report a claim that was
+    /// never published without making discovery the accounting authority.
+    ExpectedClaims {
+        /// Process whose expected claims are listed.
+        process_id: ProcessId,
+    },
+    /// Lists the live processes the host retains authority for. Gated by the
+    /// bootstrap-provisioned `ProcessProbe` capability. A registry uses it to
+    /// reconcile expected claims against published registrations, including
+    /// processes that published nothing at all.
+    ProcessList,
     /// Free a previously allocated shared memory region.
     FreeRegion {
         /// Region id to free.
@@ -982,6 +1033,15 @@ pub enum HostcallOutput {
     },
     /// A tenant identity for [`HostcallRequest::ProcessTenant`].
     Tenant(Option<String>),
+    /// Authoritative ownership and mint-time tenant for
+    /// [`HostcallRequest::ProcessOwnsResource`].
+    ResourceAuthority(ResourceAuthority),
+    /// Exact reserved URIs the host expects the process to publish
+    /// ([`HostcallRequest::ExpectedClaims`]).
+    Claims(Vec<String>),
+    /// Live processes the host retains authority for
+    /// ([`HostcallRequest::ProcessList`]).
+    Processes(Vec<ProcessId>),
     /// A DER-encoded X.509 public certificate returned by a signing hostcall
     /// ([`HostcallRequest::SignTenantCa`] or [`HostcallRequest::SignUserCert`]).
     /// Carries no private-key material.
@@ -1119,11 +1179,11 @@ impl ResourceSelector {
     ///
     /// The enforcement matrix is:
     /// - `Tenant`, `Namespace`, `Locality`, `ResourceClass`, `ExplicitResource`,
-    ///   `Children`: evaluatable.
+    ///   `Uri`, `Children`: evaluatable.
     /// - `UriPrefix`: evaluatable only when the same grant also carries a
     ///   resource-class selector the prefix applies to: a network class
     ///   (`TcpListener`, `TcpStream`, or `UdpSocket`) for endpoint URIs, or
-    ///   `Volume` for volume names.
+    ///   `Volume` for volume names (and `sel://` registry URIs).
     pub fn is_evaluatable(&self, grant_selectors: &[ResourceSelector]) -> bool {
         match self {
             Self::UriPrefix(_) => grant_selectors.iter().any(|s| {
@@ -1140,6 +1200,7 @@ impl ResourceSelector {
             | Self::Locality(_)
             | Self::ResourceClass(_)
             | Self::ExplicitResource(_)
+            | Self::Uri(_)
             | Self::Children => true,
         }
     }
@@ -1152,11 +1213,19 @@ impl ResourceSelector {
     ///
     /// For `UriPrefix` on `tcp://` / `udp://` URIs, matching is component-aware
     /// (scheme exact; host exact or `*.`-label-boundary wildcard; port exact,
-    /// list, or `*`). Non-network URIs keep plain `starts_with` semantics.
+    /// list, or `*`). For `sel://` registry URIs, matching is path-segment
+    /// aware. Other non-network URIs keep plain `starts_with` semantics.
+    ///
+    /// `Uri` matches one exact canonical registry URI after normalising both
+    /// sides; it never acts as a prefix.
     pub fn matches(&self, context: &ScopeContext) -> bool {
         match self {
             Self::Tenant(expected) => context.tenant.as_ref() == Some(expected),
             Self::Namespace(namespace) => namespace.matches_tenant(context.tenant.as_deref()),
+            Self::Uri(expected) => context
+                .uri
+                .as_ref()
+                .is_some_and(|context_uri| canonical_uri(expected) == canonical_uri(context_uri)),
             Self::UriPrefix(prefix) => {
                 let context_uri = context.uri.as_ref();
                 match context_uri {
@@ -1167,8 +1236,12 @@ impl ResourceSelector {
                             NetworkEndpoint::parse(ctx_uri),
                         ) {
                             NetworkEndpoint::prefix_matches(&grant_ep, &ctx_ep)
+                        } else if uri::parse_sel(prefix).is_some()
+                            || uri::parse_sel(ctx_uri).is_some()
+                        {
+                            sel_prefix_matches(prefix, ctx_uri)
                         } else {
-                            // Plain string prefix for non-network URIs.
+                            // Plain string prefix for other non-network URIs.
                             ctx_uri.starts_with(prefix)
                         }
                     }
@@ -1181,6 +1254,43 @@ impl ResourceSelector {
             // Handled by the runtime with process-tree access.
             Self::Children => false,
         }
+    }
+}
+
+/// Normalises a registry URI to its canonical internal `sel://` spelling:
+/// trailing separators removed, and wire names projected to their internal
+/// path. Non-`sel` values (network endpoints, volume names) are returned
+/// unchanged.
+fn canonical_uri(raw: &str) -> String {
+    if let Some((tenant, path)) = uri::parse_sel(raw) {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            return format!("{}{tenant}/", uri::SEL_PREFIX);
+        }
+        return format!("{}{tenant}/{path}", uri::SEL_PREFIX);
+    }
+    if raw.contains("://") {
+        return raw.to_string();
+    }
+    match uri::resolve_wire_name(raw, &uri::DomainTable::new()) {
+        Some((tenant, path)) if path.is_empty() => format!("{}{tenant}/", uri::SEL_PREFIX),
+        Some((tenant, path)) => format!("{}{tenant}/{}", uri::SEL_PREFIX, path.join("/")),
+        None => raw.to_string(),
+    }
+}
+
+/// Path-segment-aware prefix matching for `sel://` registry URIs: a prefix
+/// matches at a segment boundary, so `sel:///control` does not match
+/// `sel:///control-plane`.
+fn sel_prefix_matches(prefix: &str, context: &str) -> bool {
+    let prefix = canonical_uri(prefix);
+    let context = canonical_uri(context);
+    if context == prefix {
+        return true;
+    }
+    match context.strip_prefix(&prefix) {
+        Some(rest) => prefix.ends_with('/') || rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -2204,26 +2314,110 @@ mod tests {
 
     #[test]
     fn uri_prefix_non_network_keeps_string_prefix() {
-        // Non-network URI keeps plain starts_with semantics.
+        // A non-`sel` URI keeps plain starts_with semantics.
         let grant = CapabilityGrant::new(
             Capability::Network,
             vec![
-                ResourceSelector::UriPrefix("sel://acme/payments/".to_string()),
+                ResourceSelector::UriPrefix("selium.control".to_string()),
                 ResourceSelector::ResourceClass(ResourceClass::TcpStream),
             ],
         );
         let ctx_match = ScopeContext {
-            uri: Some("sel://acme/payments/worker".to_string()),
+            uri: Some("selium.control-plane".to_string()),
             resource_class: Some(ResourceClass::TcpStream),
             ..ScopeContext::default()
         };
         let ctx_no_match = ScopeContext {
-            uri: Some("sel://acme/other/worker".to_string()),
+            uri: Some("other.control-plane".to_string()),
             resource_class: Some(ResourceClass::TcpStream),
             ..ScopeContext::default()
         };
         assert!(grant.allows(&ctx_match));
         assert!(!grant.allows(&ctx_no_match));
+    }
+
+    #[test]
+    fn registry_prefix_respects_segment_boundaries() {
+        let grant = CapabilityGrant::new(
+            Capability::Network,
+            vec![
+                ResourceSelector::UriPrefix("sel:///control".to_string()),
+                ResourceSelector::ResourceClass(ResourceClass::HostQueue),
+            ],
+        );
+        let same = ScopeContext {
+            uri: Some("sel:///control".to_string()),
+            resource_class: Some(ResourceClass::HostQueue),
+            ..ScopeContext::default()
+        };
+        let nested = ScopeContext {
+            uri: Some("sel:///control/status".to_string()),
+            resource_class: Some(ResourceClass::HostQueue),
+            ..ScopeContext::default()
+        };
+        let lookalike = ScopeContext {
+            uri: Some("sel:///control-plane".to_string()),
+            resource_class: Some(ResourceClass::HostQueue),
+            ..ScopeContext::default()
+        };
+        assert!(grant.allows(&same));
+        assert!(grant.allows(&nested));
+        assert!(
+            !grant.allows(&lookalike),
+            "a registry prefix must not match at a non-segment boundary"
+        );
+    }
+
+    #[test]
+    fn exact_uri_selector_matches_only_the_canonical_name() {
+        let selector = ResourceSelector::Uri("sel:///control".to_string());
+        let exact = ScopeContext {
+            uri: Some("sel:///control".to_string()),
+            ..ScopeContext::default()
+        };
+        let longer = ScopeContext {
+            uri: Some("sel:///control-plane".to_string()),
+            ..ScopeContext::default()
+        };
+        let nested = ScopeContext {
+            uri: Some("sel:///control/status".to_string()),
+            ..ScopeContext::default()
+        };
+        assert!(selector.matches(&exact));
+        assert!(!selector.matches(&longer));
+        assert!(!selector.matches(&nested), "Uri is exact, never a prefix");
+    }
+
+    #[test]
+    fn exact_uri_selector_normalises_wire_names_and_trailing_separators() {
+        let selector = ResourceSelector::Uri("sel:///control".to_string());
+        let wire = ScopeContext {
+            uri: Some("control".to_string()),
+            ..ScopeContext::default()
+        };
+        let trailing = ScopeContext {
+            uri: Some("sel:///control/".to_string()),
+            ..ScopeContext::default()
+        };
+        assert!(selector.matches(&wire));
+        assert!(selector.matches(&trailing));
+    }
+
+    #[test]
+    fn uri_selector_is_evaluatable() {
+        let selector = ResourceSelector::Uri("sel:///control".to_string());
+        assert!(selector.is_evaluatable(std::slice::from_ref(&selector)));
+    }
+
+    #[test]
+    fn route_claim_grant_round_trips() {
+        let grant = CapabilityGrant {
+            capability: Capability::RouteClaim,
+            selectors: vec![ResourceSelector::Uri("sel:///control".to_string())],
+        };
+        let encoded = encode_rkyv(&grant).expect("encode");
+        let decoded: CapabilityGrant = decode_rkyv(&encoded).expect("decode");
+        assert_eq!(decoded, grant);
     }
 
     // --- is_evaluatable tests ---

@@ -15,6 +15,7 @@ pub enum DiscoveryResponseOffset {}
 ///   4 = Revoked
 ///   5 = Forbidden
 ///   6 = Domains(domains)
+///   7 = Conflict
 pub struct DiscoveryResponse<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }

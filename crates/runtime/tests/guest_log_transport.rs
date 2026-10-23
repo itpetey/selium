@@ -3,8 +3,8 @@
 //! Integration tests for the guest log transport change.
 //!
 //! Tests the end-to-end behaviour of:
-//! - Tier-1 discovery registration on AllocRegion
-//! - URI revocation on process termination
+//! - No host-published discovery registration on AllocRegion
+//! - Owner-keyed and identity-keyed revocation on process termination
 //! - GuestLogRegister hostcall validation
 //! - Deprecated GuestLog::write/read_from still functioning
 //! - Drop backpressure channel semantics
@@ -36,24 +36,26 @@ fn alloc_region(runtime: &Runtime, process_id: ProcessId, purpose: ResourceKind)
 }
 
 #[test]
-fn alloc_region_with_log_channel_publishes_discovery_register_events() {
+fn alloc_region_with_log_channel_publishes_no_registration() {
     let (runtime, mut subscriber) = runtime_with_discovery_feed();
     let process_id = spawn_shared_memory_guest(&runtime, "log-channel-guest");
 
     let region_id = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
 
+    // Allocation is a host fact the owner publishes for itself: the feed
+    // carries no registration, and the runtime does not auto-register a
+    // purpose alias (`sel:///logs`).
     let uris = drain_register_uris(&mut subscriber);
-
-    // Region registrations are typed and tenant-scoped: the guest runs with
-    // no tenant (platform), so its region mint under the root tenant.
     assert!(
-        uris.contains(&format!("sel:///region/{region_id}")),
-        "expected region URI to be published, got: {uris:?}"
+        uris.is_empty(),
+        "the host must not publish a registration for an allocated region, got: {uris:?}"
     );
-    // The runtime SHALL NOT auto-register purpose aliases.
+
+    // The authority still answers for the just-minted region.
+    let authority = runtime.resource_authority(process_id, ResourceClass::SharedRegion, region_id);
     assert!(
-        !uris.iter().any(|uri| uri == "sel:///logs"),
-        "no purpose alias shall be published"
+        authority.owned,
+        "the minting process owns the region before any publication"
     );
 }
 
@@ -133,15 +135,19 @@ fn drain_register_uris(
     uris
 }
 
-/// Drains all currently available Revoke events from the discovery feed and
-/// returns the set of URI strings they contain.
+/// Drains all currently available revocation events from the discovery feed.
+///
+/// Returns the URI-keyed revocations, the owner-keyed `ProcessGone` ids, and
+/// the identity-keyed `ResourceFreed` `(class, id)` pairs.
 fn drain_revoke_uris(
     subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
 ) -> (
     std::collections::HashSet<String>,
+    std::collections::HashSet<ProcessId>,
     std::collections::HashSet<(String, u64)>,
 ) {
     let mut uris = std::collections::HashSet::new();
+    let mut owners = std::collections::HashSet::new();
     let mut resources = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
@@ -149,7 +155,10 @@ fn drain_revoke_uris(
                 DiscoveryRequest::Revoke { uri } => {
                     uris.insert(uri);
                 }
-                DiscoveryRequest::RevokeResource { class, id } => {
+                DiscoveryRequest::ProcessGone { process_id } => {
+                    owners.insert(process_id);
+                }
+                DiscoveryRequest::ResourceFreed { class, id } => {
                     resources.insert((class, id));
                 }
                 _ => {}
@@ -158,7 +167,7 @@ fn drain_revoke_uris(
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    (uris, resources)
+    (uris, owners, resources)
 }
 
 #[test]
@@ -251,35 +260,33 @@ fn process_termination_publishes_discovery_revoke_events() {
     let (runtime, mut subscriber) = runtime_with_discovery_feed();
     let process_id = spawn_shared_memory_guest(&runtime, "terminating-guest");
 
-    // Allocate regions to generate discovery URIs.
-    let _r1 = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
-    let _r2 = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
-
-    // Drain the Register events published during allocation.
-    let registered = drain_register_uris(&mut subscriber);
+    // Allocate regions: the host records their authority but publishes
+    // nothing on the feed.
+    let log_region = alloc_region(&runtime, process_id, ResourceKind::LogChannel);
+    let shared_region = alloc_region(&runtime, process_id, ResourceKind::SharedMemory);
     assert!(
-        !registered.is_empty(),
-        "expected Register events to be published before termination"
+        drain_register_uris(&mut subscriber).is_empty(),
+        "allocation must not publish a registration"
     );
 
-    // Stop the process — this should publish Revoke operations.
+    // Stop the process — owner-keyed and identity-keyed revocations are
+    // published for discovery to apply.
     runtime.stop_process(process_id).expect("stop process");
 
-    let (revoked, revoked_resources) = drain_revoke_uris(&mut subscriber);
+    let (revoked, owners, freed) = drain_revoke_uris(&mut subscriber);
     assert!(
-        !revoked.is_empty() || !revoked_resources.is_empty(),
-        "expected Revoke events to be published after termination"
+        revoked.is_empty(),
+        "the host no longer revokes individual URIs, got: {revoked:?}"
     );
-
-    // Every previously registered URI should have a matching revocation:
-    // either a URI-keyed Revoke, or an identity-keyed RevokeResource whose
-    // class and id the URI ends with.
-    for uri in &registered {
-        let covered = revoked.contains(uri)
-            || revoked_resources
-                .iter()
-                .any(|(class, id)| uri.ends_with(&format!("/{class}/{id}")));
-        assert!(covered, "expected revocation for {uri}");
+    assert!(
+        owners.contains(&process_id),
+        "expected ProcessGone for {process_id}, got: {owners:?}"
+    );
+    for region_id in [log_region, shared_region] {
+        assert!(
+            freed.contains(&("region".to_string(), region_id)),
+            "expected ResourceFreed for region {region_id}, got: {freed:?}"
+        );
     }
 }
 

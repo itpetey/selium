@@ -546,8 +546,20 @@ pub fn accountant_grants() -> Vec<CapabilityGrant> {
             Capability::HostQueue,
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
         ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(CONTROL_PATH))],
+        ),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(NARROWING_TABLE_PATH))],
+        ),
     ]
+}
+
+/// The exact root route `path` names.
+fn root_route(path: &str) -> String {
+    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
 }
 
 /// Every capability variant: a delinquent tenant's narrowing set, so conferral
@@ -566,7 +578,7 @@ pub fn all_capabilities() -> Vec<Capability> {
         Capability::GuestLogWrite,
         Capability::HostQueue,
         Capability::DelegateGrants,
-        Capability::SystemRegistration,
+        Capability::RouteClaim,
         Capability::MintCertificate,
         Capability::QuotaWrite,
     ]
@@ -590,7 +602,10 @@ pub fn bookkeeper_grants() -> Vec<CapabilityGrant> {
             Capability::SharedMemory,
             vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
         ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(BUCKET_TOPIC_PATH))],
+        ),
     ]
 }
 
@@ -711,12 +726,16 @@ async fn accountant(mut ctx: Context) -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     accounts.rebuild_payloads(ledger_payloads);
 
-    // Attach the bookkeeper's bucket topic.
+    // Attach the bookkeeper's bucket topic. Both roles boot from this module
+    // and the bookkeeper publishes the route from its own entrypoint, so the
+    // accountant converges rather than treating an early miss as permanent.
     let topic = ctx
-        .lookup(&format!("sel:///{BUCKET_TOPIC_PATH}"))
+        .resolve_ready(
+            &format!("sel:///{BUCKET_TOPIC_PATH}"),
+            std::time::Duration::from_secs(30),
+        )
         .await
-        .with_context(|| "accountant: bucket topic resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("accountant: bucket topic route not found"))?;
+        .with_context(|| "accountant: bucket topic resolve failed")?;
     let channel = Channel::attach(topic.resource_id)
         .map_err(|e| anyhow::anyhow!("accountant: bucket topic attach failed: {e}"))?;
     let transport = ShmTransport::new(&channel, &channel)

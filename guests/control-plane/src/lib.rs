@@ -291,8 +291,16 @@ pub fn control_plane_grants() -> Vec<CapabilityGrant> {
             Capability::HostQueue,
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
         ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(control_route())],
+        ),
     ]
+}
+
+/// The exact reserved route claim covered by the control plane's descriptor.
+pub fn control_route() -> String {
+    format!("{}/{}", selium_abi::uri::SEL_PREFIX, CONTROL_PATH)
 }
 
 /// Maps a discovery lookup outcome to a typed resolve response.
@@ -1062,7 +1070,7 @@ mod tests {
         assert!(capabilities.contains(&Capability::Storage));
         assert!(capabilities.contains(&Capability::SharedMemory));
         assert!(capabilities.contains(&Capability::HostQueue));
-        assert!(capabilities.contains(&Capability::SystemRegistration));
+        assert!(capabilities.contains(&Capability::RouteClaim));
 
         // No grant carries a tenant selector: the single instance serves all
         // tenants and derives each session's tenant from the identity.

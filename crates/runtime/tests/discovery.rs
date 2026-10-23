@@ -2,9 +2,8 @@
 //!
 //! Deploys the real `selium-discovery` and `selium-discovery-probe` WASM
 //! guests together and asserts on the control-plane slice end-to-end:
-//! bootstrap with discovery wiring, Tier-1 registration events via the
-//! discovery feed, guest→discovery rendezvous, readiness signalling, and
-//! URI revocation on process exit.
+//! bootstrap with discovery wiring, the revocation-only feed, guest→discovery
+//! rendezvous, readiness signalling, and teardown revocation.
 //!
 //! Cross-guest shared-memory RPC wake is not yet implemented (tracked by
 //! `channel-wake-wait`), so Tier-2 register/lookup is deferred. The
@@ -53,9 +52,8 @@ fn attach_feed_subscriber(runtime: &Runtime) -> Subscriber<DiscoveryRequest, Shm
         .expect("discovery feed region id");
     let channel = Channel::attach(feed_region_id).expect("attach to discovery feed");
     let capacity = channel.ring().capacity();
-    // Replay from the start of the ring: bootstrap-time events (the
-    // host-authored handler registrations) are published before this test
-    // attaches, so a tail-starting reader would never see them.
+    // Replay from the start of the ring so any bootstrap-time events are
+    // observable to a reader that attaches later.
     let transport = ShmTransport::new_replay(&channel, &channel).expect("feed transport");
     Subscriber::new(FramedRead::new(transport), Some(capacity))
 }
@@ -118,37 +116,20 @@ fn discovery_bootstrap_slice_end_to_end() {
         "expected discovery feed/listener attach, got: {discovery_messages:?}"
     );
 
-    // --- 2.3: Assert Tier-1 flow ---
-    // Attach to the discovery feed and allocate a region from the host for
-    // the probe process to observe Tier-1 register events.
+    // --- 2.3: The feed carries revocations only ---
+    // Allocating a region publishes nothing: the owning guest publishes its
+    // canonical record, and the host records authority synchronously.
     let mut subscriber = attach_feed_subscriber(&runtime);
     let host_region_id = alloc_region(&runtime, probe_guest.process_id, ResourceKind::SharedMemory);
-    // The probe runs with no tenant (platform), so its region mints under the
-    // root tenant as a typed `sel:///region/<id>` URI.
-    let expected_uri = format!("sel:///region/{host_region_id}");
-
-    // One drain of the feed collects both categories: the ring is consumed as it
-    // is read, so separate drains would swallow each other's events.
-    let (registered, handlers) = drain_feed_registrations(&mut subscriber);
-
-    // Handler registrations are host-authored from the descriptor, published
-    // on the feed so a serve-side guest can resolve the owning process without
-    // any guest being able to forge the pin.
+    let registered = drain_feed_registrations(&mut subscriber);
     assert!(
-        handlers.contains(&("sel-probe".to_string(), probe_guest.process_id)),
-        "expected a host-authored handler registration for the probe's scheme, got: {handlers:?}"
-    );
-    assert!(
-        registered.contains(&expected_uri),
-        "expected Tier-1 register URI {expected_uri}, got: {registered:?}"
+        registered.is_empty(),
+        "the host must not publish registrations, got: {registered:?}"
     );
 
     // --- 2.4: Assert revocation ---
-    // Stop the probe process — the runtime must publish identity-keyed
-    // RevokeResource events for the shared resources it minted, plus a single
-    // owner-keyed RevokeByOwner (revocation of any routes the process
-    // registered itself lives in discovery, keyed by the recorded owner —
-    // there is no runtime side map of guest-registered routes).
+    // Stop the probe process — the runtime publishes owner-keyed ProcessGone
+    // plus identity-keyed ResourceFreed for the shared resources it minted.
     runtime
         .stop_process(probe_guest.process_id)
         .expect("stop probe process");
@@ -165,8 +146,11 @@ fn discovery_bootstrap_slice_end_to_end() {
         revoked_owners
     );
 
-    // Verify the probe process is fully gone.
-    assert_eq!(runtime.loaded_guest_count(), 1); // only discovery remains
+    // Verify the probe process is fully gone and discovery remains resident.
+    // `loaded_guest_count` drops while another thread drives a guest, so check
+    // residency instead.
+    assert!(!runtime.is_guest_resident(probe_guest.process_id));
+    assert!(runtime.is_guest_resident(discovery_guest.process_id));
 
     // Cleanup: stop discovery too.
     runtime
@@ -195,6 +179,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             // registrations under a bootstrap-provisioned authority, not a
             // privileged guest identity.
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,
@@ -227,8 +215,8 @@ fn discovery_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
         ],
         tenant: None,
         discovery_service: false,
-        // Declares a protocol handler so the host publishes a host-authored
-        // handler registration on the Tier-1 feed at spawn.
+        // Declares a protocol handler; the host provisions the handler claim
+        // and the guest publishes the route itself.
         handlers: vec!["sel-probe".to_string()],
     }
 }
@@ -243,34 +231,24 @@ fn discovery_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
 }
 
-/// Drains the feed, collecting registered URIs and host-authored handler
-/// registrations. Both are asserted from one drain because reading the ring
-/// consumes every event in it.
+/// Drains the feed, collecting registration events. The feed is
+/// revocation-only, so the set must stay empty at spawn/allocation.
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
 fn drain_feed_registrations(
     subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<(String, ProcessId)>,
-) {
+) -> std::collections::HashSet<String> {
     let mut uris = std::collections::HashSet::new();
-    let mut handlers = std::collections::HashSet::new();
     loop {
         match subscriber.read_with_tag() {
-            Ok((request, _tag)) => match request {
-                DiscoveryRequest::Register { uri, .. } => {
-                    uris.insert(uri);
-                }
-                DiscoveryRequest::RegisterHandler { scheme, process_id } => {
-                    handlers.insert((scheme, process_id));
-                }
-                _ => {}
-            },
+            Ok((DiscoveryRequest::Register { uri, .. }, _tag)) => {
+                uris.insert(uri);
+            }
+            Ok(_) => {}
             Err(selium_wire::error::Error::BufferEmpty) => break,
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    (uris, handlers)
+    uris
 }
 
 fn drain_log_messages(runtime: &Runtime, process_id: u64) -> Vec<String> {
@@ -306,10 +284,10 @@ fn drain_revoke_events(
                 DiscoveryRequest::Revoke { uri } => {
                     uris.insert(uri);
                 }
-                DiscoveryRequest::RevokeByOwner { process_id } => {
+                DiscoveryRequest::ProcessGone { process_id } => {
                     owners.insert(process_id);
                 }
-                DiscoveryRequest::RevokeResource { class, id } => {
+                DiscoveryRequest::ResourceFreed { class, id } => {
                     resources.insert((class, id));
                 }
                 _ => {}

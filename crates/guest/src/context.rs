@@ -28,6 +28,15 @@ use crate::{
 const RPC_REP_CAPACITY: u64 = 4096;
 /// RPC ring capacity for discovery requests.
 const RPC_REQ_CAPACITY: u64 = 4096;
+/// How long a serve-side guest waits for a protocol-handler claim to be
+/// published before treating it as absent.
+const HANDLER_RESOLVE_BOUND: Duration = Duration::from_secs(60);
+/// How long a boot-time platform-service lookup converges before failing.
+///
+/// System services publish their own routes from their entrypoints, so a
+/// consumer that boots alongside one must retry rather than treat an early miss
+/// as permanent.
+const SERVICE_READY_BOUND: Duration = Duration::from_secs(30);
 
 /// Declaration of a named service route: a path plus the target to map it to,
 /// with an optional root-service designation for apex aliasing.
@@ -95,19 +104,110 @@ impl Context {
         })
     }
 
+    /// Publishes the canonical typed record `sel://<tenant>/<class>/<id>` for
+    /// a resource this guest owns.
+    ///
+    /// Admission validates the URI against the host's authority record: the
+    /// caller must own `(class, id)` and the URI's tenant must be the tenant
+    /// the host minted it under. Publication is optional — a private resource
+    /// that is never published stays fully owned and accounted for, merely
+    /// undiscoverable.
+    pub async fn publish_canonical(
+        &mut self,
+        target: &ResourceTarget,
+    ) -> Result<String, GuestError> {
+        let authority = crate::hostcall::resource_authority(
+            crate::process_id(),
+            target.class.clone(),
+            target.resource_id,
+        )?;
+        if !authority.owned {
+            return Err(GuestError::Host(format!(
+                "cannot publish canonical record for {:?} {}: caller does not own it",
+                target.class, target.resource_id
+            )));
+        }
+        let tenant = authority.tenant.unwrap_or_default();
+        let uri = uri::resource_uri(&tenant, target.class.clone(), target.resource_id);
+        let mut canonical = target.clone();
+        canonical.uri = uri.clone();
+        canonical.tenant = (!tenant.is_empty()).then_some(tenant);
+        self.register_inner(&uri, canonical, false).await?;
+        Ok(uri)
+    }
+
+    /// Publishes this process's own node (`sel://<tenant>/proc/<id>`).
+    ///
+    /// The process is the owner of its node, so the host authority attests the
+    /// publication. A process that never publishes stays undiscoverable while
+    /// remaining fully accounted for by the host.
+    pub async fn publish_process_node(&mut self) {
+        let process_id = crate::process_id();
+        let target = ResourceTarget {
+            uri: String::new(),
+            host_id: String::new(),
+            resource_id: process_id,
+            interface: None,
+            tenant: None,
+            class: ResourceClass::Process,
+            labels: Vec::new(),
+        };
+        if let Err(error) = self.publish_canonical(&target).await {
+            crate::warn!("process node publication failed for {process_id}: {error}");
+        }
+    }
+
+    /// Publishes the protocol-handler routes this process holds host-issued
+    /// claims for.
+    ///
+    /// Handler names are reserved (`sel:///handler/<scheme>`); the host
+    /// provisions the claim, and this guest publishes the route under it. The
+    /// route resolves to the handler process, which is exactly what a
+    /// serve-side guest pins its listener to.
+    pub async fn publish_handler_claims(&mut self) {
+        let process_id = crate::process_id();
+        let claims = match crate::hostcall::expected_claims(process_id) {
+            Ok(claims) => claims,
+            Err(error) => {
+                crate::warn!("handler claim lookup failed for {process_id}: {error}");
+                return;
+            }
+        };
+        crate::info!(
+            "process {process_id} has {} expected route claims",
+            claims.len()
+        );
+        for uri in claims {
+            if !uri.contains("/handler/") {
+                // Platform routes are served by their guest with the listener
+                // target, not by this generic handler publication.
+                continue;
+            }
+            let target = ResourceTarget {
+                uri: uri.clone(),
+                host_id: String::new(),
+                resource_id: process_id,
+                interface: None,
+                tenant: None,
+                class: ResourceClass::Process,
+                labels: Vec::new(),
+            };
+            if let Err(error) = self.register_inner(&uri, target, false).await {
+                crate::warn!("handler claim publication failed for {uri}: {error}");
+            }
+        }
+    }
+
     /// Returns a client of the durable store service, connecting on first use.
     ///
     /// The store route is resolved for the caller, so a guest never has to
-    /// know it. When the store is not registered the request fails with a
-    /// typed error rather than hanging.
+    /// know it. The store publishes its own route from its entrypoint, so this
+    /// converges for a bounded window before failing with a typed error.
     pub async fn store(&mut self) -> Result<StoreClient, GuestError> {
         if let Some(client) = self.store_client.clone() {
             return Ok(client);
         }
-        let target = self
-            .lookup(STORE_ROUTE)
-            .await?
-            .ok_or_else(|| GuestError::Host(format!("store service unreachable: {STORE_ROUTE}")))?;
+        let target = self.resolve_ready(STORE_ROUTE, SERVICE_READY_BOUND).await?;
         let sender = ResourceSender::attach(target.resource_id)?;
         let client = store::connect(sender).await?;
         self.store_client = Some(client.clone());
@@ -133,16 +233,16 @@ impl Context {
     /// on first use.
     ///
     /// The control route is resolved for the caller, so a guest never has to
-    /// know it. When the catalogue is not reachable the request fails with a
-    /// typed error rather than hanging; name resolution is gated on the
-    /// catalogue, allocation is not.
+    /// know it. The control plane publishes its own route from its entrypoint,
+    /// so this converges for a bounded window before failing with a typed
+    /// error; name resolution is gated on the catalogue, allocation is not.
     pub async fn catalogue(&mut self) -> Result<ControlClient, GuestError> {
         if let Some(client) = self.control_client.clone() {
             return Ok(client);
         }
-        let target = self.lookup(CONTROL_ROUTE).await?.ok_or_else(|| {
-            GuestError::Host(format!("catalogue service unreachable: {CONTROL_ROUTE}"))
-        })?;
+        let target = self
+            .resolve_ready(CONTROL_ROUTE, SERVICE_READY_BOUND)
+            .await?;
         let sender = ResourceSender::attach(target.resource_id)?;
         let client = control::connect(sender).await?;
         self.control_client = Some(client.clone());
@@ -243,9 +343,9 @@ impl Context {
     /// }
     /// ```
     pub async fn watch(&mut self, uri: &str) -> Result<RouteWatch, GuestError> {
-        let table = self.lookup(ROUTE_TABLE_ROUTE).await?.ok_or_else(|| {
-            GuestError::Host(format!("route table unreachable: {ROUTE_TABLE_ROUTE}"))
-        })?;
+        let table = self
+            .resolve_ready(ROUTE_TABLE_ROUTE, SERVICE_READY_BOUND)
+            .await?;
         let channel = Channel::attach(table.resource_id)
             .map_err(|error| GuestError::Host(format!("route table attach: {error}")))?;
         let transport = ShmTransport::new_replay(&channel, &channel)
@@ -364,19 +464,43 @@ impl Context {
             .is_some())
     }
 
-    /// Resolves the bootstrap-registered protocol handler for `scheme` via
-    /// discovery.
+    /// Resolves the protocol handler for `scheme` via discovery.
     ///
-    /// Handler registration is host-authored (published on the Tier-1 feed
-    /// from a guest descriptor), so the result cannot be forged by a guest.
-    /// Serve-side guests use it to pin the process legitimately allowed to
-    /// deliver handoffs.
+    /// The handler URI (`sel:///handler/<scheme>`) is published by the guest
+    /// that holds the host-issued route claim, so the result cannot be forged
+    /// by another guest. Serve-side guests use it to pin the process
+    /// legitimately allowed to deliver handoffs. A handler that has not yet
+    /// published resolves as `None`; consumers converge rather than treat that
+    /// as permanent.
     pub async fn resolve_protocol_handler(
         &mut self,
         scheme: &str,
     ) -> Result<Option<selium_abi::ProcessId>, GuestError> {
         let uri = format!("{}/handler/{}", uri::SEL_PREFIX, scheme);
-        Ok(self.lookup(&uri).await?.map(|target| target.resource_id))
+        // Bootstrap is a single pass with no readiness gate: a handler guest
+        // publishes its route at the start of its own entrypoint, which may
+        // still be in flight when a peer starts. Converge on the claim rather
+        // than treating an early miss as permanent.
+        let deadline = crate::Instant::now()?
+            .checked_add(HANDLER_RESOLVE_BOUND)
+            .ok_or_else(|| {
+                GuestError::Host(format!(
+                    "handler resolve bound overflows the clock for {uri}"
+                ))
+            })?;
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            if let Some(target) = self.lookup(&uri).await? {
+                return Ok(Some(target.resource_id));
+            }
+            let now = crate::Instant::now()?;
+            if now >= deadline {
+                return Ok(None);
+            }
+            let wait = backoff.min(deadline - now);
+            crate::Timer::new(now + wait).await;
+            backoff = (backoff * 2).min(Duration::from_millis(250));
+        }
     }
 
     /// Returns the raw discovery host-queue handle this context was built
@@ -391,10 +515,12 @@ impl Context {
     /// wire name) to a resource via the discovery service.
     ///
     /// Convenience method that delegates to `self.discovery().request()`.
-    /// When the resolved resource's owner declared it attachable by
-    /// resolution, the discovery service records the resolved id with the
-    /// runtime on the caller's behalf, giving the caller an authorisation
-    /// basis for `HostQueueAttach`/`AttachRegion` on the returned resource.
+    ///
+    /// Resolution is **not** an authorisation basis on its own. When the
+    /// resolved resource's owner declared it attachable by resolution, the
+    /// discovery service records the resolved id with the runtime on the
+    /// caller's behalf, and the *host* enforces the owner's declaration scope;
+    /// the returned target carries no permission by itself.
     pub async fn lookup(&mut self, uri: &str) -> Result<Option<ResourceTarget>, GuestError> {
         let request = DiscoveryRequest::Resolve(uri.to_string());
 
@@ -410,6 +536,7 @@ impl Context {
             DiscoveryResponse::Registered
             | DiscoveryResponse::Revoked
             | DiscoveryResponse::Forbidden
+            | DiscoveryResponse::Conflict
             | DiscoveryResponse::Resolved(_)
             | DiscoveryResponse::Domains(_) => Err(GuestError::Host(
                 "unexpected discovery response variant".to_string(),
@@ -456,8 +583,8 @@ impl Context {
     /// [`Serve`] value. The guest creates its own resource; the runtime no
     /// longer provisions routes on a guest's behalf.
     ///
-    /// Registration in the root/system tenant is permitted only when the guest
-    /// holds the system-registration capability (enforced by discovery).
+    /// Registration in the root/system tenant is permitted only for the exact
+    /// URI a `RouteClaim` covers (enforced by discovery).
     pub async fn serve(&mut self, serve: Serve) -> Result<String, GuestError> {
         // A named service must project to a wire name: reject typed-resource
         // paths and non-DNS-safe segments up front.
@@ -478,6 +605,11 @@ impl Context {
         // onto the target so discovery registers under that URI.
         let mut target = serve.target;
         target.uri = uri.clone();
+        // Publish the canonical typed record first, so the named route is
+        // admissible on the first attempt without waiting for any host feed
+        // event. The canonical tenant comes from the host's mint-time record,
+        // not from the caller's own tenant.
+        self.publish_canonical(&target).await?;
         // A served resource is published for other guests to resolve and
         // attach, so the owner declares it attachable by resolution. The
         // declaration admits the whole platform: discovery's own resolve is
@@ -527,10 +659,12 @@ impl Context {
                 Ok(())
             }
             DiscoveryResponse::Forbidden => Err(GuestError::Host(
-                "registration forbidden: process does not own the route or lacks the \
-                 system-registration capability"
+                "registration forbidden: process does not own the target or lacks a route claim"
                     .to_string(),
             )),
+            DiscoveryResponse::Conflict => Err(GuestError::Host(format!(
+                "registration conflict: {uri} is already claimed by another live registration"
+            ))),
             other => Err(GuestError::Host(format!(
                 "unexpected discovery response: {other:?}"
             ))),

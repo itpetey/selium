@@ -299,7 +299,32 @@ impl Poller {
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) => {
-                            eprintln!("inbound TCP read error: {e}");
+                            // A reset/abort is a connection end, not a ring
+                            // failure: readers must still observe EOF rather
+                            // than park forever on a peer that vanished.
+                            let connection_ended = matches!(
+                                e.kind(),
+                                io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::BrokenPipe
+                            );
+                            if connection_ended {
+                                drop(inbound_writer.decrement_writer_count());
+                                let new_gen = inbound_writer
+                                    .backend()
+                                    .fetch_add_u64(
+                                        selium_shm::layout::GENERATION_COUNTER_OFFSET,
+                                        1,
+                                        Ordering::Release,
+                                    )
+                                    .map(|g| g.wrapping_add(1))
+                                    .ok();
+                                if let (Some(new_gen), Some(cb)) = (new_gen, advance.as_ref()) {
+                                    cb(region_id, new_gen);
+                                }
+                            } else {
+                                eprintln!("inbound TCP read error: {e}");
+                            }
                             running.store(false, Ordering::Relaxed);
                             finished = true;
                             break;

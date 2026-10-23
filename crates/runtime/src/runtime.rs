@@ -29,6 +29,10 @@ use crate::{
 pub(crate) type DiscoveryPublisher = Publisher<DiscoveryRequest, ShmTransport>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 pub(crate) type SharedResourceOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
+/// Mint-time principal tenant per resource identity. Recorded synchronously
+/// inside the minting hostcall, so it is the authority for tenant attribution
+/// even when no registration has been projected.
+pub(crate) type ResourceTenants = HashMap<(ResourceClass, u64), String>;
 /// Serving tenant tracked per (process_id, volume local id) so an append is
 /// reserved against the tenant the volume was minted under, not the writer's.
 pub(crate) type VolumeTenants = HashMap<(ProcessId, u64), String>;
@@ -54,6 +58,9 @@ pub struct Runtime {
     pub(crate) loaded_guests: Arc<Mutex<HashMap<ProcessId, LoadedGuest>>>,
     pub(crate) local_handle_owners: Arc<Mutex<LocalHandleOwners>>,
     pub(crate) shared_resource_owners: Arc<Mutex<SharedResourceOwners>>,
+    /// Mint-time principal tenant per resource identity (see
+    /// [`ResourceTenants`]).
+    pub(crate) resource_tenants: Arc<Mutex<ResourceTenants>>,
     pub(crate) next_operation_id: Arc<Mutex<OperationId>>,
     pub(crate) operations: Arc<Mutex<HashMap<OperationId, HostOperation>>>,
     pub(crate) mailboxes: Arc<Mutex<HashMap<ProcessId, Arc<GuestMailbox>>>>,
@@ -191,6 +198,7 @@ impl Runtime {
             loaded_guests: Arc::new(Mutex::new(HashMap::new())),
             local_handle_owners: Arc::new(Mutex::new(HashMap::new())),
             shared_resource_owners: Arc::new(Mutex::new(HashMap::new())),
+            resource_tenants: Arc::new(Mutex::new(HashMap::new())),
             next_operation_id: Arc::new(Mutex::new(1)),
             operations,
             mailboxes,

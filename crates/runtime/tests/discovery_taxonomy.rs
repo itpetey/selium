@@ -1,23 +1,25 @@
 //! Discovery taxonomy substrate tests.
 //!
-//! Exercises the Tier-1 discovery flow the runtime publishes over the
-//! discovery feed: process-node registration at spawn, principal-provenance
-//! region allocation with tenant-scoped delegation, and teardown revocation.
+//! Exercises the host authority the runtime keeps for discovery: mint-time
+//! tenant records, the authority read, and the revocation-only feed. The host
+//! no longer publishes registrations; owners publish their own records.
+
+use std::collections::HashSet;
 
 use selium_abi::{
     AbiErrorCode, Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest,
-    ProcessId, RegionProt, ResourceClass, ResourceKind, ResourceSelector,
+    ProcessId, RegionProt, ResourceAuthority, ResourceClass, ResourceKind, ResourceSelector,
 };
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use selium_service::DiscoveryRequest;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{framed::FramedRead, pubsub::Subscriber};
 
-/// A resource minted under a serving tenant is revoked under the tenant it was
-/// minted for when its owning process exits, and its quota comes back to that
-/// same tenant's ceiling — the case the tenant side maps used to miss.
+/// A resource minted under a serving tenant is attributed to that tenant by
+/// the authority and released under it when the owner exits — the case the
+/// tenant side maps used to miss.
 #[test]
-fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
+fn a_cross_tenant_mint_reports_and_releases_under_the_minting_tenant() {
     let (runtime, mut subscriber) = runtime_with_feed();
     // A ceiling only `acme` is subject to, so a mis-attributed release shows.
     runtime
@@ -31,13 +33,22 @@ fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
     )];
     // A root-principal guest mints for a named tenant without delegation.
     let pid = spawn_guest(&runtime, "root-minter", None, grants);
-    let _ = drain_uris(&mut subscriber); // process-node registration
 
     let region_id = alloc_region(&runtime, pid, Some("acme")).expect("cross-tenant mint");
-    let (registered, _, _) = drain_uris(&mut subscriber);
+    let events = drain_feed(&mut subscriber);
     assert!(
-        registered.contains(&format!("sel://acme/region/{region_id}")),
-        "the region is registered under the tenant it was minted for, got: {registered:?}"
+        events.registered.is_empty(),
+        "the host must not publish a registration, got: {:?}",
+        events.registered
+    );
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::SharedRegion, region_id),
+        ResourceAuthority {
+            owned: true,
+            tenant: Some("acme".to_string()),
+            other_classes: Vec::new(),
+        },
+        "the authority answers with the mint-time tenant before any publication"
     );
     assert_eq!(
         runtime
@@ -48,13 +59,15 @@ fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
         "the reservation is charged to the serving tenant's ceiling"
     );
 
-    // Teardown: the registration is revoked by identity (the registry revokes
-    // under the tenant it recorded), and the quota returns to that tenant.
+    // Teardown: the process is revoked by owner and the region by identity; the
+    // quota returns to the tenant it was charged to.
     runtime.stop_process(pid).expect("stop process");
-    let (_, _revoked, revoked_resources) = drain_uris(&mut subscriber);
+    let events = drain_feed(&mut subscriber);
+    assert!(events.gone.contains(&pid), "expected ProcessGone for {pid}");
     assert!(
-        revoked_resources.contains(&("region".to_string(), region_id)),
-        "expected identity-keyed revocation at teardown, got: {revoked_resources:?}"
+        events.freed.contains(&("region".to_string(), region_id)),
+        "expected identity-keyed ResourceFreed, got: {:?}",
+        events.freed
     );
     assert_eq!(
         runtime
@@ -64,6 +77,205 @@ fn a_cross_tenant_mint_revokes_and_releases_under_the_minting_tenant() {
         0,
         "the reservation is released to the tenant it was charged to, not the owner's"
     );
+}
+
+#[test]
+fn discovery_lifecycle_over_the_feed_is_revocation_only() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    let pid = spawn_guest(&runtime, "lifecycle-guest", Some("acme"), grants);
+
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.registered.is_empty(),
+        "process start publishes no registration"
+    );
+
+    let region_id = alloc_region(&runtime, pid, None).expect("allocate region");
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.registered.is_empty(),
+        "allocation publishes no registration"
+    );
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::SharedRegion, region_id).tenant,
+        Some("acme".to_string())
+    );
+
+    runtime.stop_process(pid).expect("stop process");
+    let events = drain_feed(&mut subscriber);
+    assert!(events.gone.contains(&pid));
+    assert!(
+        events.freed.contains(&("region".to_string(), region_id)),
+        "expected identity-keyed region revoke, got: {:?}",
+        events.freed
+    );
+}
+
+#[test]
+fn host_queue_authority_uses_principal_provenance() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    let grants = vec![CapabilityGrant::new(
+        Capability::HostQueue,
+        vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+    )];
+    let pid = spawn_guest(&runtime, "queue-guest", Some("acme"), grants);
+
+    // Own-tenant queue: authority reports the caller's tenant.
+    let queue_id = create_queue(&runtime, pid, None).expect("own-tenant queue");
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.registered.is_empty(),
+        "queue creation publishes no registration"
+    );
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::HostQueue, queue_id),
+        ResourceAuthority {
+            owned: true,
+            tenant: Some("acme".to_string()),
+            other_classes: Vec::new(),
+        }
+    );
+
+    // A cross-tenant queue mint without delegation is denied.
+    let denied = create_queue(&runtime, pid, Some("beta"));
+    assert_eq!(denied, Err(AbiErrorCode::PermissionDenied));
+
+    // Teardown revokes the queue by identity.
+    runtime.stop_process(pid).expect("stop process");
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.freed.contains(&("queue".to_string(), queue_id)),
+        "expected identity-keyed queue revocation at teardown, got: {:?}",
+        events.freed
+    );
+}
+
+#[test]
+fn process_start_and_exit_publish_no_registration() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    let pid = spawn_guest(&runtime, "acme-guest", Some("acme"), grants);
+
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.registered.is_empty() && events.revoked.is_empty(),
+        "spawn publishes no process-node registration"
+    );
+    // The host still answers for the process: it is accounted for even though
+    // it never published a node.
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::Process, pid),
+        ResourceAuthority {
+            owned: true,
+            tenant: Some("acme".to_string()),
+            other_classes: Vec::new(),
+        }
+    );
+
+    runtime.stop_process(pid).expect("stop process");
+    let events = drain_feed(&mut subscriber);
+    assert!(
+        events.gone.contains(&pid),
+        "owner-keyed ProcessGone revokes the node if the process published one"
+    );
+    assert!(
+        events.revoked.is_empty(),
+        "the host does not revoke individual URIs"
+    );
+}
+
+#[test]
+fn root_process_allocates_for_any_tenant_without_delegation() {
+    // Option B: a root principal (no tenant) may mint for any tenant — this
+    // is the path connector-quic takes under mTLS, where the connector
+    // (root) allocates per-stream regions under the authenticated client's
+    // tenant without holding per-tenant delegation grants.
+    let (runtime, mut subscriber) = runtime_with_feed();
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    let pid = spawn_guest(&runtime, "root-connector", None, grants);
+
+    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("root allocation");
+    let events = drain_feed(&mut subscriber);
+    assert!(events.registered.is_empty());
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::SharedRegion, region_id).tenant,
+        Some("acme".to_string()),
+        "the region is attributed to the serving tenant, not the root caller"
+    );
+}
+
+#[test]
+fn system_process_allocates_for_another_tenant_with_delegation() {
+    let (runtime, mut subscriber) = runtime_with_feed();
+    // A root/system process (no tenant) holding tenant-scoped delegation for
+    // tenant "acme".
+    let grants = vec![
+        CapabilityGrant::new(
+            Capability::SharedMemory,
+            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        ),
+        CapabilityGrant::new(
+            Capability::DelegateGrants,
+            vec![ResourceSelector::Tenant("acme".to_string())],
+        ),
+    ];
+    let pid = spawn_guest(&runtime, "system-allocator", None, grants);
+
+    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("delegated allocation");
+    let events = drain_feed(&mut subscriber);
+    assert!(events.registered.is_empty());
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::SharedRegion, region_id).tenant,
+        Some("acme".to_string())
+    );
+}
+
+#[test]
+fn unauthorised_cross_tenant_allocation_is_denied() {
+    let (runtime, _subscriber) = runtime_with_feed();
+    // A tenant-scoped process (tenant "acme") without delegation for "beta"
+    // cannot mint a region for it.
+    let grants = vec![CapabilityGrant::new(
+        Capability::SharedMemory,
+        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+    )];
+    let pid = spawn_guest(&runtime, "unprivileged", Some("acme"), grants);
+
+    let result = alloc_region(&runtime, pid, Some("beta"));
+    assert_eq!(result, Err(AbiErrorCode::PermissionDenied));
+}
+
+/// The authority answer for a `(class, id)` the caller is expected to own.
+#[expect(clippy::panic, reason = "unexpected hostcall output indicates a bug")]
+fn authority(
+    runtime: &Runtime,
+    process_id: ProcessId,
+    class: ResourceClass,
+    id: u64,
+) -> ResourceAuthority {
+    let (status, op_id) = runtime.begin_hostcall(
+        process_id,
+        HostcallRequest::ProcessOwnsResource {
+            process_id,
+            resource_class: class,
+            resource_id: id,
+        },
+    );
+    assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+    match runtime.poll_hostcall(process_id, op_id) {
+        CompletionState::Ready(HostcallOutput::ResourceAuthority(authority)) => authority,
+        other => panic!("expected ResourceAuthority, got {other:?}"),
+    }
 }
 
 #[expect(
@@ -129,55 +341,32 @@ fn create_queue(
     }
 }
 
-#[test]
-fn discovery_lifecycle_over_the_feed() {
-    // 5.2 runtime-substrate golden path: spawn-node → allocate-region →
-    // teardown-revoke, observed end-to-end on the discovery feed.
-    let (runtime, mut subscriber) = runtime_with_feed();
-    let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-    )];
-    let pid = spawn_guest(&runtime, "lifecycle-guest", Some("acme"), grants);
-
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(registered.contains(&format!("sel://acme/proc/{pid}")));
-
-    let region_id = alloc_region(&runtime, pid, None).expect("allocate region");
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(registered.contains(&format!("sel://acme/region/{region_id}")));
-
-    runtime.stop_process(pid).expect("stop process");
-    let (_, revoked, revoked_resources) = drain_uris(&mut subscriber);
-    assert!(revoked.contains(&format!("sel://acme/proc/{pid}")));
-    assert!(
-        revoked_resources.contains(&("region".to_string(), region_id)),
-        "expected identity-keyed region revoke, got: {revoked_resources:?}"
-    );
+/// Events observed on the revocation-only feed.
+#[derive(Default)]
+struct FeedEvents {
+    registered: HashSet<String>,
+    revoked: HashSet<String>,
+    gone: HashSet<ProcessId>,
+    freed: HashSet<(String, u64)>,
 }
 
 #[expect(clippy::panic, reason = "feed read errors in test indicate a bug")]
-fn drain_uris(
-    subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>,
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-    std::collections::HashSet<(String, u64)>,
-) {
-    let mut registered = std::collections::HashSet::new();
-    let mut revoked = std::collections::HashSet::new();
-    let mut revoked_resources = std::collections::HashSet::new();
+fn drain_feed(subscriber: &mut Subscriber<DiscoveryRequest, ShmTransport>) -> FeedEvents {
+    let mut events = FeedEvents::default();
     loop {
         match subscriber.read_with_tag() {
             Ok((request, _tag)) => match request {
                 DiscoveryRequest::Register { uri, .. } => {
-                    registered.insert(uri);
+                    events.registered.insert(uri);
                 }
                 DiscoveryRequest::Revoke { uri } => {
-                    revoked.insert(uri);
+                    events.revoked.insert(uri);
                 }
-                DiscoveryRequest::RevokeResource { class, id } => {
-                    revoked_resources.insert((class, id));
+                DiscoveryRequest::ProcessGone { process_id } => {
+                    events.gone.insert(process_id);
+                }
+                DiscoveryRequest::ResourceFreed { class, id } => {
+                    events.freed.insert((class, id));
                 }
                 _ => {}
             },
@@ -185,39 +374,7 @@ fn drain_uris(
             Err(error) => panic!("feed read failed: {error}"),
         }
     }
-    (registered, revoked, revoked_resources)
-}
-
-#[test]
-fn host_queue_registration_uses_principal_provenance() {
-    let (runtime, mut subscriber) = runtime_with_feed();
-    let grants = vec![CapabilityGrant::new(
-        Capability::HostQueue,
-        vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-    )];
-    let pid = spawn_guest(&runtime, "queue-guest", Some("acme"), grants);
-    let _ = drain_uris(&mut subscriber); // process-node registration
-
-    // Own-tenant queue: registered under `sel://acme/queue/<id>`.
-    let queue_id = create_queue(&runtime, pid, None).expect("own-tenant queue");
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(
-        registered.contains(&format!("sel://acme/queue/{queue_id}")),
-        "expected queue registered under the caller's tenant, got: {registered:?}"
-    );
-
-    // A cross-tenant queue mint without delegation is denied.
-    let denied = create_queue(&runtime, pid, Some("beta"));
-    assert_eq!(denied, Err(AbiErrorCode::PermissionDenied));
-
-    // Teardown revokes the queue by resource identity; the registry recorded
-    // the tenant it was minted for.
-    runtime.stop_process(pid).expect("stop process");
-    let (_, _revoked, revoked_resources) = drain_uris(&mut subscriber);
-    assert!(
-        revoked_resources.contains(&("queue".to_string(), queue_id)),
-        "expected identity-keyed queue revocation at teardown, got: {revoked_resources:?}"
-    );
+    events
 }
 
 fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
@@ -225,46 +382,30 @@ fn module_with_entrypoint(entrypoint: &str) -> Vec<u8> {
 }
 
 #[test]
-fn process_node_registered_at_spawn_and_revoked_at_teardown() {
-    let (runtime, mut subscriber) = runtime_with_feed();
+fn expected_claims_are_visible_without_publication() {
+    let (runtime, _subscriber) = runtime_with_feed();
+    let claimed = "sel:///control";
     let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+        Capability::RouteClaim,
+        vec![ResourceSelector::Uri(claimed.to_string())],
     )];
-    let pid = spawn_guest(&runtime, "acme-guest", Some("acme"), grants);
+    let pid = spawn_guest(&runtime, "claim-holder", None, grants);
 
-    let (registered, _, _) = drain_uris(&mut subscriber);
+    // The host knows the expected claim even though the process published
+    // nothing, so reconciliation can report drift.
+    assert_eq!(runtime.expected_claims(pid), vec![claimed.to_string()]);
     assert!(
-        registered.contains(&format!("sel://acme/proc/{pid}")),
-        "expected process-node registration, got: {registered:?}"
+        runtime.restore_process_authority(pid).is_some(),
+        "the non-publishing guest remains in the process table"
     );
-
-    runtime.stop_process(pid).expect("stop process");
-    let (_, revoked, _) = drain_uris(&mut subscriber);
-    assert!(
-        revoked.contains(&format!("sel://acme/proc/{pid}")),
-        "expected process-node revocation, got: {revoked:?}"
-    );
-}
-
-#[test]
-fn root_process_allocates_for_any_tenant_without_delegation() {
-    // Option B: a root principal (no tenant) may mint for any tenant — this
-    // is the path connector-quic takes under mTLS, where the connector
-    // (root) allocates per-stream regions under the authenticated client's
-    // tenant without holding per-tenant delegation grants.
-    let (runtime, mut subscriber) = runtime_with_feed();
-    let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-    )];
-    let pid = spawn_guest(&runtime, "root-connector", None, grants);
-
-    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("root allocation");
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(
-        registered.contains(&format!("sel://acme/region/{region_id}")),
-        "expected region minted under the serving tenant, got: {registered:?}"
+    assert_eq!(
+        authority(&runtime, pid, ResourceClass::Process, pid),
+        ResourceAuthority {
+            owned: true,
+            tenant: Some(String::new()),
+            other_classes: Vec::new(),
+        },
+        "the non-publishing guest remains in the ownership sets"
     );
 }
 
@@ -312,44 +453,4 @@ fn spawn_guest(
         })
         .expect("spawn guest")
         .process_id
-}
-
-#[test]
-fn system_process_allocates_for_another_tenant_with_delegation() {
-    let (runtime, mut subscriber) = runtime_with_feed();
-    // A root/system process (no tenant) holding tenant-scoped delegation for
-    // tenant "acme".
-    let grants = vec![
-        CapabilityGrant::new(
-            Capability::SharedMemory,
-            vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-        ),
-        CapabilityGrant::new(
-            Capability::DelegateGrants,
-            vec![ResourceSelector::Tenant("acme".to_string())],
-        ),
-    ];
-    let pid = spawn_guest(&runtime, "system-allocator", None, grants);
-
-    let region_id = alloc_region(&runtime, pid, Some("acme")).expect("delegated allocation");
-    let (registered, _, _) = drain_uris(&mut subscriber);
-    assert!(
-        registered.contains(&format!("sel://acme/region/{region_id}")),
-        "expected region minted under the principal tenant, got: {registered:?}"
-    );
-}
-
-#[test]
-fn unauthorised_cross_tenant_allocation_is_denied() {
-    let (runtime, _subscriber) = runtime_with_feed();
-    // A tenant-scoped process (tenant "acme") without delegation for "beta"
-    // cannot mint a region for it.
-    let grants = vec![CapabilityGrant::new(
-        Capability::SharedMemory,
-        vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-    )];
-    let pid = spawn_guest(&runtime, "unprivileged", Some("acme"), grants);
-
-    let result = alloc_region(&runtime, pid, Some("beta"));
-    assert_eq!(result, Err(AbiErrorCode::PermissionDenied));
 }

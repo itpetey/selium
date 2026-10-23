@@ -13,14 +13,16 @@ pub enum DiscoveryRequestOffset {}
 ///   2 = ResolveLabels { key, value }
 ///   3 = Register { uri, target, owner, root_service }
 ///   4 = Revoke { uri }
-///   5 = RevokeByOwner { process_id }
-///   6 = SeedDomain { domain, tenant }
 ///   7 = ListDomains
-///   8 = RevokeResource { class, id }
 ///   9 = Renew { uri }
 ///  10 = SetHealth { name, healthy }
-///  11 = RegisterHandler { scheme, process_id }
 ///  12 = SetDomain { domain, tenant }
+///  13 = ProcessGone { process_id }
+///  14 = ResourceFreed { class, id }
+///
+/// Tags 5, 6, 8, and 11 are retired (`RevokeByOwner`, `SeedDomain`,
+/// `RevokeResource`, `RegisterHandler`) and are left as gaps: strict decode
+/// rejects them rather than mapping an old message onto a surviving variant.
 pub struct DiscoveryRequest<'a> {
   pub _tab: ::flatbuffers::Table<'a>,
 }
@@ -48,7 +50,6 @@ impl<'a> DiscoveryRequest<'a> {
   pub const VT_ID: ::flatbuffers::VOffsetT = 26;
   pub const VT_NAME: ::flatbuffers::VOffsetT = 28;
   pub const VT_HEALTHY: ::flatbuffers::VOffsetT = 30;
-  pub const VT_SCHEME: ::flatbuffers::VOffsetT = 32;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -63,7 +64,6 @@ impl<'a> DiscoveryRequest<'a> {
     builder.add_id(args.id);
     builder.add_process_id(args.process_id);
     builder.add_owner(args.owner);
-    if let Some(x) = args.scheme { builder.add_scheme(x); }
     if let Some(x) = args.name { builder.add_name(x); }
     if let Some(x) = args.class { builder.add_class(x); }
     if let Some(x) = args.tenant { builder.add_tenant(x); }
@@ -127,7 +127,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<bool>(DiscoveryRequest::VT_ROOT_SERVICE, Some(false)).unwrap()}
   }
-  /// Owning process for a Tier-1 registration (Register variant); 0 = None.
+  /// Owning process hint (Register variant); 0 = None.
   #[inline]
   pub fn owner(&self) -> u64 {
     // Safety:
@@ -135,7 +135,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u64>(DiscoveryRequest::VT_OWNER, Some(0)).unwrap()}
   }
-  /// Process whose owner-keyed registrations are revoked (RevokeByOwner variant).
+  /// Process whose owner-keyed registrations are revoked (ProcessGone variant).
   #[inline]
   pub fn process_id(&self) -> u64 {
     // Safety:
@@ -143,7 +143,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u64>(DiscoveryRequest::VT_PROCESS_ID, Some(0)).unwrap()}
   }
-  /// Domain to seed (SeedDomain variant).
+  /// Domain to set (SetDomain variant).
   #[inline]
   pub fn domain(&self) -> Option<&'a str> {
     // Safety:
@@ -151,7 +151,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_DOMAIN, None)}
   }
-  /// Tenant the domain maps to (SeedDomain variant).
+  /// Tenant the domain maps to (SetDomain variant).
   #[inline]
   pub fn tenant(&self) -> Option<&'a str> {
     // Safety:
@@ -159,8 +159,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_TENANT, None)}
   }
-  /// Resource class segment of the resource whose registration is revoked
-  /// (RevokeResource variant).
+  /// Resource class segment of the freed resource (ResourceFreed variant).
   #[inline]
   pub fn class(&self) -> Option<&'a str> {
     // Safety:
@@ -168,7 +167,7 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_CLASS, None)}
   }
-  /// Resource id whose registration is revoked (RevokeResource variant).
+  /// Resource id of the freed resource (ResourceFreed variant).
   #[inline]
   pub fn id(&self) -> u64 {
     // Safety:
@@ -192,14 +191,6 @@ impl<'a> DiscoveryRequest<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<bool>(DiscoveryRequest::VT_HEALTHY, Some(false)).unwrap()}
   }
-  /// Protocol scheme (RegisterHandler variant).
-  #[inline]
-  pub fn scheme(&self) -> Option<&'a str> {
-    // Safety:
-    // Created from valid Table for this object
-    // which contains a valid value in this slot
-    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(DiscoveryRequest::VT_SCHEME, None)}
-  }
 }
 
 impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
@@ -222,7 +213,6 @@ impl ::flatbuffers::Verifiable for DiscoveryRequest<'_> {
      .visit_field::<u64>("id", Self::VT_ID, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
      .visit_field::<bool>("healthy", Self::VT_HEALTHY, false)?
-     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("scheme", Self::VT_SCHEME, false)?
      .finish();
     Ok(())
   }
@@ -242,7 +232,6 @@ pub struct DiscoveryRequestArgs<'a> {
     pub id: u64,
     pub name: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub healthy: bool,
-    pub scheme: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for DiscoveryRequestArgs<'a> {
   #[inline]
@@ -262,7 +251,6 @@ impl<'a> Default for DiscoveryRequestArgs<'a> {
       id: 0,
       name: None,
       healthy: false,
-      scheme: None,
     }
   }
 }
@@ -329,10 +317,6 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> DiscoveryRequestBuilder<'a, '
     self.fbb_.push_slot::<bool>(DiscoveryRequest::VT_HEALTHY, healthy, false);
   }
   #[inline]
-  pub fn add_scheme(&mut self, scheme: ::flatbuffers::WIPOffset<&'b  str>) {
-    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(DiscoveryRequest::VT_SCHEME, scheme);
-  }
-  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> DiscoveryRequestBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     DiscoveryRequestBuilder {
@@ -364,7 +348,6 @@ impl ::core::fmt::Debug for DiscoveryRequest<'_> {
       ds.field("id", &self.id());
       ds.field("name", &self.name());
       ds.field("healthy", &self.healthy());
-      ds.field("scheme", &self.scheme());
       ds.finish()
   }
 }

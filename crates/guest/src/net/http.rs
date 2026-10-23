@@ -182,7 +182,7 @@ impl HttpServe {
     /// when no connector is registered.
     ///
     /// A guest running in the root/system tenant (an empty tenant label)
-    /// additionally requires the system-registration capability to serve.
+    /// additionally requires a host-issued route claim to serve.
     pub async fn bind(ctx: &mut Context, path: &str) -> Result<Self, GuestError> {
         let mut listener = ResourceListener::create()
             .map_err(|e| GuestError::Host(format!("create listener: {e}")))?;

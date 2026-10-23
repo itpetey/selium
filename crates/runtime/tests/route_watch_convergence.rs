@@ -214,6 +214,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,
@@ -238,7 +242,7 @@ fn probe_descriptor(arguments: Vec<SystemGuestArg>, mode: u64) -> SystemGuestDes
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
         ],
-        tenant: None,
+        tenant: Some("probe".to_string()),
         discovery_service: false,
         handlers: Vec::new(),
     }
@@ -253,11 +257,12 @@ fn discovery_wasm() -> Vec<u8> {
 }
 
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        // A process that has already exited has no log channel left; the
+        // interesting lines were drained before it went.
+        return Vec::new();
+    };
+    frames
         .iter()
         .map(|frame| {
             selium_service::log::LogRecord::decode(frame)

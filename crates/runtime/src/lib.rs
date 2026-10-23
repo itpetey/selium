@@ -10,7 +10,6 @@ pub use runtime::Runtime;
 
 mod bootstrap;
 mod config;
-pub mod discovery;
 mod error;
 mod host_functions;
 mod hostcall;

@@ -19,9 +19,11 @@ use crate::{Context, GuestError, Result, resource::ResourceSender};
 /// Returns an error when the connector is unavailable, discovery denies the
 /// attach, or the outcome is NXDOMAIN, timeout, or truncation.
 pub async fn resolve(ctx: &mut Context, name: &str) -> Result<Vec<IpAddr>> {
-    let target = ctx.lookup(RESOLVE_URI).await?.ok_or_else(|| {
-        GuestError::Host(format!("dns connector not registered at {RESOLVE_URI}"))
-    })?;
+    // Bootstrap is a single pass and the connector publishes its route from
+    // its own entrypoint: converge rather than treat an early miss as absent.
+    let target = ctx
+        .resolve_ready(RESOLVE_URI, std::time::Duration::from_secs(10))
+        .await?;
 
     let sender = ResourceSender::attach(target.resource_id)?;
 

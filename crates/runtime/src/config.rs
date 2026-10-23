@@ -34,9 +34,9 @@ pub struct SystemGuestDescriptor {
     /// Children spawned by this guest inherit this tenant.
     pub tenant: Option<String>,
     /// Protocol handler names this guest serves (e.g. `sel-http` for
-    /// `selium-connector-http`). The runtime publishes a host-authored
-    /// registration for each so serve-side guests can pin their listeners to
-    /// the handler process.
+    /// `selium-connector-http`). The runtime provisions a non-delegable
+    /// `RouteClaim` for `sel:///handler/<scheme>` so the guest can publish the
+    /// handler route itself; serve-side guests pin their listeners to it.
     pub handlers: Vec<String>,
     /// Declares this guest as the platform's discovery service: it consumes the
     /// Tier-1 feed ring and hosts the RPC listener other guests resolve

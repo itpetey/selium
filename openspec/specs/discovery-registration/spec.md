@@ -30,8 +30,27 @@ The discovery service SHALL accept `DiscoveryRequest::Register { uri, target }`,
 - **WHEN** the process that owns a registration exits or is killed
 - **THEN** the discovery service SHALL revoke the process's registrations without a runtime-maintained map of well-known URIs
 
+### Requirement: Host-authoritative admission
+Admission decisions SHALL be evaluated against the host's authoritative resource
+record for `(class, id)` — existence, owner, class, and tenant — rather than the
+feed-projected registry store. A lagging projection SHALL NOT cause admission to
+refuse a resource the authority recognises, and a projected record that the
+authority does not attest SHALL NOT by itself authorise a registration.
+
+#### Scenario: Admission succeeds before the feed catches up
+- **WHEN** a guest owns a just-minted resource and registers a route for it before the canonical typed event is projected
+- **THEN** discovery SHALL consult the host record, accept the registration, and respond `Registered`
+
+#### Scenario: Projection cannot authorise
+- **WHEN** the projected store contains a typed target that the host authority does not attest for the caller
+- **THEN** discovery SHALL refuse the registration
+
+#### Scenario: Authority failure fails closed
+- **WHEN** the host authority cannot answer the resource query
+- **THEN** discovery SHALL deny the registration rather than fall back to the projection
+
 ### Requirement: Guest custom URI validation
-A guest (Tier-2) SHALL be permitted to register a URI only within the guest's own tenant (a non-root tenant) and only for a target resource the guest owns. Registration into the root tenant (empty tenant) SHALL be rejected. A guest MAY register leaf aliases for a target it owns, under its own tenant. A leaf alias SHALL be accepted only when the claimed target's typed registration currently exists and the claimed class matches the class of the resource the caller owns; external names SHALL meet the same class-match requirement.
+A guest (Tier-2) SHALL be permitted to register a URI only within the guest's own tenant (a non-root tenant), or under a root claim it holds (see `route-claims`), and only for a target resource the guest owns according to the host's authoritative record. A guest MAY register leaf aliases for a target it owns, under its own tenant. A leaf alias SHALL be accepted when the host attests that the caller owns the claimed `(class, id)` and that the resource's tenant matches the alias tenant, whether or not the canonical typed registration has reached the projected store; external names SHALL meet the same authority and class-match requirement.
 
 #### Scenario: Guest registers custom URI for owned resource
 - **WHEN** a guest (tenant "acme", process 42) sends `DiscoveryRequest::Register` for a URI under `sel://acme/` targeting a resource id the guest's process owns
@@ -47,9 +66,13 @@ A guest (Tier-2) SHALL be permitted to register a URI only within the guest's ow
 - **THEN** the discovery service SHALL respond `DiscoveryResponse::Forbidden`
 
 #### Scenario: Guest alias rejected for unregistered target
-- **WHEN** a guest registers a leaf alias whose canonical typed target is not currently registered (for example the target was revoked, or lives under a different tenant)
+- **WHEN** a guest registers a leaf alias whose claimed target the host authority does not attest as owned by the caller under that tenant
 - **THEN** the discovery service SHALL respond `DiscoveryResponse::NotFound`
 - **AND** the alias SHALL NOT be stored
+
+#### Scenario: Guest alias admitted while the projection lags
+- **WHEN** a guest owns the claimed target and registers a leaf alias before the canonical typed registration has been projected
+- **THEN** the discovery service SHALL accept and store the alias
 
 #### Scenario: Guest revokes their own custom URI
 - **WHEN** a guest sends `DiscoveryRequest::Revoke` for a URI they previously registered under their own tenant
@@ -97,22 +120,27 @@ Internal addressing SHALL use a single deterministic URI schema: `sel://<tenant>
 - **THEN** resolving `sel://acme/proc/123` SHALL return that process's target
 
 ### Requirement: Root Tenant Namespace
-The empty tenant (`sel:///…`) SHALL be the root/system namespace, reserved to the runtime and system guests (Tier-1). Guest registration SHALL require a non-root tenant, so the root namespace cannot be registered, aliased, or taken over by a guest.
+The empty tenant (`sel:///…`) SHALL be the root/system namespace. A guest SHALL register under the root namespace only when it holds a `RouteClaim` covering the exact URI (see `route-claims`); otherwise root registration SHALL be refused. Non-root registration SHALL remain confined to the caller's tenant.
 
 #### Scenario: Guest cannot register the root namespace
-- **WHEN** a guest sends `DiscoveryRequest::Register` for a URI under `sel:///`
+- **WHEN** a guest without a claim for `sel:///control` sends `DiscoveryRequest::Register` for it
 - **THEN** the discovery service SHALL respond `DiscoveryResponse::Forbidden` and store nothing
 
 #### Scenario: System guest registers under root
-- **WHEN** the runtime registers a system guest's channel at `sel:///dns/resolve`
-- **THEN** resolving `sel:///dns/resolve` SHALL return its target
+- **WHEN** a guest holding a claim for `sel:///control` registers it
+- **THEN** resolving `sel:///control` SHALL return its target
 
 ### Requirement: Leaf Aliases
-A single-segment name under a tenant (`sel://<tenant>/<name>`) SHALL be registrable as a leaf alias resolving to a typed target `(type, id)`. An alias SHALL NOT name another alias. When a target is revoked, every alias resolving to that target SHALL also be revoked.
+A single-segment name under a tenant (`sel://<tenant>/<name>`) SHALL be registrable as a leaf alias resolving to a typed target `(type, id)`. An alias SHALL NOT name another alias. An alias SHALL resolve through its canonical typed target; while that target has not reached the projection, resolution SHALL return `NotFound` rather than the alias's own stored metadata. When a target is revoked, every alias resolving to that target SHALL also be revoked.
 
 #### Scenario: Alias resolves to a typed target
 - **WHEN** the alias `sel://acme/proxy` is registered pointing at `(proc, 123)`
 - **THEN** resolving `sel://acme/proxy` SHALL return the same target as `sel://acme/proc/123`
+
+#### Scenario: Alias resolves only through its canonical target
+- **WHEN** an alias has been admitted but its canonical typed target is not yet projected
+- **THEN** resolving the alias SHALL return `NotFound`
+- **AND** once the canonical target is projected, resolving the alias SHALL return that target
 
 #### Scenario: Revoking a target revokes its aliases
 - **WHEN** region 456, which has a registered alias, is revoked
@@ -137,14 +165,19 @@ The discovery service SHALL support prefix listing under the typed schema, for e
 - **THEN** the discovery service SHALL NOT return tenant "acme"'s targets
 
 ### Requirement: Process Node Addressing
-Every process SHALL be addressable as a typed entry `sel://<tenant>/proc/<id>` from spawn until teardown, even when the process has allocated no resources.
+A process SHALL be addressable as a typed entry `sel://<tenant>/proc/<id>` by publishing its own node when its entrypoint starts. The host SHALL revoke that node when the process exits; a process that has not yet published SHALL be undiscoverable but SHALL remain visible to the host for ownership, metering, and reclamation.
 
 #### Scenario: A process without resources is addressable
-- **WHEN** process 123 of tenant "acme" is spawned and allocates nothing
+- **WHEN** process 123 of tenant "acme" starts, publishes its node, and allocates nothing
 - **THEN** resolving `sel://acme/proc/123` SHALL return the process's target
 
+#### Scenario: An unpublished process is accounted but undiscoverable
+- **WHEN** process 123 never publishes its node
+- **THEN** resolving `sel://acme/proc/123` SHALL return `NotFound`
+- **AND** the host SHALL still know the process and its owned resources
+
 ### Requirement: Guest Revocation Authorisation
-A guest (Tier-2) SHALL be permitted to revoke only custom registrations — leaf aliases and opaque external names — whose target resource the guest owns, and only within the guest's own tenant. Revocation of a typed URI over Tier-2 SHALL be rejected (`Forbidden`): typed URIs are runtime-minted and revoked over the Tier-1 feed. Revocation of an unknown key SHALL return `NotFound`.
+A guest (Tier-2) SHALL be permitted to revoke only custom registrations — leaf aliases and opaque external names — whose target resource the guest owns, and only within the guest's own tenant. Revocation of a typed URI over Tier-2 SHALL be rejected (`Forbidden`): typed URIs are host-attested and revoked when the resource is freed or its owner exits. Revocation of an unknown key SHALL return `NotFound`.
 
 #### Scenario: Guest revokes own external name
 - **WHEN** a guest that owns the target resource sends `DiscoveryRequest::Revoke` for an external name it registered
@@ -192,7 +225,7 @@ The discovery service SHALL consult the advisory domain-to-tenant table when acc
 - **THEN** the discovery service SHALL refuse the registration
 
 ### Requirement: Serve-based route registration
-`Context` SHALL provide a `serve` method that registers a named route from a resource the guest created itself. The route SHALL derive from a path (for example `["bridge"]`) plus the guest's tenant, producing both the internal path (`sel://<tenant>/bridge`) and the wire name (`bridge.<tenant>`, or `bridge.<owned-domain>` when the domain table maps the tenant). The method SHALL optionally accept a root-service flag for apex aliasing.
+`Context` SHALL provide a `serve` method that registers a named route from a resource the guest created itself. The route SHALL derive from a path (for example `["bridge"]`) plus the guest's tenant, producing both the internal path (`sel://<tenant>/bridge`) and the wire name (`bridge.<tenant>`, or `bridge.<owned-domain>` when the domain table maps the tenant). The method SHALL publish the canonical typed record for the target before publishing the named route, so admission ordering is deterministic. The method SHALL optionally accept a root-service flag for apex aliasing.
 
 #### Scenario: Guest registers its own route
 - **WHEN** a guest calls `ctx.serve(Serve { path: ["bridge"], target, default: false }).await`
@@ -202,40 +235,42 @@ The discovery service SHALL consult the advisory domain-to-tenant table when acc
 - **WHEN** the guest's tenant owns a registered domain and serves a path
 - **THEN** the wire name under that domain SHALL also resolve to the route
 
+#### Scenario: Canonical record is published first
+- **WHEN** a guest serves a route whose canonical typed target is not yet published
+- **THEN** `serve` SHALL first publish `sel://<tenant>/<class>/<id>` and then the named route, so the route is admissible on the first attempt
+
 ### Requirement: Root registration capability-gated
-Registration in the root/system tenant SHALL be permitted only when the guest holds the corresponding registration capability, replacing the runtime's special-case well-known URI provisioning.
+Registration in the root/system tenant SHALL be permitted only for an exact URI covered by a `RouteClaim` held by the caller, replacing the runtime's special-case well-known URI provisioning and the coarse system-registration boolean.
 
 #### Scenario: Root registration requires capability
-- **WHEN** a guest without the system-registration capability attempts to register in the root tenant
+- **WHEN** a guest without a claim for the exact URI attempts to register in the root tenant
 - **THEN** the request SHALL be forbidden
 
 #### Scenario: Capability-holding guest registers in root
-- **WHEN** a guest holding the system-registration capability registers in the root tenant
+- **WHEN** a guest holding a claim for the exact URI registers in the root tenant
 - **THEN** the registration SHALL be accepted
 
-### Requirement: FlatBuffers Tier-1 Discovery Feed
-The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded `DiscoveryRequest` values. The runtime SHALL publish typed `DiscoveryRequest` values (encoded via `FlatMsg`) instead of raw rkyv bytes, and the discovery guest SHALL subscribe to and decode typed `DiscoveryRequest` values via `FlatMsg`. The feed representation SHALL cover every Tier-1 operation — `Register` (including an optional owner), `Revoke`, `RevokeByOwner`, `RevokeResource` (revoking the registration recorded for a resource identity), `RegisterHandler`, and `SeedDomain` — without lossy collapse onto an unrelated variant.
+### Requirement: Revocation-Only Tier-1 Feed
+The runtime→discovery (Tier-1) event feed SHALL carry FlatBuffers-encoded
+`DiscoveryRequest` values, and SHALL carry **revocations only**:
+`ProcessGone { process_id }` (owner-keyed removal) and
+`ResourceFreed { class, id }` (identity-keyed removal). It SHALL NOT carry
+registration or configuration events. The runtime SHALL publish typed values
+encoded via `FlatMsg`, and the discovery guest SHALL subscribe to and decode them
+via `FlatMsg`.
 
-#### Scenario: Process-node registration round-trips over the feed
-- **WHEN** the runtime publishes a `DiscoveryRequest::Register` for a spawned process
-- **THEN** the discovery guest SHALL decode the same registration, preserving `uri`, `target`, and `owner`
-
-#### Scenario: Revoke-by-owner round-trips over the feed
-- **WHEN** the runtime publishes `DiscoveryRequest::RevokeByOwner { process_id }`
+#### Scenario: ProcessGone round-trips over the feed
+- **WHEN** the runtime publishes `DiscoveryRequest::ProcessGone { process_id }` for an exited process
 - **THEN** the feed SHALL carry the operation with its `process_id` intact
-- **AND** the discovery guest SHALL decode it as `RevokeByOwner` rather than another variant
+- **AND** discovery SHALL revoke the process's node and every owner-keyed registration
 
-#### Scenario: Revoke-by-resource round-trips over the feed
-- **WHEN** the runtime publishes `DiscoveryRequest::RevokeResource { class, id }` for a freed resource
+#### Scenario: ResourceFreed round-trips over the feed
+- **WHEN** the runtime publishes `DiscoveryRequest::ResourceFreed { class, id }` for a freed resource
 - **THEN** the discovery guest SHALL decode it and revoke the registration recorded for that resource identity
 
-#### Scenario: Host-authored handler registration round-trips
-- **WHEN** the runtime publishes a host-authored handler registration
-- **THEN** the discovery guest SHALL record the handler's owning process
-
-#### Scenario: Seed-domain round-trips over the feed
-- **WHEN** the runtime publishes `DiscoveryRequest::SeedDomain { domain, tenant }`
-- **THEN** the feed SHALL carry both `domain` and `tenant` intact to the discovery guest
+#### Scenario: No registration events on the feed
+- **WHEN** a resource is allocated or a process starts
+- **THEN** the runtime SHALL NOT publish a registration event; the owning guest publishes its own record
 
 #### Scenario: Feed is not rkyv-encoded
 - **WHEN** the runtime publishes to or the discovery guest reads from the Tier-1 feed

@@ -83,6 +83,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,

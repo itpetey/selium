@@ -14,7 +14,7 @@
 
 use anyhow::{Context as _, bail};
 use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
-use selium_guest::{Context, ResourceSender, entrypoint, info};
+use selium_guest::{Context, ResourceSender, entrypoint, error, info};
 use selium_service::{
     AccountantControl, AccountantControlResponse, ControlRequest, ControlResponse, IdentityRequest,
     IdentityResponse,
@@ -28,6 +28,10 @@ const ACCOUNTANT_ROUTE: &str = "sel:///accountant";
 const CONTROL_ROUTE: &str = "sel:///control";
 /// The served identity route.
 const IDENTITY_ROUTE: &str = "sel:///identity";
+/// How long a boot-time route lookup converges before failing. Owners publish
+/// their own routes from their entrypoints, so a peer that boots alongside them
+/// must retry rather than treat an early miss as permanent.
+const ROUTE_READY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 const LEAF_MANIFEST: &str = "acme-leaf";
 /// Manifest the post-restart leaf is published under.
 const LEAF_MANIFEST_AFTER_RESTART: &str = "acme-leaf-after-restart";
@@ -96,10 +100,9 @@ async fn control_client(
     ctx: &mut Context,
 ) -> anyhow::Result<rpc::OwnedRpcClient<ControlRequest, ControlResponse>> {
     let target = ctx
-        .lookup(CONTROL_ROUTE)
+        .resolve_ready(CONTROL_ROUTE, ROUTE_READY_BOUND)
         .await
-        .with_context(|| "identity-onboard: control route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: control route not found"))?;
+        .with_context(|| "identity-onboard: control route resolve failed")?;
     let sender = ResourceSender::attach(target.resource_id)
         .with_context(|| "identity-onboard: control listener attach failed")?;
     rpc::connect::<ControlRequest, ControlResponse, _>(sender, 4096, 4096)
@@ -113,10 +116,9 @@ async fn identity_client(
     ctx: &mut Context,
 ) -> anyhow::Result<rpc::OwnedRpcClient<IdentityRequest, IdentityResponse>> {
     let target = ctx
-        .lookup(IDENTITY_ROUTE)
+        .resolve_ready(IDENTITY_ROUTE, ROUTE_READY_BOUND)
         .await
-        .with_context(|| "identity-onboard: identity route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: identity route not found"))?;
+        .with_context(|| "identity-onboard: identity route resolve failed")?;
     let sender = ResourceSender::attach(target.resource_id)
         .with_context(|| "identity-onboard: identity listener attach failed")?;
     rpc::connect::<IdentityRequest, IdentityResponse, _>(sender, 4096, 4096)
@@ -167,31 +169,38 @@ async fn onboard(mut ctx: Context, spki: (u64, u64), mode: u64) -> anyhow::Resul
     drop(selium_guest::log::init());
     info!("identity-onboard: started");
 
-    let mut client = identity_client(&mut ctx).await?;
+    let result = run_mode(&mut ctx, spki, mode).await;
+    if let Err(error) = &result {
+        error!("identity-onboard: mode {mode} failed: {error:#}");
+    }
+    result
+}
+
+/// Runs one operator leg. Only the identity-facing legs connect to the identity
+/// guest; deploy, verify, and quota talk to the control plane and accountant, so
+/// they must not depend on identity being resolvable.
+async fn run_mode(ctx: &mut Context, spki: (u64, u64), mode: u64) -> anyhow::Result<()> {
     match mode {
         MODE_ONBOARD => {
+            let mut client = identity_client(ctx).await?;
             // SAFETY: the runtime wrote the client SPKI into this guest's
             // linear memory for this entrypoint invocation.
             let spki_der = unsafe { selium_guest::args::bytes(spki.0, spki.1) }.to_vec();
-            onboard_acme(&mut ctx, &mut client, spki_der).await?;
+            onboard_acme(ctx, &mut client, spki_der).await?;
             info!("identity-onboard: {TENANT} onboarded and client certificate issued");
         }
         MODE_ISSUE => {
+            let mut client = identity_client(ctx).await?;
             // SAFETY: the runtime wrote the client SPKI into this guest's
             // linear memory for this entrypoint invocation.
             let spki_der = unsafe { selium_guest::args::bytes(spki.0, spki.1) }.to_vec();
-            issue_leaf_after_restart(&mut ctx, &mut client, spki_der).await?;
+            issue_leaf_after_restart(ctx, &mut client, spki_der).await?;
         }
-        MODE_DEPLOY => {
-            upload_and_deploy(&mut ctx).await?;
-        }
-        MODE_VERIFY_DEPLOYMENT => {
-            verify_deployment(&mut ctx).await?;
-        }
-        MODE_SET_QUOTA => {
-            set_process_quota(&mut ctx).await?;
-        }
+        MODE_DEPLOY => upload_and_deploy(ctx).await?,
+        MODE_VERIFY_DEPLOYMENT => verify_deployment(ctx).await?,
+        MODE_SET_QUOTA => set_process_quota(ctx).await?,
         MODE_REVOKE => {
+            let mut client = identity_client(ctx).await?;
             let revoked = client
                 .request(IdentityRequest::RevokeTenant {
                     tenant: TENANT.to_string(),
@@ -277,10 +286,9 @@ async fn onboard_acme(
 /// ceiling.
 async fn set_process_quota(ctx: &mut Context) -> anyhow::Result<()> {
     let target = ctx
-        .lookup(ACCOUNTANT_ROUTE)
+        .resolve_ready(ACCOUNTANT_ROUTE, ROUTE_READY_BOUND)
         .await
-        .with_context(|| "identity-onboard: accountant route resolve failed")?
-        .ok_or_else(|| anyhow::anyhow!("identity-onboard: accountant route not found"))?;
+        .with_context(|| "identity-onboard: accountant route resolve failed")?;
     let sender = ResourceSender::attach(target.resource_id)
         .with_context(|| "identity-onboard: accountant listener attach failed")?;
     let mut client =

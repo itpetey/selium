@@ -129,9 +129,23 @@ pub fn process_capability(
     process_id: selium_abi::ProcessId,
     capability: selium_abi::Capability,
 ) -> Result<bool> {
+    process_capability_for_uri(process_id, capability, None)
+}
+
+/// Returns whether `process_id` holds `capability` in the scope of `uri`.
+///
+/// A `RouteClaim` names its reserved URI through `ResourceSelector::Uri`, so
+/// the probe must evaluate the grant in that URI's scope; the runtime includes
+/// `uri` in the `ScopeContext`.
+pub fn process_capability_for_uri(
+    process_id: selium_abi::ProcessId,
+    capability: selium_abi::Capability,
+    uri: Option<String>,
+) -> Result<bool> {
     match hostcall_ready(HostcallRequest::ProcessCapability {
         process_id,
         capability,
+        uri,
     })? {
         HostcallOutput::U64(value) => Ok(value != 0),
         other => Err(GuestError::Host(format!(
@@ -140,26 +154,49 @@ pub fn process_capability(
     }
 }
 
-/// Whether `process_id` owns the resource named by `class` and `resource_id`.
+/// The authoritative ownership answer for `(class, resource_id)`.
 ///
-/// Answers from the host's ownership records, which are updated synchronously
+/// Answers from the host's mint-time records, which are updated synchronously
 /// as the host mints a resource. A guest cannot reconstruct that reliably from
 /// a pushed feed — the feed can lag a resource the caller has only just
 /// created — so this is the question to ask before admitting anything that
 /// depends on ownership.
-pub fn process_owns_resource(
+pub fn resource_authority(
     process_id: selium_abi::ProcessId,
     class: selium_abi::ResourceClass,
     resource_id: u64,
-) -> Result<bool> {
+) -> Result<selium_abi::ResourceAuthority> {
     match hostcall_ready(HostcallRequest::ProcessOwnsResource {
         process_id,
         resource_class: class,
         resource_id,
     })? {
-        HostcallOutput::U64(value) => Ok(value != 0),
+        HostcallOutput::ResourceAuthority(authority) => Ok(authority),
         other => Err(GuestError::Host(format!(
             "unexpected hostcall output for ProcessOwnsResource: {other:?}"
+        ))),
+    }
+}
+
+/// The exact reserved URIs the host expects this process to publish.
+pub fn expected_claims(process_id: selium_abi::ProcessId) -> Result<Vec<String>> {
+    match hostcall_ready(HostcallRequest::ExpectedClaims { process_id })? {
+        HostcallOutput::Claims(claims) => Ok(claims),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ExpectedClaims: {other:?}"
+        ))),
+    }
+}
+
+/// The live processes the host retains authority for.
+///
+/// Gated by `ProcessProbe`; used by a registry to reconcile expected claims
+/// against published registrations.
+pub fn process_list() -> Result<Vec<selium_abi::ProcessId>> {
+    match hostcall_ready(HostcallRequest::ProcessList)? {
+        HostcallOutput::Processes(processes) => Ok(processes),
+        other => Err(GuestError::Host(format!(
+            "unexpected hostcall output for ProcessList: {other:?}"
         ))),
     }
 }

@@ -51,14 +51,16 @@ table DomainEntry {
 ///   2 = ResolveLabels { key, value }
 ///   3 = Register { uri, target, owner, root_service }
 ///   4 = Revoke { uri }
-///   5 = RevokeByOwner { process_id }
-///   6 = SeedDomain { domain, tenant }
 ///   7 = ListDomains
-///   8 = RevokeResource { class, id }
 ///   9 = Renew { uri }
 ///  10 = SetHealth { name, healthy }
-///  11 = RegisterHandler { scheme, process_id }
 ///  12 = SetDomain { domain, tenant }
+///  13 = ProcessGone { process_id }
+///  14 = ResourceFreed { class, id }
+///
+/// Tags 5, 6, 8, and 11 are retired (`RevokeByOwner`, `SeedDomain`,
+/// `RevokeResource`, `RegisterHandler`) and are left as gaps: strict decode
+/// rejects them rather than mapping an old message onto a surviving variant.
 table DiscoveryRequest {
     /// Variant discriminator.
     variant: ubyte;
@@ -72,25 +74,22 @@ table DiscoveryRequest {
     target: ResourceTarget;
     /// Marks the registration as the tenant's root service (Register variant).
     root_service: bool;
-    /// Owning process for a Tier-1 registration (Register variant); 0 = None.
+    /// Owning process hint (Register variant); 0 = None.
     owner: ulong;
-    /// Process whose owner-keyed registrations are revoked (RevokeByOwner variant).
+    /// Process whose owner-keyed registrations are revoked (ProcessGone variant).
     process_id: ulong;
-    /// Domain to seed (SeedDomain variant).
+    /// Domain to set (SetDomain variant).
     domain: string;
-    /// Tenant the domain maps to (SeedDomain variant).
+    /// Tenant the domain maps to (SetDomain variant).
     tenant: string;
-    /// Resource class segment of the resource whose registration is revoked
-    /// (RevokeResource variant).
+    /// Resource class segment of the freed resource (ResourceFreed variant).
     class: string;
-    /// Resource id whose registration is revoked (RevokeResource variant).
+    /// Resource id of the freed resource (ResourceFreed variant).
     id: ulong;
     /// Health record name (SetHealth variant).
     name: string;
     /// Whether the guest is healthy (SetHealth variant).
     healthy: bool;
-    /// Protocol scheme (RegisterHandler variant).
-    scheme: string;
 }
 
 /// Discovery response message.
@@ -103,6 +102,7 @@ table DiscoveryRequest {
 ///   4 = Revoked
 ///   5 = Forbidden
 ///   6 = Domains(domains)
+///   7 = Conflict
 table DiscoveryResponse {
     /// Variant discriminator.
     variant: ubyte;

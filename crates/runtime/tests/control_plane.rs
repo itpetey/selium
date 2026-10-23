@@ -181,7 +181,10 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///control".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: false,
@@ -209,7 +212,6 @@ fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
                 Capability::HostQueue,
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
-            CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
         ],
         tenant: None,
         discovery_service: false,
@@ -241,6 +243,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             // registrations under a bootstrap-provisioned authority, not a
             // privileged guest identity.
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,

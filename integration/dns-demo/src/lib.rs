@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{Context as _, bail};
+use anyhow::bail;
 use selium_guest::{Context, TcpStream, entrypoint, error, info};
 
 /// The name the demo resolves.
@@ -28,9 +28,13 @@ async fn resolve_demo(mut ctx: Context, connect: (u64, u64)) -> anyhow::Result<(
     info!("dns-demo: booting");
 
     // Resolve the name through the DNS connector route in discovery.
-    let addresses = selium_guest::net::resolve(&mut ctx, DEMO_NAME)
-        .await
-        .with_context(|| "dns-demo: resolve failed")?;
+    let addresses = match selium_guest::net::resolve(&mut ctx, DEMO_NAME).await {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            error!("dns-demo: resolve failed: {error:#}");
+            return Err(error.into());
+        }
+    };
 
     for address in &addresses {
         info!("resolved {} -> {}", DEMO_NAME, address);

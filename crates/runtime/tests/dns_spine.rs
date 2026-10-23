@@ -4,7 +4,7 @@
 //! `selium-dns-demo` WASM guests against a loopback fake DNS resolver and
 //! asserts the resolution data path end-to-end: the connector creates its own
 //! listener and self-registers the `dns/resolve` route (under its
-//! system-registration grant), and the demo guest resolves `example.test`
+//! host-issued route claim), and the demo guest resolves `example.test`
 //! through discovery (lookup `dns/resolve` → typed `DnsQuery` → UDP/53 →
 //! typed `DnsResponse`) and then connects to the resolved literal.
 //!
@@ -47,7 +47,10 @@ fn connector_descriptor(module_bytes: Vec<u8>, resolver: String) -> SystemGuestD
                 vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
             ),
             // Self-registration in the root namespace requires the capability.
-            CapabilityGrant::new(Capability::SystemRegistration, vec![]),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///dns/resolve".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: false,
@@ -114,6 +117,10 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
             // registrations under a bootstrap-provisioned authority, not a
             // privileged guest identity.
             CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
         ],
         tenant: None,
         discovery_service: true,
@@ -126,11 +133,10 @@ fn discovery_wasm() -> Vec<u8> {
 }
 
 fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .kernel()
-        .processes()
-        .drain_log_channel(process_id)
-        .expect("drain log channel")
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        return Vec::new();
+    };
+    frames
         .iter()
         .map(|frame| {
             selium_service::log::LogRecord::decode(frame)

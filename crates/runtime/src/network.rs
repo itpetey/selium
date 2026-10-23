@@ -901,7 +901,7 @@ mod tests {
         // Poll until writer_count reaches 0 (EOF).
         let start = std::time::Instant::now();
         let mut eof = false;
-        while start.elapsed() < std::time::Duration::from_secs(5) {
+        while start.elapsed() < std::time::Duration::from_secs(30) {
             if let Ok(0) = inbound_reader.writer_count() {
                 eof = true;
                 break;

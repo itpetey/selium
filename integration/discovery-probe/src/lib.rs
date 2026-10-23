@@ -38,8 +38,9 @@ async fn discovery_probe(mut ctx: Context, route: (u64, u64), mode: u64) -> anyh
         ROLE_REGION => {
             info!(guest = "discovery-probe", "booting");
 
-            // Allocate a shared-memory channel — the runtime publishes Tier-1
-            // registration events on the discovery feed for this region.
+            // Allocate a shared-memory channel. The host records its authority
+            // synchronously; the owner (not the runtime) publishes any
+            // registration for it.
             let channel = Channel::create(PROBE_CHANNEL_CAPACITY, ChannelBackpressure::Park)?;
             info!(region_id = channel.region_id(), "probe: region allocated");
 

@@ -14,7 +14,7 @@
 //!   `example.com -> acme`).
 //!
 //! The root tenant (`sel:///…`) is reserved: a guest registers inside it only
-//! with the system-registration capability.
+//! under an exact host-issued route claim.
 //!
 //! This module is the single source of truth for these rules, shared by the
 //! runtime (URI generation), the discovery guest (validation and unified wire

@@ -65,6 +65,28 @@ cargo test -p selium-guest
 - **International English only** - Do not use American English anywhere in the project unless required for calling third party APIs.
 - **WASM page size is 64 KiB** - `WASM_PAGE_SIZE` (65536) is the page unit for region offsets; `RING_HEADER_SIZE` (4096) is the ring coordination-header layout constant. Never conflate them.
 
+## Agent tooling
+
+`opencode.json` wires the `rust-analyzer` MCP server (install with
+`cargo install rust-analyzer-mcp`; requires the `rustup component add rust-analyzer`
+component). It is for **navigation only**.
+
+- Use it for go-to-definition, find-references, hover, and document symbols. It resolves
+  across crates with symbol identity, which `grep` cannot distinguish from a same-named
+  local.
+- **Do not trust its diagnostics.** They disagree with rustc on this workspace: it reports
+  a spurious `E0277` (`NonNull<()>: Send`) at `guests/store/src/lib.rs:300`, while
+  `cargo check --workspace` and `cargo check -p selium-store --all-targets` both pass
+  clean. Its messages leak rust-analyzer-internal lifetimes (e.g. `'<erased>`), which is
+  the tell that the error came from its own trait solver rather than from the compiler.
+  `cargo check` and `cargo clippy` remain authoritative.
+- The workspace takes about 30 seconds to index. Until it finishes, definition and
+  reference queries return empty instead of failing, so retry an empty result before
+  concluding a symbol is unused.
+- rust-analyzer analyses the host target, so `#[cfg(target_arch = "wasm32")]` code is
+  reported as inactive and gets no semantic help. Guest-only regions still require a
+  `wasm32-unknown-unknown` build to validate.
+
 ## Code Style
 
 ### Formatting
@@ -154,4 +176,3 @@ pub type Result<T> = std::result::Result<T, Error>;
 - Guest I/O is shared-memory-first; hostcalls are for control, not data.
 - `AttachRegion` maps regions into the **calling guest's own memory** (via `HostCaller`), so guests can attach mid-entrypoint.
 - **Ring protocol single-writer-domain rule**: the ring protocol (`selium-shm::layout`) is defined once and consumed by both guest-side and host-side code. Each ring MUST be single-writer-domain: all writers on a given ring operate within the same atomicity domain (guest hardware atomics OR host mutex-mediated atomics, never mixed). Mixed-domain writes are out-of-contract and may corrupt data. Readers may cross domains safely. This is asserted in debug builds where a domain tag is available.
-```

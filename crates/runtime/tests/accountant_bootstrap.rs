@@ -6,7 +6,7 @@
 //! - the bookkeeper and accountant grant sets (`selium_accountant::bookkeeper_grants()`,
 //!   `accountant_grants()`) are admissible at bootstrap, carrying the
 //!   bookkeeper's `MeteringRead`/`ActivityRead` and the accountant's
-//!   `QuotaWrite`/`Storage`/`SystemRegistration`;
+//!   `QuotaWrite`/`Storage`/route claims;
 //! - both entrypoints boot from the **same module bytes** (one module, two
 //!   descriptors — design decision 1);
 //! - the runtime honours the dependency order (bookkeeper before accountant)
@@ -23,7 +23,7 @@ use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 
 /// 7.1: the accountant guest's grant set is admissible at bootstrap, carrying
 /// `QuotaWrite` (bootstrap-provisioned only), durable-log storage, and the
-/// system-registration grant for the root-namespace routes it serves.
+/// route claims for the root-namespace routes it serves.
 #[test]
 fn accountant_descriptor_grants_are_bootstrap_admissible() {
     let runtime = Runtime::default();
@@ -59,7 +59,7 @@ fn accountant_descriptor_grants_are_bootstrap_admissible() {
         authority
             .grants
             .iter()
-            .any(|grant| grant.capability == Capability::SystemRegistration)
+            .any(|grant| grant.capability == Capability::RouteClaim)
     );
 }
 

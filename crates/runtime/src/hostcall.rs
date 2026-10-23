@@ -10,7 +10,7 @@ use selium_abi::{
     ProcessId, ResourceClass, ResourceIdentity, ResourceSelector, ScopeContext, SharedResourceId,
     TaskId, VolumeDescriptor,
 };
-use selium_service::{DiscoveryRequest, FlatMsg, ResourceTarget, log::LogRecord};
+use selium_service::{DiscoveryRequest, FlatMsg, log::LogRecord};
 use wasmtiny::{RegionProt as WasmProt, runtime::SharedMemory};
 
 use crate::{SystemGuestDescriptor, error::kernel_error, runtime::Runtime};
@@ -322,6 +322,12 @@ impl Runtime {
                 let page_offset = 0;
 
                 self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
+                // Mint-time authority: record the principal tenant
+                // synchronously, so admission and canonical publication never
+                // depend on a projected registration.
+                self.resource_tenants
+                    .lock()
+                    .insert((ResourceClass::SharedRegion, shared_id), principal.clone());
 
                 // Record which ledger the reservation was charged against, so the
                 // release path credits the serving tenant rather than
@@ -332,30 +338,6 @@ impl Runtime {
                     &principal,
                     size_bytes,
                 );
-
-                // Tier-1 discovery registration: one canonical typed URI.
-                let uri = crate::discovery::region_registration_uri(&principal, shared_id);
-                let target = ResourceTarget {
-                    uri: uri.clone(),
-                    host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
-                    resource_id: shared_id,
-                    interface: None,
-                    tenant: (!principal.is_empty()).then_some(principal.clone()),
-                    class: ResourceClass::SharedRegion,
-                    labels: Vec::new(),
-                };
-                let request = DiscoveryRequest::Register {
-                    uri,
-                    target,
-                    owner: Some(process_id),
-                    root_service: false,
-                };
-                if let Err(error) = self.publish_discovery_event(request) {
-                    return Err(AbiError::new(
-                        AbiErrorCode::Internal,
-                        format!("discovery publish failed: {error}"),
-                    ));
-                }
 
                 Ok(HostOperationState::Ready(HostcallOutput::RegionAlloc(
                     selium_abi::RegionAllocation {
@@ -445,7 +427,7 @@ impl Runtime {
                 // registry recorded the region's tenant at registration and
                 // revokes under it, so a cross-tenant mint is revoked under the
                 // tenant it was minted for.
-                let request = DiscoveryRequest::RevokeResource {
+                let request = DiscoveryRequest::ResourceFreed {
                     class: ResourceClass::SharedRegion.uri_segment().to_string(),
                     id: region_id,
                 };
@@ -455,6 +437,9 @@ impl Runtime {
                         format!("discovery publish failed: {error}"),
                     ));
                 }
+                self.resource_tenants
+                    .lock()
+                    .remove(&(ResourceClass::SharedRegion, region_id));
 
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
@@ -720,6 +705,10 @@ impl Runtime {
                     .open((!principal.is_empty()).then_some(principal.as_str()), &name)
                     .map_err(kernel_error)?;
                 self.claim_local_handle(process_id, ResourceClass::Volume, descriptor.local_id);
+                self.resource_tenants.lock().insert(
+                    (ResourceClass::Volume, descriptor.local_id),
+                    principal.clone(),
+                );
                 self.volume_tenants
                     .lock()
                     .insert((process_id, descriptor.local_id), principal);
@@ -833,6 +822,9 @@ impl Runtime {
                     .map_err(kernel_error)?;
                 self.release_local_handle(process_id, &ResourceClass::Volume, local_id);
                 self.volume_tenants.lock().remove(&(process_id, local_id));
+                self.resource_tenants
+                    .lock()
+                    .remove(&(ResourceClass::Volume, local_id));
                 Ok(HostOperationState::Ready(HostcallOutput::Empty))
             }
             HostcallRequest::VolumeUsage { tenant } => {
@@ -1041,34 +1033,10 @@ impl Runtime {
                     ResourceClass::HostQueue,
                     descriptor.shared_id,
                 );
-                // Tier-1 registration: queues are first-class resources so a
-                // guest can register an external route whose target is its
-                // listener queue and still pass discovery's ownership
-                // validation. Registered under the principal tenant and
-                // revoked on process teardown.
-                let uri =
-                    crate::discovery::queue_registration_uri(&principal, descriptor.shared_id);
-                let target = ResourceTarget {
-                    uri: uri.clone(),
-                    host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
-                    resource_id: descriptor.shared_id,
-                    interface: None,
-                    tenant: (!principal.is_empty()).then_some(principal.clone()),
-                    class: ResourceClass::HostQueue,
-                    labels: Vec::new(),
-                };
-                let request = DiscoveryRequest::Register {
-                    uri,
-                    target,
-                    owner: Some(process_id),
-                    root_service: false,
-                };
-                if let Err(error) = self.publish_discovery_event(request) {
-                    return Err(AbiError::new(
-                        AbiErrorCode::Internal,
-                        format!("discovery publish failed: {error}"),
-                    ));
-                }
+                self.resource_tenants.lock().insert(
+                    (ResourceClass::HostQueue, descriptor.shared_id),
+                    principal.clone(),
+                );
                 Ok(HostOperationState::Ready(HostcallOutput::HostQueue(
                     descriptor,
                 )))
@@ -1262,6 +1230,28 @@ impl Runtime {
                 process_id,
                 tenant: self.process_tenant(process_id),
             })),
+            HostcallRequest::ExpectedClaims { process_id: target } => {
+                // A guest may always see its own expectation; another
+                // process's expectation is registry state and requires the
+                // bootstrap-provisioned probe authority.
+                if target != process_id {
+                    self.require_capability(process_id, Capability::ProcessProbe)?;
+                }
+                Ok(HostOperationState::Ready(HostcallOutput::Claims(
+                    self.expected_claims(target),
+                )))
+            }
+            HostcallRequest::ProcessList => {
+                // Process membership is registry state: only the
+                // bootstrap-provisioned probe authority may enumerate it.
+                self.require_capability(process_id, Capability::ProcessProbe)?;
+                let mut processes: Vec<ProcessId> =
+                    self.process_authorities.lock().keys().copied().collect();
+                processes.sort_unstable();
+                Ok(HostOperationState::Ready(HostcallOutput::Processes(
+                    processes,
+                )))
+            }
             HostcallRequest::ProcessTenant { process_id } => Ok(HostOperationState::Ready(
                 HostcallOutput::Tenant(self.process_tenant(process_id)),
             )),
@@ -1276,23 +1266,18 @@ impl Runtime {
                 // process owns as itself). The host records into both
                 // synchronously as it mints a resource, so this answer cannot
                 // lag a resource the caller has only just created.
-                let owns = self
-                    .shared_resource_owners
-                    .lock()
-                    .get(&(resource_class.clone(), resource_id))
-                    .is_some_and(|owners| owners.contains(&owner))
-                    || self
-                        .local_handle_owners
-                        .lock()
-                        .get(&(resource_class, resource_id))
-                        .is_some_and(|owners| owners.contains(&owner));
-                Ok(HostOperationState::Ready(HostcallOutput::U64(u64::from(
-                    owns,
-                ))))
+                Ok(HostOperationState::Ready(
+                    HostcallOutput::ResourceAuthority(self.resource_authority(
+                        owner,
+                        resource_class,
+                        resource_id,
+                    )),
+                ))
             }
             HostcallRequest::ProcessCapability {
                 process_id: target_process_id,
                 capability,
+                uri,
             } => {
                 // Gated by the bootstrap-provisioned `ProcessProbe` authority
                 // rather than by any guest identity: a registry implementation
@@ -1302,10 +1287,11 @@ impl Runtime {
                 // grant is held *within that tenant*, so evaluating against an
                 // empty context would report "not held" for a grant the target
                 // genuinely holds. The probe still discloses nothing beyond
-                // the capability asked for — only the target's own tenant is
-                // used, and only as the scope to evaluate in.
+                // the capability asked for — only the target's own tenant and
+                // the URI it asks about are used, and only as evaluation scope.
                 let scope = ScopeContext {
                     tenant: self.process_tenant(target_process_id),
+                    uri,
                     ..ScopeContext::default()
                 };
                 let held = self.authorises(target_process_id, capability, &scope);
@@ -2032,6 +2018,19 @@ impl Runtime {
             ));
         }
 
+        // A route claim is non-delegable: only the host may designate the
+        // process that owns a reserved name, so a parent can never confer
+        // (and thereby duplicate) a claim on a child.
+        if grants
+            .iter()
+            .any(|grant| grant.capability == Capability::RouteClaim)
+        {
+            return Err(AbiError::new(
+                AbiErrorCode::PermissionDenied,
+                "RouteClaim cannot be conferred on child processes",
+            ));
+        }
+
         // Tenant-scoped grant delegation: a parent holding a
         // `DelegateGrants` grant with a tenant or root namespace selector may
         // confer child grants it does not itself hold, provided **every**
@@ -2202,7 +2201,28 @@ fn parent_grant_covers_child(parent: &CapabilityGrant, child: &CapabilityGrant) 
             })
         }
         ResourceSelector::UriPrefix(parent_prefix) => child.selectors.iter().any(|selector| {
-            matches!(selector, ResourceSelector::UriPrefix(child_prefix) if child_prefix.starts_with(parent_prefix))
+            match selector {
+                ResourceSelector::UriPrefix(child_prefix) | ResourceSelector::Uri(child_prefix) => {
+                    // Evaluate the parent with the same canonical, segment-aware
+                    // matcher used at enforcement time, so delegation coverage
+                    // cannot admit a child grant the parent would not match.
+                    ResourceSelector::UriPrefix(parent_prefix.clone()).matches(&ScopeContext {
+                        uri: Some(child_prefix.clone()),
+                        ..ScopeContext::default()
+                    })
+                }
+                _ => false,
+            }
+        }),
+        ResourceSelector::Uri(parent_uri) => child.selectors.iter().any(|selector| {
+            match selector {
+                ResourceSelector::Uri(child_uri) => ResourceSelector::Uri(parent_uri.clone())
+                    .matches(&ScopeContext {
+                        uri: Some(child_uri.clone()),
+                        ..ScopeContext::default()
+                    }),
+                _ => false,
+            }
         }),
         ResourceSelector::Locality(parent_locality) => child.selectors.iter().any(|selector| {
             matches!(selector, ResourceSelector::Locality(child_locality) if parent_locality.matches(child_locality))
@@ -3555,6 +3575,89 @@ mod tests {
             runtime.poll_hostcall(parent.process_id, op),
             CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn route_claim_cannot_be_conferred_on_children() {
+        let runtime = Runtime::default();
+        let parent = spawn_with_grants_and_tenant(
+            &runtime,
+            "claim-holder",
+            vec![
+                CapabilityGrant::new(
+                    Capability::ProcessLifecycle,
+                    vec![ResourceSelector::ResourceClass(ResourceClass::Process)],
+                ),
+                CapabilityGrant::new(
+                    Capability::RouteClaim,
+                    vec![ResourceSelector::Uri("sel:///control".to_string())],
+                ),
+            ],
+            None,
+        );
+
+        let (status, op) = runtime.begin_hostcall(
+            parent.process_id,
+            HostcallRequest::ProcessStart {
+                source: selium_abi::ModuleSource::Inline(module_with_entrypoint("main", "")),
+                entrypoint: "main".to_string(),
+                arguments: Vec::new(),
+                grants: vec![CapabilityGrant::new(
+                    Capability::RouteClaim,
+                    vec![ResourceSelector::Uri("sel:///control".to_string())],
+                )],
+                tenant: None,
+            },
+        );
+        assert_eq!(
+            status,
+            selium_abi::HOSTCALL_STATUS_FAILED,
+            "RouteClaim is non-delegable"
+        );
+        assert!(matches!(
+            runtime.poll_hostcall(parent.process_id, op),
+            CompletionState::Failed(error) if error.code == AbiErrorCode::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn route_claim_requires_one_exact_root_uri() {
+        let runtime = Runtime::default();
+        let descriptor = |capability: CapabilityGrant| SystemGuestDescriptor {
+            name: "claim-guest".to_string(),
+            module_id: "claim-guest-module".to_string(),
+            module_bytes: module_with_entrypoint("boot", ""),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![capability],
+            tenant: None,
+            discovery_service: false,
+            handlers: Vec::new(),
+        };
+
+        // Selector-less: vacuously claims every name.
+        let selectorless = runtime.spawn_system_guest(descriptor(CapabilityGrant::new(
+            Capability::RouteClaim,
+            Vec::new(),
+        )));
+        assert!(selectorless.is_err(), "a selector-less claim is invalid");
+
+        // Tenant-scoped: claims are root well-known names only.
+        let tenant_scoped = runtime.spawn_system_guest(descriptor(CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri("sel://acme/control".to_string())],
+        )));
+        assert!(
+            tenant_scoped.is_err(),
+            "a claim outside the root namespace is invalid"
+        );
+
+        // One exact root URI: admitted.
+        let admitted = runtime.spawn_system_guest(descriptor(CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri("sel:///control".to_string())],
+        )));
+        admitted.expect("bootstrap claim admitted");
     }
 
     #[test]
@@ -5233,7 +5336,8 @@ mod tests {
             guest.process_id,
             HostcallRequest::ProcessCapability {
                 process_id: guest.process_id,
-                capability: Capability::SystemRegistration,
+                capability: Capability::ActivityRead,
+                uri: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
@@ -5253,7 +5357,8 @@ mod tests {
             prober.process_id,
             HostcallRequest::ProcessCapability {
                 process_id: guest.process_id,
-                capability: Capability::SystemRegistration,
+                capability: Capability::ActivityRead,
+                uri: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -5261,6 +5366,38 @@ mod tests {
             runtime.poll_hostcall(prober.process_id, op),
             CompletionState::Ready(HostcallOutput::U64(0))
         ));
+    }
+
+    /// Process membership is registry state and is gated on the
+    /// bootstrap-provisioned probe authority, like capability probing.
+    #[test]
+    fn process_list_requires_the_probe_authority() {
+        let runtime = Runtime::default();
+        let guest = spawn_with_grants(&runtime, Vec::new());
+
+        let (status, op) = runtime.begin_hostcall(guest.process_id, HostcallRequest::ProcessList);
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_FAILED);
+        match runtime.poll_hostcall(guest.process_id, op) {
+            CompletionState::Failed(error) => {
+                assert_eq!(error.code, AbiErrorCode::PermissionDenied);
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+
+        let prober = spawn_with_grants(
+            &runtime,
+            vec![CapabilityGrant::new(Capability::ProcessProbe, Vec::new())],
+        );
+        let (status, op) = runtime.begin_hostcall(prober.process_id, HostcallRequest::ProcessList);
+        assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
+        let CompletionState::Ready(HostcallOutput::Processes(processes)) =
+            runtime.poll_hostcall(prober.process_id, op)
+        else {
+            panic!("expected Processes output");
+        };
+        assert!(processes.contains(&guest.process_id));
+        assert!(processes.contains(&prober.process_id));
+        assert!(processes.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     /// A probe answers truthfully for a tenant-scoped grant: the target holds it
@@ -5273,7 +5410,7 @@ mod tests {
             &runtime,
             "tenant-scoped",
             vec![CapabilityGrant::new(
-                Capability::SystemRegistration,
+                Capability::ActivityRead,
                 vec![ResourceSelector::Tenant("acme".to_string())],
             )],
             Some("acme"),
@@ -5287,7 +5424,8 @@ mod tests {
             prober.process_id,
             HostcallRequest::ProcessCapability {
                 process_id: tenant_guest.process_id,
-                capability: Capability::SystemRegistration,
+                capability: Capability::ActivityRead,
+                uri: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);
@@ -5306,6 +5444,7 @@ mod tests {
             HostcallRequest::ProcessCapability {
                 process_id: tenant_guest.process_id,
                 capability: Capability::MintCertificate,
+                uri: None,
             },
         );
         assert_eq!(status, selium_abi::HOSTCALL_STATUS_READY);

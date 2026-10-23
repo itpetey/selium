@@ -52,8 +52,9 @@ use selium_service::{ControlRequest, ControlResponse, DelegationStatus, Deployme
 use spine_common::{
     CONNECTOR_ADDR, CONTROL_URI, SCHEDULER_DEFERRED, SpinePortGuard, StateRoot,
     bridge_server_descriptor, client_options, connector_descriptor, control_plane_descriptor,
-    discovery_descriptor, drain_logs, identity_descriptor, operator_descriptor, read_issued_leaf,
-    read_wasm, runtime_in_state_root, seed_tls_blob_store, store_descriptor, wait_for_logs,
+    discovery_descriptor, drain_logs_if_live, identity_descriptor, operator_descriptor,
+    read_issued_leaf, read_wasm, runtime_in_state_root, seed_tls_blob_store, store_descriptor,
+    wait_for_logs,
 };
 
 mod common;
@@ -160,7 +161,16 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
             ("quic-connector: listening on", 1),
             ("rebuilt client anchor set", 1),
         ],
-        Duration::from_secs(30),
+        Duration::from_secs(120),
+    );
+
+    // The bridge publishes its route from its own entrypoint; a client that
+    // connects before that would be refused by the connector with "no route".
+    let _ = wait_for_logs(
+        &runtime,
+        bridge,
+        &[("bridge-server: route registered", 1)],
+        Duration::from_secs(120),
     );
 
     // Diagnostic collector mirrors the spine test's failure-path handling.
@@ -174,7 +184,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
                 for process_id in [connector, bridge, control_plane] {
-                    for message in drain_logs(&runtime, process_id) {
+                    for message in drain_logs_if_live(&runtime, process_id) {
                         collected
                             .lock()
                             .expect("collector lock")
@@ -224,7 +234,11 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
 
     let opening = client.rpc::<ControlRequest, ControlResponse>(CONTROL_URI);
     let mut rpc = match tokio::time::timeout(Duration::from_secs(120), opening).await {
-        Ok(result) => result.expect("control route channel open"),
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => panic!(
+            "control route channel open failed: {error}; state: {:#?}",
+            dump()
+        ),
         Err(_elapsed) => panic!("channel open timed out; state: {:#?}", dump()),
     };
 
@@ -387,7 +401,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         (control_plane, "control-plane"),
         (revoke_guest.process_id, "identity-onboard"),
     ] {
-        let logs = drain_logs(&runtime, process_id);
+        let logs = drain_logs_if_live(&runtime, process_id);
         // The refused post-revocation handshake is expected to log
         // incoming-connection and client-auth failures on the connector
         // ("no client trust anchors configured" — the empty rebuilt union
@@ -416,7 +430,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
     runtime.stop_process(bridge).expect("stop bridge-server");
     runtime.stop_process(connector).expect("stop connector");
     runtime.stop_process(identity).expect("stop identity");
-    runtime
-        .stop_process(revoke_guest.process_id)
-        .expect("stop revocation driver");
+    // The revocation driver is a one-shot guest: it completes and is reaped by
+    // the runtime, so there is nothing left to stop.
+    drop(revoke_guest);
 }

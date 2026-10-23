@@ -4,8 +4,8 @@
 //! integration test:
 //!
 //! - the identity guest's grant set (`selium_identity::identity_grants()`,
-//!   including `MintCertificate` plus `SystemRegistration` for its
-//!   root-namespace routes) is admissible at bootstrap;
+//!   including `MintCertificate` plus route claims for its root-namespace
+//!   routes) is admissible at bootstrap;
 //! - the host keyring initialises and is installed before identity runs;
 //! - the connector and bridge declare a dependency on identity, and the
 //!   runtime honours that dependency order even when the descriptor vector is
@@ -62,7 +62,7 @@ fn guests_boot_in_declaration_order() {
 
 /// 7.1: the identity guest's grant set is admissible at bootstrap, carrying
 /// the `MintCertificate` capability (bootstrap-provisioned only) plus the
-/// system-registration grant for its root-namespace routes.
+/// route claims for its root-namespace routes.
 #[test]
 fn identity_descriptor_grants_are_bootstrap_admissible() {
     let runtime = Runtime::default();
@@ -95,7 +95,7 @@ fn identity_descriptor_grants_are_bootstrap_admissible() {
         authority
             .grants
             .iter()
-            .any(|grant| grant.capability == Capability::SystemRegistration)
+            .any(|grant| grant.capability == Capability::RouteClaim)
     );
 }
 

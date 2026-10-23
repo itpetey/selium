@@ -351,8 +351,24 @@ pub fn identity_grants() -> Vec<CapabilityGrant> {
             Capability::HostQueue,
             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
         ),
-        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(IDENTITY_PATH))],
+        ),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(ANCHOR_TABLE_PATH))],
+        ),
+        CapabilityGrant::new(
+            Capability::RouteClaim,
+            vec![ResourceSelector::Uri(root_route(GRANT_TABLE_PATH))],
+        ),
     ]
+}
+
+/// The exact root route `path` names.
+fn root_route(path: &str) -> String {
+    format!("{}/{}", selium_abi::uri::SEL_PREFIX, path)
 }
 
 /// Builds one live table over its own `LiveTable` ring, returning the ring id
@@ -1197,6 +1213,6 @@ mod tests {
         assert!(has(Capability::Storage));
         assert!(has(Capability::SharedMemory));
         assert!(has(Capability::HostQueue));
-        assert!(has(Capability::SystemRegistration));
+        assert!(has(Capability::RouteClaim));
     }
 }

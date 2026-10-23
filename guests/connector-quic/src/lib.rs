@@ -470,7 +470,6 @@ async fn connector_quic_inner(mut ctx: Context) -> anyhow::Result<()> {
 
     let server_config = build_server_config(certs, key, anchors.as_ref())
         .with_context(|| "quic-connector: TLS config build failed")?;
-
     let local_addr: SocketAddr = QUIC_LISTEN_ADDR
         .parse()
         .with_context(|| "quic-connector: invalid listen address")?;

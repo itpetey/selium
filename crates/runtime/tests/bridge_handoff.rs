@@ -71,7 +71,10 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
                             Capability::DelegateGrants,
                             vec![ResourceSelector::Namespace(Namespace::Root)],
                         ),
-                        CapabilityGrant::new(Capability::SystemRegistration, Vec::new()),
+                        CapabilityGrant::new(
+                            Capability::RouteClaim,
+                            vec![ResourceSelector::Uri("sel:///bridge".to_string())],
+                        ),
                         CapabilityGrant::new(
                             Capability::HostQueue,
                             vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
@@ -96,7 +99,7 @@ fn bootstrap_connector_and_bridge() -> (Runtime, ProcessId, ProcessId) {
     let bridge_server = find("bridge-server").process_id;
 
     // Handler resolution is now a discovery lookup (the runtime publishes a
-    // host-authored handler registration on the Tier-1 feed); this substrate
+    // guest-published handler route under a host-issued claim); this substrate
     // test drives hostcalls directly, so the pin is exercised by the bridge
     // spine test rather than here.
 

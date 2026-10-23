@@ -75,7 +75,7 @@ async fn accept_loop(
 /// pointer argument (`(address, length)` over `udp://<resolver>:53` bytes),
 /// binds a raw UDP socket, creates its own listener queue, and self-registers
 /// the `dns/resolve` route in the root namespace — permitted only because the
-/// connector holds the system-registration capability.
+/// connector holds the host-issued claim for that exact name.
 #[entrypoint]
 async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result<()> {
     drop(selium_guest::log::init());
@@ -88,13 +88,15 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .with_context(|| "dns-connector: udp bind failed")?;
+    info!("dns-connector: udp bound");
 
     let listener =
         ResourceListener::create().with_context(|| "dns-connector: create listener failed")?;
+    info!("dns-connector: listener created");
 
     // Self-register the `dns/resolve` route under the root namespace. The
     // connector runs as the root/platform tenant, so this requires the
-    // system-registration capability (enforced by discovery).
+    // host-issued claim for that exact name (enforced by discovery).
     let target = ResourceTarget {
         uri: String::new(), // pinned by `serve` to the derived internal path
         host_id: String::new(),
@@ -111,6 +113,7 @@ async fn dns_connector(mut ctx: Context, resolver: (u64, u64)) -> anyhow::Result
     })
     .await
     .with_context(|| "dns-connector: serve failed")?;
+    info!("dns-connector: route registered");
 
     // Health is published state: advertise the DNS connector's health.
     if let Err(error) = ctx.publish_health("dns-connector").await {

@@ -70,6 +70,9 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
+        self.resource_tenants
+            .lock()
+            .remove(&(ResourceClass::Process, process_id));
         // An already-reaped process (retry after `cleanup_failed_process`)
         // reports NotFound; the kernel state is already reclaimed.
         if let Err(error) = self.kernel.processes().reap_process(process_id)
@@ -383,6 +386,13 @@ impl Runtime {
         tenant: Option<String>,
         parent: Option<ProcessId>,
     ) {
+        // A process is a resource the host minted: record its mint-time tenant
+        // synchronously so the authority read answers before the process has
+        // published its own node.
+        self.resource_tenants.lock().insert(
+            (ResourceClass::Process, process_id),
+            tenant.clone().unwrap_or_default(),
+        );
         self.process_authorities.lock().insert(
             process_id,
             ProcessAuthority {
@@ -392,6 +402,106 @@ impl Runtime {
                 resolved_resources: HashSet::new(),
             },
         );
+    }
+
+    /// Returns the exact reserved URIs the host provisioned `process_id` a
+    /// `RouteClaim` for.
+    ///
+    /// The host knows the expectation independently of discovery publication,
+    /// so a claimed name that was never published is observable as drift while
+    /// the process stays fully accounted.
+    pub fn expected_claims(&self, process_id: ProcessId) -> Vec<String> {
+        self.process_authorities
+            .lock()
+            .get(&process_id)
+            .map(|authority| {
+                authority
+                    .grants
+                    .iter()
+                    .filter(|grant| grant.capability == Capability::RouteClaim)
+                    .flat_map(|grant| {
+                        grant
+                            .selectors
+                            .iter()
+                            .filter_map(|selector| match selector {
+                                ResourceSelector::Uri(uri) => Some(uri.clone()),
+                                _ => None,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Answers the authoritative ownership question for `(class, id)` from the
+    /// host's mint-time records.
+    ///
+    /// When the queried class is not owned, the answer lists the classes the
+    /// process *does* own for the same id, so admission can distinguish a
+    /// class mismatch (a permission failure) from an identity the caller does
+    /// not own at all.
+    pub fn resource_authority(
+        &self,
+        process_id: ProcessId,
+        resource_class: ResourceClass,
+        resource_id: u64,
+    ) -> selium_abi::ResourceAuthority {
+        if !self.owns_under(process_id, &resource_class, resource_id) {
+            return selium_abi::ResourceAuthority {
+                owned: false,
+                tenant: None,
+                other_classes: self.classes_owned_for(process_id, resource_id),
+            };
+        }
+        let tenant = self
+            .resource_tenants
+            .lock()
+            .get(&(resource_class, resource_id))
+            .cloned()
+            .or_else(|| self.process_tenant(process_id))
+            .or_else(|| Some(String::new()));
+        selium_abi::ResourceAuthority {
+            owned: true,
+            tenant,
+            other_classes: Vec::new(),
+        }
+    }
+
+    fn owns_under(
+        &self,
+        process_id: ProcessId,
+        resource_class: &ResourceClass,
+        resource_id: u64,
+    ) -> bool {
+        self.shared_resource_owners
+            .lock()
+            .get(&(resource_class.clone(), resource_id))
+            .is_some_and(|owners| owners.contains(&process_id))
+            || self
+                .local_handle_owners
+                .lock()
+                .get(&(resource_class.clone(), resource_id))
+                .is_some_and(|owners| owners.contains(&process_id))
+    }
+
+    fn classes_owned_for(&self, process_id: ProcessId, resource_id: u64) -> Vec<ResourceClass> {
+        let mut classes: Vec<ResourceClass> = self
+            .shared_resource_owners
+            .lock()
+            .iter()
+            .filter(|((_, id), owners)| *id == resource_id && owners.contains(&process_id))
+            .map(|((class, _), _)| class.clone())
+            .collect();
+        classes.extend(
+            self.local_handle_owners
+                .lock()
+                .iter()
+                .filter(|((_, id), owners)| *id == resource_id && owners.contains(&process_id))
+                .map(|((class, _), _)| class.clone()),
+        );
+        classes.sort_by_key(ResourceClass::uri_segment);
+        classes.dedup();
+        classes
     }
 
     /// Returns the tenant identity assigned to a process, if any.
@@ -426,6 +536,25 @@ impl Runtime {
                 })
             {
                 return Err(Error::InvalidGrant(grant.capability.clone()));
+            }
+            // A route claim grants one exact reserved name. A selector-less
+            // grant would be vacuous, a multi-URI grant unsatisfiable under
+            // intersection semantics, and a non-`Uri` selector could never be
+            // evaluated as a name.
+            if grant.capability == Capability::RouteClaim {
+                let mut uris = grant
+                    .selectors
+                    .iter()
+                    .filter_map(|selector| match selector {
+                        ResourceSelector::Uri(uri) => Some(uri),
+                        _ => None,
+                    });
+                let (Some(uri), None) = (uris.next(), uris.next()) else {
+                    return Err(Error::InvalidGrant(grant.capability.clone()));
+                };
+                if grant.selectors.len() != 1 || !selium_abi::uri::is_root_uri(uri) {
+                    return Err(Error::InvalidGrant(grant.capability.clone()));
+                }
             }
             for selector in &grant.selectors {
                 if !selector.is_evaluatable(&grant.selectors) {
@@ -480,6 +609,9 @@ impl Runtime {
         self.local_handle_owners
             .lock()
             .remove(&(ResourceClass::Process, process_id));
+        self.resource_tenants
+            .lock()
+            .remove(&(ResourceClass::Process, process_id));
         // Remove the failed process from all shared-resource owner sets,
         // but preserve co-owners (fix: previously retain deleted entire
         // owner sets when one co-owner failed).
@@ -527,19 +659,13 @@ impl Runtime {
             region_attachments.retain(|_, attachers| !attachers.is_empty());
         }
 
-        // Revoke the process node first, so the process becomes unresolvable
-        // before its resources are reclaimed.
-        let tenant = process_tenant.as_deref().unwrap_or_default();
-        let node_uri = crate::discovery::process_registration_uri(tenant, process_id);
-        let request = DiscoveryRequest::Revoke { uri: node_uri };
-        self.publish_discovery_event(request)?;
-
-        // Owner-keyed revocation: ask discovery to revoke every route the
-        // process registered itself (via `serve`). There is no runtime side
-        // map of guest-registered routes — discovery records each route's
-        // owner and revokes them on this event.
-        let request = DiscoveryRequest::RevokeByOwner { process_id };
-        self.publish_discovery_event(request)?;
+        // Owner-keyed revocation first: the process node, its named routes,
+        // aliases, health records, and any typed record it owns as itself
+        // (its own process-node URI). Identity-keyed typed records (regions,
+        // queues, volumes) survive this event and are removed by
+        // `ResourceFreed` only when the host actually frees them, so a
+        // co-owner exiting does not delete a record another still needs.
+        self.publish_discovery_event(DiscoveryRequest::ProcessGone { process_id })?;
 
         // Snapshot the shared resources this process owns before the ownership
         // sets are mutated: used for identity-keyed revocation, for dropping
@@ -553,21 +679,31 @@ impl Runtime {
             .map(|(key, _)| key.clone())
             .collect();
 
-        // Revoke region and queue registrations by resource identity: the
-        // registry recorded each resource's tenant at registration and revokes
-        // under it, so a cross-tenant mint is revoked under the tenant it was
-        // minted for. No runtime tenant side map.
-        for (class, id) in &owned_shared {
-            if matches!(
-                class,
-                ResourceClass::SharedRegion | ResourceClass::HostQueue
-            ) {
-                let request = DiscoveryRequest::RevokeResource {
-                    class: class.uri_segment().to_string(),
-                    id: *id,
-                };
-                self.publish_discovery_event(request)?;
-            }
+        // Revoke the registrations for the resource identities this process
+        // actually frees. A resource a co-owner still holds is *not* freed, so
+        // its identity-keyed record must survive this owner's exit; publishing
+        // `ResourceFreed` for it would drop a record the co-owner still needs.
+        let freed_shared: Vec<(ResourceClass, u64)> = {
+            let owners = self.shared_resource_owners.lock();
+            owned_shared
+                .iter()
+                .filter(|(class, id)| {
+                    matches!(
+                        class,
+                        ResourceClass::SharedRegion | ResourceClass::HostQueue
+                    ) && owners
+                        .get(&(class.clone(), *id))
+                        .is_some_and(|set| set.len() == 1)
+                })
+                .cloned()
+                .collect()
+        };
+        for (class, id) in &freed_shared {
+            let request = DiscoveryRequest::ResourceFreed {
+                class: class.uri_segment().to_string(),
+                id: *id,
+            };
+            self.publish_discovery_event(request)?;
         }
 
         // Quota facts for the reclaim passes below, keyed by the owning
@@ -632,6 +768,16 @@ impl Runtime {
                             pending as u64,
                         );
                     }
+                    // The queue's shared identity ends with its last handle, so
+                    // the authority must stop reporting the dead process as its
+                    // owner (the ResourceFreed event above already named it).
+                    if let Some(shared_id) = shared_id {
+                        self.release_shared_resource(
+                            process_id,
+                            &ResourceClass::HostQueue,
+                            shared_id,
+                        );
+                    }
                 }
                 ResourceClass::TcpListener => {
                     drop(self.kernel.close_tcp_listener(local_id));
@@ -669,7 +815,13 @@ impl Runtime {
 
         for shared_id in owned_regions {
             let mapping_count = self.kernel.memory().shared_region_mapping_count(shared_id);
-            self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
+            let last_owner =
+                self.release_shared_resource(process_id, &ResourceClass::SharedRegion, shared_id);
+            // A co-owner keeps the region (and its reservation) alive; only the
+            // last owner leaving can free it.
+            if !last_owner {
+                continue;
+            }
             if mapping_count == 0 {
                 // The region is destroyed: return its bytes to the ledger the
                 // reservation was charged against — the tenant it was minted
@@ -679,6 +831,9 @@ impl Runtime {
                 // co-attachers.)
                 let region_len = self.kernel.memory().shared_region_len(shared_id).ok();
                 drop(self.kernel.memory().destroy_shared_region(shared_id));
+                self.resource_tenants
+                    .lock()
+                    .remove(&(ResourceClass::SharedRegion, shared_id));
                 if !self
                     .kernel
                     .quota()
@@ -2203,6 +2358,96 @@ mod tests {
         );
     }
 
+    /// A co-owner exit must not publish `ResourceFreed` for a shared resource
+    /// the surviving owner still holds: the identity-keyed record would be
+    /// dropped while the resource is still live. The last owner's exit does
+    /// publish it, and only then is the region destroyed.
+    #[test]
+    fn co_owner_exit_publishes_no_resource_freed() {
+        let runtime = Runtime::default();
+        let mut subscriber = swap_in_working_publisher(&runtime);
+        let owner_a = spawn_tenant_guest(&runtime, "co-owner-a", "acme");
+        let owner_b = spawn_tenant_guest(&runtime, "co-owner-b", "acme");
+
+        let (shared_id, _len) = runtime
+            .kernel()
+            .memory()
+            .allocate_shared_region(64)
+            .expect("allocate region");
+        runtime.claim_shared_resource(owner_a, ResourceClass::SharedRegion, shared_id);
+        runtime.claim_shared_resource(owner_b, ResourceClass::SharedRegion, shared_id);
+
+        // The first owner exits: the region survives for its co-owner, so no
+        // identity-keyed revocation names it and the region is not destroyed.
+        runtime.stop_process(owner_a).expect("stop first owner");
+        let events = drain_feed(&mut subscriber);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, DiscoveryRequest::ProcessGone { process_id } if *process_id == owner_a)
+            ),
+            "expected the owner-keyed revocation, got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, DiscoveryRequest::ResourceFreed { id, .. } if *id == shared_id)
+            ),
+            "a co-owned region must not be reported as freed, got: {events:?}"
+        );
+        assert_eq!(
+            runtime
+                .kernel()
+                .memory()
+                .shared_region_len(shared_id)
+                .expect("co-owned region survives the first owner's exit"),
+            65_536
+        );
+
+        // The last owner exits: now the host actually reclaims the region.
+        runtime.stop_process(owner_b).expect("stop last owner");
+        let events = drain_feed(&mut subscriber);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                DiscoveryRequest::ResourceFreed { class, id } if class == "region" && *id == shared_id
+            )),
+            "expected the identity-keyed revocation once the last owner exits, got: {events:?}"
+        );
+    }
+
+    /// The authority answer distinguishes a class mismatch from an unknown
+    /// identity, so admission can refuse it as a permission failure.
+    #[test]
+    fn resource_authority_reports_a_class_mismatch() {
+        let runtime = Runtime::default();
+        let guest = spawn_tenant_guest(&runtime, "class-mismatch-guest", "acme");
+        let (shared_id, _len) = runtime
+            .kernel()
+            .memory()
+            .allocate_shared_region(64)
+            .expect("allocate region");
+        runtime.claim_shared_resource(guest, ResourceClass::SharedRegion, shared_id);
+
+        let owned = runtime.resource_authority(guest, ResourceClass::SharedRegion, shared_id);
+        assert!(owned.owned);
+        assert!(owned.other_classes.is_empty());
+        assert_eq!(owned.tenant.as_deref(), Some("acme"));
+
+        let mismatch = runtime.resource_authority(guest, ResourceClass::Volume, shared_id);
+        assert!(!mismatch.owned);
+        assert!(
+            mismatch
+                .other_classes
+                .contains(&ResourceClass::SharedRegion),
+            "expected the owned class to be reported, got: {:?}",
+            mismatch.other_classes
+        );
+        assert!(mismatch.tenant.is_none());
+
+        let unknown = runtime.resource_authority(guest, ResourceClass::Volume, shared_id + 999);
+        assert!(!unknown.owned);
+        assert!(unknown.other_classes.is_empty());
+    }
+
     /// Teardown support: replaces the runtime's discovery publisher with one
     /// over a full Park channel, so every synchronous publish surfaces
     /// `BufferFull` instead of silently succeeding (the real feed is a Drop
@@ -2314,20 +2559,15 @@ mod tests {
         );
 
         // Install a working publisher and retry: the stop completes and the
-        // process-node revocation is published.
+        // owner-keyed revocation is published.
         let mut subscriber = swap_in_working_publisher(&runtime);
         runtime.stop_process(pid).expect("retry stop");
         let events = drain_feed(&mut subscriber);
-        let revoked = events
-            .iter()
-            .filter_map(|event| match event {
-                DiscoveryRequest::Revoke { uri } => Some(uri.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert!(
-            revoked.contains(&crate::discovery::process_registration_uri("acme", pid)),
-            "expected the process-node revocation after retry, got: {revoked:?}"
+            events
+                .iter()
+                .any(|event| matches!(event, DiscoveryRequest::ProcessGone { process_id } if *process_id == pid)),
+            "expected the owner-keyed revocation after retry, got: {events:?}"
         );
         assert!(
             runtime.process_tenant(pid).is_none(),
@@ -2368,16 +2608,11 @@ mod tests {
         let mut subscriber = swap_in_working_publisher(&runtime);
         runtime.stop_process(pid).expect("retry stop");
         let events = drain_feed(&mut subscriber);
-        let revoked = events
-            .iter()
-            .filter_map(|event| match event {
-                DiscoveryRequest::Revoke { uri } => Some(uri.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         assert!(
-            revoked.contains(&crate::discovery::process_registration_uri("acme", pid)),
-            "expected the process-node revocation after retry, got: {revoked:?}"
+            events
+                .iter()
+                .any(|event| matches!(event, DiscoveryRequest::ProcessGone { process_id } if *process_id == pid)),
+            "expected the owner-keyed revocation after retry, got: {events:?}"
         );
     }
 

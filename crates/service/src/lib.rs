@@ -187,8 +187,9 @@ pub enum DiscoveryRequest {
         uri: String,
         /// Target resource to map the URI to.
         target: ResourceTarget,
-        /// Owning process, populated by Tier-1 runtime registrations so the
-        /// store can validate Tier-2 ownership without parsing the URI.
+        /// Owning process hint. Owners publish their own registrations now, so
+        /// discovery attributes ownership to the verified caller and this field
+        /// is carried for wire compatibility only.
         owner: Option<u64>,
         /// Marks the registration as the tenant's root service, so the bare
         /// domain (apex) resolves to it.
@@ -199,58 +200,48 @@ pub enum DiscoveryRequest {
         /// URI to revoke.
         uri: String,
     },
-    /// Revoke every route owned by a process (published by the runtime when
-    /// the process exits). Owner-keyed revocation lives in discovery, not in a
-    /// runtime-maintained side map.
-    RevokeByOwner {
+    /// Revoke every route owned by a process. Published by the runtime when
+    /// the process exits; owner-keyed registrations (process node, named
+    /// routes, aliases, health records) are removed. Identity-keyed typed
+    /// records survive until `ResourceFreed`.
+    #[tag(13)]
+    ProcessGone {
         /// Process whose owner-keyed registrations are revoked.
         process_id: u64,
     },
-    /// Seed an out-of-band domain→tenant mapping (Tier-1 publish only).
-    SeedDomain {
-        /// Domain to map (e.g. `example.com`).
-        domain: String,
-        /// Tenant the domain maps to (e.g. `acme`).
-        tenant: String,
-    },
     /// Request the provisioned domain→tenant table. Used by connectors to
     /// obtain a copy for local wire-name resolution.
+    #[tag(7)]
     ListDomains,
     /// Revoke the registration recorded for a resource identity (published by
-    /// the runtime when a resource is freed). The registry revokes under the
-    /// tenant it recorded at registration, so a cross-tenant mint is revoked
-    /// under the tenant it was minted for.
-    RevokeResource {
+    /// the runtime when a resource is actually freed). Identity-keyed, so a
+    /// co-owner exiting does not remove a record another owner still needs.
+    #[tag(14)]
+    ResourceFreed {
         /// Resource class segment (e.g. `region`, `queue`).
         class: String,
         /// Shared resource id.
         id: u64,
     },
     /// Renew a guest registration's lease, keeping the route live.
+    #[tag(9)]
     Renew {
         /// URI of the registration to renew.
         uri: String,
     },
     /// Set a guest's health record (Tier-2): `healthy` publishes it, `!healthy`
     /// removes it. Health is published state, not a readiness signal.
+    #[tag(10)]
     SetHealth {
         /// Health record name, scoped to the caller's tenant.
         name: String,
         /// Whether the guest is healthy.
         healthy: bool,
     },
-    /// Register a host-authored protocol handler (Tier-1 only): the runtime
-    /// publishes this from a guest descriptor, so the registration cannot be
-    /// forged by a guest. Resolution is a discovery lookup.
-    RegisterHandler {
-        /// Protocol scheme (e.g. `sel-quic`).
-        scheme: String,
-        /// Process that handles the scheme.
-        process_id: u64,
-    },
     /// Seed the advisory domain-to-tenant mapping. Accepted from a caller
     /// holding the bootstrap-provisioned `DomainWrite` authority (the identity
     /// guest owns the mapping durably).
+    #[tag(12)]
     SetDomain {
         /// Domain to map (e.g. `example.com`).
         domain: String,
@@ -282,8 +273,12 @@ pub enum DiscoveryResponse {
     Revoked,
     /// The caller is not authorised to register the given target.
     Forbidden,
+    /// A well-known claimed URI is already held by another live registration.
+    #[tag(7)]
+    Conflict,
     /// The provisioned domain→tenant table, returned for [`DiscoveryRequest::ListDomains`].
     #[field("domains")]
+    #[tag(6)]
     Domains(Vec<DomainEntry>),
 }
 
@@ -1427,6 +1422,38 @@ mod tests {
         assert!(result.is_err(), "unknown class segment must fail decode");
     }
 
+    /// Strict decode: a retired discovery request tag is rejected rather than
+    /// mapped onto a surviving variant. Retired tags are left as gaps so an
+    /// old-format message can never decode as a different variant.
+    #[test]
+    fn retired_request_variant_tags_are_decode_errors() {
+        for variant in [5u8, 6u8, 8u8, 11u8, 15u8] {
+            let mut builder = flatbuffers::FlatBufferBuilder::new();
+            let args = crate::fbs::selium::discovery::DiscoveryRequestArgs {
+                variant,
+                uri: None,
+                key: None,
+                value: None,
+                target: None,
+                root_service: false,
+                owner: 0,
+                process_id: 0,
+                domain: None,
+                tenant: None,
+                class: None,
+                id: 0,
+                name: None,
+                healthy: false,
+            };
+            let root = crate::fbs::selium::discovery::DiscoveryRequest::create(&mut builder, &args);
+            builder.finish(root, None);
+            let bytes = builder.finished_data().to_vec();
+            let result: ::std::result::Result<DiscoveryRequest, InvalidFlatbuffer> =
+                FlatMsg::decode(&bytes);
+            assert!(result.is_err(), "tag {variant} must fail decode");
+        }
+    }
+
     /// Strict decode: an unknown request variant tag is a decode error,
     /// not a silently reinterpreted default variant.
     #[test]
@@ -1447,7 +1474,6 @@ mod tests {
             id: 0,
             name: None,
             healthy: false,
-            scheme: None,
         };
         let root = crate::fbs::selium::discovery::DiscoveryRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1477,7 +1503,6 @@ mod tests {
             id: 0,
             name: None,
             healthy: false,
-            scheme: None,
         };
         let root = crate::fbs::selium::discovery::DiscoveryRequest::create(&mut builder, &args);
         builder.finish(root, None);
@@ -1934,27 +1959,16 @@ mod tests {
     }
 
     #[test]
-    fn discovery_revoke_by_owner_round_trips() {
-        let request = DiscoveryRequest::RevokeByOwner { process_id: 99 };
+    fn discovery_process_gone_round_trips() {
+        let request = DiscoveryRequest::ProcessGone { process_id: 99 };
         let bytes = FlatMsg::encode(&request);
         let decoded: DiscoveryRequest = FlatMsg::decode(&bytes).expect("decode");
         assert_eq!(decoded, request);
     }
 
     #[test]
-    fn discovery_seed_domain_round_trips() {
-        let request = DiscoveryRequest::SeedDomain {
-            domain: "example.com".to_string(),
-            tenant: "acme".to_string(),
-        };
-        let bytes = FlatMsg::encode(&request);
-        let decoded: DiscoveryRequest = FlatMsg::decode(&bytes).expect("decode");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn discovery_revoke_resource_round_trips() {
-        let request = DiscoveryRequest::RevokeResource {
+    fn discovery_resource_freed_round_trips() {
+        let request = DiscoveryRequest::ResourceFreed {
             class: "region".to_string(),
             id: 42,
         };
@@ -1964,14 +1978,11 @@ mod tests {
     }
 
     #[test]
-    fn discovery_register_handler_round_trips() {
-        let request = DiscoveryRequest::RegisterHandler {
-            scheme: "sel-quic".to_string(),
-            process_id: 42,
-        };
-        let decoded: DiscoveryRequest =
-            FlatMsg::decode(&FlatMsg::encode(&request)).expect("decode");
-        assert_eq!(decoded, request);
+    fn discovery_conflict_round_trips() {
+        let response = DiscoveryResponse::Conflict;
+        let decoded: DiscoveryResponse =
+            FlatMsg::decode(&FlatMsg::encode(&response)).expect("decode");
+        assert_eq!(decoded, response);
     }
 
     #[test]

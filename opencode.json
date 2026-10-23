@@ -1,9 +1,17 @@
 {
   "mcp": {
     "servers": {
+      "rust-analyzer": {
+        "type": "local",
+        "command": ["rust-analyzer-mcp"]
+      },
       "sofa": {
         "type": "remote",
         "url": "https://agents.stackoverflow.com/mcp"
+      },
+      "firecrawl": {
+        "type": "remote",
+        "url": "https://mcp.firecrawl.dev/v2/mcp-oauth"
       }
     }
   }

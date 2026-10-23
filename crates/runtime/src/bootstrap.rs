@@ -1,9 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use selium_abi::{
-    ActivityEvent, Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
-};
-use selium_service::{DiscoveryRequest, ResourceTarget};
+use selium_abi::{ActivityEvent, Capability, CapabilityGrant, ResourceIdentity, ResourceSelector};
 use selium_shm::{Channel, ChannelBackpressure, transport::ShmTransport};
 use selium_wire::{framed::FramedWrite, pubsub::Publisher};
 use tracing::info;
@@ -136,10 +133,23 @@ impl Runtime {
         // convergence are the guests' concern, expressed through route watches
         // and retry rather than host policy.
         let mut names = BTreeSet::new();
+        let mut claims: BTreeMap<String, String> = BTreeMap::new();
         let mut report = BootstrapReport::default();
         for descriptor in config.system_guests {
             if !names.insert(descriptor.name.clone()) {
+                // Reject the configuration without leaking the guests already
+                // started before the duplicate was noticed.
+                self.rollback_bootstrapped(&report);
                 return Err(Error::DuplicateDescriptor(descriptor.name));
+            }
+            for uri in descriptor_claim_uris(&descriptor) {
+                if let Some(existing) = claims.insert(uri.clone(), descriptor.name.clone()) {
+                    self.rollback_bootstrapped(&report);
+                    return Err(Error::Host(format!(
+                        "duplicate route claim {uri} declared by {existing} and {}",
+                        descriptor.name
+                    )));
+                }
             }
             let bootstrapped = match self.spawn_system_guest(descriptor.clone()) {
                 Ok(bootstrapped) => bootstrapped,
@@ -200,18 +210,26 @@ impl Runtime {
         &self,
         descriptor: SystemGuestDescriptor,
     ) -> Result<BootstrappedGuest> {
-        self.validate_grants(&descriptor.grants)?;
+        // Handler schemes are host-provisioned route claims: the guest that
+        // declares a protocol handler is the only process allowed to publish
+        // `sel:///handler/<scheme>`. Platform routes are declared explicitly as
+        // `RouteClaim` grants on the descriptor.
+        let grants = grant_uris_with_handler_claims(&descriptor);
+        self.validate_grants(&grants)?;
 
         let process = self.kernel.processes().start_process(
             descriptor.module_id.clone(),
             descriptor.entrypoint.clone(),
-            descriptor.grants.clone(),
+            grants.clone(),
         );
-        self.persist_process_authority(
+        self.persist_process_authority(process.local_id, grants, descriptor.tenant.clone(), None);
+        // The process owns itself as a resource from the moment it exists: the
+        // entrypoint publishes its own node before the host would otherwise get
+        // another chance to claim the handle.
+        self.claim_local_handle(
             process.local_id,
-            descriptor.grants.clone(),
-            descriptor.tenant.clone(),
-            None,
+            selium_abi::ResourceClass::Process,
+            process.local_id,
         );
 
         // Shared-page fast-path detection: probe the guest's module bytes
@@ -310,11 +328,6 @@ impl Runtime {
             self.cleanup_failed_process(process.local_id)?;
             return Err(error);
         }
-        self.claim_local_handle(
-            process.local_id,
-            selium_abi::ResourceClass::Process,
-            process.local_id,
-        );
         self.kernel.processes().record_activity(ActivityEvent {
             kind: selium_abi::ActivityKind::GuestBootstrapped,
             process_id: Some(process.local_id),
@@ -326,63 +339,13 @@ impl Runtime {
             "bootstrapped system guest"
         );
 
-        // Register the process node (`sel://<tenant>/proc/<id>`) so every
-        // process is discoverable from spawn. Publishing is a no-op when
-        // discovery is not enabled.
-        if let Err(error) =
-            self.register_process_node(process.local_id, descriptor.tenant.as_deref())
-        {
-            self.cleanup_failed_process(process.local_id)?;
-            return Err(error);
-        }
-
-        // Publish a host-authored handler registration for each protocol scheme
-        // this guest handles, so serve-side guests can pin it via a discovery
-        // lookup. Host authorship keeps the pin unforgeable.
-        for scheme in &descriptor.handlers {
-            let request = DiscoveryRequest::RegisterHandler {
-                scheme: scheme.clone(),
-                process_id: process.local_id,
-            };
-            if let Err(error) = self.publish_discovery_event(request) {
-                self.cleanup_failed_process(process.local_id)?;
-                return Err(error);
-            }
-        }
-
+        // Registration publication belongs to the owner, not the host: the
+        // process publishes its own node (and its named routes/handler claims)
+        // when its entrypoint starts. The host merely attests authority.
         Ok(BootstrappedGuest {
             name: descriptor.name,
             process_id: process.local_id,
         })
-    }
-
-    /// Records and publishes the process-node registration for a spawned
-    /// process so it is addressable as `sel://<tenant>/proc/<id>` from spawn
-    /// until teardown.
-    fn register_process_node(
-        &self,
-        process_id: selium_abi::ProcessId,
-        tenant: Option<&str>,
-    ) -> Result<()> {
-        let uri =
-            crate::discovery::process_registration_uri(tenant.unwrap_or_default(), process_id);
-        let target = ResourceTarget {
-            uri: uri.clone(),
-            host_id: String::new(), // Runtime doesn't know host_id; discovery will fill it.
-            resource_id: process_id,
-            interface: None,
-            tenant: tenant.map(str::to_string),
-            class: ResourceClass::Process,
-            labels: Vec::new(),
-        };
-        let request = DiscoveryRequest::Register {
-            uri,
-            target,
-            owner: Some(process_id),
-            root_service: false,
-        };
-        self.publish_discovery_event(request)?;
-        Ok(())
     }
 
     pub(crate) fn load_guest_module(
@@ -448,10 +411,63 @@ impl Runtime {
     }
 }
 
+/// Returns the exact registry URIs a descriptor claims: its explicit
+/// `RouteClaim` grants plus one claim per declared protocol handler scheme.
+fn descriptor_claim_uris(descriptor: &SystemGuestDescriptor) -> Vec<String> {
+    let mut uris: Vec<String> = descriptor
+        .grants
+        .iter()
+        .filter(|grant| grant.capability == Capability::RouteClaim)
+        .flat_map(|grant| {
+            grant
+                .selectors
+                .iter()
+                .filter_map(|selector| match selector {
+                    ResourceSelector::Uri(uri) => Some(uri.clone()),
+                    _ => None,
+                })
+        })
+        .collect();
+    for scheme in &descriptor.handlers {
+        let uri = handler_claim_uri(scheme);
+        if !uris.contains(&uri) {
+            uris.push(uri);
+        }
+    }
+    uris
+}
+
+/// Returns the descriptor's grants with a host-provisioned `RouteClaim` added
+/// for each declared protocol handler scheme.
+fn grant_uris_with_handler_claims(descriptor: &SystemGuestDescriptor) -> Vec<CapabilityGrant> {
+    let mut grants = descriptor.grants.clone();
+    for scheme in &descriptor.handlers {
+        let uri = handler_claim_uri(scheme);
+        let already_claimed = grants.iter().any(|grant| {
+            grant.capability == Capability::RouteClaim
+                && grant.selectors.iter().any(
+                    |selector| matches!(selector, ResourceSelector::Uri(claimed) if claimed == &uri),
+                )
+        });
+        if !already_claimed {
+            grants.push(CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri(uri)],
+            ));
+        }
+    }
+    grants
+}
+
+/// The exact registry URI a protocol handler claim covers.
+fn handler_claim_uri(scheme: &str) -> String {
+    format!("{}/handler/{scheme}", selium_abi::uri::SEL_PREFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selium_abi::{Capability, CapabilityGrant, LocalityScope, ResourceSelector};
+    use selium_abi::{Capability, CapabilityGrant, LocalityScope, ResourceClass, ResourceSelector};
     use selium_kernel::Kernel;
     use wasmtiny::WasmValue;
 
@@ -626,6 +642,68 @@ mod tests {
             .map(|bootstrapped| bootstrapped.name.as_str())
             .collect();
         assert_eq!(order, vec!["zulu", "alpha", "mike"]);
+    }
+
+    #[test]
+    fn duplicate_route_claims_across_descriptors_are_rejected() {
+        let runtime = Runtime::default();
+        let guest = |name: &str, claim: &str| SystemGuestDescriptor {
+            name: name.to_string(),
+            module_id: format!("{name}-module"),
+            module_bytes: module_with_entrypoint("boot", ""),
+            entrypoint: "boot".to_string(),
+            arguments: Vec::new(),
+            grants: vec![CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri(claim.to_string())],
+            )],
+            tenant: None,
+            discovery_service: false,
+            handlers: Vec::new(),
+        };
+
+        let result = runtime.bootstrap_system_guests(RuntimeConfig {
+            start_discovery: false,
+            system_guests: vec![
+                guest("first", "sel:///control"),
+                guest("second", "sel:///control"),
+            ],
+            state_dir: None,
+        });
+        assert!(
+            result.is_err(),
+            "two descriptors may not claim the same reserved name"
+        );
+        // The guest started before the duplicate was noticed is rolled back, so
+        // a rejected configuration leaves nothing running.
+        assert_eq!(
+            runtime.loaded_guest_count(),
+            0,
+            "a rejected bootstrap must not leak the guests it already started"
+        );
+    }
+
+    #[test]
+    fn handler_schemes_provision_route_claims() {
+        let runtime = Runtime::default();
+        let guest = runtime
+            .spawn_system_guest(SystemGuestDescriptor {
+                name: "handler".to_string(),
+                module_id: "handler-module".to_string(),
+                module_bytes: module_with_entrypoint("boot", ""),
+                entrypoint: "boot".to_string(),
+                arguments: Vec::new(),
+                grants: Vec::new(),
+                tenant: None,
+                discovery_service: false,
+                handlers: vec!["sel-quic".to_string()],
+            })
+            .expect("spawn handler guest");
+
+        assert_eq!(
+            runtime.expected_claims(guest.process_id),
+            vec!["sel:///handler/sel-quic".to_string()]
+        );
     }
 
     #[test]

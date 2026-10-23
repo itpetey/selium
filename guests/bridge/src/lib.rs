@@ -46,6 +46,10 @@ const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
 /// The accountant guest's published narrowing table route.
 const NARROWING_TABLE_ROUTE: &str = "sel:///accounting-narrowing";
+/// How long a boot-time route lookup converges before failing: owners publish
+/// their own routes from their entrypoints, so a peer that boots alongside them
+/// must retry rather than treat an early miss as permanent.
+const ROUTE_READY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The identity-published grant table: a `fingerprint -> baseline grants` live
 /// table read at handoff conferral. Replaces the interim `IdentityGrantMap`
@@ -72,11 +76,13 @@ impl GrantTable {
 
     /// Attaches to the identity guest's published grant table route.
     pub async fn attach(ctx: &mut Context) -> anyhow::Result<Self> {
+        // Identity publishes this route from its own entrypoint, so a peer that
+        // boots alongside it converges rather than treating an early miss as
+        // permanent.
         let target = ctx
-            .lookup(GRANT_TABLE_ROUTE)
+            .resolve_ready(GRANT_TABLE_ROUTE, ROUTE_READY_BOUND)
             .await
-            .with_context(|| "bridge-server: identity grant table resolve failed")?
-            .ok_or_else(|| anyhow::anyhow!("identity grant table route not found"))?;
+            .with_context(|| "bridge-server: identity grant table resolve failed")?;
         let channel = Channel::attach(target.resource_id)
             .map_err(|e| anyhow::anyhow!("grant table region attach failed: {e}"))?;
         // Replay from the ring start: grants may predate this attachment.
@@ -114,10 +120,9 @@ impl NarrowingTable {
     /// Attaches to the accountant's published narrowing table route.
     pub async fn attach(ctx: &mut Context) -> anyhow::Result<Self> {
         let target = ctx
-            .lookup(NARROWING_TABLE_ROUTE)
+            .resolve_ready(NARROWING_TABLE_ROUTE, ROUTE_READY_BOUND)
             .await
-            .with_context(|| "bridge-server: narrowing table resolve failed")?
-            .ok_or_else(|| anyhow::anyhow!("narrowing table route not found"))?;
+            .with_context(|| "bridge-server: narrowing table resolve failed")?;
         let channel = Channel::attach(target.resource_id)
             .map_err(|e| anyhow::anyhow!("narrowing table region attach failed: {e}"))?;
         let transport = ShmTransport::new_replay(&channel, &channel)
@@ -282,6 +287,7 @@ async fn bridge_server(mut ctx: Context, bridge_channel_module: (u64, u64)) -> a
     })
     .await
     .with_context(|| "bridge-server: serve failed")?;
+    info!("bridge-server: route registered");
 
     let mut grant_table = match GrantTable::attach(&mut ctx).await {
         Ok(table) => table,

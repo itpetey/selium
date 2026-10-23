@@ -156,39 +156,60 @@ The runtime SHALL revoke a resource's registration by resource identity (class a
   `Context`-leading entrypoints (guests do not call `Context::from_raw`
   themselves)
 
-### Requirement: Runtime discovery RPC session
-`selium-runtime` SHALL hold an `RpcClient<DiscoveryRequest, DiscoveryResponse>` connected to the discovery guest, established during bootstrap alongside the existing discovery queue for guest `Context` connections. This session SHALL be used for authoritative Tier-1 resource registration.
+### Requirement: Runtime discovery publication session
+`selium-runtime` SHALL establish the runtime→discovery publication session during bootstrap: the Tier-1 feed publisher, plus the discovery listener queue wired into guest `Context` connections. The session SHALL be used only for authoritative revocation events; guest-visible registrations are published by the guests that own the resources.
 
 #### Scenario: Runtime connects to discovery guest
-- **WHEN** the runtime bootstraps
-- **THEN** it SHALL create an `RpcClient` to the discovery guest for authoritative resource registration
+- **WHEN** the runtime bootstraps with discovery enabled
+- **THEN** it SHALL create the runtime→discovery feed publisher and the guest-facing discovery listener
+- **AND** authoritative revocation events SHALL be published on that feed
 
-### Requirement: Automatic resource registration on allocation
-When the runtime dispatches an `AllocRegion` hostcall, it SHALL send `DiscoveryRequest::Register` for the allocated region under `sel://<tenant>/region/<id>`, where `<tenant>` is the allocation's principal tenant (the tenant on whose behalf the region is minted). The runtime SHALL NOT auto-register purpose aliases; aliases are registered explicitly by the resource's owner.
+### Requirement: Resource authority record on allocation
+When the runtime dispatches `AllocRegion`, `HostQueueCreate`, or a volume open, it SHALL record the minted resource's authoritative identity `(class, id)` and its principal tenant (the tenant on whose behalf the resource is minted) in its authority records, updated synchronously within the minting hostcall.
 
-#### Scenario: Runtime registers log channel on AllocRegion
+#### Scenario: Mint records the principal tenant
 - **WHEN** a guest invokes `AllocRegion { purpose: LogChannel, ... }`, the runtime allocates region 7, and the allocation's principal tenant is "acme"
-- **THEN** the runtime SHALL register `sel://acme/region/7` and SHALL NOT register a purpose alias
+- **THEN** the runtime SHALL record that region 7 exists, is owned by the caller, and was minted under tenant "acme"
 
-#### Scenario: Runtime registers generic SharedMemory region
-- **WHEN** a guest invokes `AllocRegion { purpose: SharedMemory, ... }` and the runtime allocates region 3 under tenant "acme"
-- **THEN** the runtime SHALL register `sel://acme/region/3`
+#### Scenario: Authority answers before the owner publishes
+- **WHEN** the owner asks the runtime whether it owns region 7 before it has published the canonical record
+- **THEN** the runtime SHALL answer from its mint-time authority record, including tenant "acme"
+
+### Requirement: No host registration publication
+The runtime SHALL NOT publish a Tier-1 registration for any resource or process node, and SHALL NOT auto-register purpose aliases. The owner publishes its own canonical, process, and named records.
+
+#### Scenario: Allocation publishes nothing
+- **WHEN** a guest allocates a region or creates a host queue
+- **THEN** the runtime SHALL NOT publish a registration event for it; the owner publishes the canonical record
+
+#### Scenario: Process start publishes nothing
+- **WHEN** a process is spawned
+- **THEN** the runtime SHALL NOT publish its process node; the process publishes it
 
 ### Requirement: Process Teardown Revocation
-When a process exits, the runtime SHALL publish Tier-1 revocation events for the process's region URIs and for its process node before reclaiming its resources. Teardown bookkeeping SHALL be staged: a revocation's pending entry SHALL be removed only after its publish succeeds, so a failed teardown loses no bookkeeping. A stop that fails part-way SHALL retain the process authority so the stop can be retried and the remaining revocations completed, rather than silently skipping them.
+When a process exits, the runtime SHALL publish Tier-1 revocation events — `ProcessGone { process_id }` for owner-keyed removal, and `ResourceFreed { class, id }` for each resource identity it reclaims — before or alongside reclaiming its resources. Teardown bookkeeping SHALL be staged: a revocation's pending entry SHALL be removed only after its publish succeeds, so a failed teardown loses no bookkeeping. A stop that fails part-way SHALL retain the process authority so the stop can be retried and the remaining revocations completed, rather than silently skipping them.
 
 #### Scenario: Exit revokes before reclaim
 - **WHEN** a process with allocated regions is stopped
-- **THEN** revocation events for its region URIs SHALL be published to the discovery feed before its shared resources are reclaimed
+- **THEN** revocation events SHALL be published to the discovery feed before its shared resources are reclaimed
 
 #### Scenario: Runtime revokes all process URIs on exit
 - **WHEN** process 42 of tenant "acme" terminates
-- **THEN** the runtime SHALL revoke `sel://acme/region/*` for the regions it allocated and SHALL revoke `sel://acme/proc/42`
+- **THEN** the runtime SHALL publish `ProcessGone { process_id: 42 }`, which revokes its process node and every route it owned
 - **AND** subsequent `Resolve` calls for those URIs SHALL return `NotFound`
+
+#### Scenario: Runtime revokes freed resource identities
+- **WHEN** process 42 terminates and its region 7 and queue 9 are reclaimed
+- **THEN** the runtime SHALL publish `ResourceFreed { class: "region", id: 7 }` and `ResourceFreed { class: "queue", id: 9 }`
 
 #### Scenario: Failed teardown is retryable
 - **WHEN** a process stop fails part-way because a discovery revocation cannot be published
 - **THEN** the stop SHALL return an error (not succeed silently), the pending revocations SHALL remain staged, and a later stop of the same process SHALL publish them
+
+#### Scenario: Co-owned resource survives an owner exit
+- **WHEN** two processes own the same shared region and one of them exits
+- **THEN** the runtime SHALL NOT publish `ResourceFreed` for that region, and the region SHALL remain live for the surviving owner
+- **AND** the last owner's exit SHALL publish `ResourceFreed` for it
 
 ### Requirement: GuestLogRegister hostcall validation
 The runtime SHALL validate that the `shared_id` in a `GuestLogRegister` hostcall was allocated by the calling process. If the `shared_id` belongs to a different process, the runtime SHALL return an error.
@@ -286,34 +307,43 @@ then length).
 - **WHEN** a pointer-argument payload cannot be written into the guest's linear memory
 - **THEN** the runtime SHALL fail the bootstrap with a descriptive error rather than truncating or silently dropping the payload
 
-### Requirement: Process Node Registration
-The runtime SHALL publish a Tier-1 registration for a process node `sel://<tenant>/proc/<id>` when a process is spawned, and a revocation when the process is cleaned up, so every process is discoverable even before it allocates any resource.
+### Requirement: Owner-published process nodes
+The runtime SHALL NOT publish a process node. A process SHALL publish its own `sel://<tenant>/proc/<id>` node when its entrypoint starts, using its host-attested identity, and the runtime SHALL revoke it on exit with `ProcessGone { process_id }`, so an unpublished process stays undiscoverable but fully accounted. A registry entrypoint that takes infrastructure handles instead of a `Context` is exempt and publishes its routes directly.
 
-#### Scenario: Process node registered at spawn
-- **WHEN** process 123 of tenant "acme" is spawned
-- **THEN** the runtime SHALL register `sel://acme/proc/123` so it resolves through discovery
+#### Scenario: Process node is published by the process
+- **WHEN** process 123 of tenant "acme" starts and publishes its node
+- **THEN** `sel://acme/proc/123` SHALL resolve through discovery
 
 #### Scenario: Process node revoked at teardown
 - **WHEN** process 123 exits
-- **THEN** the runtime SHALL revoke `sel://acme/proc/123` so it no longer resolves
+- **THEN** the runtime SHALL publish `ProcessGone { process_id: 123 }` and `sel://acme/proc/123` SHALL no longer resolve
+
+#### Scenario: Unpublished process is accounted but undiscoverable
+- **WHEN** process 123 never publishes its node
+- **THEN** `sel://acme/proc/123` SHALL NOT resolve
+- **AND** the runtime SHALL still know the process and its owned resources
+
+#### Scenario: Registry publishes its routes without a self-RPC
+- **WHEN** the registry entrypoint takes the feed and listener handles instead of a `Context`
+- **THEN** it SHALL publish its own routes directly and SHALL NOT issue an RPC to its own listener
 
 ### Requirement: Principal-Provenance Allocation
 `AllocRegion`, `HostQueueCreate` and volume open SHALL mint the resource under the serving tenant supplied with the call, which MAY differ from the caller's own tenant. A root principal (a process with no tenant) MAY mint for any tenant — trusted edge infrastructure such as connectors runs as root. A tenant-scoped process MAY mint for another tenant only with a `DelegateGrants` grant scoped to that tenant; allocation crossing a tenant boundary without that authority SHALL be denied with `AbiErrorCode::PermissionDenied`. A `DelegateGrants` grant SHALL carry at least one `Tenant` selector; a selector-less `DelegateGrants` grant would vacuously match every tenant (including root) and SHALL be rejected at spawn.
 
 #### Scenario: System process allocates for another tenant
 - **WHEN** a root/system process holding tenant-scoped delegation allocates a region on behalf of tenant "acme"
-- **THEN** the runtime SHALL register the region under `sel://acme/region/<id>`
+- **THEN** the runtime SHALL record the region as minted under tenant "acme", and the owner SHALL publish it as `sel://acme/region/<id>`
 
 #### Scenario: Root principal allocates for any tenant without delegation
 - **WHEN** a root process with no `DelegateGrants` grants allocates a region on behalf of tenant "acme" (the connector path: a root connector minting per-stream channels under an authenticated client's tenant)
-- **THEN** the runtime SHALL register the region under `sel://acme/region/<id>`
+- **THEN** the runtime SHALL record the region as minted under tenant "acme", and the owner SHALL publish it as `sel://acme/region/<id>`
 
 #### Scenario: Unauthorised cross-tenant allocation denied
 - **WHEN** a tenant-scoped process without tenant-scoped delegation attempts to allocate a region for a tenant other than its own
 - **THEN** the runtime SHALL return `AbiErrorCode::PermissionDenied`
 
 #### Scenario: Host queue minted under the serving tenant
-- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is registered under `sel://acme/queue/<id>`; when a cross-tenant mint is authorised, the queue is registered under the serving tenant
+- **WHEN** a guest in tenant "acme" creates a host queue with no serving tenant, the queue is recorded under `sel://acme/queue/<id>`; when a cross-tenant mint is authorised, the queue is recorded under the serving tenant
 - **THEN** teardown SHALL revoke the queue under the tenant it was minted for
 
 #### Scenario: Volume minted under the serving tenant
@@ -392,24 +422,22 @@ The runtime SHALL publish a Tier-1 registration for a process node `sel://<tenan
 - **WHEN** a volume is removed
 - **THEN** its bytes SHALL be released from the tenant's volume usage
 
-### Requirement: Host-Authored Protocol Handler Registration
+### Requirement: Protocol handler route claims
+The runtime SHALL provision a route claim for each protocol scheme a guest
+descriptor declares, so the guest can publish `sel:///handler/<scheme>` itself
+under an authority that cannot be forged. The runtime SHALL NOT publish the
+handler's registration event and SHALL NOT keep a host-side handler registry.
+Handler resolution SHALL remain a discovery lookup.
 
-The runtime SHALL publish a protocol handler registration for each guest
-descriptor that declares handlers, on the Tier-1 feed, so the registration is
-host-authored and cannot be forged by a guest. Handler resolution SHALL be a
-discovery lookup; the runtime SHALL NOT keep a host-side handler registry.
-
-#### Scenario: Handler registration is host-authored
-
+#### Scenario: Handler claim is host-provisioned
 - **WHEN** the runtime spawns a guest whose descriptor declares a protocol handler
-- **THEN** it SHALL publish that handler's registration on the Tier-1 feed
+- **THEN** it SHALL provision that handler's singleton route claim for the process
+- **AND** it SHALL NOT publish a handler registration event
 
-#### Scenario: Handler resolution is a discovery lookup
-
-- **WHEN** a serve-side guest resolves the handler for a protocol scheme
-- **THEN** it SHALL obtain the owning process from discovery, not from a runtime-maintained map
+#### Scenario: Handler guest publishes its claim
+- **WHEN** the handler guest publishes `sel:///handler/<scheme>` under its claim
+- **THEN** a serve-side guest resolving the scheme SHALL obtain the owning process from discovery
 
 #### Scenario: Guests cannot forge a handler
-
-- **WHEN** a guest registers a protocol handler route it was not assigned
-- **THEN** the registration SHALL NOT be treated as host-authored authority
+- **WHEN** a guest publishes a handler route it was not assigned a claim for
+- **THEN** the registration SHALL be refused

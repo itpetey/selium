@@ -270,15 +270,22 @@ fn generate_entrypoint(
                 // have no error channel, so a failed handle aborts the guest.
                 let from_raw = match return_kind {
                     EntrypointReturn::ResultUnit => quote! {
-                        let ctx = ::selium_guest::Context::from_raw(#arg as u64).await?;
+                        let mut ctx = ::selium_guest::Context::from_raw(#arg as u64).await?;
                     },
                     EntrypointReturn::Unit => quote! {
-                        let ctx = ::selium_guest::Context::from_raw(#arg as u64)
+                        let mut ctx = ::selium_guest::Context::from_raw(#arg as u64)
                             .await
                             .expect("failed to construct bootstrap context");
                     },
                 };
                 prelude.push(from_raw);
+                // A process publishes its own node (and any protocol-handler
+                // claims the host provisioned) when its entrypoint starts:
+                // discovery is a projection, and the owner is its publisher.
+                prelude.push(quote! {
+                    ctx.publish_process_node().await;
+                    ctx.publish_handler_claims().await;
+                });
                 call_args.push(quote! { ctx });
             }
             EntrypointParam::Integer(ty) => {
