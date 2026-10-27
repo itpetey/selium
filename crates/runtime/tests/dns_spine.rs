@@ -12,7 +12,7 @@
 //! `wasm32-unknown-unknown` first:
 //!
 //! ```sh
-//! cargo build --target wasm32-unknown-unknown -p selium-connector-dns -p selium-dns-demo
+//! cargo build --release --target wasm32-unknown-unknown -p selium-discovery -p selium-connector-dns -p selium-dns-demo
 //! cargo test -p selium-runtime --test dns_spine -- --ignored
 //! ```
 
@@ -214,9 +214,11 @@ async fn guest_resolves_via_connector_then_connects_by_literal() {
 }
 
 fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
-    // The shared reader rebuilds the guest if its inputs changed (a no-op
-    // when fresh) and fails loudly if the build or the read fails.
-    common::read_guest_wasm_debug(crate_name, file_name)
+    // Debug guests are slow enough in the interpreter that their fixed DNS
+    // timeouts expire under pack load. Use optimised guests for this
+    // end-to-end data-path test; the shared reader still rebuilds them when
+    // their inputs change and fails loudly if the build or read fails.
+    common::read_guest_wasm(crate_name, file_name)
 }
 
 /// Log summaries the reap path moved into the activity log for `process_id`.

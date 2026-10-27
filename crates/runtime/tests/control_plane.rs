@@ -11,7 +11,7 @@
 //! be built for `wasm32-unknown-unknown` first:
 //!
 //! ```sh
-//! cargo build --target wasm32-unknown-unknown \
+//! cargo build --release --target wasm32-unknown-unknown \
 //!   -p selium-discovery -p selium-store -p selium-control-plane -p selium-control-probe
 //! cargo test -p selium-runtime --test control_plane -- --ignored
 //! ```
@@ -193,7 +193,7 @@ fn control_plane_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 }
 
 fn control_plane_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-control-plane", "selium_control_plane.wasm")
+    common::read_guest_wasm("selium-control-plane", "selium_control_plane.wasm")
 }
 
 fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
@@ -220,7 +220,7 @@ fn control_probe_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 }
 
 fn control_probe_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-control-probe", "selium_control_probe.wasm")
+    common::read_guest_wasm("selium-control-probe", "selium_control_probe.wasm")
 }
 
 fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
@@ -255,7 +255,7 @@ fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
 }
 
 fn discovery_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
+    common::read_guest_wasm("selium-discovery", "selium_discovery.wasm")
 }
 
 #[expect(clippy::panic, reason = "test helper panics on a missing guest")]
