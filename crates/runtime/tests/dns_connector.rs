@@ -206,3 +206,14 @@ fn ungranted_guest_cannot_attach_connector_channel() {
         CompletionState::Failed(_)
     ));
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `dns-connector` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: dns-connector/typed-egress-resolution/successful-resolution
+// scenario: dns-connector/typed-egress-resolution/resolution-is-grant-gated
+// scenario: dns-connector/reply-correlation/concurrent-queries-do-not-cross
+// scenario: dns-connector/honest-failure-outcomes/nxdomain-is-typed
+// scenario: dns-connector/honest-failure-outcomes/upstream-error-codes-are-typed
+// scenario: dns-connector/honest-failure-outcomes/forwarding-failure-is-typed
+// scenario: dns-connector/well-known-discovery-registration/tenant-scoped-resolution-policy

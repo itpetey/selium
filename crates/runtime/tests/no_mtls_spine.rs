@@ -17,14 +17,13 @@
 //! process — the runtime installs a process-global region provider) and
 //! serialise on the cross-process spine port lock.
 
-use std::time::Duration;
-
 use selium_runtime::RuntimeConfig;
 use selium_service::{ControlRequest, ControlResponse};
 use spine_common::{
-    CONNECTOR_ADDR, CONTROL_URI, SpinePortGuard, StateRoot, bridge_server_descriptor,
-    client_options_no_identity, connector_descriptor, discovery_descriptor, drain_logs, read_wasm,
-    runtime_in_state_root, seed_tls_blob_store, store_descriptor, wait_for_logs,
+    CONNECTOR_ADDR, CONTROL_URI, CONVERGENCE_BOUND, HANDSHAKE_BOUND, SHORT_BOUND, SpinePortGuard,
+    StateRoot, bridge_server_descriptor, client_options_no_identity, connector_descriptor,
+    discovery_descriptor, drain_logs, read_wasm, runtime_in_state_root, seed_tls_blob_store,
+    store_descriptor, wait_for_logs,
 };
 
 mod common;
@@ -95,7 +94,7 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
             ("quic-connector: listening on", 1),
             ("serving without client authentication", 1),
         ],
-        Duration::from_secs(30),
+        SHORT_BOUND,
     );
 
     // A certless client completes the QUIC handshake against the wasm
@@ -104,7 +103,7 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
         CONNECTOR_ADDR.parse().expect("connector address"),
         client_options_no_identity(),
     );
-    let client = match tokio::time::timeout(Duration::from_secs(240), connecting).await {
+    let client = match tokio::time::timeout(HANDSHAKE_BOUND, connecting).await {
         Ok(result) => result.expect("certless client connection"),
         Err(_elapsed) => panic!("certless handshake timed out"),
     };
@@ -113,7 +112,7 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
     // the bridge refuses it (attach-then-close) and the connector FINs the
     // client stream — the serving side never accepts the handshake.
     let opening = client.rpc::<ControlRequest, ControlResponse>(CONTROL_URI);
-    match tokio::time::timeout(Duration::from_secs(120), opening).await {
+    match tokio::time::timeout(CONVERGENCE_BOUND, opening).await {
         Ok(Err(_refused)) => {}
         Ok(Ok(_rpc)) => panic!("the bridge must refuse an unauthenticated handoff"),
         Err(_elapsed) => panic!("unauthenticated open did not settle"),
@@ -124,7 +123,7 @@ async fn no_mtls_connector_serves_but_bridge_refuses_unauthenticated_handoffs() 
         &runtime,
         bridge,
         &[("refusing handoff with unparseable identity", 1)],
-        Duration::from_secs(30),
+        SHORT_BOUND,
     );
 
     for (process_id, name) in [(connector, "quic-connector"), (bridge, "bridge-server")] {

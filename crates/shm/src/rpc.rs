@@ -142,6 +142,37 @@ impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
     }
 }
 
+/// A session the host has marked closed: the parent region and the request
+/// ring's new generation (for waking a parked receiver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedSession {
+    /// Parent region id the receiver registered its generation wait under.
+    pub region_id: u64,
+    /// New request-ring generation, passed to the host's wake registry.
+    pub generation: u64,
+}
+
+/// Marks an RPC session's peer departed and bumps the request ring, waking a
+/// server parked in `recv`.
+///
+/// Host-side teardown calls this for a sender process that has died: the
+/// sender cannot drop its writer registration, so the receiver would otherwise
+/// park forever and retain the connection region. The temporary attachment is
+/// dropped immediately; only the flag and generation word are touched.
+pub fn close_session(shared_id: u64) -> std::result::Result<ClosedSession, RpcError> {
+    let (request_channel, _reply_channel) =
+        attach_rpc_region(shared_id).map_err(|error| RpcError::Serialisation(error.to_string()))?;
+    let generation = request_channel
+        .ring()
+        .region()
+        .mark_peer_closed()
+        .map_err(|error| RpcError::Serialisation(error.to_string()))?;
+    Ok(ClosedSession {
+        region_id: request_channel.region_id(),
+        generation,
+    })
+}
+
 /// Accepts an incoming shared-memory RPC session.
 ///
 /// Attaches to the multi-memory region identified by `connection.shared_id`,
@@ -633,3 +664,23 @@ mod tests {
         server.await.expect("server task");
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `resource-handshake` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: resource-handshake/rendezvous-trait-for-connection-establishment/client-sends-connection-via-rendezvous
+// scenario: resource-handshake/rendezvous-trait-for-connection-establishment/server-accepts-connection-via-rendezvous
+// scenario: resource-handshake/host-mediated-connection-queue-resourcesender-resourcelistener/client-sends-connection-request-via-resourcesender
+// scenario: resource-handshake/host-mediated-connection-queue-resourcesender-resourcelistener/server-accepts-connection-via-resourcelistener
+// scenario: resource-handshake/typed-accept-trait/accepting-an-rpc-connection-via-accept-trait
+// scenario: resource-handshake/backpressure-on-send/server-is-slow-to-accept
+// scenario: resource-handshake/connection-identity/server-receives-client-identity
+// scenario: resource-handshake/queue-attach-authorisation/ungranted-attach-denied
+// scenario: resource-handshake/queue-attach-authorisation/discovery-resolved-attach-permitted
+// scenario: resource-handshake/queue-attach-authorisation/owner-attach-always-permitted
+// scenario: resource-handshake/handoff-metadata/metadata-delivered
+// scenario: resource-handshake/handoff-metadata/no-metadata
+// scenario: resource-handshake/handoff-metadata/oversized-metadata-rejected
+// scenario: resource-handshake/pinned-handoff-sender/handoff-from-unpinned-sender-refused
+// scenario: resource-handshake/pinned-handoff-sender/handler-resolution-is-authoritative
+// scenario: resource-handshake/guest-self-identity/self-info

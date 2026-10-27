@@ -14,16 +14,36 @@ on:
       - main
       - spine
 
+  # The soak and crash-consistency lanes are too slow for every push; they run
+  # nightly (and on demand) through the same gate entry point.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# The verification surface is one aggregate gate: every wasm prerequisite, the
+# whole workspace (unit, integration, doc tests, clippy, fmt), the wasm-patch
+# guard, spec traceability, the stage-2 wait-word conformance suites, and the
+# full ignored pack. It replaces the former check / test / selected-spine
+# jobs, so a new ignored test is covered by default rather than by being added
+# to a list.
+#
+# Branch protection must require the `Gate` job's check (see
+# docs/verification-gate.md). Required status checks are a repository setting,
+# not something this file can assert.
+
 jobs:
-  check:
-    name: Cargo checks
+  gate:
+    name: Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
-      # The workspace pins wasmtiny via a path dependency at ../../wasmtiny,
-      # so the repos are checked out side-by-side to preserve that layout.
+      # The workspace pins `wasmtiny` (and `ring`/`getrandom`) by git rev, so
+      # no sibling checkout is needed; the sibling wasmtiny checkout is kept
+      # only because the workspace's patching story in AGENTS.md assumes the
+      # two repositories are checked out side by side.
       - uses: actions/checkout@v7
         with:
           path: proto/arch3
@@ -31,159 +51,39 @@ jobs:
         with:
           repository: itpetey/wasmtiny
           path: wasmtiny
+          continue-on-error: true
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: stable
           components: clippy, rustfmt
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-        working-directory: proto/arch3
-
-      - name: cargo fmt
-        run: cargo fmt --all --check
-        working-directory: proto/arch3
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-        working-directory: proto/arch3
-
-  test:
-    name: Cargo tests
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: proto/arch3
-      - uses: actions/checkout@v7
-        with:
-          repository: itpetey/wasmtiny
-          path: wasmtiny
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
-        with:
-          toolchain: stable
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      - name: cargo test
-        run: cargo test --workspace --all-targets
-        working-directory: proto/arch3
-
-  spine:
-    name: Golden-path spine (WASM guest)
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: proto/arch3
-      - uses: actions/checkout@v7
-        with:
-          repository: itpetey/wasmtiny
-          path: wasmtiny
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
-        with:
-          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Every system guest must compile to wasm32; regressions here are
-      # invisible to the native test suite.
-      - name: build guests for wasm32
-        run: cargo build --target wasm32-unknown-unknown -p selium-spine-demo -p selium-discovery -p selium-discovery-probe -p selium-guest -p selium-connector-http -p selium-connector-dns -p selium-dns-demo
-        working-directory: proto/arch3
-
-      - name: golden-path spine test
-        run: cargo test -p selium-runtime --test spine -- --ignored
-        working-directory: proto/arch3
-
-      - name: discovery bootstrap test
-        run: cargo test -p selium-runtime --test discovery -- --ignored
-        working-directory: proto/arch3
-
-      - name: dns resolution spine test
-        run: cargo test -p selium-runtime --test dns_spine -- --ignored
-        working-directory: proto/arch3
-
-  shared-page-fastpath-guest:
-    name: Shared-page fast path (atomics guest)
-    runs-on: ubuntu-latest
-    env:
-      # Stage 1+2 toolchain wiring: nightly + stdarch_wasm_atomic_wait +
-      # +atomics/+shared-memory. Building std with the atomics feature is what
-      # makes wasm-ld accept --shared-memory (the prebuilt std was compiled
-      # without it), and --shared-memory/--max-memory is what declares memory 0
-      # shared with a maximum — the wasmtiny validator requirement.
-      RUSTFLAGS: >-
-        -C target-feature=+atomics,+bulk-memory,+mutable-globals
-        -C link-arg=--shared-memory
-        -C link-arg=--max-memory=1073741824
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: proto/arch3
-      - uses: actions/checkout@v7
-        with:
-          repository: itpetey/wasmtiny
-          path: wasmtiny
+      # The atomics net-demo and mt-demo prerequisites need nightly + rust-src;
+      # scripts/build-all.sh builds them as part of the gate.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: nightly
           components: rust-src
           targets: wasm32-unknown-unknown
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      # Cargo can only emit selium_net_demo.wasm for a crate named
-      # selium-net-demo, but the fastpath_wake test resolves the atomics
-      # module at selium_net_demo_atomics.wasm (see net_demo_wasm_path in
-      # crates/runtime/tests/fastpath_wake.rs — the plain and atomics
-      # flavours cannot share one output path). Copy it aside, mirroring
-      # build_atomics_guest in scripts/build-all.sh.
-      - name: build atomics guest
-        run: |
-          cargo build -Zbuild-std=std,panic_abort \
-            --target wasm32-unknown-unknown \
-            -p selium-spine-demo -p selium-discovery -p selium-net-demo \
-            --features selium-guest/nightly-wasm-atomics
-          cp target/wasm32-unknown-unknown/debug/selium_net_demo.wasm \
-             target/wasm32-unknown-unknown/debug/selium_net_demo_atomics.wasm
-        working-directory: proto/arch3
-
-      # Task 5.1 of the shared-page-fastpath change: deploy the real
-      # atomics net-demo guest and assert its memory.atomic.notify wakes
-      # the host drainer directly, with zero transition kicks after
-      # detection. RUSTFLAGS must be cleared for the host build — the
-      # wasm-only link flags poison a native compile.
-      - name: fast-path end-to-end (no runtime kick)
-        run: cargo test -p selium-runtime --test fastpath_wake -- --ignored
-        working-directory: proto/arch3
-        env:
-          RUSTFLAGS: ""
-
-      # RUSTFLAGS must be cleared here too: wasm-tools is compiled for the
-      # host target, and the job-level wasm flags (+atomics,
-      # --shared-memory) poison a native link just as they do for the test
-      # step above.
+      # The wasm-patch guard and the shared-memory declaration check read the
+      # built modules with wasm-tools.
       - name: install wasm-tools
         run: cargo install wasm-tools --locked --no-default-features --features print
         env:
           RUSTFLAGS: ""
 
-      # The guest module must declare memory 0 shared with a maximum, or the
-      # wasmtiny validator rejects atomic instructions and the fast path can
-      # never activate.
-      - name: verify shared-memory declaration
-        run: >-
-          wasm-tools print proto/arch3/target/wasm32-unknown-unknown/debug/selium_spine_demo.wasm
-          | grep -E '\(memory .*shared'
+      - name: verification gate
+        run: scripts/gate.sh
+        working-directory: proto/arch3
+        env:
+          GATE_REPEAT: "1"
 
-  shared-page-fastpath-stage2:
-    name: Shared-page fast path Stage 2 (per-OS wait-words)
+  soak:
+    name: Soak and crash-consistency
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -195,25 +95,21 @@ jobs:
         with:
           repository: itpetey/wasmtiny
           path: wasmtiny
+          continue-on-error: true
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
         with:
           toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: nightly
+          components: rust-src
+          targets: wasm32-unknown-unknown
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      # Task 4.2/4.3 of the shared-page-fastpath change: Stage 2 may only be
-      # enabled where the notify/wait race conformance test passes. This job
-      # is the per-platform evidence on Linux (futex); macOS is permanently
-      # Stage 1 (Darwin rejects wait-word primitives), and Windows/FreeBSD
-      # enablement awaits the same evidence there.
-      - name: stage 2 conformance (Linux futex)
-        run: cargo test -p selium-kernel --features stage2-wait-words --test wait_notify
-        working-directory: proto/arch3
-
-      # The whole kernel and runtime suites must also hold with Stage 2
-      # active, since every engine-backed wait then parks on the OS
-      # wait-word instead of the registry.
-      - name: kernel + runtime suites with stage 2 enabled
-        run: >-
-          cargo test -p selium-kernel -p selium-runtime
-          --features selium-runtime/stage2-wait-words
+      # Same entry point as the merge gate; the scheduled lane selects the
+      # soak/crash steps and prints their results and the known-unknowns
+      # register.
+      - name: soak and crash-consistency lanes
+        run: scripts/gate.sh --soak-only
         working-directory: proto/arch3

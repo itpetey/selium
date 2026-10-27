@@ -805,3 +805,86 @@ mod tests {
         );
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-guest` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-guest/safe-guest-handles/guest-opens-primitive-through-sdk-handle
+// scenario: selium-guest/messaging-pattern-layer/guest-selects-messaging-pattern
+// scenario: selium-guest/messaging-pattern-layer/prototype-local-pattern-composition
+// scenario: selium-guest/pub-sub-generation-change-detection/publisher-overwrites-unread-data-shm
+// scenario: selium-guest/pub-sub-generation-change-detection/normal-publishing-within-capacity
+// scenario: selium-guest/pub-sub-generation-change-detection/first-read-after-subscription
+// scenario: selium-guest/non-blocking-reader-poll/frame-is-ready
+// scenario: selium-guest/non-blocking-reader-poll/no-frame-ready-writers-connected
+// scenario: selium-guest/non-blocking-reader-poll/no-frame-ready-all-writers-disconnected
+// scenario: selium-guest/non-blocking-reader-poll/reader-detects-overwrite
+// scenario: selium-guest/strong-writer-backpressure-via-asyncwrite/writer-sends-bytes
+// scenario: selium-guest/strong-writer-backpressure-via-asyncwrite/writer-buffer-full
+// scenario: selium-guest/reader-writer-upgrade-and-downgrade/strong-reader-downgrades-to-weak
+// scenario: selium-guest/reader-writer-upgrade-and-downgrade/weak-reader-upgrades-to-strong
+// scenario: selium-guest/reader-writer-upgrade-and-downgrade/strong-writer-downgrades-to-weak
+// scenario: selium-guest/reader-writer-upgrade-and-downgrade/weak-writer-upgrades-to-strong
+// scenario: selium-guest/subscriber-publisher-upgrade-and-downgrade/subscriber-upgrades-from-weak-to-strong-shm
+// scenario: selium-guest/subscriber-publisher-upgrade-and-downgrade/publisher-upgrades-from-weak-to-strong-shm
+// scenario: selium-guest/safety-comments-on-unsafe-impls/safety-comment-documents-send-sync-rationale
+// scenario: selium-guest/livetable-in-selium-wire/livetable-is-importable-from-selium-wire
+// scenario: selium-guest/livetable-in-selium-wire/livetable-is-re-exported-from-selium-guest
+// scenario: selium-guest/rpc-types-in-selium-wire/rpcclient-is-importable-from-selium-wire
+// scenario: selium-guest/rpc-types-in-selium-wire/rpcclient-is-re-exported-from-selium-guest
+// scenario: selium-guest/guest-log-transport-module/guest-initialises-logging
+// scenario: selium-guest/guest-log-transport-module/logging-not-initialised
+// scenario: selium-guest/log-record-types-re-exported/log-record-fields-are-accessible
+// scenario: selium-guest/initerror-type/initerror-displays-meaningful-messages
+// scenario: selium-guest/resourcekind-threading-in-ringbuf/ringbuf-created-with-logchannel-purpose
+// scenario: selium-guest/guest-log-handle-deprecation/deprecated-guestlog-write-still-functions
+// scenario: selium-guest/reactor-parking-and-wake-sources/reactor-stalls-on-channel-waits
+// scenario: selium-guest/reactor-parking-and-wake-sources/channel-wait-resumes-on-generation-advance
+// scenario: selium-guest/host-clock-timer-firing/deadline-wake-delivery
+// scenario: selium-guest/entrypoint-result-extraction/successful-future-returns-its-output
+// scenario: selium-guest/entrypoint-result-extraction/failing-future-returns-its-error
+// scenario: selium-guest/entrypoint-result-extraction/entrypoint-parks-without-completing
+// scenario: selium-guest/entrypoint-result-extraction/late-completion-ends-the-process
+// scenario: selium-guest/entrypoint-result-extraction/panic-in-future-aborts-the-guest
+// scenario: selium-guest/joinhandle-result-access/result-extracted-after-reactor-parks
+// scenario: selium-guest/joinhandle-result-access/result-extraction-before-completion
+// scenario: selium-guest/raw-discovery-handle-accessor/guest-forwards-discovery-handle-to-a-spawned-child
+// scenario: selium-guest/entrypoint-argument-reader/read-pointer-argument-as-bytes
+// scenario: selium-guest/entrypoint-argument-reader/read-pointer-argument-as-utf-8
+// scenario: selium-guest/concurrent-task-execution/independent-tasks-advance-in-parallel
+// scenario: selium-guest/concurrent-task-execution/spawned-future-must-be-send
+// scenario: selium-guest/durable-storage-handles/log-operations-served-by-the-store
+// scenario: selium-guest/durable-storage-handles/no-storage-hostcalls-remain
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `guest-context` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: guest-context/discovery-client-in-context/guest-resolves-a-uri
+// scenario: guest-context/context-lookup-convenience-method/guest-resolves-a-known-uri-via-lookup
+// scenario: guest-context/context-lookup-convenience-method/guest-resolves-an-unknown-uri-via-lookup
+// scenario: guest-context/context-lookup-convenience-method/discovery-service-disconnected-during-lookup
+// scenario: guest-context/boot-time-service-convergence/consumer-converges-on-a-service-that-publishes-later
+// scenario: guest-context/boot-time-service-convergence/a-genuine-miss-is-not-retried-on-the-request-path
+// scenario: guest-context/context-register-convenience-method/guest-registers-a-uri-via-context
+// scenario: guest-context/context-register-convenience-method/registration-rejected-forbidden
+// scenario: guest-context/canonical-typed-publication/owner-publishes-a-canonical-record
+// scenario: guest-context/canonical-typed-publication/cross-tenant-canonical-publication-refused
+// scenario: guest-context/canonical-typed-publication/canonical-publication-is-optional
+// scenario: guest-context/context-revoke-convenience-method/guest-revokes-a-uri-via-context
+// scenario: guest-context/serve-based-route-registration/guest-registers-its-own-route
+// scenario: guest-context/serve-based-route-registration/route-registration-derives-wire-name-from-the-domain-table
+// scenario: guest-context/serve-based-route-registration/canonical-record-is-published-first
+// scenario: guest-context/serve-based-route-registration/claimed-root-name-is-served
+// scenario: guest-context/serve-based-route-registration/unclaimed-root-name-is-refused
+// scenario: guest-context/root-registration-capability-gated/root-registration-requires-capability
+// scenario: guest-context/root-registration-capability-gated/capability-holding-guest-registers-in-root
+// scenario: guest-context/context-store-client/durable-log-through-the-context
+// scenario: guest-context/context-store-client/store-service-unreachable
+// scenario: guest-context/context-resource-operations/named-region-creation
+// scenario: guest-context/context-resource-operations/name-resolution
+// scenario: guest-context/context-resource-operations/allocation-without-the-catalogue
+// scenario: guest-context/context-route-watch/guest-watches-a-route-and-converges
+// scenario: guest-context/context-route-watch/guest-re-attaches-after-a-provider-restarts
+// scenario: guest-context/context-route-watch/watch-outlives-an-unreachable-registry
+// scenario: guest-context/context-health-reporting/guest-publishes-health
+// scenario: guest-context/context-health-reporting/health-is-optional

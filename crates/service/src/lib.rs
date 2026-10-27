@@ -2313,3 +2313,42 @@ mod tests {
         }
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `schema-wire-generation` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: schema-wire-generation/wire-type-generation-from-generic-domain-type/generic-field-becomes-bytes-in-wire-type
+// scenario: schema-wire-generation/wire-type-generation-from-generic-domain-type/optional-generic-field-becomes-bytes-in-wire-type
+// scenario: schema-wire-generation/wire-type-generation-from-generic-domain-type/optional-scalar-field-uses-sentinel-in-wire-type
+// scenario: schema-wire-generation/wire-type-generation-from-generic-domain-type/concrete-field-passes-through-unchanged
+// scenario: schema-wire-generation/wire-type-generation-from-generic-domain-type/string-field-passes-through-unchanged
+// scenario: schema-wire-generation/flatmsg-bridge-impl-generation/encode-round-trips-through-generated-bridge
+// scenario: schema-wire-generation/flatmsg-bridge-impl-generation/hasschema-delegates-to-wire-type-schema
+// scenario: schema-wire-generation/error-on-generic-struct-without-wire-parameter/generic-struct-without-wire-fails-with-clear-error
+// scenario: schema-wire-generation/non-generic-struct-without-wire-works-unchanged/existing-wire-type-annotation-still-compiles
+// scenario: schema-wire-generation/data-carrying-enum-flatmsg-generation/enum-encodes-as-flattened-table
+// scenario: schema-wire-generation/data-carrying-enum-flatmsg-generation/enum-decodes-from-flattened-table
+// scenario: schema-wire-generation/data-carrying-enum-flatmsg-generation/unit-only-enum-behaviour-unchanged
+// scenario: schema-wire-generation/enum-variant-tag-assignment/tags-follow-declaration-order
+// scenario: schema-wire-generation/enum-variant-tag-assignment/duplicate-tag-is-a-compile-error
+// scenario: schema-wire-generation/enum-field-mapping-attributes/field-rename-maps-to-table-field
+// scenario: schema-wire-generation/enum-field-mapping-attributes/skipped-field-is-omitted-then-defaulted
+// scenario: schema-wire-generation/enum-strict-decode-errors/unknown-tag-rejected
+// scenario: schema-wire-generation/enum-strict-decode-errors/missing-required-field-rejected
+// scenario: schema-wire-generation/mixed-unit-and-data-variants/unit-variant-round-trips-alongside-data-variants
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-service` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-service/service-message-crate/crate-renamed-and-authoritative
+// scenario: selium-service/single-canonical-type-per-message/record-message-has-one-type
+// scenario: selium-service/data-carrying-enums-encode-via-generated-codec/control-response-encodes-and-decodes
+// scenario: selium-service/desired-state-records-are-flatbuffers-encodable/desired-state-record-round-trips
+// scenario: selium-service/pipe-control-frames-are-service-messages/handshake-is-flatbuffers
+// scenario: selium-service/strict-flatbuffers-service-decode/unknown-variant-tag-fails-decode
+// scenario: selium-service/strict-flatbuffers-service-decode/missing-required-nested-field-fails-decode
+// scenario: selium-service/discovery-message-vocabulary/revocation-variants-round-trip
+// scenario: selium-service/discovery-message-vocabulary/retired-variants-are-absent
+// scenario: selium-service/discovery-message-vocabulary/conflict-is-distinct-from-forbidden
+// scenario: selium-service/discovery-message-vocabulary/strict-decode-rejects-retired-variant-tags
+// scenario: selium-service/discovery-message-vocabulary/retired-tags-are-left-as-gaps

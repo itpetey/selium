@@ -272,3 +272,18 @@ fn two_attachments_share_region() {
 
     free_region(&runtime, process_id, region_id);
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `guest-shared-memory` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: guest-shared-memory/shared-region-allocation-via-regionprovider/guest-allocates-a-shared-region-via-provider
+// scenario: guest-shared-memory/shared-region-allocation-via-regionprovider/guest-allocates-with-read-only-protection
+// scenario: guest-shared-memory/shared-region-free/guest-frees-a-region-via-provider
+// scenario: guest-shared-memory/shared-region-free/region-freed-while-other-instances-are-attached
+// scenario: guest-shared-memory/shared-region-attach/guest-attaches-to-an-existing-region-via-provider
+// scenario: guest-shared-memory/shared-region-attach/guest-attaches-to-a-non-existent-region
+// scenario: guest-shared-memory/native-atomic-access-to-shared-regions/guest-reads-shared-data-via-regionmapping-read-u64
+// scenario: guest-shared-memory/native-atomic-access-to-shared-regions/guest-uses-atomic-cas-on-coordination-field
+// scenario: guest-shared-memory/shared-region-coordination-layout/standard-coordination-layout
+// scenario: guest-shared-memory/shared-region-coordination-layout/host-proxy-coordinates-via-shared-fields
+// scenario: guest-shared-memory/shared-region-coordination-layout/kernel-notifies-guest-via-generation-counter

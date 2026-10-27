@@ -97,3 +97,11 @@ pub(crate) fn install_heap_provider() {
         selium_memory::HeapRegionProvider::new(),
     )));
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-shm` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-shm/reader-writer-wait-semantics/pending-implies-registered
+// scenario: selium-shm/reader-writer-wait-semantics/disconnect-is-observable
+// scenario: selium-shm/layout-plumbing-separation/layout-usable-without-a-provider
+// scenario: selium-shm/layout-plumbing-separation/public-api-stability

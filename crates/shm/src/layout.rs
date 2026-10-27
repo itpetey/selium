@@ -54,6 +54,14 @@ pub const WRITER_COUNT_OFFSET: u64 = 16;
 pub const WRITER_SLOTS_OFFSET: u64 = 1080;
 /// Byte offset of the shared `writer_slot_counter` (fetch_add for unique writer slot indices).
 pub const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
+/// Byte offset of the shared `peer_closed` word.
+///
+/// The host sets this on a session's request ring when the peer process
+/// departs without a clean close (a crash). Readers treat it as EOF, exactly
+/// like a zero writer count, so a handler parked on the ring can close its
+/// session and release the region. The word sits after the last allocated
+/// header field (2112) and well inside `RING_HEADER_SIZE`.
+pub const PEER_CLOSED_OFFSET: u64 = 2112;
 
 /// A monotonic cursor over a shared-memory ring buffer.
 #[derive(Clone, Copy, Debug)]
@@ -357,6 +365,23 @@ pub fn allocate_writer_id(backend: &dyn MappingBackend) -> Result<u32> {
         return Err(Error::CapacityExceeded);
     }
     Ok(id as u32)
+}
+
+/// Loads the shared `peer_closed` flag.
+pub fn load_peer_closed(backend: &dyn MappingBackend) -> Result<bool> {
+    backend
+        .atomic_load_u64(PEER_CLOSED_OFFSET, Ordering::Acquire)
+        .map(|value| value != 0)
+        .map_err(Error::from)
+}
+
+/// Marks the ring's peer as departed and bumps the generation so a parked
+/// reader wakes and observes it. Returns the new generation.
+pub fn mark_peer_closed(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_store_u64(PEER_CLOSED_OFFSET, 1, Ordering::Release)
+        .map_err(Error::from)?;
+    bump_generation(backend)
 }
 
 /// Bumps the generation counter and returns the new value.
@@ -1059,3 +1084,11 @@ mod tests {
         assert_eq!(encoded, 1); // encoded position 0 = 1
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `ring-protocol-core` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: ring-protocol-core/single-ring-protocol-definition/guest-and-host-read-identical-rings
+// scenario: ring-protocol-core/single-ring-protocol-definition/multi-memory-header-parsed-identically
+// scenario: ring-protocol-core/backend-generic-primitives/slot-allocation-is-uniform
+// scenario: ring-protocol-core/backend-generic-primitives/reservation-behaves-identically-across-backends

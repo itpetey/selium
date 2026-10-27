@@ -43,6 +43,46 @@ impl HostQueueRegistry {
             .ok_or(Error::NotFound(format!("host queue handle {local_id}")))
     }
 
+    /// Returns the number of live host queues (shared objects, not handles).
+    ///
+    /// The soak lane reads this to prove queue ownership is released when the
+    /// owner stops.
+    pub fn live_queue_count(&self) -> usize {
+        self.inner.queues_by_shared.lock().len()
+    }
+
+    /// Releases a local handle to a host queue and removes the queue once no
+    /// local handle references it.
+    ///
+    /// A queue with a live attacher stays (the attacher may still receive);
+    /// a queue whose last handle is gone is unreachable and is reclaimed.
+    pub fn detach_host_queue(&self, local_id: u64) {
+        let shared_id = {
+            let mut local = self.inner.local_queues.lock();
+            let Some(shared_id) = local.remove(&local_id) else {
+                return;
+            };
+            if local.values().any(|id| *id == shared_id) {
+                return;
+            }
+            shared_id
+        };
+        self.inner.queues_by_shared.lock().remove(&shared_id);
+    }
+
+    /// Removes a host queue and every local handle to it.
+    ///
+    /// Used when the queue's owning component stops: the listener queue is
+    /// created host-side (not through a guest hostcall), so no process handle
+    /// would otherwise release it.
+    pub fn destroy_host_queue(&self, shared_id: SharedResourceId) {
+        self.inner.queues_by_shared.lock().remove(&shared_id);
+        self.inner
+            .local_queues
+            .lock()
+            .retain(|_, id| *id != shared_id);
+    }
+
     /// Creates a new host-mediated connection queue.
     pub fn create_host_queue(&self, memory: &MemoryRegistry) -> HostQueueDescriptor {
         let local_id = memory.next_local_id();

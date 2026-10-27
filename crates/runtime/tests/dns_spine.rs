@@ -18,7 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use selium_abi::{Capability, CapabilityGrant, ResourceClass, ResourceSelector};
+use selium_abi::{ActivityKind, Capability, CapabilityGrant, ResourceClass, ResourceSelector};
 use selium_runtime::{Runtime, RuntimeConfig, SystemGuestArg, SystemGuestDescriptor};
 use selium_service::FlatMsg;
 
@@ -283,6 +283,11 @@ fn spawn_fake_tcp_server() -> std::net::SocketAddr {
 
 /// Polls the guest log channel until every needle appears in the drained
 /// messages.
+///
+/// The demo guest is one-shot: it can complete before the wait observes its
+/// last lines, which the reap path moves into the `ProcessExited` activity
+/// record. Read that record too, so a fast completion is not mistaken for a
+/// stuck guest (the failure this test reported under pack load).
 #[expect(clippy::panic, reason = "test helper")]
 fn wait_for_logs(
     runtime: &Runtime,
@@ -294,6 +299,13 @@ fn wait_for_logs(
     let start = Instant::now();
     while start.elapsed() < timeout {
         seen.extend(drain_logs(runtime, process_id));
+        if !runtime.is_guest_resident(process_id) {
+            for message in reaped_log_lines(runtime, process_id) {
+                if !seen.contains(&message) {
+                    seen.push(message);
+                }
+            }
+        }
         if needles
             .iter()
             .all(|needle| seen.iter().any(|message| message.contains(needle)))
@@ -303,4 +315,16 @@ fn wait_for_logs(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
+}
+
+/// Log summaries the reap path moved into the activity log for `process_id`.
+fn reaped_log_lines(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .activity_log()
+        .iter()
+        .filter(|event| {
+            event.process_id == Some(process_id) && event.kind == ActivityKind::ProcessExited
+        })
+        .map(|event| event.message.clone())
+        .collect()
 }

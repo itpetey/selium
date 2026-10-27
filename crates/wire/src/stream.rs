@@ -1450,3 +1450,18 @@ fn try_poll_ready<M: MessageTransport>(reader: &mut FramedRead<M>) -> WireResult
         Err(e) => Err(e),
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `transport-abstraction` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: transport-abstraction/messagetransport-trait/transport-signals-data-available
+// scenario: transport-abstraction/messagetransport-trait/transport-signals-empty
+// scenario: transport-abstraction/messagetransport-trait/transport-signals-peer-closed
+// scenario: transport-abstraction/patterns-generic-over-messagetransport/publisher-is-instantiated-with-shm-transport
+// scenario: transport-abstraction/patterns-generic-over-messagetransport/publisher-is-instantiated-with-quic-transport
+// scenario: transport-abstraction/patterns-generic-over-messagetransport/subscriber-detects-overwrite-over-shm-transport
+// scenario: transport-abstraction/patterns-generic-over-messagetransport/subscriber-does-not-report-overwrite-over-quic-transport
+// scenario: transport-abstraction/frame-format-transport-independent/frame-written-over-shm-is-readable-over-shm
+// scenario: transport-abstraction/frame-format-transport-independent/frame-written-over-quic-is-readable-over-quic
+// scenario: transport-abstraction/transport-error-abstraction/rpcerror-from-transport-error
+// scenario: transport-abstraction/waker-honest-frame-readiness/socket-transport-parks-through-the-codec

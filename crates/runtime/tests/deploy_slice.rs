@@ -87,7 +87,7 @@ fn deploy_spawns_from_a_durable_slice_across_restart() {
         &runtime,
         probe,
         &[("uploaded module", 1), ("durable slice", 1)],
-        std::time::Duration::from_secs(30),
+        spine_common::SHORT_BOUND,
     );
     assert!(
         logs.iter().any(|line| line.contains("uploaded module")),
@@ -114,7 +114,7 @@ fn deploy_spawns_from_a_durable_slice_across_restart() {
         &runtime,
         probe,
         &[("reusing persisted manifest", 1), ("durable slice", 1)],
-        std::time::Duration::from_secs(30),
+        spine_common::SHORT_BOUND,
     );
     assert!(
         logs.iter()

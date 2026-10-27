@@ -359,3 +359,19 @@ where
     let mut cx = Context::from_waker(&waker);
     Pin::new(framed).poll_next(&mut cx)
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `framed-io` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: framed-io/framedread-type/read-a-complete-frame
+// scenario: framed-io/framedread-type/no-frame-ready
+// scenario: framed-io/framedread-type/underlying-transport-returns-overwrite-error
+// scenario: framed-io/framedwrite-type/write-a-framed-payload
+// scenario: framed-io/framedwrite-type/payload-too-large-for-frame
+// scenario: framed-io/framedread-framedwrite-generic-over-transport/framedread-wraps-an-shm-transport
+// scenario: framed-io/framedread-framedwrite-generic-over-transport/framedread-wraps-a-quic-transport
+// scenario: framed-io/framedread-exposes-generation-counter/read-generation-counter
+// scenario: framed-io/messagetransport-composes-asyncread-asyncwrite/frame-codec-reads-header-via-asyncread
+// scenario: framed-io/messagetransport-composes-asyncread-asyncwrite/frame-codec-writes-payload-via-asyncwrite
+// scenario: framed-io/waker-honest-async-read-path/native-read-parks-instead-of-spinning
+// scenario: framed-io/waker-honest-async-read-path/generation-tracked-read-is-unchanged

@@ -1496,3 +1496,35 @@ mod tests {
         }
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-accountant` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-accountant/per-second-metering-sampling/sample-covers-all-live-processes
+// scenario: selium-accountant/counter-and-gauge-reduction/counter-difference
+// scenario: selium-accountant/counter-and-gauge-reduction/gauge-sample
+// scenario: selium-accountant/counter-and-gauge-reduction/storage-read-per-tenant
+// scenario: selium-accountant/bucket-publication/accountant-consumes-buckets
+// scenario: selium-accountant/metering-projection-by-the-host/observations-track-consumption
+// scenario: selium-accountant/per-minute-billing-windows-and-ledger/window-rolled-to-ledger
+// scenario: selium-accountant/per-minute-billing-windows-and-ledger/dropped-sample-recovered
+// scenario: selium-accountant/plan-and-overage-ceilings/overage-recorded
+// scenario: selium-accountant/plan-and-overage-ceilings/hard-ceiling-preempted
+// scenario: selium-accountant/account-state-machine-and-enforcement/delinquency-suspends-a-tenant
+// scenario: selium-accountant/account-state-machine-and-enforcement/restored-tenant
+// scenario: selium-accountant/quota-enforcement-at-allocation/allocation-over-quota-denied
+// scenario: selium-accountant/quota-enforcement-at-allocation/append-over-volume-quota-denied
+// scenario: selium-accountant/quota-enforcement-at-allocation/spawn-over-process-quota-denied
+// scenario: selium-accountant/quota-enforcement-at-allocation/quota-distinct-from-grant
+// scenario: selium-accountant/quota-enforcement-at-allocation/pre-authoring-usage-is-inherited
+// scenario: selium-accountant/quota-enforcement-at-allocation/a-dying-process-releases-its-reservations
+// scenario: selium-accountant/pipe-quotas-meter-queued-items/over-ceiling-send-denied
+// scenario: selium-accountant/pipe-quotas-meter-queued-items/receiving-frees-the-slot
+// scenario: selium-accountant/handed-off-resources-transfer-ownership/cross-tenant-handoff-moves-the-reservation
+// scenario: selium-accountant/narrowing-publication/narrowed-conferral
+// scenario: selium-accountant/sole-quota-authorship/non-accountant-quota-write-denied
+// scenario: selium-accountant/process-quota-ceiling/default-process-ceiling-authored
+// scenario: selium-accountant/process-quota-ceiling/raised-process-ceiling-authored
+// scenario: selium-accountant/process-quota-ceiling/delinquent-process-ceiling-zeroed
+// scenario: selium-accountant/per-tenant-cpu-budget-authoring/ceiling-authored-per-minute
+// scenario: selium-accountant/per-tenant-cpu-budget-authoring/delinquent-cpu-ceiling-zeroed

@@ -820,3 +820,20 @@ fn ungranted_region_attach_denied() {
         CompletionState::Ready(_)
     ));
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `http-connector` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: http-connector/edge-termination-of-http-1-1-over-tls/browser-grade-request
+// scenario: http-connector/edge-termination-of-http-1-1-over-tls/missing-certificate-material
+// scenario: http-connector/discovery-based-route-resolution/request-routed-to-registered-guest
+// scenario: http-connector/discovery-based-route-resolution/request-routed-via-a-registered-domain
+// scenario: http-connector/discovery-based-route-resolution/apex-request-routed-to-the-root-service
+// scenario: http-connector/discovery-based-route-resolution/no-route-registered
+// scenario: http-connector/typed-forwarding-with-tag-correlation/concurrent-keep-alive-requests
+// scenario: http-connector/zero-network-grant-app-guests/app-guest-serves-with-no-network-grant
+// scenario: http-connector/zero-network-grant-app-guests/ungranted-third-party-cannot-intercept
+// scenario: http-connector/edge-backpressure-honesty/slow-app-guest
+// scenario: http-connector/streaming-bodies-via-server-streaming-rpc/chunked-response-streamed-to-the-wire
+// scenario: http-connector/streaming-bodies-via-server-streaming-rpc/oversized-request-rejected-at-the-edge
+// scenario: http-connector/raw-path-coexistence/byo-framework-alongside-connector

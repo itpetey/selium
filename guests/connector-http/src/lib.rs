@@ -274,3 +274,16 @@ async fn load_tls_config(ctx: &mut Context) -> Result<Arc<rustls::ServerConfig>,
     info!("http-connector: TLS configured successfully");
     Ok(Arc::new(config))
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `connector-channel-forwarding` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: connector-channel-forwarding/route-resolution-to-typed-session/forwarded-request-reaches-registered-guest
+// scenario: connector-channel-forwarding/route-resolution-to-typed-session/session-establishment-contacts-only-the-resolved-guest
+// scenario: connector-channel-forwarding/per-connection-region-lifecycle/distinct-regions-per-external-connection
+// scenario: connector-channel-forwarding/per-connection-region-lifecycle/reclamation-on-disconnect
+// scenario: connector-channel-forwarding/per-connection-region-lifecycle/reclamation-on-serving-guest-close
+// scenario: connector-channel-forwarding/queue-derived-receiver-rights/zero-grant-serving-guest-attaches-session-region
+// scenario: connector-channel-forwarding/queue-derived-receiver-rights/third-party-cannot-claim-handoff-rights
+// scenario: connector-channel-forwarding/stale-route-failure-semantics/revoked-route-fails-loudly
+// scenario: connector-channel-forwarding/stale-route-failure-semantics/failed-forward-does-not-poison-the-connector

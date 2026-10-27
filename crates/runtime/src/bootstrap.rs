@@ -158,6 +158,9 @@ impl Runtime {
                     return Err(error);
                 }
             };
+            if descriptor.discovery_service {
+                *self.discovery_process_id.lock() = Some(bootstrapped.process_id);
+            }
             report.guests.push(bootstrapped);
         }
 

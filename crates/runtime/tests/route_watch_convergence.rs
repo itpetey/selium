@@ -41,6 +41,10 @@ const ROLE_PROVIDER: u64 = 1;
 /// registration rather than a leaf alias (an alias additionally requires the
 /// typed target to be registered under its own URI first).
 const ROUTE: &str = "sel://probe/app/service";
+/// Reviewed bound on a route-watch convergence event. Both sides run in the
+/// interpreted guest; the appearance is driven by a host wake, so a loaded
+/// runner only delays it.
+const CONVERGENCE_BOUND: Duration = Duration::from_secs(30);
 
 /// Waits for the consumer to report an appearance and returns the resource id
 /// it converged on.
@@ -50,7 +54,7 @@ fn appeared_resource(runtime: &Runtime, consumer_id: u64) -> u64 {
         runtime,
         consumer_id,
         "consumer: appeared",
-        Duration::from_secs(30),
+        CONVERGENCE_BOUND,
     );
     line.split_whitespace()
         .next_back()
@@ -107,7 +111,7 @@ fn consumer_converges_on_a_provider_that_starts_later_and_restarts() {
         &runtime,
         consumer_id,
         "consumer: watching",
-        Duration::from_secs(30),
+        CONVERGENCE_BOUND,
     );
 
     // --- The provider appears. Nothing polls the consumer. ---
@@ -116,7 +120,7 @@ fn consumer_converges_on_a_provider_that_starts_later_and_restarts() {
         &runtime,
         first_provider,
         "provider: registered",
-        Duration::from_secs(30),
+        CONVERGENCE_BOUND,
     );
     let first = appeared_resource(&runtime, consumer_id);
 
@@ -128,7 +132,7 @@ fn consumer_converges_on_a_provider_that_starts_later_and_restarts() {
         &runtime,
         consumer_id,
         "consumer: revoked",
-        Duration::from_secs(30),
+        CONVERGENCE_BOUND,
     );
 
     // --- The provider restarts with a fresh resource: re-attach. ---
@@ -137,7 +141,7 @@ fn consumer_converges_on_a_provider_that_starts_later_and_restarts() {
         &runtime,
         second_provider,
         "provider: registered",
-        Duration::from_secs(30),
+        CONVERGENCE_BOUND,
     );
     let second = appeared_resource(&runtime, consumer_id);
     assert_ne!(

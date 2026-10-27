@@ -21,7 +21,7 @@
 //! cargo test -p selium-runtime --test accountant_recovery -- --ignored
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use selium_abi::ResourceClass;
 use selium_accountant::{
@@ -32,6 +32,11 @@ use selium_runtime::{Runtime, RuntimeConfig, SystemGuestDescriptor};
 use spine_common::{
     StateRoot, discovery_descriptor, read_wasm, runtime_in_state_root, store_descriptor,
 };
+
+/// Reviewed bound on a respawned accountant replaying the ledger and
+/// re-authoring enforcement. The replay is guest work plus host polling, so a
+/// loaded runner only delays it.
+const RECOVERY_BOUND: Duration = Duration::from_secs(60);
 
 mod common;
 mod spine_common;
@@ -79,6 +84,7 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
         })
         .expect("bootstrap accounting spine");
 
+    wait_for_enforcement_reauthored(&runtime, None, RECOVERY_BOUND);
     assert_enforcement_reauthored(&runtime);
 
     // Stop the accountant and re-spawn it from the same descriptor: the
@@ -116,24 +122,7 @@ async fn accountant_ledger_survives_restart_and_reauthors_enforcement() {
 
     // There is no readiness signal: drive the respawned guest and wait for the
     // re-authored enforcement to become observable.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        runtime.poll_guest(respawn.process_id);
-        if runtime
-            .kernel()
-            .quota()
-            .lookup(ACTIVE, ResourceClass::SharedRegion)
-            == Some(40 * 65_536)
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "respawned accountant never re-authored enforcement"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
+    wait_for_enforcement_reauthored(&runtime, Some(respawn.process_id), RECOVERY_BOUND);
     assert_enforcement_reauthored(&runtime);
 
     for guest in report.guests {
@@ -159,6 +148,40 @@ fn accounting_descriptor(
         discovery_service: false,
         handlers: Vec::new(),
     }
+}
+
+/// Waits, bounded, for the accountant to re-author every quota the assertion
+/// below checks.
+///
+/// The accountant authors `SharedRegion`, `Volume`, `Process`, and `Cpu`
+/// through separate hostcalls, and may park before it starts (converging on the
+/// bookkeeper's topic). Observing one class is therefore not evidence that the
+/// projection is complete: under pack load an intermediate state failed the
+/// immediate assertion even though the guest was still working.
+fn wait_for_enforcement_reauthored(runtime: &Runtime, poll: Option<u64>, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(process_id) = poll {
+            runtime.poll_guest(process_id);
+        }
+        if enforcement_reauthored(runtime) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accountant never re-authored enforcement within {bound:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Every enforcement fact the assertion below checks is present.
+fn enforcement_reauthored(runtime: &Runtime) -> bool {
+    let quota = runtime.kernel().quota();
+    quota.lookup(DELINQUENT, ResourceClass::SharedRegion) == Some(0)
+        && quota.lookup(DELINQUENT, ResourceClass::Volume) == Some(0)
+        && quota.lookup(ACTIVE, ResourceClass::SharedRegion) == Some(40 * 65_536)
+        && quota.lookup(ACTIVE, ResourceClass::Volume) == Some(20 * 65_536)
 }
 
 /// Asserts the accountant re-authored enforcement from the replayed ledger:

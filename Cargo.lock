@@ -1343,6 +1343,7 @@ version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
  "selium-guest",
+ "selium-service",
  "selium-shm",
 ]
 

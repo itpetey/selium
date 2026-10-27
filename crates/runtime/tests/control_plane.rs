@@ -100,7 +100,7 @@ fn control_plane_bootstrap_slice_end_to_end() {
             ("catalogue registered", 1),
             ("health published and observed: true", 1),
         ],
-        std::time::Duration::from_secs(60),
+        spine_common::OBSERVATION_BOUND,
     );
     assert!(
         logs.iter()
@@ -126,7 +126,7 @@ fn control_plane_bootstrap_slice_end_to_end() {
             ("catalogue unreachable", 1),
             ("anonymous allocation succeeded", 1),
         ],
-        std::time::Duration::from_secs(60),
+        spine_common::OBSERVATION_BOUND,
     );
     assert!(
         logs.iter()
@@ -148,7 +148,7 @@ fn control_plane_bootstrap_slice_end_to_end() {
         &runtime,
         probe,
         &[("catalogue replayed", 1)],
-        std::time::Duration::from_secs(60),
+        spine_common::OBSERVATION_BOUND,
     );
     assert!(
         logs.iter().any(|line| line.contains("catalogue replayed")),
@@ -267,3 +267,34 @@ fn find(report: &BootstrapReport, name: &str) -> selium_abi::ProcessId {
         .unwrap_or_else(|| panic!("bootstrap report contains guest {name}"))
         .process_id
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `control-plane` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: control-plane/control-plane-guest-crate/control-plane-bootstraps-from-descriptor
+// scenario: control-plane/served-typed-control-surface/serving-route-registered
+// scenario: control-plane/served-typed-control-surface/external-client-reaches-the-served-surface
+// scenario: control-plane/typed-wire-protocol/typed-request-and-reply
+// scenario: control-plane/typed-wire-protocol/no-text-grammar-for-control
+// scenario: control-plane/user-facing-desired-state-ownership/deployment-update-recorded
+// scenario: control-plane/user-facing-desired-state-ownership/desired-state-read-reflects-accepted-updates
+// scenario: control-plane/user-facing-desired-state-ownership/pipeline-binding-recorded
+// scenario: control-plane/narrow-delegation/placement-delegated-to-scheduler
+// scenario: control-plane/narrow-delegation/resolution-delegated-to-discovery
+// scenario: control-plane/narrow-delegation/recovery-delegated-to-supervisor
+// scenario: control-plane/capability-enforced-access/privileged-client-reaches-the-control-surface
+// scenario: control-plane/capability-enforced-access/unprivileged-client-is-refused
+// scenario: control-plane/capability-enforced-access/session-with-unresolvable-tenant-refused
+// scenario: control-plane/requestor-tenant-derivation/tenant-scoped-deliverer-scoped-to-its-tenant
+// scenario: control-plane/requestor-tenant-derivation/root-deliverer-scoped-as-root
+// scenario: control-plane/requestor-tenant-derivation/external-client-scoped-through-its-bridge-channel
+// scenario: control-plane/module-upload-to-the-durable-store/upload-stores-a-module
+// scenario: control-plane/module-upload-to-the-durable-store/deploy-references-a-stored-module
+// scenario: control-plane/module-upload-to-the-durable-store/uploaded-module-survives-a-restart
+// scenario: control-plane/delegation-error-propagation/delegated-failure-carries-step-and-context
+// scenario: control-plane/flatbuffers-desired-state-log-records/deployment-intent-is-recorded-as-flatbuffers
+// scenario: control-plane/flatbuffers-desired-state-log-records/projection-rebuilds-from-flatbuffers-replay
+// scenario: control-plane/flatbuffers-desired-state-log-records/desired-state-types-live-in-the-service-crate
+// scenario: control-plane/resource-catalogue-ownership/registration-recorded-durably
+// scenario: control-plane/resource-catalogue-ownership/lookup-is-tenant-scoped
+// scenario: control-plane/resource-catalogue-ownership/catalogue-rebuilt-on-boot

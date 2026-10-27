@@ -144,3 +144,24 @@ impl TcpListener {
         self.listener.accept::<TcpStream>().await
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `guest-networking` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: guest-networking/guest-tcp-listener/guest-accepts-a-connection
+// scenario: guest-networking/guest-tcp-listener/each-connection-is-a-hot-attached-region
+// scenario: guest-networking/literals-only-network-addresses/hostname-connect-rejected
+// scenario: guest-networking/literals-only-network-addresses/literal-connect-accepted
+// scenario: guest-networking/guest-udp-socket-datagram-api/guest-sends-a-datagram
+// scenario: guest-networking/guest-udp-socket-datagram-api/guest-receives-a-datagram
+// scenario: guest-networking/raw-stream-escape-hatch/byo-framework-drives-the-stream
+// scenario: guest-networking/tcp-stream-via-shared-memory-ring-buffer/guest-connects-to-remote-tcp-endpoint
+// scenario: guest-networking/tcp-stream-via-shared-memory-ring-buffer/guest-reads-data-from-tcp-stream
+// scenario: guest-networking/tcp-stream-via-shared-memory-ring-buffer/guest-writes-data-to-tcp-stream
+// scenario: guest-networking/tcp-stream-via-shared-memory-ring-buffer/stream-eof-from-remote-end
+// scenario: guest-networking/tcp-stream-via-shared-memory-ring-buffer/frame-boundaries-are-not-messages
+// scenario: guest-networking/quinn-udpsender-implementation/quinn-sends-a-datagram
+// scenario: guest-networking/quinn-udpsender-implementation/quinn-sends-with-full-send-channel
+// scenario: guest-networking/quinn-asyncudpsocket-recv-implementation/quinn-polls-for-received-datagrams
+// scenario: guest-networking/quinn-asyncudpsocket-recv-implementation/quinn-polls-with-empty-recv-channel
+// scenario: guest-networking/quinn-asyncudpsocket-recv-implementation/quinn-polls-with-disconnected-recv-channel

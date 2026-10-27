@@ -217,6 +217,17 @@ impl Debug for KernelBackend {
     }
 }
 
+impl KernelBackend {
+    /// Detaches this backend's host mapping.
+    ///
+    /// Called by the last named owner of the mapping (e.g. a process's
+    /// log-channel reader) when it is dropped. Clones produced by `sub_region`
+    /// share the mapping and must not detach it, so this is not a `Drop` impl.
+    pub(crate) fn detach_mapping(&self) {
+        drop(self.memory.detach_shared_region(self.local_id));
+    }
+}
+
 /// Helper: allocates a shared region and creates a `KernelBackend` for it.
 impl MemoryRegistry {
     /// Allocates a shared region and returns a `KernelBackend` covering the

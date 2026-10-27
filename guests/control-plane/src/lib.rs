@@ -1298,3 +1298,15 @@ mod tests {
         );
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `resource-catalogue` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: resource-catalogue/catalogue-ownership-by-a-system-guest/catalogue-survives-restart
+// scenario: resource-catalogue/catalogue-ownership-by-a-system-guest/removal-is-recorded
+// scenario: resource-catalogue/named-resource-registration/owner-registers-a-name
+// scenario: resource-catalogue/named-resource-registration/non-owner-registration-rejected
+// scenario: resource-catalogue/anonymous-allocation-is-not-catalogued/scratch-region-without-the-catalogue
+// scenario: resource-catalogue/anonymous-allocation-is-not-catalogued/catalogue-unreachable
+// scenario: resource-catalogue/catalogue-backed-lookup/name-resolves-to-its-resource
+// scenario: resource-catalogue/catalogue-backed-lookup/cross-tenant-lookup-refused

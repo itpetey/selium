@@ -19,14 +19,12 @@
 //! cargo test -p selium-runtime --test power_cycle -- --ignored
 //! ```
 
-use std::time::Duration;
-
 use selium_abi::ResourceClass;
 use selium_runtime::RuntimeConfig;
 use spine_common::{
-    StateRoot, control_plane_descriptor, discovery_descriptor, identity_descriptor,
-    operator_descriptor_named, read_blob, read_log_records, read_manifest, read_wasm,
-    store_descriptor, wait_for_logs,
+    CONVERGENCE_BOUND, StateRoot, control_plane_descriptor, discovery_descriptor,
+    identity_descriptor, operator_descriptor_named, read_blob, read_log_records, read_manifest,
+    read_wasm, store_descriptor, wait_for_logs,
 };
 
 mod common;
@@ -166,19 +164,19 @@ async fn platform_state_survives_a_power_cycle() {
         &runtime,
         onboard,
         &[("onboarded and client certificate issued", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
     wait_for_logs(
         &runtime,
         deploy,
         &[("power-cycle: deployed power-cycle-worker", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
     wait_for_logs(
         &runtime,
         quota,
         &[("power-cycle: authored acme process ceiling", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
 
     // The tenant's durable record landed in the identity guest's log.
@@ -278,7 +276,7 @@ async fn second_lifetime_asserts_survival() {
         &runtime,
         issued,
         &[("issued a further acme certificate after the restart", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
     let ca_before = std::fs::read(state.path().join("keys/tenants/acme.cert.der"))
         .expect("the tenant CA recorded before the restart is still on disk");
@@ -298,7 +296,7 @@ async fn second_lifetime_asserts_survival() {
         &runtime,
         verify,
         &[("power-cycle: deployment power-cycle-worker replicas=2", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
 
     // The uploaded module's bytes survived.

@@ -124,6 +124,31 @@ impl TimerDriver {
     pub(crate) fn schedule(&self, request: SleepRequest) {
         self.queue.push(request);
     }
+
+    /// Drops every sleep queued by `process_id`.
+    ///
+    /// A stopped process will never consume the completion wake, so its
+    /// deadlines must not linger in the driver — a guest parked on a long
+    /// `Timer` would otherwise leave a queue entry behind for its full
+    /// duration (the soak lane's timer finding).
+    pub(crate) fn cancel_process(&self, process_id: ProcessId) {
+        let mut pending = self.queue.pending.lock();
+        let before = pending.len();
+        pending.retain(|Reverse(request)| request.process_id != process_id);
+        if pending.len() != before {
+            // The earliest deadline may have moved; wake the driver so it
+            // re-parks against the new head.
+            self.queue.arrived.notify_all();
+        }
+    }
+
+    /// Returns the number of guest sleeps still queued on the driver.
+    ///
+    /// The soak lane reads this to prove a reaped process does not strand its
+    /// deadlines in the driver.
+    pub(crate) fn pending_count(&self) -> usize {
+        self.queue.pending.lock().len()
+    }
 }
 
 impl Runtime {

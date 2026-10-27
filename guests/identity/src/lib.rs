@@ -1216,3 +1216,21 @@ mod tests {
         assert!(has(Capability::RouteClaim));
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-identity` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-identity/host-held-signing-oracle/signing-returns-certificates-never-keys
+// scenario: selium-identity/host-held-signing-oracle/tenant-ca-key-never-reaches-the-guest
+// scenario: selium-identity/host-held-signing-oracle/user-leaf-signed-from-client-supplied-spki
+// scenario: selium-identity/depth-3-certificate-hierarchy/tenant-ca-minted-by-the-intermediate
+// scenario: selium-identity/depth-3-certificate-hierarchy/root-key-unreachable-from-guests
+// scenario: selium-identity/tenant-ca-lifecycle/onboarding-a-tenant-publishes-its-anchor
+// scenario: selium-identity/tenant-ca-lifecycle/revoking-a-tenant-ca-removes-its-anchor
+// scenario: selium-identity/user-certificate-lifecycle/issuing-a-user-cert-records-the-fingerprint
+// scenario: selium-identity/user-certificate-lifecycle/short-ttl-leaf-expires
+// scenario: selium-identity/principal-registry-and-baseline-grants/grant-table-reflects-the-registry
+// scenario: selium-identity/principal-registry-and-baseline-grants/unknown-fingerprint-is-absent
+// scenario: selium-identity/tiered-request-surface/tenant-tier-request-cannot-mint-a-tenant-ca
+// scenario: selium-identity/tiered-request-surface/operator-tier-request-mints-a-tenant-ca
+// scenario: selium-identity/durable-state-and-replay/restart-replays-registries

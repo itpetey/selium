@@ -342,3 +342,19 @@ fn spawn_shared_memory_guest(runtime: &Runtime, name: &str) -> ProcessId {
         )],
     )
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `guest-log-transport` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: guest-log-transport/guest-log-channel-creation/log-channel-is-created-with-drop-backpressure
+// scenario: guest-log-transport/guest-log-channel-creation/log-channel-capacity-is-configurable
+// scenario: guest-log-transport/log-channel-allocated-with-logchannel-purpose/runtime-auto-registers-log-channel
+// scenario: guest-log-transport/tracing-subscriber-integration/tracing-info-publishes-to-log-channel
+// scenario: guest-log-transport/tracing-subscriber-integration/tracing-error-with-fields-publishes-structured-record
+// scenario: guest-log-transport/tracing-subscriber-integration/subscriber-init-is-idempotent
+// scenario: guest-log-transport/re-entrancy-guard/re-entrant-log-event-is-suppressed
+// scenario: guest-log-transport/third-party-log-stream-discovery/third-party-guest-subscribes-via-process-uri
+// scenario: guest-log-transport/third-party-log-stream-discovery/third-party-guest-subscribes-via-custom-uri
+// scenario: guest-log-transport/log-record-wire-format/log-record-encodes-and-decodes-round-trip
+// scenario: guest-log-transport/kernel-log-channel-subscription/kernel-receives-log-channel-registration
+// scenario: guest-log-transport/kernel-log-channel-subscription/host-side-consumer-reads-logs-from-kernel

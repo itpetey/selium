@@ -659,6 +659,51 @@ impl Runtime {
             region_attachments.retain(|_, attachers| !attachers.is_empty());
         }
 
+        // The log-channel reader maps the guest's log region host-side. Release
+        // it before the region reclaim pass: a region is only destroyed once its
+        // mapping count reaches zero, so a mapping left here would keep the
+        // guest's log region alive after the process is gone.
+        self.kernel.processes().release_log_channel(process_id);
+
+        // Release the guest-memory mappings this process took on shared
+        // regions *before* the reclaim pass. The engine counts attachments and
+        // only decrements them on an explicit detach with the same memory; the
+        // guest instance is already unloaded by now, so the runtime recorded
+        // the handles at attach time. Without this a stopped owner leaves every
+        // region it mapped permanently un-destroyable (the soak lane's finding).
+        self.detach_guest_region_mappings(Some(process_id), None);
+
+        // A stopped guest never consumes a timer wake; drop its pending
+        // deadlines so a long `Timer` does not outlive the process.
+        self.cancel_process_timers(process_id);
+
+        // A sender that died cannot withdraw the writer registration of an
+        // RPC session it handed to a receiver, so the receiver's handler would
+        // park forever and retain the connection region. Mark each handed-off
+        // session's peer departed and wake the receiver; the handler then
+        // closes the session and frees the region it owns.
+        let handed_off = self
+            .handed_off_sessions
+            .lock()
+            .remove(&process_id)
+            .unwrap_or_default();
+        for shared_id in handed_off {
+            if let Ok(closed) = selium_shm::rpc::close_session(shared_id) {
+                self.note_generation_advance(closed.region_id, closed.generation);
+            }
+        }
+
+        // The discovery service's listener queue is created host-side, so no
+        // process local handle owns it: release it (and the feed publisher)
+        // when the discovery guest stops.
+        if *self.discovery_process_id.lock() == Some(process_id) {
+            if let Some(shared_id) = self.discovery_listener_shared_id.lock().take() {
+                self.kernel.queues().destroy_host_queue(shared_id);
+            }
+            *self.discovery_process_id.lock() = None;
+            *self.discovery_publisher.lock() = None;
+        }
+
         // Owner-keyed revocation first: the process node, its named routes,
         // aliases, health records, and any typed record it owns as itself
         // (its own process-node URI). Identity-keyed typed records (regions,
@@ -777,6 +822,11 @@ impl Runtime {
                             &ResourceClass::HostQueue,
                             shared_id,
                         );
+                        // The queue itself ends with its last local handle: a
+                        // queue with no attacher left is unreachable, so
+                        // reclaim it rather than accumulating one per listener
+                        // that ever stopped.
+                        self.kernel.queues().detach_host_queue(local_id);
                     }
                 }
                 ResourceClass::TcpListener => {
@@ -1410,12 +1460,26 @@ impl Runtime {
                     ),
                 });
                 debug!(process_id, "guest entrypoint completed; reaping process");
+                // Unload the module *before* teardown: the reclaim pass reads
+                // each region's mapping count, and this poll owner is the last
+                // chance to drop the app. (Engine-side attachments taken by a
+                // guest-side `AttachRegion` are not decremented by this drop;
+                // that remaining growth is filed as change task 8.4.)
+                drop(loaded_guest);
                 drop(self.cleanup_failed_process(process_id));
                 false
             }
             Ok(_) => {
-                self.loaded_guests.lock().insert(process_id, loaded_guest);
-                true
+                // A stop may have run while this pass was executing: do not
+                // resurrect the guest it unloaded, or the execution leaks (the
+                // soak lane's resident-guest finding).
+                if self.kernel.processes().is_running(process_id) {
+                    self.loaded_guests.lock().insert(process_id, loaded_guest);
+                    true
+                } else {
+                    drop(loaded_guest);
+                    false
+                }
             }
             Err(error) => {
                 // A failed poll is permanent: do not re-insert the guest, or
@@ -1426,6 +1490,9 @@ impl Runtime {
                     error = %error,
                     "guest poll after mailbox wake failed"
                 );
+                // As in the completion path: detach and unload first so the
+                // module's region mappings are gone before the reclaim pass.
+                drop(loaded_guest);
                 self.record_poll_failure(process_id, &error);
                 false
             }
@@ -2710,3 +2777,91 @@ mod tests {
         );
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-runtime` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-runtime/wasmtiny-backed-guest-execution/runtime-starts-a-guest-module
+// scenario: selium-runtime/shared-memory-hostcall-passthrough/authorised-region-allocation
+// scenario: selium-runtime/shared-memory-hostcall-passthrough/unauthorised-region-allocation-denied
+// scenario: selium-runtime/region-lifetime-tied-to-guest-lifecycle/guest-exits-with-attached-regions
+// scenario: selium-runtime/network-hostcall-dispatch/guest-connects-to-tcp-endpoint-via-runtime
+// scenario: selium-runtime/network-hostcall-dispatch/guest-binds-tcp-listener-via-runtime
+// scenario: selium-runtime/network-hostcall-dispatch/guest-binds-udp-socket-via-runtime
+// scenario: selium-runtime/dedicated-timer-driver/guest-calls-sleep
+// scenario: selium-runtime/dedicated-timer-driver/timer-completes-without-an-ambient-executor
+// scenario: selium-runtime/dedicated-timer-driver/a-cancelled-sleep-is-not-woken
+// scenario: selium-runtime/cross-process-channel-wake-delivery/cross-guest-write-wakes-a-parked-reader
+// scenario: selium-runtime/cross-process-channel-wake-delivery/host-commit-wakes-its-subscriber
+// scenario: selium-runtime/cross-process-channel-wake-delivery/waking-a-stopped-process-is-a-no-op
+// scenario: selium-runtime/resource-revocation-by-identity/minted-resource-revokes-under-its-tenant
+// scenario: selium-runtime/resource-revocation-by-identity/teardown-needs-no-side-map
+// scenario: selium-runtime/sub-struct-architecture/sub-structs-are-independently-usable
+// scenario: selium-runtime/sub-struct-architecture/cross-subsystem-orchestration-uses-function-parameters
+// scenario: selium-runtime/tokio-dependency/runtime-uses-ambient-tokio-context
+// scenario: selium-runtime/tokio-dependency/tests-use-tokio-test
+// scenario: selium-runtime/async-network-i-o/tcp-accept-loop-uses-async-i-o
+// scenario: selium-runtime/async-network-i-o/tcp-proxy-uses-async-i-o
+// scenario: selium-runtime/discovery-enabled-bootstrap/discovery-wiring-uses-tagged-argument-encoding
+// scenario: selium-runtime/discovery-enabled-bootstrap/readiness-is-per-guest
+// scenario: selium-runtime/discovery-enabled-bootstrap/application-guest-receives-discovery-handle
+// scenario: selium-runtime/runtime-discovery-publication-session/runtime-connects-to-discovery-guest
+// scenario: selium-runtime/resource-authority-record-on-allocation/mint-records-the-principal-tenant
+// scenario: selium-runtime/resource-authority-record-on-allocation/authority-answers-before-the-owner-publishes
+// scenario: selium-runtime/no-host-registration-publication/allocation-publishes-nothing
+// scenario: selium-runtime/no-host-registration-publication/process-start-publishes-nothing
+// scenario: selium-runtime/process-teardown-revocation/exit-revokes-before-reclaim
+// scenario: selium-runtime/process-teardown-revocation/runtime-revokes-all-process-uris-on-exit
+// scenario: selium-runtime/process-teardown-revocation/runtime-revokes-freed-resource-identities
+// scenario: selium-runtime/process-teardown-revocation/failed-teardown-is-retryable
+// scenario: selium-runtime/process-teardown-revocation/co-owned-resource-survives-an-owner-exit
+// scenario: selium-runtime/guestlogregister-hostcall-validation/guestlogregister-accepted-for-own-region
+// scenario: selium-runtime/guestlogregister-hostcall-validation/guestlogregister-rejected-for-foreign-region
+// scenario: selium-runtime/discovery-handle-passed-to-guest-entrypoints/application-guest-receives-discovery-handle-unchanged
+// scenario: selium-runtime/grant-admission-and-evaluation/accept-then-deny-is-impossible
+// scenario: selium-runtime/grant-admission-and-evaluation/errors-attribute-correctly
+// scenario: selium-runtime/entrypoint-failure-detection/non-zero-exit-code-fails-bootstrap
+// scenario: selium-runtime/entrypoint-failure-detection/zero-exit-code-proceeds-normally
+// scenario: selium-runtime/entrypoint-failure-detection/void-entrypoint-no-return-value-proceeds-normally
+// scenario: selium-runtime/entrypoint-argument-injection/integer-argument-encoded-as-i64
+// scenario: selium-runtime/entrypoint-argument-injection/pointer-argument-bytes-injected-into-guest-memory
+// scenario: selium-runtime/entrypoint-argument-injection/pointer-argument-layout-is-declaration-ordered
+// scenario: selium-runtime/entrypoint-argument-injection/oversized-pointer-payload-rejected
+// scenario: selium-runtime/owner-published-process-nodes/process-node-is-published-by-the-process
+// scenario: selium-runtime/owner-published-process-nodes/process-node-revoked-at-teardown
+// scenario: selium-runtime/owner-published-process-nodes/unpublished-process-is-accounted-but-undiscoverable
+// scenario: selium-runtime/owner-published-process-nodes/registry-publishes-its-routes-without-a-self-rpc
+// scenario: selium-runtime/principal-provenance-allocation/system-process-allocates-for-another-tenant
+// scenario: selium-runtime/principal-provenance-allocation/root-principal-allocates-for-any-tenant-without-delegation
+// scenario: selium-runtime/principal-provenance-allocation/unauthorised-cross-tenant-allocation-denied
+// scenario: selium-runtime/principal-provenance-allocation/host-queue-minted-under-the-serving-tenant
+// scenario: selium-runtime/principal-provenance-allocation/volume-minted-under-the-serving-tenant
+// scenario: selium-runtime/principal-provenance-allocation/selector-less-delegation-grant-rejected
+// scenario: selium-runtime/entrypoint-completion-terminates-the-process/completed-entrypoint-reaps-the-process
+// scenario: selium-runtime/entrypoint-completion-terminates-the-process/long-running-entrypoint-stays-resident
+// scenario: selium-runtime/process-spawn-quota/spawn-over-the-process-ceiling-denied
+// scenario: selium-runtime/process-spawn-quota/quota-distinct-from-lifecycle-grant
+// scenario: selium-runtime/process-spawn-quota/exited-process-returns-its-slot
+// scenario: selium-runtime/state-root-boot/dependants-start-after-the-store
+// scenario: selium-runtime/state-root-boot/usage-reconstructed-at-boot
+// scenario: selium-runtime/host-keyring-persistence/first-boot-generates-and-persists
+// scenario: selium-runtime/host-keyring-persistence/restart-preserves-the-hierarchy
+// scenario: selium-runtime/volume-hostcall-enforcement/append-beyond-the-ceiling-denied
+// scenario: selium-runtime/volume-hostcall-enforcement/removal-releases-usage
+// scenario: selium-runtime/protocol-handler-route-claims/handler-claim-is-host-provisioned
+// scenario: selium-runtime/protocol-handler-route-claims/handler-guest-publishes-its-claim
+// scenario: selium-runtime/protocol-handler-route-claims/guests-cannot-forge-a-handler
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `route-claims` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: route-claims/host-issued-route-claims/claim-holder-publishes-a-reserved-name
+// scenario: route-claims/host-issued-route-claims/process-without-a-claim-is-refused
+// scenario: route-claims/host-issued-route-claims/claim-is-not-delegable
+// scenario: route-claims/host-issued-route-claims/exact-match-only
+// scenario: route-claims/exclusive-live-claims/second-claimant-refused
+// scenario: route-claims/exclusive-live-claims/claim-released-on-owner-exit
+// scenario: route-claims/well-known-names-are-claims/handler-guest-claims-its-scheme
+// scenario: route-claims/well-known-names-are-claims/another-guest-cannot-claim-a-scheme
+// scenario: route-claims/expected-claim-reconciliation/unpublished-claim-is-visible-as-drift
+// scenario: route-claims/expected-claim-reconciliation/non-publishing-guest-remains-accounted

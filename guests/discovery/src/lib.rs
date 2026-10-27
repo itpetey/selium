@@ -1027,6 +1027,7 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
             }
         };
 
+        let connection_region_id = incoming.shared_id;
         let connection =
             match selium_shm::rpc::accept::<DiscoveryRequest, DiscoveryResponse>(incoming.into()) {
                 Ok(c) => c,
@@ -1038,7 +1039,12 @@ async fn discovery_main(feed_region_id: u64, listener_shared_id: u64) -> anyhow:
 
         let store = store.clone();
         let route_table = route_table.clone();
-        selium_guest::spawn(handler(store, route_table, connection));
+        selium_guest::spawn(handler(
+            store,
+            route_table,
+            connection_region_id,
+            connection,
+        ));
     }
 }
 
@@ -1075,6 +1081,7 @@ async fn feed_loop(
 async fn handler(
     store: Arc<Mutex<DiscoveryStore>>,
     route_table: Arc<RouteTable>,
+    connection_region_id: u64,
     mut conn: selium_shm::rpc::RpcConnection<DiscoveryRequest, DiscoveryResponse>,
 ) {
     let client_process_id = conn.client_process_id();
@@ -1090,219 +1097,233 @@ async fn handler(
             "failed to resolve caller tenant for process {client_process_id}; denying requests"
         );
     }
+    // A delivered rendezvous region transfers to discovery, so this handler
+    // owns its client's connection region and releases it when the session
+    // ends. (Releasing a departed client's region while the handler is parked
+    // would unmap memory the parked read is using; that needs a parked-read
+    // interrupt and is recorded as a known unknown.)
     loop {
-        match conn.recv().await {
-            Ok(request) => {
-                let response = {
-                    let mut store = store
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let response = match request.payload() {
-                        Ok(payload) if !scope_verified => denied_response(&payload),
-                        Ok(payload) => match payload {
-                            DiscoveryRequest::Resolve(uri) => {
-                                match store.resolve_exact(&uri, caller_tenant.as_deref()) {
-                                    Some(target) => {
-                                        // A resolved shared resource (region or
-                                        // queue) gains an authorisation basis
-                                        // for the resolving client, but only
-                                        // when its owner declared it attachable
-                                        // by resolution: the runtime enforces
-                                        // the declaration's scope and refuses an
-                                        // undeclared resource. No guest identity
-                                        // is privileged for recording.
-                                        if matches!(
-                                            target.class,
-                                            selium_abi::ResourceClass::SharedRegion
-                                                | selium_abi::ResourceClass::HostQueue
-                                        ) && let Err(error) =
-                                            selium_guest::record_resolved_resource_for(
-                                                target.class.clone(),
-                                                target.resource_id,
-                                                client_process_id,
-                                            )
-                                        {
-                                            selium_guest::warn!(
-                                                "resolve authorisation record failed: {error}"
-                                            );
-                                        }
-                                        DiscoveryResponse::Found(target)
-                                    }
-                                    None => DiscoveryResponse::NotFound,
-                                }
-                            }
-                            DiscoveryRequest::ResolvePrefix(prefix) => {
-                                let targets =
-                                    store.resolve_prefix(&prefix, caller_tenant.as_deref());
-                                DiscoveryResponse::Resolved(targets)
-                            }
-                            DiscoveryRequest::ResolveLabels { key, value } => {
-                                let targets =
-                                    store.resolve_labels(&key, &value, caller_tenant.as_deref());
-                                DiscoveryResponse::Resolved(targets)
-                            }
-                            DiscoveryRequest::Register {
-                                target,
-                                root_service,
-                                ..
-                            } => {
-                                // Ownership and the mint tenant are host facts.
-                                // Admission asks the authority synchronously and
-                                // never falls back to the projected store.
-                                match admission_authority(selium_guest::resource_authority(
-                                    client_process_id,
-                                    target.class.clone(),
-                                    target.resource_id,
-                                )) {
-                                    Some(authority) => {
-                                        let tentative = store.registration_key(&target.uri);
-                                        let claim_held = tentative.as_deref().is_some_and(|uri| {
-                                            selium_guest::process_capability_for_uri(
-                                                client_process_id,
-                                                Capability::RouteClaim,
-                                                Some(uri.to_string()),
-                                            )
-                                            .unwrap_or(false)
-                                        });
-                                        let response = store.apply_register(
-                                            client_process_id,
-                                            caller_tenant.as_deref(),
-                                            target,
-                                            &authority,
-                                            claim_held,
-                                            root_service,
-                                        );
-                                        if matches!(response, DiscoveryResponse::Registered)
-                                            && let Some(uri) = tentative
-                                        {
-                                            if uri.contains("/handler/") {
-                                                selium_guest::info!(
-                                                    "discovery: registered handler route {uri} for process {client_process_id}"
-                                                );
-                                            }
-                                            let now_ms = selium_guest::time::now()
-                                                .map(|nanos| nanos / 1_000_000)
-                                                .unwrap_or(0);
-                                            store.set_lease(&uri, client_process_id, now_ms);
-                                        } else if let Some(uri) = &tentative
-                                            && uri.contains("/handler/")
-                                        {
-                                            selium_guest::warn!(
-                                                "discovery: handler route {uri} for process {client_process_id} refused: {response:?}"
-                                            );
-                                        }
-                                        response
-                                    }
-                                    None => {
-                                        // Fail closed: the projection never
-                                        // substitutes for an authority answer.
-                                        selium_guest::warn!(
-                                            "discovery authority read failed for process {client_process_id}"
-                                        );
-                                        DiscoveryResponse::Forbidden
-                                    }
-                                }
-                            }
-                            DiscoveryRequest::Renew { uri } => {
-                                let now_ms = selium_guest::time::now()
-                                    .map(|nanos| nanos / 1_000_000)
-                                    .unwrap_or(0);
-                                // Keyed exactly as the original registration was,
-                                // so a wire-name registration renews the lease
-                                // taken out under its projected internal URI.
-                                if store.renew_lease_raw(&uri, client_process_id, now_ms) {
-                                    DiscoveryResponse::Registered
-                                } else {
-                                    DiscoveryResponse::Forbidden
-                                }
-                            }
-                            DiscoveryRequest::SetHealth { name, healthy } => {
-                                store.set_health(
-                                    caller_tenant.as_deref(),
-                                    client_process_id,
-                                    &name,
-                                    healthy,
-                                );
-                                if healthy {
-                                    DiscoveryResponse::Registered
-                                } else {
-                                    DiscoveryResponse::Revoked
-                                }
-                            }
-                            DiscoveryRequest::Revoke { uri } => {
-                                let internal =
-                                    store.registration_key(&uri).unwrap_or_else(|| uri.clone());
-                                let authority = match store.revocation_target(&internal) {
-                                    Some((class, id)) => selium_guest::resource_authority(
-                                        client_process_id,
-                                        class,
-                                        id,
-                                    )
-                                    .unwrap_or(selium_abi::ResourceAuthority {
-                                        owned: false,
-                                        tenant: None,
-                                        other_classes: Vec::new(),
-                                    }),
-                                    None => selium_abi::ResourceAuthority {
-                                        owned: false,
-                                        tenant: None,
-                                        other_classes: Vec::new(),
-                                    },
-                                };
-                                store.apply_revoke(
-                                    client_process_id,
-                                    caller_tenant.as_deref(),
-                                    &authority,
-                                    &uri,
-                                )
-                            }
-                            DiscoveryRequest::ListDomains => {
-                                DiscoveryResponse::Domains(store.domain_entries())
-                            }
-                            DiscoveryRequest::SetDomain { domain, tenant } => {
-                                // The advisory domain mapping is authored by the
-                                // bootstrap-provisioned `DomainWrite` authority
-                                // (the identity guest), not by any guest identity.
-                                let allowed = selium_guest::process_capability(
-                                    client_process_id,
-                                    Capability::DomainWrite,
-                                )
-                                .unwrap_or(false);
-                                if allowed {
-                                    store.seed_domain(&domain, &tenant);
-                                    DiscoveryResponse::Registered
-                                } else {
-                                    DiscoveryResponse::Forbidden
-                                }
-                            }
-                            // Tier-1 revocation operations never arrive over
-                            // RPC.
-                            DiscoveryRequest::ProcessGone { .. }
-                            | DiscoveryRequest::ResourceFreed { .. } => {
-                                DiscoveryResponse::Forbidden
-                            }
-                        },
-                        Err(error) => {
-                            selium_guest::warn!("discovery payload decode failed: {error}");
-                            continue;
-                        }
-                    };
-                    if let Err(error) = sync_route_table(&store, &route_table) {
-                        selium_guest::warn!("discovery route table sync failed: {error}");
-                    }
-                    response
-                };
-                if let Err(error) = request.reply(response).await {
-                    selium_guest::warn!("discovery reply failed: {error}");
-                    break;
-                }
-            }
+        let request = match conn.recv().await {
+            Ok(request) => request,
             Err(selium_shm::rpc::RpcError::ConnectionClosed) => break,
             Err(error) => {
                 selium_guest::warn!("discovery recv failed: {error}");
                 break;
             }
+        };
+        {
+            let response = {
+                let mut store = store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let response = match request.payload() {
+                    Ok(payload) if !scope_verified => denied_response(&payload),
+                    Ok(payload) => match payload {
+                        DiscoveryRequest::Resolve(uri) => {
+                            match store.resolve_exact(&uri, caller_tenant.as_deref()) {
+                                Some(target) => {
+                                    // A resolved shared resource (region or
+                                    // queue) gains an authorisation basis
+                                    // for the resolving client, but only
+                                    // when its owner declared it attachable
+                                    // by resolution: the runtime enforces
+                                    // the declaration's scope and refuses an
+                                    // undeclared resource. No guest identity
+                                    // is privileged for recording.
+                                    if matches!(
+                                        target.class,
+                                        selium_abi::ResourceClass::SharedRegion
+                                            | selium_abi::ResourceClass::HostQueue
+                                    ) && let Err(error) =
+                                        selium_guest::record_resolved_resource_for(
+                                            target.class.clone(),
+                                            target.resource_id,
+                                            client_process_id,
+                                        )
+                                    {
+                                        selium_guest::warn!(
+                                            "resolve authorisation record failed: {error}"
+                                        );
+                                    }
+                                    DiscoveryResponse::Found(target)
+                                }
+                                None => DiscoveryResponse::NotFound,
+                            }
+                        }
+                        DiscoveryRequest::ResolvePrefix(prefix) => {
+                            let targets = store.resolve_prefix(&prefix, caller_tenant.as_deref());
+                            DiscoveryResponse::Resolved(targets)
+                        }
+                        DiscoveryRequest::ResolveLabels { key, value } => {
+                            let targets =
+                                store.resolve_labels(&key, &value, caller_tenant.as_deref());
+                            DiscoveryResponse::Resolved(targets)
+                        }
+                        DiscoveryRequest::Register {
+                            target,
+                            root_service,
+                            ..
+                        } => {
+                            // Ownership and the mint tenant are host facts.
+                            // Admission asks the authority synchronously and
+                            // never falls back to the projected store.
+                            match admission_authority(selium_guest::resource_authority(
+                                client_process_id,
+                                target.class.clone(),
+                                target.resource_id,
+                            )) {
+                                Some(authority) => {
+                                    let tentative = store.registration_key(&target.uri);
+                                    let claim_held = tentative.as_deref().is_some_and(|uri| {
+                                        selium_guest::process_capability_for_uri(
+                                            client_process_id,
+                                            Capability::RouteClaim,
+                                            Some(uri.to_string()),
+                                        )
+                                        .unwrap_or(false)
+                                    });
+                                    let response = store.apply_register(
+                                        client_process_id,
+                                        caller_tenant.as_deref(),
+                                        target,
+                                        &authority,
+                                        claim_held,
+                                        root_service,
+                                    );
+                                    if matches!(response, DiscoveryResponse::Registered)
+                                        && let Some(uri) = tentative
+                                    {
+                                        if uri.contains("/handler/") {
+                                            selium_guest::info!(
+                                                "discovery: registered handler route {uri} for process {client_process_id}"
+                                            );
+                                        }
+                                        let now_ms = selium_guest::time::now()
+                                            .map(|nanos| nanos / 1_000_000)
+                                            .unwrap_or(0);
+                                        store.set_lease(&uri, client_process_id, now_ms);
+                                    } else if let Some(uri) = &tentative
+                                        && uri.contains("/handler/")
+                                    {
+                                        selium_guest::warn!(
+                                            "discovery: handler route {uri} for process {client_process_id} refused: {response:?}"
+                                        );
+                                    }
+                                    response
+                                }
+                                None => {
+                                    // Fail closed: the projection never
+                                    // substitutes for an authority answer.
+                                    selium_guest::warn!(
+                                        "discovery authority read failed for process {client_process_id}"
+                                    );
+                                    DiscoveryResponse::Forbidden
+                                }
+                            }
+                        }
+                        DiscoveryRequest::Renew { uri } => {
+                            let now_ms = selium_guest::time::now()
+                                .map(|nanos| nanos / 1_000_000)
+                                .unwrap_or(0);
+                            // Keyed exactly as the original registration was,
+                            // so a wire-name registration renews the lease
+                            // taken out under its projected internal URI.
+                            if store.renew_lease_raw(&uri, client_process_id, now_ms) {
+                                DiscoveryResponse::Registered
+                            } else {
+                                DiscoveryResponse::Forbidden
+                            }
+                        }
+                        DiscoveryRequest::SetHealth { name, healthy } => {
+                            store.set_health(
+                                caller_tenant.as_deref(),
+                                client_process_id,
+                                &name,
+                                healthy,
+                            );
+                            if healthy {
+                                DiscoveryResponse::Registered
+                            } else {
+                                DiscoveryResponse::Revoked
+                            }
+                        }
+                        DiscoveryRequest::Revoke { uri } => {
+                            let internal =
+                                store.registration_key(&uri).unwrap_or_else(|| uri.clone());
+                            let authority = match store.revocation_target(&internal) {
+                                Some((class, id)) => {
+                                    selium_guest::resource_authority(client_process_id, class, id)
+                                        .unwrap_or(selium_abi::ResourceAuthority {
+                                            owned: false,
+                                            tenant: None,
+                                            other_classes: Vec::new(),
+                                        })
+                                }
+                                None => selium_abi::ResourceAuthority {
+                                    owned: false,
+                                    tenant: None,
+                                    other_classes: Vec::new(),
+                                },
+                            };
+                            store.apply_revoke(
+                                client_process_id,
+                                caller_tenant.as_deref(),
+                                &authority,
+                                &uri,
+                            )
+                        }
+                        DiscoveryRequest::ListDomains => {
+                            DiscoveryResponse::Domains(store.domain_entries())
+                        }
+                        DiscoveryRequest::SetDomain { domain, tenant } => {
+                            // The advisory domain mapping is authored by the
+                            // bootstrap-provisioned `DomainWrite` authority
+                            // (the identity guest), not by any guest identity.
+                            let allowed = selium_guest::process_capability(
+                                client_process_id,
+                                Capability::DomainWrite,
+                            )
+                            .unwrap_or(false);
+                            if allowed {
+                                store.seed_domain(&domain, &tenant);
+                                DiscoveryResponse::Registered
+                            } else {
+                                DiscoveryResponse::Forbidden
+                            }
+                        }
+                        // Tier-1 revocation operations never arrive over
+                        // RPC.
+                        DiscoveryRequest::ProcessGone { .. }
+                        | DiscoveryRequest::ResourceFreed { .. } => DiscoveryResponse::Forbidden,
+                    },
+                    Err(error) => {
+                        selium_guest::warn!("discovery payload decode failed: {error}");
+                        continue;
+                    }
+                };
+                if let Err(error) = sync_route_table(&store, &route_table) {
+                    selium_guest::warn!("discovery route table sync failed: {error}");
+                }
+                response
+            };
+            if let Err(error) = request.reply(response).await {
+                selium_guest::warn!("discovery reply failed: {error}");
+                break;
+            }
         }
+    }
+
+    // The handler is done with the connection. Only a close confirmed by the
+    // host-set peer-departed flag is final: a writer-count dip during setup
+    // also surfaces as `ConnectionClosed` and must not free a live session.
+    // With a confirmed close, drop the session, then release the region
+    // discovery owns on the client's behalf.
+    let peer_closed = conn.peer_closed_flag().unwrap_or(false);
+    drop(conn);
+    if peer_closed && let Err(error) = selium_shm::free_region(connection_region_id) {
+        selium_guest::warn!(
+            "discovery failed to release connection region {connection_region_id}: {error}"
+        );
     }
 }
 

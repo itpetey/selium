@@ -50,11 +50,11 @@ use selium_identity_onboard::{MODE_ONBOARD, MODE_REVOKE};
 use selium_runtime::RuntimeConfig;
 use selium_service::{ControlRequest, ControlResponse, DelegationStatus, Deployment};
 use spine_common::{
-    CONNECTOR_ADDR, CONTROL_URI, SCHEDULER_DEFERRED, SpinePortGuard, StateRoot,
-    bridge_server_descriptor, client_options, connector_descriptor, control_plane_descriptor,
-    discovery_descriptor, drain_logs_if_live, identity_descriptor, operator_descriptor,
-    read_issued_leaf, read_wasm, runtime_in_state_root, seed_tls_blob_store, store_descriptor,
-    wait_for_logs,
+    CONNECTOR_ADDR, CONTROL_URI, CONVERGENCE_BOUND, HANDSHAKE_BOUND, OBSERVATION_BOUND,
+    SCHEDULER_DEFERRED, SpinePortGuard, StateRoot, bridge_server_descriptor, client_options,
+    connector_descriptor, control_plane_descriptor, discovery_descriptor, drain_logs_if_live,
+    identity_descriptor, operator_descriptor, read_issued_leaf, read_wasm, runtime_in_state_root,
+    seed_tls_blob_store, store_descriptor, wait_for_logs,
 };
 
 mod common;
@@ -161,7 +161,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
             ("quic-connector: listening on", 1),
             ("rebuilt client anchor set", 1),
         ],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
 
     // The bridge publishes its route from its own entrypoint; a client that
@@ -170,7 +170,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         &runtime,
         bridge,
         &[("bridge-server: route registered", 1)],
-        Duration::from_secs(120),
+        CONVERGENCE_BOUND,
     );
 
     // Diagnostic collector mirrors the spine test's failure-path handling.
@@ -227,13 +227,13 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         CONNECTOR_ADDR.parse().expect("connector address"),
         client_options(leaf.clone(), client_pkcs8.clone()),
     );
-    let client = match tokio::time::timeout(Duration::from_secs(240), connecting).await {
+    let client = match tokio::time::timeout(HANDSHAKE_BOUND, connecting).await {
         Ok(result) => result.expect("client connection"),
         Err(_elapsed) => panic!("handshake timed out; state: {:#?}", dump()),
     };
 
     let opening = client.rpc::<ControlRequest, ControlResponse>(CONTROL_URI);
-    let mut rpc = match tokio::time::timeout(Duration::from_secs(120), opening).await {
+    let mut rpc = match tokio::time::timeout(CONVERGENCE_BOUND, opening).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => panic!(
             "control route channel open failed: {error}; state: {:#?}",
@@ -247,7 +247,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         replicas: 3,
         module: "api/v1".to_string(),
     });
-    let accepted = match tokio::time::timeout(Duration::from_secs(120), deploying).await {
+    let accepted = match tokio::time::timeout(CONVERGENCE_BOUND, deploying).await {
         Ok(result) => result.expect("deploy round trip"),
         Err(_elapsed) => panic!("deploy timed out; guest logs: {:#?}", logs()),
     };
@@ -328,7 +328,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         &runtime,
         connector,
         &[("rebuilt client anchor set", 1)],
-        Duration::from_secs(60),
+        OBSERVATION_BOUND,
     );
     let rebuilds: Vec<String> = rebuild_logs
         .iter()
@@ -374,7 +374,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         CONNECTOR_ADDR.parse().expect("connector address"),
         client_options(leaf, client_pkcs8),
     );
-    let refused_client = match tokio::time::timeout(Duration::from_secs(240), refused).await {
+    let refused_client = match tokio::time::timeout(HANDSHAKE_BOUND, refused).await {
         Ok(Ok(client)) => client,
         // The handshake itself was refused: even better.
         Ok(Err(_refused)) => {
@@ -385,7 +385,7 @@ async fn identity_spine_onboards_and_reaches_the_control_plane() {
         Err(_elapsed) => panic!("revoked connection did not settle; state: {:#?}", dump()),
     };
     let opening = refused_client.rpc::<ControlRequest, ControlResponse>(CONTROL_URI);
-    match tokio::time::timeout(Duration::from_secs(120), opening).await {
+    match tokio::time::timeout(CONVERGENCE_BOUND, opening).await {
         Ok(Err(_refused)) => {}
         Ok(Ok(_rpc)) => panic!(
             "the revoked tenant's leaf must not carry a stream; post-revocation rebuilds: {rebuilds:?}; state: {:#?}",

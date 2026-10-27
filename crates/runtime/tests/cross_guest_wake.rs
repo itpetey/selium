@@ -352,3 +352,19 @@ fn waking_a_stopped_guest_is_a_no_op() {
     runtime.stop_process(survivor_id).expect("stop survivor");
     runtime.stop_process(publisher_id).expect("stop publisher");
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `channel-wake-wait` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: channel-wake-wait/wakeable-channel-reads/reader-parks-and-wakes-on-publish
+// scenario: channel-wake-wait/wakeable-channel-reads/reader-observes-disconnect-without-spinning
+// scenario: channel-wake-wait/wakeable-channel-writes-park-backpressure/parked-writer-resumes-after-reader-advance
+// scenario: channel-wake-wait/timer-completion/sleep-completes
+// scenario: channel-wake-wait/no-spin-stubs/no-silent-success-stubs
+// scenario: channel-wake-wait/cross-process-wait-registration/guest-reader-wakes-on-host-written-data
+// scenario: channel-wake-wait/cross-process-wait-registration/registration-for-unattached-region
+// scenario: channel-wake-wait/event-driven-proxy-threads/no-spin-loops
+// scenario: channel-wake-wait/event-driven-proxy-threads/stall-kicks-outbound-drain
+// scenario: channel-wake-wait/cross-thread-wake-delivery/poller-thread-delivers-an-end-to-end-wake
+// scenario: channel-wake-wait/cross-thread-wake-delivery/wake-racing-an-in-flight-poll-is-not-lost
+// scenario: channel-wake-wait/cross-thread-wake-delivery/no-embedder-cooperation-required

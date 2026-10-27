@@ -9,9 +9,10 @@ use selium_wire::error::{Error, Result};
 
 use crate::layout::{
     self, allocate_reader_slot, allocate_writer_id, cas_next_tail, init_ring, load_generation,
-    load_next_tail, load_writer_count, minimum_reader_position, minimum_writer_position,
-    release_reader_slot, reserve_tail, store_backpressure, store_reader_slot,
-    store_shared_capacity, store_writer_slot, update_reader_slot, update_writer_slot,
+    load_next_tail, load_peer_closed, load_writer_count, mark_peer_closed, minimum_reader_position,
+    minimum_writer_position, release_reader_slot, reserve_tail, store_backpressure,
+    store_reader_slot, store_shared_capacity, store_writer_slot, update_reader_slot,
+    update_writer_slot,
 };
 
 // Re-export all layout constants for backward compatibility.
@@ -204,6 +205,21 @@ impl ChannelRegion {
     /// Loads the shared `writer_count` from shared memory.
     pub fn load_writer_count(&self) -> Result<u64> {
         load_writer_count(self.backend())
+    }
+
+    /// Returns whether the peer has been marked departed.
+    ///
+    /// A departed peer is equivalent to a zero writer count: the host sets
+    /// this after the peer process is reaped, so a parked reader can close the
+    /// session and release its region.
+    pub fn peer_closed(&self) -> Result<bool> {
+        load_peer_closed(self.backend())
+    }
+
+    /// Marks the peer as departed and wakes parked readers by bumping the
+    /// generation. Returns the new generation.
+    pub fn mark_peer_closed(&self) -> Result<u64> {
+        mark_peer_closed(self.backend())
     }
 
     /// Atomically adds to the shared `writer_count`, returning the previous value.

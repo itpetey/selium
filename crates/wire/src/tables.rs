@@ -941,3 +941,20 @@ mod tests {
         assert_eq!(view.get(&"client-ca-acme".to_string()), Ok(Some(1u64)));
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `route-watch` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: route-watch/reactive-route-watch/watch-seeds-from-the-current-state
+// scenario: route-watch/reactive-route-watch/provider-appears-after-the-watch-starts
+// scenario: route-watch/reactive-route-watch/provider-is-replaced
+// scenario: route-watch/reactive-route-watch/provider-is-revoked
+// scenario: route-watch/reactive-route-watch/watch-converges-on-the-write
+// scenario: route-watch/registration-leases/lapsed-lease-expires-the-registration
+// scenario: route-watch/registration-leases/renewal-keeps-the-registration-live
+// scenario: route-watch/registration-leases/lease-expiry-fires-on-the-timer-schedule
+// scenario: route-watch/route-change-generations/replacement-advances-the-generation
+// scenario: route-watch/convergence-without-a-readiness-gate/consumer-starts-before-its-provider
+// scenario: route-watch/convergence-without-a-readiness-gate/provider-restarts-mid-life
+// scenario: route-watch/health-is-published-state/guest-reports-health-as-state
+// scenario: route-watch/health-is-published-state/missing-health-is-not-a-boot-failure

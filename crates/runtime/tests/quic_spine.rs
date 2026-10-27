@@ -77,6 +77,19 @@ const SERVER_NAME: &str = "localhost";
 /// handshake comment). Each opens a stream, so the guest-side "one accept
 /// per stream" assertion counts these too; keep the two in sync.
 const WARMUP_ROUNDS: usize = 12;
+/// Reviewed bound on the interpreted TLS 1.3 handshake. The handshake runs
+/// inside the wasm connector, so it is an order of magnitude slower than a
+/// native one; a loaded CI runner can take minutes, and the failure this
+/// distinguishes is "never completes", not "slow".
+const HANDSHAKE_BOUND: Duration = Duration::from_secs(240);
+/// Reviewed bound on two concurrent payload echoes through the interpreter
+/// (the relay is paced by quinn, so this is deliberately larger than the
+/// handshake). A relocation of the pacer's steady state shows up as the
+/// client's idle timeout, not as this bound.
+const RELAY_BOUND: Duration = Duration::from_secs(300);
+/// Reviewed bound on observing the guest-side relay logs, which are already
+/// produced by the time the echo futures resolve.
+const OBSERVATION_BOUND: Duration = Duration::from_secs(60);
 
 /// Builds the `selium-client` connection options: trust the connector's
 /// self-signed test certificate, with a patient transport config (the wasm32
@@ -316,10 +329,10 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
         &runtime,
         connector,
         &[("quic-connector: listening on", 1)],
-        Duration::from_secs(30),
+        OBSERVATION_BOUND,
     );
     let bound = format!("quic-demo: bound {SERVER_NAME}");
-    let _ = wait_for_logs(&runtime, demo, &[(&bound, 1)], Duration::from_secs(30));
+    let _ = wait_for_logs(&runtime, demo, &[(&bound, 1)], OBSERVATION_BOUND);
 
     // A native `selium-client` SDK connection. The future is created here and
     // awaited below (after the diagnostic collector starts) so handshake logs
@@ -355,7 +368,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
 
     // TLS 1.3 handshake against the wasm connector's quinn endpoint (the
     // production shm `AsyncUdpSocket` + guest `Runtime` adapters).
-    let client = match tokio::time::timeout(Duration::from_secs(240), connecting).await {
+    let client = match tokio::time::timeout(HANDSHAKE_BOUND, connecting).await {
         Ok(result) => result.expect("client connection"),
         Err(_elapsed) => {
             let mut snapshot = collected.lock().expect("collector lock").clone();
@@ -386,7 +399,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
     let payload_a_clone = payload_a.clone();
     let payload_b_clone = payload_b.clone();
 
-    let (echo_a, echo_b) = match tokio::time::timeout(Duration::from_secs(300), async {
+    let (echo_a, echo_b) = match tokio::time::timeout(RELAY_BOUND, async {
         tokio::join!(
             echo_round_trip(&connection, payload_a_clone),
             echo_round_trip(&connection, payload_b_clone),
@@ -443,7 +456,7 @@ async fn external_quinn_client_echoes_through_wasm_connector_guest() {
             ("accepted stream", WARMUP_ROUNDS + 2),
             (echo_needle.as_str(), 2),
         ],
-        Duration::from_secs(30),
+        OBSERVATION_BOUND,
     );
     assert_eq!(
         demo_logs

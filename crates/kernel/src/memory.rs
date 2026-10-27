@@ -253,6 +253,22 @@ impl MemoryRegistry {
             .count()
     }
 
+    /// Returns the number of live shared regions.
+    ///
+    /// The soak lane reads this to prove that region ownership is released
+    /// when the owner stops, rather than accumulating one record per spawn.
+    pub fn live_shared_region_count(&self) -> usize {
+        self.inner.shared_regions.lock().len()
+    }
+
+    /// Returns the number of live local mappings across every shared region.
+    ///
+    /// Mappings are what pin a region's pages in a process's address space, so
+    /// a leak here is a leak even if the region record is dropped.
+    pub fn live_shared_mapping_count(&self) -> usize {
+        self.inner.shared_mappings.lock().len()
+    }
+
     /// Returns the wasmtiny `SharedRegionId` backing a selium `SharedResourceId`.
     pub fn wasmtiny_region_id(&self, shared_id: SharedResourceId) -> Result<SharedRegionId> {
         self.inner
@@ -416,6 +432,26 @@ impl MemoryRegistry {
             .map_err(map_wasm_error)
     }
 
+    /// Detaches a shared region previously mapped into a guest's memory by
+    /// [`attach_shared_region_to_memory`].
+    ///
+    /// Symmetric with the attach: the engine decrements the region's
+    /// attachment count only on an explicit detach, so teardown uses this to
+    /// release mappings taken on a guest's behalf without needing the guest
+    /// instance (which may already be unloaded).
+    pub fn detach_shared_region_from_memory(
+        &self,
+        memory: &mut Memory,
+        shared_id: SharedResourceId,
+    ) -> Result<()> {
+        let region_id = self.wasmtiny_region_id(shared_id)?;
+        let registry = self.inner.store.lock().shared_memory_registry();
+        registry
+            .lock()
+            .detach_region(memory, region_id)
+            .map_err(map_wasm_error)
+    }
+
     /// Registers a shared region that was already allocated (e.g. by WasmApplication)
     /// in the kernel's metadata, returning a new selium `SharedResourceId`.
     pub fn register_guest_allocated_region(
@@ -480,3 +516,13 @@ mod tests {
         assert!(ids_a.iter().all(|&id| id != 0), "ids must never be 0");
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `per-page-memory-protection` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: per-page-memory-protection/per-page-memory-protection-on-attach/consumer-attaches-with-reader-slot
+// scenario: per-page-memory-protection/per-page-memory-protection-on-attach/consumer-attempts-write-to-data-page
+// scenario: per-page-memory-protection/per-page-memory-protection-on-attach/consumer-writes-to-its-own-cursor-page
+// scenario: per-page-memory-protection/per-page-memory-protection-on-attach/consumer-attempts-write-to-another-reader-s-cursor-page
+// scenario: per-page-memory-protection/producer-full-access/producer-attaches-without-reader-slot
+// scenario: per-page-memory-protection/protection-is-kernel-enforced/malicious-guest-bypass-attempt

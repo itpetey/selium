@@ -50,6 +50,28 @@ pub(crate) struct WaitEntry {
     pub(crate) generation: u64,
 }
 
+/// Process-local fault switches used by the failure-injection suite.
+///
+/// Every field is off (zero) by default: arming one is an explicit test
+/// action, and nothing in the product path consults them otherwise. They live
+/// on the runtime rather than behind a feature flag so an integration test can
+/// drive the same `Runtime` it bootstrapped, and are exposed only through
+/// `#[doc(hidden)]` setters.
+#[derive(Default)]
+pub(crate) struct RuntimeFaults {
+    /// Make the host's authoritative resource query fail as unavailable.
+    pub(crate) authority_unavailable: std::sync::atomic::AtomicBool,
+    /// Make a discovery-feed publish fail (teardown, revocation).
+    pub(crate) discovery_publish_failure: std::sync::atomic::AtomicBool,
+    /// Nanoseconds added to guest-visible clocks (`TimeNow`/`TimeMonotonic`),
+    /// so a lease can be aged past its TTL without waiting for wall time.
+    pub(crate) clock_offset_nanos: std::sync::atomic::AtomicU64,
+}
+
+/// Recorded guest-memory handles per (process, shared region) attachment.
+pub(crate) type GuestRegionMappings =
+    HashMap<(ProcessId, u64), Vec<wasmtiny::runtime::SharedMemory>>;
+
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
 pub struct Runtime {
@@ -157,6 +179,23 @@ pub struct Runtime {
     /// loading or generating the host keyring, and reconstructing per-tenant
     /// volume usage all happen exactly once, before any guest runs.
     state_root_prepared: Arc<AtomicBool>,
+    /// The discovery service's process id, recorded at bootstrap so its
+    /// teardown can release the host-created listener queue.
+    pub(crate) discovery_process_id: Arc<Mutex<Option<ProcessId>>>,
+    /// Guest-memory handles for shared-region attachments taken on a
+    /// process's behalf, one per attach. Teardown detaches each through the
+    /// same `Memory` the attach used: the engine decrements a region's
+    /// attachment count only on an explicit detach, and the guest instance may
+    /// already be unloaded by then (see `selium_kernel::MemoryRegistry::
+    /// detach_shared_region_from_memory`).
+    pub(crate) guest_region_memories: Arc<Mutex<GuestRegionMappings>>,
+    /// Parent regions a process handed to a receiver, keyed by the sender.
+    /// On the sender's teardown the runtime marks each session's peer departed
+    /// and wakes the receiver, so its parked handler closes and frees the
+    /// region it owns.
+    pub(crate) handed_off_sessions: Arc<Mutex<HashMap<ProcessId, Vec<u64>>>>,
+    /// Test-only fault injection (see [`RuntimeFaults`]); off unless armed.
+    pub(crate) faults: Arc<RuntimeFaults>,
 }
 
 /// Per-process CPU budget window: the wall-clock minute the process's engine
@@ -222,6 +261,10 @@ impl Runtime {
             worker_counts: Arc::new(Mutex::new(HashMap::new())),
             cpu_budget_windows: Arc::new(Mutex::new(HashMap::new())),
             state_root_prepared: Arc::new(AtomicBool::new(false)),
+            discovery_process_id: Arc::new(Mutex::new(None)),
+            guest_region_memories: Arc::new(Mutex::new(HashMap::new())),
+            handed_off_sessions: Arc::new(Mutex::new(HashMap::new())),
+            faults: Arc::new(RuntimeFaults::default()),
         };
 
         // Initialise the mio network poller if possible (best-effort).
@@ -299,6 +342,51 @@ impl Runtime {
         self.kernel.clone()
     }
 
+    /// Diagnostic: the process ids currently resident in the loaded-guest
+    /// table. Used by the soak lane's residency assertions.
+    #[doc(hidden)]
+    pub fn resident_guest_ids(&self) -> Vec<ProcessId> {
+        let mut ids: Vec<ProcessId> = self.loaded_guests.lock().keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Test-only: make the host authority answer an admission query as
+    /// unavailable.
+    ///
+    /// The failure-injection suite arms this to prove discovery denies a
+    /// registration instead of falling back to its projected store. Off by
+    /// default; no product path sets it.
+    #[doc(hidden)]
+    pub fn inject_authority_failure(&self, armed: bool) {
+        self.faults
+            .authority_unavailable
+            .store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: make discovery-feed publishes fail.
+    ///
+    /// Arms the retryable-teardown path: `stop_process` must report failure
+    /// and a later retry must complete the staged revocations. Off by default.
+    #[doc(hidden)]
+    pub fn inject_discovery_publish_failure(&self, armed: bool) {
+        self.faults
+            .discovery_publish_failure
+            .store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: advance every guest-visible clock by `offset`.
+    ///
+    /// The failure-injection suite uses this to age a lease past its TTL
+    /// without waiting for wall time. Off by default.
+    #[doc(hidden)]
+    pub fn advance_guest_clock(&self, offset: core::time::Duration) {
+        let nanos = u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX);
+        self.faults
+            .clock_offset_nanos
+            .fetch_add(nanos, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Returns the shared region id of the discovery pub/sub feed ring, if discovery was started.
     pub fn discovery_feed_region_id(&self) -> Option<u64> {
         self.discovery_publisher
@@ -366,6 +454,17 @@ impl Runtime {
     /// something unrelated re-enters the guest, so a Tier-1 event can sit
     /// unread indefinitely and the routes it removes stay resolvable.
     pub(crate) fn publish_discovery_event(&self, request: DiscoveryRequest) -> Result<()> {
+        // Test seam: the failure-injection suite arms this to exercise the
+        // retryable teardown path. Off unless explicitly armed.
+        if self
+            .faults
+            .discovery_publish_failure
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::Error::Host(
+                "discovery publish failed (injected)".to_string(),
+            ));
+        }
         // Scoped so the publisher lock is released before the wake is
         // delivered: the wake re-enters the woken guest inline, and that guest
         // may itself publish to the feed.
@@ -417,6 +516,108 @@ impl Runtime {
                     .map(std::num::NonZeroUsize::get)
                     .unwrap_or(1)
             })
+    }
+
+    /// Records a shared-region attachment taken into a guest's memory, so
+    /// teardown can detach it later without the guest instance.
+    pub(crate) fn record_guest_region_mapping(
+        &self,
+        process_id: ProcessId,
+        region_id: u64,
+        memory: &wasmtiny::runtime::SharedMemory,
+    ) {
+        self.guest_region_memories
+            .lock()
+            .entry((process_id, region_id))
+            .or_default()
+            .push(memory.clone());
+    }
+
+    /// Detaches every recorded guest-memory mapping for `process_id` (or for a
+    /// single `region_id` when given), releasing the engine's attachment
+    /// counts.
+    pub(crate) fn detach_guest_region_mappings(
+        &self,
+        process_id: Option<ProcessId>,
+        region_id: Option<u64>,
+    ) {
+        let handles: Vec<(u64, wasmtiny::runtime::SharedMemory)> = {
+            let mut records = self.guest_region_memories.lock();
+            let keys: Vec<(ProcessId, u64)> = records
+                .keys()
+                .filter(|(owner, region)| {
+                    process_id.is_none_or(|expected| *owner == expected)
+                        && region_id.is_none_or(|expected| *region == expected)
+                })
+                .copied()
+                .collect();
+            keys.into_iter()
+                .flat_map(|key| {
+                    records
+                        .remove(&key)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|memory| (key.1, memory))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        for (region, memory) in handles {
+            let Ok(mut memory) = memory.lock() else {
+                continue;
+            };
+            drop(
+                self.kernel
+                    .memory()
+                    .detach_shared_region_from_memory(&mut memory, region),
+            );
+        }
+    }
+
+    /// Drops any sleeps the process left queued on the timer driver.
+    pub(crate) fn cancel_process_timers(&self, process_id: ProcessId) {
+        if let Some(driver) = self.timer_driver.get() {
+            driver.cancel_process(process_id);
+        }
+    }
+
+    /// Guest-visible clock offset armed by the failure-injection suite, in
+    /// nanoseconds. Zero unless `advance_guest_clock` was called.
+    pub(crate) fn guest_clock_offset_nanos(&self) -> u64 {
+        self.faults
+            .clock_offset_nanos
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Number of guest sleeps still queued on the timer driver, or zero when
+    /// no timer has been scheduled.
+    ///
+    /// A reaped process must not strand its deadlines: the soak lane asserts
+    /// this returns to zero after every spawn/stop cycle.
+    pub fn pending_timer_count(&self) -> usize {
+        self.timer_driver
+            .get()
+            .map_or(0, crate::timer::TimerDriver::pending_count)
+    }
+
+    /// Diagnostic: owners of every shared region, sorted by region id.
+    ///
+    /// Used by the soak lane to attribute a leaked region to the process that
+    /// still owns it (an empty owner list means the resource is unattributed).
+    pub fn region_owner_report(&self) -> Vec<(u64, Vec<u64>)> {
+        let owners = self.shared_resource_owners.lock();
+        let mut report: Vec<(u64, Vec<u64>)> = owners
+            .iter()
+            .filter(|((class, _), _)| *class == selium_abi::ResourceClass::SharedRegion)
+            .map(|((_, id), processes)| {
+                let mut processes: Vec<u64> = processes.iter().copied().collect();
+                processes.sort_unstable();
+                (*id, processes)
+            })
+            .collect();
+        report.sort_unstable();
+        report
     }
 }
 

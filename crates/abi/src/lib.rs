@@ -2546,3 +2546,90 @@ mod tests {
         assert_eq!(decoded, envelope);
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-abi` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-abi/shared-region-hostcall-variants/allocregion-hostcall-round-trip
+// scenario: selium-abi/shared-region-hostcall-variants/attachregion-with-reader-slot
+// scenario: selium-abi/regionprot-enum/regionprot-serialisation
+// scenario: selium-abi/sleep-hostcall-variant/sleep-operation-created
+// scenario: selium-abi/sleep-hostcall-variant/sleep-operation-polled-before-deadline
+// scenario: selium-abi/sleep-hostcall-variant/sleep-operation-polled-after-deadline
+// scenario: selium-abi/udpbind-hostcall/guest-binds-udp-socket
+// scenario: selium-abi/tcpconnect-hostcall/guest-connects-to-tcp-endpoint
+// scenario: selium-abi/tcpbind-hostcall/guest-binds-tcp-listener
+// scenario: selium-abi/waitregister-hostcall/round-trip-encoding
+// scenario: selium-abi/waitregister-hostcall/wake-routed-via-envelope-task
+// scenario: selium-abi/waitregister-hostcall/unattached-region-rejected
+// scenario: selium-abi/hostqueuecreate-serving-tenant/serving-tenant-round-trips
+// scenario: selium-abi/host-guest-boundary-only/service-messages-are-not-part-of-the-abi
+// scenario: selium-abi/host-guest-boundary-only/hostcall-contract-is-unchanged
+// scenario: selium-abi/certificate-signing-hostcall-variants/signtenantca-round-trips
+// scenario: selium-abi/certificate-signing-hostcall-variants/signusercert-round-trips
+// scenario: selium-abi/certificate-signing-hostcall-variants/revokeca-returns-no-key-material
+// scenario: selium-abi/mintcertificate-capability-variant/signing-hostcall-requires-the-capability
+// scenario: selium-abi/process-start-module-source/spawn-from-inline-bytes
+// scenario: selium-abi/process-start-module-source/spawn-from-a-durable-slice
+// scenario: selium-abi/process-start-module-source/slice-outside-the-caller-s-authority
+// scenario: selium-abi/process-start-module-source/no-host-side-catalogue
+// scenario: selium-abi/capability-probe-gated-by-authority/authorised-probe
+// scenario: selium-abi/capability-probe-gated-by-authority/unauthorised-probe-denied
+// scenario: selium-abi/owner-scoped-attach-authorisation/owner-authorises-a-peer
+// scenario: selium-abi/owner-scoped-attach-authorisation/non-owner-caller-is-denied
+// scenario: selium-abi/owner-scoped-attach-authorisation/recorded-id-authorises-the-attach
+// scenario: selium-abi/owner-scoped-attach-authorisation/no-privileged-guest-identity
+// scenario: selium-abi/owner-declared-resolvable-attach/declared-resource-admits-a-resolver
+// scenario: selium-abi/owner-declared-resolvable-attach/undeclared-resource-refuses-a-record
+// scenario: selium-abi/owner-declared-resolvable-attach/declaration-scope-enforced
+// scenario: selium-abi/quota-hostcall-variants/quotaset-round-trips
+// scenario: selium-abi/quota-hostcall-variants/quotaclear-removes-the-counter
+// scenario: selium-abi/quotawrite-capability-variant/quota-hostcall-requires-the-capability
+// scenario: selium-abi/process-metering-observation/observation-fields-round-trip
+// scenario: selium-abi/process-metering-observation/cpu-microseconds-absent
+// scenario: selium-abi/process-metering-observation/storage-is-not-a-per-process-field
+// scenario: selium-abi/cpu-resource-class/cpu-variant-joins-the-resource-vocabulary
+// scenario: selium-abi/cpu-resource-class/cpu-class-allocates-no-resource
+// scenario: selium-abi/volume-hostcall-variants/bytes-round-trip
+// scenario: selium-abi/volume-hostcall-variants/append-never-rewrites-earlier-bytes
+// scenario: selium-abi/volume-hostcall-variants/sync-is-a-durable-barrier
+// scenario: selium-abi/volume-resource-class/log-and-blob-classes-are-absent
+// scenario: selium-abi/volume-resource-class/volume-is-the-storage-quota-dimension
+// scenario: selium-abi/tenant-volume-usage-hostcall/reading-reflects-resident-bytes
+// scenario: selium-abi/tenant-volume-usage-hostcall/removal-releases-usage
+// scenario: selium-abi/tenant-volume-usage-hostcall/reading-survives-a-restart
+// scenario: selium-abi/tenant-volume-usage-hostcall/unauthorised-caller-denied
+// scenario: selium-abi/resource-authority-hostcall/owned-resource-reports-its-tenant
+// scenario: selium-abi/resource-authority-hostcall/unowned-resource-reports-no-ownership
+// scenario: selium-abi/resource-authority-hostcall/root-minted-resource-reports-the-root-tenant
+// scenario: selium-abi/resource-authority-hostcall/class-mismatch-is-reported
+// scenario: selium-abi/resource-authority-hostcall/authority-survives-projection-lag
+// scenario: selium-abi/capability-probe-scope/route-claim-is-probed-in-the-uri-s-scope
+// scenario: selium-abi/capability-probe-scope/probe-requires-the-probe-authority
+// scenario: selium-abi/expected-claims-and-process-list/expected-claims-are-visible-to-the-owner
+// scenario: selium-abi/expected-claims-and-process-list/another-process-s-expected-claims-require-the-probe-authority
+// scenario: selium-abi/live-process-list/process-list-requires-the-probe-authority
+// scenario: selium-abi/live-process-list/process-list-includes-a-silent-process
+// scenario: selium-abi/route-claim-abi-variants/route-claim-variants-round-trip
+// scenario: selium-abi/route-claim-abi-variants/uri-selector-is-part-of-the-selector-vocabulary
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `addressing` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: addressing/single-canonical-namespace/internal-path-is-canonical
+// scenario: addressing/single-canonical-namespace/no-parallel-namespace
+// scenario: addressing/path-label-reversal/bridge-route-projects-to-a-wire-name
+// scenario: addressing/path-label-reversal/deeper-path-reverses-in-full
+// scenario: addressing/path-label-reversal/root-route-projects-to-a-bare-name
+// scenario: addressing/advisory-domain-to-tenant-table/provisioned-domain-routes-to-its-tenant
+// scenario: addressing/advisory-domain-to-tenant-table/mapping-survives-restart
+// scenario: addressing/advisory-domain-to-tenant-table/mapping-is-advisory-not-authoritative-for-identity
+// scenario: addressing/advisory-domain-to-tenant-table/synthetic-tenant-label-always-resolves
+// scenario: addressing/unified-wire-name-resolution/sni-resolved-through-the-shared-resolver
+// scenario: addressing/unified-wire-name-resolution/host-resolved-through-the-shared-resolver
+// scenario: addressing/named-service-projection-boundary/resource-id-uri-stays-internal
+// scenario: addressing/apex-root-service-alias/domain-maps-directly-to-a-service
+// scenario: addressing/apex-root-service-alias/apex-paths-route-to-the-root-service
+// scenario: addressing/single-serve-declaration/one-declaration-yields-both-names
+// scenario: addressing/single-serve-declaration/resolution-returns-the-registered-route-target
+// scenario: addressing/process-keyed-revocation/guest-exit-revokes-its-routes

@@ -23,7 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use selium_abi::{Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector};
+use selium_abi::{
+    ActivityKind, Capability, CapabilityGrant, Namespace, ResourceClass, ResourceSelector,
+};
 use selium_client::{ClientIdentity, ConnectOptions, FlatMsg as _};
 use selium_kernel::Kernel;
 use selium_runtime::{Runtime, SystemGuestArg, SystemGuestDescriptor};
@@ -50,6 +52,28 @@ pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
 pub(crate) const SERVER_NAME: &str = "bridge";
 /// The tenant the onboarding guest mints and the client connects as.
 pub(crate) const TENANT: &str = "acme";
+
+/// Reviewed bound on a guest reaching a logged milestone after bootstrap:
+/// onboarding, deployment recording, catalogue replay, a connector consuming
+/// the anchor set. A spine that has not converged in this window is parked or
+/// dead, not merely slow; the bound is generous enough for a loaded CI runner
+/// while still failing loudly. Waits use `wait_for_logs(..., CONVERGENCE_BOUND)`
+/// rather than an incidental literal, so slowing a test is a reviewed change to
+/// one constant.
+pub(crate) const CONVERGENCE_BOUND: Duration = Duration::from_secs(120);
+
+/// Reviewed bound on the interpreted-guest QUIC/TLS handshake. The handshake
+/// runs inside the wasm connector, so it is an order of magnitude slower than
+/// a native one; 240 s separates "loaded runner" from "never completes".
+pub(crate) const HANDSHAKE_BOUND: Duration = Duration::from_secs(240);
+
+/// Reviewed bound on observing one state change after it is triggered
+/// (anchor-set rebuild, revocation refusal, a probe's catalogue round trip).
+pub(crate) const OBSERVATION_BOUND: Duration = Duration::from_secs(60);
+
+/// Reviewed bound on a short guest milestone (a listener reporting ready, a
+/// probe logging its result) where the work is a few interpreted passes.
+pub(crate) const SHORT_BOUND: Duration = Duration::from_secs(30);
 
 /// A temporary state root for one test, removed on drop.
 ///
@@ -625,6 +649,21 @@ pub(crate) fn wait_for_logs(
         // the timeout rather than panicking on the drain, so the accumulated
         // lines are what the caller sees.
         seen.extend(drain_logs_if_live(runtime, process_id));
+        // The reap path drains a departing guest's remaining frames into its
+        // `ProcessExited` activity record before releasing the channel. A
+        // short-lived guest can therefore finish before its waiter observes
+        // the channel at all; read the record too so the milestone stays
+        // observable. (Without this, `power_cycle` lost the quota leg's line
+        // whenever that leg completed before the test reached it, which the
+        // enforced pack reproduced under load.) The record is a joined summary
+        // of the drained lines, so add it once.
+        if !runtime.is_guest_resident(process_id) {
+            for message in reaped_log_lines(runtime, process_id) {
+                if !seen.contains(&message) {
+                    seen.push(message);
+                }
+            }
+        }
         if needles.iter().all(|(needle, count)| {
             seen.iter()
                 .filter(|message| message.contains(needle))
@@ -636,4 +675,20 @@ pub(crate) fn wait_for_logs(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
+}
+
+/// Log summaries the reap path moved into the activity log for `process_id`.
+///
+/// A guest that exits has its remaining log frames drained into the
+/// `ProcessExited` activity record before the channel is released, so this is
+/// the only place its last lines survive.
+fn reaped_log_lines(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .activity_log()
+        .iter()
+        .filter(|event| {
+            event.process_id == Some(process_id) && event.kind == ActivityKind::ProcessExited
+        })
+        .map(|event| event.message.clone())
+        .collect()
 }

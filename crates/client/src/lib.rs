@@ -490,3 +490,15 @@ pub async fn connect(addr: SocketAddr, options: ConnectOptions) -> Result<Client
         connection,
     })
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-client` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-client/quic-connection/client-connects
+// scenario: selium-client/mutual-tls-client-identity/client-presents-identity
+// scenario: selium-client/channel-open-per-stream/open-a-channel
+// scenario: selium-client/typed-messaging-handles/subscribe-to-a-channel
+// scenario: selium-client/typed-messaging-handles/publish-to-a-channel
+// scenario: selium-client/typed-termination-errors/channel-open-fails
+// scenario: selium-client/unified-error-surface/connection-failure-surfaces-typed-error
+// scenario: selium-client/encoding-re-exports/single-import-surface

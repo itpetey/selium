@@ -155,11 +155,23 @@ impl MessageTransport for ShmTransport {
     }
 
     fn poll_peer_closed(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
-        match self.reader.region().load_writer_count() {
+        let region = self.reader.region();
+        match region.load_writer_count() {
+            // A zero writer count is the ordinary close (the peer dropped its
+            // writer). The explicit flag covers a peer process that died
+            // without dropping it (a crash), which the host records on the
+            // session's request ring.
             Ok(0) => Poll::Ready(Ok(true)),
-            Ok(_) => Poll::Ready(Ok(false)),
+            Ok(_) => match region.peer_closed() {
+                Ok(closed) => Poll::Ready(Ok(closed)),
+                Err(error) => Poll::Ready(Err(error)),
+            },
             Err(error) => Poll::Ready(Err(error)),
         }
+    }
+
+    fn peer_closed_flag(&self) -> Result<bool> {
+        self.reader.region().peer_closed()
     }
 
     fn generation(&self) -> Result<u64> {

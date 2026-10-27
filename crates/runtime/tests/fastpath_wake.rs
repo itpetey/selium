@@ -380,3 +380,15 @@ fn wait_for_log(runtime: &Runtime, process_id: u64, needle: &str, timeout: Durat
     }
     panic!("timed out waiting for {needle:?} in guest log; got {seen:?}");
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `shared-page-fastpath` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: shared-page-fastpath/guest-notify-emission-on-ring-writes/feature-gated-guest-write
+// scenario: shared-page-fastpath/guest-notify-emission-on-ring-writes/stable-guest-unaffected
+// scenario: shared-page-fastpath/unified-shared-region-wait-registry-stage-1/guest-write-wakes-outbound-drainer
+// scenario: shared-page-fastpath/unified-shared-region-wait-registry-stage-1/mixed-environment
+// scenario: shared-page-fastpath/optional-per-os-wait-word-primitives-stage-2/conformance-gated-enablement
+// scenario: shared-page-fastpath/detection-not-configuration/attach-detects-capability
+// scenario: shared-page-fastpath/detection-not-configuration/mixed-attachers
+// scenario: shared-page-fastpath/no-spin-regression/idle-connection-on-portable-path

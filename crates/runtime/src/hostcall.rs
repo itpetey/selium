@@ -322,6 +322,7 @@ impl Runtime {
                 let page_offset = 0;
 
                 self.claim_shared_resource(process_id, ResourceClass::SharedRegion, shared_id);
+
                 // Mint-time authority: record the principal tenant
                 // synchronously, so admission and canonical publication never
                 // depend on a projected registration.
@@ -386,6 +387,14 @@ impl Runtime {
                     }
                 }
                 drop(guests);
+
+                // Detach the *calling* process's recorded guest-memory
+                // handles: a guest-side attach bypasses the module's own
+                // bookkeeping, so the app-level detach above cannot decrement
+                // its engine count. Other attachers keep the region alive (a
+                // non-zero mapping count makes the destroy below fail, which
+                // is the specified "other instances are attached" behaviour).
+                self.detach_guest_region_mappings(Some(process_id), Some(region_id));
 
                 // Detach all kernel-level mappings for this region before destroying.
                 self.kernel.memory().detach_all_shared_mappings(region_id);
@@ -526,6 +535,14 @@ impl Runtime {
                     drop(guests);
                     page_offset
                 };
+
+                // Remember the guest-memory handle for this attachment: the
+                // engine's attachment count is only released by an explicit
+                // detach with the same memory, which teardown performs without
+                // the guest instance.
+                if let Some(memory) = &guest_memory {
+                    self.record_guest_region_mapping(process_id, region_id, memory);
+                }
 
                 // Shared-page fast-path detection, not configuration. The
                 // outbound drain for this region blocks on the engine's
@@ -1260,6 +1277,19 @@ impl Runtime {
                 resource_class,
                 resource_id,
             } => {
+                // Test seam: the failure-injection suite arms this to prove
+                // discovery denies a registration rather than falling back to
+                // its projection. Off unless explicitly armed.
+                if self
+                    .faults
+                    .authority_unavailable
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(AbiError::new(
+                        AbiErrorCode::Internal,
+                        "host authority unavailable (injected)".to_string(),
+                    ));
+                }
                 // Ownership is read from the host's authoritative owner sets:
                 // the shared-resource set (regions, queues, volumes) and the
                 // process-local-handle set (the `Process` node a spawned
@@ -1447,11 +1477,13 @@ impl Runtime {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or(Duration::ZERO)
                     .as_nanos() as u64;
+                let nanos = nanos.saturating_add(self.guest_clock_offset_nanos());
                 Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
             }
             HostcallRequest::TimeMonotonic => {
                 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
                 let nanos = EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64;
+                let nanos = nanos.saturating_add(self.guest_clock_offset_nanos());
                 Ok(HostOperationState::Ready(HostcallOutput::U64(nanos)))
             }
             HostcallRequest::Sleep { millis } => {
@@ -1880,6 +1912,16 @@ impl Runtime {
         {
             owners.remove(&sender_pid);
             owners.insert(receiver_pid);
+        }
+        drop(shared_resource_owners);
+
+        // Remember the handoff: a sender that dies without a clean close
+        // cannot withdraw its writer, so teardown marks the session's peer
+        // departed for the receiver (see `cleanup_process_resources`).
+        let mut sessions = self.handed_off_sessions.lock();
+        let regions = sessions.entry(sender_pid).or_default();
+        if !regions.contains(&region_id) {
+            regions.push(region_id);
         }
     }
 
@@ -5649,3 +5691,42 @@ mod tests {
         );
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `capability-enforcement` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: capability-enforcement/evaluatable-scope-contexts/tenant-isolation-enforces
+// scenario: capability-enforcement/evaluatable-scope-contexts/selector-admission-at-grant-time
+// scenario: capability-enforcement/unguessable-resource-identities/guessing-is-not-viable
+// scenario: capability-enforcement/owner-scoped-resource-handoff/owner-authorises-attach
+// scenario: capability-enforcement/owner-scoped-resource-handoff/role-confers-nothing
+// scenario: capability-enforcement/ownership-checked-attach/queue-handoff-shares-ownership
+// scenario: capability-enforcement/ownership-checked-attach/owner-authorisation-admits-a-peer
+// scenario: capability-enforcement/ownership-checked-attach/no-implicit-sharing
+// scenario: capability-enforcement/descendant-telemetry-reads/supervisor-reads-child-telemetry
+// scenario: capability-enforcement/cleanup-preserves-co-owners/co-owner-survives-cleanup
+// scenario: capability-enforcement/network-endpoint-uris-in-scope-contexts/connect-evaluated-against-uri-grant
+// scenario: capability-enforcement/network-endpoint-uris-in-scope-contexts/denial-names-the-uri
+// scenario: capability-enforcement/exact-uri-selector/exact-uri-matches
+// scenario: capability-enforcement/exact-uri-selector/longer-name-does-not-match
+// scenario: capability-enforcement/exact-uri-selector/wire-name-is-normalised
+// scenario: capability-enforcement/component-aware-uri-prefix-matching/label-suffix-attack-rejected
+// scenario: capability-enforcement/component-aware-uri-prefix-matching/port-wildcard
+// scenario: capability-enforcement/component-aware-uri-prefix-matching/registry-prefix-respects-segment-boundaries
+// scenario: capability-enforcement/grant-time-evaluatable-honesty-for-uriprefix/uriprefix-on-non-network-class-rejected
+// scenario: capability-enforcement/grant-time-evaluatable-honesty-for-uriprefix/volume-name-prefix-admitted
+// scenario: capability-enforcement/namespace-selector-hierarchy/tenant-selector-admits-only-its-tenant
+// scenario: capability-enforcement/namespace-selector-hierarchy/root-selector-admits-the-root-namespace
+// scenario: capability-enforcement/scoped-grant-delegation/delegator-spawns-within-tenant
+// scenario: capability-enforcement/scoped-grant-delegation/root-delegator-spawns-for-any-tenant
+// scenario: capability-enforcement/scoped-grant-delegation/non-delegator-out-of-scope-child-denied
+// scenario: capability-enforcement/scoped-grant-delegation/delegation-outside-tenant-denied
+// scenario: capability-enforcement/scoped-grant-delegation/unscoped-grant-not-conferable-under-delegation
+// scenario: capability-enforcement/delegategrants-is-not-conferable/re-delegation-denied
+// scenario: capability-enforcement/mintcertificate-is-not-conferable/providing-mintcertificate-at-spawn-is-denied
+// scenario: capability-enforcement/quotawrite-is-not-conferable/conferring-quotawrite-at-spawn-is-denied
+// scenario: capability-enforcement/routeclaim-is-not-conferable/child-cannot-receive-a-route-claim
+// scenario: capability-enforcement/routeclaim-is-not-conferable/bootstrap-claim-admitted
+// scenario: capability-enforcement/volume-hostcall-authorisation/capability-required
+// scenario: capability-enforcement/volume-hostcall-authorisation/cross-tenant-open-denied
+// scenario: capability-enforcement/volume-hostcall-authorisation/root-serves-a-tenant

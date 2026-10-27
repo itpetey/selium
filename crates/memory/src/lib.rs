@@ -980,3 +980,24 @@ mod tests {
         drop(set_region_provider(Box::new(HeapRegionProvider::new())));
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `region-provider` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: region-provider/regionprovider-trait/provider-allocates-a-region
+// scenario: region-provider/regionprovider-trait/provider-attaches-to-existing-region
+// scenario: region-provider/regionprovider-trait/provider-frees-a-region
+// scenario: region-provider/global-regionprovider-installation/provider-installed-before-i-o-operations
+// scenario: region-provider/global-regionprovider-installation/no-provider-installed
+// scenario: region-provider/heapregionprovider-for-testing/two-heapregions-share-memory
+// scenario: region-provider/regionmapping-remains-transport-agnostic/regionmapping-used-without-a-provider
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `shared-region-builder` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: shared-region-builder/builder-pattern-for-multi-memory-regions/building-an-rpc-session-region
+// scenario: shared-region-builder/builder-pattern-for-multi-memory-regions/adding-memory-after-seal
+// scenario: shared-region-builder/builder-pattern-for-multi-memory-regions/total-memory-exceeds-capacity
+// scenario: shared-region-builder/positional-sub-memory-discovery/server-discovers-request-and-reply-rings
+// scenario: shared-region-builder/positional-sub-memory-discovery/accessing-out-of-bounds-memory-index
+// scenario: shared-region-builder/layout-immutability-after-seal/attaching-party-reads-layout

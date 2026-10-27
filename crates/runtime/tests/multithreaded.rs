@@ -31,6 +31,26 @@ use selium_runtime::{Runtime, SystemGuestDescriptor};
 /// The linear-memory address this fixture places its mailbox at. The guest is
 /// free to choose any address; only the mailbox *layout* is fixed by the ABI.
 const MAILBOX_BASE: u32 = 0x1000;
+/// Reviewed bound on the worker pool settling: every worker commits its page
+/// and its fuel before the observation is read. The work is interpreted CPU on
+/// a shared host, so a loaded CI runner can take minutes; the bound is a
+/// failure threshold, not a performance assertion.
+const WORKER_SETTLE_BOUND: Duration = Duration::from_secs(120);
+/// Reviewed bound on the `mt-demo` SDK guest completing two CPU-bound tasks
+/// (interpreted, atomics, two workers) plus its serial baseline.
+const MT_DEMO_BOUND: Duration = Duration::from_secs(240);
+/// Reviewed bound on teardown joining a worker pool (a stop, then the guest
+/// count reaching zero).
+const TEARDOWN_BOUND: Duration = Duration::from_secs(30);
+/// Reviewed bound on a short reaping/execution step (trap teardown, a parked
+/// worker returning after a wake).
+const EXIT_BOUND: Duration = Duration::from_secs(30);
+/// Reviewed bound on the concurrent-execution proof. Both workers must reach a
+/// rendezvous that only completes when the other arrives; a serial run cannot
+/// finish at all, so this bound only distinguishes "concurrent" from
+/// "deadlocked", never "fast" from "slow".
+const RENDEZVOUS_BOUND: Duration = Duration::from_secs(60);
+
 /// Worker-entry body that traps immediately (`unreachable`).
 const TRAPPING_WORKER: &str = r#"(module
     (memory 1)
@@ -42,6 +62,7 @@ const TRAPPING_WORKER: &str = r#"(module
 /// page, run `iterations` of a busy loop, and park; polls metering until the
 /// whole pool has finished its work, and returns the single projected
 /// per-process observation.
+#[expect(clippy::panic, reason = "a pool that never settles is a test failure")]
 fn aggregate_observation(
     name: &str,
     workers: usize,
@@ -65,7 +86,7 @@ fn aggregate_observation(
     // stop advancing (two equal samples) proves the whole pool has finished —
     // without a fixed sleep, which races on a loaded CI.
     let expected_pages = (1 + workers) as u64; // declared page + one per worker.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + WORKER_SETTLE_BOUND;
     let mut previous_cpu = None;
     let observation = loop {
         runtime.metering_tick();
@@ -77,15 +98,27 @@ fn aggregate_observation(
         let pages_committed = observation.memory_bytes == expected_pages * 65_536;
         let cpu_settled =
             previous_cpu == Some(observation.cpu_instructions) && observation.cpu_instructions > 0;
-        if (pages_committed && cpu_settled) || Instant::now() >= deadline {
+        if pages_committed && cpu_settled {
             break observation;
+        }
+        if Instant::now() >= deadline {
+            // Do not assert on a half-settled observation: reporting the
+            // bound that expired is the diagnosis.
+            runtime.stop_process(process_id).expect("stop process");
+            panic!(
+                "the worker pool did not settle within {WORKER_SETTLE_BOUND:?}: \
+                 pages={} expected={}, cpu={} (previous {previous_cpu:?})",
+                observation.memory_bytes / 65_536,
+                expected_pages,
+                observation.cpu_instructions,
+            );
         }
         previous_cpu = Some(observation.cpu_instructions);
         std::thread::sleep(Duration::from_millis(20));
     };
 
     runtime.stop_process(process_id).expect("stop process");
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
     observation
 }
 
@@ -137,7 +170,7 @@ fn execution_guard_is_bypassed_for_multithreaded_guests() {
     );
 
     runtime.stop_process(process_id).expect("stop process");
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
 }
 
 /// Loads the atomics mt-demo module, failing with an actionable message when
@@ -250,8 +283,8 @@ fn multithreaded_guest_is_halted_when_it_exhausts_its_cpu_budget() {
         .set("acme", ResourceClass::Cpu, 50_000);
     runtime.refresh_cpu_budgets();
 
-    wait_for_process_exit(&runtime, process_id, Duration::from_secs(30));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, process_id, EXIT_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
     assert!(
         runtime.activity_log().iter().any(|event| {
             event.process_id == Some(process_id)
@@ -334,8 +367,8 @@ fn sdk_mt_demo_guest_runs_two_cpu_bound_tasks_in_parallel() {
     let parallel = spawn_mt_demo(&runtime, module_bytes.clone(), "parallel");
     // Generous budget: the work is CPU-bound WASM interpreted on a shared
     // host, so a loaded machine can take well over a minute per phase.
-    wait_for_process_exit(&runtime, parallel, Duration::from_secs(240));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, parallel, MT_DEMO_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
     assert!(
         !runtime.activity_log().iter().any(|event| {
             event.process_id == Some(parallel)
@@ -348,8 +381,8 @@ fn sdk_mt_demo_guest_runs_two_cpu_bound_tasks_in_parallel() {
     let runtime = Runtime::default();
     runtime.set_worker_count("serial", 1);
     let serial = spawn_mt_demo(&runtime, module_bytes, "serial");
-    wait_for_process_exit(&runtime, serial, Duration::from_secs(240));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, serial, MT_DEMO_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
     assert!(
         !runtime.activity_log().iter().any(|event| {
             event.process_id == Some(serial)
@@ -395,8 +428,8 @@ fn trapping_worker_tears_guest_down_without_hang() {
     let process_id = bootstrapped.process_id;
 
     // The trapped workers must tear the process down (reap) without hanging.
-    wait_for_process_exit(&runtime, process_id, Duration::from_secs(30));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, process_id, EXIT_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
 
     // The reap recorded the fault, not a normal exit.
     assert!(
@@ -410,49 +443,63 @@ fn trapping_worker_tears_guest_down_without_hang() {
     );
 }
 
-/// 6.2: two CPU-bound worker tasks complete in less wall-clock time on two
-/// workers than on one (serial execution), over the guest's shared linear
-/// memory.
+/// 6.2: two CPU-bound worker tasks run **concurrently** over the guest's
+/// shared linear memory, proven without wall-clock.
+///
+/// Every worker increments a shared atomic arrival counter and then waits for
+/// it to reach two. With two workers, both arrive and both return; with a
+/// single worker (or if the pool serialised invocations) the first worker
+/// waits for an arrival that can never come, so the process never exits and
+/// the rendezvous bound expires. That makes concurrency a binary, load-
+/// independent property: a slow host only makes both cases slower, it cannot
+/// invert the outcome. (The previous formulation compared serial and parallel
+/// wall time and was flaky under load, which is exactly what this replaces.)
 #[test]
-fn two_cpu_bound_tasks_beat_serial_wall_time_on_two_workers() {
+fn two_workers_reach_a_shared_rendezvous_concurrently() {
     let runtime = Runtime::default();
-
-    // Serial baseline: one worker runs both CPU-bound units one after
-    // another (4M increments total), so the total work equals the parallel
-    // run's. Wall time is measured from right after spawn, so the AOT
-    // compilation inside `spawn_system_guest` is not counted.
-    runtime.set_worker_count("pool", 1);
-    let serial = runtime
+    runtime.set_worker_count("rendezvous", 2);
+    let bootstrapped = runtime
         .spawn_system_guest(pool_descriptor(
-            "pool",
-            "pool-cpu-serial",
-            &cpu_bound_module(4_000_000),
+            "rendezvous",
+            "rendezvous-module",
+            &rendezvous_worker_module(),
         ))
-        .expect("spawn serial guest");
-    let start = Instant::now();
-    wait_for_process_exit(&runtime, serial.process_id, Duration::from_secs(60));
-    let serial_time = start.elapsed();
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+        .expect("spawn rendezvous guest");
+    let process_id = bootstrapped.process_id;
 
-    // Parallel: two workers each run one CPU-bound unit (2M each, 4M total)
-    // concurrently over the same shared linear memory.
-    runtime.set_worker_count("pool", 2);
-    let parallel = runtime
-        .spawn_system_guest(pool_descriptor(
-            "pool",
-            "pool-cpu",
-            &cpu_bound_module(2_000_000),
-        ))
-        .expect("spawn parallel guest");
-    let start = Instant::now();
-    wait_for_process_exit(&runtime, parallel.process_id, Duration::from_secs(60));
-    let parallel_time = start.elapsed();
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
-
+    wait_for_process_exit(&runtime, process_id, RENDEZVOUS_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
     assert!(
-        parallel_time < serial_time.mul_f32(0.8),
-        "two workers must beat serial wall time: serial {serial_time:?} vs parallel {parallel_time:?}"
+        !runtime.activity_log().iter().any(|event| {
+            event.process_id == Some(process_id)
+                && (event.message.contains("worker trapped") || event.message.contains("wedged"))
+        }),
+        "both workers must meet at the rendezvous and return cleanly, not trap or wedge: {:#?}",
+        runtime.activity_log()
     );
+}
+
+/// Worker-entry body that arrives at a two-party rendezvous: atomically bump
+/// the counter at address 0, then wait until it reads two. A bounded atomic
+/// wait re-checks, so a spurious wake cannot deadlock the pair.
+fn rendezvous_worker_module() -> String {
+    r#"(module
+    (memory 1)
+    (func (export "boot") (result i32) i32.const 0)
+    (func (export "__selium_guest_worker") (param $id i32) (result i32)
+      (local $current i32)
+      ;; Arrive: the atomic add returns the previous count.
+      (i32.const 0) (i32.const 1) (i32.atomic.rmw.add) (drop)
+      (block $done
+        (loop $wait
+          (local.set $current (i32.atomic.load (i32.const 0)))
+          (br_if $done (i32.ge_u (local.get $current) (i32.const 2)))
+          ;; Bounded wait (10 ms) so the loop re-reads; no notify is needed.
+          (drop (memory.atomic.wait32
+            (i32.const 0) (local.get $current) (i64.const 10000000)))
+          (br $wait)))
+      (i32.const 0)))"#
+        .to_string()
 }
 
 /// Waits until `loaded_guest_count` reaches `expected` or `timeout` elapses.
@@ -513,8 +560,8 @@ fn wake_delivery_notifies_parked_workers_without_driving_the_reactor() {
     // returning from the worker entry so the process exits — the waking
     // thread never drives the reactor.
     runtime.wake_guest_task(process_id, 7);
-    wait_for_process_exit(&runtime, process_id, Duration::from_secs(30));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, process_id, EXIT_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
 }
 
 /// 4.1: a multithreaded guest is provisioned with the configured worker-pool
@@ -542,8 +589,8 @@ fn worker_pool_provisioned_at_spawn_with_configured_count_and_joins_on_teardown(
 
     // The pool runs the guest's CPU-bound workers; each returns after its
     // work and the process exits on its own, then the pool monitor reaps it.
-    wait_for_process_exit(&runtime, process_id, Duration::from_secs(30));
-    wait_for_guest_count(&runtime, 0, Duration::from_secs(10));
+    wait_for_process_exit(&runtime, process_id, EXIT_BOUND);
+    wait_for_guest_count(&runtime, 0, TEARDOWN_BOUND);
 
     // Teardown of an already-reaped process is tolerated (idempotent).
     drop(runtime.stop_process(process_id));
@@ -591,3 +638,14 @@ fn working_parked_worker_module(iterations: u32) -> String {
       i32.const 0))"#
     )
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `guest-worker-pool` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: guest-worker-pool/dedicated-os-worker-threads/worker-pool-is-provisioned-at-spawn
+// scenario: guest-worker-pool/dedicated-os-worker-threads/pool-size-respects-the-core-bound
+// scenario: guest-worker-pool/concurrent-task-execution/cpu-bound-tasks-overlap
+// scenario: guest-worker-pool/single-flight-task-invariant/a-polled-task-is-not-polled-twice-at-once
+// scenario: guest-worker-pool/wake-delivery-by-notify/parked-task-resumes-in-place
+// scenario: guest-worker-pool/per-worker-fault-isolation/faulting-worker-stops-the-process
+// scenario: guest-worker-pool/concurrent-instance-execution-contract/workers-share-one-instance-concurrently

@@ -204,6 +204,17 @@ where
         }
     }
 
+    /// Returns whether the peer was explicitly marked departed by the host.
+    ///
+    /// A receiver uses this to distinguish a confirmed death from an early
+    /// writer-count dip during handshake setup.
+    pub fn peer_closed_flag(&self) -> std::result::Result<bool, RpcError> {
+        self.request_reader
+            .inner()
+            .peer_closed_flag()
+            .map_err(RpcError::from)
+    }
+
     /// Returns the process id of the connected client.
     pub fn client_process_id(&self) -> u64 {
         self.client_process_id
@@ -320,3 +331,35 @@ where
         Err(e) => Err(e.into()),
     }
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `selium-rpc` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: selium-rpc/typed-rpc-client/client-sends-request-and-receives-reply
+// scenario: selium-rpc/typed-rpc-client/client-handles-disconnected-server
+// scenario: selium-rpc/typed-rpc-connection/server-receives-request-and-sends-reply
+// scenario: selium-rpc/typed-rpc-connection/server-detects-client-disconnect
+// scenario: selium-rpc/rpc-connection-handshake-via-rendezvous/client-connects-to-server-via-shm-rendezvous
+// scenario: selium-rpc/rpc-connection-handshake-via-rendezvous/server-accepts-client-connection-via-shm-rendezvous
+// scenario: selium-rpc/rpc-session-layout/client-and-server-agree-on-channel-layout-for-shm
+// scenario: selium-rpc/rpc-request-correlation/server-replies-to-a-specific-request
+// scenario: selium-rpc/server-streaming-rpc/ordered-reply-stream
+// scenario: selium-rpc/server-streaming-rpc/mid-stream-error
+// scenario: selium-rpc/bidi-streaming-rpc/half-close
+// scenario: selium-rpc/stream-cancellation/cancel-stops-production
+// scenario: selium-rpc/stream-cancellation/server-abandonment-notifies-client
+// scenario: selium-rpc/streaming-backpressure-honesty/slow-consumer
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// These tests are the evidence for the `secure-rpc` scenarios. One scenario may
+// be claimed by several tests; the annotation lives next to the evidence.
+// scenario: secure-rpc/bidirectional-rpc-session-isolation/client-connects-to-server
+// scenario: secure-rpc/bidirectional-rpc-session-isolation/unauthorised-client-attempts-connection
+// scenario: secure-rpc/bidirectional-rpc-session-isolation/malicious-guest-cannot-access-another-tenant-s-session
+// scenario: secure-rpc/typed-request-reply-with-correlation/client-sends-typed-request-and-receives-typed-reply
+// scenario: secure-rpc/typed-request-reply-with-correlation/correlation-id-wraps-around
+// scenario: secure-rpc/one-reply-per-request-enforcement/server-replies-to-a-request
+// scenario: secure-rpc/one-reply-per-request-enforcement/server-attempts-to-reply-twice
+// scenario: secure-rpc/connection-close-detection/client-drops-rpcclient
+// scenario: secure-rpc/connection-close-detection/server-drops-rpcconnection
+// scenario: secure-rpc/frameheader-tag-field-for-rpc-correlation/client-matches-reply-to-request

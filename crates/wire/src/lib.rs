@@ -56,6 +56,16 @@ pub trait MessageTransport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     /// Returns `Poll::Ready(Ok(true))` if the remote peer has disconnected.
     fn poll_peer_closed(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<bool>>;
 
+    /// Returns whether the peer has been explicitly marked departed.
+    ///
+    /// Separate from [`poll_peer_closed`](Self::poll_peer_closed), which also
+    /// treats a zero writer count as close: this only reports the host's
+    /// explicit signal, so a receiver can tell a confirmed death from an
+    /// early handshake-time writer-count dip.
+    fn peer_closed_flag(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Returns the current generation counter, or zero if unsupported.
     fn generation(&self) -> Result<u64>;
 

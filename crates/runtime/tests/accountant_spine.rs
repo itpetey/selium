@@ -31,6 +31,10 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, RegionProt,
     ResourceClass, ResourceKind, ResourceSelector,
 };
+/// Reviewed bound on the bookkeeper's ledger window becoming visible after the
+/// workload runs. The window is written by the guest and read by the host, so a
+/// loaded runner only delays it.
+const LEDGER_WINDOW_BOUND: Duration = Duration::from_secs(90);
 use selium_accountant::{
     ACCOUNTANT_ENTRYPOINT, BOOKKEEPER_ENTRYPOINT, LEDGER_LOG, LedgerRecord, accountant_grants,
     bookkeeper_grants,
@@ -131,7 +135,7 @@ async fn accounting_loop_reaches_the_ledger_and_denies_over_ceiling() {
 
     // Buckets flow and the ledger records usage on the minute boundary.
     let guest_pids: Vec<u64> = report.guests.iter().map(|guest| guest.process_id).collect();
-    let window = wait_for_ledger_window(&runtime, TENANT, Duration::from_secs(90), &guest_pids);
+    let window = wait_for_ledger_window(&runtime, TENANT, LEDGER_WINDOW_BOUND, &guest_pids);
     match window {
         LedgerRecord::Window { usage, .. } => {
             assert!(
