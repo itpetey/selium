@@ -600,8 +600,24 @@ pub fn minimum_reader_position(backend: &dyn MappingBackend) -> Result<Option<u6
 /// Returns the minimum active writer position from the shared `writer_slots`
 /// array.
 pub fn minimum_writer_position(backend: &dyn MappingBackend) -> Result<Option<u64>> {
+    minimum_writer_position_excluding(backend, None)
+}
+
+/// Returns the minimum active writer position, optionally ignoring one slot.
+///
+/// A blocking writer excludes its own slot: its position anchors *other*
+/// writers, and counting it against itself would pin the writer behind its last
+/// reservation (a frame larger than half the ring would then wedge it
+/// permanently, even after a reader drained everything).
+pub fn minimum_writer_position_excluding(
+    backend: &dyn MappingBackend,
+    exclude_slot: Option<u32>,
+) -> Result<Option<u64>> {
     let mut minimum = None;
     for slot in 0..MAX_WRITER_SLOTS as u32 {
+        if exclude_slot == Some(slot) {
+            continue;
+        }
         let offset = WRITER_SLOTS_OFFSET + slot as u64 * 8;
         let encoded = backend.atomic_load_u64(offset, Ordering::Acquire)?;
         if encoded == 0 {
@@ -731,6 +747,28 @@ pub fn reserve_tail(
     protect_readers: bool,
     protect_writers: bool,
 ) -> Result<u64> {
+    reserve_tail_excluding_writer(
+        backend,
+        len,
+        capacity,
+        protect_readers,
+        protect_writers,
+        None,
+    )
+}
+
+/// Reserves `len` bytes at the tail, ignoring one writer slot's position.
+///
+/// A blocking writer passes its own slot so that its recorded position anchors
+/// other writers without constraining its own reservation.
+pub fn reserve_tail_excluding_writer(
+    backend: &dyn MappingBackend,
+    len: u64,
+    capacity: u64,
+    protect_readers: bool,
+    protect_writers: bool,
+    exclude_writer_slot: Option<u32>,
+) -> Result<u64> {
     if len == 0 || len > capacity {
         return Err(Error::CapacityExceeded);
     }
@@ -744,7 +782,7 @@ pub fn reserve_tail(
             None
         };
         let min_writer = if protect_writers {
-            minimum_writer_position(backend)?
+            minimum_writer_position_excluding(backend, exclude_writer_slot)?
         } else {
             None
         };

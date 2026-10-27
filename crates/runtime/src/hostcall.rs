@@ -1149,6 +1149,19 @@ impl Runtime {
                 resource_id,
                 scope,
             } => {
+                // Test seam: the failure-injection suite arms this to prove a
+                // served resource whose attachability cannot be declared
+                // publishes no route. Off unless explicitly armed.
+                if self
+                    .faults
+                    .declare_attachable_failure
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(AbiError::new(
+                        AbiErrorCode::Internal,
+                        "attachability declaration refused (injected)".to_string(),
+                    ));
+                }
                 // The owner declares the resource attachable by resolution;
                 // the declaration's scope bounds who a later record admits.
                 self.require_attach_handoff_standing(process_id, &resource_class, resource_id)?;

@@ -45,6 +45,18 @@ pub enum StreamWriter {
     Blocking(BlockingWriter),
 }
 
+/// Peer lifecycle for a peer-to-peer byte-stream reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerMode {
+    /// The peer's existence is already established (a stream handoff
+    /// recipient): an empty ring with no writers is EOF.
+    Attached,
+    /// Wait for the first peer before treating an empty, writer-less ring as
+    /// EOF (the allocator side of a per-stream channel, whose serving peer
+    /// attaches after the relay starts).
+    AwaitingFirstPeer,
+}
+
 /// The read half of a byte stream: decodes frames from the inbound ring and
 /// strips headers, presenting a continuous byte stream.
 ///
@@ -60,10 +72,6 @@ pub struct ByteStreamReader {
     read_buf: Vec<u8>,
     /// Offset into `read_buf` for the next copy.
     read_offset: usize,
-    /// Generation when this reader was created, used to distinguish initial
-    /// writer attachment from activity (including close) that already raced
-    /// ahead of the first read.
-    initial_generation: u64,
     /// Keeps the parent shared region alive while the stream is in use.
     _region: Region,
 }
@@ -126,59 +134,26 @@ impl AsyncWrite for StreamWriter {
 impl ByteStreamReader {
     /// Wraps an attached ring reader as the read half of a byte stream.
     pub fn new(reader: Reader, region: Region) -> Self {
-        let initial_generation = reader.region().load_generation().unwrap_or(0);
         Self {
             reader: StreamReader::Plain(reader),
             read_buf: Vec::new(),
             read_offset: 0,
-            initial_generation,
             _region: region,
         }
     }
 
     /// Wraps an attached blocking ring reader as the read half of a
     /// peer-to-peer byte stream (see [`StreamReader::Blocking`]).
+    ///
+    /// The peer is considered already attached: an empty ring with no writers
+    /// is EOF.
     pub fn blocking(reader: BlockingReader, region: Region) -> Self {
-        let initial_generation = reader.region().load_generation().unwrap_or(0);
         Self {
             reader: StreamReader::Blocking(reader),
             read_buf: Vec::new(),
             read_offset: 0,
-            initial_generation,
             _region: region,
         }
-    }
-
-    /// Waits for the remote writer's first attachment or ring activity.
-    ///
-    /// A newly allocated peer-to-peer stream has no remote writer yet. Its
-    /// reader must not mistake that initial state for the EOF produced when
-    /// an attached writer later closes. Plain host-proxy streams do not have
-    /// this attachment race and return immediately.
-    pub async fn wait_for_peer(&self) -> std::io::Result<()> {
-        let StreamReader::Blocking(reader) = &self.reader else {
-            return Ok(());
-        };
-        let region = reader.region();
-        let position = reader.position();
-        let initial_generation = self.initial_generation;
-
-        std::future::poll_fn(move |cx| {
-            let generation = region.load_generation().map_err(std::io::Error::other)?;
-            let writer_count = region.load_writer_count().map_err(std::io::Error::other)?;
-            let tail = region.read_next_tail().map_err(std::io::Error::other)?;
-            if writer_count > 0 || position < tail || generation != initial_generation {
-                return Poll::Ready(Ok(()));
-            }
-
-            if !selium_memory::register_generation_wait(region.region_id(), generation, cx.waker())
-                || region.load_generation().ok() != Some(generation)
-            {
-                cx.waker().wake_by_ref();
-            }
-            Poll::Pending
-        })
-        .await
     }
 }
 
@@ -349,8 +324,13 @@ impl ByteStream {
         region: Region,
         blocking: bool,
     ) -> Result<Self> {
-        let (reader, writer) =
-            Self::halves_from_channels(reader_channel, writer_channel, region.clone(), blocking)?;
+        let (reader, writer) = Self::halves_from_channels_with_peer_mode(
+            reader_channel,
+            writer_channel,
+            region,
+            blocking,
+            PeerMode::Attached,
+        )?;
         Ok(Self { reader, writer })
     }
 
@@ -361,19 +341,40 @@ impl ByteStream {
     /// (writer count + EOF-to-peer). With `blocking = false` both halves
     /// are plain (host-proxy-driven rings, e.g. TCP, where the runtime's
     /// proxy threads own the peer side).
+    ///
+    /// The reader treats its peer as already attached; use
+    /// [`halves_from_channels_with_peer_mode`](Self::halves_from_channels_with_peer_mode)
+    /// for the allocator side of a per-stream channel.
     pub fn halves_from_channels(
         reader_channel: &Channel,
         writer_channel: &Channel,
         region: Region,
         blocking: bool,
     ) -> Result<(ByteStreamReader, ByteStreamWriter)> {
+        Self::halves_from_channels_with_peer_mode(
+            reader_channel,
+            writer_channel,
+            region,
+            blocking,
+            PeerMode::Attached,
+        )
+    }
+
+    /// Builds independent read/write halves with an explicit reader peer mode.
+    pub fn halves_from_channels_with_peer_mode(
+        reader_channel: &Channel,
+        writer_channel: &Channel,
+        region: Region,
+        blocking: bool,
+        peer_mode: PeerMode,
+    ) -> Result<(ByteStreamReader, ByteStreamWriter)> {
         let reader = if blocking {
-            ByteStreamReader::blocking(
-                reader_channel
-                    .blocking_reader_from(0)
-                    .map_err(|e| GuestError::Host(format!("create blocking reader failed: {e}")))?,
-                region.clone(),
-            )
+            let reader = match peer_mode {
+                PeerMode::Attached => reader_channel.blocking_reader_from(0),
+                PeerMode::AwaitingFirstPeer => reader_channel.blocking_reader_from_awaiting_peer(0),
+            }
+            .map_err(|e| GuestError::Host(format!("create blocking reader failed: {e}")))?;
+            ByteStreamReader::blocking(reader, region.clone())
         } else {
             ByteStreamReader::new(reader_channel.reader(), region.clone())
         };

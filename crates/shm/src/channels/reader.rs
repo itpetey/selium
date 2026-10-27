@@ -24,6 +24,28 @@ pub trait HasGeneration {
     fn generation(&self) -> Result<u64>;
 }
 
+/// How a blocking reader interprets an empty ring that has no writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerLifecycle {
+    /// The peer's existence is already established, so an empty ring with no
+    /// writers is ordinary EOF.
+    ///
+    /// This is the default for rendezvous recipients and for every legacy
+    /// many-to-many channel reader, whose membership policy is unchanged.
+    Attached,
+    /// No peer has attached yet: an empty ring with no writers is pending
+    /// attachment, not closure.
+    ///
+    /// The snapshot distinguishes initial absence from a peer that attached
+    /// and withdrew before the reader's first poll: any generation movement
+    /// (writer attachment, a committed frame, peer withdrawal, or an explicit
+    /// departure mark) establishes that a peer existed.
+    AwaitingFirstPeer {
+        /// Generation observed when the reader was created.
+        initial_generation: u64,
+    },
+}
+
 /// Blocking byte-stream reader that tracks its position via a reader slot,
 /// preventing the ring buffer from overwriting unread data.
 ///
@@ -32,12 +54,17 @@ pub trait HasGeneration {
 /// payload) as they appear in the ring buffer. Use
 /// [`FramedRead`](crate::io::framed::FramedRead) for frame-level
 /// operations.
+///
+/// A reader created with [`PeerLifecycle::AwaitingFirstPeer`] waits for its
+/// point-to-point peer instead of reporting EOF before that peer ever
+/// attaches. Committed frames are always drained before EOF is reported.
 pub struct BlockingReader {
     region: ChannelRegion,
     pos: u64,
     reader_id: u32,
     terminated: bool,
     last_generation: u64,
+    lifecycle: PeerLifecycle,
     /// Buffered frame bytes from a read partially copied to the caller.
     pending_frame: Vec<u8>,
     /// Offset into `pending_frame` for the next copy.
@@ -82,6 +109,10 @@ pub struct WeakReader {
 
 impl BlockingReader {
     /// Creates a new blocking reader at `start_pos` with the given `reader_id`.
+    ///
+    /// The reader treats its peer as already attached: an empty ring with no
+    /// writers is EOF. Use [`Self::new_awaiting_peer`] for a point-to-point
+    /// reader that may be created before its remote peer attaches.
     pub fn new(region: ChannelRegion, start_pos: u64, reader_id: u32) -> Self {
         Self {
             region,
@@ -89,9 +120,122 @@ impl BlockingReader {
             reader_id,
             terminated: false,
             last_generation: 0,
+            lifecycle: PeerLifecycle::Attached,
             pending_frame: Vec::new(),
             pending_offset: 0,
         }
+    }
+
+    /// Creates a blocking reader that waits for its first peer.
+    ///
+    /// Snapshots the ring generation at construction so that a peer which
+    /// attaches and withdraws before the first poll is still observed as
+    /// closure rather than initial absence (see [`PeerLifecycle`]).
+    pub fn new_awaiting_peer(
+        region: ChannelRegion,
+        start_pos: u64,
+        reader_id: u32,
+    ) -> Result<Self> {
+        let initial_generation = region.load_generation()?;
+        // Activity that happened before this reader existed is already
+        // evidence of a peer: an attached writer, committed data (a replaying
+        // reader), or an explicit departure mark.
+        let already_active = region.load_writer_count()? > 0
+            || start_pos < region.read_next_tail()?
+            || region.peer_closed()?;
+        let lifecycle = if already_active {
+            PeerLifecycle::Attached
+        } else {
+            PeerLifecycle::AwaitingFirstPeer { initial_generation }
+        };
+        Ok(Self {
+            region,
+            pos: start_pos,
+            reader_id,
+            terminated: false,
+            last_generation: 0,
+            lifecycle,
+            pending_frame: Vec::new(),
+            pending_offset: 0,
+        })
+    }
+
+    /// Returns the reader's peer lifecycle.
+    pub fn lifecycle(&self) -> PeerLifecycle {
+        self.lifecycle
+    }
+
+    /// Reports whether the peer has closed, using the same lifecycle rules as
+    /// [`AsyncRead`].
+    ///
+    /// An awaiting-first-peer reader reports `false` while no peer activity
+    /// has ever been observed, so a transport cannot disagree with its own
+    /// read half about closure.
+    pub fn peer_closed(&self) -> Result<bool> {
+        if self.region.peer_closed()? {
+            return Ok(true);
+        }
+        let writer_count = self.region.load_writer_count()?;
+        match self.lifecycle {
+            PeerLifecycle::Attached => Ok(writer_count == 0),
+            PeerLifecycle::AwaitingFirstPeer { initial_generation } => {
+                if self.region.load_generation()? == initial_generation {
+                    // No attachment, frame, withdrawal, or departure mark yet.
+                    Ok(false)
+                } else {
+                    Ok(writer_count == 0)
+                }
+            }
+        }
+    }
+
+    /// Registers for a generation wake after finding no data.
+    ///
+    /// Re-checks the empty/EOF/lifecycle conditions after registering so a
+    /// transition that landed in between re-arms the task instead of being
+    /// lost.
+    fn park_for_generation(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let cur_gen = self.region.load_generation().unwrap_or(0);
+        if !selium_memory::register_generation_wait(self.region.region_id(), cur_gen, cx.waker()) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // Check-after-register: a writer may have committed — or the last
+        // writer closed, or a peer attached — between our empty/EOF check and
+        // the registration. Re-arm so we are re-polled and observe it.
+        let eof_now = match self.lifecycle {
+            PeerLifecycle::Attached => self.region.load_writer_count().ok() == Some(0),
+            // A zero writer count is still pending attachment here, so it is
+            // not a reason to re-poll; generation movement covers the
+            // attach/close transitions.
+            PeerLifecycle::AwaitingFirstPeer { .. } => false,
+        };
+        if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
+            || self.region.load_generation().ok() != Some(cur_gen)
+            || eof_now
+        {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    /// Records peer activity for an awaiting-first-peer reader.
+    ///
+    /// Returns whether a peer is known to exist. Writer presence, generation
+    /// movement, committed data, and explicit departure all count as activity
+    /// and permanently move the reader to [`PeerLifecycle::Attached`].
+    fn observe_peer_activity(&mut self) -> Result<bool> {
+        let PeerLifecycle::AwaitingFirstPeer { initial_generation } = self.lifecycle else {
+            return Ok(true);
+        };
+        let active = self.region.load_writer_count()? > 0
+            || self.pos < self.region.read_next_tail()?
+            || self.region.load_generation()? != initial_generation
+            || self.region.peer_closed()?;
+        if active {
+            self.lifecycle = PeerLifecycle::Attached;
+        }
+        Ok(active)
     }
 
     /// Returns the current generation counter from the underlying ring buffer.
@@ -194,29 +338,24 @@ impl AsyncRead for BlockingReader {
         if self.pos >= tail {
             // No data. Check if writers are still connected.
             match self.region.load_writer_count() {
-                Ok(0) => return Poll::Ready(Ok(())), // EOF
+                Ok(0) => {
+                    // An awaiting-first-peer reader must not mistake initial
+                    // absence for closure; once activity is recorded this is
+                    // ordinary EOF.
+                    match self.observe_peer_activity() {
+                        Ok(true) => return Poll::Ready(Ok(())), // EOF
+                        Ok(false) => {}
+                        Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
+                    }
+                    return self.park_for_generation(cx);
+                }
+                // A live writer is peer activity: record it so an awaiting
+                // reader stops waiting for a first peer.
                 Ok(_) => {
-                    // Register for generation wake before going to sleep.
-                    let cur_gen = self.region.load_generation().unwrap_or(0);
-                    if !selium_memory::register_generation_wait(
-                        self.region.region_id(),
-                        cur_gen,
-                        cx.waker(),
-                    ) {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                    if let Err(e) = self.observe_peer_activity() {
+                        return Poll::Ready(Err(std::io::Error::other(e)));
                     }
-                    // Check-after-register: a writer may have committed —
-                    // or the last writer closed — between our empty/EOF
-                    // check and the registration. Re-arm so we are re-polled
-                    // and observe the data or the EOF.
-                    if self.region.read_next_tail().map(|t| self.pos < t) == Ok(true)
-                        || self.region.load_generation().ok() != Some(cur_gen)
-                        || self.region.load_writer_count().ok() == Some(0)
-                    {
-                        cx.waker().wake_by_ref();
-                    }
-                    return Poll::Pending;
+                    return self.park_for_generation(cx);
                 }
                 Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
             }

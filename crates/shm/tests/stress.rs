@@ -153,6 +153,14 @@ fn park_channel_generation_advances_on_write() {
     let transport = ShmTransport::new(&dummy, &channel).expect("transport");
     let mut framed = selium_wire::FramedWrite::new(transport);
 
+    // Blocking-writer registration itself publishes an attachment event, so
+    // count write bumps from the post-attachment generation.
+    let gen_after_attach = channel.ring().region().load_generation().unwrap_or(0);
+    assert_eq!(
+        gen_after_attach, 1,
+        "attachment must publish exactly one generation event"
+    );
+
     for i in 0..5 {
         let payload = format!("gen-test-{i:04}   "); // 8 bytes + 12 header = 20
         framed.write_frame(payload.as_bytes(), 0).expect("write");
@@ -160,7 +168,11 @@ fn park_channel_generation_advances_on_write() {
 
     // Generation should have advanced by 5 (one bump per write).
     let gen5 = channel.ring().region().load_generation().unwrap_or(0);
-    assert_eq!(gen5, 5, "generation should be 5 after 5 writes, got {gen5}");
+    assert_eq!(
+        gen5,
+        gen_after_attach + 5,
+        "generation should advance once per write, got {gen5}"
+    );
 }
 
 /// Two mappings of the same region (simulating two processes): writes via

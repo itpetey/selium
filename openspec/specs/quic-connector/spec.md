@@ -107,6 +107,24 @@ The connector SHALL propagate stream lifecycle end-to-end: a FIN from the client
 - **WHEN** the guest closes a stream's channel
 - **THEN** the connector SHALL finish (or reset) the corresponding QUIC stream so the client observes the close
 
+### Requirement: Relay Waits for Initial Serving Peer
+A newly allocated per-stream channel SHALL treat initial serving-guest absence as pending attachment, not guest closure. The connector SHALL propagate FIN only after the serving peer's attachment or activity establishes the lifecycle, or after explicit peer departure.
+
+#### Scenario: Relay polls before serving guest attachment
+- **WHEN** the connector's guest-to-client pump polls before the serving guest attaches
+- **THEN** it SHALL remain pending without finishing the client stream
+
+#### Scenario: Guest closes after attachment
+- **WHEN** the serving guest subsequently attaches and closes, with or without writing
+- **THEN** the connector SHALL drain committed bytes and propagate EOF to the client
+
+### Requirement: Failed Route Attachment Evicts Cached Target
+The connector SHALL evict a cached serving route when its target cannot be attached, so a later connection can resolve a replacement instead of reusing the stale target indefinitely.
+
+#### Scenario: Cached queue is no longer attachable
+- **WHEN** a connection resolves through a cached route and target attachment fails
+- **THEN** the connector SHALL evict that route before handling a later connection
+
 ### Requirement: Authenticated Client Identity on Handoff
 The connector SHALL derive an authenticated identity for each accepted connection — the tenant scope implied by the trust anchor that verified the client certificate, together with a fingerprint of the client's public key — and SHALL attach that identity, via handoff metadata, to each stream delivered to the serving guest. When client authentication is disabled, handoffs SHALL carry empty metadata.
 

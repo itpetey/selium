@@ -80,6 +80,11 @@ impl Writer {
 
     /// Upgrade this non-blocking writer to a blocking writer. Increments writer_count
     /// and allocates a writer slot for position tracking.
+    ///
+    /// Successful registration publishes the attachment through the ring's
+    /// generation counter so readers parked on an empty ring wake and observe
+    /// the new writer; a partial failure rolls the count back without
+    /// publishing.
     pub fn upgrade(self) -> Result<BlockingWriter> {
         self.region.increment_writer_count()?;
         let writer_slot = match self.region.allocate_writer_slot(0) {
@@ -89,6 +94,11 @@ impl Writer {
                 return Err(error);
             }
         };
+        if let Err(error) = self.region.bump_generation() {
+            drop(self.region.release_writer_slot(writer_slot));
+            drop(self.region.decrement_writer_count());
+            return Err(error);
+        }
         Ok(BlockingWriter {
             region: self.region,
             writer_id: self.writer_id,
@@ -155,6 +165,11 @@ impl AsyncWrite for Writer {
 impl BlockingWriter {
     /// Creates a new blocking writer. Increments writer_count, allocates a writer_id,
     /// and allocates a writer slot for position tracking.
+    ///
+    /// On success the attachment is published through the ring's generation
+    /// counter (see [`BlockingReader`](super::BlockingReader)), which wakes
+    /// readers parked on an empty ring. A partial failure releases the count
+    /// and slot it took without publishing an attachment.
     pub fn new(region: ChannelRegion, backpressure: ChannelBackpressure) -> Result<Self> {
         region.increment_writer_count()?;
         let writer_id = match region.allocate_writer_id() {
@@ -171,6 +186,11 @@ impl BlockingWriter {
                 return Err(error);
             }
         };
+        if let Err(error) = region.bump_generation() {
+            drop(region.release_writer_slot(writer_slot));
+            drop(region.decrement_writer_count());
+            return Err(error);
+        }
         Ok(Self {
             region,
             writer_id,
@@ -246,10 +266,14 @@ impl AsyncWrite for BlockingWriter {
             return Poll::Ready(Err(std::io::Error::other(Error::BufferFull)));
         }
 
-        // Blocking writers check both reader and writer positions.
+        // Blocking writers check both reader and writer positions. Their own
+        // slot is excluded: it anchors *other* writers, never themselves.
         // On Park channels, BufferFull causes backpressure (Pending).
         // On Drop channels, BufferFull causes silent drop (Ok without writing).
-        let pos = match self.region.reserve_tail(len, true, true) {
+        let pos = match self
+            .region
+            .reserve_tail_for_writer(len, true, self.writer_slot)
+        {
             Ok(p) => p,
             Err(Error::BufferFull) => {
                 if self.backpressure == ChannelBackpressure::Drop {
@@ -269,13 +293,22 @@ impl AsyncWrite for BlockingWriter {
             Err(e) => return Poll::Ready(Err(std::io::Error::other(e))),
         };
 
-        // Update writer slot to this position so other writers cannot
-        // overwrite our data until we write again.
+        // Anchor our slot at the start of the reserved frame while it is in
+        // flight: other writers must not wrap past it until the write
+        // completes.
         if let Err(e) = self.region.update_writer_slot(self.writer_slot, pos) {
             return Poll::Ready(Err(std::io::Error::other(e)));
         }
 
         if let Err(e) = write_frame_bytes(&self.region, pos, buf) {
+            return Poll::Ready(Err(std::io::Error::other(e)));
+        }
+
+        // Advance the anchor past the committed frame. The reader slot (not
+        // this one) protects committed-but-unread data, so leaving the anchor
+        // at the frame start would shrink the window the writer has for its
+        // next frame by this frame's size.
+        if let Err(e) = self.region.update_writer_slot(self.writer_slot, pos + len) {
             return Poll::Ready(Err(std::io::Error::other(e)));
         }
 

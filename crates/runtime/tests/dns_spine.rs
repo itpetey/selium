@@ -330,3 +330,6 @@ fn wait_for_logs(
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
 }
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// scenario: guest-context/attachability-precedes-route-publication/consumer-attaches-on-first-route-appearance

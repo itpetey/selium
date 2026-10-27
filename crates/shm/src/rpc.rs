@@ -11,6 +11,7 @@
 use std::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
+    task::Poll,
 };
 
 use selium_service::FlatMsg;
@@ -28,7 +29,7 @@ use selium_wire::{
     },
 };
 
-use crate::{Channel, transport::ShmTransport};
+use crate::{Channel, region::ChannelRegion, transport::ShmTransport};
 
 pub use selium_wire::rpc::RpcError;
 
@@ -156,7 +157,9 @@ impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
 ///
 /// Attaches to the multi-memory region identified by `connection.shared_id`,
 /// parses the request/reply ring layout, and returns a typed
-/// [`RpcConnection`] for the server side.
+/// [`RpcConnection`] for the server side. The server registers only the
+/// membership its directions need (request reader, reply writer) and
+/// publishes acceptance after both are installed.
 pub fn accept<Req, Rep>(
     connection: IncomingConnection,
 ) -> std::result::Result<RpcConnection<Req, Rep>, RpcError>
@@ -166,15 +169,18 @@ where
 {
     let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
 
+    // The rendezvous recipient treats the client's prior existence as
+    // established: an empty request ring with no writers is EOF, not initial
+    // absence.
     let request_transport =
-        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-    let reply_transport =
-        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+        ShmTransport::read_only(&request_channel).map_err(map_transport_error)?;
+    let reply_transport = ShmTransport::write_only(&reply_channel).map_err(map_transport_error)?;
 
-    // Announce acceptance: the client `wait_for_server_accept` parks on this
-    // region's generation, and the writer count alone does not wake it. The
-    // bump is after the reader/writer are in place, so a woken client observes
-    // the second writer immediately.
+    // Publish acceptance only now that the request reader and reply writer
+    // are in place: a client released by this transition can write its first
+    // request without it landing before the server's reader. A failed bump is
+    // a region failure, reported with this module's existing `Serialisation`
+    // bucket (no new public error variant).
     request_channel
         .ring()
         .region()
@@ -203,12 +209,10 @@ where
     let (request_channel, reply_channel) = attach_rpc_region(connection.shared_id)?;
 
     let request_transport =
-        ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-    let reply_transport =
-        ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
+        ShmTransport::read_only(&request_channel).map_err(map_transport_error)?;
+    let reply_transport = ShmTransport::write_only(&reply_channel).map_err(map_transport_error)?;
 
-    // Announce acceptance (see `accept`): the client parks on the request
-    // region's generation, not on the writer count.
+    // Announce acceptance after both directions are installed (see `accept`).
     request_channel
         .ring()
         .region()
@@ -246,9 +250,10 @@ pub fn close_session(shared_id: u64) -> std::result::Result<ClosedSession, RpcEr
 /// Creates a new shared-memory RPC client.
 ///
 /// Allocates a multi-memory region with a request ring and a reply ring,
-/// sends the parent `shared_id` to the server through `rendezvous`, and
-/// returns an [`OwnedRpcClient`] ready for requests. Dropping the client
-/// frees the session region pair.
+/// installs its own directional registrations, snapshots the acceptance
+/// generation, sends the parent `shared_id` to the server through
+/// `rendezvous`, and parks until the server publishes acceptance. Dropping the
+/// client frees the session region pair.
 pub async fn connect<Req, Rep, R>(
     rendezvous: R,
     request_capacity: u64,
@@ -272,21 +277,34 @@ where
 
     let (request_channel, reply_channel, shared_id) = create_rpc_region(req_cap, rep_cap)?;
 
-    let build_client = || -> std::result::Result<RpcClient<Req, Rep>, RpcError> {
-        let request_transport =
-            ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-        let reply_transport =
-            ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
-        Ok(WireRpcClient::new(
-            FramedWrite::new(request_transport),
-            FramedRead::new(reply_transport),
-        ))
+    // Local registrations come before the rendezvous: a server that accepts
+    // immediately must find them already in place.
+    let client = match build_unary_client(&request_channel, &reply_channel) {
+        Ok(client) => client,
+        Err(error) => {
+            if crate::free_region(shared_id).is_err() {
+                // Best-effort reclaim; surface the transport error instead.
+            }
+            return Err(error);
+        }
+    };
+    let acceptance = match Acceptance::snapshot(&request_channel) {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            drop(client);
+            if crate::free_region(shared_id).is_err() {
+                // Best-effort reclaim; surface the snapshot error instead.
+            }
+            return Err(RpcError::Serialisation(error.to_string()));
+        }
     };
 
     match rendezvous.send(shared_id).await {
         Ok(()) => {}
         Err(error) => {
-            // Rendezvous failed: reclaim the region pair before returning.
+            // Rendezvous failed: drop the registrations before reclaiming the
+            // region pair.
+            drop(client);
             if crate::free_region(shared_id).is_err() {
                 // Best-effort reclaim; surface the rendezvous error instead.
             }
@@ -296,17 +314,15 @@ where
         }
     }
 
-    let client = match build_client() {
-        Ok(client) => client,
-        Err(error) => {
-            if crate::free_region(shared_id).is_err() {
-                // Best-effort reclaim; surface the transport error instead.
-            }
-            return Err(error);
+    if let Err(error) = acceptance.wait().await {
+        drop(client);
+        if crate::free_region(shared_id).is_err() {
+            // Best-effort reclaim; surface the acceptance error instead.
         }
-    };
-
-    wait_for_server_accept(&request_channel).await?;
+        // A generation read failed: region/setup failures use this module's
+        // existing `Serialisation` bucket (no new public error variant).
+        return Err(RpcError::Serialisation(error.to_string()));
+    }
 
     Ok(OwnedRpcClient {
         inner: ManuallyDrop::new(client),
@@ -314,12 +330,35 @@ where
     })
 }
 
+/// Builds the client-side unary transports from a freshly allocated pair.
+fn build_unary_client<Req, Rep>(
+    request_channel: &Channel,
+    reply_channel: &Channel,
+) -> std::result::Result<RpcClient<Req, Rep>, RpcError>
+where
+    Req: FlatMsg,
+    Rep: FlatMsg,
+{
+    // Client membership: one counting writer on the request ring and an
+    // awaiting-first-peer reader on the reply ring. No writer is retained on
+    // the inbound reply ring, so a server that drops is observable.
+    let request_transport =
+        ShmTransport::write_only(request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::read_only_awaiting_peer(reply_channel).map_err(map_transport_error)?;
+    Ok(WireRpcClient::new(
+        FramedWrite::new(request_transport),
+        FramedRead::new(reply_transport),
+    ))
+}
+
 /// Creates a new shared-memory server-streaming RPC client.
 ///
 /// Allocates a multi-memory region with a request ring and a reply ring,
-/// sends the parent `shared_id` to the server through `rendezvous`, and
-/// returns an [`OwnedServerStreamClient`] ready for streaming calls.
-/// Dropping the client frees the session region pair.
+/// installs its own directional registrations, snapshots the acceptance
+/// generation, sends the parent `shared_id` to the server through
+/// `rendezvous`, and parks until the server publishes acceptance. Dropping the
+/// client frees the session region pair.
 pub async fn connect_server_stream<Req, Item, R>(
     rendezvous: R,
     request_capacity: u64,
@@ -343,21 +382,33 @@ where
 
     let (request_channel, reply_channel, shared_id) = create_rpc_region(req_cap, rep_cap)?;
 
-    let build_client = || -> std::result::Result<ServerStreamClient<Req, Item>, RpcError> {
-        let request_transport =
-            ShmTransport::new(&request_channel, &request_channel).map_err(map_transport_error)?;
-        let reply_transport =
-            ShmTransport::new(&reply_channel, &reply_channel).map_err(map_transport_error)?;
-        Ok(WireServerStreamClient::new(
-            FramedWrite::new(request_transport),
-            FramedRead::new(reply_transport),
-        ))
+    let client: ServerStreamClient<Req, Item> =
+        match build_stream_client(&request_channel, &reply_channel) {
+            Ok(client) => client,
+            Err(error) => {
+                if crate::free_region(shared_id).is_err() {
+                    // Best-effort reclaim; surface the transport error instead.
+                }
+                return Err(error);
+            }
+        };
+    let acceptance = match Acceptance::snapshot(&request_channel) {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            drop(client);
+            if crate::free_region(shared_id).is_err() {
+                // Best-effort reclaim; surface the snapshot error instead.
+            }
+            return Err(RpcError::Serialisation(error.to_string()));
+        }
     };
 
     match rendezvous.send(shared_id).await {
         Ok(()) => {}
         Err(error) => {
-            // Rendezvous failed: reclaim the region pair before returning.
+            // Rendezvous failed: drop the registrations before reclaiming the
+            // region pair.
+            drop(client);
             if crate::free_region(shared_id).is_err() {
                 // Best-effort reclaim; surface the rendezvous error instead.
             }
@@ -367,22 +418,40 @@ where
         }
     }
 
-    let client = match build_client() {
-        Ok(client) => client,
-        Err(error) => {
-            if crate::free_region(shared_id).is_err() {
-                // Best-effort reclaim; surface the transport error instead.
-            }
-            return Err(error);
+    if let Err(error) = acceptance.wait().await {
+        drop(client);
+        if crate::free_region(shared_id).is_err() {
+            // Best-effort reclaim; surface the acceptance error instead.
         }
-    };
-
-    wait_for_server_accept(&request_channel).await?;
+        // A generation read failed: region/setup failures use this module's
+        // existing `Serialisation` bucket (no new public error variant).
+        return Err(RpcError::Serialisation(error.to_string()));
+    }
 
     Ok(OwnedServerStreamClient {
         inner: ManuallyDrop::new(client),
         shared_id,
     })
+}
+
+/// Builds the client-side server-streaming transports from a freshly allocated
+/// pair.
+fn build_stream_client<Req, Item>(
+    request_channel: &Channel,
+    reply_channel: &Channel,
+) -> std::result::Result<ServerStreamClient<Req, Item>, RpcError>
+where
+    Req: FlatMsg,
+    Item: FlatMsg,
+{
+    let request_transport =
+        ShmTransport::write_only(request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::read_only_awaiting_peer(reply_channel).map_err(map_transport_error)?;
+    Ok(WireServerStreamClient::new(
+        FramedWrite::new(request_transport),
+        FramedRead::new(reply_transport),
+    ))
 }
 
 /// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
@@ -418,64 +487,71 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
     }
 }
 
-/// Waits until the serving side has accepted the session.
+/// Observes session acceptance through the request ring's generation counter.
 ///
-/// A blocking reader starts at the ring tail *at registration time*, so any
-/// frame written before the server registers its reader is invisible to the
-/// server forever. Waiting here makes first-frame ordering deterministic:
-/// the client cannot write its first request before the serving side has a
-/// reader positioned at the (empty) ring start.
+/// The snapshot is taken after the client has installed its local
+/// registrations (blocking-writer attachment itself advances the generation)
+/// and before the session is published through rendezvous. The serving side
+/// bumps the same generation only after installing its request reader and
+/// reply writer, so comparing against the snapshot observes acceptance exactly
+/// once — including an accept immediately followed by close, which a writer
+/// count threshold can miss because the count returns to the pre-accept value.
 ///
-/// The accept signal is the writer count on the request channel. The client
-/// contributes exactly one writer (its request transport's write half); the
-/// server contributes a second when it builds its request transport during
-/// accept, and advances the region's generation to announce it (see
-/// [`accept`]). Because a transport registers its eager reader before its
-/// writer, observing the second writer guarantees the server's reader is
-/// already in place.
+/// The client does not write request data while waiting, so an unrelated
+/// request-ring write cannot be mistaken for acceptance.
 ///
-/// The wait registers a generation wait on the request region, so an
-/// unaccepted session *parks*: the reactor hands the task back and the host
-/// is free to drive other work (including the server's accept). Busy-yielding
-/// instead would re-queue the task locally, spinning the reactor for as long
-/// as the server has not accepted — visible as an entrypoint that never
-/// reaches its first park.
-async fn wait_for_server_accept(channel: &Channel) -> Result<()> {
-    let region = channel.ring().region();
-    let region_id = region.region_id();
-    loop {
-        if region.load_writer_count()? >= 2 {
-            return Ok(());
-        }
-        let generation = region.load_generation()?;
-        // Lost-wake guard: an accept that landed between the count read and
-        // the generation read is re-checked synchronously rather than parked
-        // through.
-        if region.load_writer_count()? >= 2 || region.load_generation()? != generation {
-            continue;
-        }
-        // Park until the generation moves, then re-check the writer count.
-        // `registered` makes the future complete on the poll *after* the
-        // registration, so the loop re-checks exactly once per wake.
-        let mut registered = false;
-        std::future::poll_fn(|cx| {
-            if registered {
-                return std::task::Poll::Ready(());
-            }
-            registered = true;
-            if !selium_memory::register_generation_wait(region_id, generation, cx.waker()) {
-                // No reactor callback installed (e.g. a host-side consumer):
-                // fall back to a self-wake so the loop re-checks.
-                cx.waker().wake_by_ref();
-            }
-            // Check-after-register: an accept that landed between the reads
-            // above and the registration self-wakes us instead of being lost.
-            if region.load_generation().ok() != Some(generation) {
-                cx.waker().wake_by_ref();
-            }
-            std::task::Poll::Pending
+/// The snapshot and wait read generation words from the shared region. A read
+/// failure is reported with [`RpcError::Serialisation`], which is this module's
+/// existing bucket for region and session-setup failures — the change adds no
+/// new public error variant.
+#[derive(Clone)]
+pub struct Acceptance {
+    region: ChannelRegion,
+    observed_generation: u64,
+}
+
+impl Acceptance {
+    /// Snapshots the request ring after local registrations are in place.
+    pub fn snapshot(channel: &Channel) -> Result<Self> {
+        let region = channel.ring().region().clone();
+        let observed_generation = region.load_generation()?;
+        Ok(Self {
+            region,
+            observed_generation,
         })
-        .await;
+    }
+
+    /// Parks until the serving side publishes acceptance.
+    ///
+    /// The wait registers a generation wait on the request region, so an
+    /// unaccepted session *parks*: the reactor hands the task back and the
+    /// host is free to drive other work (including the server's accept).
+    pub async fn wait(self) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            let generation = match self.region.load_generation() {
+                Ok(generation) => generation,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            if generation != self.observed_generation {
+                return Poll::Ready(Ok(()));
+            }
+            if !selium_memory::register_generation_wait(
+                self.region.region_id(),
+                generation,
+                cx.waker(),
+            ) {
+                // No reactor callback installed (e.g. a host-side consumer):
+                // fall back to a self-wake so the wait re-checks.
+                cx.waker().wake_by_ref();
+            }
+            // Check-after-register: an accept that landed between the read
+            // above and the registration self-wakes us instead of being lost.
+            if self.region.load_generation().ok() != Some(generation) {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
     }
 }
 
@@ -575,10 +651,10 @@ mod tests {
 
     #[test]
     fn accept_advances_the_request_generation_to_signal_the_client() {
-        // `wait_for_server_accept` parks on the request region's generation;
-        // `accept` must advance it once the server's reader/writer are in
-        // place, or a client whose connect is not accepted in the same nested
-        // poll stays parked (previously: spun) forever.
+        // The client's `Acceptance` gate parks on the request region's
+        // generation; `accept` must advance it once the server's reader/writer
+        // are in place, or a client whose connect is not accepted in the same
+        // nested poll stays parked (previously: spun) forever.
         setup();
         let (request_channel, _reply_channel, shared_id) =
             create_rpc_region(4096, 4096).expect("create_rpc_region");
@@ -612,9 +688,9 @@ mod tests {
         // shared_id via the rendezvous; accept_server_stream attaches the
         // same pair server-side. Items then flow in order to stream end.
         //
-        // connect waits for the server's accept before returning (see
-        // wait_for_server_accept), so the server task is spawned first and
-        // retries the rendezvous until the connect-side send lands.
+        // connect_server_stream waits for the server's acceptance before
+        // returning, so the server task is spawned first and retries the
+        // rendezvous until the connect-side send lands.
         setup();
         use futures::StreamExt;
 
@@ -663,6 +739,266 @@ mod tests {
 
         server.await.expect("server task");
     }
+
+    // --- Deterministic acceptance ---------------------------------------
+
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::Context,
+    };
+
+    use selium_abi::RegionProt;
+
+    /// Rendezvous whose send always fails, recording the id it was offered.
+    #[derive(Clone)]
+    struct FailingRendezvous {
+        seen: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl Rendezvous for FailingRendezvous {
+        fn send(&self, shared_id: u64) -> impl std::future::Future<Output = Result<()>> + Send {
+            let seen = self.seen.clone();
+            async move {
+                *seen.lock().expect("rendezvous lock") = Some(shared_id);
+                Err(Error::ChannelClosed)
+            }
+        }
+
+        async fn recv(&self) -> Result<IncomingConnection> {
+            Err(Error::ChannelClosed)
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_accept_is_not_lost() {
+        // The server accepts as soon as the handoff is dequeued, before the
+        // client's own connect task is polled again.
+        setup();
+        let rendezvous = crate::ShmRendezvous::new();
+        let server = {
+            let rendezvous = rendezvous.clone();
+            tokio::spawn(async move {
+                let incoming = loop {
+                    match rendezvous.recv().await {
+                        Ok(connection) => break connection,
+                        Err(_) => tokio::task::yield_now().await,
+                    }
+                };
+                let conn: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+                drop(conn);
+            })
+        };
+
+        let client: OwnedRpcClient<PingMsg, PongMsg> =
+            tokio::time::timeout(std::time::Duration::from_secs(1), connect(rendezvous, 0, 0))
+                .await
+                .expect("accept-then-close must release the client")
+                .expect("connect");
+        assert!(client.shared_id() > 0);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn unaccepted_session_parks_without_closing() {
+        setup();
+        let (request_channel, reply_channel, shared_id) =
+            create_rpc_region(4096, 4096).expect("create_rpc_region");
+        let client: RpcClient<PingMsg, PongMsg> =
+            build_unary_client(&request_channel, &reply_channel).expect("client transports");
+        let acceptance = Acceptance::snapshot(&request_channel).expect("snapshot");
+
+        let mut wait = Box::pin(acceptance.wait());
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(Pin::new(&mut wait).poll(&mut cx), Poll::Pending),
+            "an idle server must leave the client parked, not accepted or closed"
+        );
+
+        // A live session must also not look closed from the reply direction.
+        assert_eq!(
+            request_channel
+                .ring()
+                .region()
+                .load_writer_count()
+                .expect("writer count"),
+            1,
+            "the client's own request writer must not be mistaken for acceptance"
+        );
+
+        drop(wait);
+        drop(client);
+        if crate::free_region(shared_id).is_err() {
+            // Best-effort cleanup in the test.
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_then_close_is_observed() {
+        // Acceptance must be a generation transition, not a writer-count
+        // threshold: the server accepts and withdraws before the client polls.
+        setup();
+        let (request_channel, reply_channel, shared_id) =
+            create_rpc_region(4096, 4096).expect("create_rpc_region");
+        let client: RpcClient<PingMsg, PongMsg> =
+            build_unary_client(&request_channel, &reply_channel).expect("client transports");
+        let acceptance = Acceptance::snapshot(&request_channel).expect("snapshot");
+
+        let incoming = IncomingConnection {
+            client_process_id: 1,
+            shared_id,
+        };
+        let connection: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+        drop(connection);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), acceptance.wait())
+            .await
+            .expect("accept must be observed even after the server closed")
+            .expect("acceptance wait");
+
+        drop(client);
+        if crate::free_region(shared_id).is_err() {
+            // Best-effort cleanup in the test.
+        }
+    }
+
+    #[tokio::test]
+    async fn server_registers_no_writer_on_its_inbound_request_ring() {
+        setup();
+        let (request_channel, reply_channel, shared_id) =
+            create_rpc_region(4096, 4096).expect("create_rpc_region");
+        let client: RpcClient<PingMsg, PongMsg> =
+            build_unary_client(&request_channel, &reply_channel).expect("client transports");
+        let request_region = request_channel.ring().region();
+        assert_eq!(request_region.load_writer_count().expect("count"), 1);
+
+        let incoming = IncomingConnection {
+            client_process_id: 1,
+            shared_id,
+        };
+        let connection: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+        assert_eq!(
+            request_region.load_writer_count().expect("count"),
+            1,
+            "the server must not retain a writer on its inbound request ring"
+        );
+
+        // Dropping the client leaves only the remote peer's withdrawal: the
+        // server observes closure rather than a self-held writer.
+        drop(client);
+        assert_eq!(
+            request_region.load_writer_count().expect("count"),
+            0,
+            "graceful client drop must reach the server's view"
+        );
+        drop(connection);
+        if crate::free_region(shared_id).is_err() {
+            // Best-effort cleanup in the test.
+        }
+    }
+
+    #[tokio::test]
+    async fn rendezvous_failure_reclaims_the_session_region() {
+        setup();
+        let seen = Arc::new(Mutex::new(None));
+        let rendezvous = FailingRendezvous { seen: seen.clone() };
+
+        let result: std::result::Result<OwnedRpcClient<PingMsg, PongMsg>, RpcError> =
+            connect(rendezvous, 0, 0).await;
+        assert!(result.is_err(), "a failed rendezvous must fail the connect");
+
+        let shared_id = seen
+            .lock()
+            .expect("rendezvous lock")
+            .expect("offered session id");
+        let attached = selium_memory::region_provider().expect("provider").attach(
+            shared_id,
+            None,
+            RegionProt::ReadWrite,
+        );
+        assert!(
+            attached.is_err(),
+            "the failed session's region must be freed, not leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_server_drop_closes_the_client_session() {
+        setup();
+        let rendezvous = crate::ShmRendezvous::new();
+        let server = {
+            let rendezvous = rendezvous.clone();
+            tokio::spawn(async move {
+                let incoming = loop {
+                    match rendezvous.recv().await {
+                        Ok(connection) => break connection,
+                        Err(_) => tokio::task::yield_now().await,
+                    }
+                };
+                let mut conn: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+                let req = conn.recv().await.expect("recv request");
+                req.reply(PongMsg("bye".to_string())).await.expect("reply");
+                // Withdraw after the reply is committed.
+            })
+        };
+
+        let mut client: OwnedRpcClient<PingMsg, PongMsg> =
+            connect(rendezvous, 0, 0).await.expect("connect");
+        let reply = client
+            .request(PingMsg("ping".to_string()))
+            .await
+            .expect("buffered reply must be drained before closure is reported");
+        assert_eq!(reply, PongMsg("bye".to_string()));
+
+        server.await.expect("server task");
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.request(PingMsg("again".to_string())),
+        )
+        .await
+        .expect("a withdrawn server must not park the client")
+        .expect_err("subsequent request must report closure");
+        assert!(
+            matches!(next, RpcError::ConnectionClosed),
+            "expected ConnectionClosed, got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_client_drop_closes_the_server_session() {
+        setup();
+        let rendezvous = crate::ShmRendezvous::new();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server = {
+            let rendezvous = rendezvous.clone();
+            tokio::spawn(async move {
+                let incoming = loop {
+                    match rendezvous.recv().await {
+                        Ok(connection) => break connection,
+                        Err(_) => tokio::task::yield_now().await,
+                    }
+                };
+                let mut conn: RpcConnection<PingMsg, PongMsg> = accept(incoming).expect("accept");
+                let closed = matches!(conn.recv().await, Err(RpcError::ConnectionClosed));
+                if closed_tx.send(closed).is_err() {
+                    // The test's receiver is gone; nothing can be reported.
+                }
+            })
+        };
+
+        let client: OwnedRpcClient<PingMsg, PongMsg> =
+            connect(rendezvous, 0, 0).await.expect("connect");
+        drop(client);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), closed_rx)
+            .await
+            .expect("server must observe closure without hanging")
+            .expect("server reported");
+        assert!(closed, "graceful client drop must close the server session");
+        server.await.expect("server task");
+    }
 }
 
 // --- Spec traceability (scripts/check-traceability.sh) -------------------
@@ -684,3 +1020,8 @@ mod tests {
 // scenario: resource-handshake/pinned-handoff-sender/handoff-from-unpinned-sender-refused
 // scenario: resource-handshake/pinned-handoff-sender/handler-resolution-is-authoritative
 // scenario: resource-handshake/guest-self-identity/self-info
+// scenario: resource-handshake/local-registration-precedes-rendezvous/server-accepts-immediately-after-rendezvous
+// scenario: resource-handshake/acceptance-is-an-explicit-event/server-accepts-and-closes-before-the-client-polls
+// scenario: resource-handshake/acceptance-is-an-explicit-event/server-has-not-accepted
+// scenario: secure-rpc/directional-session-membership/client-closes-gracefully
+// scenario: secure-rpc/directional-session-membership/server-closes-gracefully

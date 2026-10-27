@@ -24,7 +24,7 @@
 
 use anyhow::{Context as _, bail};
 use selium_guest::{
-    Context, ResourceClass, ResourceTarget, RouteEvent, entrypoint, info, process_id,
+    Context, ResourceClass, ResourceTarget, RouteEvent, Serve, entrypoint, info, process_id,
 };
 use selium_service::{DiscoveryRequest, DiscoveryResponse};
 use selium_shm::{Channel, ChannelBackpressure};
@@ -36,6 +36,16 @@ const PROBE_CHANNEL_CAPACITY: u64 = 4096;
 const PROVIDER_PARK: std::time::Duration = std::time::Duration::from_secs(3_600);
 /// Register a reserved handler route under a host-provisioned claim.
 const ROLE_CLAIM_ROUTE: u64 = 7;
+/// Converge on a route through the bounded readiness path and log the outcome.
+const ROLE_READY: u64 = 9;
+/// Resolve on demand through the bounded readiness path (short bound).
+const ROLE_READY_TIMEOUT: u64 = 10;
+/// Resolve a URI once and log how long the immediate miss took.
+const ROLE_READY_MISS: u64 = 11;
+/// Serve an owned resource with its attachability declaration refused by the
+/// host (armed through the runtime's test fault seam), then report whether
+/// either route was published.
+const ROLE_SERVE_DECLARATION_FAILS: u64 = 12;
 /// Watch a route and log every change.
 const ROLE_CONSUMER: u64 = 2;
 /// Try to register a reserved root route without its claim.
@@ -50,6 +60,11 @@ const ROLE_REGISTER_NO_RENEW: u64 = 4;
 const ROLE_RESOLVER: u64 = 3;
 /// Resolve a URI until it is gone, logging each answer.
 const ROLE_RESOLVER_UNTIL_GONE: u64 = 8;
+/// Readiness bound for the converging role: long enough for a provider the
+/// test starts after boot, short enough to fail a hung wait.
+const READY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+/// Readiness bound for the timeout role: a route nobody publishes.
+const READY_TIMEOUT_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
 /// Register, then crash (a trap, not a graceful exit).
 const ROLE_TRAP_AFTER_REGISTER: u64 = 5;
 
@@ -109,7 +124,11 @@ async fn discovery_probe(mut ctx: Context, route: (u64, u64), mode: u64) -> anyh
             info!(region_id = channel.region_id(), "probe: region allocated");
 
             info!("guest ready");
-            Ok(())
+            // Stay resident: the test drains this guest's log channel and then
+            // stops the process to assert revocation. A guest that returns
+            // immediately may be reaped (taking its log channel) before the
+            // lines are read.
+            park().await
         }
         ROLE_PROVIDER => provider(&mut ctx, route_uri(route)).await,
         ROLE_CONSUMER => consumer(&mut ctx, route_uri(route)).await,
@@ -119,6 +138,10 @@ async fn discovery_probe(mut ctx: Context, route: (u64, u64), mode: u64) -> anyh
         ROLE_FORGE => forge(&mut ctx, route_uri(route)).await,
         ROLE_CLAIM_ROUTE => claim_route(&mut ctx, route_uri(route)).await,
         ROLE_RESOLVER_UNTIL_GONE => resolver_until_gone(&mut ctx, route_uri(route)).await,
+        ROLE_READY => ready(&mut ctx, route_uri(route), READY_BOUND).await,
+        ROLE_READY_TIMEOUT => ready(&mut ctx, route_uri(route), READY_TIMEOUT_BOUND).await,
+        ROLE_READY_MISS => ready_miss(&mut ctx, route_uri(route)).await,
+        ROLE_SERVE_DECLARATION_FAILS => serve_declaration_fails(&mut ctx).await,
         other => bail!("discovery-probe: unknown mode {other}"),
     }
 }
@@ -229,6 +252,96 @@ async fn resolver(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
         DiscoveryResponse::NotFound => info!("resolver: notfound {uri}"),
         other => info!("resolver: other {uri} {other:?}"),
     }
+    Ok(())
+}
+
+/// Converges on `uri` through the bounded watch-driven readiness path.
+///
+/// Logs the resolved resource on success, or the typed timeout on expiry. A
+/// resident role must never spin: the wait parks on the route table.
+async fn ready(ctx: &mut Context, uri: &str, bound: std::time::Duration) -> anyhow::Result<()> {
+    match ctx.resolve_ready(uri, bound).await {
+        Ok(target) => info!("ready: found {uri} {}", target.resource_id),
+        Err(error) => info!("ready: timeout {uri} ({error})"),
+    }
+    // Stay resident so the probe's log channel survives until the test has
+    // drained the outcome (a guest that exits immediately may take its channel
+    // with it).
+    park().await
+}
+
+/// Calls `Context::serve` for a resource this guest owns while the host refuses
+/// the attachability declaration, then reports whether either route exists.
+///
+/// The declaration is supposed to happen before any publication, so a refused
+/// declaration must leave both the canonical typed route and the named service
+/// route unpublished.
+async fn serve_declaration_fails(ctx: &mut Context) -> anyhow::Result<()> {
+    let channel = Channel::create(PROBE_CHANNEL_CAPACITY, ChannelBackpressure::Park)
+        .context("serve-decl: create channel")?;
+    let resource_id = channel.region_id();
+    let (_, tenant) = selium_guest::self_info().context("serve-decl: self info")?;
+    let tenant = tenant.unwrap_or_default();
+    let path = ["decl", "fail"];
+
+    let target = ResourceTarget {
+        uri: String::new(), // pinned by `serve` to the derived internal path
+        host_id: "discovery-probe".to_string(),
+        resource_id,
+        interface: None,
+        tenant: None,
+        class: ResourceClass::SharedRegion,
+        labels: Vec::new(),
+    };
+    let served = ctx
+        .serve(Serve {
+            path: path.iter().map(|segment| segment.to_string()).collect(),
+            target,
+            default: false,
+        })
+        .await;
+    match served {
+        Ok(uri) => info!("serve-decl: unexpectedly served {uri}"),
+        Err(error) => info!("serve-decl: refused ({error})"),
+    }
+
+    let named = format!(
+        "{}{}/{}",
+        selium_abi::uri::SEL_PREFIX,
+        tenant,
+        path.join("/")
+    );
+    let canonical =
+        selium_abi::uri::resource_uri(&tenant, ResourceClass::SharedRegion, resource_id);
+    for uri in [named, canonical] {
+        info!("serve-decl: checking {uri}");
+        let outcome = match ctx.lookup(&uri).await {
+            Ok(Some(_)) => "present",
+            Ok(None) => "absent",
+            Err(error) => {
+                info!("serve-decl: lookup failed for {uri}: {error}");
+                "unknown"
+            }
+        };
+        info!("serve-decl: route {uri} {outcome}");
+    }
+    // Stay resident so the test can drain every line: a guest that returns
+    // immediately may exit before its log channel is read.
+    park().await
+}
+
+/// Resolves `uri` exactly once and logs how long the immediate miss took.
+///
+/// The request path must not wait for the readiness bound: a genuine miss is
+/// `NotFound` immediately.
+async fn ready_miss(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
+    let started = selium_guest::Instant::now()?;
+    let found = ctx.lookup(uri).await?;
+    let elapsed = selium_guest::Instant::now()?
+        .checked_duration_since(started)
+        .unwrap_or_default();
+    let outcome = if found.is_some() { "found" } else { "notfound" };
+    info!("miss: {outcome} {uri} {}ms", elapsed.as_millis());
     Ok(())
 }
 

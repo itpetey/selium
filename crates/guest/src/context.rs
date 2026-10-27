@@ -21,7 +21,7 @@ use crate::{
     hostcall::hostcall_ready,
     resource::ResourceSender,
     store::{self, BlobStore, DurableLog, STORE_ROUTE, StoreClient},
-    watch::{ROUTE_TABLE_ROUTE, RouteWatch},
+    watch::{ROUTE_TABLE_ROUTE, RouteEvent, RouteWatch},
 };
 
 /// How long a serve-side guest waits for a protocol-handler claim to be
@@ -34,8 +34,8 @@ const RPC_REQ_CAPACITY: u64 = 4096;
 /// How long a boot-time platform-service lookup converges before failing.
 ///
 /// System services publish their own routes from their entrypoints, so a
-/// consumer that boots alongside one must retry rather than treat an early miss
-/// as permanent.
+/// consumer that boots alongside one waits on the route watch rather than
+/// treating an early miss as permanent. The bound is only a failure backstop.
 const SERVICE_READY_BOUND: Duration = Duration::from_secs(30);
 
 /// Declaration of a named service route: a path plus the target to map it to,
@@ -329,6 +329,12 @@ impl Context {
     /// route-change table, so a consumer converges on a provider that is not
     /// yet registered and re-attaches when a provider is replaced.
     ///
+    /// The discovery route-change table itself must already be published: it is
+    /// resolved with an immediate [`lookup`](Self::lookup) (a connected
+    /// discovery service constructs it before accepting sessions), so a watch
+    /// requested before then returns [`GuestError::Host`] rather than waiting.
+    /// Convergence around the table would otherwise recurse into itself.
+    ///
     /// ```ignore
     /// // Guest code: converge on the store, then re-attach if it restarts.
     /// let mut watch = ctx.watch("sel:///store").await?;
@@ -343,9 +349,14 @@ impl Context {
     /// }
     /// ```
     pub async fn watch(&mut self, uri: &str) -> Result<RouteWatch, GuestError> {
-        let table = self
-            .resolve_ready(ROUTE_TABLE_ROUTE, SERVICE_READY_BOUND)
-            .await?;
+        // The route table is resolved with an immediate lookup: a connected
+        // discovery service constructs the table before it accepts RPC
+        // sessions, so readiness convergence here would only recurse.
+        let table = self.lookup(ROUTE_TABLE_ROUTE).await?.ok_or_else(|| {
+            GuestError::Host(format!(
+                "route table is not published yet: {ROUTE_TABLE_ROUTE}"
+            ))
+        })?;
         let channel = Channel::attach(table.resource_id)
             .map_err(|error| GuestError::Host(format!("route table attach: {error}")))?;
         let transport = ShmTransport::new_replay(&channel, &channel)
@@ -373,11 +384,12 @@ impl Context {
     /// Resolves a route once it is ready, converging rather than failing when
     /// the provider has not registered yet.
     ///
-    /// This is the retry-aware form of [`lookup`](Self::lookup): it re-resolves
-    /// on a jittered exponential backoff until the route appears or `bound`
-    /// elapses, so a consumer started before its provider converges while a
-    /// provider that never appears yields a typed timeout error rather than
-    /// waiting forever. An unreachable registry surfaces as a typed error.
+    /// This is the watch-driven form of [`lookup`](Self::lookup): it parks on
+    /// the route-change table until the route appears (or is replaced), then
+    /// re-resolves authoritatively, so a consumer started before its provider
+    /// converges on the registration write itself. `bound` is a failure
+    /// backstop: a provider that never appears yields this method's typed
+    /// readiness error rather than waiting forever.
     ///
     /// Long-lived consumers that must also observe later replacements should
     /// use [`watch`](Self::watch) instead: delivery there is event-driven.
@@ -386,27 +398,55 @@ impl Context {
         uri: &str,
         bound: Duration,
     ) -> Result<ResourceTarget, GuestError> {
-        const INITIAL_BACKOFF: Duration = Duration::from_millis(20);
-        const MAX_BACKOFF: Duration = Duration::from_millis(500);
+        match self.await_route(uri, bound).await? {
+            Some(target) => Ok(target),
+            None => Err(GuestError::Host(format!(
+                "route did not become ready within {bound:?}: {uri}"
+            ))),
+        }
+    }
+
+    /// Waits for `uri` to resolve, bounded by `bound`, using route watches.
+    ///
+    /// Returns the target on convergence, or `None` when the bound expires.
+    /// Every appearance/replacement event triggers a fresh authoritative
+    /// `lookup` because resolution records attach authority; watch events are
+    /// only the convergence signal. Revocations and stale events (a route that
+    /// disappeared between the event and the lookup) keep the wait going.
+    async fn await_route(
+        &mut self,
+        uri: &str,
+        bound: Duration,
+    ) -> Result<Option<ResourceTarget>, GuestError> {
         let deadline = crate::Instant::now()?.checked_add(bound).ok_or_else(|| {
             GuestError::Host(format!("resolve bound overflows the clock for {uri}"))
         })?;
-        let mut backoff = INITIAL_BACKOFF;
-        let mut attempt: u32 = 0;
+
         loop {
+            // An immediate answer needs no watch at all.
             if let Some(target) = self.lookup(uri).await? {
-                return Ok(target);
+                return Ok(Some(target));
             }
-            let now = crate::Instant::now()?;
-            if now >= deadline {
-                return Err(GuestError::Host(format!(
-                    "route did not become ready within {bound:?}: {uri}"
-                )));
+            if crate::Instant::now()? >= deadline {
+                return Ok(None);
             }
-            let wait = backoff.min(deadline - now);
-            crate::Timer::new(now + wait + jitter_for(crate::process_id(), attempt, wait)).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-            attempt = attempt.wrapping_add(1);
+
+            let mut watch = self.watch(uri).await?;
+            loop {
+                let Some(event) = next_event_before(&mut watch, deadline).await? else {
+                    return Ok(None);
+                };
+                if matches!(event, RouteEvent::Revoked) {
+                    // Still absent: keep watching.
+                    continue;
+                }
+                match self.lookup(uri).await? {
+                    Some(target) => return Ok(Some(target)),
+                    // A stale event: the route went away again. Start over
+                    // from a fresh watch so the next appearance is observed.
+                    None => break,
+                }
+            }
         }
     }
 
@@ -479,28 +519,13 @@ impl Context {
         let uri = format!("{}/handler/{}", uri::SEL_PREFIX, scheme);
         // Bootstrap is a single pass with no readiness gate: a handler guest
         // publishes its route at the start of its own entrypoint, which may
-        // still be in flight when a peer starts. Converge on the claim rather
-        // than treating an early miss as permanent.
-        let deadline = crate::Instant::now()?
-            .checked_add(HANDLER_RESOLVE_BOUND)
-            .ok_or_else(|| {
-                GuestError::Host(format!(
-                    "handler resolve bound overflows the clock for {uri}"
-                ))
-            })?;
-        let mut backoff = Duration::from_millis(10);
-        loop {
-            if let Some(target) = self.lookup(&uri).await? {
-                return Ok(Some(target.resource_id));
-            }
-            let now = crate::Instant::now()?;
-            if now >= deadline {
-                return Ok(None);
-            }
-            let wait = backoff.min(deadline - now);
-            crate::Timer::new(now + wait).await;
-            backoff = (backoff * 2).min(Duration::from_millis(250));
-        }
+        // still be in flight when a peer starts. Converge on the claim through
+        // the route watch rather than treating an early miss as permanent; a
+        // handler that never appears resolves as absent.
+        Ok(self
+            .await_route(&uri, HANDLER_RESOLVE_BOUND)
+            .await?
+            .map(|target| target.resource_id))
     }
 
     /// Returns the raw discovery host-queue handle this context was built
@@ -609,19 +634,21 @@ impl Context {
         // admissible on the first attempt without waiting for any host feed
         // event. The canonical tenant comes from the host's mint-time record,
         // not from the caller's own tenant.
-        self.publish_canonical(&target).await?;
+        //
         // A served resource is published for other guests to resolve and
-        // attach, so the owner declares it attachable by resolution. The
-        // declaration admits the whole platform: discovery's own resolve is
-        // already tenant-scoped, and root-namespace system guests must be able
-        // to attach a served resource too (e.g. a shared connector).
+        // attach, so the owner declares it attachable by resolution *before*
+        // any route exists. The declaration admits the whole platform:
+        // discovery's own resolve is already tenant-scoped, and root-namespace
+        // system guests must be able to attach a served resource too (e.g. a
+        // shared connector). Declaring first means a consumer that observes the
+        // route's first appearance can attach immediately, and a failed
+        // declaration publishes nothing.
         let attachable_class = matches!(
             target.class,
             selium_abi::ResourceClass::SharedRegion | selium_abi::ResourceClass::HostQueue
         )
         .then(|| target.class.clone());
         let resource_id = target.resource_id;
-        self.register_inner(&uri, target, serve.default).await?;
         if let Some(class) = attachable_class {
             crate::hostcall::declare_attachable_by_resolution(
                 class,
@@ -629,6 +656,8 @@ impl Context {
                 selium_abi::AttachDeclarationScope::Any,
             )?;
         }
+        self.publish_canonical(&target).await?;
+        self.register_inner(&uri, target, serve.default).await?;
         Ok(uri)
     }
 
@@ -737,6 +766,28 @@ impl Context {
     }
 }
 
+/// Awaits the watch's next event, bounded by `deadline`.
+///
+/// Returns `Ok(None)` when the deadline expires first. The watch is polled in
+/// place, so cancelling on the timer leaves its position intact.
+async fn next_event_before(
+    watch: &mut RouteWatch,
+    deadline: crate::Instant,
+) -> Result<Option<RouteEvent>, GuestError> {
+    let mut event = std::pin::pin!(watch.next());
+    let mut timer = std::pin::pin!(crate::Timer::new(deadline));
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(result) = event.as_mut().poll(cx) {
+            return std::task::Poll::Ready(result.map(Some));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Ok(None));
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// The tenant-scoped health route for `name`.
 fn health_uri(tenant: Option<&str>, name: &str) -> String {
     format!(
@@ -745,22 +796,6 @@ fn health_uri(tenant: Option<&str>, name: &str) -> String {
         tenant.unwrap_or_default(),
         name
     )
-}
-
-/// Spreads retrying consumers apart so they do not stampede one provider.
-///
-/// The offset is derived from the process id and the attempt number — no
-/// entropy source is needed in a guest, and two consumers converging on the
-/// same route still wake at different times.
-fn jitter_for(process_id: u64, attempt: u32, wait: Duration) -> Duration {
-    let span_ms = wait.as_millis() as u64 / 2;
-    if span_ms == 0 {
-        return Duration::ZERO;
-    }
-    let mixed = process_id
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .rotate_left(attempt % 64);
-    Duration::from_millis(mixed % span_ms)
 }
 
 #[cfg(test)]
@@ -773,26 +808,6 @@ mod tests {
         assert!(result.is_err());
         // In native mode, ResourceSender::attach(0) fails because there's
         // no host queue infrastructure.
-    }
-
-    #[test]
-    fn jitter_spreads_retrying_consumers_within_half_the_backoff() {
-        let wait = Duration::from_millis(100);
-        // Deterministic for a given process and attempt: no entropy source is
-        // available in a guest.
-        let first = jitter_for(42, 0, wait);
-        assert_eq!(first, jitter_for(42, 0, wait));
-        assert!(first < wait / 2, "jitter stays inside its half-window");
-        assert!(
-            jitter_for(43, 0, wait) != first,
-            "two consumers do not wake in lockstep"
-        );
-        assert_ne!(jitter_for(42, 1, wait), first, "successive attempts differ");
-        assert_eq!(
-            jitter_for(42, 0, Duration::from_millis(1)),
-            Duration::ZERO,
-            "no jitter below a 2 ms window"
-        );
     }
 
     #[test]
@@ -865,6 +880,7 @@ mod tests {
 // scenario: guest-context/context-lookup-convenience-method/discovery-service-disconnected-during-lookup
 // scenario: guest-context/boot-time-service-convergence/consumer-converges-on-a-service-that-publishes-later
 // scenario: guest-context/boot-time-service-convergence/a-genuine-miss-is-not-retried-on-the-request-path
+// scenario: guest-context/boot-time-service-convergence/provider-never-appears
 // scenario: guest-context/context-register-convenience-method/guest-registers-a-uri-via-context
 // scenario: guest-context/context-register-convenience-method/registration-rejected-forbidden
 // scenario: guest-context/canonical-typed-publication/owner-publishes-a-canonical-record

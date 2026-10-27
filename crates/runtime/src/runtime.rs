@@ -192,6 +192,9 @@ pub(crate) struct RuntimeFaults {
     pub(crate) authority_unavailable: std::sync::atomic::AtomicBool,
     /// Make a discovery-feed publish fail (teardown, revocation).
     pub(crate) discovery_publish_failure: std::sync::atomic::AtomicBool,
+    /// Refuse every `DeclareAttachableByResolution` request as the host would
+    /// on a failed authority check.
+    pub(crate) declare_attachable_failure: std::sync::atomic::AtomicBool,
     /// Nanoseconds added to guest-visible clocks (`TimeNow`/`TimeMonotonic`),
     /// so a lease can be aged past its TTL without waiting for wall time.
     pub(crate) clock_offset_nanos: std::sync::atomic::AtomicU64,
@@ -371,6 +374,18 @@ impl Runtime {
     pub fn inject_discovery_publish_failure(&self, armed: bool) {
         self.faults
             .discovery_publish_failure
+            .store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: make `DeclareAttachableByResolution` fail as if the host
+    /// refused the declaration.
+    ///
+    /// Proves that a served resource whose attachability cannot be declared
+    /// publishes no route at all. Off by default; no product path sets it.
+    #[doc(hidden)]
+    pub fn inject_declare_attachable_failure(&self, armed: bool) {
+        self.faults
+            .declare_attachable_failure
             .store(armed, std::sync::atomic::Ordering::SeqCst);
     }
 

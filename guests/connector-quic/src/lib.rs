@@ -40,6 +40,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use selium_guest::{
     Context, Instant, ResourceSender, UdpSocket, entrypoint, error, info, spawn, warn,
 };
+use selium_service::ResourceTarget;
 use selium_shm::{Channel, transport::ShmTransport};
 use selium_wire::{LiveTableView, framed::FramedRead, pubsub::Subscriber};
 use thiserror::Error;
@@ -203,12 +204,8 @@ pub async fn handle_connection(
     };
 
     // Deliver every accepted stream over its own byte channel.
-    let sender = match ResourceSender::attach(target.resource_id) {
-        Ok(sender) => sender,
-        Err(e) => {
-            warn!("quic-connector: attach to guest queue failed: {e}");
-            return;
-        }
+    let Some(sender) = attach_route_target(&resolver, &server_name, &target).await else {
+        return;
     };
 
     // Admission key: the authenticated client's tenant, falling back to the
@@ -269,6 +266,28 @@ pub async fn handle_connection(
 
         let (guest_reader, guest_writer) = channel.into_halves();
         spawn(relay_stream(recv, send, guest_reader, guest_writer));
+    }
+}
+
+/// Attaches the route's target queue, evicting a stale cached route when the
+/// target is no longer attachable.
+///
+/// A cached target can go stale (the serving guest restarted, or its queue was
+/// reclaimed). Keeping it would pin every later connection to a dead target, so
+/// the cache entry is evicted before giving up and the next connection
+/// re-resolves through discovery.
+async fn attach_route_target(
+    resolver: &ResolverHandle,
+    server_name: &str,
+    target: &ResourceTarget,
+) -> Option<ResourceSender> {
+    match ResourceSender::attach(target.resource_id) {
+        Ok(sender) => Some(sender),
+        Err(error) => {
+            warn!("quic-connector: attach to guest queue failed: {error}");
+            resolver.lock().await.evict(server_name);
+            None
+        }
     }
 }
 
@@ -651,3 +670,57 @@ fn rebuild_anchors(
     info!("quic-connector: rebuilt client anchor set ({count} anchors)");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolve::RouteResolver;
+
+    fn stale_target() -> ResourceTarget {
+        ResourceTarget {
+            uri: "sel://acme/bridge".to_string(),
+            host_id: String::new(),
+            // No host queue is registered natively, so attaching it fails.
+            resource_id: 9_999,
+            interface: None,
+            tenant: Some("acme".to_string()),
+            class: selium_abi::ResourceClass::HostQueue,
+            labels: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_failure_evicts_the_cached_route() {
+        let resolver: ResolverHandle = Arc::new(tokio::sync::Mutex::new(
+            RouteResolver::with_cached_route("bridge.acme", stale_target()),
+        ));
+
+        let target = resolver
+            .lock()
+            .await
+            .resolve("bridge.acme")
+            .await
+            .expect("cached route");
+        assert!(
+            attach_route_target(&resolver, "bridge.acme", &target)
+                .await
+                .is_none(),
+            "an unattachable cached target must fail the handoff"
+        );
+
+        assert!(
+            !resolver.lock().await.is_cached("bridge.acme"),
+            "the stale target must be evicted before the next connection"
+        );
+
+        // The next connection re-resolves instead of reusing the stale target.
+        let next = resolver.lock().await.resolve("bridge.acme").await;
+        assert!(
+            matches!(next, Err(ResolveError::NotFound)),
+            "eviction must force discovery re-resolution, not a cache hit"
+        );
+    }
+}
+
+// --- Spec traceability (scripts/check-traceability.sh) -------------------
+// scenario: quic-connector/failed-route-attachment-evicts-cached-target/cached-queue-is-no-longer-attachable

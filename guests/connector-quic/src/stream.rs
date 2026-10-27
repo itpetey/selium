@@ -13,7 +13,7 @@
 
 use selium_guest::{
     GuestError, Result,
-    net::bytes::{ByteStream, ByteStreamReader, ByteStreamWriter},
+    net::bytes::{ByteStream, ByteStreamReader, ByteStreamWriter, PeerMode},
 };
 use selium_shm::byte_channel;
 
@@ -70,9 +70,16 @@ impl QuicChannel {
         // Connector mirrors the guest: read the guest's outbound ring and
         // write the guest's inbound ring. The blocking writer registers a
         // writer count so the guest's reader observes EOF when the connector
-        // closes its write half.
-        let (reader, writer) =
-            ByteStream::halves_from_channels(&ring_from_guest, &ring_to_guest, region, true)?;
+        // closes its write half. The reader waits for the serving guest's
+        // first attachment: until then the outbound ring has no writers, which
+        // is startup rather than the guest's EOF.
+        let (reader, writer) = ByteStream::halves_from_channels_with_peer_mode(
+            &ring_from_guest,
+            &ring_to_guest,
+            region,
+            true,
+            PeerMode::AwaitingFirstPeer,
+        )?;
 
         Ok(Self {
             reader: Some(reader),

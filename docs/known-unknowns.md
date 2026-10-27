@@ -64,3 +64,34 @@ Annotations are reviewed when added and can rot when a test changes;
 
 A regression that only appears in the long lanes is merged before it is
 reported. The nightly run is the first evidence, not a pre-merge guarantee.
+
+## A slow blocking writer anchors the ring window by design
+
+A blocking writer's slot bounds how far other writers may run ahead of its last
+committed frame (documented Park backpressure). A writer that goes permanently
+idle therefore caps the ring window at one capacity past its position, and the
+window arithmetic is not fuzzed: a long-idle neighbour, or many writers with
+skewed progress, is only covered by the hand-written slot tests in
+`selium-shm` and by the spine/soak lanes. Writers no longer pin themselves
+(`reserve_tail_for_writer` excludes the caller's own slot, and the slot advances
+to the end of each committed frame), so the large-frame and late-join cases the
+bridge's acceptance-frame test used to expose are covered; whether the
+cross-writer window itself should be reader-relative remains a ring-protocol
+design question rather than a fixed race.
+
+## Watch-driven boot convergence still depends on discovery reachability
+
+`Context::resolve_ready` and protocol-handler resolution converge on
+route-watch events, but the initial authoritative `lookup` and the re-resolve
+after each appearance still ride the discovery RPC path. A permanently stalled
+discovery connection surfaces as a typed lookup error or the readiness bound,
+not as a converged route: there is no host-side readiness sequencer behind it.
+
+## A spine can miss its convergence bound under sequential load
+
+The identity spine was observed hitting its onboarding convergence bound once
+while several long spines ran back to back on this host, then passing on
+isolated re-runs (about 2 minutes each). The failure was a bound expiry, not a
+wrong result: the deterministic regressions (RPC acceptance, session lifecycle,
+route readiness, bridge tables) stayed green in every run. Sustained parallel
+spine load therefore remains a timing unknown to track, not a diagnosed race.

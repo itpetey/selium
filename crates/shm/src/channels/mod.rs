@@ -4,7 +4,7 @@ use selium_wire::error::Result;
 use crate::ring_buf::{RingBuf, round_capacity};
 
 pub use self::{
-    reader::{BlockingReader, HasGeneration, Reader, WeakReader},
+    reader::{BlockingReader, HasGeneration, PeerLifecycle, Reader, WeakReader},
     writer::{BlockingWriter, Writer},
 };
 
@@ -163,6 +163,30 @@ impl Channel {
             start_pos,
             reader_id,
         ))
+    }
+
+    /// Creates a blocking reader that waits for its first point-to-point peer.
+    ///
+    /// Identical to [`blocking_reader`](Self::blocking_reader) except that an
+    /// empty ring with no writers is treated as pending attachment rather than
+    /// EOF until peer activity is observed. Use for allocator-side readers of
+    /// per-stream, point-to-point channels; rendezvous recipients and general
+    /// many-to-many channels keep the default already-attached behaviour.
+    pub fn blocking_reader_awaiting_peer(&self) -> Result<BlockingReader> {
+        let tail = self.ring.read_next_tail()?;
+        let reader_id = self.ring.region().allocate_reader_slot(tail)?;
+        BlockingReader::new_awaiting_peer(self.ring.region().clone(), tail, reader_id)
+    }
+
+    /// Returns an awaiting-first-peer blocking reader starting at `start_pos`.
+    ///
+    /// Combines the replay position of
+    /// [`blocking_reader_from`](Self::blocking_reader_from) with the peer
+    /// lifecycle of
+    /// [`blocking_reader_awaiting_peer`](Self::blocking_reader_awaiting_peer).
+    pub fn blocking_reader_from_awaiting_peer(&self, start_pos: u64) -> Result<BlockingReader> {
+        let reader_id = self.ring.region().allocate_reader_slot(start_pos)?;
+        BlockingReader::new_awaiting_peer(self.ring.region().clone(), start_pos, reader_id)
     }
 
     /// Creates a weak reader for this channel, starting at position `0`.

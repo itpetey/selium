@@ -185,6 +185,28 @@ impl ChannelRegion {
         cas_next_tail(self.backend(), current, new)
     }
 
+    /// Reserves `len` bytes at the tail for a blocking writer.
+    ///
+    /// The caller's own writer slot is excluded from the writer-protection
+    /// window: its position anchors other writers but must not constrain its
+    /// own reservation, or a frame larger than half the ring would pin it
+    /// permanently.
+    pub fn reserve_tail_for_writer(
+        &self,
+        len: u64,
+        protect_readers: bool,
+        own_writer_slot: u32,
+    ) -> Result<u64> {
+        layout::reserve_tail_excluding_writer(
+            self.backend(),
+            len,
+            self.capacity,
+            protect_readers,
+            true,
+            Some(own_writer_slot),
+        )
+    }
+
     /// Reads the next_tail cursor from shared memory (alias for `load_next_tail`).
     pub fn read_next_tail(&self) -> Result<u64> {
         self.load_next_tail()

@@ -1342,6 +1342,7 @@ name = "selium-discovery-probe"
 version = "1.0.0-alpha.7"
 dependencies = [
  "anyhow",
+ "selium-abi",
  "selium-guest",
  "selium-service",
  "selium-shm",

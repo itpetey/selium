@@ -44,6 +44,21 @@ The crate SHALL map bridge termination frames (`PipeControl::Terminate`) to type
 - **WHEN** the bridge cannot resolve or attach the requested channel
 - **THEN** the channel open SHALL return an error carrying the termination code (bad handshake vs attach failure), for every handle type
 
+### Requirement: Pre-Reply EOF Is Not Handshake Rejection
+A channel open that ends through transport EOF before any control reply SHALL surface a transport termination error, not `BadHandshake`. `BadHandshake` SHALL remain limited to an explicit bad-handshake termination or an invalid control reply.
+
+#### Scenario: Bridge closes without a control reply
+- **WHEN** the remote stream closes before acceptance or termination is received
+- **THEN** the client SHALL return its transport-terminated error rather than claiming the handshake was rejected
+
+#### Scenario: Explicit bad-handshake termination
+- **WHEN** the bridge returns a termination frame carrying the bad-handshake code
+- **THEN** the client SHALL continue to return `BadHandshake`
+
+#### Scenario: Malformed or unexpected control reply
+- **WHEN** a received control reply cannot be decoded or is neither acceptance nor termination
+- **THEN** the client SHALL return `BadHandshake`
+
 ### Requirement: Unified Error Surface
 Connection, TLS, transport, framing, RPC, and termination failures SHALL surface through one crate error type. Underlying `selium-wire` errors SHALL pass through a dedicated wire variant; failures the client can classify (termination codes, remote stream errors, serialisation) SHALL map to dedicated variants.
 

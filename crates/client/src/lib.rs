@@ -360,15 +360,17 @@ impl Client {
     /// The reply is read through the same framed reader the handle keeps:
     /// the codec may read past the reply into relayed data frames, and
     /// rebuilding the reader would silently discard them.
+    ///
+    /// A transport EOF before any reply is *not* a handshake rejection: it
+    /// is wire termination, which surfaces through the existing error
+    /// conversion. `BadHandshake` stays reserved for an explicit
+    /// bad-handshake termination frame or an undecodable/unexpected control
+    /// reply.
     async fn await_acceptance(
         mut reader: FramedRead<QuicTransport>,
     ) -> Result<FramedRead<QuicTransport>> {
         let (payload, _tag, _flags) = match reader.read_frame_async().await {
             Ok(frame) => frame,
-            Err(selium_wire::Error::Terminated) => {
-                // The bridge closed without replying: a protocol violation.
-                return Err(Error::BadHandshake);
-            }
             Err(e) => return Err(Error::from(e)),
         };
         match FlatMsg::decode(&payload) {

@@ -334,15 +334,38 @@ where
                         }
                     }
                     Err(Error::BufferEmpty) => {
-                        register_gen_wait(this.reply_reader, cx);
-                        Poll::Pending
+                        match this.reply_reader.poll_peer_closed() {
+                            Ok(true) => {
+                                // The producer withdrew with no further
+                                // frame: the stream ends rather than parking.
+                                this.done = true;
+                                Poll::Ready(None)
+                            }
+                            Ok(false) => {
+                                register_gen_wait(this.reply_reader, cx);
+                                Poll::Pending
+                            }
+                            Err(error) => Poll::Ready(Some(Err(RpcError::from(error)))),
+                        }
                     }
                     Err(e) => Poll::Ready(Some(Err(e.into()))),
                 }
             }
             Ok(false) => {
-                register_gen_wait(this.reply_reader, cx);
-                Poll::Pending
+                match this.reply_reader.poll_peer_closed() {
+                    Ok(true) => {
+                        // Buffered frames have been drained above; the
+                        // producer's withdrawal is the end of the stream even
+                        // without an explicit terminal item.
+                        this.done = true;
+                        Poll::Ready(None)
+                    }
+                    Ok(false) => {
+                        register_gen_wait(this.reply_reader, cx);
+                        Poll::Pending
+                    }
+                    Err(error) => Poll::Ready(Some(Err(RpcError::from(error)))),
+                }
             }
             Err(e) => Poll::Ready(Some(Err(e.into()))),
         }

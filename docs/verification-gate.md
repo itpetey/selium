@@ -166,3 +166,10 @@ naming a scenario that no longer exists (drift).
 `scripts/check-traceability.sh --report` prints the uncovered scenarios per
 capability without failing, which is the adoption view; the gate runs it
 strictly.
+
+A scenario that only exists in an unarchived change (under
+`openspec/changes/<change>/specs/`) is not yet in `openspec/specs`, so a test
+annotated with it reports as drift until the change's deltas are synced. Add the
+annotations with the implementation, then treat the drift as expected on the
+change branch and resolve it with the sync step at archive — `--report` is the
+pre-archive view.

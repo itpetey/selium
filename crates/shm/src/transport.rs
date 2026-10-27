@@ -21,15 +21,19 @@ use crate::{
 /// Type alias matching the OpenSpec task name.
 pub type ShmRendezvous = MemoryRendezvous;
 
-/// A duplex shared-memory transport wrapping a read channel and a write channel.
+/// A shared-memory transport.
 ///
-/// The `reader` channel is the direction from which this transport receives
-/// frames; the `writer` channel is the direction to which this transport sends
-/// frames. Both channels must be initialised and have at least one remote
-/// writer/reader respectively.
+/// A duplex transport (see [`ShmTransport::new`]) wraps a read channel and a
+/// write channel. Point-to-point session users should prefer the directional
+/// constructors ([`ShmTransport::read_only`],
+/// [`ShmTransport::read_only_awaiting_peer`], and
+/// [`ShmTransport::write_only`]): registering only the membership a direction
+/// requires keeps the peer's writer count reachable at zero, so withdrawal
+/// stays observable. Operations on a direction the transport was not built
+/// with return an explicit I/O error instead of silently succeeding.
 pub struct ShmTransport {
-    reader: Reader,
-    writer: BlockingWriter,
+    reader: Option<Reader>,
+    writer: Option<BlockingWriter>,
     last_generation: u64,
 }
 
@@ -49,7 +53,7 @@ pub struct MemoryRendezvous {
 }
 
 impl ShmTransport {
-    /// Creates a new transport from a read channel and a write channel.
+    /// Creates a new duplex transport from a read channel and a write channel.
     ///
     /// On Park channels the read side uses a *blocking* reader that registers
     /// a reader slot in shared memory; without that slot, writers never
@@ -61,15 +65,11 @@ impl ShmTransport {
     /// Returns an error if the blocking reader or writer cannot be created
     /// (e.g. slot allocation failure).
     pub fn new(read_channel: &Channel, write_channel: &Channel) -> Result<Self> {
-        let reader = if read_channel.backpressure() == ChannelBackpressure::Park {
-            Reader::Blocking(read_channel.blocking_reader()?)
-        } else {
-            Reader::NonBlocking(read_channel.reader())
-        };
+        let reader = Self::attached_reader(read_channel)?;
         let writer = write_channel.blocking_writer()?;
         Ok(Self {
-            reader,
-            writer,
+            reader: Some(reader),
+            writer: Some(writer),
             last_generation: 0,
         })
     }
@@ -88,25 +88,88 @@ impl ShmTransport {
         let reader = Reader::Blocking(read_channel.blocking_reader_from(0)?);
         let writer = write_channel.blocking_writer()?;
         Ok(Self {
-            reader,
-            writer,
+            reader: Some(reader),
+            writer: Some(writer),
             last_generation: 0,
         })
     }
 
-    /// Returns a reference to the underlying writer.
-    pub fn writer(&self) -> &BlockingWriter {
-        &self.writer
+    /// Creates a read-only transport whose peer is considered already
+    /// attached.
+    ///
+    /// Used by rendezvous recipients (the sender's prior existence is
+    /// established by the handoff) and by other consumers that own only a
+    /// receive direction. An empty ring with no writers reports EOF.
+    pub fn read_only(read_channel: &Channel) -> Result<Self> {
+        Ok(Self {
+            reader: Some(Self::attached_reader(read_channel)?),
+            writer: None,
+            last_generation: 0,
+        })
     }
 
-    /// Returns the shared region id of the read channel.
+    /// Creates a read-only transport that waits for its first peer.
+    ///
+    /// Initial absence of a point-to-point writer is pending attachment, not
+    /// EOF: the reader parks until writer presence, generation movement,
+    /// committed data, or explicit departure establishes the peer's existence.
+    /// This is the allocator-side read half of per-stream sessions.
+    pub fn read_only_awaiting_peer(read_channel: &Channel) -> Result<Self> {
+        let reader = if read_channel.backpressure() == ChannelBackpressure::Park {
+            Reader::Blocking(read_channel.blocking_reader_awaiting_peer()?)
+        } else {
+            // Drop channels use the slotless reader; initial absence is not
+            // observable there, so the legacy jump-to-tail policy remains.
+            Reader::NonBlocking(read_channel.reader())
+        };
+        Ok(Self {
+            reader: Some(reader),
+            writer: None,
+            last_generation: 0,
+        })
+    }
+
+    /// Creates a write-only transport.
+    ///
+    /// Registers only a blocking writer: no reader slot is allocated on the
+    /// inbound ring and no self-writer is retained there, so the remote
+    /// writer's withdrawal remains visible to its receiver.
+    pub fn write_only(write_channel: &Channel) -> Result<Self> {
+        Ok(Self {
+            reader: None,
+            writer: Some(write_channel.blocking_writer()?),
+            last_generation: 0,
+        })
+    }
+
+    /// Builds the read half of a duplex or already-attached transport.
+    fn attached_reader(read_channel: &Channel) -> Result<Reader> {
+        if read_channel.backpressure() == ChannelBackpressure::Park {
+            Ok(Reader::Blocking(read_channel.blocking_reader()?))
+        } else {
+            Ok(Reader::NonBlocking(read_channel.reader()))
+        }
+    }
+
+    /// Returns the underlying writer, if this transport has a write direction.
+    pub fn writer(&self) -> Option<&BlockingWriter> {
+        self.writer.as_ref()
+    }
+
+    /// Returns the shared region id of the read channel, or 0 when this
+    /// transport has no read direction.
     pub fn read_region_id(&self) -> u64 {
-        self.reader.region().region_id()
+        self.reader
+            .as_ref()
+            .map_or(0, |reader| reader.region().region_id())
     }
 
-    /// Returns the shared region id of the write channel.
+    /// Returns the shared region id of the write channel, or 0 when this
+    /// transport has no write direction.
     pub fn write_region_id(&self) -> u64 {
-        self.writer.region().region_id()
+        self.writer
+            .as_ref()
+            .map_or(0, |writer| writer.region().region_id())
     }
 }
 
@@ -116,7 +179,12 @@ impl AsyncRead for ShmTransport {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(cx, buf)
+        match self.reader.as_mut() {
+            Some(reader) => Pin::new(reader).poll_read(cx, buf),
+            None => Poll::Ready(Err(std::io::Error::other(Error::Transport(
+                "transport has no read direction".to_string(),
+            )))),
+        }
     }
 }
 
@@ -126,15 +194,30 @@ impl AsyncWrite for ShmTransport {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.writer).poll_write(cx, buf)
+        match self.writer.as_mut() {
+            Some(writer) => Pin::new(writer).poll_write(cx, buf),
+            None => Poll::Ready(Err(std::io::Error::other(Error::Transport(
+                "transport has no write direction".to_string(),
+            )))),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.writer).poll_flush(cx)
+        match self.writer.as_mut() {
+            Some(writer) => Pin::new(writer).poll_flush(cx),
+            None => Poll::Ready(Err(std::io::Error::other(Error::Transport(
+                "transport has no write direction".to_string(),
+            )))),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.writer).poll_shutdown(cx)
+        match self.writer.as_mut() {
+            Some(writer) => Pin::new(writer).poll_shutdown(cx),
+            None => Poll::Ready(Err(std::io::Error::other(Error::Transport(
+                "transport has no write direction".to_string(),
+            )))),
+        }
     }
 }
 
@@ -142,7 +225,12 @@ impl MessageTransport for ShmTransport {
     type Error = std::io::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
-        match self.reader.generation() {
+        let Some(reader) = self.reader.as_ref() else {
+            // A write-only transport has no inbound generation to compare
+            // against; readiness is always immediately available.
+            return Poll::Ready(Ok(true));
+        };
+        match reader.generation() {
             Ok(generation) => {
                 let ready = generation != self.last_generation;
                 if ready {
@@ -155,27 +243,30 @@ impl MessageTransport for ShmTransport {
     }
 
     fn poll_peer_closed(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
-        let region = self.reader.region();
-        match region.load_writer_count() {
-            // A zero writer count is the ordinary close (the peer dropped its
-            // writer). The explicit flag covers a peer process that died
-            // without dropping it (a crash), which the host records on the
-            // session's request ring.
-            Ok(0) => Poll::Ready(Ok(true)),
-            Ok(_) => match region.peer_closed() {
+        match self.reader.as_ref() {
+            Some(reader) => match reader.peer_closed() {
                 Ok(closed) => Poll::Ready(Ok(closed)),
                 Err(error) => Poll::Ready(Err(error)),
             },
-            Err(error) => Poll::Ready(Err(error)),
+            // No read direction: no peer to observe closing.
+            None => Poll::Ready(Ok(false)),
         }
     }
 
     fn peer_closed_flag(&self) -> Result<bool> {
-        self.reader.region().peer_closed()
+        match self.reader.as_ref() {
+            Some(reader) => reader.region().peer_closed(),
+            None => Ok(false),
+        }
     }
 
     fn generation(&self) -> Result<u64> {
-        self.reader.generation()
+        match self.reader.as_ref() {
+            Some(reader) => reader.generation(),
+            None => Err(Error::Transport(
+                "transport has no read direction".to_string(),
+            )),
+        }
     }
 
     fn region_id(&self) -> u64 {
@@ -195,6 +286,22 @@ impl Reader {
         match self {
             Reader::NonBlocking(r) => r.generation(),
             Reader::Blocking(r) => r.generation(),
+        }
+    }
+
+    /// Reports peer closure using this reader's lifecycle rules.
+    fn peer_closed(&self) -> selium_wire::error::Result<bool> {
+        match self {
+            // The non-blocking reader has no reader-local lifecycle state;
+            // zero writers (or an explicit departure mark) is closure.
+            Reader::NonBlocking(r) => {
+                if r.region().peer_closed()? {
+                    Ok(true)
+                } else {
+                    Ok(r.region().load_writer_count()? == 0)
+                }
+            }
+            Reader::Blocking(r) => r.peer_closed(),
         }
     }
 }
@@ -285,10 +392,19 @@ mod tests {
         .expect("create write channel");
 
         // Keep a writer alive on the read channel so writer_count is non-zero.
+        // Registration publishes the attachment by advancing the generation.
         let _writer = read_channel.blocking_writer().expect("read channel writer");
+        let generation_after_attachment = read_channel
+            .ring()
+            .region()
+            .load_generation()
+            .expect("generation");
 
         let mut transport = ShmTransport::new(&read_channel, &write_channel).expect("transport");
-        assert_eq!(transport.generation().expect("gen"), 0);
+        assert_eq!(
+            transport.generation().expect("gen"),
+            generation_after_attachment
+        );
 
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
