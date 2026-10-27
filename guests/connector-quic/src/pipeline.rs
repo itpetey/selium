@@ -126,7 +126,13 @@ pub async fn relay_stream<R, W>(
     W: FinishSink,
 {
     let to_guest = pump_client_to_guest(wire_recv, guest_writer);
-    let to_client = pump_guest_to_client(guest_reader, wire_send);
+    let to_client = async move {
+        // The serving guest attaches after the connector starts this relay.
+        // Until then the outbound ring has no writers, which is startup —
+        // not the peer-close EOF that `pump_guest_to_client` must propagate.
+        guest_reader.wait_for_peer().await?;
+        pump_guest_to_client(guest_reader, wire_send).await
+    };
     drop(tokio::join!(to_guest, to_client));
 }
 
@@ -135,12 +141,12 @@ mod tests {
     use super::*;
 
     /// A finish-recording test double for the wire send half.
-    struct MockSink {
-        inner: tokio::io::DuplexStream,
+    struct MockSink<T> {
+        inner: T,
         finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
-    impl AsyncWrite for MockSink {
+    impl<T: AsyncWrite + Unpin> AsyncWrite for MockSink<T> {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -164,7 +170,7 @@ mod tests {
         }
     }
 
-    impl FinishSink for MockSink {
+    impl<T: AsyncWrite + Unpin> FinishSink for MockSink<T> {
         fn finish(&mut self) {
             self.finished
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -239,5 +245,90 @@ mod tests {
         let mut buf = [0u8; 7];
         wire_recv.read_exact(&mut buf).await.expect("read");
         assert_eq!(&buf, b"payload");
+    }
+
+    #[tokio::test]
+    async fn relay_waits_for_the_guest_before_accepting_eof() {
+        drop(selium_memory::set_region_provider(Box::new(
+            selium_memory::HeapRegionProvider::new(),
+        )));
+
+        let channel = crate::stream::QuicChannel::allocate().expect("allocate channel");
+        let shared_id = channel.shared_id();
+        let (guest_reader, guest_writer) = channel.into_halves();
+        let (mut client, wire) = tokio::io::duplex(64);
+        let (wire_recv, wire_send) = tokio::io::split(wire);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = MockSink {
+            inner: wire_send,
+            finished: finished.clone(),
+        };
+        let relay = tokio::spawn(relay_stream(wire_recv, sink, guest_reader, guest_writer));
+
+        // Drive the relay before the serving guest attaches. The empty
+        // outbound ring must remain pending rather than finishing the stream.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the guest's initial unattached state must not finish the client stream"
+        );
+
+        let mut guest = selium_guest::net::ByteStream::attach_blocking(shared_id)
+            .expect("attach serving guest");
+        guest.write_all(b"accepted").await.expect("guest write");
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .expect("relayed response")
+        .expect("read response");
+        assert_eq!(&buf, b"accepted");
+
+        drop(guest);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay shutdown")
+            .expect("relay task");
+    }
+
+    #[tokio::test]
+    async fn relay_observes_a_guest_that_closed_before_the_relay_started() {
+        drop(selium_memory::set_region_provider(Box::new(
+            selium_memory::HeapRegionProvider::new(),
+        )));
+
+        let channel = crate::stream::QuicChannel::allocate().expect("allocate channel");
+        let shared_id = channel.shared_id();
+        let (guest_reader, guest_writer) = channel.into_halves();
+        let guest = selium_guest::net::ByteStream::attach_blocking(shared_id)
+            .expect("attach serving guest");
+        drop(guest);
+
+        let (client, wire) = tokio::io::duplex(64);
+        let (wire_recv, wire_send) = tokio::io::split(wire);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = MockSink {
+            inner: wire_send,
+            finished: finished.clone(),
+        };
+        let relay = tokio::spawn(relay_stream(wire_recv, sink, guest_reader, guest_writer));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pre-relay guest close must finish the client stream");
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay shutdown")
+            .expect("relay task");
     }
 }

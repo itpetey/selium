@@ -60,6 +60,10 @@ pub struct ByteStreamReader {
     read_buf: Vec<u8>,
     /// Offset into `read_buf` for the next copy.
     read_offset: usize,
+    /// Generation when this reader was created, used to distinguish initial
+    /// writer attachment from activity (including close) that already raced
+    /// ahead of the first read.
+    initial_generation: u64,
     /// Keeps the parent shared region alive while the stream is in use.
     _region: Region,
 }
@@ -122,10 +126,12 @@ impl AsyncWrite for StreamWriter {
 impl ByteStreamReader {
     /// Wraps an attached ring reader as the read half of a byte stream.
     pub fn new(reader: Reader, region: Region) -> Self {
+        let initial_generation = reader.region().load_generation().unwrap_or(0);
         Self {
             reader: StreamReader::Plain(reader),
             read_buf: Vec::new(),
             read_offset: 0,
+            initial_generation,
             _region: region,
         }
     }
@@ -133,12 +139,46 @@ impl ByteStreamReader {
     /// Wraps an attached blocking ring reader as the read half of a
     /// peer-to-peer byte stream (see [`StreamReader::Blocking`]).
     pub fn blocking(reader: BlockingReader, region: Region) -> Self {
+        let initial_generation = reader.region().load_generation().unwrap_or(0);
         Self {
             reader: StreamReader::Blocking(reader),
             read_buf: Vec::new(),
             read_offset: 0,
+            initial_generation,
             _region: region,
         }
+    }
+
+    /// Waits for the remote writer's first attachment or ring activity.
+    ///
+    /// A newly allocated peer-to-peer stream has no remote writer yet. Its
+    /// reader must not mistake that initial state for the EOF produced when
+    /// an attached writer later closes. Plain host-proxy streams do not have
+    /// this attachment race and return immediately.
+    pub async fn wait_for_peer(&self) -> std::io::Result<()> {
+        let StreamReader::Blocking(reader) = &self.reader else {
+            return Ok(());
+        };
+        let region = reader.region();
+        let position = reader.position();
+        let initial_generation = self.initial_generation;
+
+        std::future::poll_fn(move |cx| {
+            let generation = region.load_generation().map_err(std::io::Error::other)?;
+            let writer_count = region.load_writer_count().map_err(std::io::Error::other)?;
+            let tail = region.read_next_tail().map_err(std::io::Error::other)?;
+            if writer_count > 0 || position < tail || generation != initial_generation {
+                return Poll::Ready(Ok(()));
+            }
+
+            if !selium_memory::register_generation_wait(region.region_id(), generation, cx.waker())
+                || region.load_generation().ok() != Some(generation)
+            {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
     }
 }
 
