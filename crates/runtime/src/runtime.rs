@@ -27,6 +27,9 @@ use crate::{
 
 /// Publisher for the runtime→discovery pub/sub feed.
 pub(crate) type DiscoveryPublisher = Publisher<DiscoveryRequest, ShmTransport>;
+/// Recorded guest-memory handles per (process, shared region) attachment.
+pub(crate) type GuestRegionMappings =
+    HashMap<(ProcessId, u64), Vec<wasmtiny::runtime::SharedMemory>>;
 pub(crate) type LocalHandleOwners = HashMap<(ResourceClass, u64), BTreeSet<ProcessId>>;
 /// Mint-time principal tenant per resource identity. Recorded synchronously
 /// inside the minting hostcall, so it is the authority for tenant attribution
@@ -49,28 +52,6 @@ pub(crate) struct WaitEntry {
     pub(crate) region_id: u64,
     pub(crate) generation: u64,
 }
-
-/// Process-local fault switches used by the failure-injection suite.
-///
-/// Every field is off (zero) by default: arming one is an explicit test
-/// action, and nothing in the product path consults them otherwise. They live
-/// on the runtime rather than behind a feature flag so an integration test can
-/// drive the same `Runtime` it bootstrapped, and are exposed only through
-/// `#[doc(hidden)]` setters.
-#[derive(Default)]
-pub(crate) struct RuntimeFaults {
-    /// Make the host's authoritative resource query fail as unavailable.
-    pub(crate) authority_unavailable: std::sync::atomic::AtomicBool,
-    /// Make a discovery-feed publish fail (teardown, revocation).
-    pub(crate) discovery_publish_failure: std::sync::atomic::AtomicBool,
-    /// Nanoseconds added to guest-visible clocks (`TimeNow`/`TimeMonotonic`),
-    /// so a lease can be aged past its TTL without waiting for wall time.
-    pub(crate) clock_offset_nanos: std::sync::atomic::AtomicU64,
-}
-
-/// Recorded guest-memory handles per (process, shared region) attachment.
-pub(crate) type GuestRegionMappings =
-    HashMap<(ProcessId, u64), Vec<wasmtiny::runtime::SharedMemory>>;
 
 /// Runtime coordinating guest execution, hostcalls, and kernel resources.
 #[derive(Clone)]
@@ -196,6 +177,24 @@ pub struct Runtime {
     pub(crate) handed_off_sessions: Arc<Mutex<HashMap<ProcessId, Vec<u64>>>>,
     /// Test-only fault injection (see [`RuntimeFaults`]); off unless armed.
     pub(crate) faults: Arc<RuntimeFaults>,
+}
+
+/// Process-local fault switches used by the failure-injection suite.
+///
+/// Every field is off (zero) by default: arming one is an explicit test
+/// action, and nothing in the product path consults them otherwise. They live
+/// on the runtime rather than behind a feature flag so an integration test can
+/// drive the same `Runtime` it bootstrapped, and are exposed only through
+/// `#[doc(hidden)]` setters.
+#[derive(Default)]
+pub(crate) struct RuntimeFaults {
+    /// Make the host's authoritative resource query fail as unavailable.
+    pub(crate) authority_unavailable: std::sync::atomic::AtomicBool,
+    /// Make a discovery-feed publish fail (teardown, revocation).
+    pub(crate) discovery_publish_failure: std::sync::atomic::AtomicBool,
+    /// Nanoseconds added to guest-visible clocks (`TimeNow`/`TimeMonotonic`),
+    /// so a lease can be aged past its TTL without waiting for wall time.
+    pub(crate) clock_offset_nanos: std::sync::atomic::AtomicU64,
 }
 
 /// Per-process CPU budget window: the wall-clock minute the process's engine

@@ -20,6 +20,56 @@ use selium_service::FlatMsg;
 
 mod common;
 
+/// Regression (`harden-verification-gate` 8.1): a guest that runs its
+/// entrypoint to completion must release the **host-side** mapping its log
+/// channel holds.
+///
+/// The log-channel reader attaches a host mapping of the guest's log region;
+/// before the fix, reaping a completed guest dropped the reader without
+/// detaching that mapping, so it accumulated one per guest that ran to
+/// completion. The soak lane found it; this pins the specific lifecycle.
+///
+/// The *region* is not asserted here: the engine keeps its own attachment
+/// count for a guest-side attach and only decrements it on an explicit engine
+/// detach, which teardown cannot perform once the guest's memory is gone. That
+/// remaining growth is filed as a separate defect (see the change's task 8
+/// record) and is what the soak lane reports.
+#[test]
+#[ignore = "requires the timer-probe guest built for wasm32-unknown-unknown"]
+fn completed_guest_releases_its_log_channel_mapping() {
+    let runtime = Runtime::default();
+    let memory = runtime.kernel().memory();
+    let baseline_mappings = memory.live_shared_mapping_count();
+
+    let bootstrapped = runtime
+        .spawn_system_guest(timer_probe_descriptor())
+        .expect("bootstrap timer probe guest");
+    let process_id = bootstrapped.process_id;
+    wait_for_log(
+        &runtime,
+        process_id,
+        "timer-probe: timer fired",
+        Duration::from_secs(10),
+    );
+
+    // Completion teardown runs on the runtime's reactor thread: wait for the
+    // mapping count to settle rather than racing the reclaim pass.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if runtime.loaded_guest_count() == 0
+            && memory.live_shared_mapping_count() == baseline_mappings
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a completed guest leaked a host mapping: {} (baseline {baseline_mappings})",
+            memory.live_shared_mapping_count()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Multiple concurrent sleep hostcalls should all complete independently.
 #[test]
 fn multiple_concurrent_sleeps_complete() {
@@ -277,56 +327,6 @@ fn wasm32_guest_timer_resumes_at_deadline() {
     );
 
     runtime.stop_process(process_id).expect("stop process");
-}
-
-/// Regression (`harden-verification-gate` 8.1): a guest that runs its
-/// entrypoint to completion must release the **host-side** mapping its log
-/// channel holds.
-///
-/// The log-channel reader attaches a host mapping of the guest's log region;
-/// before the fix, reaping a completed guest dropped the reader without
-/// detaching that mapping, so it accumulated one per guest that ran to
-/// completion. The soak lane found it; this pins the specific lifecycle.
-///
-/// The *region* is not asserted here: the engine keeps its own attachment
-/// count for a guest-side attach and only decrements it on an explicit engine
-/// detach, which teardown cannot perform once the guest's memory is gone. That
-/// remaining growth is filed as a separate defect (see the change's task 8
-/// record) and is what the soak lane reports.
-#[test]
-#[ignore = "requires the timer-probe guest built for wasm32-unknown-unknown"]
-fn completed_guest_releases_its_log_channel_mapping() {
-    let runtime = Runtime::default();
-    let memory = runtime.kernel().memory();
-    let baseline_mappings = memory.live_shared_mapping_count();
-
-    let bootstrapped = runtime
-        .spawn_system_guest(timer_probe_descriptor())
-        .expect("bootstrap timer probe guest");
-    let process_id = bootstrapped.process_id;
-    wait_for_log(
-        &runtime,
-        process_id,
-        "timer-probe: timer fired",
-        Duration::from_secs(10),
-    );
-
-    // Completion teardown runs on the runtime's reactor thread: wait for the
-    // mapping count to settle rather than racing the reclaim pass.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if runtime.loaded_guest_count() == 0
-            && memory.live_shared_mapping_count() == baseline_mappings
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a completed guest leaked a host mapping: {} (baseline {baseline_mappings})",
-            memory.live_shared_mapping_count()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 // --- Spec traceability (scripts/check-traceability.sh) -------------------

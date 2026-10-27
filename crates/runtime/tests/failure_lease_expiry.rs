@@ -11,12 +11,12 @@
 
 use std::time::Duration;
 
+use failure_common as fx;
 use selium_runtime::Runtime;
 use selium_service::REGISTRATION_LEASE_TTL_MS;
 
 mod common;
 mod failure_common;
-use failure_common as fx;
 
 /// Registrations held open (without renewal) while the sweep runs: the
 /// registry is under load, not idle, when the leases lapse.

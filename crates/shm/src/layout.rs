@@ -42,6 +42,14 @@ pub const MIN_REGION_BYTES: u64 = RING_HEADER_SIZE * 2;
 pub const NEXT_TAIL_OFFSET: u64 = 8;
 /// Byte offset of the shared `next_writer_id` counter (fetch_add for unique writer IDs).
 pub const NEXT_WRITER_ID_OFFSET: u64 = 1048;
+/// Byte offset of the shared `peer_closed` word.
+///
+/// The host sets this on a session's request ring when the peer process
+/// departs without a clean close (a crash). Readers treat it as EOF, exactly
+/// like a zero writer count, so a handler parked on the ring can close its
+/// session and release the region. The word sits after the last allocated
+/// header field (2112) and well inside `RING_HEADER_SIZE`.
+pub const PEER_CLOSED_OFFSET: u64 = 2112;
 /// Byte offset where the shared `reader_slots` array begins (128 × u64).
 pub const READER_SLOTS_OFFSET: u64 = 24;
 /// Byte offset of the shared `reader_slot_counter` (fetch_add for unique reader slot indices).
@@ -54,14 +62,6 @@ pub const WRITER_COUNT_OFFSET: u64 = 16;
 pub const WRITER_SLOTS_OFFSET: u64 = 1080;
 /// Byte offset of the shared `writer_slot_counter` (fetch_add for unique writer slot indices).
 pub const WRITER_SLOT_COUNTER_OFFSET: u64 = 2104;
-/// Byte offset of the shared `peer_closed` word.
-///
-/// The host sets this on a session's request ring when the peer process
-/// departs without a clean close (a crash). Readers treat it as EOF, exactly
-/// like a zero writer count, so a handler parked on the ring can close its
-/// session and release the region. The word sits after the last allocated
-/// header field (2112) and well inside `RING_HEADER_SIZE`.
-pub const PEER_CLOSED_OFFSET: u64 = 2112;
 
 /// A monotonic cursor over a shared-memory ring buffer.
 #[derive(Clone, Copy, Debug)]
@@ -367,23 +367,6 @@ pub fn allocate_writer_id(backend: &dyn MappingBackend) -> Result<u32> {
     Ok(id as u32)
 }
 
-/// Loads the shared `peer_closed` flag.
-pub fn load_peer_closed(backend: &dyn MappingBackend) -> Result<bool> {
-    backend
-        .atomic_load_u64(PEER_CLOSED_OFFSET, Ordering::Acquire)
-        .map(|value| value != 0)
-        .map_err(Error::from)
-}
-
-/// Marks the ring's peer as departed and bumps the generation so a parked
-/// reader wakes and observes it. Returns the new generation.
-pub fn mark_peer_closed(backend: &dyn MappingBackend) -> Result<u64> {
-    backend
-        .atomic_store_u64(PEER_CLOSED_OFFSET, 1, Ordering::Release)
-        .map_err(Error::from)?;
-    bump_generation(backend)
-}
-
 /// Bumps the generation counter and returns the new value.
 pub fn bump_generation(backend: &dyn MappingBackend) -> Result<u64> {
     let prev = backend
@@ -537,6 +520,14 @@ pub fn load_next_tail(backend: &dyn MappingBackend) -> Result<u64> {
         .map_err(Error::from)
 }
 
+/// Loads the shared `peer_closed` flag.
+pub fn load_peer_closed(backend: &dyn MappingBackend) -> Result<bool> {
+    backend
+        .atomic_load_u64(PEER_CLOSED_OFFSET, Ordering::Acquire)
+        .map(|value| value != 0)
+        .map_err(Error::from)
+}
+
 /// Loads reader slot `slot`.
 pub fn load_reader_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> {
     if slot as usize >= MAX_READER_SLOTS {
@@ -571,6 +562,15 @@ pub fn load_writer_slot(backend: &dyn MappingBackend, slot: u32) -> Result<u64> 
     backend
         .atomic_load_u64(offset, Ordering::Acquire)
         .map_err(Error::from)
+}
+
+/// Marks the ring's peer as departed and bumps the generation so a parked
+/// reader wakes and observes it. Returns the new generation.
+pub fn mark_peer_closed(backend: &dyn MappingBackend) -> Result<u64> {
+    backend
+        .atomic_store_u64(PEER_CLOSED_OFFSET, 1, Ordering::Release)
+        .map_err(Error::from)?;
+    bump_generation(backend)
 }
 
 /// Computes a mask for a given capacity (must be a power of two).

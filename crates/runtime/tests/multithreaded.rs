@@ -28,35 +28,34 @@ use std::{
 use selium_abi::{ActivityKind, ResourceClass, mailbox};
 use selium_runtime::{Runtime, SystemGuestDescriptor};
 
-/// The linear-memory address this fixture places its mailbox at. The guest is
-/// free to choose any address; only the mailbox *layout* is fixed by the ABI.
-const MAILBOX_BASE: u32 = 0x1000;
-/// Reviewed bound on the worker pool settling: every worker commits its page
-/// and its fuel before the observation is read. The work is interpreted CPU on
-/// a shared host, so a loaded CI runner can take minutes; the bound is a
-/// failure threshold, not a performance assertion.
-const WORKER_SETTLE_BOUND: Duration = Duration::from_secs(120);
-/// Reviewed bound on the `mt-demo` SDK guest completing two CPU-bound tasks
-/// (interpreted, atomics, two workers) plus its serial baseline.
-const MT_DEMO_BOUND: Duration = Duration::from_secs(240);
-/// Reviewed bound on teardown joining a worker pool (a stop, then the guest
-/// count reaching zero).
-const TEARDOWN_BOUND: Duration = Duration::from_secs(30);
 /// Reviewed bound on a short reaping/execution step (trap teardown, a parked
 /// worker returning after a wake).
 const EXIT_BOUND: Duration = Duration::from_secs(30);
+/// The linear-memory address this fixture places its mailbox at. The guest is
+/// free to choose any address; only the mailbox *layout* is fixed by the ABI.
+const MAILBOX_BASE: u32 = 0x1000;
+/// Reviewed bound on the `mt-demo` SDK guest completing two CPU-bound tasks
+/// (interpreted, atomics, two workers) plus its serial baseline.
+const MT_DEMO_BOUND: Duration = Duration::from_secs(240);
 /// Reviewed bound on the concurrent-execution proof. Both workers must reach a
 /// rendezvous that only completes when the other arrives; a serial run cannot
 /// finish at all, so this bound only distinguishes "concurrent" from
 /// "deadlocked", never "fast" from "slow".
 const RENDEZVOUS_BOUND: Duration = Duration::from_secs(60);
-
+/// Reviewed bound on teardown joining a worker pool (a stop, then the guest
+/// count reaching zero).
+const TEARDOWN_BOUND: Duration = Duration::from_secs(30);
 /// Worker-entry body that traps immediately (`unreachable`).
 const TRAPPING_WORKER: &str = r#"(module
     (memory 1)
     (func (export "boot") (result i32) i32.const 0)
     (func (export "__selium_guest_worker") (param i32) (result i32)
       unreachable))"#;
+/// Reviewed bound on the worker pool settling: every worker commits its page
+/// and its fuel before the observation is read. The work is interpreted CPU on
+/// a shared host, so a loaded CI runner can take minutes; the bound is a
+/// failure threshold, not a performance assertion.
+const WORKER_SETTLE_BOUND: Duration = Duration::from_secs(120);
 
 /// Spawns a `WORKERS`-strong multithreaded guest whose workers each commit one
 /// page, run `iterations` of a busy loop, and park; polls metering until the
@@ -337,6 +336,29 @@ fn pool_descriptor(name: &str, module_id: &str, module_text: &str) -> SystemGues
     }
 }
 
+/// Worker-entry body that arrives at a two-party rendezvous: atomically bump
+/// the counter at address 0, then wait until it reads two. A bounded atomic
+/// wait re-checks, so a spurious wake cannot deadlock the pair.
+fn rendezvous_worker_module() -> String {
+    r#"(module
+    (memory 1)
+    (func (export "boot") (result i32) i32.const 0)
+    (func (export "__selium_guest_worker") (param $id i32) (result i32)
+      (local $current i32)
+      ;; Arrive: the atomic add returns the previous count.
+      (i32.const 0) (i32.const 1) (i32.atomic.rmw.add) (drop)
+      (block $done
+        (loop $wait
+          (local.set $current (i32.atomic.load (i32.const 0)))
+          (br_if $done (i32.ge_u (local.get $current) (i32.const 2)))
+          ;; Bounded wait (10 ms) so the loop re-reads; no notify is needed.
+          (drop (memory.atomic.wait32
+            (i32.const 0) (local.get $current) (i64.const 10000000)))
+          (br $wait)))
+      (i32.const 0)))"#
+        .to_string()
+}
+
 /// 6.2 (end-to-end, real SDK guest): the `selium-mt-demo` guest spawns two
 /// CPU-bound tasks through the SDK's work-stealing executor and joins them.
 /// This is the proof that the engine runs a real rustc-compiled module over
@@ -477,29 +499,6 @@ fn two_workers_reach_a_shared_rendezvous_concurrently() {
         "both workers must meet at the rendezvous and return cleanly, not trap or wedge: {:#?}",
         runtime.activity_log()
     );
-}
-
-/// Worker-entry body that arrives at a two-party rendezvous: atomically bump
-/// the counter at address 0, then wait until it reads two. A bounded atomic
-/// wait re-checks, so a spurious wake cannot deadlock the pair.
-fn rendezvous_worker_module() -> String {
-    r#"(module
-    (memory 1)
-    (func (export "boot") (result i32) i32.const 0)
-    (func (export "__selium_guest_worker") (param $id i32) (result i32)
-      (local $current i32)
-      ;; Arrive: the atomic add returns the previous count.
-      (i32.const 0) (i32.const 1) (i32.atomic.rmw.add) (drop)
-      (block $done
-        (loop $wait
-          (local.set $current (i32.atomic.load (i32.const 0)))
-          (br_if $done (i32.ge_u (local.get $current) (i32.const 2)))
-          ;; Bounded wait (10 ms) so the loop re-reads; no notify is needed.
-          (drop (memory.atomic.wait32
-            (i32.const 0) (local.get $current) (i64.const 10000000)))
-          (br $wait)))
-      (i32.const 0)))"#
-        .to_string()
 }
 
 /// Waits until `loaded_guest_count` reaches `expected` or `timeout` elapses.

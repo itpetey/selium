@@ -33,6 +33,10 @@ use selium_service::FlatMsg;
 
 mod common;
 
+/// Reviewed bound on a route-watch convergence event. Both sides run in the
+/// interpreted guest; the appearance is driven by a host wake, so a loaded
+/// runner only delays it.
+const CONVERGENCE_BOUND: Duration = Duration::from_secs(30);
 /// The consumer role: watch a route and log every event.
 const ROLE_CONSUMER: u64 = 2;
 /// The provider role: register a route and stay resident.
@@ -41,10 +45,6 @@ const ROLE_PROVIDER: u64 = 1;
 /// registration rather than a leaf alias (an alias additionally requires the
 /// typed target to be registered under its own URI first).
 const ROUTE: &str = "sel://probe/app/service";
-/// Reviewed bound on a route-watch convergence event. Both sides run in the
-/// interpreted guest; the appearance is driven by a host wake, so a loaded
-/// runner only delays it.
-const CONVERGENCE_BOUND: Duration = Duration::from_secs(30);
 
 /// Waits for the consumer to report an appearance and returns the resource id
 /// it converged on.

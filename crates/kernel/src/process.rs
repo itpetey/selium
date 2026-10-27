@@ -24,17 +24,6 @@ pub(crate) struct LogChannelState {
     pub(crate) read_position: u64,
 }
 
-impl Drop for LogChannelState {
-    fn drop(&mut self) {
-        // The reader holds a host mapping of the guest's log region, and no
-        // other owner names that mapping. Detaching it here keeps the mapping
-        // registry from outliving the process — and, because a region is only
-        // destroyed once its mapping count reaches zero, a leaked mapping also
-        // leaked the region (found by the soak lane).
-        self.backend.detach_mapping();
-    }
-}
-
 pub(crate) struct ProcessState {
     pub(crate) module_id: String,
     pub(crate) entrypoint: String,
@@ -321,6 +310,17 @@ impl ProcessTable {
     /// Returns the latest metering observation for a process, if present.
     pub fn metering_observation(&self, process_id: ProcessId) -> Option<MeteringObservation> {
         self.inner.metering.lock().get(&process_id).cloned()
+    }
+}
+
+impl Drop for LogChannelState {
+    fn drop(&mut self) {
+        // The reader holds a host mapping of the guest's log region, and no
+        // other owner names that mapping. Detaching it here keeps the mapping
+        // registry from outliving the process — and, because a region is only
+        // destroyed once its mapping count reaches zero, a leaked mapping also
+        // leaked the region (found by the soak lane).
+        self.backend.detach_mapping();
     }
 }
 

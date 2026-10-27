@@ -42,17 +42,6 @@ pub(crate) const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
 /// The single-instance control plane's root served route, named in the bridge
 /// handshake.
 pub(crate) const CONTROL_URI: &str = "sel:///control";
-pub(crate) const LEAF_MANIFEST: &str = "acme-leaf";
-/// Blob store + manifest the onboarding guest writes the issued leaf to.
-pub(crate) const ONBOARD_STORE: &str = "selium.identity-onboard.out";
-/// The day-1 scheduler seam's typed deferred context.
-pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
-/// SNI / TLS server name: the bare root wire name for the single-instance
-/// bridge route (resolved by the connector to `sel:///bridge`).
-pub(crate) const SERVER_NAME: &str = "bridge";
-/// The tenant the onboarding guest mints and the client connects as.
-pub(crate) const TENANT: &str = "acme";
-
 /// Reviewed bound on a guest reaching a logged milestone after bootstrap:
 /// onboarding, deployment recording, catalogue replay, a connector consuming
 /// the anchor set. A spine that has not converged in this window is parked or
@@ -61,19 +50,26 @@ pub(crate) const TENANT: &str = "acme";
 /// rather than an incidental literal, so slowing a test is a reviewed change to
 /// one constant.
 pub(crate) const CONVERGENCE_BOUND: Duration = Duration::from_secs(120);
-
 /// Reviewed bound on the interpreted-guest QUIC/TLS handshake. The handshake
 /// runs inside the wasm connector, so it is an order of magnitude slower than
 /// a native one; 240 s separates "loaded runner" from "never completes".
 pub(crate) const HANDSHAKE_BOUND: Duration = Duration::from_secs(240);
-
+pub(crate) const LEAF_MANIFEST: &str = "acme-leaf";
 /// Reviewed bound on observing one state change after it is triggered
 /// (anchor-set rebuild, revocation refusal, a probe's catalogue round trip).
 pub(crate) const OBSERVATION_BOUND: Duration = Duration::from_secs(60);
-
+/// Blob store + manifest the onboarding guest writes the issued leaf to.
+pub(crate) const ONBOARD_STORE: &str = "selium.identity-onboard.out";
+/// The day-1 scheduler seam's typed deferred context.
+pub(crate) const SCHEDULER_DEFERRED: &str = "scheduler service not yet online";
+/// SNI / TLS server name: the bare root wire name for the single-instance
+/// bridge route (resolved by the connector to `sel:///bridge`).
+pub(crate) const SERVER_NAME: &str = "bridge";
 /// Reviewed bound on a short guest milestone (a listener reporting ready, a
 /// probe logging its result) where the work is a few interpreted passes.
 pub(crate) const SHORT_BOUND: Duration = Duration::from_secs(30);
+/// The tenant the onboarding guest mints and the client connects as.
+pub(crate) const TENANT: &str = "acme";
 
 /// A temporary state root for one test, removed on drop.
 ///

@@ -53,45 +53,98 @@ impl Drop for TempRoot {
     }
 }
 
-/// Builds a record with a distinct sequence and payload per index.
-fn record(sequence: u64) -> Record {
-    Record {
-        sequence,
-        timestamp_ms: 1_000 + sequence,
-        headers: vec![("source".to_string(), "crash-consistency".to_string())],
-        payload: format!("record-{sequence}").into_bytes(),
-    }
-}
+/// The manifest publish is the durable decision point for a blob: a crash
+/// before it completes must leave the previous manifest as the visible state.
+#[test]
+#[ignore = "crash-consistency lane: run nightly via scripts/gate.sh --soak"]
+fn crash_before_a_manifest_publish_keeps_the_previous_manifest() {
+    let root = TempRoot::new("crash-manifest");
+    let kernel = Kernel::with_state_dir(13, root.path());
+    let volumes = kernel.volumes();
 
-/// Writes `bytes` to a fresh volume under `name`, syncs, closes, and reopens —
-/// the durable state a restart replays.
-fn write_and_restart(volumes: &VolumeRegistry, name: &str, bytes: &[u8]) -> Vec<u8> {
-    let descriptor = volumes.open(None, name).expect("open crash volume");
-    if !bytes.is_empty() {
-        volumes
-            .append(descriptor.local_id, bytes)
-            .expect("append crash bytes");
-    }
-    volumes
-        .sync(descriptor.local_id)
-        .expect("sync crash volume");
-    drop(volumes.close(descriptor.local_id));
+    let first = format::frame(&format::encode_manifest("leaf", "blob-one"));
+    let second = format::frame(&format::encode_manifest("leaf", "blob-two"));
+    let name = format::manifest_volume("crash-manifest");
 
-    let reopened = volumes.open(None, name).expect("reopen crash volume");
-    let bytes = volumes
-        .read_at(reopened.local_id, 0, u32::MAX as usize)
-        .expect("read crash volume");
-    drop(volumes.close(reopened.local_id));
-    bytes
-}
+    // Complete first publish, torn second publish.
+    let mut bytes = first.clone();
+    bytes.extend_from_slice(&second[..second.len() / 2]);
+    let restarted = write_and_restart(&volumes, &name, &bytes);
 
-/// Replays every decodable record in `bytes`, as the store's reader does.
-fn replay(bytes: &[u8]) -> Vec<Record> {
-    let (frames, _end) = format::scan_frames(bytes);
-    frames
+    let (frames, end) = format::scan_frames(&restarted);
+    let manifests: Vec<(String, String)> = frames
         .into_iter()
-        .filter_map(|frame| format::decode_record(frame).ok())
-        .collect()
+        .filter_map(|frame| format::decode_manifest(frame).ok())
+        .collect();
+    assert_eq!(
+        manifests,
+        vec![("leaf".to_string(), "blob-one".to_string())],
+        "the torn publish must not replace the visible manifest"
+    );
+    assert_eq!(
+        format::torn_tail(&restarted),
+        Some(end),
+        "the torn publish is exactly the tail after the last complete frame"
+    );
+
+    // A recovery path trims the torn tail and retries the publish into a
+    // fresh volume (the state a successful retry leaves behind).
+    let mut trimmed = restarted[..end].to_vec();
+    trimmed.extend_from_slice(&second);
+    let recovered_name = format::manifest_volume("crash-manifest-recovered");
+    let recovered = write_and_restart(&volumes, &recovered_name, &trimmed);
+    let (frames, _end) = format::scan_frames(&recovered);
+    let recovered_manifests: Vec<(String, String)> = frames
+        .into_iter()
+        .filter_map(|frame| format::decode_manifest(frame).ok())
+        .collect();
+    assert_eq!(
+        recovered_manifests,
+        vec![
+            ("leaf".to_string(), "blob-one".to_string()),
+            ("leaf".to_string(), "blob-two".to_string()),
+        ],
+        "after trimming, a retried publish lands as the second complete frame"
+    );
+}
+
+/// A crash that corrupts a record already written must stop replay before it:
+/// the CRC is the boundary between "durable" and "discard".
+#[test]
+#[ignore = "crash-consistency lane: run nightly via scripts/gate.sh --soak"]
+fn crash_corruption_of_a_log_record_is_discarded_not_replayed() {
+    let root = TempRoot::new("crash-corrupt");
+    let kernel = Kernel::with_state_dir(11, root.path());
+    let volumes = kernel.volumes();
+
+    let records: Vec<Record> = (1..=3).map(record).collect();
+    let mut full = Vec::new();
+    for record in &records {
+        full.extend_from_slice(&format::frame(&format::encode_record(record)));
+    }
+
+    let name = format::log_volume("crash-corrupt", 0);
+    let clean = write_and_restart(&volumes, &name, &full);
+    let (frames, _end) = format::scan_frames(&clean);
+    let third_start = frames[0].len() + frames[1].len() + 2 * 8;
+
+    // Flip one payload byte of the third record: a crash that landed a bad
+    // sector rather than a short write.
+    let mut corrupt = full.clone();
+    let victim = third_start + 8 + 4;
+    corrupt[victim] ^= 0xFF;
+    let corrupt_name = format::log_volume("crash-corrupt", 1);
+    let corrupt = write_and_restart(&volumes, &corrupt_name, &corrupt);
+
+    assert_eq!(
+        replay(&corrupt),
+        records[..2],
+        "a checksum failure discards that record and everything after it"
+    );
+    assert!(
+        format::torn_tail(&corrupt).is_some(),
+        "a corrupt record is reported as a torn tail, not silently skipped"
+    );
 }
 
 /// Cuts a three-record log at every byte offset; each restart must replay a
@@ -160,96 +213,43 @@ fn crash_truncation_of_a_log_replays_a_consistent_prefix() {
     }
 }
 
-/// A crash that corrupts a record already written must stop replay before it:
-/// the CRC is the boundary between "durable" and "discard".
-#[test]
-#[ignore = "crash-consistency lane: run nightly via scripts/gate.sh --soak"]
-fn crash_corruption_of_a_log_record_is_discarded_not_replayed() {
-    let root = TempRoot::new("crash-corrupt");
-    let kernel = Kernel::with_state_dir(11, root.path());
-    let volumes = kernel.volumes();
-
-    let records: Vec<Record> = (1..=3).map(record).collect();
-    let mut full = Vec::new();
-    for record in &records {
-        full.extend_from_slice(&format::frame(&format::encode_record(record)));
+/// Builds a record with a distinct sequence and payload per index.
+fn record(sequence: u64) -> Record {
+    Record {
+        sequence,
+        timestamp_ms: 1_000 + sequence,
+        headers: vec![("source".to_string(), "crash-consistency".to_string())],
+        payload: format!("record-{sequence}").into_bytes(),
     }
-
-    let name = format::log_volume("crash-corrupt", 0);
-    let clean = write_and_restart(&volumes, &name, &full);
-    let (frames, _end) = format::scan_frames(&clean);
-    let third_start = frames[0].len() + frames[1].len() + 2 * 8;
-
-    // Flip one payload byte of the third record: a crash that landed a bad
-    // sector rather than a short write.
-    let mut corrupt = full.clone();
-    let victim = third_start + 8 + 4;
-    corrupt[victim] ^= 0xFF;
-    let corrupt_name = format::log_volume("crash-corrupt", 1);
-    let corrupt = write_and_restart(&volumes, &corrupt_name, &corrupt);
-
-    assert_eq!(
-        replay(&corrupt),
-        records[..2],
-        "a checksum failure discards that record and everything after it"
-    );
-    assert!(
-        format::torn_tail(&corrupt).is_some(),
-        "a corrupt record is reported as a torn tail, not silently skipped"
-    );
 }
 
-/// The manifest publish is the durable decision point for a blob: a crash
-/// before it completes must leave the previous manifest as the visible state.
-#[test]
-#[ignore = "crash-consistency lane: run nightly via scripts/gate.sh --soak"]
-fn crash_before_a_manifest_publish_keeps_the_previous_manifest() {
-    let root = TempRoot::new("crash-manifest");
-    let kernel = Kernel::with_state_dir(13, root.path());
-    let volumes = kernel.volumes();
-
-    let first = format::frame(&format::encode_manifest("leaf", "blob-one"));
-    let second = format::frame(&format::encode_manifest("leaf", "blob-two"));
-    let name = format::manifest_volume("crash-manifest");
-
-    // Complete first publish, torn second publish.
-    let mut bytes = first.clone();
-    bytes.extend_from_slice(&second[..second.len() / 2]);
-    let restarted = write_and_restart(&volumes, &name, &bytes);
-
-    let (frames, end) = format::scan_frames(&restarted);
-    let manifests: Vec<(String, String)> = frames
+/// Replays every decodable record in `bytes`, as the store's reader does.
+fn replay(bytes: &[u8]) -> Vec<Record> {
+    let (frames, _end) = format::scan_frames(bytes);
+    frames
         .into_iter()
-        .filter_map(|frame| format::decode_manifest(frame).ok())
-        .collect();
-    assert_eq!(
-        manifests,
-        vec![("leaf".to_string(), "blob-one".to_string())],
-        "the torn publish must not replace the visible manifest"
-    );
-    assert_eq!(
-        format::torn_tail(&restarted),
-        Some(end),
-        "the torn publish is exactly the tail after the last complete frame"
-    );
+        .filter_map(|frame| format::decode_record(frame).ok())
+        .collect()
+}
 
-    // A recovery path trims the torn tail and retries the publish into a
-    // fresh volume (the state a successful retry leaves behind).
-    let mut trimmed = restarted[..end].to_vec();
-    trimmed.extend_from_slice(&second);
-    let recovered_name = format::manifest_volume("crash-manifest-recovered");
-    let recovered = write_and_restart(&volumes, &recovered_name, &trimmed);
-    let (frames, _end) = format::scan_frames(&recovered);
-    let recovered_manifests: Vec<(String, String)> = frames
-        .into_iter()
-        .filter_map(|frame| format::decode_manifest(frame).ok())
-        .collect();
-    assert_eq!(
-        recovered_manifests,
-        vec![
-            ("leaf".to_string(), "blob-one".to_string()),
-            ("leaf".to_string(), "blob-two".to_string()),
-        ],
-        "after trimming, a retried publish lands as the second complete frame"
-    );
+/// Writes `bytes` to a fresh volume under `name`, syncs, closes, and reopens —
+/// the durable state a restart replays.
+fn write_and_restart(volumes: &VolumeRegistry, name: &str, bytes: &[u8]) -> Vec<u8> {
+    let descriptor = volumes.open(None, name).expect("open crash volume");
+    if !bytes.is_empty() {
+        volumes
+            .append(descriptor.local_id, bytes)
+            .expect("append crash bytes");
+    }
+    volumes
+        .sync(descriptor.local_id)
+        .expect("sync crash volume");
+    drop(volumes.close(descriptor.local_id));
+
+    let reopened = volumes.open(None, name).expect("reopen crash volume");
+    let bytes = volumes
+        .read_at(reopened.local_id, 0, u32::MAX as usize)
+        .expect("read crash volume");
+    drop(volumes.close(reopened.local_id));
+    bytes
 }

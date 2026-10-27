@@ -74,6 +74,16 @@ pub struct OwnedServerStreamClient<Req, Item> {
     shared_id: u64,
 }
 
+/// A session the host has marked closed: the parent region and the request
+/// ring's new generation (for waking a parked receiver).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedSession {
+    /// Parent region id the receiver registered its generation wait under.
+    pub region_id: u64,
+    /// New request-ring generation, passed to the host's wake registry.
+    pub generation: u64,
+}
+
 impl<Req, Rep> OwnedRpcClient<Req, Rep> {
     /// Returns the parent shared id of the owned session region.
     pub fn shared_id(&self) -> u64 {
@@ -140,37 +150,6 @@ impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
             // teardown raced); nothing further to do during drop.
         }
     }
-}
-
-/// A session the host has marked closed: the parent region and the request
-/// ring's new generation (for waking a parked receiver).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClosedSession {
-    /// Parent region id the receiver registered its generation wait under.
-    pub region_id: u64,
-    /// New request-ring generation, passed to the host's wake registry.
-    pub generation: u64,
-}
-
-/// Marks an RPC session's peer departed and bumps the request ring, waking a
-/// server parked in `recv`.
-///
-/// Host-side teardown calls this for a sender process that has died: the
-/// sender cannot drop its writer registration, so the receiver would otherwise
-/// park forever and retain the connection region. The temporary attachment is
-/// dropped immediately; only the flag and generation word are touched.
-pub fn close_session(shared_id: u64) -> std::result::Result<ClosedSession, RpcError> {
-    let (request_channel, _reply_channel) =
-        attach_rpc_region(shared_id).map_err(|error| RpcError::Serialisation(error.to_string()))?;
-    let generation = request_channel
-        .ring()
-        .region()
-        .mark_peer_closed()
-        .map_err(|error| RpcError::Serialisation(error.to_string()))?;
-    Ok(ClosedSession {
-        region_id: request_channel.region_id(),
-        generation,
-    })
 }
 
 /// Accepts an incoming shared-memory RPC session.
@@ -241,6 +220,27 @@ where
         FramedWrite::new(reply_transport),
         connection.client_process_id,
     ))
+}
+
+/// Marks an RPC session's peer departed and bumps the request ring, waking a
+/// server parked in `recv`.
+///
+/// Host-side teardown calls this for a sender process that has died: the
+/// sender cannot drop its writer registration, so the receiver would otherwise
+/// park forever and retain the connection region. The temporary attachment is
+/// dropped immediately; only the flag and generation word are touched.
+pub fn close_session(shared_id: u64) -> std::result::Result<ClosedSession, RpcError> {
+    let (request_channel, _reply_channel) =
+        attach_rpc_region(shared_id).map_err(|error| RpcError::Serialisation(error.to_string()))?;
+    let generation = request_channel
+        .ring()
+        .region()
+        .mark_peer_closed()
+        .map_err(|error| RpcError::Serialisation(error.to_string()))?;
+    Ok(ClosedSession {
+        region_id: request_channel.region_id(),
+        generation,
+    })
 }
 
 /// Creates a new shared-memory RPC client.

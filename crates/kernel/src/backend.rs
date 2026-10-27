@@ -67,6 +67,17 @@ impl KernelBackend {
     }
 }
 
+impl KernelBackend {
+    /// Detaches this backend's host mapping.
+    ///
+    /// Called by the last named owner of the mapping (e.g. a process's
+    /// log-channel reader) when it is dropped. Clones produced by `sub_region`
+    /// share the mapping and must not detach it, so this is not a `Drop` impl.
+    pub(crate) fn detach_mapping(&self) {
+        drop(self.memory.detach_shared_region(self.local_id));
+    }
+}
+
 impl MappingBackend for KernelBackend {
     fn size(&self) -> u64 {
         self.size
@@ -214,17 +225,6 @@ impl Debug for KernelBackend {
             .field("base_offset", &self.base_offset)
             .field("size", &self.size)
             .finish()
-    }
-}
-
-impl KernelBackend {
-    /// Detaches this backend's host mapping.
-    ///
-    /// Called by the last named owner of the mapping (e.g. a process's
-    /// log-channel reader) when it is dropped. Clones produced by `sub_region`
-    /// share the mapping and must not detach it, so this is not a `Drop` impl.
-    pub(crate) fn detach_mapping(&self) {
-        drop(self.memory.detach_shared_region(self.local_id));
     }
 }
 

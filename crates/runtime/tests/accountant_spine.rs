@@ -31,10 +31,6 @@ use selium_abi::{
     Capability, CapabilityGrant, CompletionState, HostcallOutput, HostcallRequest, RegionProt,
     ResourceClass, ResourceKind, ResourceSelector,
 };
-/// Reviewed bound on the bookkeeper's ledger window becoming visible after the
-/// workload runs. The window is written by the guest and read by the host, so a
-/// loaded runner only delays it.
-const LEDGER_WINDOW_BOUND: Duration = Duration::from_secs(90);
 use selium_accountant::{
     ACCOUNTANT_ENTRYPOINT, BOOKKEEPER_ENTRYPOINT, LEDGER_LOG, LedgerRecord, accountant_grants,
     bookkeeper_grants,
@@ -47,6 +43,10 @@ use spine_common::{
 mod common;
 mod spine_common;
 
+/// Reviewed bound on the bookkeeper's ledger window becoming visible after the
+/// workload runs. The window is written by the guest and read by the host, so a
+/// loaded runner only delays it.
+const LEDGER_WINDOW_BOUND: Duration = Duration::from_secs(90);
 /// The tenant the workload runs as and usage accrues for.
 const TENANT: &str = "acme";
 

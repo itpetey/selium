@@ -8,11 +8,11 @@
 //! `#[ignore]`d by default because it needs the discovery and discovery-probe
 //! guests built for `wasm32-unknown-unknown`.
 
+use failure_common as fx;
 use selium_runtime::Runtime;
 
 mod common;
 mod failure_common;
-use failure_common as fx;
 
 #[test]
 #[ignore = "requires the discovery and discovery-probe guests built for wasm32-unknown-unknown"]

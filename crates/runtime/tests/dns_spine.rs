@@ -219,6 +219,18 @@ fn read_wasm(crate_name: &str, file_name: &str) -> Vec<u8> {
     common::read_guest_wasm_debug(crate_name, file_name)
 }
 
+/// Log summaries the reap path moved into the activity log for `process_id`.
+fn reaped_log_lines(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    runtime
+        .activity_log()
+        .iter()
+        .filter(|event| {
+            event.process_id == Some(process_id) && event.kind == ActivityKind::ProcessExited
+        })
+        .map(|event| event.message.clone())
+        .collect()
+}
+
 /// A loopback UDP server that answers every A query for `example.test` with
 /// `127.0.0.1`, echoing the client's transaction id.
 fn spawn_fake_dns_resolver() -> std::net::SocketAddr {
@@ -315,16 +327,4 @@ fn wait_for_logs(
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("timed out waiting for {needles:?} in guest log; got {seen:?}");
-}
-
-/// Log summaries the reap path moved into the activity log for `process_id`.
-fn reaped_log_lines(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    runtime
-        .activity_log()
-        .iter()
-        .filter(|event| {
-            event.process_id == Some(process_id) && event.kind == ActivityKind::ProcessExited
-        })
-        .map(|event| event.message.clone())
-        .collect()
 }

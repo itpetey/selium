@@ -62,7 +62,15 @@ mod spine_common;
 const CERT_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixtures/cert.pem");
 /// The connector's fixed listener (its `QUIC_LISTEN_ADDR` const).
 const CONNECTOR_ADDR: &str = "127.0.0.1:4433";
+/// Reviewed bound on the interpreted TLS 1.3 handshake. The handshake runs
+/// inside the wasm connector, so it is an order of magnitude slower than a
+/// native one; a loaded CI runner can take minutes, and the failure this
+/// distinguishes is "never completes", not "slow".
+const HANDSHAKE_BOUND: Duration = Duration::from_secs(240);
 const KEY_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixtures/key.pem");
+/// Reviewed bound on observing the guest-side relay logs, which are already
+/// produced by the time the echo futures resolve.
+const OBSERVATION_BOUND: Duration = Duration::from_secs(60);
 /// Per-stream payload. Sized for the wasm interpreter's current QUIC
 /// throughput: each wire packet costs tens of milliseconds of interpreted
 /// crypto, so bulk transfers crawl (and the connector's default 30 s idle
@@ -71,25 +79,17 @@ const KEY_PEM: &[u8] = include_bytes!("../../../guests/connector-quic/tests/fixt
 /// connector's 64 KiB per-direction ring capacity — so each direction is
 /// forced through at least one park/resume cycle by payload size alone.
 const PAYLOAD_LEN: usize = 16 * 1024;
+/// Reviewed bound on two concurrent payload echoes through the interpreter
+/// (the relay is paced by quinn, so this is deliberately larger than the
+/// handshake). A relocation of the pacer's steady state shows up as the
+/// client's idle timeout, not as this bound.
+const RELAY_BOUND: Duration = Duration::from_secs(300);
 /// SNI / bare route name; must match the certificate's SAN.
 const SERVER_NAME: &str = "localhost";
 /// Warm-up round trips driven before the timed payload streams (see the
 /// handshake comment). Each opens a stream, so the guest-side "one accept
 /// per stream" assertion counts these too; keep the two in sync.
 const WARMUP_ROUNDS: usize = 12;
-/// Reviewed bound on the interpreted TLS 1.3 handshake. The handshake runs
-/// inside the wasm connector, so it is an order of magnitude slower than a
-/// native one; a loaded CI runner can take minutes, and the failure this
-/// distinguishes is "never completes", not "slow".
-const HANDSHAKE_BOUND: Duration = Duration::from_secs(240);
-/// Reviewed bound on two concurrent payload echoes through the interpreter
-/// (the relay is paced by quinn, so this is deliberately larger than the
-/// handshake). A relocation of the pacer's steady state shows up as the
-/// client's idle timeout, not as this bound.
-const RELAY_BOUND: Duration = Duration::from_secs(300);
-/// Reviewed bound on observing the guest-side relay logs, which are already
-/// produced by the time the echo futures resolve.
-const OBSERVATION_BOUND: Duration = Duration::from_secs(60);
 
 /// Builds the `selium-client` connection options: trust the connector's
 /// self-signed test certificate, with a patient transport config (the wasm32

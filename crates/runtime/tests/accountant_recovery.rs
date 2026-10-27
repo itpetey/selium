@@ -33,11 +33,6 @@ use spine_common::{
     StateRoot, discovery_descriptor, read_wasm, runtime_in_state_root, store_descriptor,
 };
 
-/// Reviewed bound on a respawned accountant replaying the ledger and
-/// re-authoring enforcement. The replay is guest work plus host polling, so a
-/// loaded runner only delays it.
-const RECOVERY_BOUND: Duration = Duration::from_secs(60);
-
 mod common;
 mod spine_common;
 
@@ -45,6 +40,10 @@ mod spine_common;
 const ACTIVE: &str = "beta";
 /// The delinquent tenant: plan + overage authored, then suspended.
 const DELINQUENT: &str = "acme";
+/// Reviewed bound on a respawned accountant replaying the ledger and
+/// re-authoring enforcement. The replay is guest work plus host polling, so a
+/// loaded runner only delays it.
+const RECOVERY_BOUND: Duration = Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the discovery and accountant guests built for wasm32-unknown-unknown"]
@@ -150,40 +149,6 @@ fn accounting_descriptor(
     }
 }
 
-/// Waits, bounded, for the accountant to re-author every quota the assertion
-/// below checks.
-///
-/// The accountant authors `SharedRegion`, `Volume`, `Process`, and `Cpu`
-/// through separate hostcalls, and may park before it starts (converging on the
-/// bookkeeper's topic). Observing one class is therefore not evidence that the
-/// projection is complete: under pack load an intermediate state failed the
-/// immediate assertion even though the guest was still working.
-fn wait_for_enforcement_reauthored(runtime: &Runtime, poll: Option<u64>, bound: Duration) {
-    let deadline = Instant::now() + bound;
-    loop {
-        if let Some(process_id) = poll {
-            runtime.poll_guest(process_id);
-        }
-        if enforcement_reauthored(runtime) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "accountant never re-authored enforcement within {bound:?}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// Every enforcement fact the assertion below checks is present.
-fn enforcement_reauthored(runtime: &Runtime) -> bool {
-    let quota = runtime.kernel().quota();
-    quota.lookup(DELINQUENT, ResourceClass::SharedRegion) == Some(0)
-        && quota.lookup(DELINQUENT, ResourceClass::Volume) == Some(0)
-        && quota.lookup(ACTIVE, ResourceClass::SharedRegion) == Some(40 * 65_536)
-        && quota.lookup(ACTIVE, ResourceClass::Volume) == Some(20 * 65_536)
-}
-
 /// Asserts the accountant re-authored enforcement from the replayed ledger:
 /// the delinquent tenant's quotas are zeroed; the active tenant is capped at
 /// its hard ceiling (plan + overage) for memory and its resident bytes.
@@ -210,6 +175,15 @@ fn assert_enforcement_reauthored(runtime: &Runtime) {
         Some(20 * 65_536),
         "active tenant's volume quota must be its hard ceiling"
     );
+}
+
+/// Every enforcement fact the assertion below checks is present.
+fn enforcement_reauthored(runtime: &Runtime) -> bool {
+    let quota = runtime.kernel().quota();
+    quota.lookup(DELINQUENT, ResourceClass::SharedRegion) == Some(0)
+        && quota.lookup(DELINQUENT, ResourceClass::Volume) == Some(0)
+        && quota.lookup(ACTIVE, ResourceClass::SharedRegion) == Some(40 * 65_536)
+        && quota.lookup(ACTIVE, ResourceClass::Volume) == Some(20 * 65_536)
 }
 
 /// Seeds one encoded ledger record into the durable usage log, host-side, in
@@ -300,4 +274,29 @@ fn seed_policy(runtime: &Runtime) {
             },
         },
     );
+}
+
+/// Waits, bounded, for the accountant to re-author every quota the assertion
+/// below checks.
+///
+/// The accountant authors `SharedRegion`, `Volume`, `Process`, and `Cpu`
+/// through separate hostcalls, and may park before it starts (converging on the
+/// bookkeeper's topic). Observing one class is therefore not evidence that the
+/// projection is complete: under pack load an intermediate state failed the
+/// immediate assertion even though the guest was still working.
+fn wait_for_enforcement_reauthored(runtime: &Runtime, poll: Option<u64>, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(process_id) = poll {
+            runtime.poll_guest(process_id);
+        }
+        if enforcement_reauthored(runtime) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accountant never re-authored enforcement within {bound:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
