@@ -27,6 +27,34 @@ const PROBE_BOUND: Duration = Duration::from_secs(30);
 /// The probe role that serves with a refused declaration.
 const ROLE_SERVE_DECLARATION_FAILS: u64 = 12;
 
+/// Collects every log line until `count` lines with `prefix` have been seen.
+#[expect(
+    clippy::panic,
+    reason = "a missing log line within the bound is a test failure"
+)]
+fn collect_after(
+    runtime: &Runtime,
+    process_id: u64,
+    prefix: &str,
+    count: usize,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        all.extend(drain_logs(runtime, process_id));
+        let matched = all.iter().filter(|line| line.starts_with(prefix)).count();
+        if matched >= count {
+            return all;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for {count} {prefix:?} lines from process {process_id}; \
+         logs: {all:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires the discovery and discovery-probe guests built for wasm32-unknown-unknown"]
 fn declaration_failure_publishes_neither_route() {
@@ -72,48 +100,6 @@ fn declaration_failure_publishes_neither_route() {
     }
 }
 
-fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
-        return Vec::new();
-    };
-    frames
-        .iter()
-        .map(|frame| {
-            selium_service::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
-}
-
-/// Collects every log line until `count` lines with `prefix` have been seen.
-#[expect(
-    clippy::panic,
-    reason = "a missing log line within the bound is a test failure"
-)]
-fn collect_after(
-    runtime: &Runtime,
-    process_id: u64,
-    prefix: &str,
-    count: usize,
-    timeout: Duration,
-) -> Vec<String> {
-    let mut all: Vec<String> = Vec::new();
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        all.extend(drain_logs(runtime, process_id));
-        let matched = all.iter().filter(|line| line.starts_with(prefix)).count();
-        if matched >= count {
-            return all;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!(
-        "timed out waiting for {count} {prefix:?} lines from process {process_id}; \
-         logs: {all:?}"
-    );
-}
-
 fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
     SystemGuestDescriptor {
         name: "discovery".to_string(),
@@ -148,6 +134,20 @@ fn discovery_probe_wasm() -> Vec<u8> {
 
 fn discovery_wasm() -> Vec<u8> {
     common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
+}
+
+fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        return Vec::new();
+    };
+    frames
+        .iter()
+        .map(|frame| {
+            selium_service::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
 }
 
 /// Spawns the probe with the discovery listener handle bootstrap would have

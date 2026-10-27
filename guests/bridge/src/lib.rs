@@ -28,13 +28,13 @@
 //! The bridge server terminates no QUIC and relays no stream bytes; it is a
 //! control-plane guest only.
 
+use std::hash::Hash;
+
 use anyhow::Context as _;
 use selium_abi::{
     Capability, CapabilityGrant, ResourceClass, ResourceIdentity, ResourceSelector,
     client_identity::ClientIdentity,
 };
-use std::hash::Hash;
-
 use selium_guest::{
     Context, ModuleSource, Process, ResourceListener, RouteEvent, Serve, entrypoint, error, info,
     net::ByteStream, warn,
@@ -48,6 +48,7 @@ const BRIDGE_CHANNEL_ENTRYPOINT: &str = "bridge_channel";
 const GRANT_TABLE_ROUTE: &str = "sel:///identity-grants";
 /// The accountant guest's published narrowing table route.
 const NARROWING_TABLE_ROUTE: &str = "sel:///accounting-narrowing";
+
 /// The identity-published grant table: a `fingerprint -> baseline grants` live
 /// table read at handoff conferral. Replaces the interim `IdentityGrantMap`
 /// stub. Until the table is attached (`Some`), every fingerprint is unknown and
@@ -65,25 +66,14 @@ pub struct NarrowingTable {
     table: Option<LiveTableView<String, Vec<u8>, ShmTransport>>,
 }
 
-/// Opens a replayed live-table view over a resolved table region.
-///
-/// Replay starts at the ring begin so mutations published before this
-/// attachment are materialised, which is what lets a late-attached table
-/// describe the current state rather than only later changes.
-fn open_table_view<K, V>(
-    target: &ResourceTarget,
-) -> anyhow::Result<LiveTableView<K, V, ShmTransport>>
-where
-    K: FlatMsg + Clone + Hash + Eq,
-    V: FlatMsg + Clone,
-{
-    let channel = Channel::attach(target.resource_id)
-        .map_err(|e| anyhow::anyhow!("table region attach failed: {e}"))?;
-    let transport = ShmTransport::new_replay(&channel, &channel)
-        .map_err(|e| anyhow::anyhow!("table transport failed: {e}"))?;
-    let subscriber = Subscriber::new(FramedRead::new(transport), None);
-    LiveTableView::new(subscriber)
-        .map_err(|e| anyhow::anyhow!("table view construction failed: {e}"))
+/// What woke the bridge server's main loop.
+enum Wake {
+    /// A change on the identity grant table's route.
+    GrantTable(anyhow::Result<RouteEvent>),
+    /// A change on the accountant narrowing table's route.
+    NarrowingTable(anyhow::Result<RouteEvent>),
+    /// A delivered stream handoff (or a receive failure).
+    Handoff(Result<selium_guest::IncomingConnection, selium_guest::GuestError>),
 }
 
 impl GrantTable {
@@ -222,127 +212,6 @@ fn bridge_channel_grants(
         ],
     ));
     child_grants
-}
-
-/// What woke the bridge server's main loop.
-enum Wake {
-    /// A change on the identity grant table's route.
-    GrantTable(anyhow::Result<RouteEvent>),
-    /// A change on the accountant narrowing table's route.
-    NarrowingTable(anyhow::Result<RouteEvent>),
-    /// A delivered stream handoff (or a receive failure).
-    Handoff(Result<selium_guest::IncomingConnection, selium_guest::GuestError>),
-}
-
-/// Awaits the next event from an optional route watch.
-///
-/// A watch that could not be created (e.g. the route table was unavailable at
-/// boot) never resolves, leaving the table's safe default in force.
-async fn next_table_event(
-    watch: &mut Option<selium_guest::RouteWatch>,
-) -> anyhow::Result<RouteEvent> {
-    match watch {
-        Some(watch) => watch.next().await.map_err(anyhow::Error::from),
-        None => std::future::pending::<anyhow::Result<RouteEvent>>().await,
-    }
-}
-
-/// Applies one watch event to a table, restoring that table's safe default on
-/// revocation, a stale appearance, or any attachment failure.
-///
-/// An appearance is only a convergence signal: `resolve` re-resolves the route
-/// through discovery (which records attach authority) and `attach` builds the
-/// live view from that target. `default` is the caller's policy for *not*
-/// having a table: grants stay fail-closed (unknown identities are refused) and
-/// narrowing stays fail-open (no subtraction).
-async fn converge_table<T, Resolve, Fut, Attach>(
-    event: anyhow::Result<RouteEvent>,
-    watch: &mut Option<selium_guest::RouteWatch>,
-    label: &str,
-    resolve: Resolve,
-    attach: Attach,
-    default: fn() -> T,
-) -> T
-where
-    Resolve: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Option<ResourceTarget>, selium_guest::GuestError>>,
-    Attach: FnOnce(&ResourceTarget) -> anyhow::Result<T>,
-{
-    match event {
-        Ok(RouteEvent::Appeared(_)) | Ok(RouteEvent::Replaced(_)) => {
-            match resolve().await {
-                Ok(Some(target)) => match attach(&target) {
-                    Ok(table) => return table,
-                    Err(error) => warn!("{label}: attach failed: {error}"),
-                },
-                Ok(None) => {} // Stale event: the route went away again.
-                Err(error) => warn!("{label}: re-resolve failed: {error}"),
-            }
-            default()
-        }
-        Ok(RouteEvent::Revoked) => default(),
-        Err(error) => {
-            warn!("{label}: watch failed: {error}; using the safe default");
-            *watch = None;
-            default()
-        }
-    }
-}
-
-/// Applies one grant-table watch event, restoring the fail-closed default on
-/// revocation or any attachment failure.
-async fn converge_grant_table(
-    event: anyhow::Result<RouteEvent>,
-    watch: &mut Option<selium_guest::RouteWatch>,
-    ctx: &mut Context,
-) -> GrantTable {
-    converge_table(
-        event,
-        watch,
-        "bridge-server: grant table",
-        || ctx.lookup(GRANT_TABLE_ROUTE),
-        GrantTable::from_target,
-        GrantTable::empty,
-    )
-    .await
-}
-
-/// Applies one narrowing-table watch event, restoring the fail-open default on
-/// revocation or any attachment failure.
-async fn converge_narrowing_table(
-    event: anyhow::Result<RouteEvent>,
-    watch: &mut Option<selium_guest::RouteWatch>,
-    ctx: &mut Context,
-) -> NarrowingTable {
-    converge_table(
-        event,
-        watch,
-        "bridge-server: narrowing table",
-        || ctx.lookup(NARROWING_TABLE_ROUTE),
-        NarrowingTable::from_target,
-        NarrowingTable::empty,
-    )
-    .await
-}
-
-/// Creates a table's route watch, reporting (not failing) when the route table
-/// is not ready.
-///
-/// Called at boot and again before a handoff, so a watch whose creation failed
-/// while the discovery route table was still unpublished is retried rather
-/// than leaving the table permanently detached.
-async fn open_table_watch(
-    ctx: &mut Context,
-    uri: &str,
-    label: &str,
-) -> Option<selium_guest::RouteWatch> {
-    match ctx.watch(uri).await {
-        Ok(watch) => Some(watch),
-        Err(error) => {
-            warn!("bridge-server: {label} unavailable: {error}");
-            None
-        }
-    }
 }
 
 /// Bridge server entrypoint.
@@ -558,6 +427,138 @@ async fn bridge_server(mut ctx: Context, bridge_channel_module: (u64, u64)) -> a
                 error!("bridge-server: bridge-channel spawn failed: {e}");
                 attach_then_close(incoming.shared_id);
             }
+        }
+    }
+}
+
+/// Applies one grant-table watch event, restoring the fail-closed default on
+/// revocation or any attachment failure.
+async fn converge_grant_table(
+    event: anyhow::Result<RouteEvent>,
+    watch: &mut Option<selium_guest::RouteWatch>,
+    ctx: &mut Context,
+) -> GrantTable {
+    converge_table(
+        event,
+        watch,
+        "bridge-server: grant table",
+        || ctx.lookup(GRANT_TABLE_ROUTE),
+        GrantTable::from_target,
+        GrantTable::empty,
+    )
+    .await
+}
+
+/// Applies one narrowing-table watch event, restoring the fail-open default on
+/// revocation or any attachment failure.
+async fn converge_narrowing_table(
+    event: anyhow::Result<RouteEvent>,
+    watch: &mut Option<selium_guest::RouteWatch>,
+    ctx: &mut Context,
+) -> NarrowingTable {
+    converge_table(
+        event,
+        watch,
+        "bridge-server: narrowing table",
+        || ctx.lookup(NARROWING_TABLE_ROUTE),
+        NarrowingTable::from_target,
+        NarrowingTable::empty,
+    )
+    .await
+}
+
+/// Applies one watch event to a table, restoring that table's safe default on
+/// revocation, a stale appearance, or any attachment failure.
+///
+/// An appearance is only a convergence signal: `resolve` re-resolves the route
+/// through discovery (which records attach authority) and `attach` builds the
+/// live view from that target. `default` is the caller's policy for *not*
+/// having a table: grants stay fail-closed (unknown identities are refused) and
+/// narrowing stays fail-open (no subtraction).
+async fn converge_table<T, Resolve, Fut, Attach>(
+    event: anyhow::Result<RouteEvent>,
+    watch: &mut Option<selium_guest::RouteWatch>,
+    label: &str,
+    resolve: Resolve,
+    attach: Attach,
+    default: fn() -> T,
+) -> T
+where
+    Resolve: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ResourceTarget>, selium_guest::GuestError>>,
+    Attach: FnOnce(&ResourceTarget) -> anyhow::Result<T>,
+{
+    match event {
+        Ok(RouteEvent::Appeared(_)) | Ok(RouteEvent::Replaced(_)) => {
+            match resolve().await {
+                Ok(Some(target)) => match attach(&target) {
+                    Ok(table) => return table,
+                    Err(error) => warn!("{label}: attach failed: {error}"),
+                },
+                Ok(None) => {} // Stale event: the route went away again.
+                Err(error) => warn!("{label}: re-resolve failed: {error}"),
+            }
+            default()
+        }
+        Ok(RouteEvent::Revoked) => default(),
+        Err(error) => {
+            warn!("{label}: watch failed: {error}; using the safe default");
+            *watch = None;
+            default()
+        }
+    }
+}
+
+/// Awaits the next event from an optional route watch.
+///
+/// A watch that could not be created (e.g. the route table was unavailable at
+/// boot) never resolves, leaving the table's safe default in force.
+async fn next_table_event(
+    watch: &mut Option<selium_guest::RouteWatch>,
+) -> anyhow::Result<RouteEvent> {
+    match watch {
+        Some(watch) => watch.next().await.map_err(anyhow::Error::from),
+        None => std::future::pending::<anyhow::Result<RouteEvent>>().await,
+    }
+}
+
+/// Opens a replayed live-table view over a resolved table region.
+///
+/// Replay starts at the ring begin so mutations published before this
+/// attachment are materialised, which is what lets a late-attached table
+/// describe the current state rather than only later changes.
+fn open_table_view<K, V>(
+    target: &ResourceTarget,
+) -> anyhow::Result<LiveTableView<K, V, ShmTransport>>
+where
+    K: FlatMsg + Clone + Hash + Eq,
+    V: FlatMsg + Clone,
+{
+    let channel = Channel::attach(target.resource_id)
+        .map_err(|e| anyhow::anyhow!("table region attach failed: {e}"))?;
+    let transport = ShmTransport::new_replay(&channel, &channel)
+        .map_err(|e| anyhow::anyhow!("table transport failed: {e}"))?;
+    let subscriber = Subscriber::new(FramedRead::new(transport), None);
+    LiveTableView::new(subscriber)
+        .map_err(|e| anyhow::anyhow!("table view construction failed: {e}"))
+}
+
+/// Creates a table's route watch, reporting (not failing) when the route table
+/// is not ready.
+///
+/// Called at boot and again before a handoff, so a watch whose creation failed
+/// while the discovery route table was still unpublished is retried rather
+/// than leaving the table permanently detached.
+async fn open_table_watch(
+    ctx: &mut Context,
+    uri: &str,
+    label: &str,
+) -> Option<selium_guest::RouteWatch> {
+    match ctx.watch(uri).await {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            warn!("bridge-server: {label} unavailable: {error}");
+            None
         }
     }
 }

@@ -26,20 +26,20 @@ use selium_service::FlatMsg;
 
 mod common;
 
+/// The route nobody ever publishes.
+const ABSENT_ROUTE: &str = "sel://probe/ready/absent";
 /// Reviewed bound on a convergence event (the appearance is host-wake driven).
 const CONVERGENCE_BOUND: Duration = Duration::from_secs(30);
 /// The route that appears late.
 const LATE_ROUTE: &str = "sel://probe/ready/late";
-/// The route nobody ever publishes.
-const ABSENT_ROUTE: &str = "sel://probe/ready/absent";
 /// Provider role.
 const ROLE_PROVIDER: u64 = 1;
 /// Converging readiness role.
 const ROLE_READY: u64 = 9;
-/// Short-bound readiness role (times out).
-const ROLE_READY_TIMEOUT: u64 = 10;
 /// Immediate request-path miss role.
 const ROLE_READY_MISS: u64 = 11;
+/// Short-bound readiness role (times out).
+const ROLE_READY_TIMEOUT: u64 = 10;
 
 /// Bootstraps discovery plus a ready probe for `LATE_ROUTE`, a short-bound
 /// probe for `ABSENT_ROUTE`, and an immediate-miss probe for `ABSENT_ROUTE`.
@@ -74,6 +74,105 @@ fn bootstrap(runtime: &Runtime) -> (u64, u64, u64) {
         process(ROLE_READY_TIMEOUT),
         process(ROLE_READY_MISS),
     )
+}
+
+fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: "discovery".to_string(),
+        module_id: "discovery-module".to_string(),
+        module_bytes,
+        entrypoint: "discovery_main".to_string(),
+        arguments: Vec::new(), // populated by bootstrap
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
+            CapabilityGrant::new(
+                Capability::RouteClaim,
+                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
+            ),
+        ],
+        tenant: None,
+        discovery_service: true,
+        handlers: Vec::new(),
+    }
+}
+
+fn discovery_probe_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-discovery-probe", "selium_discovery_probe.wasm")
+}
+
+fn discovery_wasm() -> Vec<u8> {
+    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
+}
+
+fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
+    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
+        // A process that already exited has no log channel left; its
+        // interesting lines were drained before it went.
+        return Vec::new();
+    };
+    frames
+        .iter()
+        .map(|frame| {
+            selium_service::log::LogRecord::decode(frame)
+                .expect("decode log record")
+                .message
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::panic,
+    reason = "a missing log line within the bound is a test failure"
+)]
+fn expect_line(runtime: &Runtime, process_id: u64, prefix: &str, timeout: Duration) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        seen.extend(drain_logs(runtime, process_id));
+        if let Some(found) = seen.iter().find(|message| message.starts_with(prefix)) {
+            return found.clone();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {prefix:?} from process {process_id}; got {seen:?}");
+}
+
+fn guest_name(mode: u64) -> String {
+    format!("discovery-probe-{mode}")
+}
+
+fn probe_descriptor(route: &str, mode: u64) -> SystemGuestDescriptor {
+    SystemGuestDescriptor {
+        name: guest_name(mode),
+        module_id: format!("discovery-probe-{mode}-module"),
+        module_bytes: discovery_probe_wasm(),
+        entrypoint: "discovery_probe".to_string(),
+        arguments: vec![
+            SystemGuestArg::Pointer(route.as_bytes().to_vec()),
+            SystemGuestArg::Integer(mode),
+        ],
+        grants: vec![
+            CapabilityGrant::new(
+                Capability::SharedMemory,
+                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
+            ),
+            CapabilityGrant::new(
+                Capability::HostQueue,
+                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
+            ),
+        ],
+        tenant: Some("probe".to_string()),
+        discovery_service: false,
+        handlers: Vec::new(),
+    }
 }
 
 /// A consumer started before its provider converges on the later registration.
@@ -118,105 +217,6 @@ fn resolve_ready_converges_on_a_late_route_and_distinguishes_misses() {
         found.contains(LATE_ROUTE),
         "readiness converged on the late route: {found:?}"
     );
-}
-
-fn drain_logs(runtime: &Runtime, process_id: u64) -> Vec<String> {
-    let Ok(frames) = runtime.kernel().processes().drain_log_channel(process_id) else {
-        // A process that already exited has no log channel left; its
-        // interesting lines were drained before it went.
-        return Vec::new();
-    };
-    frames
-        .iter()
-        .map(|frame| {
-            selium_service::log::LogRecord::decode(frame)
-                .expect("decode log record")
-                .message
-        })
-        .collect()
-}
-
-#[expect(
-    clippy::panic,
-    reason = "a missing log line within the bound is a test failure"
-)]
-fn expect_line(runtime: &Runtime, process_id: u64, prefix: &str, timeout: Duration) -> String {
-    let mut seen: Vec<String> = Vec::new();
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        seen.extend(drain_logs(runtime, process_id));
-        if let Some(found) = seen.iter().find(|message| message.starts_with(prefix)) {
-            return found.clone();
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("timed out waiting for {prefix:?} from process {process_id}; got {seen:?}");
-}
-
-fn discovery_descriptor(module_bytes: Vec<u8>) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: "discovery".to_string(),
-        module_id: "discovery-module".to_string(),
-        module_bytes,
-        entrypoint: "discovery_main".to_string(),
-        arguments: Vec::new(), // populated by bootstrap
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-            CapabilityGrant::new(Capability::ProcessProbe, Vec::new()),
-            CapabilityGrant::new(
-                Capability::RouteClaim,
-                vec![ResourceSelector::Uri("sel:///discovery-routes".to_string())],
-            ),
-        ],
-        tenant: None,
-        discovery_service: true,
-        handlers: Vec::new(),
-    }
-}
-
-fn discovery_probe_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-discovery-probe", "selium_discovery_probe.wasm")
-}
-
-fn discovery_wasm() -> Vec<u8> {
-    common::read_guest_wasm_debug("selium-discovery", "selium_discovery.wasm")
-}
-
-fn guest_name(mode: u64) -> String {
-    format!("discovery-probe-{mode}")
-}
-
-fn probe_descriptor(route: &str, mode: u64) -> SystemGuestDescriptor {
-    SystemGuestDescriptor {
-        name: guest_name(mode),
-        module_id: format!("discovery-probe-{mode}-module"),
-        module_bytes: discovery_probe_wasm(),
-        entrypoint: "discovery_probe".to_string(),
-        arguments: vec![
-            SystemGuestArg::Pointer(route.as_bytes().to_vec()),
-            SystemGuestArg::Integer(mode),
-        ],
-        grants: vec![
-            CapabilityGrant::new(
-                Capability::SharedMemory,
-                vec![ResourceSelector::ResourceClass(ResourceClass::SharedRegion)],
-            ),
-            CapabilityGrant::new(
-                Capability::HostQueue,
-                vec![ResourceSelector::ResourceClass(ResourceClass::HostQueue)],
-            ),
-        ],
-        tenant: Some("probe".to_string()),
-        discovery_service: false,
-        handlers: Vec::new(),
-    }
 }
 
 /// Spawns a provider for `route`, wiring in the discovery listener handle that

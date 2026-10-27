@@ -45,6 +45,29 @@ impl FlatMsg for Pong {
 }
 
 #[tokio::test]
+async fn awaiting_peer_read_only_transport_parks_before_attachment() {
+    install_heap_provider();
+    let channel = make_park_channel(256);
+    let mut transport =
+        ShmTransport::read_only_awaiting_peer(&channel).expect("awaiting read-only transport");
+
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut storage = [0u8; 8];
+    let mut buf = tokio::io::ReadBuf::new(&mut storage);
+    let read = std::pin::Pin::new(&mut transport).poll_read(&mut cx, &mut buf);
+    assert!(
+        matches!(read, std::task::Poll::Pending),
+        "initial absence must park, not finish the stream"
+    );
+    let closed = match std::pin::Pin::new(&mut transport).poll_peer_closed(&mut cx) {
+        std::task::Poll::Ready(result) => result.expect("poll_peer_closed"),
+        std::task::Poll::Pending => false,
+    };
+    assert!(!closed, "an unattached peer is not a closed peer");
+}
+
+#[tokio::test]
 async fn bidi_stream_backpressure_no_spin_no_loss() {
     install_heap_provider();
 
@@ -246,6 +269,91 @@ async fn bidi_stream_independent_send_receive() {
     assert!(end.is_none(), "should be end-of-stream");
 
     server_handle.await.expect("server task");
+}
+
+#[test]
+fn directional_transports_register_only_their_own_membership() {
+    install_heap_provider();
+    let channel = make_channel(256);
+    let region = channel.ring().region();
+
+    let write_only = ShmTransport::write_only(&channel).expect("write-only transport");
+    assert_eq!(
+        region.load_writer_count().expect("writer count"),
+        1,
+        "a write-only transport registers exactly one writer"
+    );
+    assert_eq!(write_only.read_region_id(), 0);
+    assert_eq!(write_only.write_region_id(), region.region_id());
+    drop(write_only);
+    assert_eq!(
+        region.load_writer_count().expect("writer count"),
+        0,
+        "dropping the write-only transport withdraws its writer"
+    );
+
+    let read_only = ShmTransport::read_only(&channel).expect("read-only transport");
+    assert_eq!(
+        region.load_writer_count().expect("writer count"),
+        0,
+        "a read-only transport must not retain a writer on its inbound ring"
+    );
+    assert_eq!(read_only.write_region_id(), 0);
+    assert_eq!(read_only.read_region_id(), region.region_id());
+}
+
+#[test]
+fn directional_transports_report_unsupported_directions() {
+    install_heap_provider();
+    let channel = make_channel(256);
+
+    let mut write_only = ShmTransport::write_only(&channel).expect("write-only transport");
+    let error = expect_read_error(&mut write_only);
+    assert!(
+        error.to_string().contains("no read direction"),
+        "explicit error, got: {error}"
+    );
+
+    let mut read_only = ShmTransport::read_only(&channel).expect("read-only transport");
+    let error = expect_write_error(&mut read_only);
+    assert!(
+        error.to_string().contains("no write direction"),
+        "explicit error, got: {error}"
+    );
+}
+
+// --- Directional transports ---------------------------------------------
+
+/// Polls a read on the transport once and returns any direction error.
+fn expect_read_error(transport: &mut ShmTransport) -> std::io::Error {
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut storage = [0u8; 8];
+    let mut buf = tokio::io::ReadBuf::new(&mut storage);
+    match std::pin::Pin::new(transport).poll_read(&mut cx, &mut buf) {
+        std::task::Poll::Ready(Err(error)) => error,
+        std::task::Poll::Ready(Ok(())) => {
+            std::io::Error::other("unexpected: unsupported read direction succeeded")
+        }
+        std::task::Poll::Pending => {
+            std::io::Error::other("unexpected: unsupported read direction parked")
+        }
+    }
+}
+
+/// Polls a write on the transport once and returns any direction error.
+fn expect_write_error(transport: &mut ShmTransport) -> std::io::Error {
+    let waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    match std::pin::Pin::new(transport).poll_write(&mut cx, b"x") {
+        std::task::Poll::Ready(Err(error)) => error,
+        std::task::Poll::Ready(Ok(written)) => std::io::Error::other(format!(
+            "unexpected: wrote {written} bytes without a write direction"
+        )),
+        std::task::Poll::Pending => {
+            std::io::Error::other("unexpected: unsupported write direction parked")
+        }
+    }
 }
 
 #[test]
@@ -890,6 +998,149 @@ async fn stale_cancel_frame_skipped_for_next_request() {
 }
 
 #[tokio::test]
+async fn streaming_client_drop_closes_the_server_session() {
+    install_heap_provider();
+    let request_channel = make_park_channel(1024);
+    let reply_channel = make_park_channel(1024);
+    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
+
+    let server_handle = tokio::spawn(async move {
+        let req = server.recv().await.expect("recv request");
+        drop(req);
+        // The client is gone: the next receive must report closure.
+        assert!(
+            matches!(
+                server.recv().await,
+                Err(selium_wire::rpc::RpcError::ConnectionClosed)
+            ),
+            "server must observe the client's graceful withdrawal"
+        );
+    });
+
+    let mut client = client;
+    let stream = client.call(Ping("drop".to_string())).await.expect("call");
+    drop(stream);
+    drop(client);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), server_handle)
+        .await
+        .expect("server must not hang on a dropped client")
+        .expect("server task");
+}
+
+#[tokio::test]
+async fn streaming_live_idle_peer_remains_connected() {
+    install_heap_provider();
+    let request_channel = make_park_channel(1024);
+    let reply_channel = make_park_channel(1024);
+    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
+
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        req.send_item(Pong("first".to_string()))
+            .await
+            .expect("send item");
+        // Stay alive (holding the reply writer) until the test releases us.
+        if release_rx.await.is_err() {
+            // The test finished first; dropping now closes the session.
+        }
+        req.finish().await.expect("finish");
+    });
+
+    let mut client = client;
+    let mut stream = client.call(Ping("idle".to_string())).await.expect("call");
+
+    use futures::StreamExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("first item")
+        .expect("item")
+        .expect("ok");
+    assert_eq!(first, Pong("first".to_string()));
+
+    let idle = tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
+    assert!(
+        idle.is_err(),
+        "a live idle peer must keep the stream open, got {idle:?}"
+    );
+
+    if release_tx.send(()).is_err() {
+        // The server already finished; nothing to release.
+    }
+    let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("finish must end the stream");
+    assert!(end.is_none(), "explicit finish ends the stream");
+    server_handle.await.expect("server task");
+}
+
+// --- Deterministic streaming lifecycle ----------------------------------
+
+fn streaming_pair(
+    request_channel: &Channel,
+    reply_channel: &Channel,
+) -> (
+    RpcServerStreamClient<Ping, Pong, ShmTransport>,
+    RpcServerStreamConnection<Ping, Pong, ShmTransport>,
+) {
+    let client = RpcServerStreamClient::new(
+        FramedWrite::new(ShmTransport::write_only(request_channel).expect("client request writer")),
+        FramedRead::new(
+            ShmTransport::read_only_awaiting_peer(reply_channel).expect("client reply reader"),
+        ),
+    );
+    let server = RpcServerStreamConnection::new(
+        FramedRead::new(ShmTransport::read_only(request_channel).expect("server request reader")),
+        FramedWrite::new(ShmTransport::write_only(reply_channel).expect("server reply writer")),
+        42,
+    );
+    (client, server)
+}
+
+#[tokio::test]
+async fn streaming_server_drop_without_terminal_item_ends_the_stream() {
+    install_heap_provider();
+    let request_channel = make_park_channel(1024);
+    let reply_channel = make_park_channel(1024);
+    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
+
+    let server_handle = tokio::spawn(async move {
+        let mut req = server.recv().await.expect("recv request");
+        req.send_item(Pong("only".to_string()))
+            .await
+            .expect("send item");
+        // No finish(), no final item: the drop withdraws the reply writer.
+        drop(req);
+        drop(server);
+    });
+
+    let mut client = client;
+    let mut stream = client
+        .call(Ping("no-terminal".to_string()))
+        .await
+        .expect("call");
+
+    use futures::StreamExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("first item must not hang")
+        .expect("item")
+        .expect("ok");
+    assert_eq!(first, Pong("only".to_string()));
+
+    let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("drained-then-close must end the stream rather than parking");
+    assert!(
+        end.is_none(),
+        "withdrawal without a terminal item ends the stream"
+    );
+
+    server_handle.await.expect("server task");
+}
+
+#[tokio::test]
 async fn streams_never_report_overwritten() {
     install_heap_provider();
 
@@ -970,257 +1221,6 @@ async fn streams_never_report_overwritten() {
     }
 
     server_handle.await.expect("server task");
-}
-
-// --- Directional transports ---------------------------------------------
-
-/// Polls a read on the transport once and returns any direction error.
-fn expect_read_error(transport: &mut ShmTransport) -> std::io::Error {
-    let waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    let mut storage = [0u8; 8];
-    let mut buf = tokio::io::ReadBuf::new(&mut storage);
-    match std::pin::Pin::new(transport).poll_read(&mut cx, &mut buf) {
-        std::task::Poll::Ready(Err(error)) => error,
-        std::task::Poll::Ready(Ok(())) => {
-            std::io::Error::other("unexpected: unsupported read direction succeeded")
-        }
-        std::task::Poll::Pending => {
-            std::io::Error::other("unexpected: unsupported read direction parked")
-        }
-    }
-}
-
-/// Polls a write on the transport once and returns any direction error.
-fn expect_write_error(transport: &mut ShmTransport) -> std::io::Error {
-    let waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    match std::pin::Pin::new(transport).poll_write(&mut cx, b"x") {
-        std::task::Poll::Ready(Err(error)) => error,
-        std::task::Poll::Ready(Ok(written)) => std::io::Error::other(format!(
-            "unexpected: wrote {written} bytes without a write direction"
-        )),
-        std::task::Poll::Pending => {
-            std::io::Error::other("unexpected: unsupported write direction parked")
-        }
-    }
-}
-
-#[test]
-fn directional_transports_report_unsupported_directions() {
-    install_heap_provider();
-    let channel = make_channel(256);
-
-    let mut write_only = ShmTransport::write_only(&channel).expect("write-only transport");
-    let error = expect_read_error(&mut write_only);
-    assert!(
-        error.to_string().contains("no read direction"),
-        "explicit error, got: {error}"
-    );
-
-    let mut read_only = ShmTransport::read_only(&channel).expect("read-only transport");
-    let error = expect_write_error(&mut read_only);
-    assert!(
-        error.to_string().contains("no write direction"),
-        "explicit error, got: {error}"
-    );
-}
-
-#[test]
-fn directional_transports_register_only_their_own_membership() {
-    install_heap_provider();
-    let channel = make_channel(256);
-    let region = channel.ring().region();
-
-    let write_only = ShmTransport::write_only(&channel).expect("write-only transport");
-    assert_eq!(
-        region.load_writer_count().expect("writer count"),
-        1,
-        "a write-only transport registers exactly one writer"
-    );
-    assert_eq!(write_only.read_region_id(), 0);
-    assert_eq!(write_only.write_region_id(), region.region_id());
-    drop(write_only);
-    assert_eq!(
-        region.load_writer_count().expect("writer count"),
-        0,
-        "dropping the write-only transport withdraws its writer"
-    );
-
-    let read_only = ShmTransport::read_only(&channel).expect("read-only transport");
-    assert_eq!(
-        region.load_writer_count().expect("writer count"),
-        0,
-        "a read-only transport must not retain a writer on its inbound ring"
-    );
-    assert_eq!(read_only.write_region_id(), 0);
-    assert_eq!(read_only.read_region_id(), region.region_id());
-}
-
-#[tokio::test]
-async fn awaiting_peer_read_only_transport_parks_before_attachment() {
-    install_heap_provider();
-    let channel = make_park_channel(256);
-    let mut transport =
-        ShmTransport::read_only_awaiting_peer(&channel).expect("awaiting read-only transport");
-
-    let waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    let mut storage = [0u8; 8];
-    let mut buf = tokio::io::ReadBuf::new(&mut storage);
-    let read = std::pin::Pin::new(&mut transport).poll_read(&mut cx, &mut buf);
-    assert!(
-        matches!(read, std::task::Poll::Pending),
-        "initial absence must park, not finish the stream"
-    );
-    let closed = match std::pin::Pin::new(&mut transport).poll_peer_closed(&mut cx) {
-        std::task::Poll::Ready(result) => result.expect("poll_peer_closed"),
-        std::task::Poll::Pending => false,
-    };
-    assert!(!closed, "an unattached peer is not a closed peer");
-}
-
-// --- Deterministic streaming lifecycle ----------------------------------
-
-fn streaming_pair(
-    request_channel: &Channel,
-    reply_channel: &Channel,
-) -> (
-    RpcServerStreamClient<Ping, Pong, ShmTransport>,
-    RpcServerStreamConnection<Ping, Pong, ShmTransport>,
-) {
-    let client = RpcServerStreamClient::new(
-        FramedWrite::new(ShmTransport::write_only(request_channel).expect("client request writer")),
-        FramedRead::new(
-            ShmTransport::read_only_awaiting_peer(reply_channel).expect("client reply reader"),
-        ),
-    );
-    let server = RpcServerStreamConnection::new(
-        FramedRead::new(ShmTransport::read_only(request_channel).expect("server request reader")),
-        FramedWrite::new(ShmTransport::write_only(reply_channel).expect("server reply writer")),
-        42,
-    );
-    (client, server)
-}
-
-#[tokio::test]
-async fn streaming_server_drop_without_terminal_item_ends_the_stream() {
-    install_heap_provider();
-    let request_channel = make_park_channel(1024);
-    let reply_channel = make_park_channel(1024);
-    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
-
-    let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        req.send_item(Pong("only".to_string()))
-            .await
-            .expect("send item");
-        // No finish(), no final item: the drop withdraws the reply writer.
-        drop(req);
-        drop(server);
-    });
-
-    let mut client = client;
-    let mut stream = client
-        .call(Ping("no-terminal".to_string()))
-        .await
-        .expect("call");
-
-    use futures::StreamExt;
-    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("first item must not hang")
-        .expect("item")
-        .expect("ok");
-    assert_eq!(first, Pong("only".to_string()));
-
-    let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("drained-then-close must end the stream rather than parking");
-    assert!(
-        end.is_none(),
-        "withdrawal without a terminal item ends the stream"
-    );
-
-    server_handle.await.expect("server task");
-}
-
-#[tokio::test]
-async fn streaming_live_idle_peer_remains_connected() {
-    install_heap_provider();
-    let request_channel = make_park_channel(1024);
-    let reply_channel = make_park_channel(1024);
-    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
-
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_handle = tokio::spawn(async move {
-        let mut req = server.recv().await.expect("recv request");
-        req.send_item(Pong("first".to_string()))
-            .await
-            .expect("send item");
-        // Stay alive (holding the reply writer) until the test releases us.
-        if release_rx.await.is_err() {
-            // The test finished first; dropping now closes the session.
-        }
-        req.finish().await.expect("finish");
-    });
-
-    let mut client = client;
-    let mut stream = client.call(Ping("idle".to_string())).await.expect("call");
-
-    use futures::StreamExt;
-    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("first item")
-        .expect("item")
-        .expect("ok");
-    assert_eq!(first, Pong("first".to_string()));
-
-    let idle = tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await;
-    assert!(
-        idle.is_err(),
-        "a live idle peer must keep the stream open, got {idle:?}"
-    );
-
-    if release_tx.send(()).is_err() {
-        // The server already finished; nothing to release.
-    }
-    let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
-        .await
-        .expect("finish must end the stream");
-    assert!(end.is_none(), "explicit finish ends the stream");
-    server_handle.await.expect("server task");
-}
-
-#[tokio::test]
-async fn streaming_client_drop_closes_the_server_session() {
-    install_heap_provider();
-    let request_channel = make_park_channel(1024);
-    let reply_channel = make_park_channel(1024);
-    let (client, mut server) = streaming_pair(&request_channel, &reply_channel);
-
-    let server_handle = tokio::spawn(async move {
-        let req = server.recv().await.expect("recv request");
-        drop(req);
-        // The client is gone: the next receive must report closure.
-        assert!(
-            matches!(
-                server.recv().await,
-                Err(selium_wire::rpc::RpcError::ConnectionClosed)
-            ),
-            "server must observe the client's graceful withdrawal"
-        );
-    });
-
-    let mut client = client;
-    let stream = client.call(Ping("drop".to_string())).await.expect("call");
-    drop(stream);
-    drop(client);
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), server_handle)
-        .await
-        .expect("server must not hang on a dropped client")
-        .expect("server task");
 }
 
 // --- Spec traceability (scripts/check-traceability.sh) -------------------

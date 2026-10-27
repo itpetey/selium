@@ -85,6 +85,29 @@ pub struct ClosedSession {
     pub generation: u64,
 }
 
+/// Observes session acceptance through the request ring's generation counter.
+///
+/// The snapshot is taken after the client has installed its local
+/// registrations (blocking-writer attachment itself advances the generation)
+/// and before the session is published through rendezvous. The serving side
+/// bumps the same generation only after installing its request reader and
+/// reply writer, so comparing against the snapshot observes acceptance exactly
+/// once — including an accept immediately followed by close, which a writer
+/// count threshold can miss because the count returns to the pre-accept value.
+///
+/// The client does not write request data while waiting, so an unrelated
+/// request-ring write cannot be mistaken for acceptance.
+///
+/// The snapshot and wait read generation words from the shared region. A read
+/// failure is reported with [`RpcError::Serialisation`], which is this module's
+/// existing bucket for region and session-setup failures — the change adds no
+/// new public error variant.
+#[derive(Clone)]
+pub struct Acceptance {
+    region: ChannelRegion,
+    observed_generation: u64,
+}
+
 impl<Req, Rep> OwnedRpcClient<Req, Rep> {
     /// Returns the parent shared id of the owned session region.
     pub fn shared_id(&self) -> u64 {
@@ -150,6 +173,51 @@ impl<Req, Item> Drop for OwnedServerStreamClient<Req, Item> {
             // Already reclaimed (e.g. peer freed it first, or process
             // teardown raced); nothing further to do during drop.
         }
+    }
+}
+
+impl Acceptance {
+    /// Snapshots the request ring after local registrations are in place.
+    pub fn snapshot(channel: &Channel) -> Result<Self> {
+        let region = channel.ring().region().clone();
+        let observed_generation = region.load_generation()?;
+        Ok(Self {
+            region,
+            observed_generation,
+        })
+    }
+
+    /// Parks until the serving side publishes acceptance.
+    ///
+    /// The wait registers a generation wait on the request region, so an
+    /// unaccepted session *parks*: the reactor hands the task back and the
+    /// host is free to drive other work (including the server's accept).
+    pub async fn wait(self) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            let generation = match self.region.load_generation() {
+                Ok(generation) => generation,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            if generation != self.observed_generation {
+                return Poll::Ready(Ok(()));
+            }
+            if !selium_memory::register_generation_wait(
+                self.region.region_id(),
+                generation,
+                cx.waker(),
+            ) {
+                // No reactor callback installed (e.g. a host-side consumer):
+                // fall back to a self-wake so the wait re-checks.
+                cx.waker().wake_by_ref();
+            }
+            // Check-after-register: an accept that landed between the read
+            // above and the registration self-wakes us instead of being lost.
+            if self.region.load_generation().ok() != Some(generation) {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
     }
 }
 
@@ -330,28 +398,6 @@ where
     })
 }
 
-/// Builds the client-side unary transports from a freshly allocated pair.
-fn build_unary_client<Req, Rep>(
-    request_channel: &Channel,
-    reply_channel: &Channel,
-) -> std::result::Result<RpcClient<Req, Rep>, RpcError>
-where
-    Req: FlatMsg,
-    Rep: FlatMsg,
-{
-    // Client membership: one counting writer on the request ring and an
-    // awaiting-first-peer reader on the reply ring. No writer is retained on
-    // the inbound reply ring, so a server that drops is observable.
-    let request_transport =
-        ShmTransport::write_only(request_channel).map_err(map_transport_error)?;
-    let reply_transport =
-        ShmTransport::read_only_awaiting_peer(reply_channel).map_err(map_transport_error)?;
-    Ok(WireRpcClient::new(
-        FramedWrite::new(request_transport),
-        FramedRead::new(reply_transport),
-    ))
-}
-
 /// Creates a new shared-memory server-streaming RPC client.
 ///
 /// Allocates a multi-memory region with a request ring and a reply ring,
@@ -434,6 +480,11 @@ where
     })
 }
 
+/// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
+fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
+    crate::byte_channel::attach(shared_id)
+}
+
 /// Builds the client-side server-streaming transports from a freshly allocated
 /// pair.
 fn build_stream_client<Req, Item>(
@@ -454,9 +505,26 @@ where
     ))
 }
 
-/// Attaches to an RPC region by `shared_id` and extracts the two ring channels.
-fn attach_rpc_region(shared_id: u64) -> Result<(Channel, Channel)> {
-    crate::byte_channel::attach(shared_id)
+/// Builds the client-side unary transports from a freshly allocated pair.
+fn build_unary_client<Req, Rep>(
+    request_channel: &Channel,
+    reply_channel: &Channel,
+) -> std::result::Result<RpcClient<Req, Rep>, RpcError>
+where
+    Req: FlatMsg,
+    Rep: FlatMsg,
+{
+    // Client membership: one counting writer on the request ring and an
+    // awaiting-first-peer reader on the reply ring. No writer is retained on
+    // the inbound reply ring, so a server that drops is observable.
+    let request_transport =
+        ShmTransport::write_only(request_channel).map_err(map_transport_error)?;
+    let reply_transport =
+        ShmTransport::read_only_awaiting_peer(reply_channel).map_err(map_transport_error)?;
+    Ok(WireRpcClient::new(
+        FramedWrite::new(request_transport),
+        FramedRead::new(reply_transport),
+    ))
 }
 
 /// Creates a multi-memory region with two ring buffers for RPC.
@@ -484,74 +552,6 @@ fn map_transport_error(error: selium_wire::error::Error) -> RpcError {
             RpcError::Serialisation(message)
         }
         other => RpcError::Serialisation(other.to_string()),
-    }
-}
-
-/// Observes session acceptance through the request ring's generation counter.
-///
-/// The snapshot is taken after the client has installed its local
-/// registrations (blocking-writer attachment itself advances the generation)
-/// and before the session is published through rendezvous. The serving side
-/// bumps the same generation only after installing its request reader and
-/// reply writer, so comparing against the snapshot observes acceptance exactly
-/// once — including an accept immediately followed by close, which a writer
-/// count threshold can miss because the count returns to the pre-accept value.
-///
-/// The client does not write request data while waiting, so an unrelated
-/// request-ring write cannot be mistaken for acceptance.
-///
-/// The snapshot and wait read generation words from the shared region. A read
-/// failure is reported with [`RpcError::Serialisation`], which is this module's
-/// existing bucket for region and session-setup failures — the change adds no
-/// new public error variant.
-#[derive(Clone)]
-pub struct Acceptance {
-    region: ChannelRegion,
-    observed_generation: u64,
-}
-
-impl Acceptance {
-    /// Snapshots the request ring after local registrations are in place.
-    pub fn snapshot(channel: &Channel) -> Result<Self> {
-        let region = channel.ring().region().clone();
-        let observed_generation = region.load_generation()?;
-        Ok(Self {
-            region,
-            observed_generation,
-        })
-    }
-
-    /// Parks until the serving side publishes acceptance.
-    ///
-    /// The wait registers a generation wait on the request region, so an
-    /// unaccepted session *parks*: the reactor hands the task back and the
-    /// host is free to drive other work (including the server's accept).
-    pub async fn wait(self) -> Result<()> {
-        std::future::poll_fn(|cx| {
-            let generation = match self.region.load_generation() {
-                Ok(generation) => generation,
-                Err(error) => return Poll::Ready(Err(error)),
-            };
-            if generation != self.observed_generation {
-                return Poll::Ready(Ok(()));
-            }
-            if !selium_memory::register_generation_wait(
-                self.region.region_id(),
-                generation,
-                cx.waker(),
-            ) {
-                // No reactor callback installed (e.g. a host-side consumer):
-                // fall back to a self-wake so the wait re-checks.
-                cx.waker().wake_by_ref();
-            }
-            // Check-after-register: an accept that landed between the read
-            // above and the registration self-wakes us instead of being lost.
-            if self.region.load_generation().ok() != Some(generation) {
-                cx.waker().wake_by_ref();
-            }
-            Poll::Pending
-        })
-        .await
     }
 }
 

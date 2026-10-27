@@ -750,22 +750,6 @@ async fn splice_pipe(
     }
 }
 
-/// Writes one control frame, parking on ring backpressure until it is
-/// committed.
-///
-/// Control replies (acceptance in particular) must be delivered before any
-/// application frame is relayed, so a full client-facing ring must park the
-/// pipe here rather than surface a spurious `BufferFull`.
-async fn write_control(
-    stream_write: &mut FramedWrite<StreamWriteTransport>,
-    control: &PipeControl,
-) -> std::result::Result<(), WireError> {
-    let payload = FlatMsg::encode(control);
-    stream_write
-        .write_frame_with_flags_async(&payload, 0, FrameHeader::FLAG_READY)
-        .await
-}
-
 /// Sends a termination frame, logging a delivery failure before the writer is
 /// dropped (which closes the stream and surfaces EOF to the connector).
 async fn terminate(stream_write: &mut FramedWrite<StreamWriteTransport>, code: u32) {
@@ -797,6 +781,22 @@ async fn wait_for_ring_advance(region: &selium_shm::ChannelRegion) {
         Poll::Pending
     })
     .await
+}
+
+/// Writes one control frame, parking on ring backpressure until it is
+/// committed.
+///
+/// Control replies (acceptance in particular) must be delivered before any
+/// application frame is relayed, so a full client-facing ring must park the
+/// pipe here rather than surface a spurious `BufferFull`.
+async fn write_control(
+    stream_write: &mut FramedWrite<StreamWriteTransport>,
+    control: &PipeControl,
+) -> std::result::Result<(), WireError> {
+    let payload = FlatMsg::encode(control);
+    stream_write
+        .write_frame_with_flags_async(&payload, 0, FrameHeader::FLAG_READY)
+        .await
 }
 
 #[cfg(test)]

@@ -34,24 +34,25 @@ const PROBE_CHANNEL_CAPACITY: u64 = 4096;
 /// How long a resident role stays parked between checks. Long enough never to
 /// elapse during a test; these entrypoints are services, not one-shot jobs.
 const PROVIDER_PARK: std::time::Duration = std::time::Duration::from_secs(3_600);
+/// Readiness bound for the converging role: long enough for a provider the
+/// test starts after boot, short enough to fail a hung wait.
+const READY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+/// Readiness bound for the timeout role: a route nobody publishes.
+const READY_TIMEOUT_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
 /// Register a reserved handler route under a host-provisioned claim.
 const ROLE_CLAIM_ROUTE: u64 = 7;
-/// Converge on a route through the bounded readiness path and log the outcome.
-const ROLE_READY: u64 = 9;
-/// Resolve on demand through the bounded readiness path (short bound).
-const ROLE_READY_TIMEOUT: u64 = 10;
-/// Resolve a URI once and log how long the immediate miss took.
-const ROLE_READY_MISS: u64 = 11;
-/// Serve an owned resource with its attachability declaration refused by the
-/// host (armed through the runtime's test fault seam), then report whether
-/// either route was published.
-const ROLE_SERVE_DECLARATION_FAILS: u64 = 12;
 /// Watch a route and log every change.
 const ROLE_CONSUMER: u64 = 2;
 /// Try to register a reserved root route without its claim.
 const ROLE_FORGE: u64 = 6;
 /// Register a route (SDK path, with lease renewal) and stay resident.
 const ROLE_PROVIDER: u64 = 1;
+/// Converge on a route through the bounded readiness path and log the outcome.
+const ROLE_READY: u64 = 9;
+/// Resolve a URI once and log how long the immediate miss took.
+const ROLE_READY_MISS: u64 = 11;
+/// Resolve on demand through the bounded readiness path (short bound).
+const ROLE_READY_TIMEOUT: u64 = 10;
 /// Allocate a region, log, and return.
 const ROLE_REGION: u64 = 0;
 /// Register through the raw client and never renew the lease.
@@ -60,11 +61,10 @@ const ROLE_REGISTER_NO_RENEW: u64 = 4;
 const ROLE_RESOLVER: u64 = 3;
 /// Resolve a URI until it is gone, logging each answer.
 const ROLE_RESOLVER_UNTIL_GONE: u64 = 8;
-/// Readiness bound for the converging role: long enough for a provider the
-/// test starts after boot, short enough to fail a hung wait.
-const READY_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
-/// Readiness bound for the timeout role: a route nobody publishes.
-const READY_TIMEOUT_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+/// Serve an owned resource with its attachability declaration refused by the
+/// host (armed through the runtime's test fault seam), then report whether
+/// either route was published.
+const ROLE_SERVE_DECLARATION_FAILS: u64 = 12;
 /// Register, then crash (a trap, not a graceful exit).
 const ROLE_TRAP_AFTER_REGISTER: u64 = 5;
 
@@ -189,6 +189,36 @@ async fn provider(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
     park().await
 }
 
+/// Converges on `uri` through the bounded watch-driven readiness path.
+///
+/// Logs the resolved resource on success, or the typed timeout on expiry. A
+/// resident role must never spin: the wait parks on the route table.
+async fn ready(ctx: &mut Context, uri: &str, bound: std::time::Duration) -> anyhow::Result<()> {
+    match ctx.resolve_ready(uri, bound).await {
+        Ok(target) => info!("ready: found {uri} {}", target.resource_id),
+        Err(error) => info!("ready: timeout {uri} ({error})"),
+    }
+    // Stay resident so the probe's log channel survives until the test has
+    // drained the outcome (a guest that exits immediately may take its channel
+    // with it).
+    park().await
+}
+
+/// Resolves `uri` exactly once and logs how long the immediate miss took.
+///
+/// The request path must not wait for the readiness bound: a genuine miss is
+/// `NotFound` immediately.
+async fn ready_miss(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
+    let started = selium_guest::Instant::now()?;
+    let found = ctx.lookup(uri).await?;
+    let elapsed = selium_guest::Instant::now()?
+        .checked_duration_since(started)
+        .unwrap_or_default();
+    let outcome = if found.is_some() { "found" } else { "notfound" };
+    info!("miss: {outcome} {uri} {}ms", elapsed.as_millis());
+    Ok(())
+}
+
 /// Builds a region-backed target for `uri`.
 fn region_target(uri: &str, resource_id: u64) -> ResourceTarget {
     ResourceTarget {
@@ -255,19 +285,40 @@ async fn resolver(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Converges on `uri` through the bounded watch-driven readiness path.
+/// Resolves `uri` periodically until it reports `NotFound`.
 ///
-/// Logs the resolved resource on success, or the typed timeout on expiry. A
-/// resident role must never spin: the wait parks on the route table.
-async fn ready(ctx: &mut Context, uri: &str, bound: std::time::Duration) -> anyhow::Result<()> {
-    match ctx.resolve_ready(uri, bound).await {
-        Ok(target) => info!("ready: found {uri} {}", target.resource_id),
-        Err(error) => info!("ready: timeout {uri} ({error})"),
+/// A single resolve races the discovery sweep; a lapsed-lease test must keep
+/// asking until the sweep has ticked past the deadline.
+async fn resolver_until_gone(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
+    loop {
+        let response = ctx
+            .discovery()
+            .request(DiscoveryRequest::Resolve(uri.to_string()))
+            .await
+            .context("resolver: resolve")?;
+        match response {
+            DiscoveryResponse::NotFound => {
+                info!("resolver: notfound {uri}");
+                return Ok(());
+            }
+            DiscoveryResponse::Found(target) => {
+                info!("resolver: found {uri} {}", target.resource_id);
+            }
+            other => info!("resolver: other {uri} {other:?}"),
+        }
+        let now = selium_guest::Instant::now().context("resolver: clock")?;
+        let deadline = now
+            .checked_add(std::time::Duration::from_millis(250))
+            .unwrap_or(selium_guest::Instant::MAX);
+        selium_guest::Timer::new(deadline).await;
     }
-    // Stay resident so the probe's log channel survives until the test has
-    // drained the outcome (a guest that exits immediately may take its channel
-    // with it).
-    park().await
+}
+
+/// Decodes the route URI argument the runtime wrote into guest memory.
+fn route_uri(route: (u64, u64)) -> &'static str {
+    // SAFETY: `route` is this entrypoint's pointer argument; the runtime
+    // populated it with the descriptor's argument bytes before the call.
+    unsafe { selium_guest::args::str(route.0, route.1) }.unwrap_or_default()
 }
 
 /// Calls `Context::serve` for a resource this guest owns while the host refuses
@@ -328,57 +379,6 @@ async fn serve_declaration_fails(ctx: &mut Context) -> anyhow::Result<()> {
     // Stay resident so the test can drain every line: a guest that returns
     // immediately may exit before its log channel is read.
     park().await
-}
-
-/// Resolves `uri` exactly once and logs how long the immediate miss took.
-///
-/// The request path must not wait for the readiness bound: a genuine miss is
-/// `NotFound` immediately.
-async fn ready_miss(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
-    let started = selium_guest::Instant::now()?;
-    let found = ctx.lookup(uri).await?;
-    let elapsed = selium_guest::Instant::now()?
-        .checked_duration_since(started)
-        .unwrap_or_default();
-    let outcome = if found.is_some() { "found" } else { "notfound" };
-    info!("miss: {outcome} {uri} {}ms", elapsed.as_millis());
-    Ok(())
-}
-
-/// Resolves `uri` periodically until it reports `NotFound`.
-///
-/// A single resolve races the discovery sweep; a lapsed-lease test must keep
-/// asking until the sweep has ticked past the deadline.
-async fn resolver_until_gone(ctx: &mut Context, uri: &str) -> anyhow::Result<()> {
-    loop {
-        let response = ctx
-            .discovery()
-            .request(DiscoveryRequest::Resolve(uri.to_string()))
-            .await
-            .context("resolver: resolve")?;
-        match response {
-            DiscoveryResponse::NotFound => {
-                info!("resolver: notfound {uri}");
-                return Ok(());
-            }
-            DiscoveryResponse::Found(target) => {
-                info!("resolver: found {uri} {}", target.resource_id);
-            }
-            other => info!("resolver: other {uri} {other:?}"),
-        }
-        let now = selium_guest::Instant::now().context("resolver: clock")?;
-        let deadline = now
-            .checked_add(std::time::Duration::from_millis(250))
-            .unwrap_or(selium_guest::Instant::MAX);
-        selium_guest::Timer::new(deadline).await;
-    }
-}
-
-/// Decodes the route URI argument the runtime wrote into guest memory.
-fn route_uri(route: (u64, u64)) -> &'static str {
-    // SAFETY: `route` is this entrypoint's pointer argument; the runtime
-    // populated it with the descriptor's argument bytes before the call.
-    unsafe { selium_guest::args::str(route.0, route.1) }.unwrap_or_default()
 }
 
 /// Registers `uri` and then crashes, so revocation must run on the failure

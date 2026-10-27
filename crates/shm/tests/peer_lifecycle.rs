@@ -23,53 +23,10 @@ use selium_shm::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
+static INSTALL: Once = Once::new();
 /// Wakers registered by the ring's generation-wait path, used to prove that
 /// attachment alone wakes a parked reader.
 static WAITS: Mutex<Vec<(u64, u64, Waker)>> = Mutex::new(Vec::new());
-static INSTALL: Once = Once::new();
-
-fn register_generation(region_id: u64, generation: u64, waker: &Waker) {
-    let mut waits = WAITS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    waits.push((region_id, generation, waker.clone()));
-}
-
-fn wake_generation(region_id: u64, new_generation: u64) {
-    let mut waits = WAITS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut remaining = Vec::new();
-    for (rid, generation, waker) in waits.drain(..) {
-        if rid == region_id && generation < new_generation {
-            waker.wake();
-        } else {
-            remaining.push((rid, generation, waker));
-        }
-    }
-    *waits = remaining;
-}
-
-fn install_generation_callbacks() {
-    INSTALL.call_once(|| {
-        selium_memory::install_generation_callbacks(register_generation, wake_generation);
-    });
-}
-
-fn install_heap_provider() {
-    drop(selium_memory::set_region_provider(Box::new(
-        selium_memory::HeapRegionProvider::new(),
-    )));
-}
-
-fn park_channel(capacity: u64) -> Channel {
-    Channel::create_with_backpressure(
-        capacity,
-        ChannelBackpressure::Park,
-        ResourceKind::SharedMemory,
-    )
-    .expect("create channel")
-}
 
 /// Waker that only counts wakes; used where a wake must *not* happen.
 struct CountingWaker(AtomicUsize);
@@ -82,74 +39,6 @@ impl Wake for CountingWaker {
     fn wake_by_ref(self: &Arc<Self>) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
-}
-
-fn counting_waker() -> (Arc<CountingWaker>, Waker) {
-    let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&counter));
-    (counter, waker)
-}
-
-fn noop_waker() -> Waker {
-    futures::task::noop_waker()
-}
-
-/// Polls the reader once, returning the poll result and whatever bytes it
-/// produced.
-fn poll_read_once(
-    reader: &mut BlockingReader,
-    waker: &Waker,
-) -> (Poll<std::io::Result<()>>, Vec<u8>) {
-    let mut context = Context::from_waker(waker);
-    let mut storage = [0u8; 64];
-    let mut buf = ReadBuf::new(&mut storage);
-    let result = Pin::new(reader).poll_read(&mut context, &mut buf);
-    let filled = buf.filled().to_vec();
-    (result, filled)
-}
-
-fn write_frame(channel: &Channel, payload: &[u8]) {
-    let required = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
-    let position = channel.ring().reserve(required).expect("reserve");
-    channel
-        .ring()
-        .write_frame(position, payload, 0, 0)
-        .expect("write frame");
-}
-
-#[test]
-fn initial_peer_absence_is_not_closure() {
-    install_heap_provider();
-    let channel = park_channel(64);
-    let mut reader = channel
-        .blocking_reader_awaiting_peer()
-        .expect("awaiting reader");
-
-    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
-    assert!(matches!(result, Poll::Pending), "initial absence must park");
-    assert!(filled.is_empty());
-    assert_eq!(
-        reader.lifecycle(),
-        PeerLifecycle::AwaitingFirstPeer {
-            initial_generation: reader.generation().expect("generation")
-        }
-    );
-    assert!(
-        !reader.peer_closed().expect("peer close"),
-        "an unattached peer is not a closed peer"
-    );
-}
-
-#[test]
-fn ordinary_channel_retains_immediate_eof() {
-    install_heap_provider();
-    let channel = park_channel(64);
-    let mut reader = channel.blocking_reader().expect("legacy reader");
-
-    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
-    assert!(matches!(result, Poll::Ready(Ok(()))), "legacy EOF");
-    assert!(filled.is_empty(), "no data before EOF");
-    assert!(reader.peer_closed().expect("peer close"));
 }
 
 #[test]
@@ -166,47 +55,6 @@ fn accepting_peer_starts_attached() {
     assert!(
         matches!(result, Poll::Ready(Ok(()))),
         "closure after handoff"
-    );
-    assert!(filled.is_empty());
-    assert!(reader.peer_closed().expect("peer close"));
-}
-
-#[test]
-fn final_frame_precedes_eof() {
-    install_heap_provider();
-    let channel = park_channel(256);
-    let mut reader = channel
-        .blocking_reader_from_awaiting_peer(0)
-        .expect("awaiting reader");
-    let writer = channel.blocking_writer().expect("writer");
-    write_frame(&channel, b"last");
-    drop(writer);
-    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
-    assert!(matches!(result, Poll::Ready(Ok(()))));
-    assert!(
-        filled.ends_with(b"last"),
-        "committed frame must arrive first, got {filled:?}"
-    );
-
-    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
-    assert!(matches!(result, Poll::Ready(Ok(()))), "EOF after drain");
-    assert!(filled.is_empty());
-}
-
-#[test]
-fn peer_attaches_and_closes_before_the_first_poll() {
-    install_heap_provider();
-    let channel = park_channel(64);
-    let mut reader = channel
-        .blocking_reader_awaiting_peer()
-        .expect("awaiting reader");
-    let writer = channel.blocking_writer().expect("peer attaches");
-    drop(writer);
-
-    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
-    assert!(
-        matches!(result, Poll::Ready(Ok(()))),
-        "a peer that came and went is closure, not initial absence"
     );
     assert!(filled.is_empty());
     assert!(reader.peer_closed().expect("peer close"));
@@ -248,6 +96,12 @@ fn attachment_without_data_wakes_a_parked_reader() {
     assert!(reader.peer_closed().expect("peer close"));
 }
 
+fn counting_waker() -> (Arc<CountingWaker>, Waker) {
+    let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&counter));
+    (counter, waker)
+}
+
 #[test]
 fn failed_writer_registration_publishes_nothing() {
     install_heap_provider();
@@ -273,6 +127,152 @@ fn failed_writer_registration_publishes_nothing() {
         generation_before,
         "failed registration must not publish an attachment"
     );
+}
+
+#[test]
+fn final_frame_precedes_eof() {
+    install_heap_provider();
+    let channel = park_channel(256);
+    let mut reader = channel
+        .blocking_reader_from_awaiting_peer(0)
+        .expect("awaiting reader");
+    let writer = channel.blocking_writer().expect("writer");
+    write_frame(&channel, b"last");
+    drop(writer);
+    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
+    assert!(matches!(result, Poll::Ready(Ok(()))));
+    assert!(
+        filled.ends_with(b"last"),
+        "committed frame must arrive first, got {filled:?}"
+    );
+
+    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
+    assert!(matches!(result, Poll::Ready(Ok(()))), "EOF after drain");
+    assert!(filled.is_empty());
+}
+
+#[test]
+fn initial_peer_absence_is_not_closure() {
+    install_heap_provider();
+    let channel = park_channel(64);
+    let mut reader = channel
+        .blocking_reader_awaiting_peer()
+        .expect("awaiting reader");
+
+    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
+    assert!(matches!(result, Poll::Pending), "initial absence must park");
+    assert!(filled.is_empty());
+    assert_eq!(
+        reader.lifecycle(),
+        PeerLifecycle::AwaitingFirstPeer {
+            initial_generation: reader.generation().expect("generation")
+        }
+    );
+    assert!(
+        !reader.peer_closed().expect("peer close"),
+        "an unattached peer is not a closed peer"
+    );
+}
+
+fn install_generation_callbacks() {
+    INSTALL.call_once(|| {
+        selium_memory::install_generation_callbacks(register_generation, wake_generation);
+    });
+}
+
+fn install_heap_provider() {
+    drop(selium_memory::set_region_provider(Box::new(
+        selium_memory::HeapRegionProvider::new(),
+    )));
+}
+
+fn noop_waker() -> Waker {
+    futures::task::noop_waker()
+}
+
+#[test]
+fn ordinary_channel_retains_immediate_eof() {
+    install_heap_provider();
+    let channel = park_channel(64);
+    let mut reader = channel.blocking_reader().expect("legacy reader");
+
+    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
+    assert!(matches!(result, Poll::Ready(Ok(()))), "legacy EOF");
+    assert!(filled.is_empty(), "no data before EOF");
+    assert!(reader.peer_closed().expect("peer close"));
+}
+
+fn park_channel(capacity: u64) -> Channel {
+    Channel::create_with_backpressure(
+        capacity,
+        ChannelBackpressure::Park,
+        ResourceKind::SharedMemory,
+    )
+    .expect("create channel")
+}
+
+#[test]
+fn peer_attaches_and_closes_before_the_first_poll() {
+    install_heap_provider();
+    let channel = park_channel(64);
+    let mut reader = channel
+        .blocking_reader_awaiting_peer()
+        .expect("awaiting reader");
+    let writer = channel.blocking_writer().expect("peer attaches");
+    drop(writer);
+
+    let (result, filled) = poll_read_once(&mut reader, &noop_waker());
+    assert!(
+        matches!(result, Poll::Ready(Ok(()))),
+        "a peer that came and went is closure, not initial absence"
+    );
+    assert!(filled.is_empty());
+    assert!(reader.peer_closed().expect("peer close"));
+}
+
+/// Polls the reader once, returning the poll result and whatever bytes it
+/// produced.
+fn poll_read_once(
+    reader: &mut BlockingReader,
+    waker: &Waker,
+) -> (Poll<std::io::Result<()>>, Vec<u8>) {
+    let mut context = Context::from_waker(waker);
+    let mut storage = [0u8; 64];
+    let mut buf = ReadBuf::new(&mut storage);
+    let result = Pin::new(reader).poll_read(&mut context, &mut buf);
+    let filled = buf.filled().to_vec();
+    (result, filled)
+}
+
+fn register_generation(region_id: u64, generation: u64, waker: &Waker) {
+    let mut waits = WAITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    waits.push((region_id, generation, waker.clone()));
+}
+
+fn wake_generation(region_id: u64, new_generation: u64) {
+    let mut waits = WAITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut remaining = Vec::new();
+    for (rid, generation, waker) in waits.drain(..) {
+        if rid == region_id && generation < new_generation {
+            waker.wake();
+        } else {
+            remaining.push((rid, generation, waker));
+        }
+    }
+    *waits = remaining;
+}
+
+fn write_frame(channel: &Channel, payload: &[u8]) {
+    let required = FrameHeader::ENCODED_SIZE as u64 + payload.len() as u64;
+    let position = channel.ring().reserve(required).expect("reserve");
+    channel
+        .ring()
+        .write_frame(position, payload, 0, 0)
+        .expect("write frame");
 }
 
 // --- Spec traceability (scripts/check-traceability.sh) -------------------

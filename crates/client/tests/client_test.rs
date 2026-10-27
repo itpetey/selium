@@ -66,134 +66,6 @@ async fn bad_handshake_termination_maps_to_bad_handshake_error() {
     bridge.abort();
 }
 
-/// A bridge that closes the stream before any control reply is wire
-/// termination, not a handshake rejection.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pre_reply_stream_close_is_transport_termination() {
-    let (addr, server) = bind_server(plain_server_config()).await;
-    let bridge = tokio::spawn(async move {
-        let connection = server
-            .accept()
-            .await
-            .expect("accept")
-            .await
-            .expect("handshake");
-        let (send, recv) = connection.accept_bi().await.expect("stream");
-
-        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
-        let (payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
-        assert!(matches!(
-            <PipeControl as FlatMsg>::decode(&payload).expect("control frame"),
-            PipeControl::Handshake { .. }
-        ));
-        // FIN without any control reply.
-        drop(send);
-        drop(reader);
-        keep_connection_alive().await;
-    });
-
-    let client = selium_client::connect(addr, plain_options())
-        .await
-        .expect("connect");
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        expect_open_error(client.subscriber::<String>("sel://acme/void")),
-    )
-    .await
-    .expect("pre-reply close within timeout");
-    assert!(
-        matches!(
-            error,
-            selium_client::Error::Wire(selium_wire::Error::Terminated)
-        ),
-        "pre-reply EOF must surface transport termination, got {error:?}"
-    );
-
-    bridge.abort();
-}
-
-/// A control reply that cannot be decoded is a contract violation and keeps
-/// its bad-handshake mapping.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn malformed_control_reply_maps_to_bad_handshake() {
-    let (addr, server) = bind_server(plain_server_config()).await;
-    let bridge = tokio::spawn(async move {
-        let connection = server
-            .accept()
-            .await
-            .expect("accept")
-            .await
-            .expect("handshake");
-        let (send, recv) = connection.accept_bi().await.expect("stream");
-
-        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
-        let mut writer = FramedWrite::new(QuicTransport::write_only(send));
-        let (_payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
-        writer
-            .write_frame(b"not-a-control-reply", 0)
-            .expect("malformed reply");
-        keep_connection_alive().await;
-    });
-
-    let client = selium_client::connect(addr, plain_options())
-        .await
-        .expect("connect");
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        expect_open_error(client.subscriber::<String>("sel://acme/garbage")),
-    )
-    .await
-    .expect("reply within timeout");
-    assert!(
-        matches!(error, selium_client::Error::BadHandshake),
-        "an undecodable reply is a bad handshake, got {error:?}"
-    );
-
-    bridge.abort();
-}
-
-/// A decodable but unexpected control variant is also a bad handshake.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unexpected_control_reply_maps_to_bad_handshake() {
-    let (addr, server) = bind_server(plain_server_config()).await;
-    let bridge = tokio::spawn(async move {
-        let connection = server
-            .accept()
-            .await
-            .expect("accept")
-            .await
-            .expect("handshake");
-        let (send, recv) = connection.accept_bi().await.expect("stream");
-
-        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
-        let mut writer = FramedWrite::new(QuicTransport::write_only(send));
-        let (_payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
-        let unexpected = FlatMsg::encode(&PipeControl::Handshake {
-            uri: "sel://acme/other".to_string(),
-        });
-        writer
-            .write_frame(&unexpected, 0)
-            .expect("unexpected reply");
-        keep_connection_alive().await;
-    });
-
-    let client = selium_client::connect(addr, plain_options())
-        .await
-        .expect("connect");
-    let error = tokio::time::timeout(
-        Duration::from_secs(5),
-        expect_open_error(client.subscriber::<String>("sel://acme/other")),
-    )
-    .await
-    .expect("reply within timeout");
-    assert!(
-        matches!(error, selium_client::Error::BadHandshake),
-        "an unexpected control variant is a bad handshake, got {error:?}"
-    );
-
-    bridge.abort();
-}
-
 /// 5.4: a bidirectional-streaming RPC round-trips items in both directions
 /// on one session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -662,6 +534,46 @@ async fn live_table_set_get_delete_round_trip() {
     bridge.abort();
 }
 
+/// A control reply that cannot be decoded is a contract violation and keeps
+/// its bad-handshake mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_control_reply_maps_to_bad_handshake() {
+    let (addr, server) = bind_server(plain_server_config()).await;
+    let bridge = tokio::spawn(async move {
+        let connection = server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
+        let (send, recv) = connection.accept_bi().await.expect("stream");
+
+        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
+        let mut writer = FramedWrite::new(QuicTransport::write_only(send));
+        let (_payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
+        writer
+            .write_frame(b"not-a-control-reply", 0)
+            .expect("malformed reply");
+        keep_connection_alive().await;
+    });
+
+    let client = selium_client::connect(addr, plain_options())
+        .await
+        .expect("connect");
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        expect_open_error(client.subscriber::<String>("sel://acme/garbage")),
+    )
+    .await
+    .expect("reply within timeout");
+    assert!(
+        matches!(error, selium_client::Error::BadHandshake),
+        "an undecodable reply is a bad handshake, got {error:?}"
+    );
+
+    bridge.abort();
+}
+
 /// The server's mTLS config, mirroring the connector's `build_server_config`
 /// (TLS 1.3 + mandatory client auth against the test client anchor).
 fn mtls_server_config() -> quinn::ServerConfig {
@@ -703,6 +615,52 @@ fn plain_options() -> ConnectOptions {
 /// seam (TLS 1.3, ring provider, no client auth).
 fn plain_server_config() -> quinn::ServerConfig {
     quinn::ServerConfig::with_single_cert(server_certs(), server_key()).expect("server config")
+}
+
+/// A bridge that closes the stream before any control reply is wire
+/// termination, not a handshake rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pre_reply_stream_close_is_transport_termination() {
+    let (addr, server) = bind_server(plain_server_config()).await;
+    let bridge = tokio::spawn(async move {
+        let connection = server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
+        let (send, recv) = connection.accept_bi().await.expect("stream");
+
+        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
+        let (payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
+        assert!(matches!(
+            <PipeControl as FlatMsg>::decode(&payload).expect("control frame"),
+            PipeControl::Handshake { .. }
+        ));
+        // FIN without any control reply.
+        drop(send);
+        drop(reader);
+        keep_connection_alive().await;
+    });
+
+    let client = selium_client::connect(addr, plain_options())
+        .await
+        .expect("connect");
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        expect_open_error(client.subscriber::<String>("sel://acme/void")),
+    )
+    .await
+    .expect("pre-reply close within timeout");
+    assert!(
+        matches!(
+            error,
+            selium_client::Error::Wire(selium_wire::Error::Terminated)
+        ),
+        "pre-reply EOF must surface transport termination, got {error:?}"
+    );
+
+    bridge.abort();
 }
 
 /// 5.3: a publisher is a `futures::Sink<T>` whose `send` emits an encoded frame.
@@ -931,6 +889,48 @@ async fn tls_builder_handshake_completes_against_connector_seam() {
     drop(connection);
     drop(endpoint);
     accept.await.expect("server task");
+}
+
+/// A decodable but unexpected control variant is also a bad handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unexpected_control_reply_maps_to_bad_handshake() {
+    let (addr, server) = bind_server(plain_server_config()).await;
+    let bridge = tokio::spawn(async move {
+        let connection = server
+            .accept()
+            .await
+            .expect("accept")
+            .await
+            .expect("handshake");
+        let (send, recv) = connection.accept_bi().await.expect("stream");
+
+        let mut reader = FramedRead::new(QuicTransport::read_only(recv));
+        let mut writer = FramedWrite::new(QuicTransport::write_only(send));
+        let (_payload, _tag, _flags) = reader.read_frame_async().await.expect("handshake frame");
+        let unexpected = FlatMsg::encode(&PipeControl::Handshake {
+            uri: "sel://acme/other".to_string(),
+        });
+        writer
+            .write_frame(&unexpected, 0)
+            .expect("unexpected reply");
+        keep_connection_alive().await;
+    });
+
+    let client = selium_client::connect(addr, plain_options())
+        .await
+        .expect("connect");
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        expect_open_error(client.subscriber::<String>("sel://acme/other")),
+    )
+    .await
+    .expect("reply within timeout");
+    assert!(
+        matches!(error, selium_client::Error::BadHandshake),
+        "an unexpected control variant is a bad handshake, got {error:?}"
+    );
+
+    bridge.abort();
 }
 
 // --- Spec traceability (scripts/check-traceability.sh) -------------------

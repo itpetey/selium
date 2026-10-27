@@ -269,28 +269,6 @@ pub async fn handle_connection(
     }
 }
 
-/// Attaches the route's target queue, evicting a stale cached route when the
-/// target is no longer attachable.
-///
-/// A cached target can go stale (the serving guest restarted, or its queue was
-/// reclaimed). Keeping it would pin every later connection to a dead target, so
-/// the cache entry is evicted before giving up and the next connection
-/// re-resolves through discovery.
-async fn attach_route_target(
-    resolver: &ResolverHandle,
-    server_name: &str,
-    target: &ResourceTarget,
-) -> Option<ResourceSender> {
-    match ResourceSender::attach(target.resource_id) {
-        Ok(sender) => Some(sender),
-        Err(error) => {
-            warn!("quic-connector: attach to guest queue failed: {error}");
-            resolver.lock().await.evict(server_name);
-            None
-        }
-    }
-}
-
 /// Registers the wasm32 time source backing `web_time::Instant`, forwarding to
 /// the hostcall monotonic and wall clocks.
 ///
@@ -407,6 +385,28 @@ async fn attach_anchor_table(ctx: &mut Context) -> AnchorTableSource {
         Err(e) => {
             warn!("quic-connector: anchor table view failed: {e}");
             AnchorTableSource::Unavailable
+        }
+    }
+}
+
+/// Attaches the route's target queue, evicting a stale cached route when the
+/// target is no longer attachable.
+///
+/// A cached target can go stale (the serving guest restarted, or its queue was
+/// reclaimed). Keeping it would pin every later connection to a dead target, so
+/// the cache entry is evicted before giving up and the next connection
+/// re-resolves through discovery.
+async fn attach_route_target(
+    resolver: &ResolverHandle,
+    server_name: &str,
+    target: &ResourceTarget,
+) -> Option<ResourceSender> {
+    match ResourceSender::attach(target.resource_id) {
+        Ok(sender) => Some(sender),
+        Err(error) => {
+            warn!("quic-connector: attach to guest queue failed: {error}");
+            resolver.lock().await.evict(server_name);
+            None
         }
     }
 }

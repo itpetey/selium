@@ -766,6 +766,16 @@ impl Context {
     }
 }
 
+/// The tenant-scoped health route for `name`.
+fn health_uri(tenant: Option<&str>, name: &str) -> String {
+    format!(
+        "{}{}/health/{}",
+        uri::SEL_PREFIX,
+        tenant.unwrap_or_default(),
+        name
+    )
+}
+
 /// Awaits the watch's next event, bounded by `deadline`.
 ///
 /// Returns `Ok(None)` when the deadline expires first. The watch is polled in
@@ -786,16 +796,6 @@ async fn next_event_before(
         std::task::Poll::Pending
     })
     .await
-}
-
-/// The tenant-scoped health route for `name`.
-fn health_uri(tenant: Option<&str>, name: &str) -> String {
-    format!(
-        "{}{}/health/{}",
-        uri::SEL_PREFIX,
-        tenant.unwrap_or_default(),
-        name
-    )
 }
 
 #[cfg(test)]
